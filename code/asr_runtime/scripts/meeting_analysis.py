@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import ssl
 import sys
 import urllib.error
@@ -87,7 +88,40 @@ def build_prompt(transcript_report: dict[str, Any]) -> str:
     )
 
 
+def _load_dotenv_if_present() -> None:
+    """Minimal .env loader (no python-dotenv dependency). Populates os.environ once.
+
+    Searches cwd then the project root (parents[3] of this script). Existing
+    environment variables are never overwritten.
+    """
+    candidates = [Path.cwd() / ".env", Path(__file__).resolve().parents[3] / ".env"]
+    for env_path in candidates:
+        if not env_path.is_file():
+            continue
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+        return
+
+
 def _load_llm_config(path: Path) -> dict[str, Any]:
+    """Load LLM gateway config. Prefer env vars (12-factor); fall back to local JSON file."""
+    _load_dotenv_if_present()
+    base_url = os.environ.get("LLM_GATEWAY_BASE_URL")
+    api_key = os.environ.get("LLM_GATEWAY_API_KEY")
+    if base_url and api_key:
+        return {
+            "base_url": base_url,
+            "api_key": api_key,
+            "model": os.environ.get("LLM_GATEWAY_MODEL", "gpt-5.5"),
+            "timeout_seconds": int(os.environ.get("LLM_GATEWAY_TIMEOUT_SECONDS", "60")),
+        }
     return json.loads(path.read_text(encoding="utf-8"))
 
 

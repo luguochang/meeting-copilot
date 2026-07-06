@@ -6,5 +6,9 @@ requires-python = ">=3.11"
 dependencies = [
   "fastapi",
   "uvicorn",
+  "pydantic>=2",
+  "httpx",
+  "python-dotenv",
+  "structlog",
 ]
 
