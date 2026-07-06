@@ -64,7 +64,7 @@
 - [x] Phase 0-3: structlog 结构化日志（commit 1ac0758）
 - [x] Phase 0-4: DECISION.md 冻结（归档延后到 Phase 2，commit ab65708）
 - [x] Phase 1-1: 干净音频 ASR 重测（见 §7）
-- [ ] Phase 1-2: ASR 路线决断
+- [x] Phase 1-2: ASR 路线决断 = **本地继续**（文档默认 + Phase 1-1 证据支持；远程作为可选高质量模式保留，不默认开启）
 - [ ] Phase 2: 主链路打通
 - [ ] Phase 2.5: 方案考量卡
 - [ ] Phase 3: 前端重构
