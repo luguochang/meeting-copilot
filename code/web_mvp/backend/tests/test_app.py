@@ -4482,7 +4482,7 @@ def test_asr_live_llm_execution_runs_disabled_endpoint_returns_404_for_missing_s
     assert "ASR live session not found: missing_asr_review" in response.text
 
 
-def test_asr_live_llm_execution_runs_disabled_endpoint_rejects_unsupported_mode():
+def test_asr_live_llm_execution_runs_endpoint_rejects_unsupported_mode():
     client = TestClient(create_app())
     create_response = client.post(
         "/live/asr/mock/sessions",
@@ -4491,12 +4491,73 @@ def test_asr_live_llm_execution_runs_disabled_endpoint_rejects_unsupported_mode(
 
     response = client.post(
         "/live/asr/sessions/local_asr_execution_mode_review/llm-execution-runs",
-        json={"mode": "enabled"},
+        json={"mode": "foo"},
     )
 
     assert create_response.status_code == 201
     assert response.status_code == 422
-    assert "unsupported llm execution mode: enabled" in response.text
+    assert "unsupported llm execution mode: foo" in response.text
+
+
+def test_asr_live_llm_execution_runs_enabled_without_config_returns_422(monkeypatch):
+    monkeypatch.delenv("LLM_GATEWAY_BASE_URL", raising=False)
+    monkeypatch.delenv("LLM_GATEWAY_API_KEY", raising=False)
+    client = TestClient(create_app())
+    create_response = client.post(
+        "/live/asr/mock/sessions",
+        json=_asr_live_payload(session_id="local_asr_execution_enabled_no_cfg"),
+    )
+    response = client.post(
+        "/live/asr/sessions/local_asr_execution_enabled_no_cfg/llm-execution-runs",
+        json={"mode": "enabled"},
+    )
+    assert create_response.status_code == 201
+    assert response.status_code == 422
+    assert "not configured" in response.text
+
+
+def test_asr_live_llm_execution_runs_enabled_calls_llm_and_creates_real_cards(monkeypatch):
+    from meeting_copilot_web_mvp import llm_service
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = 0
+
+        def post_json(self, url, headers, body, timeout):
+            self.calls += 1
+            return {
+                "choices": [{"message": {"content": '{"suggestion_text":"建议确认 owner","confidence":0.8,"trigger_reason":"owner 缺失"}'}}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 30, "total_tokens": 130},
+            }
+
+    fake = FakeClient()
+    monkeypatch.setattr(llm_service, "HttpxLlmClient", lambda: fake)
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_GATEWAY_MODEL", "test-model")
+    client = TestClient(create_app())
+    create_response = client.post(
+        "/live/asr/mock/sessions",
+        json=_asr_live_payload(session_id="local_asr_execution_enabled_run"),
+    )
+    assert create_response.status_code == 201
+    response = client.post(
+        "/live/asr/sessions/local_asr_execution_enabled_run/llm-execution-runs",
+        json={"mode": "enabled"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["executor_mode"] == "enabled"
+    assert body["run_count"] >= 1
+    run = body["runs"][0]
+    assert run["run_status"] == "completed"
+    assert run["llm_call_status"] == "called"
+    assert run["card_status"] == "new"
+    assert run["card"]["card_status"] == "new"
+    assert run["card"]["suggestion_text"]
+    assert run["card"]["llm_trace"]["model"] == "test-model"
+    assert run["llm_usage"]["total_tokens"] == 130
+    assert fake.calls == body["run_count"]
 
 
 def test_asr_live_llm_execution_runs_disabled_endpoint_requires_explicit_mode():

@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
 from meeting_copilot_web_mvp.logging_config import configure_logging, get_logger
+from meeting_copilot_web_mvp import llm_service
 
 configure_logging()
 _log = get_logger("meeting_copilot_web_mvp.app")
@@ -1027,18 +1028,31 @@ def create_app(
         session_id: str,
         payload: CreateLlmExecutionRunsRequest,
     ) -> dict[str, Any]:
-        if payload.mode != "disabled":
-            raise HTTPException(
-                status_code=422,
-                detail=f"unsupported llm execution mode: {payload.mode}",
-            )
         try:
             record = asr_live_repo.get(session_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=f"ASR live session not found: {session_id}") from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        runs = _disabled_execution_runs_from_record(record)
+        if payload.mode == "disabled":
+            runs = _disabled_execution_runs_from_record(record)
+        elif payload.mode == "enabled":
+            config = llm_service.LlmConfig.from_env()
+            if config is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "LLM execution enabled but LLM_GATEWAY_BASE_URL / "
+                        "LLM_GATEWAY_API_KEY not configured in environment"
+                    ),
+                )
+            previews = _execution_previews_from_record(record)
+            runs = llm_service.build_enabled_execution_runs(previews, config)
+        else:
+            raise HTTPException(
+                status_code=422,
+                detail=f"unsupported llm execution mode: {payload.mode}",
+            )
         return {
             "session_id": session_id,
             "source": record["source"],
