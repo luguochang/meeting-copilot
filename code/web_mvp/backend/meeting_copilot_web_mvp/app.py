@@ -3,15 +3,23 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import structlog
+import time
+import uuid
 from pathlib import Path
 import re
 from typing import Any
 from urllib.parse import quote
 from urllib.parse import urlparse
 
-from fastapi import Body, FastAPI, HTTPException, Response
+from fastapi import Body, FastAPI, HTTPException, Request, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
+
+from meeting_copilot_web_mvp.logging_config import configure_logging, get_logger
+
+configure_logging()
+_log = get_logger("meeting_copilot_web_mvp.app")
 
 from meeting_copilot_core.contracts import SuggestionCardV1
 from meeting_copilot_core.session_snapshot import build_markdown_report
@@ -234,6 +242,28 @@ def create_app(
         else InMemoryAsrLiveSessionRepository()
     )
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+    @app.middleware("http")
+    async def _structured_request_logging(request: Request, call_next):
+        request_id = request.headers.get("x-request-id") or uuid.uuid4().hex[:12]
+        structlog.contextvars.clear_contextvars()
+        structlog.contextvars.bind_contextvars(
+            request_id=request_id,
+            method=request.method,
+            path=request.url.path,
+        )
+        start = time.perf_counter()
+        _log.info("request.start")
+        try:
+            response = await call_next(request)
+        except Exception:
+            duration_ms = round((time.perf_counter() - start) * 1000, 2)
+            _log.error("request.error", duration_ms=duration_ms, exc_info=True)
+            raise
+        duration_ms = round((time.perf_counter() - start) * 1000, 2)
+        _log.info("request.end", status_code=response.status_code, duration_ms=duration_ms)
+        response.headers["x-request-id"] = request_id
+        return response
 
     @app.get("/health")
     def health() -> dict[str, str]:
