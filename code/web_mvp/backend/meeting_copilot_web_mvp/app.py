@@ -1067,6 +1067,43 @@ def create_app(
             "runs": runs,
         }
 
+    @app.post("/live/asr/sessions/{session_id}/approach-cards")
+    def create_asr_live_session_approach_cards(
+        session_id: str,
+        payload: CreateLlmExecutionRunsRequest,
+    ) -> dict[str, Any]:
+        try:
+            record = asr_live_repo.get(session_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=f"ASR live session not found: {session_id}") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if payload.mode != "enabled":
+            raise HTTPException(status_code=422, detail=f"unsupported approach mode: {payload.mode}")
+        config = llm_service.LlmConfig.from_env()
+        if config is None:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "LLM execution enabled but LLM_GATEWAY_BASE_URL / "
+                    "LLM_GATEWAY_API_KEY not configured in environment"
+                ),
+            )
+        transcript_text = " ".join(
+            str((e.get("payload") or {}).get("text", ""))
+            for e in record.get("events") or []
+            if e.get("event_type") == "transcript_final"
+        )
+        cards, usage = llm_service.build_approach_cards(transcript_text, config)
+        return {
+            "session_id": session_id,
+            "source": record["source"],
+            "trace_kind": record["trace_kind"],
+            "approach_cards": cards,
+            "count": len(cards),
+            "llm_usage": usage,
+        }
+
     @app.post("/live/asr/sessions/{session_id}/llm-schema-validation-dry-runs")
     def create_asr_live_session_llm_schema_validation_dry_runs(
         session_id: str,
