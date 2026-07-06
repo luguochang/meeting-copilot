@@ -62,10 +62,27 @@
 - [x] Phase 0-1: git 基线（独立仓库，commit 65da6ec）
 - [x] Phase 0-2: 密钥迁 .env + 依赖补全（commit 8972d92）
 - [x] Phase 0-3: structlog 结构化日志（commit 1ac0758）
-- [ ] Phase 0-4: 归档脚手架脚本
-- [ ] Phase 1-1: 干净音频 ASR 重测
+- [x] Phase 0-4: DECISION.md 冻结（归档延后到 Phase 2，commit ab65708）
+- [x] Phase 1-1: 干净音频 ASR 重测（见 §7）
 - [ ] Phase 1-2: ASR 路线决断
 - [ ] Phase 2: 主链路打通
 - [ ] Phase 2.5: 方案考量卡
 - [ ] Phase 3: 前端重构
 - [ ] Phase 4: 桌面 + 加固
+
+## 7. Phase 1-1 ASR 干净音频重测结论（2026-07-06）
+
+用 `simulated-release-review.16k.wav`（macOS `say` 生成的干净中文技术口播，17.9s）重测：
+
+| 引擎 | RTF | 延迟 | 转写可读性 | 关键实体 |
+|---|---|---|---|---|
+| FunASR | 0.95 | 16952ms | 可读，基本正确 | 灰度✓ 错误率✓ 回滚✓ 监控✓ 负责人张三✓ 测试用例✓；checkout-service→payment gate✗ P99→t九九 staging✗ |
+| sherpa-onnx | 0.026 | 461ms | 可读，略差 | 错误率✓ 回滚✓ 监控✓；灰度→先挥✗ 用例→用力✗ P99→九九 staging✗ |
+
+**结论**：
+1. **两个本地 ASR 在干净音频上都输出可读中文**，都没有"我是我样"。这证实 7/4 真实麦克风测试的"我是我样"是**音频采集管线 bug**，不是 ASR 引擎问题。本地 ASR 路线在干净音频上可行。
+2. FunASR 准确度更高但慢（RTF 0.95，边缘实时）；sherpa 快得多（RTF 0.026）但准确度略低（灰度→先挥）。
+3. 两者都漏/错英文技术实体（checkout-service/P99/staging），**需要热词**才能召回。
+4. 真正的阻塞是**真实麦克风采集管线**（sidecar no_execution + Tauri no-op），不是 ASR 质量。
+
+**Phase 1-2 建议**：不 pivot 远程。本地继续（FunASR 准确优先 / sherpa 实时优先，按场景选），加技术热词，Phase 2 修真实麦克风采集管线。
