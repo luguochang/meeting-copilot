@@ -1,0 +1,76 @@
+{
+  "technical_entities": [
+    {
+      "type": "service",
+      "text": "payment-gateway",
+      "normalized": "payment-gateway",
+      "start_ms": 1000,
+      "end_ms": 2300
+    },
+    {
+      "type": "percentage",
+      "text": "10%",
+      "normalized": "10%",
+      "start_ms": 3600,
+      "end_ms": 4300
+    },
+    {
+      "type": "metric",
+      "text": "P99",
+      "normalized": "P99",
+      "start_ms": 5200,
+      "end_ms": 5700
+    },
+    {
+      "type": "threshold",
+      "text": "800 毫秒",
+      "normalized": "800ms",
+      "start_ms": 6000,
+      "end_ms": 7000
+    },
+    {
+      "type": "metric",
+      "text": "错误率",
+      "normalized": "错误率",
+      "start_ms": 7800,
+      "end_ms": 8500
+    },
+    {
+      "type": "threshold",
+      "text": "0.1%",
+      "normalized": "0.1%",
+      "start_ms": 8800,
+      "end_ms": 9300
+    },
+    {
+      "type": "operation",
+      "text": "回滚",
+      "normalized": "回滚",
+      "start_ms": 9800,
+      "end_ms": 10400
+    },
+    {
+      "type": "metric",
+      "text": "Grafana",
+      "normalized": "Grafana",
+      "start_ms": 13800,
+      "end_ms": 14700
+    }
+  ],
+  "decisions": [
+    {
+      "text": "payment-gateway 先灰度 10%",
+      "evidence_start_ms": 0,
+      "evidence_end_ms": 4300
+    }
+  ],
+  "action_items": [
+    {
+      "text": "补充 Grafana 看板和告警阈值",
+      "owner": "李四",
+      "deadline": "今天下班前"
+    }
+  ],
+  "risks": [],
+  "gaps": []
+}

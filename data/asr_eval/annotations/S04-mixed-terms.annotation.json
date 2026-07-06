@@ -1,0 +1,72 @@
+{
+  "technical_entities": [
+    {
+      "type": "artifact",
+      "text": "PR",
+      "normalized": "PR",
+      "start_ms": 500,
+      "end_ms": 900
+    },
+    {
+      "type": "endpoint",
+      "text": "GET /api/v1/orders",
+      "normalized": "GET /api/v1/orders",
+      "start_ms": 2500,
+      "end_ms": 4700
+    },
+    {
+      "type": "field",
+      "text": "response",
+      "normalized": "response",
+      "start_ms": 5200,
+      "end_ms": 6100
+    },
+    {
+      "type": "field",
+      "text": "total_amount",
+      "normalized": "total_amount",
+      "start_ms": 7200,
+      "end_ms": 8500
+    },
+    {
+      "type": "field",
+      "text": "amount",
+      "normalized": "amount",
+      "start_ms": 10500,
+      "end_ms": 11200
+    },
+    {
+      "type": "client",
+      "text": "mobile-app",
+      "normalized": "mobile-app",
+      "start_ms": 14500,
+      "end_ms": 15600
+    },
+    {
+      "type": "job",
+      "text": "BI job",
+      "normalized": "BI job",
+      "start_ms": 16000,
+      "end_ms": 16800
+    }
+  ],
+  "decisions": [
+    {
+      "text": "新增 total_amount 字段并保留 amount 字段两个版本",
+      "evidence_start_ms": 5000,
+      "evidence_end_ms": 13000
+    }
+  ],
+  "action_items": [],
+  "risks": [
+    {
+      "text": "mobile-app 和 BI job 解析失败"
+    }
+  ],
+  "gaps": [
+    {
+      "type": "test_verification_gap",
+      "text": "未明确兼容性测试"
+    }
+  ]
+}

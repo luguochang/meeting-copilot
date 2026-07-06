@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "samples": [
+    {
+      "id": "S01-api-review",
+      "audio_path": "../samples/S01-api-review.wav",
+      "reference_path": "../references/S01-api-review.txt",
+      "annotation_path": "../annotations/S01-api-review.annotation.json",
+      "language": "zh-CN",
+      "scenario": "api_review",
+      "duration_seconds": 24.0
+    },
+    {
+      "id": "S02-release-review",
+      "audio_path": "../samples/S02-release-review.wav",
+      "reference_path": "../references/S02-release-review.txt",
+      "annotation_path": "../annotations/S02-release-review.annotation.json",
+      "language": "zh-CN",
+      "scenario": "release_review",
+      "duration_seconds": 22.0
+    },
+    {
+      "id": "S03-incident-review",
+      "audio_path": "../samples/S03-incident-review.wav",
+      "reference_path": "../references/S03-incident-review.txt",
+      "annotation_path": "../annotations/S03-incident-review.annotation.json",
+      "language": "zh-CN",
+      "scenario": "incident_review",
+      "duration_seconds": 25.0
+    },
+    {
+      "id": "S04-mixed-terms",
+      "audio_path": "../samples/S04-mixed-terms.wav",
+      "reference_path": "../references/S04-mixed-terms.txt",
+      "annotation_path": "../annotations/S04-mixed-terms.annotation.json",
+      "language": "zh-CN",
+      "scenario": "mixed_terms",
+      "duration_seconds": 20.0
+    }
+  ]
+}

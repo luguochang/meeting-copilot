@@ -1,0 +1,238 @@
+{
+  "id": "api-review",
+  "title": "API 兼容性评审会",
+  "source": "fixture",
+  "scenario_type": "api_review",
+  "expected_gap_rule_count": 2,
+  "expected_gate_tags": [
+    "AC-PCWEB-009",
+    "AC-PCWEB-010",
+    "AC-PCWEB-011",
+    "AC-PCWEB-013",
+    "AC-PCWEB-019"
+  ],
+  "session": {
+    "session_id": "demo_api_review_001",
+    "transcript_report": {
+      "provider": "fixture-funasr",
+      "latency_ms": 1600,
+      "rtf": 0.4,
+      "text": "这次 GET /api/v1/orders 的 response 新增 trace_id 字段。老版本调用方要兼容两个版本。张三下周三补充兼容性测试用例，但还没说上线监控看什么。",
+      "normalized_text": "这次 GET /api/v1/orders 的 response 新增 trace_id 字段。老版本调用方要兼容两个版本。张三下周三补充兼容性测试用例，但还没说上线监控看什么。",
+      "segments": [
+        {
+          "id": "seg_001",
+          "start_ms": 0,
+          "end_ms": 6200,
+          "text": "这次 GET /api/v1/orders 的 response 新增 trace_id 字段。",
+          "confidence": 0.92,
+          "finalized_at_ms": 7600
+        },
+        {
+          "id": "seg_002",
+          "start_ms": 6200,
+          "end_ms": 10500,
+          "text": "老版本调用方要兼容两个版本。",
+          "confidence": 0.9,
+          "finalized_at_ms": 11800
+        },
+        {
+          "id": "seg_003",
+          "start_ms": 10500,
+          "end_ms": 16400,
+          "text": "张三下周三补充兼容性测试用例，但还没说上线监控看什么。",
+          "confidence": 0.89,
+          "finalized_at_ms": 18600
+        },
+        {
+          "id": "seg_002_rev1",
+          "revision_of": "seg_002",
+          "start_ms": 6200,
+          "end_ms": 10500,
+          "text": "老版本调用方只需要兼容 v2，不再兼容两个版本。",
+          "confidence": 0.94,
+          "finalized_at_ms": 26000
+        }
+      ],
+      "evidence_spans": [
+        {
+          "id": "ev_001",
+          "segment_id": "seg_001",
+          "start_ms": 0,
+          "end_ms": 6200,
+          "quote": "这次 GET /api/v1/orders 的 response 新增 trace_id 字段。"
+        },
+        {
+          "id": "ev_002",
+          "segment_id": "seg_002",
+          "start_ms": 6200,
+          "end_ms": 10500,
+          "quote": "老版本调用方要兼容两个版本。"
+        },
+        {
+          "id": "ev_003",
+          "segment_id": "seg_003",
+          "start_ms": 10500,
+          "end_ms": 16400,
+          "quote": "张三下周三补充兼容性测试用例，但还没说上线监控看什么。"
+        },
+        {
+          "id": "ev_002_rev1",
+          "segment_id": "seg_002_rev1",
+          "revision_of": "ev_002",
+          "start_ms": 6200,
+          "end_ms": 10500,
+          "quote": "老版本调用方只需要兼容 v2，不再兼容两个版本。"
+        }
+      ]
+    },
+    "analysis": {
+      "summary": "讨论订单接口新增 trace_id 字段、旧版本兼容和兼容性测试，但监控指标尚未明确。",
+      "meeting_context": {
+        "is_engineering_meeting": true,
+        "reason": "包含 API 字段变更、兼容策略、测试用例和上线监控缺口。"
+      },
+      "states": {
+        "decision_candidates": [
+          {
+            "id": "decision_001",
+            "statement": "GET /api/v1/orders response 新增 trace_id 字段",
+            "evidence_span_ids": ["ev_001"]
+          },
+          {
+            "id": "decision_002",
+            "statement": "老版本调用方兼容两个版本",
+            "evidence_span_ids": ["ev_002"]
+          }
+        ],
+        "action_items": [
+          {
+            "id": "action_001",
+            "description": "张三下周三补充兼容性测试用例",
+            "owner": "张三",
+            "evidence_span_ids": ["ev_003"]
+          }
+        ],
+        "risks": [
+          {
+            "id": "risk_001",
+            "description": "上线监控指标未明确，接口变更后异常可能发现较晚。",
+            "evidence_span_ids": ["ev_003"]
+          }
+        ],
+        "open_questions": [
+          {
+            "id": "question_001",
+            "question": "上线后应该看哪些监控指标？",
+            "evidence_span_ids": ["ev_003"]
+          }
+        ]
+      },
+      "suggestion_cards": [
+        {
+          "id": "card_002",
+          "type": "test_verification_gap",
+          "title": "确认兼容性测试覆盖旧版调用方",
+          "suggested_question": "张三补充的兼容性测试是否需要覆盖旧版本调用方和 trace_id 缺失两种路径？",
+          "evidence_span_ids": ["ev_002", "ev_003"],
+          "state_refs": ["decision_candidate:decision_002", "action_item:action_001"],
+          "state_event_ids": ["event_002", "event_003"],
+          "gap_rule_id": "api.compatibility.test_verification.required",
+          "trigger_reason": "已决定兼容两个版本并安排补测试，但测试范围还没有明确覆盖旧版调用路径。",
+          "trigger_source": "state_gap_detector",
+          "final_segment_at_ms": 18600,
+          "state_event_at_ms": 19300,
+          "card_created_at_ms": 24400,
+          "latency_ms": 5800,
+          "prompt_version": "suggestion-card.v1",
+          "model": "gpt-5.5",
+          "usage": {
+            "prompt_tokens": 218,
+            "completion_tokens": 92,
+            "total_tokens": 310
+          },
+          "schema_result": "valid",
+          "show_or_silence_decision": "show",
+          "segment_batch": ["seg_002", "seg_003"]
+        },
+        {
+          "id": "card_001",
+          "type": "metric_monitoring_gap",
+          "title": "补齐接口变更监控指标",
+          "suggested_question": "上线后是否需要明确 trace_id 字段变更的错误率、解析失败率或调用方告警指标？",
+          "evidence_span_ids": ["ev_003"],
+          "state_refs": ["open_question:question_001", "risk:risk_001"],
+          "state_event_ids": ["event_004", "event_005"],
+          "gap_rule_id": "api.change.monitoring.required",
+          "trigger_reason": "接口字段变更和兼容测试已讨论，但上线监控指标没有闭环。",
+          "trigger_source": "state_gap_detector",
+          "final_segment_at_ms": 18600,
+          "state_event_at_ms": 19700,
+          "card_created_at_ms": 24600,
+          "latency_ms": 6000,
+          "prompt_version": "suggestion-card.v1",
+          "model": "gpt-5.5",
+          "usage": {
+            "prompt_tokens": 240,
+            "completion_tokens": 96,
+            "total_tokens": 336
+          },
+          "schema_result": "valid",
+          "show_or_silence_decision": "show",
+          "segment_batch": ["seg_003"]
+        }
+      ]
+    },
+    "state_events": [
+      {
+        "id": "event_001",
+        "target_type": "DecisionCandidate",
+        "target_id": "decision_001",
+        "event_type": "created",
+        "created_at_ms": 8200,
+        "evidence_span_ids": ["ev_001"]
+      },
+      {
+        "id": "event_002",
+        "target_type": "DecisionCandidate",
+        "target_id": "decision_002",
+        "event_type": "created",
+        "created_at_ms": 12300,
+        "evidence_span_ids": ["ev_002"]
+      },
+      {
+        "id": "event_003",
+        "target_type": "ActionItem",
+        "target_id": "action_001",
+        "event_type": "created",
+        "created_at_ms": 19300,
+        "evidence_span_ids": ["ev_003"]
+      },
+      {
+        "id": "event_004",
+        "target_type": "Risk",
+        "target_id": "risk_001",
+        "event_type": "created",
+        "created_at_ms": 19600,
+        "evidence_span_ids": ["ev_003"]
+      },
+      {
+        "id": "event_005",
+        "target_type": "OpenQuestion",
+        "target_id": "question_001",
+        "event_type": "created",
+        "created_at_ms": 19700,
+        "evidence_span_ids": ["ev_003"]
+      }
+    ],
+    "llm_usage": {
+      "model": "gpt-5.5",
+      "call_count": 1,
+      "usage": {
+        "prompt_tokens": 458,
+        "completion_tokens": 188,
+        "total_tokens": 646
+      }
+    }
+  }
+}

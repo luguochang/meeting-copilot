@@ -1,0 +1,683 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Meeting Copilot · 工作台视觉方案 v1</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Lexend:wght@300;400;500;600;700&family=Fira+Code:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+/* ============================================================
+   Meeting Copilot 工作台 · 设计令牌
+   来源：ui-ux-pro-max --design-system (density=8, motion=3, variance=4)
+   覆盖：字体改为 Lexend + 系统中文 + Fira Code（自动生成的 Cinzel/Josefin 不适用技术产品）
+   ============================================================ */
+:root {
+  /* 表面层（深色但非纯黑，长会议护眼） */
+  --bg-deep:        #0B0F1A;   /* 应用底色 */
+  --bg-base:        #0F172A;   /* 工作区底色 */
+  --bg-elevated:    #11182C;   /* 卡片/面板 */
+  --bg-overlay:     #161F36;   /* 悬浮/hover */
+
+  /* 文本 */
+  --fg-primary:     #F1F5F9;   /* 主文本 */
+  --fg-secondary:   #94A3B8;   /* 次文本 */
+  --fg-muted:       #64748B;   /* 弱化/timestamp */
+
+  /* 品牌与交互 */
+  --accent:         #6366F1;   /* 靛蓝 — LLM/链接/CTA */
+  --accent-glow:    rgba(99,102,241,.18);
+  --primary:        #D97706;   /* 琥珀 — 时间/注意力/进行中 */
+  --primary-soft:   rgba(217,119,6,.14);
+
+  /* 语义状态色（映射会议状态机） */
+  --ok:             #22C55E;   /* 已确认决策 */
+  --warn:           #F59E0B;   /* 候选/待确认 */
+  --risk:           #EF4444;   /* 风险/破坏性 */
+  --info:           #38BDF8;   /* 信息/行动项 */
+
+  /* 描边与分隔 */
+  --border:         rgba(255,255,255,.08);
+  --border-strong:  rgba(255,255,255,.14);
+
+  /* 间距（8dp 节奏，密集仪表盘） */
+  --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px;
+  --sp-5: 24px; --sp-6: 32px; --sp-7: 48px;
+
+  /* 圆角与阴影 */
+  --r-sm: 6px; --r-md: 10px; --r-lg: 14px;
+  --shadow-sm: 0 1px 2px rgba(0,0,0,.3);
+  --shadow-md: 0 4px 12px rgba(0,0,0,.35);
+  --shadow-card: 0 8px 24px rgba(0,0,0,.4);
+
+  /* 字体 */
+  --font-sans: "Lexend", -apple-system, BlinkMacSystemFont, "PingFang SC",
+               "Microsoft YaHei", "Noto Sans SC", sans-serif;
+  --font-mono: "Fira Code", ui-monospace, "SF Mono", Menlo, monospace;
+
+  /* 动效（低打扰：150-300ms，仅 1-2 个关键元素） */
+  --ease: cubic-bezier(.16,1,.3,1);
+  --t-fast: 150ms; --t-base: 220ms;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+body {
+  font-family: var(--font-sans);
+  background: var(--bg-deep);
+  color: var(--fg-primary);
+  font-size: 14px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  font-display: swap;
+}
+button { font-family: inherit; cursor: pointer; border: none; background: none; color: inherit; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: var(--r-sm); }
+
+/* ===================== 布局骨架 ===================== */
+.app {
+  display: grid;
+  grid-template-rows: 56px 1fr 40px;
+  grid-template-columns: 248px 1fr 340px;
+  grid-template-areas:
+    "topbar topbar topbar"
+    "left  center right"
+    "status status status";
+  height: 100vh;
+  gap: 1px;
+  background: var(--border);
+}
+.app > * { background: var(--bg-base); }
+
+/* ===================== 顶栏 ===================== */
+.topbar { grid-area: topbar; display: flex; align-items: center; gap: var(--sp-5); padding: 0 var(--sp-5); }
+.brand { display: flex; align-items: center; gap: var(--sp-3); }
+.brand-mark {
+  width: 28px; height: 28px; border-radius: 8px;
+  background: linear-gradient(135deg, var(--accent), var(--primary));
+  display: grid; place-items: center; color: #fff;
+}
+.brand-mark svg { width: 16px; height: 16px; }
+.brand-name { font-weight: 600; letter-spacing: -.01em; }
+.session-meta { display: flex; align-items: center; gap: var(--sp-4); color: var(--fg-secondary); font-size: 13px; }
+.session-meta .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--fg-muted); }
+.rec { display: inline-flex; align-items: center; gap: 6px; color: var(--risk); font-weight: 500; }
+.rec .pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--risk); animation: pulse 1.6s var(--ease) infinite; }
+@keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.4;transform:scale(.7)} }
+.spacer { flex: 1; }
+.actions { display: flex; gap: var(--sp-2); }
+.btn {
+  height: 34px; padding: 0 var(--sp-4); border-radius: var(--r-sm);
+  font-size: 13px; font-weight: 500; display: inline-flex; align-items: center; gap: 6px;
+  border: 1px solid var(--border); color: var(--fg-primary);
+  transition: background var(--t-fast) var(--ease), border-color var(--t-fast) var(--ease);
+}
+.btn:hover { background: var(--bg-overlay); border-color: var(--border-strong); }
+.btn svg { width: 14px; height: 14px; }
+.btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn-primary:hover { background: #5457e6; }
+.btn-ghost { border-color: transparent; color: var(--fg-secondary); }
+.btn-danger { color: var(--risk); }
+
+/* ===================== 左栏：状态板 ===================== */
+.left { grid-area: left; overflow-y: auto; padding: var(--sp-4); }
+.panel-title {
+  font-size: 11px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: .08em; color: var(--fg-muted); margin: var(--sp-4) 0 var(--sp-3);
+  padding: 0 var(--sp-1);
+}
+.panel-title:first-child { margin-top: var(--sp-1); }
+.topic-card {
+  background: var(--bg-elevated); border: 1px solid var(--border);
+  border-radius: var(--r-md); padding: var(--sp-3) var(--sp-4); margin-bottom: var(--sp-3);
+}
+.topic-card .label { font-size: 11px; color: var(--fg-muted); margin-bottom: 4px; }
+.topic-card .title { font-weight: 600; font-size: 14px; }
+.state-group { margin-bottom: var(--sp-2); }
+.state-row {
+  display: flex; align-items: center; gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-3); border-radius: var(--r-sm);
+  cursor: pointer; transition: background var(--t-fast) var(--ease);
+}
+.state-row:hover { background: var(--bg-overlay); }
+.state-row .icon { width: 16px; height: 16px; flex-shrink: 0; }
+.state-row .name { flex: 1; font-size: 13px; color: var(--fg-primary); }
+.state-row .count {
+  font-family: var(--font-mono); font-size: 11px; font-weight: 600;
+  min-width: 20px; text-align: center; padding: 2px 6px; border-radius: 10px;
+}
+.c-decision { color: var(--ok); } .c-decision .count { background: rgba(34,197,94,.14); color: var(--ok); }
+.c-action   { color: var(--info); } .c-action .count { background: rgba(56,189,248,.14); color: var(--info); }
+.c-risk     { color: var(--risk); } .c-risk .count { background: rgba(239,68,68,.14); color: var(--risk); }
+.c-question { color: var(--warn); } .c-question .count { background: rgba(245,158,11,.14); color: var(--warn); }
+.c-candidate{ color: var(--warn); } .c-candidate .count { background: rgba(245,158,11,.14); color: var(--warn); }
+
+/* ===================== 中栏：转写流 + 建议卡片 ===================== */
+.center { grid-area: center; overflow-y: auto; padding: var(--sp-5) var(--sp-6); }
+.stream-header { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: var(--sp-4); }
+.stream-header h2 { font-size: 15px; font-weight: 600; }
+.stream-header .hint { font-size: 12px; color: var(--fg-muted); }
+.legend { display: flex; gap: var(--sp-4); font-size: 12px; color: var(--fg-secondary); align-items: center; }
+.legend-item { display: inline-flex; align-items: center; gap: 6px; }
+.legend-item .swatch { width: 12px; height: 3px; border-radius: 2px; }
+.legend-item .swatch.gap { background: var(--warn); }
+.legend-item .swatch.approach { background: #a78bfa; }
+.legend-item .num { font-family: var(--font-mono); color: var(--fg-primary); font-weight: 600; }
+.transcript { font-size: 14.5px; line-height: 1.75; }
+.utterance { display: grid; grid-template-columns: 56px 1fr; gap: var(--sp-4); padding: var(--sp-2) 0; }
+.utterance .ts { font-family: var(--font-mono); font-size: 11px; color: var(--fg-muted); padding-top: 3px; }
+.utterance .text { color: var(--fg-primary); }
+.utterance .text .entity {
+  font-family: var(--font-mono); font-size: 13px;
+  background: var(--accent-glow); color: #a5b4fc;
+  padding: 1px 5px; border-radius: 4px; margin: 0 1px;
+}
+.utterance.partial .text { color: var(--fg-secondary); }
+.utterance.partial .ts::after { content: " …"; color: var(--accent); }
+.utterance .speaker { font-size: 12px; color: var(--fg-secondary); margin-right: 6px; font-weight: 500; }
+
+/* 内联建议卡片 — 低频、带证据、可操作 */
+.suggestion {
+  margin: var(--sp-3) 0 var(--sp-3) 56px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--warn);
+  border-radius: var(--r-md);
+  padding: var(--sp-3) var(--sp-4);
+  box-shadow: var(--shadow-card);
+  transition: border-color var(--t-base) var(--ease), transform var(--t-base) var(--ease);
+}
+.suggestion:hover { transform: translateY(-1px); }
+.suggestion.gap-owner { border-left-color: var(--info); }
+.suggestion.gap-deadline { border-left-color: var(--warn); }
+.suggestion.gap-rollback { border-left-color: var(--risk); }
+.suggestion.gap-test { border-left-color: var(--ok); }
+.suggestion.gap-monitoring { border-left-color: var(--accent); }
+/* 方案考量卡 — 与缺口卡同结构，靛紫左边框区分（缺口卡用状态色，考量卡统一紫） */
+.suggestion.approach { border-left-color: #a78bfa; }
+.sug-head { display: flex; align-items: center; gap: var(--sp-2); margin-bottom: 6px; }
+.sug-head svg { width: 15px; height: 15px; }
+.sug-head .type { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; }
+.sug-head .type.gap-owner { color: var(--info); }
+.sug-head .type.gap-rollback { color: var(--risk); }
+.sug-head .type.gap-monitoring { color: var(--accent); }
+.sug-head .type.approach { color: #a78bfa; }
+.sug-body { font-size: 13.5px; color: var(--fg-primary); margin-bottom: var(--sp-2); }
+.sug-body strong { color: #fbbf24; font-weight: 600; }
+.evidence {
+  display: flex; align-items: flex-start; gap: 8px;
+  background: rgba(0,0,0,.25); border: 1px solid var(--border);
+  border-radius: var(--r-sm); padding: var(--sp-2) var(--sp-3);
+  font-size: 12.5px; color: var(--fg-secondary);
+}
+.evidence svg { width: 14px; height: 14px; flex-shrink: 0; margin-top: 2px; color: var(--accent); }
+.evidence .quote { font-style: italic; color: var(--fg-primary); }
+.evidence .ts { font-family: var(--font-mono); color: var(--fg-muted); }
+.sug-actions { display: flex; gap: var(--sp-2); margin-top: var(--sp-3); }
+.chip {
+  font-size: 12px; padding: 5px 10px; border-radius: var(--r-sm);
+  border: 1px solid var(--border); color: var(--fg-secondary);
+  display: inline-flex; align-items: center; gap: 5px;
+  transition: all var(--t-fast) var(--ease);
+}
+.chip:hover { background: var(--bg-overlay); color: var(--fg-primary); border-color: var(--border-strong); }
+.chip svg { width: 12px; height: 12px; }
+.chip.keep:hover { color: var(--ok); border-color: var(--ok); }
+.chip.dismiss:hover { color: var(--fg-muted); }
+
+/* ===================== 右栏：证据 / 当前建议详情 ===================== */
+.right { grid-area: right; overflow-y: auto; padding: var(--sp-4); border-left: 1px solid var(--border); }
+.right .panel-title { margin-top: var(--sp-1); }
+.detail-card {
+  background: var(--bg-elevated); border: 1px solid var(--border);
+  border-radius: var(--r-md); padding: var(--sp-4); margin-bottom: var(--sp-4);
+}
+.detail-card h3 { font-size: 13px; font-weight: 600; margin-bottom: var(--sp-2); display: flex; align-items: center; gap: 6px; }
+.detail-card h3 svg { width: 14px; height: 14px; color: var(--accent); }
+.detail-card p { font-size: 13px; color: var(--fg-secondary); line-height: 1.6; }
+.evidence-list { display: flex; flex-direction: column; gap: var(--sp-2); }
+.evidence-item {
+  font-size: 12.5px; padding: var(--sp-2) var(--sp-3);
+  background: rgba(0,0,0,.2); border-radius: var(--r-sm);
+  border-left: 2px solid var(--accent);
+}
+.evidence-item .ts { font-family: var(--font-mono); font-size: 11px; color: var(--fg-muted); }
+.evidence-item .q { color: var(--fg-primary); margin-top: 2px; }
+.meta-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-3); }
+.meta-item .k { font-size: 11px; color: var(--fg-muted); }
+.meta-item .v { font-family: var(--font-mono); font-size: 13px; color: var(--fg-primary); margin-top: 2px; }
+
+/* ===================== 底部状态条（替代原 8 个 no-op 面板） ===================== */
+.status { grid-area: status; display: flex; align-items: center; gap: var(--sp-5); padding: 0 var(--sp-5); font-size: 12px; color: var(--fg-secondary); }
+.status .group { display: flex; align-items: center; gap: 6px; }
+.status .group svg { width: 13px; height: 13px; }
+.status .k { color: var(--fg-muted); }
+.status .v { font-family: var(--font-mono); color: var(--fg-primary); }
+.status .ok { color: var(--ok); }
+.status .warn { color: var(--warn); }
+.status .divider { width: 1px; height: 16px; background: var(--border); }
+.debug-toggle { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: var(--r-sm); border: 1px solid var(--border); }
+.debug-toggle:hover { background: var(--bg-overlay); }
+.debug-toggle svg { width: 13px; height: 13px; }
+
+/* ===================== 调试抽屉（原 no-op 面板降级到此） ===================== */
+.debug-drawer {
+  position: fixed; top: 0; right: 0; height: 100vh; width: 360px;
+  background: var(--bg-base); border-left: 1px solid var(--border-strong);
+  box-shadow: -16px 0 40px rgba(0,0,0,.5);
+  transform: translateX(100%); transition: transform var(--t-base) var(--ease);
+  z-index: 100; overflow-y: auto; padding: var(--sp-5);
+}
+.debug-drawer.open { transform: translateX(0); }
+.debug-drawer h3 { font-size: 13px; margin-bottom: var(--sp-3); }
+.debug-drawer .close { position: absolute; top: var(--sp-4); right: var(--sp-4); }
+.debug-row {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: var(--sp-2) 0; border-bottom: 1px solid var(--border); font-size: 12px;
+}
+.debug-row .k { color: var(--fg-secondary); }
+.debug-row .v { font-family: var(--font-mono); }
+.badge-noop { font-size: 10px; padding: 2px 6px; border-radius: 4px; background: rgba(100,116,139,.2); color: var(--fg-muted); }
+.badge-ok { background: rgba(34,197,94,.14); color: var(--ok); }
+.scrim { position: fixed; inset: 0; background: rgba(0,0,0,.5); opacity: 0; pointer-events: none; transition: opacity var(--t-base) var(--ease); z-index: 99; }
+.scrim.show { opacity: 1; pointer-events: auto; }
+
+/* ===================== Toast ===================== */
+.toast {
+  position: fixed; bottom: 60px; left: 50%; transform: translateX(-50%) translateY(20px);
+  background: var(--bg-elevated); border: 1px solid var(--border-strong);
+  padding: var(--sp-3) var(--sp-5); border-radius: var(--r-md); box-shadow: var(--shadow-card);
+  font-size: 13px; opacity: 0; pointer-events: none; transition: all var(--t-base) var(--ease); z-index: 200;
+  display: flex; align-items: center; gap: 8px;
+}
+.toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+.toast svg { width: 15px; height: 15px; color: var(--ok); }
+
+/* ===================== 滚动条 ===================== */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--fg-muted); }
+
+/* ===================== 响应式 ===================== */
+@media (max-width: 1100px) {
+  .app { grid-template-columns: 220px 1fr; grid-template-areas: "topbar topbar" "left center" "status status"; }
+  .right { display: none; }
+}
+@media (max-width: 720px) {
+  .app { grid-template-columns: 1fr; grid-template-areas: "topbar" "center" "status"; }
+  .left { display: none; }
+  .center { padding: var(--sp-4); }
+}
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- ============ 顶栏 ============ -->
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg>
+      </div>
+      <span class="brand-name">Meeting Copilot</span>
+    </div>
+    <div class="session-meta">
+      <span class="rec"><span class="pulse"></span> 录音中</span>
+      <span class="dot"></span>
+      <span>支付服务 v2.3 灰度发布评审</span>
+      <span class="dot"></span>
+      <span style="font-family:var(--font-mono)">14:32:15</span>
+    </div>
+    <div class="spacer"></div>
+    <div class="actions">
+      <button class="btn btn-ghost" onclick="toast('已暂停采集')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+        暂停
+      </button>
+      <button class="btn btn-primary" onclick="toast('已结束会议，正在生成纪要…')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+        结束并生成纪要
+      </button>
+    </div>
+  </header>
+
+  <!-- ============ 左栏：会议状态板 ============ -->
+  <aside class="left">
+    <div class="topic-card">
+      <div class="label">当前议题</div>
+      <div class="title">支付服务 v2.3 灰度发布</div>
+    </div>
+
+    <div class="panel-title">会议状态</div>
+    <div class="state-group">
+      <div class="state-row c-decision">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+        <span class="name">已确认决策</span>
+        <span class="count">2</span>
+      </div>
+      <div class="state-row c-candidate">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 8v4"/><path d="M12 16h.01"/></svg>
+        <span class="name">候选决策</span>
+        <span class="count">2</span>
+      </div>
+      <div class="state-row c-action">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+        <span class="name">行动项</span>
+        <span class="count">3</span>
+      </div>
+      <div class="state-row c-risk">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        <span class="name">风险</span>
+        <span class="count">1</span>
+      </div>
+      <div class="state-row c-question">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        <span class="name">未闭环问题</span>
+        <span class="count">2</span>
+      </div>
+    </div>
+
+    <div class="panel-title">建议卡片</div>
+    <div class="state-group">
+      <div class="state-row c-action">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>
+        <span class="name">已保留</span>
+        <span class="count">3</span>
+      </div>
+      <div class="state-row">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--fg-muted)"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>
+        <span class="name" style="color:var(--fg-secondary)">待处理</span>
+        <span class="count" style="background:rgba(100,116,139,.14);color:var(--fg-muted)">2</span>
+      </div>
+      <div class="state-row" style="color:#a78bfa">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6"/><path d="M10 22h4"/><path d="M15.09 14c.18-.98.65-1.74 1.41-2.5A4.65 4.65 0 0 0 18 8 6 6 0 0 0 6 8c0 1 .23 2.23 1.5 3.5A4.61 4.61 0 0 1 8.91 14"/></svg>
+        <span class="name">方案考量</span>
+        <span class="count" style="background:rgba(167,139,250,.14);color:#a78bfa">2</span>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ============ 中栏：实时转写流 ============ -->
+  <main class="center">
+    <div class="stream-header">
+      <h2>实时转写</h2>
+      <div class="legend">
+        <span class="legend-item"><span class="swatch gap"></span>缺口卡 <span class="num">3</span></span>
+        <span class="legend-item"><span class="swatch approach"></span>方案考量卡 <span class="num">2</span></span>
+        <span class="legend-item" style="color:var(--fg-muted)">FunASR streaming</span>
+      </div>
+    </div>
+    <div class="transcript">
+
+      <div class="utterance">
+        <div class="ts">14:30</div>
+        <div class="text"><span class="speaker">张工：</span>我们这次 <span class="entity">支付服务 v2.3</span> 准备灰度上线，先简单过一下方案。</div>
+      </div>
+
+      <div class="utterance">
+        <div class="ts">14:31</div>
+        <div class="text"><span class="speaker">李工：</span>计划先放 <span class="entity">5% 流量</span>，观察一天，没问题再逐步放量到 <span class="entity">25%</span>。</div>
+      </div>
+
+      <!-- 方案考量卡 1：灰度档位替代方案（与缺口卡同结构，靛紫边框区分） -->
+      <div class="suggestion approach">
+        <div class="sug-head">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:#a78bfa"><path d="M9 18h6"/><path d="M10 22h4"/><path d="M15.09 14c.18-.98.65-1.74 1.41-2.5A4.65 4.65 0 0 0 18 8 6 6 0 0 0 6 8c0 1 .23 2.23 1.5 3.5A4.61 4.61 0 0 1 8.91 14"/></svg>
+          <span class="type approach">方案考量 · 替代档位</span>
+        </div>
+        <div class="sug-body">灰度方案为 <strong>5% → 25% → 全量</strong>，是否考虑过中间增加 <strong>50% 档</strong> 观察期？支付类变更从 25% 直接跳全量，故障暴露窗口较短。</div>
+        <div class="evidence">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+          <div>
+            <span class="ts">14:31 · </span>
+            <span class="quote">"先放 5% 流量，观察一天，没问题再逐步放量到 25%"</span>
+          </div>
+        </div>
+        <div class="sug-actions">
+          <button class="chip keep" onclick="toast('已保留到纪要')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg>保留</button>
+          <button class="chip" onclick="toast('已复制追问文案')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>复制追问</button>
+          <button class="chip dismiss" onclick="toast('已忽略')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>忽略</button>
+        </div>
+      </div>
+
+      <div class="utterance">
+        <div class="ts">14:31</div>
+        <div class="text"><span class="speaker">张工：</span>rollback 方案这块……我们先把降级开关准备好就行吧。</div>
+      </div>
+
+      <!-- 建议卡片 1：rollback owner 缺失 -->
+      <div class="suggestion gap-rollback" id="sug-1">
+        <div class="sug-head">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--risk)"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+          <span class="type gap-rollback">缺口 · Rollback 负责人</span>
+        </div>
+        <div class="sug-body">提到 <strong>rollback 方案</strong>，但未指定执行 owner。建议在灰度前确认 rollback 的负责人与触发条件，避免事故时无人执行。</div>
+        <div class="evidence">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+          <div>
+            <span class="ts">14:31 · </span>
+            <span class="quote">"rollback 方案这块……我们先把降级开关准备好就行吧"</span>
+          </div>
+        </div>
+        <div class="sug-actions">
+          <button class="chip keep" onclick="toast('已保留到纪要')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg>保留</button>
+          <button class="chip" onclick="toast('已复制追问文案')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>复制追问</button>
+          <button class="chip dismiss" onclick="toast('已标记误报')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>忽略</button>
+        </div>
+      </div>
+
+      <div class="utterance">
+        <div class="ts">14:32</div>
+        <div class="text"><span class="speaker">王工：</span>监控主要看 <span class="entity">支付成功率</span> 和 <span class="entity">P99 延迟</span>，发现异常就手动切流。</div>
+      </div>
+
+      <div class="utterance">
+        <div class="ts">14:33</div>
+        <div class="text"><span class="speaker">张工：</span>上线之后谁负责盯盘？我这边可能没法全程看。</div>
+      </div>
+
+      <!-- 建议卡片 2：盯盘 owner 缺失 -->
+      <div class="suggestion gap-owner">
+        <div class="sug-head">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--info)"><path d="M20 7h-9"/><path d="M14 17H5"/><circle cx="17" cy="17" r="3"/><circle cx="7" cy="7" r="3"/></svg>
+          <span class="type gap-owner">缺口 · Owner 待确认</span>
+        </div>
+        <div class="sug-body">灰度盯盘 <strong>未明确 owner</strong>。张工表示无法全程盯盘，建议确认轮值负责人或配置自动告警阈值。</div>
+        <div class="evidence">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+          <div>
+            <span class="ts">14:33 · </span>
+            <span class="quote">"上线之后谁负责盯盘？我这边可能没法全程看"</span>
+          </div>
+        </div>
+        <div class="sug-actions">
+          <button class="chip keep" onclick="toast('已保留到纪要')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg>保留</button>
+          <button class="chip" onclick="toast('已转为待确认项')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><path d="M12 8v4"/></svg>转待确认</button>
+          <button class="chip dismiss" onclick="toast('已忽略')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>忽略</button>
+        </div>
+      </div>
+
+      <div class="utterance">
+        <div class="ts">14:34</div>
+        <div class="text"><span class="speaker">李工：</span>测试这边覆盖了核心链路，下单、回调、对账都跑了回归。</div>
+      </div>
+
+      <!-- 方案考量卡 2：灰度增量回归考量 -->
+      <div class="suggestion approach">
+        <div class="sug-head">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:#a78bfa"><path d="M9 18h6"/><path d="M10 22h4"/><path d="M15.09 14c.18-.98.65-1.74 1.41-2.5A4.65 4.65 0 0 0 18 8 6 6 0 0 0 6 8c0 1 .23 2.23 1.5 3.5A4.61 4.61 0 0 1 8.91 14"/></svg>
+          <span class="type approach">方案考量 · 增量回归</span>
+        </div>
+        <div class="sug-body">测试覆盖了核心链路回归，但是否考虑过 <strong>灰度增量回归</strong>？回调签名变更、对账时区差异在小流量下可能不暴露，建议补充 5% 档的增量用例。</div>
+        <div class="evidence">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+          <div>
+            <span class="ts">14:34 · </span>
+            <span class="quote">"测试这边覆盖了核心链路，下单、回调、对账都跑了回归"</span>
+          </div>
+        </div>
+        <div class="sug-actions">
+          <button class="chip keep" onclick="toast('已保留到纪要')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg>保留</button>
+          <button class="chip" onclick="toast('已复制追问文案')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>复制追问</button>
+          <button class="chip dismiss" onclick="toast('已忽略')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>忽略</button>
+        </div>
+      </div>
+
+      <div class="utterance">
+        <div class="ts">14:35</div>
+        <div class="text"><span class="speaker">张工：</span>那 deadline 我们计划 <span class="entity">本周四</span> 全量上线，大家看时间够不够。</div>
+      </div>
+
+      <!-- 建议卡片 3：deadline 与观察期冲突 -->
+      <div class="suggestion gap-deadline">
+        <div class="sug-head">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--warn)"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+          <span class="type" style="color:var(--warn)">缺口 · Deadline 待确认</span>
+        </div>
+        <div class="sug-body">全量 deadline <strong>本周四</strong> 与 5% 灰度 <strong>1 天观察期</strong> 存在冲突。建议确认灰度阶段是否充分，或推迟全量时间。</div>
+        <div class="evidence">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+          <div>
+            <span class="ts">14:31 · </span><span class="quote">"先放 5% 流量，观察一天"</span>；<span class="ts">14:35 · </span><span class="quote">"本周四全量上线"</span>
+          </div>
+        </div>
+        <div class="sug-actions">
+          <button class="chip keep" onclick="toast('已保留到纪要')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg>保留</button>
+          <button class="chip" onclick="toast('已复制追问文案')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>复制追问</button>
+          <button class="chip dismiss" onclick="toast('已忽略')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>忽略</button>
+        </div>
+      </div>
+
+      <!-- partial（实时进行中） -->
+      <div class="utterance partial">
+        <div class="ts">14:36</div>
+        <div class="text"><span class="speaker">王工：</span>我建议把 P99 延迟的告警阈值定在</div>
+      </div>
+
+    </div>
+  </main>
+
+  <!-- ============ 右栏：当前建议详情 / 证据 ============ -->
+  <aside class="right">
+    <div class="panel-title">当前建议</div>
+    <div class="detail-card">
+      <h3>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/></svg>
+        Rollback 负责人缺失
+      </h3>
+      <p>灰度方案中提到 rollback 但未指定执行 owner。在支付类变更中，rollback owner 缺失是高频事故原因。</p>
+    </div>
+
+    <div class="panel-title">证据片段</div>
+    <div class="evidence-list" style="margin-bottom:var(--sp-5)">
+      <div class="evidence-item">
+        <div class="ts">14:31:08 — segment #042</div>
+        <div class="q">"rollback 方案这块……我们先把降级开关准备好就行吧"</div>
+      </div>
+      <div class="evidence-item">
+        <div class="ts">14:31:22 — segment #043</div>
+        <div class="q">"降级开关准备好就行" — 未提及触发条件 / 负责人 / 时效</div>
+      </div>
+    </div>
+
+    <div class="panel-title">LLM 追溯</div>
+    <div class="detail-card">
+      <div class="meta-grid">
+        <div class="meta-item"><div class="k">Provider</div><div class="v">gpt-5.5</div></div>
+        <div class="meta-item"><div class="k">置信度</div><div class="v">0.82</div></div>
+        <div class="meta-item"><div class="k">Prompt 版本</div><div class="v">gap-v3.1</div></div>
+        <div class="meta-item"><div class="k">Token</div><div class="v">412</div></div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ============ 底部状态条 ============ -->
+  <footer class="status">
+    <div class="group">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/></svg>
+      <span class="k">ASR</span>
+      <span class="v">FunASR</span>
+      <span class="k">·</span>
+      <span class="v">CER 8.2%</span>
+      <span class="k">·</span>
+      <span class="v">实体召回</span>
+      <span class="ok">0.86 ✓</span>
+    </div>
+    <div class="divider"></div>
+    <div class="group">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+      <span class="k">LLM</span>
+      <span class="v">12 次</span>
+      <span class="k">·</span>
+      <span class="v">8.4k token</span>
+    </div>
+    <div class="divider"></div>
+    <div class="group">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+      <span class="k">延迟</span>
+      <span class="v">partial P50 1.2s</span>
+      <span class="k">·</span>
+      <span class="v">final P95 2.8s</span>
+    </div>
+    <button class="debug-toggle" onclick="toggleDebug()">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      系统状态
+    </button>
+  </footer>
+</div>
+
+<!-- ============ 调试抽屉（原 8 个 no-op 面板降级到此） ============ -->
+<div class="scrim" id="scrim" onclick="toggleDebug()"></div>
+<aside class="debug-drawer" id="drawer" aria-hidden="true">
+  <button class="close btn btn-ghost" onclick="toggleDebug()">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+  </button>
+  <h3>系统状态（开发者）</h3>
+  <p style="font-size:12px;color:var(--fg-muted);margin-bottom:var(--sp-4)">原工作台的 8 个准备度/边界/契约面板已降级到此抽屉，默认对用户隐藏。</p>
+  <div class="debug-row"><span class="k">桌面 Shell 准备度</span><span class="v"><span class="badge-noop">noop_only</span></span></div>
+  <div class="debug-row"><span class="k">桌面运行时边界</span><span class="v"><span class="badge-noop">noop_bound</span></span></div>
+  <div class="debug-row"><span class="k">原生桥契约</span><span class="v"><span class="badge-noop">noop_bound</span></span></div>
+  <div class="debug-row"><span class="k">ASR Worker</span><span class="v"><span class="badge-noop">no_execution</span></span></div>
+  <div class="debug-row"><span class="k">麦克风 Adapter</span><span class="v"><span class="badge-noop">noop_only</span></span></div>
+  <div class="debug-row"><span class="k">真实麦克风 Shadow</span><span class="v"><span class="badge-noop">blocked</span></span></div>
+  <div class="debug-row"><span class="k">成卡链路</span><span class="v"><span class="badge-noop">not_created</span></span></div>
+  <div class="debug-row"><span class="k">LLM 执行</span><span class="v"><span class="badge-noop">disabled</span></span></div>
+  <div class="debug-row"><span class="k">ASR 质量门禁</span><span class="v"><span class="badge-noop">not_exited</span></span></div>
+  <div style="margin-top:var(--sp-5);padding:var(--sp-3);background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.2);border-radius:var(--r-sm);font-size:12px;color:var(--fg-secondary)">
+    以上 no-op 状态正是主链路未完成的根因。Phase 2 打通后，这些项将逐个变为 <span class="badge-noop badge-ok">ready</span>。
+  </div>
+</aside>
+
+<!-- ============ Toast ============ -->
+<div class="toast" id="toast">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+  <span id="toast-text">已完成</span>
+</div>
+
+<script>
+function toast(msg){
+  const t=document.getElementById('toast');
+  document.getElementById('toast-text').textContent=msg;
+  t.classList.add('show');
+  clearTimeout(window._tt);
+  window._tt=setTimeout(()=>t.classList.remove('show'),2200);
+}
+function toggleDebug(){
+  const d=document.getElementById('drawer'),s=document.getElementById('scrim');
+  const open=d.classList.toggle('open');
+  s.classList.toggle('show',open);
+  d.setAttribute('aria-hidden',!open);
+}
+// 点击建议卡片高亮右栏
+document.querySelectorAll('.suggestion').forEach(s=>{
+  s.addEventListener('click',e=>{if(e.target.closest('.chip'))return;s.style.borderColor='var(--border-strong)';});
+});
+</script>
+</body>
+</html>

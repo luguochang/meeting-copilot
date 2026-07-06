@@ -1,0 +1,78 @@
+{
+  "script_id": "incident-review-001",
+  "scenario": "incident_review",
+  "language": "zh-CN",
+  "turns": [
+    {
+      "speaker": "A",
+      "text": "凌晨 order-worker 消费堆积，lag 最高到了八万，告警延迟了六分钟。"
+    },
+    {
+      "speaker": "B",
+      "text": "临时扩容已经止血，根因可能是库存接口 timeout 增多。"
+    },
+    {
+      "speaker": "C",
+      "text": "复盘报告我们下周一发，但监控阈值谁来改还没定。"
+    }
+  ],
+  "technical_entities": [
+    "order-worker",
+    "lag",
+    "timeout",
+    "监控阈值"
+  ],
+  "expected_state_events": [
+    {
+      "event_type": "risk.created",
+      "target_type": "Risk",
+      "expected_text": "order-worker 消费堆积和告警延迟"
+    },
+    {
+      "event_type": "decision_candidate.created",
+      "target_type": "DecisionCandidate",
+      "expected_text": "临时扩容止血"
+    },
+    {
+      "event_type": "open_question.created",
+      "target_type": "OpenQuestion",
+      "expected_text": "监控阈值 owner 未确定"
+    }
+  ],
+  "expected_gap_candidates": [
+    "owner",
+    "metric_monitoring",
+    "deadline"
+  ],
+  "expected_suggestion_cards": [
+    {
+      "card_id": "incident-review-001-owner-gap",
+      "gap_type": "owner",
+      "suggested_question": "监控阈值调整是否需要现在指定 owner？",
+      "evidence_span_required": true,
+      "trigger_window_seconds": {
+        "min": 0,
+        "max": 30
+      },
+      "should_show": true
+    },
+    {
+      "card_id": "incident-review-001-deadline-gap",
+      "gap_type": "deadline",
+      "suggested_question": "复盘报告和阈值调整是否需要分别确认截止时间？",
+      "evidence_span_required": true,
+      "trigger_window_seconds": {
+        "min": 0,
+        "max": 30
+      },
+      "should_show": true
+    }
+  ],
+  "baseline_expectations": {
+    "transcript_only_detects_gap": false,
+    "summary_only_detects_within_window": false,
+    "copilot_should_detect_within_window": true
+  },
+  "expected_engineering_card_count_min": 1,
+  "expected_engineering_card_count_max": 3
+}

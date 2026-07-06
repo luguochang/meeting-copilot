@@ -1,0 +1,83 @@
+{
+  "pcweb_id": "PCWEB-104",
+  "policy_name": "Desktop ASR Worker Command Runner Implementation Skeleton",
+  "policy_status": "desktop_asr_worker_command_runner_implementation_skeleton_policy_only",
+  "default_quality_gate_status": "included_in_root_pytest",
+  "required_previous_contracts": [
+    "PCWEB-103"
+  ],
+  "skeleton_mode": "command_runner_implementation_skeleton_only",
+  "execution_mode": "no_dispatch_no_execution",
+  "skeleton_version": "desktop_asr_worker_command_runner_implementation_skeleton.v1",
+  "runner_implementation_status": "skeleton_not_bound",
+  "native_command_runner_status": "skeleton_file_not_bound",
+  "native_command_runner_path": "code/desktop_tauri/src-tauri/src/asr_worker_command_runner.rs",
+  "sidecar_module_path": "code/asr_runtime/scripts/asr_worker_sidecar.py",
+  "command_transport_preview": "stdio_jsonl",
+  "command_catalog": [
+    "worker.prepare",
+    "worker.start",
+    "worker.health",
+    "worker.collect_events",
+    "worker.stop",
+    "worker.cleanup"
+  ],
+  "approved_event_output_root": "artifacts/tmp/asr_events",
+  "approved_runtime_root": "artifacts/tmp/desktop_asr_worker_runtime",
+  "allowed_provider_modes_now": [
+    "mock_streaming",
+    "sherpa_onnx_streaming"
+  ],
+  "future_provider_modes_requiring_approval": [
+    "funasr_streaming"
+  ],
+  "forbidden_provider_modes": [
+    "remote_asr",
+    "remote_llm_asr"
+  ],
+  "allowed_source_kinds_now": [
+    "synthetic"
+  ],
+  "future_source_kinds_requiring_approval": [
+    "mic",
+    "file",
+    "system_audio"
+  ],
+  "forbidden_roots": [
+    "configs/local",
+    "data/asr_eval/local_samples",
+    "data/asr_eval/samples",
+    "data/local_runtime",
+    "outputs"
+  ],
+  "safe_to_execute_command_runner_now": false,
+  "safe_to_bind_command_runner_now": false,
+  "safe_to_accept_worker_command_now": false,
+  "safe_to_dispatch_worker_command_now": false,
+  "safe_to_execute_worker_command_now": false,
+  "safe_to_spawn_process_now": false,
+  "safe_to_run_subprocess_now": false,
+  "safe_to_start_worker_now": false,
+  "safe_to_stop_worker_now": false,
+  "safe_to_check_worker_health_now": false,
+  "safe_to_collect_worker_events_now": false,
+  "safe_to_bind_worker_command_transport_now": false,
+  "safe_to_bind_tauri_command_now": false,
+  "safe_to_invoke_tauri_ipc_now": false,
+  "safe_to_import_provider_now": false,
+  "safe_to_execute_provider_now": false,
+  "safe_to_capture_audio_now": false,
+  "safe_to_request_audio_permission_now": false,
+  "safe_to_read_user_audio_now": false,
+  "safe_to_read_configs_local_now": false,
+  "safe_to_read_secret_now": false,
+  "safe_to_call_remote_asr_now": false,
+  "safe_to_call_llm_now": false,
+  "safe_to_download_models_now": false,
+  "safe_to_run_modelscope_now": false,
+  "safe_to_write_runtime_audio_now": false,
+  "safe_to_write_event_file_now": false,
+  "safe_to_read_event_file_now": false,
+  "safe_to_mutate_web_session_now": false,
+  "safe_to_run_tauri_or_cargo_now": false
+}

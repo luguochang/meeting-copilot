@@ -1,0 +1,78 @@
+{
+  "script_id": "api-review-001",
+  "scenario": "api_review",
+  "language": "zh-CN",
+  "turns": [
+    {
+      "speaker": "A",
+      "text": "我们先看 payment-gateway 的创建订单接口，字段 request_id 要兼容旧客户端。"
+    },
+    {
+      "speaker": "B",
+      "text": "错误码先沿用 40012，但是灰度期间需要看 P99 延迟。"
+    },
+    {
+      "speaker": "C",
+      "text": "兼容逻辑可以本周合进去，owner 我们会后再确认。"
+    }
+  ],
+  "technical_entities": [
+    "payment-gateway",
+    "request_id",
+    "40012",
+    "P99"
+  ],
+  "expected_state_events": [
+    {
+      "event_type": "topic.created",
+      "target_type": "Topic",
+      "expected_text": "payment-gateway 创建订单接口兼容性评审"
+    },
+    {
+      "event_type": "decision_candidate.created",
+      "target_type": "DecisionCandidate",
+      "expected_text": "错误码沿用 40012"
+    },
+    {
+      "event_type": "risk.created",
+      "target_type": "Risk",
+      "expected_text": "P99 延迟和灰度兼容风险"
+    }
+  ],
+  "expected_gap_candidates": [
+    "owner",
+    "rollback",
+    "metric_monitoring"
+  ],
+  "expected_suggestion_cards": [
+    {
+      "card_id": "api-review-001-owner-gap",
+      "gap_type": "owner",
+      "suggested_question": "是否需要现在确认 payment-gateway 兼容逻辑的 owner？",
+      "evidence_span_required": true,
+      "trigger_window_seconds": {
+        "min": 0,
+        "max": 30
+      },
+      "should_show": true
+    },
+    {
+      "card_id": "api-review-001-rollback-gap",
+      "gap_type": "rollback",
+      "suggested_question": "是否需要补一句灰度失败时的回滚条件和执行人？",
+      "evidence_span_required": true,
+      "trigger_window_seconds": {
+        "min": 0,
+        "max": 30
+      },
+      "should_show": true
+    }
+  ],
+  "baseline_expectations": {
+    "transcript_only_detects_gap": false,
+    "summary_only_detects_within_window": false,
+    "copilot_should_detect_within_window": true
+  },
+  "expected_engineering_card_count_min": 1,
+  "expected_engineering_card_count_max": 3
+}

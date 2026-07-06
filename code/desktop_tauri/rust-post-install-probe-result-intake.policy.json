@@ -1,0 +1,143 @@
+{
+  "pcweb_id": "PCWEB-089",
+  "policy_name": "Desktop Rust Post-Install Probe Result Intake Policy",
+  "policy_status": "rust_post_install_probe_result_intake_policy_only",
+  "default_quality_gate_status": "included_in_root_pytest",
+  "result_intake_mode": "manual_result_validation_only",
+  "accepted_result_source": "caller_provided_json_only",
+  "probe_execution_status": "not_run",
+  "external_command_execution_status": "not_run",
+  "cargo_check_readiness": "blocked_until_pcweb_084_and_user_approval",
+  "safe_to_run_post_install_probe_now": false,
+  "safe_to_run_rustc_version_now": false,
+  "safe_to_run_cargo_version_now": false,
+  "safe_to_run_rustup_version_now": false,
+  "safe_to_run_xcode_select_probe_now": false,
+  "safe_to_run_cargo_check_now": false,
+  "safe_to_run_cargo_build_now": false,
+  "safe_to_run_tauri_dev_now": false,
+  "safe_to_run_tauri_build_now": false,
+  "safe_to_fetch_dependencies_now": false,
+  "safe_to_generate_cargo_lock_now": false,
+  "safe_to_generate_target_dir_now": false,
+  "safe_to_read_configs_local_now": false,
+  "safe_to_read_raw_probe_output_now": false,
+  "safe_to_read_shell_profiles_now": false,
+  "safe_to_read_cargo_home_now": false,
+  "safe_to_read_rustup_home_now": false,
+  "safe_to_accept_raw_probe_output_now": false,
+  "allowed_result_fields": [
+    "rustc_status",
+    "cargo_status",
+    "rustup_status",
+    "macos_xcode_select_status",
+    "macos_xcode_select_path_status",
+    "first_cargo_check_readiness"
+  ],
+  "allowed_status_values": {
+    "rustc_status": [
+      "available",
+      "missing",
+      "unexpected_error",
+      "not_run"
+    ],
+    "cargo_status": [
+      "available",
+      "missing",
+      "unexpected_error",
+      "not_run"
+    ],
+    "rustup_status": [
+      "available",
+      "missing",
+      "unexpected_error",
+      "not_run"
+    ],
+    "macos_xcode_select_status": [
+      "available",
+      "missing",
+      "unexpected_error",
+      "not_run",
+      "not_applicable"
+    ],
+    "macos_xcode_select_path_status": [
+      "path_present",
+      "path_missing",
+      "not_applicable",
+      "not_run"
+    ],
+    "first_cargo_check_readiness": [
+      "blocked_until_pcweb_084_and_user_approval"
+    ]
+  },
+  "forbidden_raw_result_fields": [
+    "stdout",
+    "stderr",
+    "raw_stdout",
+    "raw_stderr",
+    "command",
+    "command_text",
+    "executable_path",
+    "xcode_path",
+    "developer_tools_path",
+    "path",
+    "env",
+    "cwd",
+    "shell_profile",
+    "path_environment",
+    "cargo_home",
+    "rustup_home",
+    "dependency_cache_path",
+    "target_dir",
+    "cargo_lock_path",
+    "provider_config",
+    "api_key",
+    "authorization",
+    "bearer_token"
+  ],
+  "next_required_decisions": [
+    "explicit_first_cargo_check_approval_still_required",
+    "future_probe_execution_requires_separate_approval",
+    "no_audio_worker_secret_remote_boundary_reconfirmed"
+  ],
+  "cargo_check_blockers": [
+    "pcweb_084_artifact_policy_reacknowledged",
+    "first_dependency_resolution_network_or_cache_policy_approved",
+    "cargo_target_dir_artifact_tmp_approved",
+    "cargo_lock_generation_commit_policy_approved",
+    "explicit_user_approval_for_first_cargo_check",
+    "no_audio_worker_secret_remote_boundary_reconfirmed"
+  ],
+  "forbidden_default_side_effects": [
+    "probe_command_execution",
+    "shell_execution",
+    "installer_execution",
+    "package_manager_execution",
+    "cargo_command_execution",
+    "tauri_command_execution",
+    "shell_profile_read",
+    "path_environment_read",
+    "cargo_home_read",
+    "rustup_home_read",
+    "dependency_cache_read",
+    "cargo_lock_read",
+    "target_dir_read",
+    "raw_probe_output_read",
+    "raw_probe_output_acceptance",
+    "dependency_download",
+    "cargo_artifact_generation",
+    "audio_permission_request",
+    "audio_device_enumeration",
+    "microphone_capture",
+    "system_audio_capture",
+    "asr_worker_spawn",
+    "provider_config_read",
+    "secret_read",
+    "configs_local_read",
+    "remote_asr_call",
+    "remote_llm_call",
+    "installer_creation",
+    "signing",
+    "notarization"
+  ]
+}

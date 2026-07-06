@@ -1,0 +1,36 @@
+{
+  "script_id": "non-engineering-control-001",
+  "scenario": "non_engineering_control",
+  "language": "zh-CN",
+  "turns": [
+    {
+      "speaker": "A",
+      "text": "我们今天先确认团建时间，周五下午大家是否都方便。"
+    },
+    {
+      "speaker": "B",
+      "text": "预算可以按每人两百来估，地点选交通方便一点的地方。"
+    },
+    {
+      "speaker": "C",
+      "text": "名单我会后整理一下，明天发到群里。"
+    }
+  ],
+  "technical_entities": [],
+  "expected_state_events": [
+    {
+      "event_type": "topic.created",
+      "target_type": "Topic",
+      "expected_text": "团建时间和预算讨论"
+    }
+  ],
+  "expected_gap_candidates": [],
+  "expected_suggestion_cards": [],
+  "baseline_expectations": {
+    "transcript_only_detects_gap": false,
+    "summary_only_detects_within_window": false,
+    "copilot_should_detect_within_window": false
+  },
+  "expected_engineering_card_count_min": 0,
+  "expected_engineering_card_count_max": 0
+}

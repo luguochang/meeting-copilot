@@ -1,0 +1,288 @@
+{
+  "id": "schema-degradation-review",
+  "title": "模型降级发布评审会",
+  "source": "fixture",
+  "scenario_type": "schema_degradation_review",
+  "expected_gap_rule_count": 1,
+  "expected_gate_tags": [
+    "AC-PCWEB-009",
+    "AC-PCWEB-010",
+    "AC-PCWEB-011",
+    "AC-PCWEB-013",
+    "AC-PCWEB-019"
+  ],
+  "session": {
+    "session_id": "demo_schema_degradation_001",
+    "transcript_report": {
+      "provider": "fixture-funasr",
+      "latency_ms": 1700,
+      "rtf": 0.41,
+      "text": "search-service 明天灰度 5%。如果召回率下降超过 2% 就回滚。王五负责上线监控，但回滚演练还没有安排。模型有几次结构化输出失败和超时，先不要打断会议。",
+      "normalized_text": "search-service 明天灰度 5%。如果召回率下降超过 2% 就回滚。王五负责上线监控，但回滚演练还没有安排。模型有几次结构化输出失败和超时，先不要打断会议。",
+      "segments": [
+        {
+          "id": "seg_001",
+          "start_ms": 0,
+          "end_ms": 5200,
+          "text": "search-service 明天灰度 5%。",
+          "confidence": 0.91,
+          "finalized_at_ms": 6500
+        },
+        {
+          "id": "seg_002",
+          "start_ms": 5200,
+          "end_ms": 11200,
+          "text": "如果召回率下降超过 2% 就回滚。",
+          "confidence": 0.9,
+          "finalized_at_ms": 12800
+        },
+        {
+          "id": "seg_003",
+          "start_ms": 11200,
+          "end_ms": 17000,
+          "text": "王五负责上线监控，但回滚演练还没有安排。",
+          "confidence": 0.88,
+          "finalized_at_ms": 19200
+        },
+        {
+          "id": "seg_004",
+          "start_ms": 17000,
+          "end_ms": 22500,
+          "text": "模型有几次结构化输出失败和超时，先不要打断会议。",
+          "confidence": 0.86,
+          "finalized_at_ms": 24600
+        }
+      ],
+      "evidence_spans": [
+        {
+          "id": "ev_001",
+          "segment_id": "seg_001",
+          "start_ms": 0,
+          "end_ms": 5200,
+          "quote": "search-service 明天灰度 5%。"
+        },
+        {
+          "id": "ev_002",
+          "segment_id": "seg_002",
+          "start_ms": 5200,
+          "end_ms": 11200,
+          "quote": "如果召回率下降超过 2% 就回滚。"
+        },
+        {
+          "id": "ev_003",
+          "segment_id": "seg_003",
+          "start_ms": 11200,
+          "end_ms": 17000,
+          "quote": "王五负责上线监控，但回滚演练还没有安排。"
+        },
+        {
+          "id": "ev_004",
+          "segment_id": "seg_004",
+          "start_ms": 17000,
+          "end_ms": 22500,
+          "quote": "模型有几次结构化输出失败和超时，先不要打断会议。"
+        }
+      ]
+    },
+    "analysis": {
+      "summary": "讨论 search-service 灰度上线、回滚阈值、上线监控责任人和缺失的回滚演练，同时覆盖模型结构化失败时的静默降级。",
+      "meeting_context": {
+        "is_engineering_meeting": true,
+        "reason": "包含灰度比例、召回率、回滚、上线监控和回滚演练等发布评审要素。"
+      },
+      "states": {
+        "decision_candidates": [
+          {
+            "id": "decision_001",
+            "statement": "search-service 明天灰度 5%",
+            "evidence_span_ids": ["ev_001"]
+          },
+          {
+            "id": "decision_002",
+            "statement": "召回率下降超过 2% 时回滚",
+            "evidence_span_ids": ["ev_002"]
+          }
+        ],
+        "action_items": [
+          {
+            "id": "action_001",
+            "description": "王五负责上线监控",
+            "owner": "王五",
+            "evidence_span_ids": ["ev_003"]
+          }
+        ],
+        "risks": [
+          {
+            "id": "risk_001",
+            "description": "回滚演练尚未安排，故障时执行路径可能不熟悉。",
+            "evidence_span_ids": ["ev_003"]
+          }
+        ],
+        "open_questions": [
+          {
+            "id": "question_001",
+            "question": "回滚演练由谁安排，什么时候完成？",
+            "evidence_span_ids": ["ev_003"]
+          }
+        ]
+      },
+      "suggestion_cards": [
+        {
+          "id": "card_show_001",
+          "type": "rollback_gap",
+          "title": "补齐回滚演练安排",
+          "suggested_question": "是否需要现在确认 search-service 的回滚演练负责人和完成时间？",
+          "evidence_span_ids": ["ev_003"],
+          "state_refs": ["open_question:question_001", "risk:risk_001"],
+          "state_event_ids": ["event_003", "event_004"],
+          "gap_rule_id": "release.rollback.drill.required",
+          "trigger_reason": "已有灰度和回滚阈值，但回滚演练未安排。",
+          "trigger_source": "state_gap_detector",
+          "final_segment_at_ms": 19200,
+          "state_event_at_ms": 20200,
+          "card_created_at_ms": 24600,
+          "latency_ms": 5400,
+          "prompt_version": "suggestion-card.v1",
+          "model": "gpt-5.5",
+          "usage": {
+            "prompt_tokens": 220,
+            "completion_tokens": 76,
+            "total_tokens": 296
+          },
+          "schema_result": "valid",
+          "show_or_silence_decision": "show",
+          "segment_batch": ["seg_003"]
+        },
+        {
+          "id": "card_failed_001",
+          "type": "metric_monitoring_gap",
+          "title": "结构化失败静默记录",
+          "suggested_question": "模型输出缺少必填字段，保持静默并等待下一轮稳定上下文。",
+          "evidence_span_ids": ["ev_004"],
+          "state_refs": ["action_item:action_001"],
+          "state_event_ids": ["event_005"],
+          "gap_rule_id": "llm.schema.failed.silenced",
+          "trigger_reason": "模型结构化结果 failed，不能形成可靠会中建议。",
+          "trigger_source": "schema_guard",
+          "final_segment_at_ms": 24600,
+          "state_event_at_ms": 25200,
+          "card_created_at_ms": 26800,
+          "latency_ms": 2200,
+          "prompt_version": "suggestion-card.v1",
+          "model": "gpt-5.5",
+          "usage": {
+            "prompt_tokens": 180,
+            "completion_tokens": 12,
+            "total_tokens": 192
+          },
+          "schema_result": "failed",
+          "show_or_silence_decision": "silence",
+          "segment_batch": ["seg_004"]
+        },
+        {
+          "id": "card_timeout_001",
+          "type": "metric_monitoring_gap",
+          "title": "结构化超时静默记录",
+          "suggested_question": "模型结构化超时，保持静默并等待下一轮调度。",
+          "evidence_span_ids": ["ev_004"],
+          "state_refs": ["action_item:action_001"],
+          "state_event_ids": ["event_005"],
+          "gap_rule_id": "llm.schema.timeout.silenced",
+          "trigger_reason": "模型结构化结果 timeout，不能形成可靠会中建议。",
+          "trigger_source": "schema_guard",
+          "final_segment_at_ms": 24600,
+          "state_event_at_ms": 25200,
+          "card_created_at_ms": 27100,
+          "latency_ms": 2500,
+          "prompt_version": "suggestion-card.v1",
+          "model": "gpt-5.5",
+          "usage": {
+            "prompt_tokens": 176,
+            "completion_tokens": 0,
+            "total_tokens": 176
+          },
+          "schema_result": "timeout",
+          "show_or_silence_decision": "silence",
+          "segment_batch": ["seg_004"]
+        },
+        {
+          "id": "card_invalid_001",
+          "type": "metric_monitoring_gap",
+          "title": "结构化非法静默记录",
+          "suggested_question": "模型输出 schema invalid，保持静默并仅进入审计时间线。",
+          "evidence_span_ids": ["ev_004"],
+          "state_refs": ["action_item:action_001"],
+          "state_event_ids": ["event_005"],
+          "gap_rule_id": "llm.schema.invalid.silenced",
+          "trigger_reason": "模型结构化结果 invalid，不能形成可靠会中建议。",
+          "trigger_source": "schema_guard",
+          "final_segment_at_ms": 24600,
+          "state_event_at_ms": 25200,
+          "card_created_at_ms": 27400,
+          "latency_ms": 2800,
+          "prompt_version": "suggestion-card.v1",
+          "model": "gpt-5.5",
+          "usage": {
+            "prompt_tokens": 182,
+            "completion_tokens": 14,
+            "total_tokens": 196
+          },
+          "schema_result": "invalid",
+          "show_or_silence_decision": "silence",
+          "segment_batch": ["seg_004"]
+        }
+      ]
+    },
+    "state_events": [
+      {
+        "id": "event_001",
+        "target_type": "DecisionCandidate",
+        "target_id": "decision_001",
+        "event_type": "created",
+        "created_at_ms": 7200,
+        "evidence_span_ids": ["ev_001"]
+      },
+      {
+        "id": "event_002",
+        "target_type": "DecisionCandidate",
+        "target_id": "decision_002",
+        "event_type": "created",
+        "created_at_ms": 13600,
+        "evidence_span_ids": ["ev_002"]
+      },
+      {
+        "id": "event_003",
+        "target_type": "Risk",
+        "target_id": "risk_001",
+        "event_type": "created",
+        "created_at_ms": 20000,
+        "evidence_span_ids": ["ev_003"]
+      },
+      {
+        "id": "event_004",
+        "target_type": "OpenQuestion",
+        "target_id": "question_001",
+        "event_type": "created",
+        "created_at_ms": 20200,
+        "evidence_span_ids": ["ev_003"]
+      },
+      {
+        "id": "event_005",
+        "target_type": "ActionItem",
+        "target_id": "action_001",
+        "event_type": "created",
+        "created_at_ms": 25200,
+        "evidence_span_ids": ["ev_004"]
+      }
+    ],
+    "llm_usage": {
+      "model": "gpt-5.5",
+      "call_count": 4,
+      "usage": {
+        "prompt_tokens": 758,
+        "completion_tokens": 102,
+        "total_tokens": 860
+      }
+    }
+  }
+}

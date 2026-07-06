@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "samples": [
+    {
+      "id": "S01-api-review",
+      "audio_path": "../samples/S01-api-review.wav",
+      "reference_path": "../references/S01-api-review.txt",
+      "annotation_path": "../annotations/S01-api-review.annotation.json",
+      "language": "zh-CN",
+      "scenario": "api_review",
+      "duration_seconds": 24.0
+    }
+  ]
+}

@@ -1,0 +1,156 @@
+{
+  "pcweb_id": "PCWEB-086",
+  "policy_name": "Desktop Rust Toolchain Installation Decision Policy",
+  "policy_status": "rust_toolchain_installation_decision_policy_only",
+  "default_quality_gate_status": "included_in_root_pytest",
+  "installation_decision_mode": "no_install_decision_report_only",
+  "recommended_install_provider": "official_rustup",
+  "safe_to_install_toolchain_now": false,
+  "safe_to_modify_shell_profile_now": false,
+  "safe_to_run_install_command_now": false,
+  "safe_to_run_rustup_now": false,
+  "safe_to_run_cargo_check_now": false,
+  "safe_to_run_cargo_build_now": false,
+  "safe_to_run_tauri_dev_now": false,
+  "safe_to_run_tauri_build_now": false,
+  "safe_to_fetch_dependencies_now": false,
+  "safe_to_generate_cargo_lock_now": false,
+  "safe_to_generate_target_dir_now": false,
+  "safe_to_read_configs_local_now": false,
+  "required_approval_tokens_before_install": [
+    "explicit_user_approval_for_rust_toolchain_install",
+    "approved_install_provider_official_rustup",
+    "approved_shell_profile_modification_policy",
+    "approved_network_download_policy_for_rustup",
+    "approved_post_install_probe_policy",
+    "no_audio_worker_secret_remote_boundary_reconfirmed"
+  ],
+  "post_install_verification_order": [
+    "rustc_version",
+    "cargo_version",
+    "rustup_version",
+    "macos_xcode_select_presence_redacted",
+    "pcweb_084_cargo_check_preflight"
+  ],
+  "platform_notes": {
+    "macos": {
+      "current_pcweb_085_probe_summary": [
+        "rustc_missing",
+        "cargo_missing",
+        "rustup_missing",
+        "xcode_command_line_tools_available"
+      ],
+      "future_prerequisites": [
+        "official_rustup_approval_required",
+        "shell_profile_modification_policy_required",
+        "post_install_probe_policy_required"
+      ]
+    },
+    "windows": {
+      "current_scope": "future_platform_not_executed_on_this_machine",
+      "future_prerequisites": [
+        "visual_studio_build_tools_required_for_windows_future_build",
+        "official_rustup_approval_required",
+        "installer_policy_required"
+      ]
+    },
+    "linux": {
+      "current_scope": "future_platform_not_executed_on_this_machine",
+      "future_prerequisites": [
+        "system_package_manager_approval_required",
+        "official_rustup_approval_required",
+        "shell_profile_modification_policy_required"
+      ]
+    }
+  },
+  "forbidden_commands": [
+    ["curl", "https://sh.rustup.rs", "-sSf"],
+    ["curl", "--proto", "=https", "--tlsv1.2", "-sSf", "https://sh.rustup.rs"],
+    ["sh", "rustup-init"],
+    ["sh", "-c"],
+    ["zsh", "-lc"],
+    ["bash", "-lc"],
+    ["rustup", "toolchain", "install"],
+    ["rustup", "update"],
+    ["rustup", "default"],
+    ["cargo", "check"],
+    ["cargo", "build"],
+    ["cargo", "tauri", "dev"],
+    ["cargo", "tauri", "build"],
+    ["brew", "install", "rustup"],
+    ["xcode-select", "--install"],
+    ["winget", "install"],
+    ["scoop", "install"],
+    ["choco", "install"],
+    ["apt", "install"],
+    ["dnf", "install"],
+    ["yum", "install"],
+    ["npm", "install"],
+    ["npm", "ci"],
+    ["pnpm", "install"],
+    ["yarn", "install"],
+    ["npx", "tauri", "dev"],
+    ["npx", "tauri", "build"]
+  ],
+  "forbidden_default_side_effects": [
+    "shell_profile_modification",
+    "path_modification",
+    "cargo_home_modification",
+    "rustup_home_modification",
+    "system_settings_modification",
+    "installer_execution",
+    "package_manager_execution",
+    "dependency_download",
+    "cargo_artifact_generation",
+    "audio_permission_request",
+    "audio_device_enumeration",
+    "microphone_capture",
+    "system_audio_capture",
+    "asr_worker_spawn",
+    "provider_config_read",
+    "secret_read",
+    "configs_local_read",
+    "remote_asr_call",
+    "remote_llm_call",
+    "installer_creation",
+    "signing",
+    "notarization"
+  ],
+  "remaining_preconditions_before_first_install": [
+    "explicit_user_approval_for_rust_toolchain_install",
+    "approved_install_provider_official_rustup",
+    "approved_shell_profile_modification_policy",
+    "approved_network_download_policy_for_rustup",
+    "approved_post_install_probe_policy",
+    "no_audio_worker_secret_remote_boundary_reconfirmed"
+  ],
+  "remaining_preconditions_before_first_cargo_check_after_install": [
+    "pcweb_084_artifact_policy_acknowledged",
+    "pcweb_085_toolchain_readiness_reprobed_after_install",
+    "explicit_user_approval_for_first_cargo_check",
+    "first_dependency_resolution_network_fetch_approved_or_cache_preseeded",
+    "no_audio_worker_secret_remote_boundary_reconfirmed"
+  ],
+  "official_sources": [
+    {
+      "label": "Install Rust",
+      "url": "https://www.rust-lang.org/tools/install"
+    },
+    {
+      "label": "rustup book",
+      "url": "https://rust-lang.github.io/rustup/"
+    },
+    {
+      "label": "Cargo check command",
+      "url": "https://doc.rust-lang.org/cargo/commands/cargo-check.html"
+    },
+    {
+      "label": "Cargo build cache",
+      "url": "https://doc.rust-lang.org/cargo/reference/build-cache.html"
+    },
+    {
+      "label": "Tauri v2 prerequisites",
+      "url": "https://v2.tauri.app/start/prerequisites/"
+    }
+  ]
+}

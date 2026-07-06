@@ -1,0 +1,78 @@
+{
+  "script_id": "release-review-001",
+  "scenario": "release_review",
+  "language": "zh-CN",
+  "turns": [
+    {
+      "speaker": "A",
+      "text": "这次 checkout-service 周五晚上灰度百分之十，先看 error_rate 和 P99。"
+    },
+    {
+      "speaker": "B",
+      "text": "如果指标异常我们暂停扩量，但回滚脚本还没有在 staging 跑过。"
+    },
+    {
+      "speaker": "C",
+      "text": "验收用例还差支付失败重试，我们今天补一下。"
+    }
+  ],
+  "technical_entities": [
+    "checkout-service",
+    "error_rate",
+    "P99",
+    "staging"
+  ],
+  "expected_state_events": [
+    {
+      "event_type": "topic.created",
+      "target_type": "Topic",
+      "expected_text": "checkout-service 灰度发布评审"
+    },
+    {
+      "event_type": "risk.created",
+      "target_type": "Risk",
+      "expected_text": "回滚脚本没有在 staging 跑过"
+    },
+    {
+      "event_type": "action_item.created",
+      "target_type": "ActionItem",
+      "expected_text": "补支付失败重试验收用例"
+    }
+  ],
+  "expected_gap_candidates": [
+    "rollback",
+    "test_verification",
+    "metric_monitoring"
+  ],
+  "expected_suggestion_cards": [
+    {
+      "card_id": "release-review-001-rollback-gap",
+      "gap_type": "rollback",
+      "suggested_question": "是否需要在会里确认回滚脚本验证完成的时间和负责人？",
+      "evidence_span_required": true,
+      "trigger_window_seconds": {
+        "min": 0,
+        "max": 30
+      },
+      "should_show": true
+    },
+    {
+      "card_id": "release-review-001-test-gap",
+      "gap_type": "test_verification",
+      "suggested_question": "支付失败重试用例补完后，是否需要再设一个上线前验收点？",
+      "evidence_span_required": true,
+      "trigger_window_seconds": {
+        "min": 0,
+        "max": 30
+      },
+      "should_show": true
+    }
+  ],
+  "baseline_expectations": {
+    "transcript_only_detects_gap": false,
+    "summary_only_detects_within_window": false,
+    "copilot_should_detect_within_window": true
+  },
+  "expected_engineering_card_count_min": 1,
+  "expected_engineering_card_count_max": 3
+}

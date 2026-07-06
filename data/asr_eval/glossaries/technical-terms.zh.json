@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "terms": [
+    {
+      "canonical": "payment-gateway",
+      "aliases": ["payment gateway", "paymentgateway", "paymentway", "payment gate 为", "payment gate"]
+    },
+    {
+      "canonical": "request_id",
+      "aliases": ["request id", "request-id", "request_id"]
+    },
+    {
+      "canonical": "error_rate",
+      "aliases": ["error rate", "error-rate", "error_rate", "errorate", "错误率"]
+    },
+    {
+      "canonical": "P99",
+      "aliases": ["t 九九", "九九"]
+    },
+    {
+      "canonical": "Grafana",
+      "aliases": ["grafana", "格拉法纳"]
+    },
+    {
+      "canonical": "redis",
+      "aliases": ["redis", "rediscost"]
+    },
+    {
+      "canonical": "redis cluster",
+      "aliases": ["redis cluster", "redis 集群", "redi coasterbqp", "redi coasterbqpqps"]
+    },
+    {
+      "canonical": "order-service",
+      "aliases": ["order service", "order-service"]
+    },
+    {
+      "canonical": "checkout-service",
+      "aliases": ["checkout service", "checkout-service", "checkoutservice", "check koutservice", "trcoutservice service"]
+    },
+    {
+      "canonical": "feature-store",
+      "aliases": ["feature store", "feature-store", "featurestore", "ure store"]
+    },
+    {
+      "canonical": "recommendation-service",
+      "aliases": ["recommendation service", "recommendation-service", "recommendationservice", "dationservice"]
+    },
+    {
+      "canonical": "order-worker",
+      "aliases": ["order worker", "order-worker", "orderworker", "autoker"]
+    }
+  ]
+}

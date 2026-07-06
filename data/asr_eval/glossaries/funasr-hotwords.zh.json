@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "purpose": "funasr_synthetic_technical_meeting_hotwords",
+  "hotwords": [
+    "payment-gateway",
+    "request_id",
+    "40012",
+    "P99",
+    "recommendation-service",
+    "feature-store",
+    "redis cluster",
+    "QPS",
+    "mysql",
+    "order-worker",
+    "lag",
+    "timeout",
+    "监控阈值",
+    "checkout-service",
+    "error_rate",
+    "staging",
+    "owner",
+    "rollback"
+  ]
+}

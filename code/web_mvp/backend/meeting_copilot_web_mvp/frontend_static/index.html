@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Meeting Copilot</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body class="app-shell">
+    <header class="app-header">
+      <div class="brand-lockup">
+        <div class="brand-mark" aria-hidden="true">
+          <span></span>
+          <span></span>
+        </div>
+        <div>
+          <p class="eyebrow">PC Local Web MVP</p>
+          <h1>Meeting Copilot</h1>
+        </div>
+      </div>
+      <div class="toolbar">
+        <div class="toolbar-group primary-flow">
+          <select id="fixture-select" aria-label="Demo fixture"></select>
+          <button id="load-fixture-button" type="button">加载样本</button>
+          <button id="mainline-asr-blocked-trial-button" type="button">主线试运行</button>
+          <button id="mainline-asr-event-artifact-trial-button" type="button">工件主线</button>
+        </div>
+        <div class="toolbar-group simulation-flow">
+          <button id="mac-local-shadow-mvp-button" type="button">Synthetic Preview</button>
+          <button id="realistic-meeting-simulation-button" type="button">真实模拟</button>
+          <button id="long-realistic-meeting-simulation-button" type="button">长会模拟</button>
+        </div>
+        <div class="toolbar-group support-flow">
+          <button id="mainline-feedback-export-closure-button" type="button">闭环预览</button>
+          <button id="export-report-button" type="button">导出 Markdown</button>
+          <button id="delete-session-button" type="button">删除会话</button>
+        </div>
+      </div>
+    </header>
+
+    <main class="workbench">
+      <section class="main-column">
+        <section class="summary-band" aria-labelledby="summary-title">
+          <div class="session-hero">
+            <p class="eyebrow">Current Session</p>
+            <h2 id="summary-title">等待加载会议样本</h2>
+            <p id="meeting-summary" class="summary-text">请选择一个本地 demo fixture。</p>
+            <div class="mainline-status-strip" aria-label="Mainline status">
+              <span>Local first</span>
+              <span>ASR gate visible</span>
+              <span>No remote call by default</span>
+            </div>
+          </div>
+          <div id="quality-panel" class="quality-strip" aria-label="Quality and trace"></div>
+          <div id="evaluation-panel" class="evaluation-panel" aria-label="Fixture evaluation"></div>
+        </section>
+
+        <section class="desktop-section local-shadow-preview-release" aria-labelledby="local-shadow-preview-release-title" id="local-shadow-preview-release-panel">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Release Truth</p>
+              <h2 id="local-shadow-preview-release-title">Local Shadow Preview</h2>
+            </div>
+            <button id="local-shadow-preview-release-refresh" type="button">刷新状态</button>
+          </div>
+          <div id="local-shadow-preview-release-content" class="release-summary-grid">
+            <div class="empty">正在读取本地预览发布状态。</div>
+          </div>
+        </section>
+
+        <section class="desktop-section" aria-labelledby="mac-local-shadow-mvp-title">
+          <div class="section-heading">
+            <p class="eyebrow">Local Synthetic Preview</p>
+            <h2 id="mac-local-shadow-mvp-title">本地演示闭环</h2>
+          </div>
+          <div id="mac-local-shadow-mvp-panel" class="mac-local-shadow-mvp-panel">
+            <div class="empty">等待本地 shadow MVP 演示会话。</div>
+          </div>
+        </section>
+
+        <section class="desktop-section" aria-labelledby="mainline-closure-title">
+          <div class="section-heading">
+            <p class="eyebrow">Mainline Closure</p>
+            <h2 id="mainline-closure-title">主线闭环</h2>
+          </div>
+          <div id="mainline-closure-panel" class="mainline-closure-panel">
+            <div class="empty">等待主线试运行后的反馈与导出预览。</div>
+          </div>
+        </section>
+
+        <section class="desktop-section" aria-labelledby="desktop-readiness-title">
+          <div class="section-heading">
+            <p class="eyebrow">Desktop Shell Readiness</p>
+            <h2 id="desktop-readiness-title">桌面准备度</h2>
+          </div>
+          <div id="desktop-readiness-panel" class="desktop-readiness-panel">
+            <div class="empty">正在读取桌面准备度边界。</div>
+          </div>
+        </section>
+
+        <section class="desktop-section" aria-labelledby="desktop-runtime-boundary-title">
+          <div class="section-heading">
+            <p class="eyebrow">Desktop Runtime Boundary</p>
+            <h2 id="desktop-runtime-boundary-title">桌面运行时边界</h2>
+          </div>
+          <div id="desktop-runtime-boundary-panel" class="desktop-runtime-boundary-panel">
+            <div class="empty">正在读取桌面运行时决策边界。</div>
+          </div>
+        </section>
+
+        <section class="desktop-section" aria-labelledby="desktop-native-bridge-contract-title">
+          <div class="section-heading">
+            <p class="eyebrow">Desktop Native Bridge Contract</p>
+            <h2 id="desktop-native-bridge-contract-title">原生桥契约</h2>
+          </div>
+          <div id="desktop-native-bridge-contract-panel" class="desktop-native-bridge-contract-panel">
+            <div class="empty">正在读取桌面原生桥契约。</div>
+          </div>
+        </section>
+
+        <section class="desktop-section" aria-labelledby="desktop-native-runtime-title">
+          <div class="section-heading">
+            <p class="eyebrow">Desktop Native Runtime</p>
+            <h2 id="desktop-native-runtime-title">原生运行时</h2>
+          </div>
+          <div id="desktop-native-runtime-panel" class="desktop-native-runtime-panel">
+            <div class="empty">正在检测 Tauri 原生运行时。</div>
+          </div>
+        </section>
+
+        <section class="desktop-section" aria-labelledby="desktop-asr-handoff-dry-run-title">
+          <div class="section-heading">
+            <p class="eyebrow">Desktop ASR Handoff</p>
+            <h2 id="desktop-asr-handoff-dry-run-title">ASR 交接</h2>
+          </div>
+          <div id="desktop-asr-handoff-dry-run-panel" class="desktop-asr-handoff-dry-run-panel">
+            <div class="empty">正在读取 ASR worker dry-run 状态。</div>
+          </div>
+        </section>
+
+        <section class="desktop-section" aria-labelledby="desktop-mic-adapter-contract-title">
+          <div class="section-heading">
+            <p class="eyebrow">Desktop Mic Adapter</p>
+            <h2 id="desktop-mic-adapter-contract-title">麦克风合同</h2>
+          </div>
+          <div id="desktop-mic-adapter-contract-panel" class="desktop-mic-adapter-contract-panel">
+            <div class="empty">正在读取麦克风 adapter 合同。</div>
+          </div>
+        </section>
+
+        <section class="desktop-section" aria-labelledby="desktop-real-mic-shadow-readiness-title">
+          <div class="section-heading">
+            <p class="eyebrow">Real Mic Shadow Test</p>
+            <h2 id="desktop-real-mic-shadow-readiness-title">真实麦克风准备度（Blocked）</h2>
+          </div>
+          <div id="desktop-real-mic-shadow-readiness-panel" class="desktop-real-mic-shadow-readiness-panel">
+            <div class="empty">正在读取真实麦克风 shadow test 准备状态。</div>
+          </div>
+        </section>
+
+        <section class="state-section" aria-labelledby="state-title">
+          <div class="section-heading">
+            <p class="eyebrow">Meeting State</p>
+            <h2 id="state-title">状态板</h2>
+          </div>
+          <div id="state-board" class="state-board"></div>
+        </section>
+
+        <section class="suggestion-section" aria-labelledby="suggestion-title">
+          <div class="section-heading">
+            <p class="eyebrow">Realtime Suggestions</p>
+            <h2 id="suggestion-title">建议卡片</h2>
+          </div>
+          <div id="suggestion-list" class="suggestion-list"></div>
+        </section>
+
+        <section class="lifecycle-section" aria-labelledby="card-lifecycle-readiness-title">
+          <div class="section-heading">
+            <p class="eyebrow">Card Lifecycle Readiness</p>
+            <h2 id="card-lifecycle-readiness-title">成卡链路</h2>
+          </div>
+          <div id="card-lifecycle-readiness-panel" class="card-lifecycle-readiness-panel">
+            <div class="empty">Live ASR 结束后显示候选成卡链路状态。</div>
+          </div>
+        </section>
+
+        <section class="event-section" aria-labelledby="event-stream-title">
+          <div class="section-heading">
+            <div>
+              <p id="event-stream-eyebrow" class="eyebrow">Replay Event Stream</p>
+              <h2 id="event-stream-title">事件流</h2>
+            </div>
+            <div class="event-mode-control" role="group" aria-label="Event stream mode">
+              <button id="event-mode-replay" type="button" aria-pressed="true">Replay</button>
+              <button id="event-mode-live-mock" type="button" aria-pressed="false">Live Mock</button>
+              <button id="event-mode-live-asr" type="button" aria-pressed="false">Live ASR</button>
+            </div>
+          </div>
+          <div id="event-stream-panel" class="event-stream-panel"></div>
+        </section>
+      </section>
+
+      <aside class="side-column">
+        <section class="side-panel" aria-labelledby="evidence-title">
+          <div class="section-heading compact">
+            <p class="eyebrow">Evidence</p>
+            <h2 id="evidence-title">证据片段</h2>
+          </div>
+          <div id="evidence-panel" class="evidence-panel"></div>
+        </section>
+
+        <section class="side-panel" aria-labelledby="transcript-title">
+          <div class="section-heading compact">
+            <p class="eyebrow">Transcript</p>
+            <h2 id="transcript-title">转写</h2>
+          </div>
+          <div id="transcript-panel" class="transcript-panel"></div>
+        </section>
+
+        <section class="side-panel" aria-labelledby="report-title">
+          <div class="section-heading compact">
+            <p class="eyebrow">Report</p>
+            <h2 id="report-title">Markdown</h2>
+          </div>
+          <pre id="report-panel" class="report-panel"></pre>
+        </section>
+
+        <section class="side-panel" aria-labelledby="shadow-report-feedback-title">
+          <div class="section-heading compact">
+            <p class="eyebrow">Shadow Feedback</p>
+            <h2 id="shadow-report-feedback-title">验收反馈</h2>
+          </div>
+          <div id="shadow-report-feedback-panel" class="shadow-report-feedback-panel">
+            <form id="shadow-report-feedback-form" class="shadow-report-feedback-form">
+              <label for="shadow-report-feedback-candidate-report">Report JSON</label>
+              <textarea id="shadow-report-feedback-candidate-report" name="candidate_report" rows="6"></textarea>
+              <label for="shadow-report-feedback-entries">Feedback JSON</label>
+              <textarea id="shadow-report-feedback-entries" name="feedback_entries" rows="4">[]</textarea>
+              <button type="submit">提交反馈</button>
+            </form>
+            <div id="shadow-report-feedback-result" class="shadow-report-feedback-result">
+              <div class="empty">暂无反馈结果</div>
+            </div>
+          </div>
+        </section>
+      </aside>
+    </main>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

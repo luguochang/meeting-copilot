@@ -1,0 +1,67 @@
+{
+  "technical_entities": [
+    {
+      "type": "component",
+      "text": "Redis",
+      "normalized": "Redis",
+      "start_ms": 900,
+      "end_ms": 1500
+    },
+    {
+      "type": "service",
+      "text": "order-service",
+      "normalized": "order-service",
+      "start_ms": 4600,
+      "end_ms": 5700
+    },
+    {
+      "type": "metric",
+      "text": "P95",
+      "normalized": "P95",
+      "start_ms": 6500,
+      "end_ms": 7000
+    },
+    {
+      "type": "threshold",
+      "text": "120 毫秒",
+      "normalized": "120ms",
+      "start_ms": 7600,
+      "end_ms": 8500
+    },
+    {
+      "type": "threshold",
+      "text": "2 秒",
+      "normalized": "2s",
+      "start_ms": 9500,
+      "end_ms": 10100
+    },
+    {
+      "type": "operation",
+      "text": "限流",
+      "normalized": "限流",
+      "start_ms": 13500,
+      "end_ms": 14100
+    },
+    {
+      "type": "metric",
+      "text": "连接池监控",
+      "normalized": "连接池监控",
+      "start_ms": 14500,
+      "end_ms": 15800
+    }
+  ],
+  "decisions": [],
+  "action_items": [
+    {
+      "text": "补限流和连接池监控",
+      "owner": "王五",
+      "deadline": "本周五前"
+    }
+  ],
+  "risks": [
+    {
+      "text": "Redis 连接池耗尽导致 order-service 超时"
+    }
+  ],
+  "gaps": []
+}

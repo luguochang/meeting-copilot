@@ -1,0 +1,18 @@
+{
+  "S01-api-review": {
+    "text": "我们这次接口新增 trace_id 字段，但是老版本调用方要兼容两个版本。张三下周三补充兼容性测试用例。上线的时候先灰度百分之十，如果错误率超过千分之一就回滚。",
+    "entities": ["trace_id", "兼容", "调用方", "灰度", "回滚"]
+  },
+  "S02-release-review": {
+    "text": "这次 payment-gateway 先灰度 10%，如果 P99 超过 800 毫秒或者错误率超过 0.1% 就回滚。李四今天下班前补充 Grafana 看板和告警阈值。",
+    "entities": ["payment-gateway", "10%", "P99", "800ms", "错误率", "0.1%", "回滚", "Grafana"]
+  },
+  "S03-incident-review": {
+    "text": "昨晚 Redis 连接池耗尽导致 order-service 超时，P95 从 120 毫秒涨到 2 秒。王五负责本周五前补限流和连接池监控，复盘里要说明根因和预防措施。",
+    "entities": ["Redis", "order-service", "P95", "120ms", "2s", "限流", "连接池监控"]
+  },
+  "S04-mixed-terms": {
+    "text": "这个 PR 会把 GET /api/v1/orders 的 response 增加 total_amount 字段，同时保留 amount 字段两个版本，避免 mobile-app 和 BI job 解析失败。",
+    "entities": ["PR", "GET /api/v1/orders", "response", "total_amount", "amount", "mobile-app", "BI job"]
+  }
+}

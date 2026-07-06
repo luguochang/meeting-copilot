@@ -1,0 +1,116 @@
+{
+  "pcweb_id": "PCWEB-105",
+  "policy_name": "Desktop Microphone Adapter Contract",
+  "policy_status": "desktop_mic_adapter_contract_policy_only",
+  "default_quality_gate_status": "included_in_root_pytest",
+  "required_previous_contracts": [
+    "PCWEB-104",
+    "DRV-032"
+  ],
+  "contract_mode": "mic_adapter_command_contract_only",
+  "contract_version": "desktop_mic_adapter_contract.v1",
+  "adapter_execution_status": "not_bound_not_executed",
+  "permission_request_status": "not_requested",
+  "user_start_boundary": "explicit_user_start_required_before_capture",
+  "approved_runtime_audio_root": "artifacts/tmp/desktop_mic_adapter_runtime",
+  "approved_audio_chunk_root": "artifacts/tmp/desktop_mic_adapter_runtime/audio_chunks",
+  "delete_semantics": "delete_audio_chunks_before_session_discard",
+  "source_kind": "mic",
+  "future_forbidden_source_kinds_before_separate_approval": [
+    "file",
+    "system_audio"
+  ],
+  "command_transition_catalog": [
+    {
+      "command_id": "mic_adapter.prepare",
+      "allowed_current_states": [
+        "not_prepared"
+      ],
+      "requested_state_after": "prepared",
+      "safe_to_execute_now": false
+    },
+    {
+      "command_id": "mic_adapter.status",
+      "allowed_current_states": [
+        "not_prepared",
+        "prepared",
+        "recording",
+        "paused",
+        "stopped",
+        "deleted"
+      ],
+      "requested_state_after": "unchanged",
+      "safe_to_execute_now": false
+    },
+    {
+      "command_id": "mic_adapter.start",
+      "allowed_current_states": [
+        "prepared",
+        "stopped"
+      ],
+      "requested_state_after": "recording",
+      "safe_to_execute_now": false
+    },
+    {
+      "command_id": "mic_adapter.pause",
+      "allowed_current_states": [
+        "recording"
+      ],
+      "requested_state_after": "paused",
+      "safe_to_execute_now": false
+    },
+    {
+      "command_id": "mic_adapter.resume",
+      "allowed_current_states": [
+        "paused"
+      ],
+      "requested_state_after": "recording",
+      "safe_to_execute_now": false
+    },
+    {
+      "command_id": "mic_adapter.stop",
+      "allowed_current_states": [
+        "recording",
+        "paused"
+      ],
+      "requested_state_after": "stopped",
+      "safe_to_execute_now": false
+    },
+    {
+      "command_id": "mic_adapter.delete_audio_chunks",
+      "allowed_current_states": [
+        "stopped"
+      ],
+      "requested_state_after": "deleted",
+      "safe_to_execute_now": false
+    }
+  ],
+  "forbidden_roots": [
+    "configs/local",
+    "data/asr_eval/local_samples",
+    "data/asr_eval/samples",
+    "data/local_runtime",
+    "outputs"
+  ],
+  "safe_to_bind_mic_adapter_now": false,
+  "safe_to_accept_mic_command_now": false,
+  "safe_to_execute_mic_command_now": false,
+  "safe_to_select_input_device_now": false,
+  "safe_to_request_audio_permission_now": false,
+  "safe_to_capture_audio_now": false,
+  "safe_to_start_recording_now": false,
+  "safe_to_pause_recording_now": false,
+  "safe_to_resume_recording_now": false,
+  "safe_to_stop_recording_now": false,
+  "safe_to_write_audio_chunk_now": false,
+  "safe_to_read_audio_chunk_now": false,
+  "safe_to_delete_audio_chunks_now": false,
+  "safe_to_read_user_audio_now": false,
+  "safe_to_read_configs_local_now": false,
+  "safe_to_read_secret_now": false,
+  "safe_to_call_remote_asr_now": false,
+  "safe_to_call_llm_now": false,
+  "safe_to_download_models_now": false,
+  "safe_to_mutate_web_session_now": false,
+  "safe_to_run_tauri_or_cargo_now": false
+}

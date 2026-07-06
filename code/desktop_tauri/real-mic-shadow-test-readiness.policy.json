@@ -1,0 +1,37 @@
+{
+  "pcweb_id": "PCWEB-115",
+  "policy_name": "Real Mic Shadow Test Readiness Gate",
+  "policy_status": "real_mic_shadow_test_readiness_policy_only",
+  "default_quality_gate_status": "included_in_root_pytest",
+  "readiness_mode": "static_preflight_report_only",
+  "default_readiness_status": "blocked_not_ready_for_user_real_mic_shadow_test",
+  "forbidden_roots": [
+    "configs/local",
+    "data/asr_eval/local_samples",
+    "data/asr_eval/samples",
+    "data/local_runtime",
+    "outputs"
+  ],
+  "required_inputs": [
+    "asr_quality_decision_gate",
+    "real_tauri_noop_run_observed",
+    "worker_mic_source_manual_approval",
+    "real_mic_adapter_implementation_smoke",
+    "real_asr_worker_mic_source_smoke",
+    "shadow_report_export_feedback_readiness"
+  ],
+  "safe_to_access_microphone_from_gate_now": false,
+  "safe_to_enumerate_audio_devices_from_gate_now": false,
+  "safe_to_request_audio_permission_from_gate_now": false,
+  "safe_to_read_real_user_audio_from_gate_now": false,
+  "safe_to_write_audio_chunk_from_gate_now": false,
+  "safe_to_delete_audio_chunk_from_gate_now": false,
+  "safe_to_spawn_worker_from_gate_now": false,
+  "safe_to_run_tauri_or_cargo_from_gate_now": false,
+  "safe_to_read_configs_local_from_gate_now": false,
+  "safe_to_read_secret_from_gate_now": false,
+  "safe_to_call_remote_asr_from_gate_now": false,
+  "safe_to_call_llm_from_gate_now": false,
+  "safe_to_download_models_from_gate_now": false,
+  "safe_to_download_public_audio_from_gate_now": false
+}

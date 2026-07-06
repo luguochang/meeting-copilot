@@ -1,0 +1,107 @@
+{
+  "provider": "mock",
+  "summary": {
+    "sample_count": 4,
+    "failed_sample_count": 0,
+    "scored_cer_sample_count": 4,
+    "scored_entity_sample_count": 4,
+    "avg_cer": 0.0,
+    "avg_entity_f1": 1.0,
+    "latency": {
+      "count": 4,
+      "p50_ms": 0,
+      "p95_ms": 0,
+      "max_ms": 0
+    }
+  },
+  "samples": [
+    {
+      "id": "S01-api-review",
+      "scenario": "api_review",
+      "language": "zh-CN",
+      "status": "success",
+      "error": null,
+      "hypothesis": "我们这次接口新增 trace_id 字段，但是老版本调用方要兼容两个版本。张三下周三补充兼容性测试用例。上线的时候先灰度百分之十，如果错误率超过千分之一就回滚。",
+      "reference": "我们这次接口新增 trace_id 字段，但是老版本调用方要兼容两个版本。张三下周三补充兼容性测试用例。上线的时候先灰度百分之十，如果错误率超过千分之一就回滚。\n",
+      "cer": 0.0,
+      "entity_accuracy": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "missing": [],
+        "extra": []
+      },
+      "evaluation_status": {
+        "cer": "scored",
+        "entity_accuracy": "scored"
+      },
+      "latency_ms": 0
+    },
+    {
+      "id": "S02-release-review",
+      "scenario": "release_review",
+      "language": "zh-CN",
+      "status": "success",
+      "error": null,
+      "hypothesis": "这次 payment-gateway 先灰度 10%，如果 P99 超过 800 毫秒或者错误率超过 0.1% 就回滚。李四今天下班前补充 Grafana 看板和告警阈值。",
+      "reference": "这次 payment-gateway 先灰度 10%，如果 P99 超过 800 毫秒或者错误率超过 0.1% 就回滚。李四今天下班前补充 Grafana 看板和告警阈值。\n",
+      "cer": 0.0,
+      "entity_accuracy": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "missing": [],
+        "extra": []
+      },
+      "evaluation_status": {
+        "cer": "scored",
+        "entity_accuracy": "scored"
+      },
+      "latency_ms": 0
+    },
+    {
+      "id": "S03-incident-review",
+      "scenario": "incident_review",
+      "language": "zh-CN",
+      "status": "success",
+      "error": null,
+      "hypothesis": "昨晚 Redis 连接池耗尽导致 order-service 超时，P95 从 120 毫秒涨到 2 秒。王五负责本周五前补限流和连接池监控，复盘里要说明根因和预防措施。",
+      "reference": "昨晚 Redis 连接池耗尽导致 order-service 超时，P95 从 120 毫秒涨到 2 秒。王五负责本周五前补限流和连接池监控，复盘里要说明根因和预防措施。\n",
+      "cer": 0.0,
+      "entity_accuracy": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "missing": [],
+        "extra": []
+      },
+      "evaluation_status": {
+        "cer": "scored",
+        "entity_accuracy": "scored"
+      },
+      "latency_ms": 0
+    },
+    {
+      "id": "S04-mixed-terms",
+      "scenario": "mixed_terms",
+      "language": "zh-CN",
+      "status": "success",
+      "error": null,
+      "hypothesis": "这个 PR 会把 GET /api/v1/orders 的 response 增加 total_amount 字段，同时保留 amount 字段两个版本，避免 mobile-app 和 BI job 解析失败。",
+      "reference": "这个 PR 会把 GET /api/v1/orders 的 response 增加 total_amount 字段，同时保留 amount 字段两个版本，避免 mobile-app 和 BI job 解析失败。\n",
+      "cer": 0.0,
+      "entity_accuracy": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "missing": [],
+        "extra": []
+      },
+      "evaluation_status": {
+        "cer": "scored",
+        "entity_accuracy": "scored"
+      },
+      "latency_ms": 0
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "provider": "mock",
+  "summary": {
+    "sample_count": 1,
+    "failed_sample_count": 0,
+    "scored_cer_sample_count": 1,
+    "scored_entity_sample_count": 1,
+    "avg_cer": 0.0,
+    "avg_entity_f1": 1.0,
+    "latency": {
+      "count": 1,
+      "p50_ms": 0,
+      "p95_ms": 0,
+      "max_ms": 0
+    }
+  },
+  "samples": [
+    {
+      "id": "S01-api-review",
+      "scenario": "api_review",
+      "language": "zh-CN",
+      "status": "success",
+      "error": null,
+      "hypothesis": "我们这次接口新增 trace_id 字段，但是老版本调用方要兼容两个版本。张三下周三补充兼容性测试用例。上线的时候先灰度百分之十，如果错误率超过千分之一就回滚。",
+      "reference": "我们这次接口新增 trace_id 字段，但是老版本调用方要兼容两个版本。张三下周三补充兼容性测试用例。上线的时候先灰度百分之十，如果错误率超过千分之一就回滚。\n",
+      "cer": 0.0,
+      "entity_accuracy": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "missing": [],
+        "extra": []
+      },
+      "evaluation_status": {
+        "cer": "scored",
+        "entity_accuracy": "scored"
+      },
+      "latency_ms": 0
+    }
+  ]
+}

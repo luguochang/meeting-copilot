@@ -1,0 +1,141 @@
+{
+  "manifest_version": "public_audio_source_whitelist.v1",
+  "default_download_status": "not_started",
+  "safe_to_download_now": false,
+  "safe_to_read_user_audio": false,
+  "safe_to_read_configs_local": false,
+  "allowed_storage_roots": [
+    "data/asr_eval/public_raw",
+    "artifacts/tmp/public_audio"
+  ],
+  "forbidden_storage_roots": [
+    "configs/local",
+    "data/asr_eval/local_samples",
+    "data/asr_eval/samples",
+    "data/local_runtime",
+    "outputs"
+  ],
+  "observed_but_not_whitelisted_sources": [
+    {
+      "source_id": "magichub_web_meeting_candidate",
+      "name": "MagicHub / Mandarin Chinese Conversational Speech Corpus - Web Meeting",
+      "url": "https://magichub.com/datasets/mandarin-chinese-conversational-speech-corpus-web-meeting/",
+      "license": "CC BY-NC-ND 4.0",
+      "dataset_kind": "mandarin_web_meeting_candidate",
+      "reason_not_whitelisted": "Requires stricter human review because the license is non-commercial/no-derivatives and the source may require website access; do not use for automatic download, extraction, transformation, commercial validation, or product-value gates.",
+      "default_download_enabled": false,
+      "raw_audio_committed_to_repo": false,
+      "product_value_validation_allowed": false
+    },
+    {
+      "source_id": "magichub_ramc_conversational_candidate",
+      "name": "MagicData-RAMC Conversational Speech / OpenSLR SLR123",
+      "url": "https://www.openslr.org/123/",
+      "license": "CC BY-NC-ND 4.0",
+      "dataset_kind": "mandarin_spontaneous_conversation_candidate",
+      "reason_not_whitelisted": "Observed as a conversational supplement, but the license is non-commercial/no-derivatives and package size is still large; do not use for automatic download, extraction, transformation, commercial validation, or product-value gates.",
+      "default_download_enabled": false,
+      "raw_audio_committed_to_repo": false,
+      "product_value_validation_allowed": false
+    },
+    {
+      "source_id": "misp_meeting_noncommercial_candidate",
+      "name": "MISP-Meeting Corpus",
+      "url": "https://challenge.xfyun.cn/misp_dataset",
+      "license": "non-commercial research license",
+      "dataset_kind": "mandarin_multichannel_meeting_candidate",
+      "reason_not_whitelisted": "Strong meeting-acoustics candidate, but the license is non-commercial and requires separate human/legal review; do not use for automatic download, automatic evaluation, commercial validation, or product-value gates.",
+      "default_download_enabled": false,
+      "raw_audio_committed_to_repo": false,
+      "product_value_validation_allowed": false
+    },
+    {
+      "source_id": "common_voice_zh_cn_candidate",
+      "name": "Mozilla Common Voice zh-CN",
+      "url": "https://commonvoice.mozilla.org/",
+      "license": "CC0-1.0",
+      "dataset_kind": "mandarin_crowdsourced_read_speech_candidate",
+      "reason_not_whitelisted": "Legally friendly baseline candidate, but it is read short speech rather than meeting speech and the current zh-CN package is large; do not use for automatic download, automatic evaluation, or product-value gates.",
+      "default_download_enabled": false,
+      "raw_audio_committed_to_repo": false,
+      "product_value_validation_allowed": false
+    },
+    {
+      "source_id": "pycon_china_authorized_domain_candidate",
+      "name": "PyCon China technical conference recordings",
+      "url": "https://cn.pycon.org/2024/",
+      "license": "authorization required",
+      "dataset_kind": "mandarin_technical_conference_authorized_only",
+      "reason_not_whitelisted": "High domain relevance for Chinese technical vocabulary, but public viewing does not grant audio extraction, transcription, derivative processing, or commercial evaluation rights; do not use for automatic download, automatic evaluation, scraping, transformation, or product-value gates without written authorization and a human transcript plan.",
+      "default_download_enabled": false,
+      "raw_audio_committed_to_repo": false,
+      "product_value_validation_allowed": false
+    },
+    {
+      "source_id": "qcon_infoq_authorized_domain_candidate",
+      "name": "QCon / InfoQ technical conference recordings",
+      "url": "https://time.geekbang.org/course/intro/101031501",
+      "license": "authorization required",
+      "dataset_kind": "mandarin_architecture_conference_authorized_only",
+      "reason_not_whitelisted": "High domain relevance for architecture and engineering-practice vocabulary, but the recordings are platform/course content and may have speaker or enterprise publication restrictions; do not use for automatic download, automatic evaluation, scraping, transformation, or product-value gates without written authorization and a human transcript plan.",
+      "default_download_enabled": false,
+      "raw_audio_committed_to_repo": false,
+      "product_value_validation_allowed": false
+    },
+    {
+      "source_id": "wenetspeech_excluded_platform_audio",
+      "name": "WenetSpeech / OpenSLR SLR121",
+      "url": "https://www.openslr.org/121/",
+      "license": "CC BY 4.0 metadata with platform-audio provenance caveat",
+      "dataset_kind": "excluded_platform_audio_urls",
+      "reason_not_whitelisted": "Excluded because the corpus relies on YouTube and podcast source audio provenance; do not use for automatic download, automatic evaluation, scraping, extraction, transformation, commercial validation, or product-value gates.",
+      "default_download_enabled": false,
+      "raw_audio_committed_to_repo": false,
+      "product_value_validation_allowed": false
+    }
+  ],
+  "sources": [
+    {
+      "source_id": "aishell4_openslr_slr111",
+      "name": "AISHELL-4 / OpenSLR SLR111",
+      "url": "https://www.openslr.org/111/",
+      "license": "CC BY-SA 4.0",
+      "dataset_kind": "mandarin_multichannel_meeting",
+      "approx_size": "test.tar.gz 5.2G; full train sets 46G+",
+      "recommended_first_subset": "test metadata and a bounded small sample extraction plan only",
+      "use_boundary": "meeting acoustics, far-field, overlap, speaker turns, diarization risk",
+      "not_for": "product value validation or software-engineering gap usefulness proof",
+      "default_download_enabled": false,
+      "raw_audio_committed_to_repo": false,
+      "product_value_validation_allowed": false
+    },
+    {
+      "source_id": "alimeeting_openslr_slr119",
+      "name": "AliMeeting / OpenSLR SLR119",
+      "url": "https://www.openslr.org/119/",
+      "license": "CC BY-SA 4.0",
+      "dataset_kind": "mandarin_multichannel_multiparty_meeting",
+      "approx_size": "Eval_Ali.tar.gz 3.42G; Test_Ali.tar.gz 8.90G",
+      "recommended_first_subset": "Eval metadata and a bounded small sample extraction plan only",
+      "use_boundary": "real meeting ASR, near-field/far-field contrast, overlap and speaker turn behavior",
+      "not_for": "product value validation or software-engineering gap usefulness proof",
+      "default_download_enabled": false,
+      "raw_audio_committed_to_repo": false,
+      "product_value_validation_allowed": false
+    },
+    {
+      "source_id": "aishell1_openslr_slr33",
+      "name": "AISHELL-1 / OpenSLR SLR33",
+      "url": "https://www.openslr.org/33/",
+      "license": "Apache License v2.0",
+      "dataset_kind": "mandarin_read_speech",
+      "approx_size": "data_aishell.tgz 15G",
+      "recommended_first_subset": "metadata and a bounded small sample extraction plan only",
+      "use_boundary": "basic Mandarin ASR smoke and model/runtime sanity checks",
+      "not_for": "meeting acoustics, speaker overlap, or product value validation",
+      "default_download_enabled": false,
+      "raw_audio_committed_to_repo": false,
+      "product_value_validation_allowed": false
+    }
+  ]
+}

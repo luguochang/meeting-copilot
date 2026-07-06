@@ -1,0 +1,79 @@
+{
+  "script_id": "architecture-review-001",
+  "scenario": "architecture_review",
+  "language": "zh-CN",
+  "turns": [
+    {
+      "speaker": "A",
+      "text": "新的 recommendation-service 会依赖 feature-store 和 redis cluster。"
+    },
+    {
+      "speaker": "B",
+      "text": "QPS 峰值按两万估，缓存穿透时可能会打到 mysql。"
+    },
+    {
+      "speaker": "C",
+      "text": "降级方案先写在设计文档里，压测 owner 还没安排。"
+    }
+  ],
+  "technical_entities": [
+    "recommendation-service",
+    "feature-store",
+    "redis cluster",
+    "QPS",
+    "mysql"
+  ],
+  "expected_state_events": [
+    {
+      "event_type": "topic.created",
+      "target_type": "Topic",
+      "expected_text": "recommendation-service 架构评审"
+    },
+    {
+      "event_type": "risk.created",
+      "target_type": "Risk",
+      "expected_text": "缓存穿透打到 mysql"
+    },
+    {
+      "event_type": "open_question.created",
+      "target_type": "OpenQuestion",
+      "expected_text": "压测 owner 未安排"
+    }
+  ],
+  "expected_gap_candidates": [
+    "owner",
+    "test_verification",
+    "rollback"
+  ],
+  "expected_suggestion_cards": [
+    {
+      "card_id": "architecture-review-001-test-gap",
+      "gap_type": "test_verification",
+      "suggested_question": "是否需要现在确认压测 owner 和压测通过阈值？",
+      "evidence_span_required": true,
+      "trigger_window_seconds": {
+        "min": 0,
+        "max": 30
+      },
+      "should_show": true
+    },
+    {
+      "card_id": "architecture-review-001-rollback-gap",
+      "gap_type": "rollback",
+      "suggested_question": "缓存穿透风险如果出现，是否需要明确降级触发条件？",
+      "evidence_span_required": true,
+      "trigger_window_seconds": {
+        "min": 0,
+        "max": 30
+      },
+      "should_show": true
+    }
+  ],
+  "baseline_expectations": {
+    "transcript_only_detects_gap": false,
+    "summary_only_detects_within_window": false,
+    "copilot_should_detect_within_window": true
+  },
+  "expected_engineering_card_count_min": 1,
+  "expected_engineering_card_count_max": 3
+}

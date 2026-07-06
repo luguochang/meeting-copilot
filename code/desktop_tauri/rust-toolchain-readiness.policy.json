@@ -1,0 +1,111 @@
+{
+  "pcweb_id": "PCWEB-085",
+  "policy_name": "Desktop Rust Toolchain Readiness Policy",
+  "policy_status": "rust_toolchain_readiness_policy_only",
+  "default_quality_gate_status": "included_in_root_pytest",
+  "toolchain_probe_mode": "local_version_and_platform_probe_only",
+  "safe_to_install_toolchain_now": false,
+  "safe_to_modify_shell_profile_now": false,
+  "safe_to_run_cargo_check_now": false,
+  "safe_to_run_cargo_build_now": false,
+  "safe_to_run_tauri_dev_now": false,
+  "safe_to_run_tauri_build_now": false,
+  "safe_to_fetch_dependencies_now": false,
+  "safe_to_generate_cargo_lock_now": false,
+  "safe_to_generate_target_dir_now": false,
+  "safe_to_read_configs_local_now": false,
+  "allowed_probe_commands": [
+    ["rustc", "--version"],
+    ["cargo", "--version"],
+    ["rustup", "--version"],
+    ["xcode-select", "-p"]
+  ],
+  "probe_output_redaction_policy": {
+    "xcode_select_path": "presence_only"
+  },
+  "toolchain_component_policy": {
+    "required_for_first_cargo_check": [
+      "rustc",
+      "cargo"
+    ],
+    "recommended_for_toolchain_management": [
+      "rustup"
+    ],
+    "macos_required_platform_prerequisite": "xcode_command_line_tools"
+  },
+  "forbidden_commands": [
+    ["cargo", "check"],
+    ["cargo", "build"],
+    ["cargo", "tauri", "dev"],
+    ["cargo", "tauri", "build"],
+    ["rustup", "update"],
+    ["rustup", "toolchain", "install"],
+    ["curl", "https://sh.rustup.rs", "-sSf"],
+    ["sh", "rustup-init"],
+    ["npm", "install"],
+    ["npm", "ci"],
+    ["pnpm", "install"],
+    ["yarn", "install"],
+    ["npm", "run", "tauri", "dev"],
+    ["npm", "run", "tauri", "build"],
+    ["pnpm", "run", "tauri", "dev"],
+    ["pnpm", "run", "tauri", "build"],
+    ["yarn", "tauri", "dev"],
+    ["yarn", "tauri", "build"],
+    ["npx", "tauri", "dev"],
+    ["npx", "tauri", "build"],
+    ["sh", "-c"],
+    ["zsh", "-lc"],
+    ["bash", "-lc"]
+  ],
+  "forbidden_default_side_effects": [
+    "audio_permission_request",
+    "audio_device_enumeration",
+    "microphone_capture",
+    "system_audio_capture",
+    "asr_worker_spawn",
+    "provider_config_read",
+    "secret_read",
+    "configs_local_read",
+    "remote_asr_call",
+    "remote_llm_call",
+    "shell_profile_modification",
+    "installer_execution",
+    "dependency_download",
+    "cargo_artifact_generation",
+    "installer_creation",
+    "signing",
+    "notarization"
+  ],
+  "remaining_preconditions_before_first_cargo_check": [
+    "explicit_user_approval_for_first_cargo_check",
+    "rustc_available",
+    "cargo_available",
+    "macos_command_line_tools_available_or_non_macos_equivalent",
+    "pcweb_084_artifact_policy_acknowledged",
+    "first_dependency_resolution_network_fetch_approved_or_cache_preseeded",
+    "no_audio_worker_secret_remote_boundary_reconfirmed"
+  ],
+  "official_sources": [
+    {
+      "label": "Install Rust",
+      "url": "https://www.rust-lang.org/tools/install"
+    },
+    {
+      "label": "rustup components",
+      "url": "https://rust-lang.github.io/rustup/concepts/components.html"
+    },
+    {
+      "label": "Cargo check command",
+      "url": "https://doc.rust-lang.org/cargo/commands/cargo-check.html"
+    },
+    {
+      "label": "Cargo build cache",
+      "url": "https://doc.rust-lang.org/cargo/reference/build-cache.html"
+    },
+    {
+      "label": "Tauri v2 prerequisites",
+      "url": "https://v2.tauri.app/start/prerequisites/"
+    }
+  ]
+}

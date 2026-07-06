@@ -1,0 +1,236 @@
+{
+  "id": "release-review",
+  "title": "灰度上线评审会",
+  "source": "fixture",
+  "scenario_type": "release_review",
+  "expected_gap_rule_count": 2,
+  "expected_gate_tags": [
+    "AC-PCWEB-009",
+    "AC-PCWEB-010",
+    "AC-PCWEB-011",
+    "AC-PCWEB-013",
+    "AC-PCWEB-019"
+  ],
+  "session": {
+    "session_id": "demo_release_review_001",
+    "transcript_report": {
+      "provider": "fixture-funasr",
+      "latency_ms": 1800,
+      "rtf": 0.42,
+      "text": "payment-gateway 先灰度 10%。如果 P99 超过 800 毫秒或者错误率超过 0.1% 就回滚。这里还没有确认回滚负责人。李四上线后盯 P99 和错误率。",
+      "normalized_text": "payment-gateway 先灰度 10%。如果 P99 超过 800ms 或者错误率超过 0.1% 就回滚。这里还没有确认回滚负责人。李四上线后盯 P99 和错误率。",
+      "segments": [
+        {
+          "id": "seg_001",
+          "start_ms": 0,
+          "end_ms": 5000,
+          "text": "payment-gateway 先灰度 10%。",
+          "confidence": 0.91,
+          "finalized_at_ms": 6200
+        },
+        {
+          "id": "seg_002",
+          "start_ms": 5000,
+          "end_ms": 11000,
+          "text": "如果 P99 超过 800 毫秒或者错误率超过 0.1% 就回滚。",
+          "confidence": 0.9,
+          "finalized_at_ms": 12400
+        },
+        {
+          "id": "seg_003",
+          "start_ms": 11000,
+          "end_ms": 15000,
+          "text": "这里还没有确认回滚负责人。",
+          "confidence": 0.88,
+          "finalized_at_ms": 17200
+        },
+        {
+          "id": "seg_004",
+          "start_ms": 15000,
+          "end_ms": 19000,
+          "text": "李四上线后盯 P99 和错误率。",
+          "confidence": 0.9,
+          "finalized_at_ms": 21200
+        }
+      ],
+      "evidence_spans": [
+        {
+          "id": "ev_001",
+          "segment_id": "seg_001",
+          "start_ms": 0,
+          "end_ms": 5000,
+          "quote": "payment-gateway 先灰度 10%。"
+        },
+        {
+          "id": "ev_002",
+          "segment_id": "seg_002",
+          "start_ms": 5000,
+          "end_ms": 11000,
+          "quote": "如果 P99 超过 800 毫秒或者错误率超过 0.1% 就回滚。"
+        },
+        {
+          "id": "ev_003",
+          "segment_id": "seg_003",
+          "start_ms": 11000,
+          "end_ms": 15000,
+          "quote": "这里还没有确认回滚负责人。"
+        },
+        {
+          "id": "ev_004",
+          "segment_id": "seg_004",
+          "start_ms": 15000,
+          "end_ms": 19000,
+          "quote": "李四上线后盯 P99 和错误率。"
+        }
+      ]
+    },
+    "analysis": {
+      "summary": "讨论 payment-gateway 灰度上线、回滚阈值、上线监控责任人和缺失的回滚负责人。",
+      "meeting_context": {
+        "is_engineering_meeting": true,
+        "reason": "包含灰度比例、P99、错误率、回滚等发布评审要素。"
+      },
+      "states": {
+        "decision_candidates": [
+          {
+            "id": "decision_001",
+            "statement": "payment-gateway 先灰度 10%",
+            "evidence_span_ids": ["ev_001"]
+          },
+          {
+            "id": "decision_002",
+            "statement": "P99 超过 800ms 或错误率超过 0.1% 时回滚",
+            "evidence_span_ids": ["ev_002"]
+          }
+        ],
+        "action_items": [
+          {
+            "id": "action_001",
+            "description": "李四上线后盯 P99 和错误率",
+            "owner": "李四",
+            "evidence_span_ids": ["ev_004"]
+          }
+        ],
+        "risks": [
+          {
+            "id": "risk_001",
+            "description": "回滚负责人尚未确认，故障时可能无人执行回滚。",
+            "evidence_span_ids": ["ev_003"]
+          }
+        ],
+        "open_questions": [
+          {
+            "id": "question_001",
+            "question": "谁负责回滚？",
+            "evidence_span_ids": ["ev_003"]
+          }
+        ]
+      },
+      "suggestion_cards": [
+        {
+          "id": "card_001",
+          "type": "owner_gap",
+          "title": "确认回滚负责人",
+          "suggested_question": "是否需要现在确认 payment-gateway 的回滚负责人？",
+          "evidence_span_ids": ["ev_003"],
+          "state_refs": ["open_question:question_001", "risk:risk_001"],
+          "state_event_ids": ["event_003", "event_004"],
+          "gap_rule_id": "release.rollback.owner.required",
+          "trigger_reason": "已经形成灰度和回滚阈值，但回滚 owner 仍为空。",
+          "trigger_source": "state_gap_detector",
+          "final_segment_at_ms": 17200,
+          "state_event_at_ms": 18200,
+          "card_created_at_ms": 23100,
+          "latency_ms": 5900,
+          "prompt_version": "suggestion-card.v1",
+          "model": "gpt-5.5",
+          "usage": {
+            "prompt_tokens": 210,
+            "completion_tokens": 88,
+            "total_tokens": 298
+          },
+          "schema_result": "valid",
+          "show_or_silence_decision": "show",
+          "segment_batch": ["seg_003"]
+        },
+        {
+          "id": "card_002",
+          "type": "rollback_gap",
+          "title": "补齐回滚执行步骤",
+          "suggested_question": "除了 P99 和错误率阈值，是否需要明确触发回滚后的执行步骤和演练确认？",
+          "evidence_span_ids": ["ev_002", "ev_003"],
+          "state_refs": ["decision_candidate:decision_002", "risk:risk_001"],
+          "state_event_ids": ["event_002", "event_003"],
+          "gap_rule_id": "release.rollback.drill.required",
+          "trigger_reason": "已给出回滚阈值，但回滚执行步骤和演练确认尚未闭环。",
+          "trigger_source": "state_gap_detector",
+          "final_segment_at_ms": 17200,
+          "state_event_at_ms": 18000,
+          "card_created_at_ms": 22800,
+          "latency_ms": 5600,
+          "prompt_version": "suggestion-card.v1",
+          "model": "gpt-5.5",
+          "usage": {
+            "prompt_tokens": 205,
+            "completion_tokens": 84,
+            "total_tokens": 289
+          },
+          "schema_result": "valid",
+          "show_or_silence_decision": "show",
+          "segment_batch": ["seg_002", "seg_003"]
+        }
+      ]
+    },
+    "state_events": [
+      {
+        "id": "event_001",
+        "target_type": "DecisionCandidate",
+        "target_id": "decision_001",
+        "event_type": "created",
+        "created_at_ms": 7000,
+        "evidence_span_ids": ["ev_001"]
+      },
+      {
+        "id": "event_002",
+        "target_type": "DecisionCandidate",
+        "target_id": "decision_002",
+        "event_type": "created",
+        "created_at_ms": 13400,
+        "evidence_span_ids": ["ev_002"]
+      },
+      {
+        "id": "event_003",
+        "target_type": "Risk",
+        "target_id": "risk_001",
+        "event_type": "created",
+        "created_at_ms": 18000,
+        "evidence_span_ids": ["ev_003"]
+      },
+      {
+        "id": "event_004",
+        "target_type": "OpenQuestion",
+        "target_id": "question_001",
+        "event_type": "created",
+        "created_at_ms": 18200,
+        "evidence_span_ids": ["ev_003"]
+      },
+      {
+        "id": "event_005",
+        "target_type": "ActionItem",
+        "target_id": "action_001",
+        "event_type": "created",
+        "created_at_ms": 21600,
+        "evidence_span_ids": ["ev_004"]
+      }
+    ],
+    "llm_usage": {
+      "model": "gpt-5.5",
+      "call_count": 1,
+      "usage": {
+        "prompt_tokens": 415,
+        "completion_tokens": 172,
+        "total_tokens": 587
+      }
+    }
+  }
+}

@@ -1,0 +1,94 @@
+{
+  "id": "business-sync",
+  "title": "商务行政同步会",
+  "source": "fixture",
+  "scenario_type": "business_admin",
+  "expected_gap_rule_count": 0,
+  "expected_gate_tags": [
+    "AC-PCWEB-014",
+    "BOUNDARY-006"
+  ],
+  "session": {
+    "session_id": "demo_business_sync_001",
+    "transcript_report": {
+      "provider": "fixture-funasr",
+      "latency_ms": 1200,
+      "rtf": 0.31,
+      "text": "这周行政采购预算先按三万控制。会议室投影仪报价让王敏下午确认。下周团建地点先看两个方案。",
+      "normalized_text": "这周行政采购预算先按三万控制。会议室投影仪报价让王敏下午确认。下周团建地点先看两个方案。",
+      "segments": [
+        {
+          "id": "seg_001",
+          "start_ms": 0,
+          "end_ms": 5200,
+          "text": "这周行政采购预算先按三万控制。",
+          "confidence": 0.93,
+          "finalized_at_ms": 6200
+        },
+        {
+          "id": "seg_002",
+          "start_ms": 5200,
+          "end_ms": 10400,
+          "text": "会议室投影仪报价让王敏下午确认。",
+          "confidence": 0.92,
+          "finalized_at_ms": 11600
+        },
+        {
+          "id": "seg_003",
+          "start_ms": 10400,
+          "end_ms": 15200,
+          "text": "下周团建地点先看两个方案。",
+          "confidence": 0.91,
+          "finalized_at_ms": 16600
+        }
+      ],
+      "evidence_spans": [
+        {
+          "id": "ev_001",
+          "segment_id": "seg_001",
+          "start_ms": 0,
+          "end_ms": 5200,
+          "quote": "这周行政采购预算先按三万控制。"
+        },
+        {
+          "id": "ev_002",
+          "segment_id": "seg_002",
+          "start_ms": 5200,
+          "end_ms": 10400,
+          "quote": "会议室投影仪报价让王敏下午确认。"
+        },
+        {
+          "id": "ev_003",
+          "segment_id": "seg_003",
+          "start_ms": 10400,
+          "end_ms": 15200,
+          "quote": "下周团建地点先看两个方案。"
+        }
+      ]
+    },
+    "analysis": {
+      "summary": "讨论行政采购预算、投影仪报价和团建地点，没有软件工程决策。",
+      "meeting_context": {
+        "is_engineering_meeting": false,
+        "reason": "内容是行政采购和团队活动安排，不包含软件工程决策、测试、上线或回滚讨论。"
+      },
+      "states": {
+        "decision_candidates": [],
+        "action_items": [],
+        "risks": [],
+        "open_questions": []
+      },
+      "suggestion_cards": []
+    },
+    "state_events": [],
+    "llm_usage": {
+      "model": "gpt-5.5",
+      "call_count": 1,
+      "usage": {
+        "prompt_tokens": 118,
+        "completion_tokens": 32,
+        "total_tokens": 150
+      }
+    }
+  }
+}

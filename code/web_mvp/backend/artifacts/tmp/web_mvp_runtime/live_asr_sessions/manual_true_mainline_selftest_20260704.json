@@ -1,0 +1,2819 @@
+{
+  "events": [
+    {
+      "at_ms": 2000,
+      "event_type": "transcript_partial",
+      "id": "transcript_partial:long_shadow_seg_001",
+      "payload": {
+        "confidence": 0.74,
+        "end_ms": 1800,
+        "is_final": false,
+        "segment_id": "long_shadow_seg_001",
+        "start_ms": 0,
+        "text": "我们先看 architecture"
+      },
+      "sequence": 1,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 27600,
+      "event_type": "transcript_final",
+      "id": "transcript_final:long_shadow_seg_001",
+      "payload": {
+        "confidence": 0.88,
+        "end_ms": 26000,
+        "evidence_spans": [
+          {
+            "end_ms": 26000,
+            "id": "asr_ev_long_shadow_seg_001",
+            "quote": "我们先看 architecture review，recommendation-service 先灰度 10%。",
+            "segment_id": "long_shadow_seg_001",
+            "start_ms": 0,
+            "status": "active"
+          }
+        ],
+        "is_final": true,
+        "segment_id": "long_shadow_seg_001",
+        "start_ms": 0,
+        "text": "我们先看 architecture review，recommendation-service 先灰度 10%。"
+      },
+      "sequence": 2,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 27600,
+      "event_type": "state_event",
+      "id": "state:asr_state_event_long_shadow_seg_001",
+      "payload": {
+        "event_id": "asr_state_event_long_shadow_seg_001",
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_001"
+        ],
+        "state_event_type": "created",
+        "state_item": {
+          "evidence_span_ids": [
+            "asr_ev_long_shadow_seg_001"
+          ],
+          "id": "asr_decision_long_shadow_seg_001",
+          "source": "live_asr_stream",
+          "state_origin": "local_deterministic_asr_skeleton",
+          "statement": "我们先看 architecture review，recommendation-service 先灰度 10%。"
+        },
+        "target_id": "asr_decision_long_shadow_seg_001",
+        "target_type": "DecisionCandidate"
+      },
+      "sequence": 3,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 27600,
+      "event_type": "scheduler_event",
+      "id": "scheduler:asr_state_event_long_shadow_seg_001",
+      "payload": {
+        "budget_remaining": 79,
+        "call_count_last_hour": 1,
+        "card_id": "",
+        "cooldown_remaining_ms": 0,
+        "decision_reason": "state_change",
+        "gap_rule_id": "asr.state_candidate.review",
+        "llm_call_status": "not_called",
+        "model": "not-called",
+        "prompt_version": "not-called",
+        "scheduler_event_type": "llm_candidate_queued",
+        "segment_batch": [
+          "long_shadow_seg_001"
+        ],
+        "source_event_ids": [
+          "asr_state_event_long_shadow_seg_001"
+        ],
+        "trigger_reason": "state_change",
+        "trigger_source": "live_asr_scheduler_log",
+        "would_call_llm": true
+      },
+      "sequence": 4,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 27600,
+      "event_type": "suggestion_candidate_event",
+      "id": "suggestion_candidate:asr_state_event_long_shadow_seg_001",
+      "payload": {
+        "candidate_id": "asr_suggestion_candidate_asr_state_event_long_shadow_seg_001",
+        "candidate_origin": "local_deterministic_asr_skeleton",
+        "candidate_policy_version": "asr-candidate-policy.v1",
+        "candidate_type": "state_gap_review",
+        "card_status": "not_created",
+        "confidence": 0.9,
+        "confidence_level": "high",
+        "confidence_source": "local_deterministic_heuristic",
+        "decision_reason": "state_change",
+        "degradation_reasons": [],
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_001"
+        ],
+        "gap_rule_id": "release.rollback.owner.required",
+        "llm_call_status": "not_called",
+        "scheduler_event_type": "llm_candidate_queued",
+        "segment_batch": [
+          "long_shadow_seg_001"
+        ],
+        "source": "live_asr_stream",
+        "source_event_ids": [
+          "asr_state_event_long_shadow_seg_001"
+        ],
+        "suggested_prompt": "确认决策是否包含 owner、回滚条件和监控口径。",
+        "target_id": "asr_decision_long_shadow_seg_001",
+        "target_type": "DecisionCandidate",
+        "trigger_reason": "Live ASR captured a decision candidate that may need release-readiness review."
+      },
+      "sequence": 5,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 27600,
+      "event_type": "llm_request_draft_event",
+      "id": "llm_request_draft:asr_state_event_long_shadow_seg_001",
+      "payload": {
+        "candidate_confidence": 0.9,
+        "candidate_confidence_level": "high",
+        "candidate_degradation_reasons": [],
+        "card_status": "not_created",
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_001"
+        ],
+        "gap_rule_id": "release.rollback.owner.required",
+        "input_summary": "DecisionCandidate asr_decision_long_shadow_seg_001 from long_shadow_seg_001 using asr_ev_long_shadow_seg_001",
+        "llm_call_status": "not_called",
+        "model": "not-called",
+        "prompt_version": "not-called",
+        "request_id": "asr_llm_request_draft_asr_suggestion_candidate_asr_state_event_long_shadow_seg_001",
+        "request_origin": "local_deterministic_asr_request_draft",
+        "request_status": "draft_only",
+        "request_type": "llm_suggestion_card_draft",
+        "schema_status": "not_generated",
+        "segment_batch": [
+          "long_shadow_seg_001"
+        ],
+        "source": "live_asr_stream",
+        "source_event_ids": [
+          "asr_state_event_long_shadow_seg_001"
+        ],
+        "suggested_prompt": "确认决策是否包含 owner、回滚条件和监控口径。",
+        "target_candidate_id": "asr_suggestion_candidate_asr_state_event_long_shadow_seg_001",
+        "target_id": "asr_decision_long_shadow_seg_001",
+        "target_type": "DecisionCandidate"
+      },
+      "sequence": 6,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 33800,
+      "event_type": "transcript_revision",
+      "id": "transcript_revision:long_shadow_seg_001_rev1",
+      "payload": {
+        "confidence": 0.93,
+        "end_ms": 27000,
+        "evidence_spans": [
+          {
+            "end_ms": 27000,
+            "id": "asr_ev_long_shadow_seg_001_rev1",
+            "quote": "我们先看 architecture review，recommendation-service 先灰度 5%，不是 10%。",
+            "revision_of": "asr_ev_long_shadow_seg_001",
+            "segment_id": "long_shadow_seg_001_rev1",
+            "start_ms": 0,
+            "status": "active"
+          }
+        ],
+        "is_final": true,
+        "revision_of": "long_shadow_seg_001",
+        "segment_id": "long_shadow_seg_001_rev1",
+        "start_ms": 0,
+        "superseded_evidence_spans": [
+          {
+            "end_ms": 26000,
+            "id": "asr_ev_long_shadow_seg_001",
+            "quote": "我们先看 architecture review，recommendation-service 先灰度 10%。",
+            "replaced_by": "asr_ev_long_shadow_seg_001_rev1",
+            "segment_id": "long_shadow_seg_001",
+            "start_ms": 0,
+            "status": "superseded"
+          }
+        ],
+        "supersedes_segment_id": "long_shadow_seg_001",
+        "text": "我们先看 architecture review，recommendation-service 先灰度 5%，不是 10%。"
+      },
+      "sequence": 7,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 33800,
+      "event_type": "state_event",
+      "id": "state:asr_state_event_long_shadow_seg_001_rev1",
+      "payload": {
+        "event_id": "asr_state_event_long_shadow_seg_001_rev1",
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_001_rev1"
+        ],
+        "state_event_type": "created",
+        "state_item": {
+          "evidence_span_ids": [
+            "asr_ev_long_shadow_seg_001_rev1"
+          ],
+          "id": "asr_decision_long_shadow_seg_001_rev1",
+          "source": "live_asr_stream",
+          "state_origin": "local_deterministic_asr_skeleton",
+          "statement": "我们先看 architecture review，recommendation-service 先灰度 5%，不是 10%。"
+        },
+        "target_id": "asr_decision_long_shadow_seg_001_rev1",
+        "target_type": "DecisionCandidate"
+      },
+      "sequence": 8,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 33800,
+      "event_type": "scheduler_event",
+      "id": "scheduler:asr_state_event_long_shadow_seg_001_rev1",
+      "payload": {
+        "budget_remaining": 79,
+        "call_count_last_hour": 1,
+        "card_id": "",
+        "cooldown_remaining_ms": 3800,
+        "decision_reason": "cooldown",
+        "gap_rule_id": "asr.state_candidate.review",
+        "llm_call_status": "not_called",
+        "model": "not-called",
+        "prompt_version": "not-called",
+        "scheduler_event_type": "llm_candidate_skipped",
+        "segment_batch": [
+          "long_shadow_seg_001_rev1"
+        ],
+        "source_event_ids": [
+          "asr_state_event_long_shadow_seg_001_rev1"
+        ],
+        "trigger_reason": "cooldown",
+        "trigger_source": "live_asr_scheduler_log",
+        "would_call_llm": false
+      },
+      "sequence": 9,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 33800,
+      "event_type": "suggestion_candidate_event",
+      "id": "suggestion_candidate:asr_state_event_long_shadow_seg_001_rev1",
+      "payload": {
+        "candidate_id": "asr_suggestion_candidate_asr_state_event_long_shadow_seg_001_rev1",
+        "candidate_origin": "local_deterministic_asr_skeleton",
+        "candidate_policy_version": "asr-candidate-policy.v1",
+        "candidate_type": "state_gap_review",
+        "card_status": "not_created",
+        "confidence": 0.9,
+        "confidence_level": "high",
+        "confidence_source": "local_deterministic_heuristic",
+        "decision_reason": "cooldown",
+        "degradation_reasons": [],
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_001_rev1"
+        ],
+        "gap_rule_id": "release.rollback.owner.required",
+        "llm_call_status": "not_called",
+        "scheduler_event_type": "llm_candidate_skipped",
+        "segment_batch": [
+          "long_shadow_seg_001_rev1"
+        ],
+        "source": "live_asr_stream",
+        "source_event_ids": [
+          "asr_state_event_long_shadow_seg_001_rev1"
+        ],
+        "suggested_prompt": "确认决策是否包含 owner、回滚条件和监控口径。",
+        "target_id": "asr_decision_long_shadow_seg_001_rev1",
+        "target_type": "DecisionCandidate",
+        "trigger_reason": "Live ASR captured a decision candidate that may need release-readiness review."
+      },
+      "sequence": 10,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 33800,
+      "event_type": "llm_request_draft_event",
+      "id": "llm_request_draft:asr_state_event_long_shadow_seg_001_rev1",
+      "payload": {
+        "candidate_confidence": 0.9,
+        "candidate_confidence_level": "high",
+        "candidate_degradation_reasons": [],
+        "card_status": "not_created",
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_001_rev1"
+        ],
+        "gap_rule_id": "release.rollback.owner.required",
+        "input_summary": "DecisionCandidate asr_decision_long_shadow_seg_001_rev1 from long_shadow_seg_001_rev1 using asr_ev_long_shadow_seg_001_rev1",
+        "llm_call_status": "not_called",
+        "model": "not-called",
+        "prompt_version": "not-called",
+        "request_id": "asr_llm_request_draft_asr_suggestion_candidate_asr_state_event_long_shadow_seg_001_rev1",
+        "request_origin": "local_deterministic_asr_request_draft",
+        "request_status": "draft_only",
+        "request_type": "llm_suggestion_card_draft",
+        "schema_status": "not_generated",
+        "segment_batch": [
+          "long_shadow_seg_001_rev1"
+        ],
+        "source": "live_asr_stream",
+        "source_event_ids": [
+          "asr_state_event_long_shadow_seg_001_rev1"
+        ],
+        "suggested_prompt": "确认决策是否包含 owner、回滚条件和监控口径。",
+        "target_candidate_id": "asr_suggestion_candidate_asr_state_event_long_shadow_seg_001_rev1",
+        "target_id": "asr_decision_long_shadow_seg_001_rev1",
+        "target_type": "DecisionCandidate"
+      },
+      "sequence": 11,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 67600,
+      "event_type": "transcript_final",
+      "id": "transcript_final:long_shadow_seg_002",
+      "payload": {
+        "confidence": 0.89,
+        "end_ms": 65000,
+        "evidence_spans": [
+          {
+            "end_ms": 65000,
+            "id": "asr_ev_long_shadow_seg_002",
+            "quote": "谁确认降级开关 owner？feature flag 半夜触发时值班群怎么通知？",
+            "segment_id": "long_shadow_seg_002",
+            "start_ms": 36000,
+            "status": "active"
+          }
+        ],
+        "is_final": true,
+        "segment_id": "long_shadow_seg_002",
+        "start_ms": 36000,
+        "text": "谁确认降级开关 owner？feature flag 半夜触发时值班群怎么通知？"
+      },
+      "sequence": 12,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 67600,
+      "event_type": "state_event",
+      "id": "state:asr_question_event_long_shadow_seg_002",
+      "payload": {
+        "event_id": "asr_question_event_long_shadow_seg_002",
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_002"
+        ],
+        "state_event_type": "created",
+        "state_item": {
+          "evidence_span_ids": [
+            "asr_ev_long_shadow_seg_002"
+          ],
+          "id": "asr_question_long_shadow_seg_002",
+          "question": "谁确认降级开关 owner？feature flag 半夜触发时值班群怎么通知？",
+          "source": "live_asr_stream",
+          "state_origin": "local_deterministic_asr_skeleton"
+        },
+        "target_id": "asr_question_long_shadow_seg_002",
+        "target_type": "OpenQuestion"
+      },
+      "sequence": 13,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 67600,
+      "event_type": "scheduler_event",
+      "id": "scheduler:asr_question_event_long_shadow_seg_002",
+      "payload": {
+        "budget_remaining": 78,
+        "call_count_last_hour": 2,
+        "card_id": "",
+        "cooldown_remaining_ms": 0,
+        "decision_reason": "state_change",
+        "gap_rule_id": "asr.state_candidate.review",
+        "llm_call_status": "not_called",
+        "model": "not-called",
+        "prompt_version": "not-called",
+        "scheduler_event_type": "llm_candidate_queued",
+        "segment_batch": [
+          "long_shadow_seg_002"
+        ],
+        "source_event_ids": [
+          "asr_question_event_long_shadow_seg_002"
+        ],
+        "trigger_reason": "state_change",
+        "trigger_source": "live_asr_scheduler_log",
+        "would_call_llm": true
+      },
+      "sequence": 14,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 67600,
+      "event_type": "suggestion_candidate_event",
+      "id": "suggestion_candidate:asr_question_event_long_shadow_seg_002",
+      "payload": {
+        "candidate_id": "asr_suggestion_candidate_asr_question_event_long_shadow_seg_002",
+        "candidate_origin": "local_deterministic_asr_skeleton",
+        "candidate_policy_version": "asr-candidate-policy.v1",
+        "candidate_type": "state_gap_review",
+        "card_status": "not_created",
+        "confidence": 0.9,
+        "confidence_level": "high",
+        "confidence_source": "local_deterministic_heuristic",
+        "decision_reason": "state_change",
+        "degradation_reasons": [],
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_002"
+        ],
+        "gap_rule_id": "open.question.followup",
+        "llm_call_status": "not_called",
+        "scheduler_event_type": "llm_candidate_queued",
+        "segment_batch": [
+          "long_shadow_seg_002"
+        ],
+        "source": "live_asr_stream",
+        "source_event_ids": [
+          "asr_question_event_long_shadow_seg_002"
+        ],
+        "suggested_prompt": "确认未闭环问题是否需要现场追问或记录 owner。",
+        "target_id": "asr_question_long_shadow_seg_002",
+        "target_type": "OpenQuestion",
+        "trigger_reason": "Live ASR captured an open question that may need follow-up."
+      },
+      "sequence": 15,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 67600,
+      "event_type": "llm_request_draft_event",
+      "id": "llm_request_draft:asr_question_event_long_shadow_seg_002",
+      "payload": {
+        "candidate_confidence": 0.9,
+        "candidate_confidence_level": "high",
+        "candidate_degradation_reasons": [],
+        "card_status": "not_created",
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_002"
+        ],
+        "gap_rule_id": "open.question.followup",
+        "input_summary": "OpenQuestion asr_question_long_shadow_seg_002 from long_shadow_seg_002 using asr_ev_long_shadow_seg_002",
+        "llm_call_status": "not_called",
+        "model": "not-called",
+        "prompt_version": "not-called",
+        "request_id": "asr_llm_request_draft_asr_suggestion_candidate_asr_question_event_long_shadow_seg_002",
+        "request_origin": "local_deterministic_asr_request_draft",
+        "request_status": "draft_only",
+        "request_type": "llm_suggestion_card_draft",
+        "schema_status": "not_generated",
+        "segment_batch": [
+          "long_shadow_seg_002"
+        ],
+        "source": "live_asr_stream",
+        "source_event_ids": [
+          "asr_question_event_long_shadow_seg_002"
+        ],
+        "suggested_prompt": "确认未闭环问题是否需要现场追问或记录 owner。",
+        "target_candidate_id": "asr_suggestion_candidate_asr_question_event_long_shadow_seg_002",
+        "target_id": "asr_question_long_shadow_seg_002",
+        "target_type": "OpenQuestion"
+      },
+      "sequence": 16,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 76000,
+      "event_type": "transcript_partial",
+      "id": "transcript_partial:long_shadow_seg_003",
+      "payload": {
+        "confidence": 0.77,
+        "end_ms": 74200,
+        "is_final": false,
+        "segment_id": "long_shadow_seg_003",
+        "start_ms": 72000,
+        "text": "如果 Redis cluster"
+      },
+      "sequence": 17,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 106500,
+      "event_type": "transcript_final",
+      "id": "transcript_final:long_shadow_seg_003",
+      "payload": {
+        "confidence": 0.87,
+        "end_ms": 104000,
+        "evidence_spans": [
+          {
+            "end_ms": 104000,
+            "id": "asr_ev_long_shadow_seg_003",
+            "quote": "如果 Redis cluster 缓存穿透打到 MySQL，P99 超过 900ms 就触发 rollback。",
+            "segment_id": "long_shadow_seg_003",
+            "start_ms": 72000,
+            "status": "active"
+          }
+        ],
+        "is_final": true,
+        "segment_id": "long_shadow_seg_003",
+        "start_ms": 72000,
+        "text": "如果 Redis cluster 缓存穿透打到 MySQL，P99 超过 900ms 就触发 rollback。"
+      },
+      "sequence": 18,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 106500,
+      "event_type": "state_event",
+      "id": "state:asr_risk_event_long_shadow_seg_003",
+      "payload": {
+        "event_id": "asr_risk_event_long_shadow_seg_003",
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_003"
+        ],
+        "state_event_type": "created",
+        "state_item": {
+          "description": "如果 Redis cluster 缓存穿透打到 MySQL，P99 超过 900ms 就触发 rollback。",
+          "evidence_span_ids": [
+            "asr_ev_long_shadow_seg_003"
+          ],
+          "id": "asr_risk_long_shadow_seg_003",
+          "impact": "condition_exceeded",
+          "mitigation": "",
+          "source": "live_asr_stream",
+          "state_origin": "local_deterministic_asr_skeleton",
+          "status": "open"
+        },
+        "target_id": "asr_risk_long_shadow_seg_003",
+        "target_type": "Risk"
+      },
+      "sequence": 19,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 106500,
+      "event_type": "scheduler_event",
+      "id": "scheduler:asr_risk_event_long_shadow_seg_003",
+      "payload": {
+        "budget_remaining": 77,
+        "call_count_last_hour": 3,
+        "card_id": "",
+        "cooldown_remaining_ms": 0,
+        "decision_reason": "state_change",
+        "gap_rule_id": "asr.state_candidate.review",
+        "llm_call_status": "not_called",
+        "model": "not-called",
+        "prompt_version": "not-called",
+        "scheduler_event_type": "llm_candidate_queued",
+        "segment_batch": [
+          "long_shadow_seg_003"
+        ],
+        "source_event_ids": [
+          "asr_risk_event_long_shadow_seg_003"
+        ],
+        "trigger_reason": "state_change",
+        "trigger_source": "live_asr_scheduler_log",
+        "would_call_llm": true
+      },
+      "sequence": 20,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 106500,
+      "event_type": "suggestion_candidate_event",
+      "id": "suggestion_candidate:asr_risk_event_long_shadow_seg_003",
+      "payload": {
+        "candidate_id": "asr_suggestion_candidate_asr_risk_event_long_shadow_seg_003",
+        "candidate_origin": "local_deterministic_asr_skeleton",
+        "candidate_policy_version": "asr-candidate-policy.v1",
+        "candidate_type": "state_gap_review",
+        "card_status": "not_created",
+        "confidence": 0.8,
+        "confidence_level": "high",
+        "confidence_source": "local_deterministic_heuristic",
+        "decision_reason": "state_change",
+        "degradation_reasons": [
+          "risk_mitigation_missing"
+        ],
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_003"
+        ],
+        "gap_rule_id": "risk.rollback.validation",
+        "llm_call_status": "not_called",
+        "scheduler_event_type": "llm_candidate_queued",
+        "segment_batch": [
+          "long_shadow_seg_003"
+        ],
+        "source": "live_asr_stream",
+        "source_event_ids": [
+          "asr_risk_event_long_shadow_seg_003"
+        ],
+        "suggested_prompt": "确认风险触发条件、回滚动作和监控指标是否明确。",
+        "target_id": "asr_risk_long_shadow_seg_003",
+        "target_type": "Risk",
+        "trigger_reason": "Live ASR captured a risk candidate that may need mitigation validation."
+      },
+      "sequence": 21,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 106500,
+      "event_type": "llm_request_draft_event",
+      "id": "llm_request_draft:asr_risk_event_long_shadow_seg_003",
+      "payload": {
+        "candidate_confidence": 0.8,
+        "candidate_confidence_level": "high",
+        "candidate_degradation_reasons": [
+          "risk_mitigation_missing"
+        ],
+        "card_status": "not_created",
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_003"
+        ],
+        "gap_rule_id": "risk.rollback.validation",
+        "input_summary": "Risk asr_risk_long_shadow_seg_003 from long_shadow_seg_003 using asr_ev_long_shadow_seg_003",
+        "llm_call_status": "not_called",
+        "model": "not-called",
+        "prompt_version": "not-called",
+        "request_id": "asr_llm_request_draft_asr_suggestion_candidate_asr_risk_event_long_shadow_seg_003",
+        "request_origin": "local_deterministic_asr_request_draft",
+        "request_status": "draft_only",
+        "request_type": "llm_suggestion_card_draft",
+        "schema_status": "not_generated",
+        "segment_batch": [
+          "long_shadow_seg_003"
+        ],
+        "source": "live_asr_stream",
+        "source_event_ids": [
+          "asr_risk_event_long_shadow_seg_003"
+        ],
+        "suggested_prompt": "确认风险触发条件、回滚动作和监控指标是否明确。",
+        "target_candidate_id": "asr_suggestion_candidate_asr_risk_event_long_shadow_seg_003",
+        "target_id": "asr_risk_long_shadow_seg_003",
+        "target_type": "Risk"
+      },
+      "sequence": 22,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 150000,
+      "event_type": "transcript_final",
+      "id": "transcript_final:long_shadow_seg_004",
+      "payload": {
+        "confidence": 0.91,
+        "end_ms": 148000,
+        "evidence_spans": [
+          {
+            "end_ms": 148000,
+            "id": "asr_ev_long_shadow_seg_004",
+            "quote": "李四明天补充 idempotency-key 重试和 callback 失败的兼容测试。",
+            "segment_id": "long_shadow_seg_004",
+            "start_ms": 116000,
+            "status": "active"
+          }
+        ],
+        "is_final": true,
+        "segment_id": "long_shadow_seg_004",
+        "start_ms": 116000,
+        "text": "李四明天补充 idempotency-key 重试和 callback 失败的兼容测试。"
+      },
+      "sequence": 23,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 150000,
+      "event_type": "state_event",
+      "id": "state:asr_action_event_long_shadow_seg_004",
+      "payload": {
+        "event_id": "asr_action_event_long_shadow_seg_004",
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_004"
+        ],
+        "state_event_type": "created",
+        "state_item": {
+          "deadline": "明天",
+          "description": "李四明天补充 idempotency-key 重试和 callback 失败的兼容测试。",
+          "evidence_span_ids": [
+            "asr_ev_long_shadow_seg_004"
+          ],
+          "id": "asr_action_long_shadow_seg_004",
+          "owner": "李四",
+          "source": "live_asr_stream",
+          "state_origin": "local_deterministic_asr_skeleton",
+          "status": "candidate"
+        },
+        "target_id": "asr_action_long_shadow_seg_004",
+        "target_type": "ActionItem"
+      },
+      "sequence": 24,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 150000,
+      "event_type": "scheduler_event",
+      "id": "scheduler:asr_action_event_long_shadow_seg_004",
+      "payload": {
+        "budget_remaining": 76,
+        "call_count_last_hour": 4,
+        "card_id": "",
+        "cooldown_remaining_ms": 0,
+        "decision_reason": "state_change",
+        "gap_rule_id": "asr.state_candidate.review",
+        "llm_call_status": "not_called",
+        "model": "not-called",
+        "prompt_version": "not-called",
+        "scheduler_event_type": "llm_candidate_queued",
+        "segment_batch": [
+          "long_shadow_seg_004"
+        ],
+        "source_event_ids": [
+          "asr_action_event_long_shadow_seg_004"
+        ],
+        "trigger_reason": "state_change",
+        "trigger_source": "live_asr_scheduler_log",
+        "would_call_llm": true
+      },
+      "sequence": 25,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 150000,
+      "event_type": "suggestion_candidate_event",
+      "id": "suggestion_candidate:asr_action_event_long_shadow_seg_004",
+      "payload": {
+        "candidate_id": "asr_suggestion_candidate_asr_action_event_long_shadow_seg_004",
+        "candidate_origin": "local_deterministic_asr_skeleton",
+        "candidate_policy_version": "asr-candidate-policy.v1",
+        "candidate_type": "state_gap_review",
+        "card_status": "not_created",
+        "confidence": 0.9,
+        "confidence_level": "high",
+        "confidence_source": "local_deterministic_heuristic",
+        "decision_reason": "state_change",
+        "degradation_reasons": [],
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_004"
+        ],
+        "gap_rule_id": "action.owner.deadline.confirmation",
+        "llm_call_status": "not_called",
+        "scheduler_event_type": "llm_candidate_queued",
+        "segment_batch": [
+          "long_shadow_seg_004"
+        ],
+        "source": "live_asr_stream",
+        "source_event_ids": [
+          "asr_action_event_long_shadow_seg_004"
+        ],
+        "suggested_prompt": "确认行动项 owner、deadline 和验收口径是否完整。",
+        "target_id": "asr_action_long_shadow_seg_004",
+        "target_type": "ActionItem",
+        "trigger_reason": "Live ASR captured an action item that may need owner/deadline confirmation."
+      },
+      "sequence": 26,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 150000,
+      "event_type": "llm_request_draft_event",
+      "id": "llm_request_draft:asr_action_event_long_shadow_seg_004",
+      "payload": {
+        "candidate_confidence": 0.9,
+        "candidate_confidence_level": "high",
+        "candidate_degradation_reasons": [],
+        "card_status": "not_created",
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_004"
+        ],
+        "gap_rule_id": "action.owner.deadline.confirmation",
+        "input_summary": "ActionItem asr_action_long_shadow_seg_004 from long_shadow_seg_004 using asr_ev_long_shadow_seg_004",
+        "llm_call_status": "not_called",
+        "model": "not-called",
+        "prompt_version": "not-called",
+        "request_id": "asr_llm_request_draft_asr_suggestion_candidate_asr_action_event_long_shadow_seg_004",
+        "request_origin": "local_deterministic_asr_request_draft",
+        "request_status": "draft_only",
+        "request_type": "llm_suggestion_card_draft",
+        "schema_status": "not_generated",
+        "segment_batch": [
+          "long_shadow_seg_004"
+        ],
+        "source": "live_asr_stream",
+        "source_event_ids": [
+          "asr_action_event_long_shadow_seg_004"
+        ],
+        "suggested_prompt": "确认行动项 owner、deadline 和验收口径是否完整。",
+        "target_candidate_id": "asr_suggestion_candidate_asr_action_event_long_shadow_seg_004",
+        "target_id": "asr_action_long_shadow_seg_004",
+        "target_type": "ActionItem"
+      },
+      "sequence": 27,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 192500,
+      "event_type": "transcript_final",
+      "id": "transcript_final:long_shadow_seg_005",
+      "payload": {
+        "confidence": 0.88,
+        "end_ms": 190000,
+        "evidence_spans": [
+          {
+            "end_ms": 190000,
+            "id": "asr_ev_long_shadow_seg_005",
+            "quote": "API 幂等和 idempotency-key 是否兼容老客户端？这个还没有确认。",
+            "segment_id": "long_shadow_seg_005",
+            "start_ms": 160000,
+            "status": "active"
+          }
+        ],
+        "is_final": true,
+        "segment_id": "long_shadow_seg_005",
+        "start_ms": 160000,
+        "text": "API 幂等和 idempotency-key 是否兼容老客户端？这个还没有确认。"
+      },
+      "sequence": 28,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 192500,
+      "event_type": "state_event",
+      "id": "state:asr_question_event_long_shadow_seg_005",
+      "payload": {
+        "event_id": "asr_question_event_long_shadow_seg_005",
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_005"
+        ],
+        "state_event_type": "created",
+        "state_item": {
+          "evidence_span_ids": [
+            "asr_ev_long_shadow_seg_005"
+          ],
+          "id": "asr_question_long_shadow_seg_005",
+          "question": "API 幂等和 idempotency-key 是否兼容老客户端？这个还没有确认。",
+          "source": "live_asr_stream",
+          "state_origin": "local_deterministic_asr_skeleton"
+        },
+        "target_id": "asr_question_long_shadow_seg_005",
+        "target_type": "OpenQuestion"
+      },
+      "sequence": 29,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 192500,
+      "event_type": "scheduler_event",
+      "id": "scheduler:asr_question_event_long_shadow_seg_005",
+      "payload": {
+        "budget_remaining": 75,
+        "call_count_last_hour": 5,
+        "card_id": "",
+        "cooldown_remaining_ms": 0,
+        "decision_reason": "state_change",
+        "gap_rule_id": "asr.state_candidate.review",
+        "llm_call_status": "not_called",
+        "model": "not-called",
+        "prompt_version": "not-called",
+        "scheduler_event_type": "llm_candidate_queued",
+        "segment_batch": [
+          "long_shadow_seg_005"
+        ],
+        "source_event_ids": [
+          "asr_question_event_long_shadow_seg_005"
+        ],
+        "trigger_reason": "state_change",
+        "trigger_source": "live_asr_scheduler_log",
+        "would_call_llm": true
+      },
+      "sequence": 30,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 192500,
+      "event_type": "suggestion_candidate_event",
+      "id": "suggestion_candidate:asr_question_event_long_shadow_seg_005",
+      "payload": {
+        "candidate_id": "asr_suggestion_candidate_asr_question_event_long_shadow_seg_005",
+        "candidate_origin": "local_deterministic_asr_skeleton",
+        "candidate_policy_version": "asr-candidate-policy.v1",
+        "candidate_type": "state_gap_review",
+        "card_status": "not_created",
+        "confidence": 0.9,
+        "confidence_level": "high",
+        "confidence_source": "local_deterministic_heuristic",
+        "decision_reason": "state_change",
+        "degradation_reasons": [],
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_005"
+        ],
+        "gap_rule_id": "open.question.followup",
+        "llm_call_status": "not_called",
+        "scheduler_event_type": "llm_candidate_queued",
+        "segment_batch": [
+          "long_shadow_seg_005"
+        ],
+        "source": "live_asr_stream",
+        "source_event_ids": [
+          "asr_question_event_long_shadow_seg_005"
+        ],
+        "suggested_prompt": "确认未闭环问题是否需要现场追问或记录 owner。",
+        "target_id": "asr_question_long_shadow_seg_005",
+        "target_type": "OpenQuestion",
+        "trigger_reason": "Live ASR captured an open question that may need follow-up."
+      },
+      "sequence": 31,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 192500,
+      "event_type": "llm_request_draft_event",
+      "id": "llm_request_draft:asr_question_event_long_shadow_seg_005",
+      "payload": {
+        "candidate_confidence": 0.9,
+        "candidate_confidence_level": "high",
+        "candidate_degradation_reasons": [],
+        "card_status": "not_created",
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_005"
+        ],
+        "gap_rule_id": "open.question.followup",
+        "input_summary": "OpenQuestion asr_question_long_shadow_seg_005 from long_shadow_seg_005 using asr_ev_long_shadow_seg_005",
+        "llm_call_status": "not_called",
+        "model": "not-called",
+        "prompt_version": "not-called",
+        "request_id": "asr_llm_request_draft_asr_suggestion_candidate_asr_question_event_long_shadow_seg_005",
+        "request_origin": "local_deterministic_asr_request_draft",
+        "request_status": "draft_only",
+        "request_type": "llm_suggestion_card_draft",
+        "schema_status": "not_generated",
+        "segment_batch": [
+          "long_shadow_seg_005"
+        ],
+        "source": "live_asr_stream",
+        "source_event_ids": [
+          "asr_question_event_long_shadow_seg_005"
+        ],
+        "suggested_prompt": "确认未闭环问题是否需要现场追问或记录 owner。",
+        "target_candidate_id": "asr_suggestion_candidate_asr_question_event_long_shadow_seg_005",
+        "target_id": "asr_question_long_shadow_seg_005",
+        "target_type": "OpenQuestion"
+      },
+      "sequence": 32,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 209000,
+      "event_type": "transcript_partial",
+      "id": "transcript_partial:long_shadow_seg_006",
+      "payload": {
+        "confidence": 0.78,
+        "end_ms": 207500,
+        "is_final": false,
+        "segment_id": "long_shadow_seg_006",
+        "start_ms": 205000,
+        "text": "如果 callback 失败超过"
+      },
+      "sequence": 33,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 240500,
+      "event_type": "transcript_final",
+      "id": "transcript_final:long_shadow_seg_006",
+      "payload": {
+        "confidence": 0.9,
+        "end_ms": 238000,
+        "evidence_spans": [
+          {
+            "end_ms": 238000,
+            "id": "asr_ev_long_shadow_seg_006",
+            "quote": "如果 callback 失败超过 0.5%，订单服务会降级，监控指标要提前看。",
+            "segment_id": "long_shadow_seg_006",
+            "start_ms": 205000,
+            "status": "active"
+          }
+        ],
+        "is_final": true,
+        "segment_id": "long_shadow_seg_006",
+        "start_ms": 205000,
+        "text": "如果 callback 失败超过 0.5%，订单服务会降级，监控指标要提前看。"
+      },
+      "sequence": 34,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 240500,
+      "event_type": "state_event",
+      "id": "state:asr_risk_event_long_shadow_seg_006",
+      "payload": {
+        "event_id": "asr_risk_event_long_shadow_seg_006",
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_006"
+        ],
+        "state_event_type": "created",
+        "state_item": {
+          "description": "如果 callback 失败超过 0.5%，订单服务会降级，监控指标要提前看。",
+          "evidence_span_ids": [
+            "asr_ev_long_shadow_seg_006"
+          ],
+          "id": "asr_risk_long_shadow_seg_006",
+          "impact": "condition_exceeded",
+          "mitigation": "",
+          "source": "live_asr_stream",
+          "state_origin": "local_deterministic_asr_skeleton",
+          "status": "open"
+        },
+        "target_id": "asr_risk_long_shadow_seg_006",
+        "target_type": "Risk"
+      },
+      "sequence": 35,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 240500,
+      "event_type": "scheduler_event",
+      "id": "scheduler:asr_risk_event_long_shadow_seg_006",
+      "payload": {
+        "budget_remaining": 74,
+        "call_count_last_hour": 6,
+        "card_id": "",
+        "cooldown_remaining_ms": 0,
+        "decision_reason": "state_change",
+        "gap_rule_id": "asr.state_candidate.review",
+        "llm_call_status": "not_called",
+        "model": "not-called",
+        "prompt_version": "not-called",
+        "scheduler_event_type": "llm_candidate_queued",
+        "segment_batch": [
+          "long_shadow_seg_006"
+        ],
+        "source_event_ids": [
+          "asr_risk_event_long_shadow_seg_006"
+        ],
+        "trigger_reason": "state_change",
+        "trigger_source": "live_asr_scheduler_log",
+        "would_call_llm": true
+      },
+      "sequence": 36,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 240500,
+      "event_type": "suggestion_candidate_event",
+      "id": "suggestion_candidate:asr_risk_event_long_shadow_seg_006",
+      "payload": {
+        "candidate_id": "asr_suggestion_candidate_asr_risk_event_long_shadow_seg_006",
+        "candidate_origin": "local_deterministic_asr_skeleton",
+        "candidate_policy_version": "asr-candidate-policy.v1",
+        "candidate_type": "state_gap_review",
+        "card_status": "not_created",
+        "confidence": 0.8,
+        "confidence_level": "high",
+        "confidence_source": "local_deterministic_heuristic",
+        "decision_reason": "state_change",
+        "degradation_reasons": [
+          "risk_mitigation_missing"
+        ],
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_006"
+        ],
+        "gap_rule_id": "risk.rollback.validation",
+        "llm_call_status": "not_called",
+        "scheduler_event_type": "llm_candidate_queued",
+        "segment_batch": [
+          "long_shadow_seg_006"
+        ],
+        "source": "live_asr_stream",
+        "source_event_ids": [
+          "asr_risk_event_long_shadow_seg_006"
+        ],
+        "suggested_prompt": "确认风险触发条件、回滚动作和监控指标是否明确。",
+        "target_id": "asr_risk_long_shadow_seg_006",
+        "target_type": "Risk",
+        "trigger_reason": "Live ASR captured a risk candidate that may need mitigation validation."
+      },
+      "sequence": 37,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 240500,
+      "event_type": "llm_request_draft_event",
+      "id": "llm_request_draft:asr_risk_event_long_shadow_seg_006",
+      "payload": {
+        "candidate_confidence": 0.8,
+        "candidate_confidence_level": "high",
+        "candidate_degradation_reasons": [
+          "risk_mitigation_missing"
+        ],
+        "card_status": "not_created",
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_006"
+        ],
+        "gap_rule_id": "risk.rollback.validation",
+        "input_summary": "Risk asr_risk_long_shadow_seg_006 from long_shadow_seg_006 using asr_ev_long_shadow_seg_006",
+        "llm_call_status": "not_called",
+        "model": "not-called",
+        "prompt_version": "not-called",
+        "request_id": "asr_llm_request_draft_asr_suggestion_candidate_asr_risk_event_long_shadow_seg_006",
+        "request_origin": "local_deterministic_asr_request_draft",
+        "request_status": "draft_only",
+        "request_type": "llm_suggestion_card_draft",
+        "schema_status": "not_generated",
+        "segment_batch": [
+          "long_shadow_seg_006"
+        ],
+        "source": "live_asr_stream",
+        "source_event_ids": [
+          "asr_risk_event_long_shadow_seg_006"
+        ],
+        "suggested_prompt": "确认风险触发条件、回滚动作和监控指标是否明确。",
+        "target_candidate_id": "asr_suggestion_candidate_asr_risk_event_long_shadow_seg_006",
+        "target_id": "asr_risk_long_shadow_seg_006",
+        "target_type": "Risk"
+      },
+      "sequence": 38,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 286200,
+      "event_type": "transcript_final",
+      "id": "transcript_final:long_shadow_seg_007",
+      "payload": {
+        "confidence": 0.91,
+        "end_ms": 284000,
+        "evidence_spans": [
+          {
+            "end_ms": 284000,
+            "id": "asr_ev_long_shadow_seg_007",
+            "quote": "张三下周三整理 request_id、trace_id 和 Kafka lag 的排查脚本。",
+            "segment_id": "long_shadow_seg_007",
+            "start_ms": 252000,
+            "status": "active"
+          }
+        ],
+        "is_final": true,
+        "segment_id": "long_shadow_seg_007",
+        "start_ms": 252000,
+        "text": "张三下周三整理 request_id、trace_id 和 Kafka lag 的排查脚本。"
+      },
+      "sequence": 39,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 286200,
+      "event_type": "state_event",
+      "id": "state:asr_action_event_long_shadow_seg_007",
+      "payload": {
+        "event_id": "asr_action_event_long_shadow_seg_007",
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_007"
+        ],
+        "state_event_type": "created",
+        "state_item": {
+          "deadline": "下周三",
+          "description": "张三下周三整理 request_id、trace_id 和 Kafka lag 的排查脚本。",
+          "evidence_span_ids": [
+            "asr_ev_long_shadow_seg_007"
+          ],
+          "id": "asr_action_long_shadow_seg_007",
+          "owner": "张三",
+          "source": "live_asr_stream",
+          "state_origin": "local_deterministic_asr_skeleton",
+          "status": "candidate"
+        },
+        "target_id": "asr_action_long_shadow_seg_007",
+        "target_type": "ActionItem"
+      },
+      "sequence": 40,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 286200,
+      "event_type": "scheduler_event",
+      "id": "scheduler:asr_action_event_long_shadow_seg_007",
+      "payload": {
+        "budget_remaining": 73,
+        "call_count_last_hour": 7,
+        "card_id": "",
+        "cooldown_remaining_ms": 0,
+        "decision_reason": "state_change",
+        "gap_rule_id": "asr.state_candidate.review",
+        "llm_call_status": "not_called",
+        "model": "not-called",
+        "prompt_version": "not-called",
+        "scheduler_event_type": "llm_candidate_queued",
+        "segment_batch": [
+          "long_shadow_seg_007"
+        ],
+        "source_event_ids": [
+          "asr_action_event_long_shadow_seg_007"
+        ],
+        "trigger_reason": "state_change",
+        "trigger_source": "live_asr_scheduler_log",
+        "would_call_llm": true
+      },
+      "sequence": 41,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 286200,
+      "event_type": "suggestion_candidate_event",
+      "id": "suggestion_candidate:asr_action_event_long_shadow_seg_007",
+      "payload": {
+        "candidate_id": "asr_suggestion_candidate_asr_action_event_long_shadow_seg_007",
+        "candidate_origin": "local_deterministic_asr_skeleton",
+        "candidate_policy_version": "asr-candidate-policy.v1",
+        "candidate_type": "state_gap_review",
+        "card_status": "not_created",
+        "confidence": 0.9,
+        "confidence_level": "high",
+        "confidence_source": "local_deterministic_heuristic",
+        "decision_reason": "state_change",
+        "degradation_reasons": [],
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_007"
+        ],
+        "gap_rule_id": "action.owner.deadline.confirmation",
+        "llm_call_status": "not_called",
+        "scheduler_event_type": "llm_candidate_queued",
+        "segment_batch": [
+          "long_shadow_seg_007"
+        ],
+        "source": "live_asr_stream",
+        "source_event_ids": [
+          "asr_action_event_long_shadow_seg_007"
+        ],
+        "suggested_prompt": "确认行动项 owner、deadline 和验收口径是否完整。",
+        "target_id": "asr_action_long_shadow_seg_007",
+        "target_type": "ActionItem",
+        "trigger_reason": "Live ASR captured an action item that may need owner/deadline confirmation."
+      },
+      "sequence": 42,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 286200,
+      "event_type": "llm_request_draft_event",
+      "id": "llm_request_draft:asr_action_event_long_shadow_seg_007",
+      "payload": {
+        "candidate_confidence": 0.9,
+        "candidate_confidence_level": "high",
+        "candidate_degradation_reasons": [],
+        "card_status": "not_created",
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_007"
+        ],
+        "gap_rule_id": "action.owner.deadline.confirmation",
+        "input_summary": "ActionItem asr_action_long_shadow_seg_007 from long_shadow_seg_007 using asr_ev_long_shadow_seg_007",
+        "llm_call_status": "not_called",
+        "model": "not-called",
+        "prompt_version": "not-called",
+        "request_id": "asr_llm_request_draft_asr_suggestion_candidate_asr_action_event_long_shadow_seg_007",
+        "request_origin": "local_deterministic_asr_request_draft",
+        "request_status": "draft_only",
+        "request_type": "llm_suggestion_card_draft",
+        "schema_status": "not_generated",
+        "segment_batch": [
+          "long_shadow_seg_007"
+        ],
+        "source": "live_asr_stream",
+        "source_event_ids": [
+          "asr_action_event_long_shadow_seg_007"
+        ],
+        "suggested_prompt": "确认行动项 owner、deadline 和验收口径是否完整。",
+        "target_candidate_id": "asr_suggestion_candidate_asr_action_event_long_shadow_seg_007",
+        "target_id": "asr_action_long_shadow_seg_007",
+        "target_type": "ActionItem"
+      },
+      "sequence": 43,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 294000,
+      "event_type": "transcript_revision",
+      "id": "transcript_revision:long_shadow_seg_007_rev1",
+      "payload": {
+        "confidence": 0.92,
+        "end_ms": 286000,
+        "evidence_spans": [
+          {
+            "end_ms": 286000,
+            "id": "asr_ev_long_shadow_seg_007_rev1",
+            "quote": "张三下周三整理 request_id、trace_id、Kafka lag 和 dead letter queue 的排查脚本。",
+            "revision_of": "asr_ev_long_shadow_seg_007",
+            "segment_id": "long_shadow_seg_007_rev1",
+            "start_ms": 252000,
+            "status": "active"
+          }
+        ],
+        "is_final": true,
+        "revision_of": "long_shadow_seg_007",
+        "segment_id": "long_shadow_seg_007_rev1",
+        "start_ms": 252000,
+        "superseded_evidence_spans": [
+          {
+            "end_ms": 284000,
+            "id": "asr_ev_long_shadow_seg_007",
+            "quote": "张三下周三整理 request_id、trace_id 和 Kafka lag 的排查脚本。",
+            "replaced_by": "asr_ev_long_shadow_seg_007_rev1",
+            "segment_id": "long_shadow_seg_007",
+            "start_ms": 252000,
+            "status": "superseded"
+          }
+        ],
+        "supersedes_segment_id": "long_shadow_seg_007",
+        "text": "张三下周三整理 request_id、trace_id、Kafka lag 和 dead letter queue 的排查脚本。"
+      },
+      "sequence": 44,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 294000,
+      "event_type": "state_event",
+      "id": "state:asr_action_event_long_shadow_seg_007_rev1",
+      "payload": {
+        "event_id": "asr_action_event_long_shadow_seg_007_rev1",
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_007_rev1"
+        ],
+        "state_event_type": "created",
+        "state_item": {
+          "deadline": "下周三",
+          "description": "张三下周三整理 request_id、trace_id、Kafka lag 和 dead letter queue 的排查脚本。",
+          "evidence_span_ids": [
+            "asr_ev_long_shadow_seg_007_rev1"
+          ],
+          "id": "asr_action_long_shadow_seg_007_rev1",
+          "owner": "张三",
+          "source": "live_asr_stream",
+          "state_origin": "local_deterministic_asr_skeleton",
+          "status": "candidate"
+        },
+        "target_id": "asr_action_long_shadow_seg_007_rev1",
+        "target_type": "ActionItem"
+      },
+      "sequence": 45,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 294000,
+      "event_type": "scheduler_event",
+      "id": "scheduler:asr_action_event_long_shadow_seg_007_rev1",
+      "payload": {
+        "budget_remaining": 73,
+        "call_count_last_hour": 7,
+        "card_id": "",
+        "cooldown_remaining_ms": 2200,
+        "decision_reason": "cooldown",
+        "gap_rule_id": "asr.state_candidate.review",
+        "llm_call_status": "not_called",
+        "model": "not-called",
+        "prompt_version": "not-called",
+        "scheduler_event_type": "llm_candidate_skipped",
+        "segment_batch": [
+          "long_shadow_seg_007_rev1"
+        ],
+        "source_event_ids": [
+          "asr_action_event_long_shadow_seg_007_rev1"
+        ],
+        "trigger_reason": "cooldown",
+        "trigger_source": "live_asr_scheduler_log",
+        "would_call_llm": false
+      },
+      "sequence": 46,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 294000,
+      "event_type": "suggestion_candidate_event",
+      "id": "suggestion_candidate:asr_action_event_long_shadow_seg_007_rev1",
+      "payload": {
+        "candidate_id": "asr_suggestion_candidate_asr_action_event_long_shadow_seg_007_rev1",
+        "candidate_origin": "local_deterministic_asr_skeleton",
+        "candidate_policy_version": "asr-candidate-policy.v1",
+        "candidate_type": "state_gap_review",
+        "card_status": "not_created",
+        "confidence": 0.9,
+        "confidence_level": "high",
+        "confidence_source": "local_deterministic_heuristic",
+        "decision_reason": "cooldown",
+        "degradation_reasons": [],
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_007_rev1"
+        ],
+        "gap_rule_id": "action.owner.deadline.confirmation",
+        "llm_call_status": "not_called",
+        "scheduler_event_type": "llm_candidate_skipped",
+        "segment_batch": [
+          "long_shadow_seg_007_rev1"
+        ],
+        "source": "live_asr_stream",
+        "source_event_ids": [
+          "asr_action_event_long_shadow_seg_007_rev1"
+        ],
+        "suggested_prompt": "确认行动项 owner、deadline 和验收口径是否完整。",
+        "target_id": "asr_action_long_shadow_seg_007_rev1",
+        "target_type": "ActionItem",
+        "trigger_reason": "Live ASR captured an action item that may need owner/deadline confirmation."
+      },
+      "sequence": 47,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 294000,
+      "event_type": "llm_request_draft_event",
+      "id": "llm_request_draft:asr_action_event_long_shadow_seg_007_rev1",
+      "payload": {
+        "candidate_confidence": 0.9,
+        "candidate_confidence_level": "high",
+        "candidate_degradation_reasons": [],
+        "card_status": "not_created",
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_007_rev1"
+        ],
+        "gap_rule_id": "action.owner.deadline.confirmation",
+        "input_summary": "ActionItem asr_action_long_shadow_seg_007_rev1 from long_shadow_seg_007_rev1 using asr_ev_long_shadow_seg_007_rev1",
+        "llm_call_status": "not_called",
+        "model": "not-called",
+        "prompt_version": "not-called",
+        "request_id": "asr_llm_request_draft_asr_suggestion_candidate_asr_action_event_long_shadow_seg_007_rev1",
+        "request_origin": "local_deterministic_asr_request_draft",
+        "request_status": "draft_only",
+        "request_type": "llm_suggestion_card_draft",
+        "schema_status": "not_generated",
+        "segment_batch": [
+          "long_shadow_seg_007_rev1"
+        ],
+        "source": "live_asr_stream",
+        "source_event_ids": [
+          "asr_action_event_long_shadow_seg_007_rev1"
+        ],
+        "suggested_prompt": "确认行动项 owner、deadline 和验收口径是否完整。",
+        "target_candidate_id": "asr_suggestion_candidate_asr_action_event_long_shadow_seg_007_rev1",
+        "target_id": "asr_action_long_shadow_seg_007_rev1",
+        "target_type": "ActionItem"
+      },
+      "sequence": 48,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 337500,
+      "event_type": "transcript_final",
+      "id": "transcript_final:long_shadow_seg_008",
+      "payload": {
+        "confidence": 0.89,
+        "end_ms": 335000,
+        "evidence_spans": [
+          {
+            "end_ms": 335000,
+            "id": "asr_ev_long_shadow_seg_008",
+            "quote": "SLO 99.9% 谁负责确认？如果 error budget 烧完是否暂停发布？",
+            "segment_id": "long_shadow_seg_008",
+            "start_ms": 304000,
+            "status": "active"
+          }
+        ],
+        "is_final": true,
+        "segment_id": "long_shadow_seg_008",
+        "start_ms": 304000,
+        "text": "SLO 99.9% 谁负责确认？如果 error budget 烧完是否暂停发布？"
+      },
+      "sequence": 49,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 337500,
+      "event_type": "state_event",
+      "id": "state:asr_question_event_long_shadow_seg_008",
+      "payload": {
+        "event_id": "asr_question_event_long_shadow_seg_008",
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_008"
+        ],
+        "state_event_type": "created",
+        "state_item": {
+          "evidence_span_ids": [
+            "asr_ev_long_shadow_seg_008"
+          ],
+          "id": "asr_question_long_shadow_seg_008",
+          "question": "SLO 99.9% 谁负责确认？如果 error budget 烧完是否暂停发布？",
+          "source": "live_asr_stream",
+          "state_origin": "local_deterministic_asr_skeleton"
+        },
+        "target_id": "asr_question_long_shadow_seg_008",
+        "target_type": "OpenQuestion"
+      },
+      "sequence": 50,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 337500,
+      "event_type": "scheduler_event",
+      "id": "scheduler:asr_question_event_long_shadow_seg_008",
+      "payload": {
+        "budget_remaining": 72,
+        "call_count_last_hour": 8,
+        "card_id": "",
+        "cooldown_remaining_ms": 0,
+        "decision_reason": "state_change",
+        "gap_rule_id": "asr.state_candidate.review",
+        "llm_call_status": "not_called",
+        "model": "not-called",
+        "prompt_version": "not-called",
+        "scheduler_event_type": "llm_candidate_queued",
+        "segment_batch": [
+          "long_shadow_seg_008"
+        ],
+        "source_event_ids": [
+          "asr_question_event_long_shadow_seg_008"
+        ],
+        "trigger_reason": "state_change",
+        "trigger_source": "live_asr_scheduler_log",
+        "would_call_llm": true
+      },
+      "sequence": 51,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 337500,
+      "event_type": "suggestion_candidate_event",
+      "id": "suggestion_candidate:asr_question_event_long_shadow_seg_008",
+      "payload": {
+        "candidate_id": "asr_suggestion_candidate_asr_question_event_long_shadow_seg_008",
+        "candidate_origin": "local_deterministic_asr_skeleton",
+        "candidate_policy_version": "asr-candidate-policy.v1",
+        "candidate_type": "state_gap_review",
+        "card_status": "not_created",
+        "confidence": 0.9,
+        "confidence_level": "high",
+        "confidence_source": "local_deterministic_heuristic",
+        "decision_reason": "state_change",
+        "degradation_reasons": [],
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_008"
+        ],
+        "gap_rule_id": "open.question.followup",
+        "llm_call_status": "not_called",
+        "scheduler_event_type": "llm_candidate_queued",
+        "segment_batch": [
+          "long_shadow_seg_008"
+        ],
+        "source": "live_asr_stream",
+        "source_event_ids": [
+          "asr_question_event_long_shadow_seg_008"
+        ],
+        "suggested_prompt": "确认未闭环问题是否需要现场追问或记录 owner。",
+        "target_id": "asr_question_long_shadow_seg_008",
+        "target_type": "OpenQuestion",
+        "trigger_reason": "Live ASR captured an open question that may need follow-up."
+      },
+      "sequence": 52,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 337500,
+      "event_type": "llm_request_draft_event",
+      "id": "llm_request_draft:asr_question_event_long_shadow_seg_008",
+      "payload": {
+        "candidate_confidence": 0.9,
+        "candidate_confidence_level": "high",
+        "candidate_degradation_reasons": [],
+        "card_status": "not_created",
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_008"
+        ],
+        "gap_rule_id": "open.question.followup",
+        "input_summary": "OpenQuestion asr_question_long_shadow_seg_008 from long_shadow_seg_008 using asr_ev_long_shadow_seg_008",
+        "llm_call_status": "not_called",
+        "model": "not-called",
+        "prompt_version": "not-called",
+        "request_id": "asr_llm_request_draft_asr_suggestion_candidate_asr_question_event_long_shadow_seg_008",
+        "request_origin": "local_deterministic_asr_request_draft",
+        "request_status": "draft_only",
+        "request_type": "llm_suggestion_card_draft",
+        "schema_status": "not_generated",
+        "segment_batch": [
+          "long_shadow_seg_008"
+        ],
+        "source": "live_asr_stream",
+        "source_event_ids": [
+          "asr_question_event_long_shadow_seg_008"
+        ],
+        "suggested_prompt": "确认未闭环问题是否需要现场追问或记录 owner。",
+        "target_candidate_id": "asr_suggestion_candidate_asr_question_event_long_shadow_seg_008",
+        "target_id": "asr_question_long_shadow_seg_008",
+        "target_type": "OpenQuestion"
+      },
+      "sequence": 53,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 354000,
+      "event_type": "transcript_partial",
+      "id": "transcript_partial:long_shadow_seg_009",
+      "payload": {
+        "confidence": 0.78,
+        "end_ms": 352200,
+        "is_final": false,
+        "segment_id": "long_shadow_seg_009",
+        "start_ms": 350000,
+        "text": "Kafka lag 如果"
+      },
+      "sequence": 54,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 380500,
+      "event_type": "transcript_final",
+      "id": "transcript_final:long_shadow_seg_009",
+      "payload": {
+        "confidence": 0.88,
+        "end_ms": 378000,
+        "evidence_spans": [
+          {
+            "end_ms": 378000,
+            "id": "asr_ev_long_shadow_seg_009",
+            "quote": "Kafka lag 如果超过 8000，告警延迟会影响 rollback 判断。",
+            "segment_id": "long_shadow_seg_009",
+            "start_ms": 350000,
+            "status": "active"
+          }
+        ],
+        "is_final": true,
+        "segment_id": "long_shadow_seg_009",
+        "start_ms": 350000,
+        "text": "Kafka lag 如果超过 8000，告警延迟会影响 rollback 判断。"
+      },
+      "sequence": 55,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 380500,
+      "event_type": "state_event",
+      "id": "state:asr_risk_event_long_shadow_seg_009",
+      "payload": {
+        "event_id": "asr_risk_event_long_shadow_seg_009",
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_009"
+        ],
+        "state_event_type": "created",
+        "state_item": {
+          "description": "Kafka lag 如果超过 8000，告警延迟会影响 rollback 判断。",
+          "evidence_span_ids": [
+            "asr_ev_long_shadow_seg_009"
+          ],
+          "id": "asr_risk_long_shadow_seg_009",
+          "impact": "condition_exceeded",
+          "mitigation": "",
+          "source": "live_asr_stream",
+          "state_origin": "local_deterministic_asr_skeleton",
+          "status": "open"
+        },
+        "target_id": "asr_risk_long_shadow_seg_009",
+        "target_type": "Risk"
+      },
+      "sequence": 56,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 380500,
+      "event_type": "scheduler_event",
+      "id": "scheduler:asr_risk_event_long_shadow_seg_009",
+      "payload": {
+        "budget_remaining": 71,
+        "call_count_last_hour": 9,
+        "card_id": "",
+        "cooldown_remaining_ms": 0,
+        "decision_reason": "state_change",
+        "gap_rule_id": "asr.state_candidate.review",
+        "llm_call_status": "not_called",
+        "model": "not-called",
+        "prompt_version": "not-called",
+        "scheduler_event_type": "llm_candidate_queued",
+        "segment_batch": [
+          "long_shadow_seg_009"
+        ],
+        "source_event_ids": [
+          "asr_risk_event_long_shadow_seg_009"
+        ],
+        "trigger_reason": "state_change",
+        "trigger_source": "live_asr_scheduler_log",
+        "would_call_llm": true
+      },
+      "sequence": 57,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 380500,
+      "event_type": "suggestion_candidate_event",
+      "id": "suggestion_candidate:asr_risk_event_long_shadow_seg_009",
+      "payload": {
+        "candidate_id": "asr_suggestion_candidate_asr_risk_event_long_shadow_seg_009",
+        "candidate_origin": "local_deterministic_asr_skeleton",
+        "candidate_policy_version": "asr-candidate-policy.v1",
+        "candidate_type": "state_gap_review",
+        "card_status": "not_created",
+        "confidence": 0.8,
+        "confidence_level": "high",
+        "confidence_source": "local_deterministic_heuristic",
+        "decision_reason": "state_change",
+        "degradation_reasons": [
+          "risk_mitigation_missing"
+        ],
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_009"
+        ],
+        "gap_rule_id": "risk.rollback.validation",
+        "llm_call_status": "not_called",
+        "scheduler_event_type": "llm_candidate_queued",
+        "segment_batch": [
+          "long_shadow_seg_009"
+        ],
+        "source": "live_asr_stream",
+        "source_event_ids": [
+          "asr_risk_event_long_shadow_seg_009"
+        ],
+        "suggested_prompt": "确认风险触发条件、回滚动作和监控指标是否明确。",
+        "target_id": "asr_risk_long_shadow_seg_009",
+        "target_type": "Risk",
+        "trigger_reason": "Live ASR captured a risk candidate that may need mitigation validation."
+      },
+      "sequence": 58,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 380500,
+      "event_type": "llm_request_draft_event",
+      "id": "llm_request_draft:asr_risk_event_long_shadow_seg_009",
+      "payload": {
+        "candidate_confidence": 0.8,
+        "candidate_confidence_level": "high",
+        "candidate_degradation_reasons": [
+          "risk_mitigation_missing"
+        ],
+        "card_status": "not_created",
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_009"
+        ],
+        "gap_rule_id": "risk.rollback.validation",
+        "input_summary": "Risk asr_risk_long_shadow_seg_009 from long_shadow_seg_009 using asr_ev_long_shadow_seg_009",
+        "llm_call_status": "not_called",
+        "model": "not-called",
+        "prompt_version": "not-called",
+        "request_id": "asr_llm_request_draft_asr_suggestion_candidate_asr_risk_event_long_shadow_seg_009",
+        "request_origin": "local_deterministic_asr_request_draft",
+        "request_status": "draft_only",
+        "request_type": "llm_suggestion_card_draft",
+        "schema_status": "not_generated",
+        "segment_batch": [
+          "long_shadow_seg_009"
+        ],
+        "source": "live_asr_stream",
+        "source_event_ids": [
+          "asr_risk_event_long_shadow_seg_009"
+        ],
+        "suggested_prompt": "确认风险触发条件、回滚动作和监控指标是否明确。",
+        "target_candidate_id": "asr_suggestion_candidate_asr_risk_event_long_shadow_seg_009",
+        "target_id": "asr_risk_long_shadow_seg_009",
+        "target_type": "Risk"
+      },
+      "sequence": 59,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 420500,
+      "event_type": "transcript_final",
+      "id": "transcript_final:long_shadow_seg_010",
+      "payload": {
+        "confidence": 0.91,
+        "end_ms": 418000,
+        "evidence_spans": [
+          {
+            "end_ms": 418000,
+            "id": "asr_ev_long_shadow_seg_010",
+            "quote": "王五今天确认压测脚本和 P99 监控 dashboard。",
+            "segment_id": "long_shadow_seg_010",
+            "start_ms": 392000,
+            "status": "active"
+          }
+        ],
+        "is_final": true,
+        "segment_id": "long_shadow_seg_010",
+        "start_ms": 392000,
+        "text": "王五今天确认压测脚本和 P99 监控 dashboard。"
+      },
+      "sequence": 60,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 420500,
+      "event_type": "state_event",
+      "id": "state:asr_action_event_long_shadow_seg_010",
+      "payload": {
+        "event_id": "asr_action_event_long_shadow_seg_010",
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_010"
+        ],
+        "state_event_type": "created",
+        "state_item": {
+          "deadline": "今天",
+          "description": "王五今天确认压测脚本和 P99 监控 dashboard。",
+          "evidence_span_ids": [
+            "asr_ev_long_shadow_seg_010"
+          ],
+          "id": "asr_action_long_shadow_seg_010",
+          "owner": "王五",
+          "source": "live_asr_stream",
+          "state_origin": "local_deterministic_asr_skeleton",
+          "status": "candidate"
+        },
+        "target_id": "asr_action_long_shadow_seg_010",
+        "target_type": "ActionItem"
+      },
+      "sequence": 61,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 420500,
+      "event_type": "scheduler_event",
+      "id": "scheduler:asr_action_event_long_shadow_seg_010",
+      "payload": {
+        "budget_remaining": 70,
+        "call_count_last_hour": 10,
+        "card_id": "",
+        "cooldown_remaining_ms": 0,
+        "decision_reason": "state_change",
+        "gap_rule_id": "asr.state_candidate.review",
+        "llm_call_status": "not_called",
+        "model": "not-called",
+        "prompt_version": "not-called",
+        "scheduler_event_type": "llm_candidate_queued",
+        "segment_batch": [
+          "long_shadow_seg_010"
+        ],
+        "source_event_ids": [
+          "asr_action_event_long_shadow_seg_010"
+        ],
+        "trigger_reason": "state_change",
+        "trigger_source": "live_asr_scheduler_log",
+        "would_call_llm": true
+      },
+      "sequence": 62,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 420500,
+      "event_type": "suggestion_candidate_event",
+      "id": "suggestion_candidate:asr_action_event_long_shadow_seg_010",
+      "payload": {
+        "candidate_id": "asr_suggestion_candidate_asr_action_event_long_shadow_seg_010",
+        "candidate_origin": "local_deterministic_asr_skeleton",
+        "candidate_policy_version": "asr-candidate-policy.v1",
+        "candidate_type": "state_gap_review",
+        "card_status": "not_created",
+        "confidence": 0.9,
+        "confidence_level": "high",
+        "confidence_source": "local_deterministic_heuristic",
+        "decision_reason": "state_change",
+        "degradation_reasons": [],
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_010"
+        ],
+        "gap_rule_id": "action.owner.deadline.confirmation",
+        "llm_call_status": "not_called",
+        "scheduler_event_type": "llm_candidate_queued",
+        "segment_batch": [
+          "long_shadow_seg_010"
+        ],
+        "source": "live_asr_stream",
+        "source_event_ids": [
+          "asr_action_event_long_shadow_seg_010"
+        ],
+        "suggested_prompt": "确认行动项 owner、deadline 和验收口径是否完整。",
+        "target_id": "asr_action_long_shadow_seg_010",
+        "target_type": "ActionItem",
+        "trigger_reason": "Live ASR captured an action item that may need owner/deadline confirmation."
+      },
+      "sequence": 63,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 420500,
+      "event_type": "llm_request_draft_event",
+      "id": "llm_request_draft:asr_action_event_long_shadow_seg_010",
+      "payload": {
+        "candidate_confidence": 0.9,
+        "candidate_confidence_level": "high",
+        "candidate_degradation_reasons": [],
+        "card_status": "not_created",
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_010"
+        ],
+        "gap_rule_id": "action.owner.deadline.confirmation",
+        "input_summary": "ActionItem asr_action_long_shadow_seg_010 from long_shadow_seg_010 using asr_ev_long_shadow_seg_010",
+        "llm_call_status": "not_called",
+        "model": "not-called",
+        "prompt_version": "not-called",
+        "request_id": "asr_llm_request_draft_asr_suggestion_candidate_asr_action_event_long_shadow_seg_010",
+        "request_origin": "local_deterministic_asr_request_draft",
+        "request_status": "draft_only",
+        "request_type": "llm_suggestion_card_draft",
+        "schema_status": "not_generated",
+        "segment_batch": [
+          "long_shadow_seg_010"
+        ],
+        "source": "live_asr_stream",
+        "source_event_ids": [
+          "asr_action_event_long_shadow_seg_010"
+        ],
+        "suggested_prompt": "确认行动项 owner、deadline 和验收口径是否完整。",
+        "target_candidate_id": "asr_suggestion_candidate_asr_action_event_long_shadow_seg_010",
+        "target_id": "asr_action_long_shadow_seg_010",
+        "target_type": "ActionItem"
+      },
+      "sequence": 64,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 468000,
+      "event_type": "transcript_final",
+      "id": "transcript_final:long_shadow_seg_011",
+      "payload": {
+        "confidence": 0.84,
+        "end_ms": 465000,
+        "evidence_spans": [
+          {
+            "end_ms": 465000,
+            "id": "asr_ev_long_shadow_seg_011",
+            "quote": "这里有重叠发言，老版本客户端如果没有 idempotency-key 会不会重复扣款？",
+            "segment_id": "long_shadow_seg_011",
+            "start_ms": 430000,
+            "status": "active"
+          }
+        ],
+        "is_final": true,
+        "segment_id": "long_shadow_seg_011",
+        "start_ms": 430000,
+        "text": "这里有重叠发言，老版本客户端如果没有 idempotency-key 会不会重复扣款？"
+      },
+      "sequence": 65,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 486800,
+      "event_type": "transcript_partial",
+      "id": "transcript_partial:long_shadow_seg_012",
+      "payload": {
+        "confidence": 0.79,
+        "end_ms": 485000,
+        "is_final": false,
+        "segment_id": "long_shadow_seg_012",
+        "start_ms": 482000,
+        "text": "发布窗口先定周四"
+      },
+      "sequence": 66,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 518000,
+      "event_type": "transcript_final",
+      "id": "transcript_final:long_shadow_seg_012",
+      "payload": {
+        "confidence": 0.88,
+        "end_ms": 515000,
+        "evidence_spans": [
+          {
+            "end_ms": 515000,
+            "id": "asr_ev_long_shadow_seg_012",
+            "quote": "发布窗口先定周四，灰度 20%，rollback checklist 由赵六负责。",
+            "segment_id": "long_shadow_seg_012",
+            "start_ms": 482000,
+            "status": "active"
+          }
+        ],
+        "is_final": true,
+        "segment_id": "long_shadow_seg_012",
+        "start_ms": 482000,
+        "text": "发布窗口先定周四，灰度 20%，rollback checklist 由赵六负责。"
+      },
+      "sequence": 67,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 518000,
+      "event_type": "state_event",
+      "id": "state:asr_state_event_long_shadow_seg_012",
+      "payload": {
+        "event_id": "asr_state_event_long_shadow_seg_012",
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_012"
+        ],
+        "state_event_type": "created",
+        "state_item": {
+          "evidence_span_ids": [
+            "asr_ev_long_shadow_seg_012"
+          ],
+          "id": "asr_decision_long_shadow_seg_012",
+          "source": "live_asr_stream",
+          "state_origin": "local_deterministic_asr_skeleton",
+          "statement": "发布窗口先定周四，灰度 20%，rollback checklist 由赵六负责。"
+        },
+        "target_id": "asr_decision_long_shadow_seg_012",
+        "target_type": "DecisionCandidate"
+      },
+      "sequence": 68,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 518000,
+      "event_type": "scheduler_event",
+      "id": "scheduler:asr_state_event_long_shadow_seg_012",
+      "payload": {
+        "budget_remaining": 69,
+        "call_count_last_hour": 11,
+        "card_id": "",
+        "cooldown_remaining_ms": 0,
+        "decision_reason": "state_change",
+        "gap_rule_id": "asr.state_candidate.review",
+        "llm_call_status": "not_called",
+        "model": "not-called",
+        "prompt_version": "not-called",
+        "scheduler_event_type": "llm_candidate_queued",
+        "segment_batch": [
+          "long_shadow_seg_012"
+        ],
+        "source_event_ids": [
+          "asr_state_event_long_shadow_seg_012"
+        ],
+        "trigger_reason": "state_change",
+        "trigger_source": "live_asr_scheduler_log",
+        "would_call_llm": true
+      },
+      "sequence": 69,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 518000,
+      "event_type": "suggestion_candidate_event",
+      "id": "suggestion_candidate:asr_state_event_long_shadow_seg_012",
+      "payload": {
+        "candidate_id": "asr_suggestion_candidate_asr_state_event_long_shadow_seg_012",
+        "candidate_origin": "local_deterministic_asr_skeleton",
+        "candidate_policy_version": "asr-candidate-policy.v1",
+        "candidate_type": "state_gap_review",
+        "card_status": "not_created",
+        "confidence": 0.9,
+        "confidence_level": "high",
+        "confidence_source": "local_deterministic_heuristic",
+        "decision_reason": "state_change",
+        "degradation_reasons": [],
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_012"
+        ],
+        "gap_rule_id": "release.rollback.owner.required",
+        "llm_call_status": "not_called",
+        "scheduler_event_type": "llm_candidate_queued",
+        "segment_batch": [
+          "long_shadow_seg_012"
+        ],
+        "source": "live_asr_stream",
+        "source_event_ids": [
+          "asr_state_event_long_shadow_seg_012"
+        ],
+        "suggested_prompt": "确认决策是否包含 owner、回滚条件和监控口径。",
+        "target_id": "asr_decision_long_shadow_seg_012",
+        "target_type": "DecisionCandidate",
+        "trigger_reason": "Live ASR captured a decision candidate that may need release-readiness review."
+      },
+      "sequence": 70,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 518000,
+      "event_type": "llm_request_draft_event",
+      "id": "llm_request_draft:asr_state_event_long_shadow_seg_012",
+      "payload": {
+        "candidate_confidence": 0.9,
+        "candidate_confidence_level": "high",
+        "candidate_degradation_reasons": [],
+        "card_status": "not_created",
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_012"
+        ],
+        "gap_rule_id": "release.rollback.owner.required",
+        "input_summary": "DecisionCandidate asr_decision_long_shadow_seg_012 from long_shadow_seg_012 using asr_ev_long_shadow_seg_012",
+        "llm_call_status": "not_called",
+        "model": "not-called",
+        "prompt_version": "not-called",
+        "request_id": "asr_llm_request_draft_asr_suggestion_candidate_asr_state_event_long_shadow_seg_012",
+        "request_origin": "local_deterministic_asr_request_draft",
+        "request_status": "draft_only",
+        "request_type": "llm_suggestion_card_draft",
+        "schema_status": "not_generated",
+        "segment_batch": [
+          "long_shadow_seg_012"
+        ],
+        "source": "live_asr_stream",
+        "source_event_ids": [
+          "asr_state_event_long_shadow_seg_012"
+        ],
+        "suggested_prompt": "确认决策是否包含 owner、回滚条件和监控口径。",
+        "target_candidate_id": "asr_suggestion_candidate_asr_state_event_long_shadow_seg_012",
+        "target_id": "asr_decision_long_shadow_seg_012",
+        "target_type": "DecisionCandidate"
+      },
+      "sequence": 71,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 518000,
+      "event_type": "state_event",
+      "id": "state:asr_action_event_long_shadow_seg_012",
+      "payload": {
+        "event_id": "asr_action_event_long_shadow_seg_012",
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_012"
+        ],
+        "state_event_type": "created",
+        "state_item": {
+          "deadline": "周四",
+          "description": "发布窗口先定周四，灰度 20%，rollback checklist 由赵六负责。",
+          "evidence_span_ids": [
+            "asr_ev_long_shadow_seg_012"
+          ],
+          "id": "asr_action_long_shadow_seg_012",
+          "owner": "由赵六",
+          "source": "live_asr_stream",
+          "state_origin": "local_deterministic_asr_skeleton",
+          "status": "candidate"
+        },
+        "target_id": "asr_action_long_shadow_seg_012",
+        "target_type": "ActionItem"
+      },
+      "sequence": 72,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 518000,
+      "event_type": "scheduler_event",
+      "id": "scheduler:asr_action_event_long_shadow_seg_012",
+      "payload": {
+        "budget_remaining": 69,
+        "call_count_last_hour": 11,
+        "card_id": "",
+        "cooldown_remaining_ms": 10000,
+        "decision_reason": "cooldown",
+        "gap_rule_id": "asr.state_candidate.review",
+        "llm_call_status": "not_called",
+        "model": "not-called",
+        "prompt_version": "not-called",
+        "scheduler_event_type": "llm_candidate_skipped",
+        "segment_batch": [
+          "long_shadow_seg_012"
+        ],
+        "source_event_ids": [
+          "asr_action_event_long_shadow_seg_012"
+        ],
+        "trigger_reason": "cooldown",
+        "trigger_source": "live_asr_scheduler_log",
+        "would_call_llm": false
+      },
+      "sequence": 73,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 518000,
+      "event_type": "suggestion_candidate_event",
+      "id": "suggestion_candidate:asr_action_event_long_shadow_seg_012",
+      "payload": {
+        "candidate_id": "asr_suggestion_candidate_asr_action_event_long_shadow_seg_012",
+        "candidate_origin": "local_deterministic_asr_skeleton",
+        "candidate_policy_version": "asr-candidate-policy.v1",
+        "candidate_type": "state_gap_review",
+        "card_status": "not_created",
+        "confidence": 0.9,
+        "confidence_level": "high",
+        "confidence_source": "local_deterministic_heuristic",
+        "decision_reason": "cooldown",
+        "degradation_reasons": [],
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_012"
+        ],
+        "gap_rule_id": "action.owner.deadline.confirmation",
+        "llm_call_status": "not_called",
+        "scheduler_event_type": "llm_candidate_skipped",
+        "segment_batch": [
+          "long_shadow_seg_012"
+        ],
+        "source": "live_asr_stream",
+        "source_event_ids": [
+          "asr_action_event_long_shadow_seg_012"
+        ],
+        "suggested_prompt": "确认行动项 owner、deadline 和验收口径是否完整。",
+        "target_id": "asr_action_long_shadow_seg_012",
+        "target_type": "ActionItem",
+        "trigger_reason": "Live ASR captured an action item that may need owner/deadline confirmation."
+      },
+      "sequence": 74,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 518000,
+      "event_type": "llm_request_draft_event",
+      "id": "llm_request_draft:asr_action_event_long_shadow_seg_012",
+      "payload": {
+        "candidate_confidence": 0.9,
+        "candidate_confidence_level": "high",
+        "candidate_degradation_reasons": [],
+        "card_status": "not_created",
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_012"
+        ],
+        "gap_rule_id": "action.owner.deadline.confirmation",
+        "input_summary": "ActionItem asr_action_long_shadow_seg_012 from long_shadow_seg_012 using asr_ev_long_shadow_seg_012",
+        "llm_call_status": "not_called",
+        "model": "not-called",
+        "prompt_version": "not-called",
+        "request_id": "asr_llm_request_draft_asr_suggestion_candidate_asr_action_event_long_shadow_seg_012",
+        "request_origin": "local_deterministic_asr_request_draft",
+        "request_status": "draft_only",
+        "request_type": "llm_suggestion_card_draft",
+        "schema_status": "not_generated",
+        "segment_batch": [
+          "long_shadow_seg_012"
+        ],
+        "source": "live_asr_stream",
+        "source_event_ids": [
+          "asr_action_event_long_shadow_seg_012"
+        ],
+        "suggested_prompt": "确认行动项 owner、deadline 和验收口径是否完整。",
+        "target_candidate_id": "asr_suggestion_candidate_asr_action_event_long_shadow_seg_012",
+        "target_id": "asr_action_long_shadow_seg_012",
+        "target_type": "ActionItem"
+      },
+      "sequence": 75,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 528000,
+      "event_type": "transcript_revision",
+      "id": "transcript_revision:long_shadow_seg_012_rev1",
+      "payload": {
+        "confidence": 0.92,
+        "end_ms": 516000,
+        "evidence_spans": [
+          {
+            "end_ms": 516000,
+            "id": "asr_ev_long_shadow_seg_012_rev1",
+            "quote": "发布窗口先定周四，灰度 10%，rollback checklist 由赵六负责。",
+            "revision_of": "asr_ev_long_shadow_seg_012",
+            "segment_id": "long_shadow_seg_012_rev1",
+            "start_ms": 482000,
+            "status": "active"
+          }
+        ],
+        "is_final": true,
+        "revision_of": "long_shadow_seg_012",
+        "segment_id": "long_shadow_seg_012_rev1",
+        "start_ms": 482000,
+        "superseded_evidence_spans": [
+          {
+            "end_ms": 515000,
+            "id": "asr_ev_long_shadow_seg_012",
+            "quote": "发布窗口先定周四，灰度 20%，rollback checklist 由赵六负责。",
+            "replaced_by": "asr_ev_long_shadow_seg_012_rev1",
+            "segment_id": "long_shadow_seg_012",
+            "start_ms": 482000,
+            "status": "superseded"
+          }
+        ],
+        "supersedes_segment_id": "long_shadow_seg_012",
+        "text": "发布窗口先定周四，灰度 10%，rollback checklist 由赵六负责。"
+      },
+      "sequence": 76,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 528000,
+      "event_type": "state_event",
+      "id": "state:asr_state_event_long_shadow_seg_012_rev1",
+      "payload": {
+        "event_id": "asr_state_event_long_shadow_seg_012_rev1",
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_012_rev1"
+        ],
+        "state_event_type": "created",
+        "state_item": {
+          "evidence_span_ids": [
+            "asr_ev_long_shadow_seg_012_rev1"
+          ],
+          "id": "asr_decision_long_shadow_seg_012_rev1",
+          "source": "live_asr_stream",
+          "state_origin": "local_deterministic_asr_skeleton",
+          "statement": "发布窗口先定周四，灰度 10%，rollback checklist 由赵六负责。"
+        },
+        "target_id": "asr_decision_long_shadow_seg_012_rev1",
+        "target_type": "DecisionCandidate"
+      },
+      "sequence": 77,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 528000,
+      "event_type": "scheduler_event",
+      "id": "scheduler:asr_state_event_long_shadow_seg_012_rev1",
+      "payload": {
+        "budget_remaining": 68,
+        "call_count_last_hour": 12,
+        "card_id": "",
+        "cooldown_remaining_ms": 0,
+        "decision_reason": "state_change",
+        "gap_rule_id": "asr.state_candidate.review",
+        "llm_call_status": "not_called",
+        "model": "not-called",
+        "prompt_version": "not-called",
+        "scheduler_event_type": "llm_candidate_queued",
+        "segment_batch": [
+          "long_shadow_seg_012_rev1"
+        ],
+        "source_event_ids": [
+          "asr_state_event_long_shadow_seg_012_rev1"
+        ],
+        "trigger_reason": "state_change",
+        "trigger_source": "live_asr_scheduler_log",
+        "would_call_llm": true
+      },
+      "sequence": 78,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 528000,
+      "event_type": "suggestion_candidate_event",
+      "id": "suggestion_candidate:asr_state_event_long_shadow_seg_012_rev1",
+      "payload": {
+        "candidate_id": "asr_suggestion_candidate_asr_state_event_long_shadow_seg_012_rev1",
+        "candidate_origin": "local_deterministic_asr_skeleton",
+        "candidate_policy_version": "asr-candidate-policy.v1",
+        "candidate_type": "state_gap_review",
+        "card_status": "not_created",
+        "confidence": 0.9,
+        "confidence_level": "high",
+        "confidence_source": "local_deterministic_heuristic",
+        "decision_reason": "state_change",
+        "degradation_reasons": [],
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_012_rev1"
+        ],
+        "gap_rule_id": "release.rollback.owner.required",
+        "llm_call_status": "not_called",
+        "scheduler_event_type": "llm_candidate_queued",
+        "segment_batch": [
+          "long_shadow_seg_012_rev1"
+        ],
+        "source": "live_asr_stream",
+        "source_event_ids": [
+          "asr_state_event_long_shadow_seg_012_rev1"
+        ],
+        "suggested_prompt": "确认决策是否包含 owner、回滚条件和监控口径。",
+        "target_id": "asr_decision_long_shadow_seg_012_rev1",
+        "target_type": "DecisionCandidate",
+        "trigger_reason": "Live ASR captured a decision candidate that may need release-readiness review."
+      },
+      "sequence": 79,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 528000,
+      "event_type": "llm_request_draft_event",
+      "id": "llm_request_draft:asr_state_event_long_shadow_seg_012_rev1",
+      "payload": {
+        "candidate_confidence": 0.9,
+        "candidate_confidence_level": "high",
+        "candidate_degradation_reasons": [],
+        "card_status": "not_created",
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_012_rev1"
+        ],
+        "gap_rule_id": "release.rollback.owner.required",
+        "input_summary": "DecisionCandidate asr_decision_long_shadow_seg_012_rev1 from long_shadow_seg_012_rev1 using asr_ev_long_shadow_seg_012_rev1",
+        "llm_call_status": "not_called",
+        "model": "not-called",
+        "prompt_version": "not-called",
+        "request_id": "asr_llm_request_draft_asr_suggestion_candidate_asr_state_event_long_shadow_seg_012_rev1",
+        "request_origin": "local_deterministic_asr_request_draft",
+        "request_status": "draft_only",
+        "request_type": "llm_suggestion_card_draft",
+        "schema_status": "not_generated",
+        "segment_batch": [
+          "long_shadow_seg_012_rev1"
+        ],
+        "source": "live_asr_stream",
+        "source_event_ids": [
+          "asr_state_event_long_shadow_seg_012_rev1"
+        ],
+        "suggested_prompt": "确认决策是否包含 owner、回滚条件和监控口径。",
+        "target_candidate_id": "asr_suggestion_candidate_asr_state_event_long_shadow_seg_012_rev1",
+        "target_id": "asr_decision_long_shadow_seg_012_rev1",
+        "target_type": "DecisionCandidate"
+      },
+      "sequence": 80,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 528000,
+      "event_type": "state_event",
+      "id": "state:asr_action_event_long_shadow_seg_012_rev1",
+      "payload": {
+        "event_id": "asr_action_event_long_shadow_seg_012_rev1",
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_012_rev1"
+        ],
+        "state_event_type": "created",
+        "state_item": {
+          "deadline": "周四",
+          "description": "发布窗口先定周四，灰度 10%，rollback checklist 由赵六负责。",
+          "evidence_span_ids": [
+            "asr_ev_long_shadow_seg_012_rev1"
+          ],
+          "id": "asr_action_long_shadow_seg_012_rev1",
+          "owner": "由赵六",
+          "source": "live_asr_stream",
+          "state_origin": "local_deterministic_asr_skeleton",
+          "status": "candidate"
+        },
+        "target_id": "asr_action_long_shadow_seg_012_rev1",
+        "target_type": "ActionItem"
+      },
+      "sequence": 81,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 528000,
+      "event_type": "scheduler_event",
+      "id": "scheduler:asr_action_event_long_shadow_seg_012_rev1",
+      "payload": {
+        "budget_remaining": 68,
+        "call_count_last_hour": 12,
+        "card_id": "",
+        "cooldown_remaining_ms": 10000,
+        "decision_reason": "cooldown",
+        "gap_rule_id": "asr.state_candidate.review",
+        "llm_call_status": "not_called",
+        "model": "not-called",
+        "prompt_version": "not-called",
+        "scheduler_event_type": "llm_candidate_skipped",
+        "segment_batch": [
+          "long_shadow_seg_012_rev1"
+        ],
+        "source_event_ids": [
+          "asr_action_event_long_shadow_seg_012_rev1"
+        ],
+        "trigger_reason": "cooldown",
+        "trigger_source": "live_asr_scheduler_log",
+        "would_call_llm": false
+      },
+      "sequence": 82,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 528000,
+      "event_type": "suggestion_candidate_event",
+      "id": "suggestion_candidate:asr_action_event_long_shadow_seg_012_rev1",
+      "payload": {
+        "candidate_id": "asr_suggestion_candidate_asr_action_event_long_shadow_seg_012_rev1",
+        "candidate_origin": "local_deterministic_asr_skeleton",
+        "candidate_policy_version": "asr-candidate-policy.v1",
+        "candidate_type": "state_gap_review",
+        "card_status": "not_created",
+        "confidence": 0.9,
+        "confidence_level": "high",
+        "confidence_source": "local_deterministic_heuristic",
+        "decision_reason": "cooldown",
+        "degradation_reasons": [],
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_012_rev1"
+        ],
+        "gap_rule_id": "action.owner.deadline.confirmation",
+        "llm_call_status": "not_called",
+        "scheduler_event_type": "llm_candidate_skipped",
+        "segment_batch": [
+          "long_shadow_seg_012_rev1"
+        ],
+        "source": "live_asr_stream",
+        "source_event_ids": [
+          "asr_action_event_long_shadow_seg_012_rev1"
+        ],
+        "suggested_prompt": "确认行动项 owner、deadline 和验收口径是否完整。",
+        "target_id": "asr_action_long_shadow_seg_012_rev1",
+        "target_type": "ActionItem",
+        "trigger_reason": "Live ASR captured an action item that may need owner/deadline confirmation."
+      },
+      "sequence": 83,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 528000,
+      "event_type": "llm_request_draft_event",
+      "id": "llm_request_draft:asr_action_event_long_shadow_seg_012_rev1",
+      "payload": {
+        "candidate_confidence": 0.9,
+        "candidate_confidence_level": "high",
+        "candidate_degradation_reasons": [],
+        "card_status": "not_created",
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_012_rev1"
+        ],
+        "gap_rule_id": "action.owner.deadline.confirmation",
+        "input_summary": "ActionItem asr_action_long_shadow_seg_012_rev1 from long_shadow_seg_012_rev1 using asr_ev_long_shadow_seg_012_rev1",
+        "llm_call_status": "not_called",
+        "model": "not-called",
+        "prompt_version": "not-called",
+        "request_id": "asr_llm_request_draft_asr_suggestion_candidate_asr_action_event_long_shadow_seg_012_rev1",
+        "request_origin": "local_deterministic_asr_request_draft",
+        "request_status": "draft_only",
+        "request_type": "llm_suggestion_card_draft",
+        "schema_status": "not_generated",
+        "segment_batch": [
+          "long_shadow_seg_012_rev1"
+        ],
+        "source": "live_asr_stream",
+        "source_event_ids": [
+          "asr_action_event_long_shadow_seg_012_rev1"
+        ],
+        "suggested_prompt": "确认行动项 owner、deadline 和验收口径是否完整。",
+        "target_candidate_id": "asr_suggestion_candidate_asr_action_event_long_shadow_seg_012_rev1",
+        "target_id": "asr_action_long_shadow_seg_012_rev1",
+        "target_type": "ActionItem"
+      },
+      "sequence": 84,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 618000,
+      "event_type": "transcript_final",
+      "id": "transcript_final:long_shadow_seg_013",
+      "payload": {
+        "confidence": 0.9,
+        "end_ms": 615000,
+        "evidence_spans": [
+          {
+            "end_ms": 615000,
+            "id": "asr_ev_long_shadow_seg_013",
+            "quote": "如果上线后错误率超过 0.1%，先降级 recommendation-service，再回滚 payment-gateway。",
+            "segment_id": "long_shadow_seg_013",
+            "start_ms": 548000,
+            "status": "active"
+          }
+        ],
+        "is_final": true,
+        "segment_id": "long_shadow_seg_013",
+        "start_ms": 548000,
+        "text": "如果上线后错误率超过 0.1%，先降级 recommendation-service，再回滚 payment-gateway。"
+      },
+      "sequence": 85,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 618000,
+      "event_type": "state_event",
+      "id": "state:asr_risk_event_long_shadow_seg_013",
+      "payload": {
+        "event_id": "asr_risk_event_long_shadow_seg_013",
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_013"
+        ],
+        "state_event_type": "created",
+        "state_item": {
+          "description": "如果上线后错误率超过 0.1%，先降级 recommendation-service，再回滚 payment-gateway。",
+          "evidence_span_ids": [
+            "asr_ev_long_shadow_seg_013"
+          ],
+          "id": "asr_risk_long_shadow_seg_013",
+          "impact": "condition_exceeded",
+          "mitigation": "回滚",
+          "source": "live_asr_stream",
+          "state_origin": "local_deterministic_asr_skeleton",
+          "status": "open"
+        },
+        "target_id": "asr_risk_long_shadow_seg_013",
+        "target_type": "Risk"
+      },
+      "sequence": 86,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 618000,
+      "event_type": "scheduler_event",
+      "id": "scheduler:asr_risk_event_long_shadow_seg_013",
+      "payload": {
+        "budget_remaining": 67,
+        "call_count_last_hour": 13,
+        "card_id": "",
+        "cooldown_remaining_ms": 0,
+        "decision_reason": "state_change",
+        "gap_rule_id": "asr.state_candidate.review",
+        "llm_call_status": "not_called",
+        "model": "not-called",
+        "prompt_version": "not-called",
+        "scheduler_event_type": "llm_candidate_queued",
+        "segment_batch": [
+          "long_shadow_seg_013"
+        ],
+        "source_event_ids": [
+          "asr_risk_event_long_shadow_seg_013"
+        ],
+        "trigger_reason": "state_change",
+        "trigger_source": "live_asr_scheduler_log",
+        "would_call_llm": true
+      },
+      "sequence": 87,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 618000,
+      "event_type": "suggestion_candidate_event",
+      "id": "suggestion_candidate:asr_risk_event_long_shadow_seg_013",
+      "payload": {
+        "candidate_id": "asr_suggestion_candidate_asr_risk_event_long_shadow_seg_013",
+        "candidate_origin": "local_deterministic_asr_skeleton",
+        "candidate_policy_version": "asr-candidate-policy.v1",
+        "candidate_type": "state_gap_review",
+        "card_status": "not_created",
+        "confidence": 0.9,
+        "confidence_level": "high",
+        "confidence_source": "local_deterministic_heuristic",
+        "decision_reason": "state_change",
+        "degradation_reasons": [],
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_013"
+        ],
+        "gap_rule_id": "risk.rollback.validation",
+        "llm_call_status": "not_called",
+        "scheduler_event_type": "llm_candidate_queued",
+        "segment_batch": [
+          "long_shadow_seg_013"
+        ],
+        "source": "live_asr_stream",
+        "source_event_ids": [
+          "asr_risk_event_long_shadow_seg_013"
+        ],
+        "suggested_prompt": "确认风险触发条件、回滚动作和监控指标是否明确。",
+        "target_id": "asr_risk_long_shadow_seg_013",
+        "target_type": "Risk",
+        "trigger_reason": "Live ASR captured a risk candidate that may need mitigation validation."
+      },
+      "sequence": 88,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 618000,
+      "event_type": "llm_request_draft_event",
+      "id": "llm_request_draft:asr_risk_event_long_shadow_seg_013",
+      "payload": {
+        "candidate_confidence": 0.9,
+        "candidate_confidence_level": "high",
+        "candidate_degradation_reasons": [],
+        "card_status": "not_created",
+        "evidence_span_ids": [
+          "asr_ev_long_shadow_seg_013"
+        ],
+        "gap_rule_id": "risk.rollback.validation",
+        "input_summary": "Risk asr_risk_long_shadow_seg_013 from long_shadow_seg_013 using asr_ev_long_shadow_seg_013",
+        "llm_call_status": "not_called",
+        "model": "not-called",
+        "prompt_version": "not-called",
+        "request_id": "asr_llm_request_draft_asr_suggestion_candidate_asr_risk_event_long_shadow_seg_013",
+        "request_origin": "local_deterministic_asr_request_draft",
+        "request_status": "draft_only",
+        "request_type": "llm_suggestion_card_draft",
+        "schema_status": "not_generated",
+        "segment_batch": [
+          "long_shadow_seg_013"
+        ],
+        "source": "live_asr_stream",
+        "source_event_ids": [
+          "asr_risk_event_long_shadow_seg_013"
+        ],
+        "suggested_prompt": "确认风险触发条件、回滚动作和监控指标是否明确。",
+        "target_candidate_id": "asr_suggestion_candidate_asr_risk_event_long_shadow_seg_013",
+        "target_id": "asr_risk_long_shadow_seg_013",
+        "target_type": "Risk"
+      },
+      "sequence": 89,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    },
+    {
+      "at_ms": 619000,
+      "event_type": "evaluation_summary",
+      "id": "evaluation:asr_stream_summary",
+      "payload": {
+        "end_of_stream_event_count": 1,
+        "error_event_count": 0,
+        "final_event_count": 13,
+        "is_mock": true,
+        "partial_event_count": 5,
+        "passes_minimum_gate": true,
+        "provider": "local_mock_asr",
+        "revision_event_count": 3,
+        "source": "live_asr_stream"
+      },
+      "sequence": 90,
+      "source": "live_asr_stream",
+      "trace_kind": "live_event"
+    }
+  ],
+  "ingest_mode": "mainline_asr_blocked_trial",
+  "mainline_decision_id": "DEC-201",
+  "provider": "local_mock_asr",
+  "session_id": "manual_true_mainline_selftest_20260704",
+  "source": "live_asr_stream",
+  "trace_kind": "live_event"
+}
