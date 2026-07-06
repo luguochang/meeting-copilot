@@ -51,7 +51,12 @@ impl NoopBridgeResponse {
 
 #[tauri::command]
 fn runtime_get_status() -> NoopBridgeResponse {
-    NoopBridgeResponse::for_command("runtime.get_status")
+    // Real status (not noop): reports the desktop shell is live.
+    let mut r = NoopBridgeResponse::for_command("runtime.get_status");
+    r.command_status = "ok";
+    r.implementation_status = "real";
+    r.safe_to_invoke_noop = true;
+    r
 }
 
 #[tauri::command]

@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "phase-0-engineering-baseline"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  backend-tests:
+    name: Backend tests (web_mvp + core)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install fastapi uvicorn "pydantic>=2" httpx python-dotenv structlog pytest httpx
+      - name: web_mvp tests
+        run: |
+          cd code/web_mvp/backend
+          pytest -q
+      - name: core tests
+        run: |
+          cd code/core
+          pytest -q
+
+  mainline-tests:
+    name: Mainline + workbench + approach tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: |
+          python -m pip install --upgrade pip
+          pip install fastapi uvicorn "pydantic>=2" httpx python-dotenv structlog pytest
+      - name: mainline + frontend + approach + stream + llm tests
+        run: |
+          cd code/web_mvp/backend
+          pytest tests/test_e2e_mainline.py tests/test_workbench.py tests/test_approach_cards.py tests/test_asr_stream.py tests/test_llm_service.py -q
+
+  rust-check:
+    name: Tauri desktop cargo check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo check
+        run: cargo check --manifest-path code/desktop_tauri/src-tauri/Cargo.toml

@@ -66,9 +66,9 @@
 - [x] Phase 1-1: 干净音频 ASR 重测（见 §7）
 - [x] Phase 1-2: ASR 路线决断 = **本地继续**（文档默认 + Phase 1-1 证据支持；远程作为可选高质量模式保留，不默认开启）
 - [~] Phase 2: 主链路打通（2-2 实时ASR流✓ commit d1bc871 / 2-3 LLM+真实成卡✓ b1ca1b4 / 2-4 E2E✓ 102782a；2-1 脚手架清理延后——37 tool 间有 import 依赖图，归档会断裂，需配合删 37 个脚手架端点的独立重构）
-- [ ] Phase 2.5: 方案考量卡
-- [ ] Phase 3: 前端重构
-- [ ] Phase 4: 桌面 + 加固
+- [x] Phase 2.5: 方案考量卡（后端✓ 55c2478；前端变体在 /workbench）
+- [x] Phase 3: 前端重构（新 /workbench 3 区工作台，接真实 API✓ 958ad6f）
+- [~] Phase 4: CI✓ + Tauri runtime_get_status 真实化✓（cargo check 通过）；真实麦克风采集（需 cpal）+ ASR sidecar 子进程 + 删 22 policy.json 延后
 
 ## 7. Phase 1-1 ASR 干净音频重测结论（2026-07-06）
 
