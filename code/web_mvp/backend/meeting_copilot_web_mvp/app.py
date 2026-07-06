@@ -59,6 +59,7 @@ from meeting_copilot_web_mvp.repository import (
 
 
 STATIC_DIR = Path(__file__).resolve().parent / "frontend_static"
+WORKBENCH_HTML = (STATIC_DIR / "workbench.html").read_text(encoding="utf-8")
 SOURCE_REPO_ROOT = Path(__file__).resolve().parents[4]
 REPO_ROOT = SOURCE_REPO_ROOT
 LOCAL_ASR_EVENTS_APPROVED_ROOT = "artifacts/tmp/asr_events"
@@ -270,6 +271,10 @@ def create_app(
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok", "service": "meeting-copilot-web-mvp"}
+
+    @app.get("/workbench")
+    def workbench() -> Response:
+        return Response(WORKBENCH_HTML, media_type="text/html; charset=utf-8")
 
     @app.websocket("/live/asr/stream/ws/{session_id}")
     async def asr_stream_ws(websocket: WebSocket, session_id: str):
