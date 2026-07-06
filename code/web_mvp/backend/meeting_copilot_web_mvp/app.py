@@ -12,12 +12,13 @@ from typing import Any
 from urllib.parse import quote
 from urllib.parse import urlparse
 
-from fastapi import Body, FastAPI, HTTPException, Request, Response
+from fastapi import Body, FastAPI, HTTPException, Request, Response, WebSocket
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
 from meeting_copilot_web_mvp.logging_config import configure_logging, get_logger
 from meeting_copilot_web_mvp import llm_service
+from meeting_copilot_web_mvp import asr_stream
 
 configure_logging()
 _log = get_logger("meeting_copilot_web_mvp.app")
@@ -269,6 +270,10 @@ def create_app(
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok", "service": "meeting-copilot-web-mvp"}
+
+    @app.websocket("/live/asr/stream/ws/{session_id}")
+    async def asr_stream_ws(websocket: WebSocket, session_id: str):
+        await asr_stream.handle_stream(websocket, session_id)
 
     @app.get("/desktop/shell-readiness")
     def desktop_shell_readiness() -> dict[str, Any]:
