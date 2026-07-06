@@ -204,3 +204,91 @@ def build_enabled_execution_runs(
             }
         runs.append(run)
     return runs
+
+
+# ---------- Approach-consideration cards (Phase 2.5) ----------
+
+APPROACH_PROMPT_VERSION = "web_mvp.approach_card.v1"
+APPROACH_MAX_PER_SESSION = 3
+APPROACH_CONFIDENCE_THRESHOLD = 0.7  # stricter than gap cards (≈0.6) — approach advice hallucinates more
+
+_APPROACH_SYSTEM_PROMPT = (
+    "你是中文技术会议 Copilot 方案考量生成器。基于会议转写，输出最多 3 条方案考量卡片。"
+    "只返回可解析 JSON 数组，每项：{\"card_type\": \"approach.alternative\" 或 \"approach.consideration\", "
+    "\"suggestion_text\": str, \"confidence\": 0-1, \"trigger_reason\": str, \"evidence_quote\": str}。"
+    "措辞用'是否考虑过/建议确认'，禁止'必须/一定/不可上线'等裁判式表达。"
+    "evidence_quote 必须是转写中的原文片段。没有可考量的方案内容时返回空数组 []。"
+)
+
+
+def build_approach_cards(
+    transcript_text: str,
+    config: LlmConfig,
+    client: LlmClient | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Ask the LLM to produce approach-consideration cards from the transcript.
+
+    Risk gates (stricter than gap cards): confidence >= 0.7, max 3 per session,
+    every card must carry an evidence_quote. Returns (cards, usage_record).
+    """
+    client = client or HttpxLlmClient()
+    body = {
+        "model": config.model,
+        "messages": [
+            {"role": "system", "content": _APPROACH_SYSTEM_PROMPT},
+            {"role": "user", "content": transcript_text},
+        ],
+        "temperature": 0,
+    }
+    headers = {
+        "Authorization": f"Bearer {config.api_key}",
+        "Content-Type": "application/json",
+    }
+    url = f"{config.base_url}/v1/chat/completions"
+    _log.info("approach.call.start", model=config.model)
+    data = client.post_json(url, headers, body, config.timeout_seconds)
+    content = data["choices"][0]["message"]["content"]
+    parsed = json.loads(_strip_json_fences(content))
+    usage = data.get("usage", {})
+    usage_record = {
+        "prompt_tokens": int(usage.get("prompt_tokens", 0)),
+        "completion_tokens": int(usage.get("completion_tokens", 0)),
+        "total_tokens": int(usage.get("total_tokens", 0)),
+    }
+    items = parsed if isinstance(parsed, list) else [parsed]
+    cards: list[dict[str, Any]] = []
+    for idx, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        confidence = float(item.get("confidence", 0.0))
+        evidence_quote = str(item.get("evidence_quote", "")).strip()
+        # risk gates: confidence threshold + evidence required
+        if confidence < APPROACH_CONFIDENCE_THRESHOLD:
+            continue
+        if not evidence_quote:
+            continue
+        card_type = str(item.get("card_type", "approach.consideration"))
+        if card_type not in {"approach.alternative", "approach.consideration"}:
+            card_type = "approach.consideration"
+        cards.append({
+            "card_id": f"approach_card_{idx}",
+            "card_type": card_type,
+            "card_status": "new",
+            "schema_name": "ApproachConsiderationV1",
+            "suggestion_text": str(item.get("suggestion_text", "")),
+            "confidence": confidence,
+            "trigger_reason": str(item.get("trigger_reason", "")),
+            "evidence_quote": evidence_quote,
+            "llm_trace": {
+                "provider": config.base_url,
+                "model": config.model,
+                "prompt_version": APPROACH_PROMPT_VERSION,
+                "call_count": 1,
+                "retry_count": 0,
+                "usage": usage_record,
+            },
+        })
+    # max per session
+    cards = cards[:APPROACH_MAX_PER_SESSION]
+    _log.info("approach.call.end", cards=len(cards), tokens=usage_record["total_tokens"])
+    return cards, usage_record
