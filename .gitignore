@@ -1,0 +1,47 @@
+# === OS ===
+.DS_Store
+
+# === Python ===
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+.venv/
+.venv-*/
+venv/
+
+# === Node ===
+node_modules/
+.next/
+dist/
+build/
+
+# === Rust ===
+target/
+
+# === Env / secrets ===
+.env
+.env.local
+*.local.json
+*.secret.json
+configs/local/
+
+# === Project data (local-only) ===
+data/asr_eval/local_samples/
+data/asr_eval/public_raw/
+data/local_runtime/
+
+# === Artifacts (tmp / generated) ===
+artifacts/tmp/
+
+# === ASR runtime heavy / regenerable dirs ===
+# (also covered by code/asr_runtime/.gitignore; repeated for root-level safety)
+code/asr_runtime/models/
+code/asr_runtime/outputs/
+code/asr_runtime/.venv-funasr/
+code/asr_runtime/.venv-sherpa/
+
+# === Editor ===
+.vscode/
+.idea/

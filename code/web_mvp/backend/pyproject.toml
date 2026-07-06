@@ -1,0 +1,10 @@
+[project]
+name = "meeting-copilot-web-mvp"
+version = "0.1.0"
+description = "Local PC Web MVP backend for Meeting Copilot"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi",
+  "uvicorn",
+]
+

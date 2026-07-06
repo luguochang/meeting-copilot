@@ -1,0 +1,55 @@
+[
+  {
+    "event_type": "partial",
+    "segment_id": "seg_rollout",
+    "text": "先灰度",
+    "start_ms": 0,
+    "end_ms": 900,
+    "received_at_ms": 950
+  },
+  {
+    "event_type": "final",
+    "segment_id": "seg_rollout",
+    "text": "先灰度 10%",
+    "start_ms": 0,
+    "end_ms": 2200,
+    "received_at_ms": 2500,
+    "confidence": 0.91
+  },
+  {
+    "event_type": "partial",
+    "segment_id": "seg_metric",
+    "text": "错误率超过",
+    "start_ms": 2200,
+    "end_ms": 3600,
+    "received_at_ms": 3900
+  },
+  {
+    "event_type": "final",
+    "segment_id": "seg_metric",
+    "text": "如果错误率超过 0.1% 就回滚",
+    "start_ms": 2200,
+    "end_ms": 5600,
+    "received_at_ms": 7000,
+    "confidence": 0.88
+  },
+  {
+    "event_type": "final",
+    "segment_id": "seg_owner_gap",
+    "text": "这里还没有确认回滚负责人",
+    "start_ms": 5600,
+    "end_ms": 8600,
+    "received_at_ms": 13000,
+    "confidence": 0.86
+  },
+  {
+    "event_type": "revision",
+    "segment_id": "seg_metric_rev",
+    "revision_of": "seg_metric",
+    "text": "如果错误率超过 0.1% 就回滚",
+    "start_ms": 2200,
+    "end_ms": 5600,
+    "received_at_ms": 16000,
+    "confidence": 0.9
+  }
+]
