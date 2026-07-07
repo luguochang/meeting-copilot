@@ -64,7 +64,8 @@ def test_sherpa_sidecar_feeds_chunks_and_reads_final(monkeypatch):
 
 
 def test_get_recognizer_falls_back_to_fake_when_sherpa_absent(monkeypatch):
-    # force _maybe_sherpa_sidecar to return None by pointing venv at a missing path
+    # FunASR + sherpa both unavailable -> Fake
+    monkeypatch.setattr(asr_stream, "_maybe_funasr_sidecar", lambda sid: None)
     monkeypatch.setattr(asr_stream, "_SHERPA_VENV_PY", asr_stream.Path("/nonexistent/python"))
     rec = asr_stream.get_recognizer("sess_fb")
     assert isinstance(rec, asr_stream.FakeStreamRecognizer)

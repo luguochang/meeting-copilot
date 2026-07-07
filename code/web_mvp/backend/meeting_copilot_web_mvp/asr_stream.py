@@ -27,6 +27,7 @@ from meeting_copilot_web_mvp.asr_live_events import (
     ASR_LIVE_TRACE_KIND,
     build_asr_live_events,
 )
+from meeting_copilot_web_mvp.transcript_normalizer import hotwords as _hotwords
 
 _log = get_logger("meeting_copilot_web_mvp.asr_stream")
 
@@ -68,9 +69,12 @@ class FakeStreamRecognizer:
 def get_recognizer(session_id: str) -> StreamRecognizer:
     """Return the active stream recognizer for a session.
 
-    Prefers the real sherpa-onnx sidecar (Phase 4) when the sherpa venv + model
-    are present; falls back to FakeStreamRecognizer otherwise.
+    Prefers FunASR streaming (better Chinese, G2) when available, then sherpa,
+    then FakeStreamRecognizer.
     """
+    funasr = _maybe_funasr_sidecar(session_id)
+    if funasr is not None:
+        return funasr
     sherpa = _maybe_sherpa_sidecar(session_id)
     if sherpa is not None:
         return sherpa
@@ -164,6 +168,93 @@ class SherpaSidecarRecognizer:
                 final["text"] = ev.get("text", "")
         _log.info("asr.sidecar.end", session_id=self.session_id)
         return final
+
+
+_FUNASR_VENV_PY = _REPO_ROOT / "code" / "asr_runtime" / ".venv-funasr" / "bin" / "python"
+_FUNASR_WORKER = _REPO_ROOT / "code" / "asr_runtime" / "scripts" / "funasr_stream_worker.py"
+
+
+class FunasrSidecarRecognizer:
+    """Real-time FunASR streaming sidecar (G2). Spawns funasr_stream_worker.py
+    (funasr 3.11 venv) with technical hotwords; feeds float32 PCM via stdin,
+    reads JSON ASR events from stdout. Better Chinese accuracy than sherpa."""
+
+    def __init__(self, session_id: str, venv_python: Path | None = None):
+        self.session_id = session_id
+        python = str(venv_python or _FUNASR_VENV_PY)
+        cmd = [python, str(_FUNASR_WORKER)]
+        try:
+            hw = _hotwords()
+            if hw:
+                cmd += ["--hotwords", " ".join(hw)]
+        except Exception:
+            pass
+        self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self._q: "queue.Queue[dict[str, Any]]" = queue.Queue()
+        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader.start()
+        self._seq = 0
+        _log.info("asr.sidecar.funasr.start", session_id=session_id)
+
+    def _read_loop(self) -> None:
+        try:
+            for line in self._proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    self._q.put(json.loads(line))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def recognize_chunk(self, pcm: bytes) -> dict[str, Any]:
+        self._seq += 1
+        try:
+            self._proc.stdin.write(pcm)
+            self._proc.stdin.flush()
+        except Exception:
+            pass
+        latest = None
+        while not self._q.empty():
+            latest = self._q.get_nowait()
+        if latest:
+            latest["segment_id"] = f"stream_seg_{self.session_id}"
+            latest.setdefault("confidence", 0.8)
+            return latest
+        return {"event_type": "partial", "segment_id": f"stream_seg_{self.session_id}", "text": "", "start_ms": (self._seq - 1) * 300, "end_ms": self._seq * 300, "confidence": 0.7}
+
+    def finalize(self) -> dict[str, Any]:
+        try:
+            self._proc.stdin.close()
+        except Exception:
+            pass
+        final = {"event_type": "final", "segment_id": f"stream_seg_{self.session_id}", "text": "", "confidence": 0.9}
+        try:
+            self._proc.wait(timeout=15)
+        except Exception:
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
+        while not self._q.empty():
+            ev = self._q.get_nowait()
+            if ev.get("event_type") == "final":
+                final["text"] = ev.get("text", "")
+        _log.info("asr.sidecar.funasr.end", session_id=self.session_id)
+        return final
+
+
+def _maybe_funasr_sidecar(session_id: str) -> FunasrSidecarRecognizer | None:
+    """Return a FunasrSidecarRecognizer if the funasr venv + worker exist, else None."""
+    if not _FUNASR_VENV_PY.is_file() or not _FUNASR_WORKER.is_file():
+        return None
+    try:
+        return FunasrSidecarRecognizer(session_id)
+    except Exception as exc:
+        _log.warning("asr.sidecar.funasr.spawn_failed", error=str(exc))
+        return None
 
 
 def _maybe_sherpa_sidecar(session_id: str) -> SherpaSidecarRecognizer | None:
