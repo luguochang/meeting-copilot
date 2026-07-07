@@ -54,7 +54,8 @@ def test_sherpa_sidecar_feeds_chunks_and_reads_final(monkeypatch):
     rec.recognize_chunk(b"\x00" * 6400)
     rec.recognize_chunk(b"\x00" * 6400)
     time.sleep(0.15)  # let the reader thread drain the partial into the queue
-    final = rec.finalize()
+    finals = rec.finalize()
+    final = finals[-1]
     assert final["event_type"] == "final"
     assert final["segment_id"] == "stream_seg_sess"
     assert final["text"] == "hi there"

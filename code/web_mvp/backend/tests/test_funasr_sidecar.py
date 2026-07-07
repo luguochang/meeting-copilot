@@ -53,15 +53,16 @@ def test_funasr_sidecar_feeds_chunks_and_reads_final(monkeypatch):
     rec.recognize_chunk(b"\x00" * 9600)
     rec.recognize_chunk(b"\x00" * 9600)
     time.sleep(0.15)
-    final = rec.finalize()
+    finals = rec.finalize()
+    final = finals[-1]
     assert final["event_type"] == "final"
     assert final["segment_id"] == "stream_seg_sess_f"
     assert final["text"] == "灰度 5%"
     assert len(fake.stdin.written) == 2
 
 
-def test_get_recognizer_prefers_funasr_when_available(monkeypatch):
-    # FunASR available -> returns FunasrSidecarRecognizer (not sherpa/fake)
+def test_get_recognizer_uses_funasr_when_sherpa_unavailable(monkeypatch):
+    # sherpa preferred but unavailable -> FunASR used
     class _StubRecognizer:
         def __init__(self, sid):
             self.sid = sid
@@ -69,6 +70,7 @@ def test_get_recognizer_prefers_funasr_when_available(monkeypatch):
             return {"event_type": "partial", "text": "stub", "segment_id": "s", "confidence": 0.8}
         def finalize(self):
             return {"event_type": "final", "text": "stub", "segment_id": "s", "confidence": 0.9}
+    monkeypatch.setattr(asr_stream, "_maybe_sherpa_sidecar", lambda sid: None)
     monkeypatch.setattr(asr_stream, "_maybe_funasr_sidecar", lambda sid: _StubRecognizer(sid))
     rec = asr_stream.get_recognizer("sess_pref")
     assert isinstance(rec, _StubRecognizer)
