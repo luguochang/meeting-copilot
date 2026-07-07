@@ -319,3 +319,71 @@ def build_approach_cards(
     cards = cards[:APPROACH_MAX_PER_SESSION]
     _log.info("approach.call.end", cards=len(cards), tokens=usage_record["total_tokens"])
     return cards, usage_record, False
+
+
+# ---------- Post-meeting minutes (Phase P1-3) ----------
+
+MINUTES_PROMPT_VERSION = "web_mvp.minutes.v1"
+
+_MINUTES_SYSTEM_PROMPT = (
+    "你是中文技术会议纪要生成器。基于转写，输出结构化纪要 JSON："
+    "{\"background\": str, \"decisions\": [str], \"action_items\": [{\"item\":str,\"owner\":str,\"deadline\":str}], "
+    "\"risks\": [str], \"open_questions\": [str], \"evidence_quotes\": [str]}。"
+    "evidence_quotes 必须来自转写原文。未确认的标'待确认'。禁止编造。无内容时返回空数组。"
+)
+
+
+def _minutes_to_markdown(m: dict[str, Any]) -> str:
+    lines = ["# 会议纪要", "", f"## 背景\n{m.get('background', '')}", ""]
+    lines.append("## 已确认决策")
+    for d in m.get("decisions") or []:
+        lines.append(f"- {d}")
+    lines.append("\n## 行动项")
+    for a in m.get("action_items") or []:
+        lines.append(f"- {a.get('item', '')} (owner: {a.get('owner', '待确认')}, deadline: {a.get('deadline', '待确认')})")
+    lines.append("\n## 风险")
+    for r in m.get("risks") or []:
+        lines.append(f"- {r}")
+    lines.append("\n## 未闭环问题")
+    for q in m.get("open_questions") or []:
+        lines.append(f"- {q}")
+    lines.append("\n## 证据片段")
+    for e in m.get("evidence_quotes") or []:
+        lines.append(f"> {e}")
+    return "\n".join(lines)
+
+
+def build_minutes(
+    transcript_text: str,
+    config: LlmConfig,
+    client: LlmClient | None = None,
+) -> tuple[str, dict[str, int], bool]:
+    """Generate structured post-meeting minutes (Markdown) via LLM. Degrades gracefully."""
+    client = client or HttpxLlmClient()
+    body = {
+        "model": config.model,
+        "messages": [
+            {"role": "system", "content": _MINUTES_SYSTEM_PROMPT},
+            {"role": "user", "content": transcript_text},
+        ],
+        "temperature": 0,
+    }
+    headers = {"Authorization": f"Bearer {config.api_key}", "Content-Type": "application/json"}
+    url = f"{config.base_url}/v1/chat/completions"
+    _log.info("minutes.call.start", model=config.model)
+    try:
+        data = _call_with_retry(client, url, headers, body, config.timeout_seconds)
+        content = data["choices"][0]["message"]["content"]
+        parsed = json.loads(_strip_json_fences(content))
+        usage = data.get("usage", {})
+    except Exception as exc:
+        _log.error("minutes.call.failed", error=str(exc), exc_info=True)
+        return "", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}, True
+    usage_record = {
+        "prompt_tokens": int(usage.get("prompt_tokens", 0)),
+        "completion_tokens": int(usage.get("completion_tokens", 0)),
+        "total_tokens": int(usage.get("total_tokens", 0)),
+    }
+    markdown = _minutes_to_markdown(parsed if isinstance(parsed, dict) else {})
+    _log.info("minutes.call.end", tokens=usage_record["total_tokens"])
+    return markdown, usage_record, False

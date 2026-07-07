@@ -767,6 +767,38 @@ def create_app(
             "degraded": degraded,
         }
 
+    @app.post("/live/asr/sessions/{session_id}/minutes")
+    def create_asr_live_session_minutes(
+        session_id: str,
+        payload: CreateLlmExecutionRunsRequest,
+    ) -> dict[str, Any]:
+        try:
+            record = asr_live_repo.get(session_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=f"ASR live session not found: {session_id}") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if payload.mode != "enabled":
+            raise HTTPException(status_code=422, detail=f"unsupported minutes mode: {payload.mode}")
+        config = llm_service.LlmConfig.from_env()
+        if config is None:
+            raise HTTPException(
+                status_code=422,
+                detail="LLM execution enabled but LLM_GATEWAY_BASE_URL / LLM_GATEWAY_API_KEY not configured in environment",
+            )
+        transcript_text = " ".join(
+            str((e.get("payload") or {}).get("normalized_text") or (e.get("payload") or {}).get("text", ""))
+            for e in record.get("events") or []
+            if e.get("event_type") == "transcript_final"
+        )
+        markdown, usage, degraded = llm_service.build_minutes(transcript_text, config)
+        return {
+            "session_id": session_id,
+            "minutes_md": markdown,
+            "llm_usage": usage,
+            "degraded": degraded,
+        }
+
     @app.get("/live/asr/sessions/{session_id}/draft")
     def get_asr_live_session_draft(session_id: str) -> dict[str, Any]:
         try:
