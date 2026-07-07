@@ -799,6 +799,17 @@ def create_app(
             "degraded": degraded,
         }
 
+    @app.delete("/live/asr/sessions/{session_id}")
+    def delete_asr_live_session(session_id: str) -> dict[str, Any]:
+        try:
+            removed = asr_live_repo.delete(session_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if not removed:
+            raise HTTPException(status_code=404, detail=f"ASR live session not found: {session_id}")
+        _log.info("asr.session.deleted", session_id=session_id)
+        return {"session_id": session_id, "deleted": True, "cascade": "transcript, events, candidates, cards"}
+
     @app.get("/live/asr/sessions/{session_id}/draft")
     def get_asr_live_session_draft(session_id: str) -> dict[str, Any]:
         try:

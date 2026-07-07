@@ -155,10 +155,31 @@ function appendLiveEvent(e) {
   }
 }
 
+$("btn-delete").addEventListener("click", async () => {
+  if (!currentSession) return toast("无会话");
+  if (!confirm("删除会话？将级联清除转写/事件/卡片。")) return;
+  try {
+    await api(`/live/asr/sessions/${currentSession}`, { method: "DELETE" });
+    if (_es) { _es.close(); _es = null; }
+    $("stream").innerHTML = '<div class="empty">会话已删除。</div>';
+    $("session-meta").textContent = "未加载会议";
+    $("rec-state").textContent = "● 未开始";
+    $("rec-state").style.color = "var(--fg-muted)";
+    currentSession = null;
+    toast("会话已删除（级联清除）");
+  } catch (err) { toast("删除失败: " + err.message); }
+});
+
+function setRecState(state) {
+  const el = $("rec-state");
+  if (state === "recording") { el.textContent = "● 录制中"; el.style.color = "var(--risk)"; }
+  else if (state === "live") { el.textContent = "● 实时订阅"; el.style.color = "var(--ok)"; }
+  else { el.textContent = "● 未开始"; el.style.color = "var(--fg-muted)"; }
+}
+
 $("btn-live").addEventListener("click", () => {
   if (!currentSession) return toast("先加载会议");
-  subscribeLive(currentSession);
-  toast("实时订阅已开启（events.sse）");
+  subscribeLive(currentSession); setRecState("live"); toast("实时订阅已开启（events.sse）");
 });
 
 $("btn-cards").addEventListener("click", async () => {
