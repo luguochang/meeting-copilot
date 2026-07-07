@@ -21,15 +21,17 @@ class _EngineeringFakeRecognizer:
 
     def recognize_chunk(self, pcm: bytes):
         self._seq += 1
-        return {"event_type": "partial", "segment_id": "real_seg", "text": "先灰度", "start_ms": 0, "end_ms": 300, "confidence": 0.8}
+        return [{"event_type": "partial", "segment_id": "real_seg", "text": "先灰度", "start_ms": 0, "end_ms": 300, "confidence": 0.8}]
 
     def finalize(self):
-        return {"event_type": "final", "segment_id": "real_seg", "text": "先灰度 5%。谁负责回滚？", "start_ms": 0, "end_ms": 900, "confidence": 0.9}
+        return [{"event_type": "final", "segment_id": "real_seg", "text": "先灰度 5%。谁负责回滚？", "start_ms": 0, "end_ms": 900, "confidence": 0.9}]
 
 
 def test_real_ws_asr_stream_persists_session_and_feeds_llm_cards(monkeypatch):
     # real recognizer path -> engineering fake; real LLM path -> fake client
     monkeypatch.setattr(asr_stream, "get_recognizer", lambda sid: _EngineeringFakeRecognizer(sid))
+    # skip L2 correction in the connection test (tested separately, avoids slow network)
+    monkeypatch.setattr(asr_stream, "_correct_transcript", lambda raw, cfg: (raw, {"total_tokens": 0}, False))
 
     class FakeLlmClient:
         def post_json(self, url, headers, body, timeout):

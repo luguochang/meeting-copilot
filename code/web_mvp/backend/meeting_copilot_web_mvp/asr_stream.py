@@ -28,13 +28,16 @@ from meeting_copilot_web_mvp.asr_live_events import (
     build_asr_live_events,
 )
 from meeting_copilot_web_mvp.transcript_normalizer import hotwords as _hotwords
+from meeting_copilot_web_mvp.transcript_normalizer import normalize as _normalize_text
+from meeting_copilot_web_mvp.llm_service import LlmConfig as _LlmConfig
+from meeting_copilot_web_mvp.asr_correct import correct_transcript as _correct_transcript
 
 _log = get_logger("meeting_copilot_web_mvp.asr_stream")
 
 
 class StreamRecognizer(Protocol):
-    def recognize_chunk(self, pcm: bytes) -> dict[str, Any]: ...
-    def finalize(self) -> dict[str, Any]: ...
+    def recognize_chunk(self, pcm: bytes) -> list[dict[str, Any]]: ...
+    def finalize(self) -> list[dict[str, Any]]: ...
 
 
 class FakeStreamRecognizer:
@@ -44,40 +47,41 @@ class FakeStreamRecognizer:
         self.session_id = session_id
         self._seq = 0
 
-    def recognize_chunk(self, pcm: bytes) -> dict[str, Any]:
+    def recognize_chunk(self, pcm: bytes) -> list[dict[str, Any]]:
         self._seq += 1
-        return {
+        return [{
             "event_type": "partial",
             "segment_id": f"stream_seg_{self.session_id}",
             "text": f"partial {self._seq} ({len(pcm)} bytes)",
             "start_ms": (self._seq - 1) * 300,
             "end_ms": self._seq * 300,
             "confidence": 0.7,
-        }
+        }]
 
-    def finalize(self) -> dict[str, Any]:
-        return {
+    def finalize(self) -> list[dict[str, Any]]:
+        return [{
             "event_type": "final",
             "segment_id": f"stream_seg_{self.session_id}",
             "text": f"final transcript for {self.session_id}",
             "start_ms": 0,
             "end_ms": self._seq * 300,
             "confidence": 0.9,
-        }
+        }]
 
 
 def get_recognizer(session_id: str) -> StreamRecognizer:
     """Return the active stream recognizer for a session.
 
-    Prefers FunASR streaming (better Chinese, G2) when available, then sherpa,
-    then FakeStreamRecognizer.
+    Prefers sherpa (proven endpoint finals + fast RTF 0.013) for real-time, then
+    FunASR streaming, then Fake. sherpa finals are LLM-corrected downstream (L2).
+    FunASR streaming has broken finals on long audio (per-segment fragments).
     """
-    funasr = _maybe_funasr_sidecar(session_id)
-    if funasr is not None:
-        return funasr
     sherpa = _maybe_sherpa_sidecar(session_id)
     if sherpa is not None:
         return sherpa
+    funasr = _maybe_funasr_sidecar(session_id)
+    if funasr is not None:
+        return funasr
     return FakeStreamRecognizer(session_id)
 
 
@@ -105,6 +109,9 @@ class SherpaSidecarRecognizer:
         self._q: "queue.Queue[dict[str, Any]]" = queue.Queue()
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
+        self._write_q: "queue.Queue[bytes | None]" = queue.Queue()
+        self._writer = threading.Thread(target=self._write_loop, daemon=True)
+        self._writer.start()
         self._seq = 0
         _log.info("asr.sidecar.start", session_id=session_id, model=str(model_dir))
 
@@ -121,53 +128,68 @@ class SherpaSidecarRecognizer:
         except Exception:
             pass
 
-    def recognize_chunk(self, pcm: bytes) -> dict[str, Any]:
-        self._seq += 1
+    def _write_loop(self) -> None:
+        """Writer thread: drains _write_q and writes to stdin (blocking write
+        happens here, not in the async event loop). Prevents burst PCM from
+        blocking the WebSocket handler while the worker loads the model."""
         try:
-            self._proc.stdin.write(pcm)
-            self._proc.stdin.flush()
+            while True:
+                item = self._write_q.get()
+                if item is None:
+                    break
+                try:
+                    self._proc.stdin.write(item)
+                    self._proc.stdin.flush()
+                except Exception:
+                    break
         except Exception:
             pass
-        latest = None
-        while not self._q.empty():
-            latest = self._q.get_nowait()
-        if latest:
-            latest["segment_id"] = f"stream_seg_{self.session_id}"
-            latest.setdefault("confidence", 0.8)
-            return latest
-        return {
-            "event_type": "partial",
-            "segment_id": f"stream_seg_{self.session_id}",
-            "text": "",
-            "start_ms": (self._seq - 1) * 300,
-            "end_ms": self._seq * 300,
-            "confidence": 0.7,
-        }
 
-    def finalize(self) -> dict[str, Any]:
+    def recognize_chunk(self, pcm: bytes) -> list[dict[str, Any]]:
+        self._seq += 1
+        self._write_q.put(pcm)  # non-blocking; writer thread handles the blocking stdin write
+        events: list[dict[str, Any]] = []
+        while not self._q.empty():
+            ev = self._q.get_nowait()
+            ev["segment_id"] = f"stream_seg_{self.session_id}"
+            ev.setdefault("confidence", 0.8)
+            events.append(ev)
+        if not events:
+            events.append({
+                "event_type": "partial",
+                "segment_id": f"stream_seg_{self.session_id}",
+                "text": "",
+                "start_ms": (self._seq - 1) * 300,
+                "end_ms": self._seq * 300,
+                "confidence": 0.7,
+            })
+        return events
+
+    def finalize(self) -> list[dict[str, Any]]:
+        self._write_q.put(None)  # signal writer to stop
+        self._writer.join(timeout=60)
         try:
             self._proc.stdin.close()
         except Exception:
             pass
-        final = {
-            "event_type": "final",
-            "segment_id": f"stream_seg_{self.session_id}",
-            "text": "",
-            "confidence": 0.9,
-        }
         try:
-            self._proc.wait(timeout=10)
+            self._proc.wait(timeout=30)
         except Exception:
             try:
                 self._proc.kill()
             except Exception:
                 pass
+        # drain ALL remaining events (multiple finals may arrive during burst streaming)
+        events: list[dict[str, Any]] = []
         while not self._q.empty():
             ev = self._q.get_nowait()
-            if ev.get("event_type") == "final":
-                final["text"] = ev.get("text", "")
-        _log.info("asr.sidecar.end", session_id=self.session_id)
-        return final
+            ev["segment_id"] = f"stream_seg_{self.session_id}"
+            ev.setdefault("confidence", 0.9)
+            events.append(ev)
+        if not events:
+            events.append({"event_type": "final", "segment_id": f"stream_seg_{self.session_id}", "text": "", "confidence": 0.9})
+        _log.info("asr.sidecar.end", session_id=self.session_id, events=len(events))
+        return events
 
 
 _FUNASR_VENV_PY = _REPO_ROOT / "code" / "asr_runtime" / ".venv-funasr" / "bin" / "python"
@@ -193,8 +215,25 @@ class FunasrSidecarRecognizer:
         self._q: "queue.Queue[dict[str, Any]]" = queue.Queue()
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
+        self._write_q: "queue.Queue[bytes | None]" = queue.Queue()
+        self._writer = threading.Thread(target=self._write_loop, daemon=True)
+        self._writer.start()
         self._seq = 0
         _log.info("asr.sidecar.funasr.start", session_id=session_id)
+
+    def _write_loop(self) -> None:
+        try:
+            while True:
+                item = self._write_q.get()
+                if item is None:
+                    break
+                try:
+                    self._proc.stdin.write(item)
+                    self._proc.stdin.flush()
+                except Exception:
+                    break
+        except Exception:
+            pass
 
     def _read_loop(self) -> None:
         try:
@@ -209,28 +248,26 @@ class FunasrSidecarRecognizer:
         except Exception:
             pass
 
-    def recognize_chunk(self, pcm: bytes) -> dict[str, Any]:
+    def recognize_chunk(self, pcm: bytes) -> list[dict[str, Any]]:
         self._seq += 1
-        try:
-            self._proc.stdin.write(pcm)
-            self._proc.stdin.flush()
-        except Exception:
-            pass
-        latest = None
+        self._write_q.put(pcm)
+        events: list[dict[str, Any]] = []
         while not self._q.empty():
-            latest = self._q.get_nowait()
-        if latest:
-            latest["segment_id"] = f"stream_seg_{self.session_id}"
-            latest.setdefault("confidence", 0.8)
-            return latest
-        return {"event_type": "partial", "segment_id": f"stream_seg_{self.session_id}", "text": "", "start_ms": (self._seq - 1) * 300, "end_ms": self._seq * 300, "confidence": 0.7}
+            ev = self._q.get_nowait()
+            ev["segment_id"] = f"stream_seg_{self.session_id}"
+            ev.setdefault("confidence", 0.8)
+            events.append(ev)
+        if not events:
+            events.append({"event_type": "partial", "segment_id": f"stream_seg_{self.session_id}", "text": "", "start_ms": (self._seq - 1) * 300, "end_ms": self._seq * 300, "confidence": 0.7})
+        return events
 
     def finalize(self) -> dict[str, Any]:
+        self._write_q.put(None)
+        self._writer.join(timeout=60)
         try:
             self._proc.stdin.close()
         except Exception:
             pass
-        final = {"event_type": "final", "segment_id": f"stream_seg_{self.session_id}", "text": "", "confidence": 0.9}
         try:
             self._proc.wait(timeout=15)
         except Exception:
@@ -238,12 +275,16 @@ class FunasrSidecarRecognizer:
                 self._proc.kill()
             except Exception:
                 pass
+        events: list[dict[str, Any]] = []
         while not self._q.empty():
             ev = self._q.get_nowait()
-            if ev.get("event_type") == "final":
-                final["text"] = ev.get("text", "")
-        _log.info("asr.sidecar.funasr.end", session_id=self.session_id)
-        return final
+            ev["segment_id"] = f"stream_seg_{self.session_id}"
+            ev.setdefault("confidence", 0.9)
+            events.append(ev)
+        if not events:
+            events.append({"event_type": "final", "segment_id": f"stream_seg_{self.session_id}", "text": "", "confidence": 0.9})
+        _log.info("asr.sidecar.funasr.end", session_id=self.session_id, events=len(events))
+        return events
 
 
 def _maybe_funasr_sidecar(session_id: str) -> FunasrSidecarRecognizer | None:
@@ -303,15 +344,38 @@ async def handle_stream(websocket, session_id: str, asr_live_repo=None, provider
         while True:
             msg = await websocket.receive()
             if msg.get("bytes") is not None:
-                event = recognizer.recognize_chunk(msg["bytes"])
-                await websocket.send_text(json.dumps(event, ensure_ascii=False))
-                if event.get("event_type") == "final" and event.get("text"):
-                    accumulated_finals.append(_to_streaming_final(event, recognizer._seq))
+                events = recognizer.recognize_chunk(msg["bytes"])
+                for ev in events:
+                    await websocket.send_text(json.dumps(ev, ensure_ascii=False))
+                    if ev.get("event_type") == "final" and ev.get("text"):
+                        accumulated_finals.append(_to_streaming_final(ev, recognizer._seq))
             elif msg.get("text") == "END":
-                final = recognizer.finalize()
-                await websocket.send_text(json.dumps(final, ensure_ascii=False))
-                if final.get("text"):
-                    accumulated_finals.append(_to_streaming_final(final, recognizer._seq + 1))
+                final_events = recognizer.finalize()
+                for ev in final_events:
+                    await websocket.send_text(json.dumps(ev, ensure_ascii=False))
+                    if ev.get("event_type") == "final" and ev.get("text"):
+                        accumulated_finals.append(_to_streaming_final(ev, recognizer._seq + 1))
+                # L2 LLM correction + L3 normalizer on the accumulated real-time finals
+                # (sherpa finals have <unk> for English/numbers; L2 fixes them via context)
+                if accumulated_finals:
+                    raw_concat = " ".join(str(f.get("text", "")) for f in accumulated_finals)
+                    corrected = raw_concat
+                    cfg = _LlmConfig.from_env()
+                    if cfg is not None:
+                        try:
+                            corrected, _u, _deg = _correct_transcript(raw_concat, cfg)
+                        except Exception as exc:
+                            _log.warning("asr.stream.correct_failed", error=str(exc))
+                    corrected = _normalize_text(corrected)
+                    accumulated_finals = [{
+                        "event_type": "final",
+                        "segment_id": "corrected_full",
+                        "text": corrected,
+                        "start_ms": 0,
+                        "end_ms": recognizer._seq * chunk_ms,
+                        "received_at_ms": recognizer._seq * chunk_ms,
+                        "confidence": 0.9,
+                    }]
                 if asr_live_repo is not None and accumulated_finals:
                     live_events = build_asr_live_events(
                         session_id=session_id,

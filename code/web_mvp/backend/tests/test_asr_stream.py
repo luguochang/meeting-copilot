@@ -49,10 +49,10 @@ def test_asr_stream_ws_recognizer_is_pluggable(monkeypatch):
             self.session_id = session_id
 
         def recognize_chunk(self, pcm):
-            return {"event_type": "partial", "segment_id": "custom", "text": "custom", "start_ms": 0, "end_ms": 100, "confidence": 0.5}
+            return [{"event_type": "partial", "segment_id": "custom", "text": "custom", "start_ms": 0, "end_ms": 100, "confidence": 0.5}]
 
         def finalize(self):
-            return {"event_type": "final", "segment_id": "custom", "text": "custom-final", "start_ms": 0, "end_ms": 100, "confidence": 0.9}
+            return [{"event_type": "final", "segment_id": "custom", "text": "custom-final", "start_ms": 0, "end_ms": 100, "confidence": 0.9}]
 
     monkeypatch.setattr(asr_stream, "get_recognizer", lambda sid: CustomRecognizer(sid))
     client = TestClient(create_app())
