@@ -5,10 +5,11 @@ description = "Local PC Web MVP backend for Meeting Copilot"
 requires-python = ">=3.11"
 dependencies = [
   "fastapi",
-  "uvicorn",
+  "uvicorn[standard]",
   "pydantic>=2",
   "httpx",
   "python-dotenv",
   "structlog",
+  "websockets",
 ]
 
