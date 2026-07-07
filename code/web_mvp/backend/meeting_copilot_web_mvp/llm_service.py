@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -83,6 +84,26 @@ def _strip_json_fences(content: str) -> str:
     return text
 
 
+def _call_with_retry(client, url, headers, body, timeout, retries=2):
+    """Call client.post_json with exponential backoff retry on any error.
+
+    Gateway 5xx / timeouts / network errors are transient — retry before giving
+    up so a flaky LLM gateway doesn't fail the whole batch.
+    """
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            return client.post_json(url, headers, body, timeout)
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries:
+                _log.warning("llm.call.retry", attempt=attempt + 1, error=str(exc))
+                time.sleep(0.5 * (2 ** attempt))
+            else:
+                raise
+    raise last_exc  # unreachable
+
+
 def execute_candidate(
     preview: dict[str, Any],
     config: LlmConfig,
@@ -115,7 +136,7 @@ def execute_candidate(
     url = f"{config.base_url}/v1/chat/completions"
     candidate_id = str(preview.get("target_candidate_id", ""))
     _log.info("llm.call.start", candidate_id=candidate_id, model=config.model)
-    data = client.post_json(url, headers, body, config.timeout_seconds)
+    data = _call_with_retry(client, url, headers, body, config.timeout_seconds)
     content = data["choices"][0]["message"]["content"]
     parsed = json.loads(_strip_json_fences(content))
     usage = data.get("usage", {})
@@ -225,11 +246,13 @@ def build_approach_cards(
     transcript_text: str,
     config: LlmConfig,
     client: LlmClient | None = None,
-) -> tuple[list[dict[str, Any]], dict[str, int]]:
+) -> tuple[list[dict[str, Any]], dict[str, int], bool]:
     """Ask the LLM to produce approach-consideration cards from the transcript.
 
     Risk gates (stricter than gap cards): confidence >= 0.7, max 3 per session,
-    every card must carry an evidence_quote. Returns (cards, usage_record).
+    every card must carry an evidence_quote. Returns (cards, usage_record, degraded).
+    On persistent LLM failure (after retry), degrades gracefully: returns ([], zeros, True)
+    instead of raising — the endpoint stays 200.
     """
     client = client or HttpxLlmClient()
     body = {
@@ -246,10 +269,14 @@ def build_approach_cards(
     }
     url = f"{config.base_url}/v1/chat/completions"
     _log.info("approach.call.start", model=config.model)
-    data = client.post_json(url, headers, body, config.timeout_seconds)
-    content = data["choices"][0]["message"]["content"]
-    parsed = json.loads(_strip_json_fences(content))
-    usage = data.get("usage", {})
+    try:
+        data = _call_with_retry(client, url, headers, body, config.timeout_seconds)
+        content = data["choices"][0]["message"]["content"]
+        parsed = json.loads(_strip_json_fences(content))
+        usage = data.get("usage", {})
+    except Exception as exc:
+        _log.error("approach.call.failed", error=str(exc), exc_info=True)
+        return [], {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}, True
     usage_record = {
         "prompt_tokens": int(usage.get("prompt_tokens", 0)),
         "completion_tokens": int(usage.get("completion_tokens", 0)),
@@ -291,4 +318,4 @@ def build_approach_cards(
     # max per session
     cards = cards[:APPROACH_MAX_PER_SESSION]
     _log.info("approach.call.end", cards=len(cards), tokens=usage_record["total_tokens"])
-    return cards, usage_record
+    return cards, usage_record, False
