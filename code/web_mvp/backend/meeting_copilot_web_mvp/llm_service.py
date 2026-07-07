@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -83,6 +84,26 @@ def _strip_json_fences(content: str) -> str:
     return text
 
 
+def _call_with_retry(client, url, headers, body, timeout, retries=2):
+    """Call client.post_json with exponential backoff retry on any error.
+
+    Gateway 5xx / timeouts / network errors are transient — retry before giving
+    up so a flaky LLM gateway doesn't fail the whole batch.
+    """
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            return client.post_json(url, headers, body, timeout)
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries:
+                _log.warning("llm.call.retry", attempt=attempt + 1, error=str(exc))
+                time.sleep(0.5 * (2 ** attempt))
+            else:
+                raise
+    raise last_exc  # unreachable
+
+
 def execute_candidate(
     preview: dict[str, Any],
     config: LlmConfig,
@@ -115,7 +136,7 @@ def execute_candidate(
     url = f"{config.base_url}/v1/chat/completions"
     candidate_id = str(preview.get("target_candidate_id", ""))
     _log.info("llm.call.start", candidate_id=candidate_id, model=config.model)
-    data = client.post_json(url, headers, body, config.timeout_seconds)
+    data = _call_with_retry(client, url, headers, body, config.timeout_seconds)
     content = data["choices"][0]["message"]["content"]
     parsed = json.loads(_strip_json_fences(content))
     usage = data.get("usage", {})
@@ -225,11 +246,13 @@ def build_approach_cards(
     transcript_text: str,
     config: LlmConfig,
     client: LlmClient | None = None,
-) -> tuple[list[dict[str, Any]], dict[str, int]]:
+) -> tuple[list[dict[str, Any]], dict[str, int], bool]:
     """Ask the LLM to produce approach-consideration cards from the transcript.
 
     Risk gates (stricter than gap cards): confidence >= 0.7, max 3 per session,
-    every card must carry an evidence_quote. Returns (cards, usage_record).
+    every card must carry an evidence_quote. Returns (cards, usage_record, degraded).
+    On persistent LLM failure (after retry), degrades gracefully: returns ([], zeros, True)
+    instead of raising — the endpoint stays 200.
     """
     client = client or HttpxLlmClient()
     body = {
@@ -246,10 +269,14 @@ def build_approach_cards(
     }
     url = f"{config.base_url}/v1/chat/completions"
     _log.info("approach.call.start", model=config.model)
-    data = client.post_json(url, headers, body, config.timeout_seconds)
-    content = data["choices"][0]["message"]["content"]
-    parsed = json.loads(_strip_json_fences(content))
-    usage = data.get("usage", {})
+    try:
+        data = _call_with_retry(client, url, headers, body, config.timeout_seconds)
+        content = data["choices"][0]["message"]["content"]
+        parsed = json.loads(_strip_json_fences(content))
+        usage = data.get("usage", {})
+    except Exception as exc:
+        _log.error("approach.call.failed", error=str(exc), exc_info=True)
+        return [], {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}, True
     usage_record = {
         "prompt_tokens": int(usage.get("prompt_tokens", 0)),
         "completion_tokens": int(usage.get("completion_tokens", 0)),
@@ -291,4 +318,72 @@ def build_approach_cards(
     # max per session
     cards = cards[:APPROACH_MAX_PER_SESSION]
     _log.info("approach.call.end", cards=len(cards), tokens=usage_record["total_tokens"])
-    return cards, usage_record
+    return cards, usage_record, False
+
+
+# ---------- Post-meeting minutes (Phase P1-3) ----------
+
+MINUTES_PROMPT_VERSION = "web_mvp.minutes.v1"
+
+_MINUTES_SYSTEM_PROMPT = (
+    "你是中文技术会议纪要生成器。基于转写，输出结构化纪要 JSON："
+    "{\"background\": str, \"decisions\": [str], \"action_items\": [{\"item\":str,\"owner\":str,\"deadline\":str}], "
+    "\"risks\": [str], \"open_questions\": [str], \"evidence_quotes\": [str]}。"
+    "evidence_quotes 必须来自转写原文。未确认的标'待确认'。禁止编造。无内容时返回空数组。"
+)
+
+
+def _minutes_to_markdown(m: dict[str, Any]) -> str:
+    lines = ["# 会议纪要", "", f"## 背景\n{m.get('background', '')}", ""]
+    lines.append("## 已确认决策")
+    for d in m.get("decisions") or []:
+        lines.append(f"- {d}")
+    lines.append("\n## 行动项")
+    for a in m.get("action_items") or []:
+        lines.append(f"- {a.get('item', '')} (owner: {a.get('owner', '待确认')}, deadline: {a.get('deadline', '待确认')})")
+    lines.append("\n## 风险")
+    for r in m.get("risks") or []:
+        lines.append(f"- {r}")
+    lines.append("\n## 未闭环问题")
+    for q in m.get("open_questions") or []:
+        lines.append(f"- {q}")
+    lines.append("\n## 证据片段")
+    for e in m.get("evidence_quotes") or []:
+        lines.append(f"> {e}")
+    return "\n".join(lines)
+
+
+def build_minutes(
+    transcript_text: str,
+    config: LlmConfig,
+    client: LlmClient | None = None,
+) -> tuple[str, dict[str, int], bool]:
+    """Generate structured post-meeting minutes (Markdown) via LLM. Degrades gracefully."""
+    client = client or HttpxLlmClient()
+    body = {
+        "model": config.model,
+        "messages": [
+            {"role": "system", "content": _MINUTES_SYSTEM_PROMPT},
+            {"role": "user", "content": transcript_text},
+        ],
+        "temperature": 0,
+    }
+    headers = {"Authorization": f"Bearer {config.api_key}", "Content-Type": "application/json"}
+    url = f"{config.base_url}/v1/chat/completions"
+    _log.info("minutes.call.start", model=config.model)
+    try:
+        data = _call_with_retry(client, url, headers, body, config.timeout_seconds)
+        content = data["choices"][0]["message"]["content"]
+        parsed = json.loads(_strip_json_fences(content))
+        usage = data.get("usage", {})
+    except Exception as exc:
+        _log.error("minutes.call.failed", error=str(exc), exc_info=True)
+        return "", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}, True
+    usage_record = {
+        "prompt_tokens": int(usage.get("prompt_tokens", 0)),
+        "completion_tokens": int(usage.get("completion_tokens", 0)),
+        "total_tokens": int(usage.get("total_tokens", 0)),
+    }
+    markdown = _minutes_to_markdown(parsed if isinstance(parsed, dict) else {})
+    _log.info("minutes.call.end", tokens=usage_record["total_tokens"])
+    return markdown, usage_record, False

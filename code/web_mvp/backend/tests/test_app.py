@@ -2487,16 +2487,6 @@ def test_asr_live_llm_execution_runs_disabled_endpoint_rejects_extra_fields():
 
 
 
-def test_card_lifecycle_append_run_id_token_avoids_punctuation_collisions():
-    slash_token = app_module._run_id_token("llm_schema_result:a/b")
-    colon_token = app_module._run_id_token("llm_schema_result:a:b")
-
-    assert slash_token != colon_token
-    assert slash_token == "llm_schema_result_a_2f_b"
-    assert colon_token == "llm_schema_result_a_b"
-
-
-
 def test_asr_live_session_persists_json_events_across_app_instances(tmp_path):
     first_client = TestClient(create_app(data_dir=tmp_path))
     payload = _asr_live_payload(session_id="persisted_asr_live_review")

@@ -5,10 +5,20 @@ description = "Local PC Web MVP backend for Meeting Copilot"
 requires-python = ">=3.11"
 dependencies = [
   "fastapi",
-  "uvicorn",
+  "uvicorn[standard]",
   "pydantic>=2",
   "httpx",
   "python-dotenv",
   "structlog",
+  "websockets",
 ]
 
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E501", "E402"]
+
+[tool.pytest.ini_options]
+pythonpath = [".", "../../core"]

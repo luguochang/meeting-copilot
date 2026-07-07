@@ -15,7 +15,6 @@ responds with one JSON ASR event per chunk (partial) and one final event.
 from __future__ import annotations
 
 import json
-import os
 import queue
 import subprocess
 import threading
