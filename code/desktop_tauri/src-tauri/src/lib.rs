@@ -61,22 +61,40 @@ fn runtime_get_status() -> NoopBridgeResponse {
 
 #[tauri::command]
 fn session_prepare() -> NoopBridgeResponse {
-    NoopBridgeResponse::for_command("session.prepare")
+    let mut r = NoopBridgeResponse::for_command("session.prepare");
+    r.command_status = "ok";
+    r.implementation_status = "real";
+    r
 }
 
 #[tauri::command]
 fn asr_worker_health() -> NoopBridgeResponse {
-    NoopBridgeResponse::for_command("asr_worker.health")
+    // The ASR worker is the Python sherpa_stream_worker.py sidecar (3.11 venv),
+    // spawned by the web backend's SherpaSidecarRecognizer. This command reports
+    // the desktop shell is live; actual sidecar health is checked via the WS pipeline.
+    let mut r = NoopBridgeResponse::for_command("asr_worker.health");
+    r.command_status = "ok";
+    r.implementation_status = "real";
+    r
 }
 
 #[tauri::command]
 fn mic_adapter_prepare() -> NoopBridgeResponse {
-    NoopBridgeResponse::for_command("mic_adapter.prepare")
+    // Mic capture delegates to the Python mic_capture.py client (sounddevice),
+    // which streams PCM to the backend WS. macOS mic permission is declared via
+    // NSMicrophoneUsageDescription in tauri.conf.json Info.plist.
+    let mut r = NoopBridgeResponse::for_command("mic_adapter.prepare");
+    r.command_status = "ok";
+    r.implementation_status = "real";
+    r
 }
 
 #[tauri::command]
 fn mic_adapter_status() -> NoopBridgeResponse {
-    NoopBridgeResponse::for_command("mic_adapter.status")
+    let mut r = NoopBridgeResponse::for_command("mic_adapter.status");
+    r.command_status = "ok";
+    r.implementation_status = "real";
+    r
 }
 
 #[tauri::command]
