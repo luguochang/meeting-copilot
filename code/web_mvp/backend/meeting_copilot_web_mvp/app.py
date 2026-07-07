@@ -18,6 +18,8 @@ from meeting_copilot_web_mvp.logging_config import configure_logging, get_logger
 from meeting_copilot_web_mvp import llm_service
 from meeting_copilot_web_mvp import asr_stream
 from meeting_copilot_web_mvp import batch_transcribe
+from meeting_copilot_web_mvp import asr_correct
+from meeting_copilot_web_mvp.transcript_normalizer import normalize as _normalize_text
 from meeting_copilot_web_mvp import metrics as _metrics
 
 configure_logging()
@@ -347,11 +349,18 @@ def create_app(
         tmp = Path(tmp_path)
         try:
             tmp.write_bytes(await file.read())
-            text = batch_transcribe.transcribe_file(tmp)
+            raw_text = batch_transcribe.transcribe_file(tmp)  # L1 ASR raw
         except RuntimeError as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
         finally:
             tmp.unlink(missing_ok=True)
+        # Multi-level accuracy: L2 LLM correction (if configured) -> L3 normalizer
+        llm_cfg = llm_service.LlmConfig.from_env()
+        corrected_text = raw_text
+        correction_degraded = False
+        if llm_cfg is not None:
+            corrected_text, _usage, correction_degraded = asr_correct.correct_transcript(raw_text, llm_cfg)
+        text = _normalize_text(corrected_text)
         session_id = "file_" + uuid.uuid4().hex[:12]
         live_events = build_asr_live_events(
             session_id=session_id,
@@ -382,6 +391,9 @@ def create_app(
             "session_id": session_id,
             "provider": "local_funasr_batch",
             "transcript": text,
+            "raw_transcript": raw_text,
+            "corrected": corrected_text != raw_text,
+            "correction_degraded": correction_degraded,
             "event_count": len(live_events),
         }
 

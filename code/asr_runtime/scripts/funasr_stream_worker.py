@@ -48,12 +48,14 @@ def main() -> None:
         cache: dict = {}
         seg = 1
         last_text = ""
+        last_chunk = None
         stdin = sys.stdin.buffer
         while True:
             data = stdin.read(chunk_stride * 4)  # float32 = 4 bytes
             if not data:
                 break
             chunk = np.frombuffer(data, dtype="float32")
+            last_chunk = chunk
             kw = {
                 "input": chunk,
                 "cache": cache,
@@ -69,13 +71,10 @@ def main() -> None:
             if text and text != last_text:
                 _emit("partial", text, seg)
                 last_text = text
-        # finalize
-        kw["input"] = np.zeros(1, dtype="float32")
-        kw["is_final"] = True
-        res = model.generate(**kw)
-        text = "".join(r.get("text", "") for r in res).strip()
-        if text:
-            _emit("final", text, seg)
+        # finalize: the is_final generate call is unreliable on long audio (produces
+        # garbage); use the last partial (accumulated hypothesis) as the final text.
+        if last_text:
+            _emit("final", last_text, seg)
 
 
 if __name__ == "__main__":
