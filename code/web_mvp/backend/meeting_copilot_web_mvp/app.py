@@ -19,9 +19,11 @@ from pydantic import BaseModel, ConfigDict, Field
 from meeting_copilot_web_mvp.logging_config import configure_logging, get_logger
 from meeting_copilot_web_mvp import llm_service
 from meeting_copilot_web_mvp import asr_stream
+from meeting_copilot_web_mvp import metrics as _metrics
 
 configure_logging()
 _log = get_logger("meeting_copilot_web_mvp.app")
+_metrics.log_config_status()
 
 from meeting_copilot_core.contracts import SuggestionCardV1
 from meeting_copilot_core.session_snapshot import build_markdown_report
@@ -275,6 +277,10 @@ def create_app(
     @app.get("/workbench")
     def workbench() -> Response:
         return Response(WORKBENCH_HTML, media_type="text/html; charset=utf-8")
+
+    @app.get("/metrics")
+    def get_metrics() -> dict[str, Any]:
+        return _metrics.metrics.snapshot()
 
     @app.websocket("/live/asr/stream/ws/{session_id}")
     async def asr_stream_ws(websocket: WebSocket, session_id: str):
@@ -715,6 +721,8 @@ def create_app(
                 )
             previews = _execution_previews_from_record(record)
             runs = llm_service.build_enabled_execution_runs(previews, config)
+            _metrics.metrics.inc("llm_calls", len(runs))
+            _metrics.metrics.inc("cards_created", sum(1 for r in runs if r.get("card_status") == "new"))
         else:
             raise HTTPException(
                 status_code=422,
