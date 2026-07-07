@@ -9,10 +9,8 @@ import uuid
 from pathlib import Path
 import re
 from typing import Any
-from urllib.parse import quote
-from urllib.parse import urlparse
 
-from fastapi import Body, FastAPI, HTTPException, Request, Response, WebSocket
+from fastapi import FastAPI, HTTPException, Request, Response, WebSocket
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -25,7 +23,6 @@ configure_logging()
 _log = get_logger("meeting_copilot_web_mvp.app")
 _metrics.log_config_status()
 
-from meeting_copilot_core.contracts import SuggestionCardV1
 from meeting_copilot_core.session_snapshot import build_markdown_report
 from meeting_copilot_web_mvp.asr_live_events import (
     ASR_LIVE_SOURCE,
@@ -301,7 +298,7 @@ def create_app(
         return report
 
     @app.get("/")
-    def workbench() -> Response:
+    def root_index() -> Response:
         return Response(
             content=(STATIC_DIR / "index.html").read_text(encoding="utf-8"),
             media_type="text/html; charset=utf-8",
