@@ -1,7 +1,16 @@
 """Tests for the realtime ASR WebSocket stream."""
 import json
+import pytest
 from fastapi.testclient import TestClient
+from meeting_copilot_web_mvp import asr_stream
 from meeting_copilot_web_mvp.app import create_app
+
+
+@pytest.fixture(autouse=True)
+def _force_fake_recognizer(monkeypatch):
+    """Force the Fake recognizer so WS tests are deterministic and don't spawn
+    the real sherpa sidecar (tested separately in test_sherpa_sidecar.py)."""
+    monkeypatch.setattr(asr_stream, "_maybe_sherpa_sidecar", lambda sid: None)
 
 
 def test_asr_stream_ws_emits_partial_per_chunk_and_final_on_end():
