@@ -756,7 +756,7 @@ def create_app(
             for e in record.get("events") or []
             if e.get("event_type") == "transcript_final"
         )
-        cards, usage = llm_service.build_approach_cards(transcript_text, config)
+        cards, usage, degraded = llm_service.build_approach_cards(transcript_text, config)
         return {
             "session_id": session_id,
             "source": record["source"],
@@ -764,6 +764,7 @@ def create_app(
             "approach_cards": cards,
             "count": len(cards),
             "llm_usage": usage,
+            "degraded": degraded,
         }
 
     @app.get("/live/asr/sessions/{session_id}/draft")
