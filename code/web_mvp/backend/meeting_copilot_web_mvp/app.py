@@ -3,15 +3,25 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import structlog
+import time
+import uuid
 from pathlib import Path
 import re
 from typing import Any
 from urllib.parse import quote
 from urllib.parse import urlparse
 
-from fastapi import Body, FastAPI, HTTPException, Response
+from fastapi import Body, FastAPI, HTTPException, Request, Response, WebSocket
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
+
+from meeting_copilot_web_mvp.logging_config import configure_logging, get_logger
+from meeting_copilot_web_mvp import llm_service
+from meeting_copilot_web_mvp import asr_stream
+
+configure_logging()
+_log = get_logger("meeting_copilot_web_mvp.app")
 
 from meeting_copilot_core.contracts import SuggestionCardV1
 from meeting_copilot_core.session_snapshot import build_markdown_report
@@ -49,6 +59,7 @@ from meeting_copilot_web_mvp.repository import (
 
 
 STATIC_DIR = Path(__file__).resolve().parent / "frontend_static"
+WORKBENCH_HTML = (STATIC_DIR / "workbench.html").read_text(encoding="utf-8")
 SOURCE_REPO_ROOT = Path(__file__).resolve().parents[4]
 REPO_ROOT = SOURCE_REPO_ROOT
 LOCAL_ASR_EVENTS_APPROVED_ROOT = "artifacts/tmp/asr_events"
@@ -235,297 +246,39 @@ def create_app(
     )
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
+    @app.middleware("http")
+    async def _structured_request_logging(request: Request, call_next):
+        request_id = request.headers.get("x-request-id") or uuid.uuid4().hex[:12]
+        structlog.contextvars.clear_contextvars()
+        structlog.contextvars.bind_contextvars(
+            request_id=request_id,
+            method=request.method,
+            path=request.url.path,
+        )
+        start = time.perf_counter()
+        _log.info("request.start")
+        try:
+            response = await call_next(request)
+        except Exception:
+            duration_ms = round((time.perf_counter() - start) * 1000, 2)
+            _log.error("request.error", duration_ms=duration_ms, exc_info=True)
+            raise
+        duration_ms = round((time.perf_counter() - start) * 1000, 2)
+        _log.info("request.end", status_code=response.status_code, duration_ms=duration_ms)
+        response.headers["x-request-id"] = request_id
+        return response
+
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok", "service": "meeting-copilot-web-mvp"}
 
-    @app.get("/desktop/shell-readiness")
-    def desktop_shell_readiness() -> dict[str, Any]:
-        return _desktop_shell_readiness()
+    @app.get("/workbench")
+    def workbench() -> Response:
+        return Response(WORKBENCH_HTML, media_type="text/html; charset=utf-8")
 
-    @app.get("/desktop/runtime-boundary")
-    def desktop_runtime_boundary() -> dict[str, Any]:
-        return _desktop_runtime_boundary()
-
-    @app.get("/desktop/native-bridge-contract")
-    def desktop_native_bridge_contract() -> dict[str, Any]:
-        return _desktop_native_bridge_contract()
-
-    @app.get("/desktop/asr-worker-handoff-dry-run-readiness")
-    def desktop_asr_worker_handoff_dry_run_readiness() -> dict[str, Any]:
-        return _desktop_asr_worker_handoff_dry_run_readiness()
-
-    @app.get("/desktop/mic-adapter-contract-readiness")
-    def desktop_mic_adapter_contract_readiness() -> dict[str, Any]:
-        return _desktop_mic_adapter_contract_readiness()
-
-    @app.get("/desktop/real-mic-shadow-test-readiness")
-    def desktop_real_mic_shadow_test_readiness() -> dict[str, Any]:
-        return _desktop_real_mic_shadow_test_readiness()
-
-    @app.get("/desktop/local-shadow-preview-release-readiness")
-    def desktop_local_shadow_preview_release_readiness() -> dict[str, Any]:
-        return {
-            "release_tier": "local_shadow_preview",
-            "demo_preview_ready": True,
-            "shadow_pilot_ready": False,
-            "production_mvp_ready": False,
-            "asr_quality_exit_status": "not_exited",
-            "asr_quality_decision_status": "blocked_by_funasr_smoke_assembly_input_guard",
-            "real_mic_readiness_status": (
-                "blocked_not_ready_for_user_real_mic_shadow_test"
-            ),
-            "llm_execution_status": "disabled_not_called",
-            "formal_card_status": "not_created_in_current_mainline_preview",
-            "formal_report_status": "preview_only_not_real_meeting_go_evidence",
-            "allowed_claim": "local synthetic/replay/artifact Copilot preview",
-            "forbidden_claims": [
-                "real meeting ready",
-                "production ASR ready",
-                "production MVP ready",
-                "background microphone capture ready",
-            ],
-            "release_blockers": [
-                "asr_quality_exit_not_passed",
-                "real_mic_shadow_test_blocked",
-                "desktop_real_audio_capture_not_enabled",
-                "llm_execution_disabled",
-                "formal_cards_not_created_in_current_mainline_preview",
-            ],
-            "next_valid_actions": [
-                "p0_local_shadow_preview_truthful_packaging",
-                "p1_asr_quality_exit_or_pivot",
-                "p2_user_authorized_shadow_pilot_after_p1",
-            ],
-            "safety_flags": {
-                "safe_to_capture_microphone_now": False,
-                "safe_to_capture_system_audio_now": False,
-                "safe_to_call_remote_asr_now": False,
-                "safe_to_call_llm_now": False,
-                "safe_to_read_configs_local_now": False,
-            },
-        }
-
-    @app.post("/desktop/mac-local-shadow-mvp-demo/sessions", status_code=201)
-    def create_mac_local_shadow_mvp_demo_session(
-        payload: CreateMacLocalShadowMvpDemoSessionRequest,
-    ) -> dict[str, Any]:
-        try:
-            live_events = build_asr_live_events(
-                session_id=payload.session_id,
-                provider="local_mock_asr",
-                streaming_events=_mac_local_shadow_mvp_streaming_events(),
-                is_mock=True,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        record = {
-            "session_id": payload.session_id,
-            "provider": "local_mock_asr",
-            "source": ASR_LIVE_SOURCE,
-            "trace_kind": ASR_LIVE_TRACE_KIND,
-            "ingest_mode": "mac_local_shadow_mvp_synthetic_demo",
-            "demo_id": "mac_local_shadow_mvp",
-            "events": live_events,
-        }
-        try:
-            asr_live_repo.create(record)
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return _mac_local_shadow_mvp_demo_response(
-            session_id=payload.session_id,
-            live_events=live_events,
-        )
-
-    @app.post("/desktop/realistic-meeting-simulation-pack/sessions", status_code=201)
-    def create_realistic_meeting_simulation_pack_session(
-        payload: CreateRealisticMeetingSimulationPackSessionRequest,
-    ) -> dict[str, Any]:
-        if payload.profile not in ("standard", "long_shadow"):
-            raise HTTPException(
-                status_code=422,
-                detail="profile must be one of: standard, long_shadow",
-            )
-        try:
-            live_events = build_asr_live_events(
-                session_id=payload.session_id,
-                provider="local_mock_asr",
-                streaming_events=_realistic_meeting_simulation_pack_streaming_events(
-                    payload.profile
-                ),
-                is_mock=True,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        record = {
-            "session_id": payload.session_id,
-            "provider": "local_mock_asr",
-            "source": ASR_LIVE_SOURCE,
-            "trace_kind": ASR_LIVE_TRACE_KIND,
-            "ingest_mode": "realistic_meeting_simulation_pack",
-            "simulation_id": "realistic_meeting_simulation_pack",
-            "profile_id": payload.profile,
-            "events": live_events,
-        }
-        try:
-            asr_live_repo.create(record)
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return _realistic_meeting_simulation_pack_response(
-            session_id=payload.session_id,
-            live_events=live_events,
-            profile_id=payload.profile,
-        )
-
-    @app.post("/desktop/mainline-asr-blocked-trial/sessions", status_code=201)
-    def create_mainline_asr_blocked_trial_session(
-        payload: CreateMainlineAsrBlockedTrialSessionRequest,
-    ) -> dict[str, Any]:
-        try:
-            live_events = build_asr_live_events(
-                session_id=payload.session_id,
-                provider="local_mock_asr",
-                streaming_events=_long_shadow_realistic_meeting_simulation_events(),
-                is_mock=True,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        record = {
-            "session_id": payload.session_id,
-            "provider": "local_mock_asr",
-            "source": ASR_LIVE_SOURCE,
-            "trace_kind": ASR_LIVE_TRACE_KIND,
-            "ingest_mode": "mainline_asr_blocked_trial",
-            "mainline_decision_id": "DEC-201",
-            "events": live_events,
-        }
-        try:
-            asr_live_repo.create(record)
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return _mainline_asr_blocked_trial_response(
-            session_id=payload.session_id,
-            live_events=live_events,
-        )
-
-    @app.post("/desktop/mainline-asr-event-artifact-trial/sessions", status_code=201)
-    def create_mainline_asr_event_artifact_trial_session(
-        payload: CreateAsrLiveSessionFromEventFileRequest,
-    ) -> dict[str, Any]:
-        events_path = Path(payload.events_path)
-        path_errors = _validate_local_asr_events_path(events_path)
-        if path_errors:
-            raise HTTPException(
-                status_code=422,
-                detail=_local_asr_event_file_error_detail(
-                    ingest_status="blocked_by_path_validation",
-                    events_path=events_path,
-                    provider=payload.provider,
-                    session_id=payload.session_id,
-                    validation_errors=path_errors,
-                ),
-            )
-        try:
-            streaming_events = _load_local_asr_events(events_path)
-        except (OSError, ValueError) as exc:
-            raise HTTPException(
-                status_code=422,
-                detail=_local_asr_event_file_error_detail(
-                    ingest_status="blocked_by_invalid_events_file",
-                    events_path=events_path,
-                    provider=payload.provider,
-                    session_id=payload.session_id,
-                    validation_errors=[str(exc)],
-                ),
-            ) from exc
-        event_contract_errors = _validate_local_asr_event_contract(streaming_events)
-        if event_contract_errors:
-            raise HTTPException(
-                status_code=422,
-                detail=_local_asr_event_file_error_detail(
-                    ingest_status="blocked_by_event_contract",
-                    events_path=events_path,
-                    provider=payload.provider,
-                    session_id=payload.session_id,
-                    validation_errors=event_contract_errors,
-                    input_event_counts=_local_asr_input_event_counts(streaming_events),
-                ),
-            )
-        try:
-            live_events = build_asr_live_events(
-                session_id=payload.session_id,
-                provider=payload.provider,
-                streaming_events=streaming_events,
-                is_mock=False,
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise HTTPException(
-                status_code=422,
-                detail=_local_asr_event_file_error_detail(
-                    ingest_status="blocked_by_event_contract",
-                    events_path=events_path,
-                    provider=payload.provider,
-                    session_id=payload.session_id,
-                    validation_errors=[str(exc)],
-                    input_event_counts=_local_asr_input_event_counts(streaming_events),
-                ),
-            ) from exc
-
-        display_path = _display_local_asr_events_path(events_path)
-        record = {
-            "session_id": payload.session_id,
-            "provider": payload.provider,
-            "source": ASR_LIVE_SOURCE,
-            "trace_kind": ASR_LIVE_TRACE_KIND,
-            "ingest_mode": "mainline_asr_event_artifact_trial",
-            "mainline_decision_id": "DEC-214",
-            "events_path": display_path,
-            "events": live_events,
-        }
-        try:
-            asr_live_repo.create(record)
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return _mainline_asr_event_artifact_trial_response(
-            session_id=payload.session_id,
-            provider=payload.provider,
-            events_path=display_path,
-            live_events=live_events,
-            streaming_events=streaming_events,
-        )
-
-    @app.post("/desktop/mainline-trial-feedback-export-closures", status_code=201)
-    def create_mainline_trial_feedback_export_closure(
-        payload: CreateMainlineTrialFeedbackExportClosureRequest,
-    ) -> dict[str, Any]:
-        try:
-            record = asr_live_repo.get(payload.session_id)
-        except KeyError as exc:
-            raise HTTPException(
-                status_code=404,
-                detail=f"ASR live session not found: {payload.session_id}",
-            ) from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        report = _mainline_trial_feedback_export_closure_from_record(
-            record,
-            feedback_entries=payload.feedback_entries,
-        )
-        if str(report.get("closure_status", "")).startswith("blocked_"):
-            raise HTTPException(status_code=422, detail=report)
-        return report
-
-    @app.post("/desktop/tauri-noop-run-results/validations")
-    def validate_desktop_tauri_noop_run_result(
-        payload: DesktopTauriNoopRunResultValidationRequest,
-    ) -> dict[str, Any]:
-        intake_tool = _load_desktop_tauri_noop_run_result_intake_module()
-        report = intake_tool.build_tauri_noop_run_result_intake_report(
-            run_result=payload.run_result,
-        )
-        if report.get("result_validation_status") != "passed":
-            raise HTTPException(status_code=422, detail=report)
-        return report
+    @app.websocket("/live/asr/stream/ws/{session_id}")
+    async def asr_stream_ws(websocket: WebSocket, session_id: str):
+        await asr_stream.handle_stream(websocket, session_id)
 
     @app.post("/shadow-reports/feedback-ingestions")
     def create_shadow_report_feedback_ingestion(
@@ -937,78 +690,36 @@ def create_app(
             "execution_previews": execution_previews,
         }
 
-    @app.get("/live/asr/sessions/{session_id}/llm-openai-request-body-previews")
-    def get_asr_live_session_llm_openai_request_body_previews(
-        session_id: str,
-    ) -> dict[str, Any]:
-        try:
-            record = asr_live_repo.get(session_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=f"ASR live session not found: {session_id}") from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        request_body_previews = _openai_request_body_previews_from_record(record)
-        block_reasons = [
-            "request_body_preview_only",
-            "provider_config_not_loaded",
-            "credentials_not_read",
-            "llm_executor_disabled",
-        ]
-        if not request_body_previews:
-            block_reasons.append("no_request_drafts")
-        redacted_preview_count = sum(
-            1
-            for preview in request_body_previews
-            if preview["redaction_status"] == "applied"
-        )
-        return {
-            "session_id": session_id,
-            "source": record["source"],
-            "trace_kind": record["trace_kind"],
-            "provider_protocol": "openai_compatible_chat_completions",
-            "preview_status": "body_preview_only",
-            "redaction_policy": OPENAI_REQUEST_BODY_REDACTION_POLICY,
-            "redaction_status": (
-                "applied" if redacted_preview_count else "not_needed"
-            ),
-            "redacted_preview_count": redacted_preview_count,
-            "llm_call_status": "not_called",
-            "credentials_status": "not_read",
-            "config_source_status": "not_read",
-            "schema_status": "not_generated",
-            "card_status": "not_created",
-            "cost_status": "not_estimated",
-            "safe_to_execute": False,
-            "request_body_preview_count": len(request_body_previews),
-            "request_body_previews": request_body_previews,
-            "forbidden_request_fields": _openai_request_forbidden_fields(),
-            "block_reasons": block_reasons,
-            "next_required_decisions": [
-                "authorized_config_file_reader",
-                "secret_storage_adapter",
-                "enabled_executor_mode_contract",
-                "schema_validation_and_card_lifecycle",
-                "token_cost_accounting",
-            ],
-        }
-
     @app.post("/live/asr/sessions/{session_id}/llm-execution-runs")
     def create_asr_live_session_llm_execution_runs(
         session_id: str,
         payload: CreateLlmExecutionRunsRequest,
     ) -> dict[str, Any]:
-        if payload.mode != "disabled":
-            raise HTTPException(
-                status_code=422,
-                detail=f"unsupported llm execution mode: {payload.mode}",
-            )
         try:
             record = asr_live_repo.get(session_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=f"ASR live session not found: {session_id}") from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        runs = _disabled_execution_runs_from_record(record)
+        if payload.mode == "disabled":
+            runs = _disabled_execution_runs_from_record(record)
+        elif payload.mode == "enabled":
+            config = llm_service.LlmConfig.from_env()
+            if config is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "LLM execution enabled but LLM_GATEWAY_BASE_URL / "
+                        "LLM_GATEWAY_API_KEY not configured in environment"
+                    ),
+                )
+            previews = _execution_previews_from_record(record)
+            runs = llm_service.build_enabled_execution_runs(previews, config)
+        else:
+            raise HTTPException(
+                status_code=422,
+                detail=f"unsupported llm execution mode: {payload.mode}",
+            )
         return {
             "session_id": session_id,
             "source": record["source"],
@@ -1018,390 +729,42 @@ def create_app(
             "runs": runs,
         }
 
-    @app.post("/live/asr/sessions/{session_id}/llm-schema-validation-dry-runs")
-    def create_asr_live_session_llm_schema_validation_dry_runs(
+    @app.post("/live/asr/sessions/{session_id}/approach-cards")
+    def create_asr_live_session_approach_cards(
         session_id: str,
-        payload: Any = Body(...),
+        payload: CreateLlmExecutionRunsRequest,
     ) -> dict[str, Any]:
-        validated_payload = _validate_llm_schema_validation_dry_run_payload(payload)
         try:
             record = asr_live_repo.get(session_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=f"ASR live session not found: {session_id}") from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return _llm_schema_validation_dry_run_from_record(record, validated_payload)
-
-    @app.post("/live/asr/sessions/{session_id}/llm-card-creation-policy-dry-runs")
-    def create_asr_live_session_llm_card_creation_policy_dry_runs(
-        session_id: str,
-        payload: Any = Body(...),
-    ) -> dict[str, Any]:
-        validated_payload = _validate_llm_schema_validation_dry_run_payload(payload)
-        try:
-            record = asr_live_repo.get(session_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=f"ASR live session not found: {session_id}") from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return _llm_card_creation_policy_dry_run_from_record(record, validated_payload)
-
-    @app.post("/live/asr/sessions/{session_id}/llm-card-lifecycle-preview-dry-runs")
-    def create_asr_live_session_llm_card_lifecycle_preview_dry_runs(
-        session_id: str,
-        payload: Any = Body(...),
-    ) -> dict[str, Any]:
-        validated_payload = _validate_llm_schema_validation_dry_run_payload(payload)
-        try:
-            record = asr_live_repo.get(session_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=f"ASR live session not found: {session_id}") from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return _llm_card_lifecycle_preview_dry_run_from_record(
-            record,
-            validated_payload,
-        )
-
-    @app.post("/live/asr/sessions/{session_id}/llm-card-lifecycle-append-preflight-dry-runs")
-    def create_asr_live_session_llm_card_lifecycle_append_preflight_dry_runs(
-        session_id: str,
-        payload: Any = Body(...),
-    ) -> dict[str, Any]:
-        validated_payload = _validate_llm_schema_validation_dry_run_payload(payload)
-        try:
-            record = asr_live_repo.get(session_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=f"ASR live session not found: {session_id}") from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return _llm_card_lifecycle_append_preflight_dry_run_from_record(
-            record,
-            validated_payload,
-        )
-
-    @app.post("/live/asr/sessions/{session_id}/llm-card-lifecycle-append-runs")
-    def create_asr_live_session_llm_card_lifecycle_append_runs(
-        session_id: str,
-        payload: Any = Body(...),
-    ) -> dict[str, Any]:
-        validated_payload = _validate_llm_card_lifecycle_append_run_payload(payload)
-        try:
-            record = asr_live_repo.get(session_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=f"ASR live session not found: {session_id}") from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return _llm_card_lifecycle_append_disabled_run_from_record(
-            record,
-            validated_payload,
-        )
-
-    @app.post("/live/asr/sessions/{session_id}/llm-card-lifecycle-append-repository-dry-runs")
-    def create_asr_live_session_llm_card_lifecycle_append_repository_dry_runs(
-        session_id: str,
-        payload: Any = Body(...),
-    ) -> dict[str, Any]:
-        validated_payload = (
-            _validate_llm_card_lifecycle_append_repository_dry_run_payload(payload)
-        )
-        try:
-            record = asr_live_repo.get(session_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=f"ASR live session not found: {session_id}") from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return _llm_card_lifecycle_append_repository_dry_run_from_record(
-            record,
-            validated_payload,
-        )
-
-    @app.post("/live/asr/sessions/{session_id}/llm-card-lifecycle-append-transaction-runs")
-    def create_asr_live_session_llm_card_lifecycle_append_transaction_runs(
-        session_id: str,
-        payload: Any = Body(...),
-    ) -> dict[str, Any]:
-        validated_payload = (
-            _validate_llm_card_lifecycle_append_transaction_run_payload(payload)
-        )
-        try:
-            record = asr_live_repo.get(session_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=f"ASR live session not found: {session_id}") from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return _llm_card_lifecycle_append_transaction_disabled_run_from_record(
-            record,
-            validated_payload,
-        )
-
-    @app.post("/live/asr/sessions/{session_id}/llm-card-lifecycle-append-result-audit-previews")
-    def create_asr_live_session_llm_card_lifecycle_append_result_audit_previews(
-        session_id: str,
-        payload: Any = Body(...),
-    ) -> dict[str, Any]:
-        validated_payload = (
-            _validate_llm_card_lifecycle_append_result_audit_preview_payload(payload)
-        )
-        try:
-            record = asr_live_repo.get(session_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=f"ASR live session not found: {session_id}") from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return _llm_card_lifecycle_append_result_audit_preview_from_record(
-            record,
-            validated_payload,
-        )
-
-    @app.post("/live/asr/sessions/{session_id}/llm-card-lifecycle-retry-replay-preflights")
-    def create_asr_live_session_llm_card_lifecycle_retry_replay_preflights(
-        session_id: str,
-        payload: Any = Body(...),
-    ) -> dict[str, Any]:
-        validated_payload = _validate_llm_card_lifecycle_retry_replay_preflight_payload(
-            payload
-        )
-        try:
-            record = asr_live_repo.get(session_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=f"ASR live session not found: {session_id}") from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return _llm_card_lifecycle_retry_replay_preflight_from_record(
-            record,
-            validated_payload,
-        )
-
-    @app.post("/live/asr/sessions/{session_id}/llm-card-lifecycle-append-event-serializer-dry-runs")
-    def create_asr_live_session_llm_card_lifecycle_append_event_serializer_dry_runs(
-        session_id: str,
-        payload: Any = Body(...),
-    ) -> dict[str, Any]:
-        validated_payload = (
-            _validate_llm_card_lifecycle_append_event_serializer_dry_run_payload(
-                payload
+        if payload.mode != "enabled":
+            raise HTTPException(status_code=422, detail=f"unsupported approach mode: {payload.mode}")
+        config = llm_service.LlmConfig.from_env()
+        if config is None:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "LLM execution enabled but LLM_GATEWAY_BASE_URL / "
+                    "LLM_GATEWAY_API_KEY not configured in environment"
+                ),
             )
+        transcript_text = " ".join(
+            str((e.get("payload") or {}).get("text", ""))
+            for e in record.get("events") or []
+            if e.get("event_type") == "transcript_final"
         )
-        try:
-            record = asr_live_repo.get(session_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=f"ASR live session not found: {session_id}") from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return _llm_card_lifecycle_append_event_serializer_dry_run_from_record(
-            record,
-            validated_payload,
-        )
-
-    @app.post("/live/asr/sessions/{session_id}/llm-card-lifecycle-append-mutation-preflights")
-    def create_asr_live_session_llm_card_lifecycle_append_mutation_preflights(
-        session_id: str,
-        payload: Any = Body(...),
-    ) -> dict[str, Any]:
-        validated_payload = (
-            _validate_llm_card_lifecycle_append_mutation_preflight_payload(
-                payload
-            )
-        )
-        try:
-            record = asr_live_repo.get(session_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=f"ASR live session not found: {session_id}") from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return _llm_card_lifecycle_append_mutation_preflight_from_record(
-            record,
-            validated_payload,
-        )
-
-    @app.post("/live/asr/sessions/{session_id}/llm-card-lifecycle-append-transaction-commit-preflights")
-    def create_asr_live_session_llm_card_lifecycle_append_transaction_commit_preflights(
-        session_id: str,
-        payload: Any = Body(...),
-    ) -> dict[str, Any]:
-        validated_payload = (
-            _validate_llm_card_lifecycle_append_transaction_commit_preflight_payload(
-                payload
-            )
-        )
-        try:
-            record = asr_live_repo.get(session_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=f"ASR live session not found: {session_id}") from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return _llm_card_lifecycle_append_transaction_commit_preflight_from_record(
-            record,
-            validated_payload,
-        )
-
-    @app.post("/live/asr/sessions/{session_id}/llm-card-lifecycle-append-idempotency-store-write-preflights")
-    def create_asr_live_session_llm_card_lifecycle_append_idempotency_store_write_preflights(
-        session_id: str,
-        payload: Any = Body(...),
-    ) -> dict[str, Any]:
-        validated_payload = (
-            _validate_llm_card_lifecycle_append_idempotency_store_write_preflight_payload(
-                payload
-            )
-        )
-        try:
-            record = asr_live_repo.get(session_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=f"ASR live session not found: {session_id}") from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return _llm_card_lifecycle_append_idempotency_store_write_preflight_from_record(
-            record,
-            validated_payload,
-        )
-
-    @app.post("/live/asr/sessions/{session_id}/llm-card-lifecycle-append-result-audit-event-persistence-preflights")
-    def create_asr_live_session_llm_card_lifecycle_append_result_audit_event_persistence_preflights(
-        session_id: str,
-        payload: Any = Body(...),
-    ) -> dict[str, Any]:
-        validated_payload = (
-            _validate_llm_card_lifecycle_append_result_audit_event_persistence_preflight_payload(
-                payload
-            )
-        )
-        try:
-            record = asr_live_repo.get(session_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=f"ASR live session not found: {session_id}") from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return (
-            _llm_card_lifecycle_append_result_audit_event_persistence_preflight_from_record(
-                record,
-                validated_payload,
-            )
-        )
-
-    @app.post("/live/asr/sessions/{session_id}/llm-card-lifecycle-readiness-summaries")
-    def create_asr_live_session_llm_card_lifecycle_readiness_summaries(
-        session_id: str,
-        payload: Any = Body(...),
-    ) -> dict[str, Any]:
-        validated_payload = _validate_llm_card_lifecycle_readiness_summary_payload(
-            payload
-        )
-        try:
-            record = asr_live_repo.get(session_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=f"ASR live session not found: {session_id}") from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return _llm_card_lifecycle_readiness_summary_from_record(
-            record,
-            validated_payload,
-        )
-
-    @app.get("/live/asr/sessions/{session_id}/llm-provider-readiness")
-    def get_asr_live_session_llm_provider_readiness(
-        session_id: str,
-    ) -> dict[str, Any]:
-        try:
-            record = asr_live_repo.get(session_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=f"ASR live session not found: {session_id}") from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return _llm_provider_readiness_from_record(record)
-
-    @app.get("/live/asr/sessions/{session_id}/llm-provider-config-boundary")
-    def get_asr_live_session_llm_provider_config_boundary(
-        session_id: str,
-    ) -> dict[str, Any]:
-        try:
-            record = asr_live_repo.get(session_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=f"ASR live session not found: {session_id}") from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return _llm_provider_config_boundary_from_record(record)
-
-    @app.get("/live/asr/sessions/{session_id}/llm-provider-masked-status")
-    def get_asr_live_session_llm_provider_masked_status(
-        session_id: str,
-    ) -> dict[str, Any]:
-        try:
-            record = asr_live_repo.get(session_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=f"ASR live session not found: {session_id}") from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return _llm_provider_masked_status_from_record(record)
-
-    @app.post("/live/asr/sessions/{session_id}/llm-provider-masked-status-loader-dry-run")
-    def dry_run_asr_live_session_llm_provider_masked_status_loader(
-        session_id: str,
-        payload: Any = Body(...),
-    ) -> dict[str, Any]:
-        _validate_llm_provider_masked_status_loader_dry_run_payload(payload)
-        try:
-            record = asr_live_repo.get(session_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=f"ASR live session not found: {session_id}") from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return _llm_provider_masked_status_loader_dry_run_from_record(record, payload)
-
-    @app.post("/live/asr/sessions/{session_id}/llm-provider-config-validation")
-    def validate_asr_live_session_llm_provider_config(
-        session_id: str,
-        payload: Any = Body(...),
-    ) -> dict[str, Any]:
-        _validate_llm_provider_config_payload(payload)
-        try:
-            record = asr_live_repo.get(session_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=f"ASR live session not found: {session_id}") from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return _llm_provider_config_validation_from_record(record, payload)
-
-    @app.post("/live/asr/sessions/{session_id}/llm-provider-config-loader-preflight")
-    def preflight_asr_live_session_llm_provider_config_loader(
-        session_id: str,
-        payload: Any = Body(...),
-    ) -> dict[str, Any]:
-        _validate_llm_provider_config_loader_preflight_payload(payload)
-        try:
-            record = asr_live_repo.get(session_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=f"ASR live session not found: {session_id}") from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return _llm_provider_config_loader_preflight_from_record(record, payload)
-
-    @app.get("/live/asr/sessions/{session_id}/llm-provider-secret-storage-policy")
-    def get_asr_live_session_llm_provider_secret_storage_policy(
-        session_id: str,
-    ) -> dict[str, Any]:
-        try:
-            record = asr_live_repo.get(session_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=f"ASR live session not found: {session_id}") from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return _llm_provider_secret_storage_policy_from_record(record)
-
-    @app.post("/live/asr/sessions/{session_id}/llm-provider-config-reader-dry-run")
-    def dry_run_asr_live_session_llm_provider_config_reader(
-        session_id: str,
-        payload: Any = Body(...),
-    ) -> dict[str, Any]:
-        _validate_llm_provider_config_reader_dry_run_payload(payload)
-        try:
-            record = asr_live_repo.get(session_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=f"ASR live session not found: {session_id}") from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return _llm_provider_config_reader_dry_run_from_record(record, payload)
+        cards, usage = llm_service.build_approach_cards(transcript_text, config)
+        return {
+            "session_id": session_id,
+            "source": record["source"],
+            "trace_kind": record["trace_kind"],
+            "approach_cards": cards,
+            "count": len(cards),
+            "llm_usage": usage,
+        }
 
     @app.get("/live/asr/sessions/{session_id}/draft")
     def get_asr_live_session_draft(session_id: str) -> dict[str, Any]:

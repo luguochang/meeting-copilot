@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Meeting Copilot Workbench</title>
+<style>
+:root{
+  --bg-deep:#0B0F1A;--bg-base:#0F172A;--bg-elevated:#11182C;--bg-overlay:#161F36;
+  --fg-primary:#F1F5F9;--fg-secondary:#94A3B8;--fg-muted:#64748B;
+  --accent:#6366F1;--accent-glow:rgba(99,102,241,.18);--primary:#D97706;
+  --ok:#22C55E;--warn:#F59E0B;--risk:#EF4444;--info:#38BDF8;--approach:#a78bfa;
+  --border:rgba(255,255,255,.08);--border-strong:rgba(255,255,255,.14);
+  --sp-1:4px;--sp-2:8px;--sp-3:12px;--sp-4:16px;--sp-5:24px;--sp-6:32px;
+  --r-sm:6px;--r-md:10px;--r-lg:14px;--shadow-card:0 8px 24px rgba(0,0,0,.4);
+  --font-sans:"Lexend",-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
+  --font-mono:"Fira Code",ui-monospace,Menlo,monospace;
+  --ease:cubic-bezier(.16,1,.3,1);--t-fast:150ms;--t-base:220ms;
+}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:var(--font-sans);background:var(--bg-deep);color:var(--fg-primary);font-size:14px;line-height:1.55;-webkit-font-smoothing:antialiased}
+button{font-family:inherit;cursor:pointer;border:none;background:none;color:inherit}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:var(--r-sm)}
+.app{display:grid;grid-template-rows:56px 1fr 36px;grid-template-columns:248px 1fr 320px;grid-template-areas:"topbar topbar topbar" "left center right" "status status status";height:100vh;gap:1px;background:var(--border)}
+.app>*{background:var(--bg-base)}
+.topbar{grid-area:topbar;display:flex;align-items:center;gap:var(--sp-5);padding:0 var(--sp-5)}
+.brand{display:flex;align-items:center;gap:var(--sp-3)}
+.brand-mark{width:28px;height:28px;border-radius:8px;background:linear-gradient(135deg,var(--accent),var(--primary));display:grid;place-items:center;color:#fff;font-weight:700}
+.brand-name{font-weight:600}
+.session-meta{display:flex;align-items:center;gap:var(--sp-3);color:var(--fg-secondary);font-size:13px}
+.spacer{flex:1}
+.actions{display:flex;gap:var(--sp-2)}
+.btn{height:34px;padding:0 var(--sp-4);border-radius:var(--r-sm);font-size:13px;font-weight:500;display:inline-flex;align-items:center;gap:6px;border:1px solid var(--border);color:var(--fg-primary);transition:background var(--t-fast) var(--ease),border-color var(--t-fast) var(--ease)}
+.btn:hover{background:var(--bg-overlay);border-color:var(--border-strong)}
+.btn-primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn-primary:hover{background:#5457e6}
+.left{grid-area:left;overflow-y:auto;padding:var(--sp-4)}
+.panel-title{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--fg-muted);margin:var(--sp-4) 0 var(--sp-3)}
+.panel-title:first-child{margin-top:var(--sp-1)}
+.state-row{display:flex;align-items:center;gap:var(--sp-3);padding:var(--sp-2) var(--sp-3);border-radius:var(--r-sm);font-size:13px}
+.state-row .name{flex:1}
+.state-row .count{font-family:var(--font-mono);font-size:11px;font-weight:600;min-width:20px;text-align:center;padding:2px 6px;border-radius:10px;background:rgba(100,116,139,.14);color:var(--fg-muted)}
+.c-decision .count{background:rgba(34,197,94,.14);color:var(--ok)}
+.c-action .count{background:rgba(56,189,248,.14);color:var(--info)}
+.c-risk .count{background:rgba(239,68,68,.14);color:var(--risk)}
+.c-question .count{background:rgba(245,158,11,.14);color:var(--warn)}
+.center{grid-area:center;overflow-y:auto;padding:var(--sp-5) var(--sp-6)}
+.center h2{font-size:15px;font-weight:600;margin-bottom:var(--sp-4)}
+.utterance{display:grid;grid-template-columns:56px 1fr;gap:var(--sp-4);padding:var(--sp-2) 0;font-size:14.5px;line-height:1.75}
+.utterance .ts{font-family:var(--font-mono);font-size:11px;color:var(--fg-muted);padding-top:3px}
+.utterance .text .speaker{font-size:12px;color:var(--fg-secondary);margin-right:6px;font-weight:500}
+.utterance .text .entity{font-family:var(--font-mono);font-size:13px;background:var(--accent-glow);color:#a5b4fc;padding:1px 5px;border-radius:4px}
+.suggestion{margin:var(--sp-3) 0 var(--sp-3) 56px;background:var(--bg-elevated);border:1px solid var(--border);border-left:3px solid var(--warn);border-radius:var(--r-md);padding:var(--sp-3) var(--sp-4);box-shadow:var(--shadow-card)}
+.suggestion.approach{border-left-color:var(--approach)}
+.sug-head{display:flex;align-items:center;gap:var(--sp-2);margin-bottom:6px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.05em}
+.sug-head.gap{color:var(--warn)}.sug-head.approach{color:var(--approach)}
+.sug-body{font-size:13.5px;margin-bottom:var(--sp-2)}
+.sug-body strong{color:#fbbf24;font-weight:600}
+.evidence{display:flex;gap:8px;background:rgba(0,0,0,.25);border:1px solid var(--border);border-radius:var(--r-sm);padding:var(--sp-2) var(--sp-3);font-size:12.5px;color:var(--fg-secondary)}
+.evidence .quote{color:var(--fg-primary);font-style:italic}
+.sug-meta{font-family:var(--font-mono);font-size:11px;color:var(--fg-muted);margin-top:6px}
+.right{grid-area:right;overflow-y:auto;padding:var(--sp-4);border-left:1px solid var(--border)}
+.detail-card{background:var(--bg-elevated);border:1px solid var(--border);border-radius:var(--r-md);padding:var(--sp-4);margin-bottom:var(--sp-4);font-size:13px}
+.detail-card h3{font-size:13px;margin-bottom:var(--sp-2)}
+.status{grid-area:status;display:flex;align-items:center;gap:var(--sp-5);padding:0 var(--sp-5);font-size:12px;color:var(--fg-secondary)}
+.status .v{font-family:var(--font-mono);color:var(--fg-primary)}
+.status .ok{color:var(--ok)}.status .warn{color:var(--warn)}.status .err{color:var(--risk)}
+.empty{color:var(--fg-muted);font-size:13px;padding:var(--sp-4)}
+.toast{position:fixed;bottom:60px;left:50%;transform:translateX(-50%) translateY(20px);background:var(--bg-elevated);border:1px solid var(--border-strong);padding:var(--sp-3) var(--sp-5);border-radius:var(--r-md);box-shadow:var(--shadow-card);font-size:13px;opacity:0;pointer-events:none;transition:all var(--t-base) var(--ease);z-index:200}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+</style>
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <div class="brand"><div class="brand-mark">M</div><span class="brand-name">Meeting Copilot</span></div>
+    <div class="session-meta"><span id="session-meta">未加载会议</span></div>
+    <div class="spacer"></div>
+    <div class="actions">
+      <button class="btn" id="btn-load">加载样本会议</button>
+      <button class="btn btn-primary" id="btn-cards">生成建议卡片</button>
+      <button class="btn" id="btn-approach">方案考量</button>
+    </div>
+  </header>
+  <aside class="left">
+    <div class="panel-title">会议状态</div>
+    <div class="state-row c-decision"><span class="name">已确认决策</span><span class="count" id="c-decision">0</span></div>
+    <div class="state-row c-action"><span class="name">行动项</span><span class="count" id="c-action">0</span></div>
+    <div class="state-row c-risk"><span class="name">风险</span><span class="count" id="c-risk">0</span></div>
+    <div class="state-row c-question"><span class="name">未闭环问题</span><span class="count" id="c-question">0</span></div>
+    <div class="panel-title">建议卡片</div>
+    <div class="state-row"><span class="name">缺口卡</span><span class="count" id="c-gap">0</span></div>
+    <div class="state-row" style="color:var(--approach)"><span class="name">方案考量卡</span><span class="count" id="c-approach" style="background:rgba(167,139,250,.14);color:var(--approach)">0</span></div>
+  </aside>
+  <main class="center">
+    <h2>实时转写 · 建议卡片</h2>
+    <div id="stream"><div class="empty">点击「加载样本会议」开始。</div></div>
+  </main>
+  <aside class="right">
+    <div class="panel-title">系统状态</div>
+    <div class="detail-card" id="sys-status"><div class="empty">未加载。</div></div>
+    <div class="panel-title">说明</div>
+    <div class="detail-card"><p>缺口卡（琥珀）来自规则候选；方案考量卡（紫）来自 LLM。点击「生成建议卡片」触发真实 LLM 执行（需配置 LLM_GATEWAY_*）；「方案考量」生成方案建议卡。</p></div>
+  </aside>
+  <footer class="status">
+    <span>ASR <span class="v" id="s-asr">—</span></span>
+    <span>LLM <span class="v" id="s-llm">—</span></span>
+    <span>卡片 <span class="v" id="s-cards">0</span></span>
+  </footer>
+</div>
+<div class="toast" id="toast"></div>
+<script src="/static/workbench.js"></script>
+</body>
+</html>
