@@ -280,6 +280,55 @@ def create_app(
     def get_metrics() -> dict[str, Any]:
         return _metrics.metrics.snapshot()
 
+    @app.get("/audio/check")
+    def audio_check() -> dict[str, Any]:
+        """Pre-meeting device check (G3): mic devices + ASR sidecars + LLM config."""
+        devices: list[dict[str, Any]] = []
+        mic_available = False
+        mic_error: str | None = None
+        try:
+            import sounddevice as sd
+            for i, d in enumerate(sd.query_devices()):
+                if d.get("max_input_channels", 0) > 0:
+                    devices.append({"index": i, "name": d.get("name"), "channels": d.get("max_input_channels")})
+                    mic_available = True
+        except Exception as exc:
+            mic_error = str(exc)
+            _log.warning("audio.check.mic_failed", error=str(exc))
+        return {
+            "mic_available": mic_available,
+            "mic_devices": devices,
+            "mic_error": mic_error,
+            "funasr_available": batch_transcribe.is_available(),
+            "sherpa_available": asr_stream._SHERPA_VENV_PY.is_file(),
+            "llm_configured": bool(llm_service.LlmConfig.from_env()),
+        }
+
+    @app.post("/live/asr/sessions/{session_id}/minutes.json")
+    def create_asr_live_session_minutes_json(
+        session_id: str,
+        payload: CreateLlmExecutionRunsRequest,
+    ) -> dict[str, Any]:
+        """Post-meeting minutes as structured JSON (G5, for Jira/Linear/GitHub)."""
+        try:
+            record = asr_live_repo.get(session_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=f"ASR live session not found: {session_id}") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if payload.mode != "enabled":
+            raise HTTPException(status_code=422, detail=f"unsupported minutes mode: {payload.mode}")
+        config = llm_service.LlmConfig.from_env()
+        if config is None:
+            raise HTTPException(status_code=422, detail="LLM execution enabled but LLM_GATEWAY_* not configured")
+        transcript_text = " ".join(
+            str((e.get("payload") or {}).get("normalized_text") or (e.get("payload") or {}).get("text", ""))
+            for e in record.get("events") or []
+            if e.get("event_type") == "transcript_final"
+        )
+        parsed, usage, degraded = llm_service.build_minutes_json(transcript_text, config)
+        return {"session_id": session_id, "minutes": parsed, "llm_usage": usage, "degraded": degraded}
+
     @app.websocket("/live/asr/stream/ws/{session_id}")
     async def asr_stream_ws(websocket: WebSocket, session_id: str):
         await asr_stream.handle_stream(websocket, session_id, asr_live_repo=asr_live_repo)

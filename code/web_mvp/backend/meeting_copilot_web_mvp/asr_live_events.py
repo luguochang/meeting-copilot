@@ -398,36 +398,58 @@ def _local_state_scheduler_events(
                 "model": "not-called",
             },
         }
-        candidate_payload = _suggestion_candidate_payload(
-            state_spec=state_spec,
-            scheduler_decision=scheduler_decision,
-            segment_id=segment_id,
-            evidence_id=evidence_id,
-            evidence_quote=str(evidence.get("quote", "")),
-            asr_confidence=raw_event.get("confidence"),
-        )
-        suggestion_candidate_event = {
-            "id": f"suggestion_candidate:{state_event_id}",
-            "event_type": "suggestion_candidate_event",
-            "at_ms": transcript_event_at_ms,
-            "_sort_step": state_index * 4 + 2,
-            "payload": candidate_payload,
-        }
-        llm_request_draft_event = {
-            "id": f"llm_request_draft:{state_event_id}",
-            "event_type": "llm_request_draft_event",
-            "at_ms": transcript_event_at_ms,
-            "_sort_step": state_index * 4 + 3,
-            "payload": _llm_request_draft_payload(candidate_payload),
-        }
-        events.extend([
-            state_event,
-            scheduler_event,
-            suggestion_candidate_event,
-            llm_request_draft_event,
-        ])
+        # G4: engineering-context gate — non-engineering meetings produce no
+        # engineering suggestion cards (state events still generated for summary).
+        engineering = _is_engineering_meeting(text)
+        if engineering:
+            candidate_payload = _suggestion_candidate_payload(
+                state_spec=state_spec,
+                scheduler_decision=scheduler_decision,
+                segment_id=segment_id,
+                evidence_id=evidence_id,
+                evidence_quote=str(evidence.get("quote", "")),
+                asr_confidence=raw_event.get("confidence"),
+            )
+            suggestion_candidate_event = {
+                "id": f"suggestion_candidate:{state_event_id}",
+                "event_type": "suggestion_candidate_event",
+                "at_ms": transcript_event_at_ms,
+                "_sort_step": state_index * 4 + 2,
+                "payload": candidate_payload,
+            }
+            llm_request_draft_event = {
+                "id": f"llm_request_draft:{state_event_id}",
+                "event_type": "llm_request_draft_event",
+                "at_ms": transcript_event_at_ms,
+                "_sort_step": state_index * 4 + 3,
+                "payload": _llm_request_draft_payload(candidate_payload),
+            }
+            events.extend([state_event, scheduler_event, suggestion_candidate_event, llm_request_draft_event])
+        else:
+            events.extend([state_event, scheduler_event])
         current_scheduler_state = scheduler_decision.state_after
     return events, current_scheduler_state
+
+
+_ENGINEERING_KEYWORDS = (
+    "灰度", "发布", "上线", "部署", "回滚", "监控", "接口", "事故", "bug", "测试",
+    "架构", "服务", "需求", "deadline", "owner", "staging", "生产", "线上",
+    "错误率", "延迟", "流量", "降级", "重试", "兼容性", "验收",
+    # technical jargon (broadened to avoid false-negatives on engineering segments)
+    "qps", "tps", "缓存", "mysql", "redis", "数据库", "压测", "峰值", "集群",
+    "容量", "性能", "并发", "api", "系统", "模块", "代码", "编译", "迭代",
+    "版本", "schema", "迁移", "设计", "文档", "排期", "进度", "故障", "告警",
+    "日志", "链路", "调用", "依赖", "框架", "组件", "压测", "降级方案",
+)
+
+
+def _is_engineering_meeting(text: str) -> bool:
+    """Heuristic: does this segment look like software-engineering discussion?
+    Non-engineering meetings produce no engineering gap cards (product-requirements)."""
+    if not text:
+        return False
+    lower = text.lower()
+    return any(kw.lower() in lower for kw in _ENGINEERING_KEYWORDS)
 
 
 def _suggestion_candidate_payload(
