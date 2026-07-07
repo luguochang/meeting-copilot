@@ -353,12 +353,13 @@ def _minutes_to_markdown(m: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def build_minutes(
+def build_minutes_json(
     transcript_text: str,
     config: LlmConfig,
     client: LlmClient | None = None,
-) -> tuple[str, dict[str, int], bool]:
-    """Generate structured post-meeting minutes (Markdown) via LLM. Degrades gracefully."""
+) -> tuple[dict[str, Any], dict[str, int], bool]:
+    """Generate structured minutes (parsed JSON dict) via LLM. Degrades gracefully.
+    Returns (parsed_dict, usage_record, degraded)."""
     client = client or HttpxLlmClient()
     body = {
         "model": config.model,
@@ -378,12 +379,23 @@ def build_minutes(
         usage = data.get("usage", {})
     except Exception as exc:
         _log.error("minutes.call.failed", error=str(exc), exc_info=True)
-        return "", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}, True
+        return {}, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}, True
     usage_record = {
         "prompt_tokens": int(usage.get("prompt_tokens", 0)),
         "completion_tokens": int(usage.get("completion_tokens", 0)),
         "total_tokens": int(usage.get("total_tokens", 0)),
     }
-    markdown = _minutes_to_markdown(parsed if isinstance(parsed, dict) else {})
     _log.info("minutes.call.end", tokens=usage_record["total_tokens"])
-    return markdown, usage_record, False
+    return (parsed if isinstance(parsed, dict) else {}), usage_record, False
+
+
+def build_minutes(
+    transcript_text: str,
+    config: LlmConfig,
+    client: LlmClient | None = None,
+) -> tuple[str, dict[str, int], bool]:
+    """Generate post-meeting minutes (Markdown) via LLM. Degrades gracefully."""
+    parsed, usage, degraded = build_minutes_json(transcript_text, config, client)
+    if degraded:
+        return "", usage, True
+    return _minutes_to_markdown(parsed), usage, False
