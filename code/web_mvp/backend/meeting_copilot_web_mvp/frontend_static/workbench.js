@@ -177,6 +177,44 @@ function setRecState(state) {
   else { el.textContent = "● 未开始"; el.style.color = "var(--fg-muted)"; }
 }
 
+let _micCtx = null, _micWs = null, _recSid = null;
+$("btn-record").addEventListener("click", async () => {
+  if (_micWs) { // 停止
+    _micWs.send("END");
+    _micCtx && _micCtx.suspend();
+    setRecState("live");
+    toast("录音结束，会话已生成。点「生成建议卡片」");
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: 16000, channelCount: 1 } });
+    _recSid = "rec_" + Date.now().toString(36);
+    currentSession = _recSid;
+    $("stream").innerHTML = "";
+    currentEvents = [];
+    setRecState("recording");
+    _micWs = new WebSocket(`/live/asr/stream/ws/${_recSid}`);
+    _micWs.onmessage = (m) => {
+      let ev; try { ev = JSON.parse(m.data); } catch { return; }
+      currentEvents.push(ev); appendLiveEvent(ev);
+      $("session-meta").textContent = `会话 ${_recSid} · ${currentEvents.length} 事件 (实时录音)`;
+    };
+    _micWs.onopen = () => {
+      _micCtx = new AudioContext({ sampleRate: 16000 });
+      const src = _micCtx.createMediaStreamSource(stream);
+      const buf = _micCtx.createBuffer(1, 4800, 16000);
+      const node = _micCtx.createScriptProcessor(4800, 1, 1);
+      node.onaudioprocess = (e) => {
+        const d = e.inputBuffer.getChannelData(0);
+        _micWs.readyState === 1 && _micWs.send(d.buffer.slice(0));
+      };
+      src.connect(node); node.connect(_micCtx.destination);
+      toast("录音中…（真实麦克风 → 实时 ASR）");
+    };
+    _micWs.onclose = () => { _micWs = null; setRecState("live"); };
+  } catch (err) { toast("麦克风权限/录音失败: " + err.message); setRecState("idle"); }
+});
+
 $("btn-live").addEventListener("click", () => {
   if (!currentSession) return toast("先加载会议");
   subscribeLive(currentSession); setRecState("live"); toast("实时订阅已开启（events.sse）");
