@@ -13,3 +13,12 @@ dependencies = [
   "websockets",
 ]
 
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+pythonpath = [".", "../../core"]
