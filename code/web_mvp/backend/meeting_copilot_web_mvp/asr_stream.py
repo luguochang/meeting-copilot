@@ -22,6 +22,11 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from meeting_copilot_web_mvp.logging_config import get_logger
+from meeting_copilot_web_mvp.asr_live_events import (
+    ASR_LIVE_SOURCE,
+    ASR_LIVE_TRACE_KIND,
+    build_asr_live_events,
+)
 
 _log = get_logger("meeting_copilot_web_mvp.asr_stream")
 
@@ -178,22 +183,64 @@ def _maybe_sherpa_sidecar(session_id: str) -> SherpaSidecarRecognizer | None:
     return None
 
 
-async def handle_stream(websocket, session_id: str) -> None:
-    """Handle one WS audio stream: read chunks, emit ASR events back over the WS."""
+async def handle_stream(websocket, session_id: str, asr_live_repo=None, provider: str = "local_real_asr") -> None:
+    """Handle one WS audio stream: read chunks, emit ASR events back over the WS.
+
+    If asr_live_repo is provided, accumulates real ASR final events and persists
+    a session record on END — so the real mic -> ASR -> session -> LLM cards
+    pipeline is connected end-to-end (llm-execution-runs / approach-cards /
+    minutes can then run on the real ASR session).
+    """
     await websocket.accept()
     recognizer = get_recognizer(session_id)
     _log.info("asr.stream.start", session_id=session_id)
+    accumulated_finals: list[dict[str, Any]] = []
+    chunk_ms = 300
+
+    def _to_streaming_final(ev: dict[str, Any], idx: int) -> dict[str, Any]:
+        return {
+            "event_type": "final",
+            "segment_id": ev.get("segment_id") or f"real_seg_{idx}",
+            "text": ev.get("text", ""),
+            "start_ms": idx * chunk_ms,
+            "end_ms": (idx + 1) * chunk_ms,
+            "received_at_ms": idx * chunk_ms + chunk_ms,
+            "confidence": ev.get("confidence", 0.85),
+        }
+
     try:
         while True:
             msg = await websocket.receive()
             if msg.get("bytes") is not None:
-                partial = recognizer.recognize_chunk(msg["bytes"])
-                await websocket.send_text(json.dumps(partial, ensure_ascii=False))
+                event = recognizer.recognize_chunk(msg["bytes"])
+                await websocket.send_text(json.dumps(event, ensure_ascii=False))
+                if event.get("event_type") == "final" and event.get("text"):
+                    accumulated_finals.append(_to_streaming_final(event, recognizer._seq))
             elif msg.get("text") == "END":
                 final = recognizer.finalize()
                 await websocket.send_text(json.dumps(final, ensure_ascii=False))
+                if final.get("text"):
+                    accumulated_finals.append(_to_streaming_final(final, recognizer._seq + 1))
+                if asr_live_repo is not None and accumulated_finals:
+                    live_events = build_asr_live_events(
+                        session_id=session_id,
+                        provider=provider,
+                        streaming_events=accumulated_finals,
+                        is_mock=False,
+                    )
+                    try:
+                        asr_live_repo.create({
+                            "session_id": session_id,
+                            "provider": provider,
+                            "source": ASR_LIVE_SOURCE,
+                            "trace_kind": ASR_LIVE_TRACE_KIND,
+                            "events": live_events,
+                        })
+                        _log.info("asr.stream.persisted", session_id=session_id, finals=len(accumulated_finals), events=len(live_events))
+                    except Exception as exc:
+                        _log.warning("asr.stream.persist_failed", session_id=session_id, error=str(exc))
                 await websocket.close()
-                _log.info("asr.stream.end", session_id=session_id, chunks=recognizer._seq)
+                _log.info("asr.stream.end", session_id=session_id, chunks=recognizer._seq, finals=len(accumulated_finals))
                 return
     except Exception as exc:
         _log.warning("asr.stream.aborted", session_id=session_id, error=str(exc))

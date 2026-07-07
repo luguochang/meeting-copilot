@@ -281,7 +281,7 @@ def create_app(
 
     @app.websocket("/live/asr/stream/ws/{session_id}")
     async def asr_stream_ws(websocket: WebSocket, session_id: str):
-        await asr_stream.handle_stream(websocket, session_id)
+        await asr_stream.handle_stream(websocket, session_id, asr_live_repo=asr_live_repo)
 
     @app.post("/shadow-reports/feedback-ingestions")
     def create_shadow_report_feedback_ingestion(
