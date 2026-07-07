@@ -117,11 +117,69 @@ $("btn-load").addEventListener("click", async () => {
     renderTranscriptAndCandidates(currentEvents);
     $("session-meta").textContent = `会话 ${sid} · ${currentEvents.length} 事件`;
     $("s-asr").textContent = "local_mock_asr";
-    $("sys-status").innerHTML = `<div class="empty">会话已加载。点击「生成建议卡片」触发 LLM。</div>`;
+    $("sys-status").innerHTML = `<div class="empty">会话已加载。点击「生成建议卡片」或「实时订阅」。</div>`;
     toast("会议已加载");
   } catch (err) {
     toast("加载失败: " + err.message);
   }
+});
+
+let _es = null;
+function subscribeLive(sid) {
+  if (_es) _es.close();
+  _es = new EventSource(`/live/asr/sessions/${sid}/events.sse`);
+  _es.onmessage = (msg) => {
+    let ev;
+    try { ev = JSON.parse(msg.data); } catch { return; }
+    currentEvents.push(ev);
+    appendLiveEvent(ev);
+    $("session-meta").textContent = `会话 ${sid} · ${currentEvents.length} 事件 (实时)`;
+  };
+  _es.onerror = () => { $("sys-status").innerHTML = `<div class="empty">实时订阅结束/重连中。</div>`; };
+}
+
+function appendLiveEvent(e) {
+  const stream = $("stream");
+  const p = e.payload || {};
+  if (e.event_type === "transcript_final") {
+    const div = document.createElement("div");
+    div.className = "utterance";
+    div.innerHTML = `<div class="ts">${fmtMs(p.start_ms || 0)}</div><div class="text"><span class="speaker">发言：</span>${escapeHtml(p.normalized_text || p.text || "")}</div>`;
+    stream.appendChild(div);
+  } else if (e.event_type === "suggestion_candidate_event") {
+    const div = document.createElement("div");
+    div.className = "suggestion";
+    div.innerHTML = `<div class="sug-head gap">缺口 · ${escapeHtml(p.gap_rule_id || "")}</div><div class="sug-body">${escapeHtml(p.trigger_reason || p.suggested_prompt || "")} <strong>(候选)</strong></div>`;
+    stream.appendChild(div);
+    $("c-gap").textContent = (parseInt($("c-gap").textContent) || 0) + 1;
+  }
+}
+
+$("btn-delete").addEventListener("click", async () => {
+  if (!currentSession) return toast("无会话");
+  if (!confirm("删除会话？将级联清除转写/事件/卡片。")) return;
+  try {
+    await api(`/live/asr/sessions/${currentSession}`, { method: "DELETE" });
+    if (_es) { _es.close(); _es = null; }
+    $("stream").innerHTML = '<div class="empty">会话已删除。</div>';
+    $("session-meta").textContent = "未加载会议";
+    $("rec-state").textContent = "● 未开始";
+    $("rec-state").style.color = "var(--fg-muted)";
+    currentSession = null;
+    toast("会话已删除（级联清除）");
+  } catch (err) { toast("删除失败: " + err.message); }
+});
+
+function setRecState(state) {
+  const el = $("rec-state");
+  if (state === "recording") { el.textContent = "● 录制中"; el.style.color = "var(--risk)"; }
+  else if (state === "live") { el.textContent = "● 实时订阅"; el.style.color = "var(--ok)"; }
+  else { el.textContent = "● 未开始"; el.style.color = "var(--fg-muted)"; }
+}
+
+$("btn-live").addEventListener("click", () => {
+  if (!currentSession) return toast("先加载会议");
+  subscribeLive(currentSession); setRecState("live"); toast("实时订阅已开启（events.sse）");
 });
 
 $("btn-cards").addEventListener("click", async () => {

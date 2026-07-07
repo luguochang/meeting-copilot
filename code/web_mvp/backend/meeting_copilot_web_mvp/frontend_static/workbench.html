@@ -75,12 +75,14 @@ button{font-family:inherit;cursor:pointer;border:none;background:none;color:inhe
 <div class="app">
   <header class="topbar">
     <div class="brand"><div class="brand-mark">M</div><span class="brand-name">Meeting Copilot</span></div>
-    <div class="session-meta"><span id="session-meta">未加载会议</span></div>
+    <div class="session-meta"><span id="rec-state" style="color:var(--fg-muted)">● 未开始</span> <span id="session-meta">未加载会议</span></div>
     <div class="spacer"></div>
     <div class="actions">
       <button class="btn" id="btn-load">加载样本会议</button>
       <button class="btn btn-primary" id="btn-cards">生成建议卡片</button>
       <button class="btn" id="btn-approach">方案考量</button>
+      <button class="btn" id="btn-live">实时订阅</button>
+      <button class="btn" id="btn-delete" style="color:var(--risk)">删除会话</button>
     </div>
   </header>
   <aside class="left">
@@ -101,6 +103,7 @@ button{font-family:inherit;cursor:pointer;border:none;background:none;color:inhe
     <div class="panel-title">系统状态</div>
     <div class="detail-card" id="sys-status"><div class="empty">未加载。</div></div>
     <div class="panel-title">说明</div>
+    <div class="detail-card"><p style="color:var(--fg-secondary);font-size:12px"><strong>数据流向</strong>：音频→本地 ASR（sherpa sidecar，不出本机）；建议卡片/纪要→LLM 网关（按 .env 配置）。可随时删除会话（级联清除转写/事件/卡片）。</p></div>
     <div class="detail-card"><p>缺口卡（琥珀）来自规则候选；方案考量卡（紫）来自 LLM。点击「生成建议卡片」触发真实 LLM 执行（需配置 LLM_GATEWAY_*）；「方案考量」生成方案建议卡。</p></div>
   </aside>
   <footer class="status">

@@ -44,6 +44,32 @@ jobs:
           cd code/web_mvp/backend
           pytest tests/test_e2e_mainline.py tests/test_workbench.py tests/test_approach_cards.py tests/test_asr_stream.py tests/test_llm_service.py -q
 
+  lint:
+    name: Ruff lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: ruff check code/web_mvp/backend/meeting_copilot_web_mvp/
+
+  workbench-smoke:
+    name: Workbench UI smoke (Chrome)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: |
+          python -m pip install --upgrade pip
+          pip install fastapi "uvicorn[standard]" "pydantic>=2" httpx python-dotenv structlog websockets
+      - run: |
+          cd code/web_mvp/backend
+          node ../../e2e/workbench_smoke.mjs
+
   rust-check:
     name: Tauri desktop cargo check
     runs-on: ubuntu-latest

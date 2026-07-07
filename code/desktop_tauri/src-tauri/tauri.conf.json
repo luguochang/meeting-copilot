@@ -19,7 +19,8 @@
         "height": 860,
         "minWidth": 1024,
         "minHeight": 720,
-        "resizable": true
+        "resizable": true,
+        "url": "workbench.html"
       }
     ],
     "security": {
@@ -27,7 +28,11 @@
     }
   },
   "bundle": {
-    "active": false,
-    "targets": "all"
+    "active": true,
+    "targets": ["app", "dmg"],
+    "icon": ["icons/icon.png"],
+    "macOS": {
+      "infoPlist": "Info.plist"
+    }
   }
 }

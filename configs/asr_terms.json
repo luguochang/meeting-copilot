@@ -1,0 +1,18 @@
+{
+  "_comment": "ASR 误识修正字典（raw 片段 → normalized）。基于 Phase 1-1 干净音频重测暴露的真实误识。保守替换：只修明确的 ASR 错误，不改语义。",
+  "terms": {
+    "t九九": "P99",
+    "T九九": "P99",
+    "t99": "P99",
+    "九九": "P99",
+    "九九延迟": "P99延迟",
+    "用力": "用例",
+    "先挥": "灰度",
+    "回軚": "回滚",
+    "回滚负责人": "回滚负责人",
+    "兼容性测试用力": "兼容性测试用例",
+    "payment gate": "checkout-service",
+    "staging": "staging"
+  },
+  "hotwords": ["checkout-service", "error_rate", "P99", "staging", "rollback", "灰度", "回滚", "监控", "灰度发布"]
+}

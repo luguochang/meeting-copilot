@@ -5,6 +5,7 @@ import re
 from typing import Any
 
 from meeting_copilot_web_mvp.live_events import render_sse_events
+from meeting_copilot_web_mvp.transcript_normalizer import normalize as _normalize_text
 
 
 ASR_LIVE_SOURCE = "live_asr_stream"
@@ -319,6 +320,7 @@ def _final_payload(
         "start_ms": int(raw_event.get("start_ms", 0)),
         "end_ms": int(raw_event.get("end_ms", 0)),
         "text": str(raw_event.get("text", "")),
+        "normalized_text": _normalize_text(str(raw_event.get("text", ""))),
         "confidence": raw_event.get("confidence"),
         "is_final": True,
         "evidence_spans": evidence_spans,
