@@ -34,6 +34,7 @@ data/local_runtime/
 
 # === Artifacts (tmp / generated) ===
 artifacts/tmp/
+.superpowers/
 
 # === ASR runtime heavy / regenerable dirs ===
 # (also covered by code/asr_runtime/.gitignore; repeated for root-level safety)
