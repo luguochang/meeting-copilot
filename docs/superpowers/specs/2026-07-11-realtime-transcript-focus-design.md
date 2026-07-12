@@ -1,7 +1,7 @@
 # Realtime Transcript Focus Design
 
 > 日期：2026-07-11  
-> 状态：视觉方案 A 已由用户确认；等待书面规范复核后进入实施计划  
+> 状态：双栏布局、AI 建议和限频校正部分继续有效；实时文字的数据模型已由 `2026-07-12-canonical-transcript-design.md` 细化替代
 > 关联产品：Meeting Copilot PC Workbench
 
 ## 1. 目标
