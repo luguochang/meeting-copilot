@@ -70,6 +70,8 @@
 - 2026-07-16 r9 packaged 主链路完成当前纵向业务闭环：真实 browser microphone、packaged 本地 FunASR、远程非 mock `gpt-5.5`、实时文字/建议/校正、录音、纪要、方案和历史重开均通过。首次文字 `7055ms`、首 final `14071ms`、首建议 `17078ms`、首可见校正 `30117ms`；3 段 canonical 文字全部在会后容器可视区。证据：`artifacts/tmp/packaged_mainline/packaged-r9-final-real-mic-20260716/report.json`。该结果关闭“packaged 前后端业务是否能同场运行”的问题，不关闭 native capture、延迟 SLO、中文人工价值或公开发布门禁。
 - DEC-400 在 clean 代码候选 `6ea965f8922d80e1feae95d03c05fc3a269921da` 上完成 packaged runtime 合同收口：机器可读 manifest 统一 Python/venv/model 路径；Tauri 用每次启动的 256-bit token + HttpOnly bootstrap cookie 保护 loopback REST/SSE/WebSocket，并校验 `/health` HMAC instance proof；desktop startup 必须等到真实 FunASR worker ready；ASR 子进程环境移除 LLM/API 密钥与 local token。backend 全量 `910 passed, 1 warning`，runtime/package 合同 `67 passed`，Rust `15 passed`，Ruff/compile/fmt/diff-check 通过。
 - 当前 clean packaged preflight 是结构化 No-Go：前端 dist 存在，但 `code/asr_runtime/.venv-funasr` 和受控 online Paraformer model directory 不存在。因此新 smoke 还没有取得“app 启动 backend -> resident ready -> WebSocket -> non-empty `funasr_realtime` final -> 进程回收”证据；这是当前首个真实阻塞点，不是继续 Provider 横评的理由。
+- DEC-401 已通过复用本机先前生成的离线 FunASR runtime/model artifact 关闭该执行阻塞，全程未下载模型、未读取密钥或用户录音。第一次运行暴露 runtime spike `30s` 超时短于 `45s` resident prewarm 和 `60s` Rust supervisor 预算；修复并补 TDD 后，relocation r2 为 Go，backend `44.731s`、FunASR ready `5.232s`、external symlink `0`。
+- 当前 2.288 GB 未签名 Tauri app 已包含当前 backend、FunASR runtime 和 online model。`phase3-clean-packaged-funasr-final-20260716-r1` 在 `18.779s` 内完成 HMAC identity、bootstrap cookie、resident-ready、受控 16 kHz mono PCM WAV -> WebSocket -> 1 个非空 `funasr_realtime` final，且 app/backend/端口回收通过。该 smoke 快速送入 WAV，只证明包内执行合同；识别文本仍有中英混合误差，不计中文质量 Go。
 - DEC-382 fresh follow-up 已修复规范化 EOS 漏判和 finalize 后浏览器断开导致的错误 `stream_interrupted`；20 秒、90 秒真实 browser microphone + 本地 FunASR + 本地 fake OpenAI-compatible gateway 均已重跑，90 秒严格 job/revision contract 为 `go`，录音 `90.488s`、会后处理 `1.522s`、RSS 增长 `7.09MB`。该证据只关闭当前 browser vertical 的结束竞态和本地协议闭环，不关闭 Phase 2 一小时、远端 provider、native capture 或发布出口。
 - 一小时 follow-up 已完成一次真实 wall-clock 运行：录音/ASR/录音块/快照延迟物理门槛通过，但重复短音频触发语义质量安全门禁，minutes/approach 被抑制，完整 Phase 2 出口保持 No-Go。runner 已默认对 `MEETING_COPILOT_REQUIRE_ONE_HOUR=1` 启用完整 review gate；证据和修复后尾部验证位于 `artifacts/tmp/mainline-rerun-20260716-120637/real-mic-one-hour/phase2-gate-assessment.json`。
 - DEC-383 已将 semantic-quality suppression 正确投影为会后“识别质量不足，已暂停”，不再误报 provider 生成失败；DEC-384 已增加长测输入 hash/时长/playlist/重复率资格，并压缩 correction job 累计输出和 ASR source snapshot。免费 46 秒完整 review 为 Go，82 秒远端链路已恢复 quality blocker 并生成建议、纪要和方案，但这些短证据不关闭 Phase 2。
@@ -817,8 +819,9 @@ DEC-382 已完成 90 秒真实 browser microphone 稳定性 smoke，并证明录
 ### Phase 3：自包含 Mac Internal Alpha（8-12 工程日）
 
 - [ ] 先实现 native microphone -> 现有 backend WebSocket 的单轨 adapter；完成真实主链路后再加 ScreenCaptureKit system audio，不在一个切片中同时开发双轨协议。
-- [ ] Tauri supervisor 启动 backend 与 warm ASR sidecar：启动、token、HMAC proof 和 resident-ready 代码合同已完成，仍缺受控 bundle 的真实 FunASR final 证据。
-- [ ] backend/ASR/model/ffmpeg 进入 app bundle，不依赖仓库/venv：runtime manifest 与 fail-fast preflight 已完成，当前 clean checkout 尚缺 FunASR Python 3.11 venv 与受控 model directory，FFmpeg 供应链也未闭环。
+- [x] Tauri supervisor 启动 backend 与 warm ASR sidecar：启动、token、HMAC proof、resident-ready、受控 WAV -> backend WebSocket -> non-empty real final 和进程回收已有当前 packaged 证据。
+- [x] backend/FunASR Python runtime/online model 进入 app bundle，不依赖仓库或用户 venv；当前仅计本机 internal runtime 证据。
+- [ ] FFmpeg 制品、不可变 revision/hash 与再分发授权闭环；实时 PCM 主链路当前使用 torchaudio，不把“可以不用 FFmpeg 跑 smoke”等同于供应链已完成。
 - [x] 每次启动的 256-bit local API token、HttpOnly/SameSite=Strict bootstrap、Origin 校验和 backend instance HMAC proof。
 - [ ] Keychain 凭据存储、packaged CSP 和 HTTPS-only 策略。
 - [ ] App Support/Logs/Caches 路径与删除语义。

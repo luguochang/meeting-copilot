@@ -25549,3 +25549,31 @@ verdict=no_go
 - 下一步是构建受控 FunASR Python 3.11 runtime 和固定模型目录，先让 clean packaged app smoke 获得真实 non-empty final，再开始 native microphone adapter。
 - Keychain、packaged CSP/HTTPS-only、entitlements、Developer ID 签名、notarization/Gatekeeper 和 separate clean Mac 仍是独立发布门禁。
 - 本决策未读取 `configs/local`、未读取用户录音或真实密钥、未调用远程 ASR/LLM，新增费用为 0。
+
+# DEC-401: clean packaged runtime 已产生真实 FunASR final，Phase 3 下一步转入 native microphone
+
+时间：2026-07-16
+
+状态：Accepted / Packaged runtime execution Go / Native capture and public release No-Go
+
+## 问题与修复
+
+1. 在 clean checkout 补齐受控 FunASR Python 3.11 runtime 和 online Paraformer model 后，首次 `phase3-controlled-runtime-20260716-r1` 构建成功，独立 ASR probe `6.58s` ready，但 backend probe 在 `35.032s` 后被 kill。根因是 `macos_bundled_runtime_spike.py` 仍硬编码 `30s` 启动等待，短于 backend resident prewarm 最长 `45s` 和 Rust/package supervisor `60s` 合同。
+2. 新增 `BACKEND_STARTUP_TIMEOUT_SECONDS=60.0` 并用必须与 packaged supervisor 预算一致的 TDD 固定；不修改 ASR 模型、不放宽 ready 条件、不把 timeout 失败降级为 Go。
+3. 生成运行时仅复用本机先前已生成的离线 FunASR runtime/model artifact；没有下载模型，没有读取 `configs/local`、密钥、用户录音或 Voice Memos 临时文件。
+
+## 真实执行证据
+
+- 代码候选：`257c80ffad54a3dbaf6834ab8340a28c69cc183f`。
+- TDD/focused：`tests/test_macos_bundled_runtime_spike.py = 9 passed`；release/runtime/package/supervisor 合同 `30 passed`；Ruff、Python compile 和 `git diff --check` 通过。
+- relocatable runtime：`artifacts/tmp/macos_bundled_runtime/phase3-controlled-runtime-20260716-r2/evidence.json`。logical size `2,106,118,270` bytes，backend Python `3.13`、FunASR Python `3.11`；backend `44.731s` 就绪，FunASR `5.232s` ready，external/relocated external symlink 均为 `0`，decision=`go_local_relocatable_runtime_spike_not_public_release`。
+- Tauri app resource：`artifacts/tmp/tauri_runtime_package/phase3-clean-packaged-runtime-20260716-r1/evidence.json`。app logical size `2,288,217,577` bytes，必需 runtime files 无缺失，decision=`go_packaged_runtime_resource_app_not_public_release`。
+- packaged supervisor + real ASR final：`artifacts/tmp/packaged_runtime_supervisor_smoke/phase3-clean-packaged-funasr-final-20260716-r1/evidence.json`。健康 HMAC identity、bootstrap `303` + HttpOnly cookie、Workbench/providers/ASR runtime 认证访问、resident `process_ready=true` 全部通过。14.8425 秒、16 kHz、mono、16-bit PCM 的受控中文技术会议 WAV 经 app backend WebSocket 产生 `1` 个非空 final，provider=`funasr_realtime`；app/backend/端口回收全部通过，总用时 `18.779s`。
+- clean provenance：`artifacts/tmp/release_provenance/phase0-clean-commit-20260716-r4/manifest.json`。`dirty_tracked_count=0`、`untracked_source_count=0`、`tracked_sensitive_count=0`；仍因非发布 evidence 和模型/FFmpeg 供应链保持 `no_go`。
+
+## 边界与下一步
+
+- 该 smoke 将 WAV 快速注入 WebSocket，它证明当前 packaged app 内 backend、认证、resident FunASR、实时事件协议和进程生命周期可运行；不是原生麦克风证据，也不是自然多人中文 ASR 质量 Go。本次 final 存在中英混合识别误差，后续质量必须仍由中文会议评测集与真人会议门禁评估。
+- Phase 3 下一个实现切片固定为 `Tauri native microphone -> existing backend WebSocket`；暂不同时开发 system audio，不重启 Provider bake-off。
+- Keychain、packaged CSP/HTTPS-only、FFmpeg 与模型供应链、entitlements、签名公证和 separate clean Mac 仍为 No-Go。
+- 本轮远程 ASR/LLM 调用均为 0，新增费用为 0。
