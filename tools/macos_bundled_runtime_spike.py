@@ -25,6 +25,7 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS = 8
+BACKEND_STARTUP_TIMEOUT_SECONDS = 60.0
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "artifacts" / "tmp" / "macos_bundled_runtime"
 DEFAULT_MODEL_DIR = (
     Path.home()
@@ -443,7 +444,7 @@ def probe_backend(bundle: Path, probe_root: Path, *, repo_root: Path) -> dict[st
     started = time.monotonic()
     responses: dict[str, dict[str, Any]] = {}
     try:
-        deadline = started + 30
+        deadline = started + BACKEND_STARTUP_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
             if process.poll() is not None:
                 break
