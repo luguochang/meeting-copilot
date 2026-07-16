@@ -41,6 +41,12 @@ def test_runtime_manifest_is_the_single_source_of_python_and_inventory_paths():
     assert "models/funasr-online/model.pt" in manifest["required_files"]
 
 
+def test_backend_probe_startup_budget_matches_packaged_supervisor_budget():
+    tool = load_tool_module()
+
+    assert tool.BACKEND_STARTUP_TIMEOUT_SECONDS == 60.0
+
+
 def test_missing_runtime_preconditions_fail_before_python_execution(tmp_path, monkeypatch):
     tool = load_tool_module()
     repo = tmp_path / "repo"
