@@ -10,9 +10,9 @@
 >
 > 文档真相与历史归档索引：`docs/archive/readiness-index.md`
 >
-> 当前代码候选基线：`257c80ffad54a3dbaf6834ab8340a28c69cc183f`；native mic 实现正在该基线之上的未提交工作树中，未重新声明 clean release commit
+> 当前代码候选基线：`6e39a19660bb75a9d35ed599dc42064f1cc09a47`；后续审计文档提交不改变该候选源码绑定
 >
-> 最新 clean provenance：`artifacts/tmp/release_provenance/phase0-clean-commit-20260716-r4/manifest.json`
+> 最新 clean provenance：`artifacts/tmp/release_provenance/phase0-clean-commit-20260717-r6/manifest.json`
 >
 > 最新 clean packaged runtime 证据：`artifacts/tmp/packaged_runtime_supervisor_smoke/phase3-native-mic-packaged-smoke-20260716-r2/evidence.json`
 

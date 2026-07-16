@@ -25640,6 +25640,7 @@ verdict=no_go
 - helper 运行 `30.753s`，stream timeline 最大约 `30,300ms`，修复前 3x 漂移已消失；backend 保存 `30.382s`、7 chunks、`972,278B` WAV，SHA-256=`75da8f94...`。
 - 本地 `funasr_realtime` 产生 2 个 transcript final，可辨识 recommendation service、feature store、QPS、缓存穿透、降级方案和 owner；同时产生 state/scheduler/suggestion candidate/LLM request draft 事件。helper stderr 为空，credential 不在 process command；app/backend/端口清理全部通过。
 - runner decision=`go_packaged_real_native_mic_helper_not_ui_not_public_release`，`counts_as_real_native_microphone_evidence=true`。
+- clean provenance：`artifacts/tmp/release_provenance/phase0-clean-commit-20260717-r6/manifest.json` 绑定候选 commit `6e39a19660bb75a9d35ed599dc42064f1cc09a47`、最新 app binary 与 r3 evidence；dirty tracked/untracked source/tracked sensitive 均为 `0`，artifact/evidence path/hash/run id 全部匹配。公开发布仍因 evidence 明确非 public release 及模型/FFmpeg revision/hash/redistribution 未闭环保持 `no_go`。
 
 ## 诚实边界
 
