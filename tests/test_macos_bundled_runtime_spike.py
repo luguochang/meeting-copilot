@@ -39,12 +39,49 @@ def test_runtime_manifest_is_the_single_source_of_python_and_inventory_paths():
     assert manifest["runtimes"]["backend"]["executable"] in manifest["required_files"]
     assert manifest["runtimes"]["funasr"]["executable"] in manifest["required_files"]
     assert "models/funasr-online/model.pt" in manifest["required_files"]
+    assert "bin/meeting-copilot-native-mic" in manifest["required_files"]
 
 
 def test_backend_probe_startup_budget_matches_packaged_supervisor_budget():
     tool = load_tool_module()
 
     assert tool.BACKEND_STARTUP_TIMEOUT_SECONDS == 60.0
+
+
+def test_native_mic_helper_contract_is_native_and_bundle_relocatable():
+    tool = load_tool_module()
+
+    command = tool.native_mic_build_command(REPO_ROOT, Path("/tmp/MeetingCopilotRuntime.bundle"))
+    source = (REPO_ROOT / tool.NATIVE_MIC_SOURCE_RELATIVE).read_text(encoding="utf-8")
+
+    assert command[0:2] == ["xcrun", "swiftc"]
+    assert command[-1].endswith("bin/meeting-copilot-native-mic")
+    assert "AVAudioEngine" in source
+    assert "AVAudioConverter" in source
+    assert "URLSessionWebSocketTask" in source
+    assert '"END"' in source
+    assert "16_000" in source
+    assert "frameSamples = 4_800" in source
+    assert "pendingPCM" in source
+    assert "API_KEY" not in source
+    assert "MEETING_COPILOT_SESSION_COOKIE" in source
+    assert 'case "--cookie"' not in source
+
+
+def test_native_mic_probe_accepts_help_written_to_stderr(tmp_path):
+    tool = load_tool_module()
+    helper = tmp_path / "bin" / "meeting-copilot-native-mic"
+    helper.parent.mkdir(parents=True)
+    helper.write_text(
+        "#!/bin/sh\necho 'Usage: meeting-copilot-native-mic --help' >&2\n",
+        encoding="utf-8",
+    )
+    helper.chmod(helper.stat().st_mode | 0o700)
+
+    probe = tool.probe_native_mic(tmp_path)
+
+    assert probe["status"] == "passed"
+    assert probe["return_code"] == 0
 
 
 def test_missing_runtime_preconditions_fail_before_python_execution(tmp_path, monkeypatch):

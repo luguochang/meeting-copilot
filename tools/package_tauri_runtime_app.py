@@ -159,9 +159,24 @@ def package_runtime_app(
     target_dir = run_root / "cargo-target"
     command = build_command(overlay_path=overlay_path, rust_target_dir=target_dir, cargo_tauri=cargo_tauri)
     environment = dict(os.environ)
-    cargo_home = repo_root / "artifacts/tmp/rust_toolchain/cargo"
-    rustup_home = repo_root / "artifacts/tmp/rust_toolchain/rustup"
-    toolchain_bin = rustup_home / "toolchains/stable-aarch64-apple-darwin/bin"
+    cargo_home = Path(
+        os.environ.get(
+            "MEETING_COPILOT_CARGO_HOME",
+            str(repo_root / "artifacts/tmp/rust_toolchain/cargo"),
+        )
+    ).expanduser()
+    rustup_home = Path(
+        os.environ.get(
+            "MEETING_COPILOT_RUSTUP_HOME",
+            str(repo_root / "artifacts/tmp/rust_toolchain/rustup"),
+        )
+    ).expanduser()
+    toolchain_bin = Path(
+        os.environ.get(
+            "MEETING_COPILOT_TOOLCHAIN_BIN",
+            str(rustup_home / "toolchains/stable-aarch64-apple-darwin/bin"),
+        )
+    ).expanduser()
     environment.update(
         {
             "CARGO_HOME": str(cargo_home),

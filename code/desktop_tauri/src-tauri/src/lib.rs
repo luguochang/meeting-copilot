@@ -11,6 +11,7 @@ pub mod desktop_audio_chunk_runtime;
 pub mod desktop_backend_supervisor;
 pub mod desktop_frontend_probe_runtime;
 pub mod mic_adapter_runtime;
+pub mod native_mic_capture_runtime;
 
 pub const BRIDGE_COMMAND_IDS: &[&str] = &[
     "runtime.get_status",
@@ -162,46 +163,48 @@ fn asr_worker_cleanup(
 }
 
 #[tauri::command]
-fn mic_adapter_prepare() -> NoopBridgeResponse {
-    // Mic capture delegates to the Python mic_capture.py client (sounddevice),
-    // which streams PCM to the backend WS. macOS mic permission is declared via
-    // NSMicrophoneUsageDescription in tauri.conf.json Info.plist.
-    let mut r = NoopBridgeResponse::for_command("mic_adapter.prepare");
-    r.command_status = "ok";
-    r.implementation_status = "real";
-    r
+fn mic_adapter_prepare(
+    microphone: tauri::State<'_, native_mic_capture_runtime::NativeMicCaptureSupervisor>,
+) -> native_mic_capture_runtime::NativeMicCaptureResponse {
+    microphone.prepare()
 }
 
 #[tauri::command]
-fn mic_adapter_status() -> NoopBridgeResponse {
-    let mut r = NoopBridgeResponse::for_command("mic_adapter.status");
-    r.command_status = "ok";
-    r.implementation_status = "real";
-    r
+fn mic_adapter_status(
+    microphone: tauri::State<'_, native_mic_capture_runtime::NativeMicCaptureSupervisor>,
+) -> native_mic_capture_runtime::NativeMicCaptureResponse {
+    microphone.status()
 }
 
 #[tauri::command]
 fn mic_adapter_start(
     session_id: Option<String>,
-) -> desktop_audio_chunk_runtime::AudioChunkCommandResponse {
-    desktop_audio_chunk_runtime::start_recording(session_id)
+    microphone: tauri::State<'_, native_mic_capture_runtime::NativeMicCaptureSupervisor>,
+    backend: tauri::State<'_, desktop_backend_supervisor::BackendSupervisor>,
+) -> native_mic_capture_runtime::NativeMicCaptureResponse {
+    microphone.start(session_id, &backend)
 }
 
 #[tauri::command]
-fn mic_adapter_pause() -> NoopBridgeResponse {
-    NoopBridgeResponse::for_command("mic_adapter.pause")
+fn mic_adapter_pause(
+    microphone: tauri::State<'_, native_mic_capture_runtime::NativeMicCaptureSupervisor>,
+) -> native_mic_capture_runtime::NativeMicCaptureResponse {
+    microphone.pause()
 }
 
 #[tauri::command]
-fn mic_adapter_resume() -> NoopBridgeResponse {
-    NoopBridgeResponse::for_command("mic_adapter.resume")
+fn mic_adapter_resume(
+    microphone: tauri::State<'_, native_mic_capture_runtime::NativeMicCaptureSupervisor>,
+) -> native_mic_capture_runtime::NativeMicCaptureResponse {
+    microphone.resume()
 }
 
 #[tauri::command]
 fn mic_adapter_stop(
     session_id: Option<String>,
-) -> desktop_audio_chunk_runtime::AudioChunkCommandResponse {
-    desktop_audio_chunk_runtime::stop_recording(session_id)
+    microphone: tauri::State<'_, native_mic_capture_runtime::NativeMicCaptureSupervisor>,
+) -> native_mic_capture_runtime::NativeMicCaptureResponse {
+    microphone.stop_for_session(session_id.as_deref())
 }
 
 #[tauri::command]
@@ -243,8 +246,16 @@ pub fn run() {
                 )
                 .into());
             }
+            let app_data_dir = app.path().app_data_dir()?;
+            let app_log_dir = app.path().app_log_dir()?;
+            let native_mic = native_mic_capture_runtime::NativeMicCaptureSupervisor::new(
+                runtime_bundle.join("bin/meeting-copilot-native-mic"),
+                app_data_dir.join("native-mic"),
+                app_log_dir,
+            );
             let workbench_url = supervisor.workbench_url().map_err(std::io::Error::other)?;
             app.manage(supervisor);
+            app.manage(native_mic);
             let window = app
                 .get_webview_window("main")
                 .ok_or_else(|| std::io::Error::other("main webview window is missing"))?;
@@ -291,6 +302,11 @@ pub fn run() {
         .expect("error while building Meeting Copilot desktop shell");
     app.run(|app_handle, event| {
         if matches!(event, tauri::RunEvent::Exit) {
+            if let Some(microphone) =
+                app_handle.try_state::<native_mic_capture_runtime::NativeMicCaptureSupervisor>()
+            {
+                microphone.stop();
+            }
             if let Some(supervisor) =
                 app_handle.try_state::<desktop_backend_supervisor::BackendSupervisor>()
             {

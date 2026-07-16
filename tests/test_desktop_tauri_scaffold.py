@@ -72,11 +72,13 @@ EXPECTED_BRIDGE_COMMANDS = {
     "mic_adapter_delete_audio_chunks": "mic_adapter.delete_audio_chunks",
 }
 
-EXPECTED_STILL_NOOP_MIC_COMMANDS = {
-    "mic_adapter_prepare",
-    "mic_adapter_status",
-    "mic_adapter_pause",
-    "mic_adapter_resume",
+EXPECTED_NATIVE_MIC_COMMANDS = {
+    "mic_adapter_prepare": "native_mic_capture_runtime::NativeMicCaptureSupervisor",
+    "mic_adapter_status": "native_mic_capture_runtime::NativeMicCaptureSupervisor",
+    "mic_adapter_start": "native_mic_capture_runtime::NativeMicCaptureSupervisor",
+    "mic_adapter_pause": "native_mic_capture_runtime::NativeMicCaptureSupervisor",
+    "mic_adapter_resume": "native_mic_capture_runtime::NativeMicCaptureSupervisor",
+    "mic_adapter_stop": "native_mic_capture_runtime::NativeMicCaptureSupervisor",
 }
 
 EXPECTED_AUDIO_CHUNK_RUNTIME_COMMANDS = {
@@ -246,18 +248,15 @@ def test_tauri_lib_binds_bridge_and_mic_adapter_commands():
         assert rust_function in lib_rs
         assert f'"{command_id}"' in lib_rs
 
-    for mic_function in EXPECTED_STILL_NOOP_MIC_COMMANDS:
-        assert re.search(
-            rf"#\[tauri::command\]\s*fn {mic_function}\(\) -> NoopBridgeResponse",
-            lib_rs,
-        )
+    for mic_function, runtime_type in EXPECTED_NATIVE_MIC_COMMANDS.items():
+        assert runtime_type in lib_rs
 
-    for mic_function, runtime_call in EXPECTED_AUDIO_CHUNK_RUNTIME_COMMANDS.items():
-        assert re.search(
-            rf"#\[tauri::command\]\s*fn {mic_function}\(\s*session_id: Option<String>,?\s*\) -> desktop_audio_chunk_runtime::AudioChunkCommandResponse",
-            lib_rs,
-        )
-        assert runtime_call in lib_rs
+    assert "microphone.prepare()" in lib_rs
+    assert "microphone.status()" in lib_rs
+    assert "microphone.start(session_id, &backend)" in lib_rs
+    assert "microphone.pause()" in lib_rs
+    assert "microphone.resume()" in lib_rs
+    assert "microphone.stop()" in lib_rs
 
     for worker_function, runtime_call in EXPECTED_ASR_WORKER_LIFECYCLE_RUNTIME_COMMANDS.items():
         assert re.search(

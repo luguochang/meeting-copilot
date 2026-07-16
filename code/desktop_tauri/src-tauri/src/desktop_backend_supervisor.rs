@@ -17,6 +17,7 @@ const LOCAL_API_TOKEN_ENV: &str = "MEETING_COPILOT_LOCAL_API_TOKEN";
 const TEST_TOKEN_OVERRIDE_ENV: &str = "MEETING_COPILOT_LOCAL_API_TOKEN_OVERRIDE";
 const ALLOW_TEST_TOKEN_OVERRIDE_ENV: &str = "MEETING_COPILOT_ALLOW_TEST_TOKEN_OVERRIDE";
 const HEALTH_PROOF_CONTEXT: &[u8] = b"meeting-copilot-health-v1";
+const SESSION_COOKIE_CONTEXT: &[u8] = b"meeting-copilot-session-v1";
 
 #[derive(Debug, Clone, Deserialize)]
 struct RuntimeBundleManifest {
@@ -37,6 +38,12 @@ pub struct BackendRuntimeSnapshot {
     pub authenticated_loopback: bool,
     pub health_identity_verified: bool,
     pub errors: Vec<String>,
+}
+
+#[derive(Clone)]
+pub struct BackendWebSocketConnection {
+    pub url: String,
+    pub cookie: String,
 }
 
 impl Default for BackendRuntimeSnapshot {
@@ -198,6 +205,51 @@ impl BackendSupervisor {
         Ok(match state.api_token.as_deref() {
             Some(token) => format!("{base_url}/desktop/bootstrap?token={token}"),
             None => format!("{base_url}/workbench"),
+        })
+    }
+
+    pub fn native_microphone_connection(
+        &self,
+        session_id: &str,
+    ) -> Result<BackendWebSocketConnection, String> {
+        if session_id.is_empty()
+            || session_id.len() > 128
+            || !session_id.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+            })
+        {
+            return Err("session_id contains unsafe characters".to_string());
+        }
+        let state = self
+            .inner
+            .lock()
+            .map_err(|_| "backend supervisor lock poisoned")?;
+        let base_url = state
+            .snapshot
+            .base_url
+            .as_deref()
+            .ok_or_else(|| "backend base URL is unavailable".to_string())?;
+        let ws_base = if let Some(value) = base_url.strip_prefix("http://") {
+            format!("ws://{value}")
+        } else if let Some(value) = base_url.strip_prefix("https://") {
+            format!("wss://{value}")
+        } else {
+            return Err("backend base URL must use HTTP or HTTPS".to_string());
+        };
+        let ws_base = ws_base.trim_end_matches('/');
+        let cookie = state
+            .api_token
+            .as_deref()
+            .map(|token| {
+                format!(
+                    "meeting_copilot_session={}",
+                    hmac_sha256_hex(token.as_bytes(), SESSION_COOKIE_CONTEXT)
+                )
+            })
+            .unwrap_or_default();
+        Ok(BackendWebSocketConnection {
+            url: format!("{ws_base}/live/asr/stream/ws/{session_id}?audio_source=tauri_native_mic"),
+            cookie,
         })
     }
 
@@ -540,5 +592,35 @@ mod tests {
         assert!(!serde_json::to_string(&supervisor.snapshot())
             .unwrap()
             .contains(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn native_microphone_connection_uses_authenticated_ws_without_exposing_token() {
+        let supervisor = BackendSupervisor::default();
+        let token = "a".repeat(64);
+        {
+            let mut state = supervisor.inner.lock().unwrap();
+            state.snapshot.base_url = Some("http://127.0.0.1:54321/".to_string());
+            state.api_token = Some(token.clone());
+        }
+
+        let connection = supervisor
+            .native_microphone_connection("meeting_native_01")
+            .unwrap();
+        assert_eq!(
+            connection.url,
+            "ws://127.0.0.1:54321/live/asr/stream/ws/meeting_native_01?audio_source=tauri_native_mic"
+        );
+        assert_eq!(
+            connection.cookie,
+            format!(
+                "meeting_copilot_session={}",
+                hmac_sha256_hex(token.as_bytes(), SESSION_COOKIE_CONTEXT)
+            )
+        );
+        assert!(!connection.cookie.contains(&token));
+        assert!(supervisor
+            .native_microphone_connection("../private")
+            .is_err());
     }
 }

@@ -35,6 +35,7 @@
     "runtime-bundle-manifest.json",
     "bin/meeting-copilot-backend",
     "bin/meeting-copilot-asr-worker",
+    "bin/meeting-copilot-native-mic",
     "runtime/backend-python/bin/python3.13",
     "runtime/backend-venv/bin/python",
     "runtime/funasr-python/bin/python3.11",

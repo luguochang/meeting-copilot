@@ -14,8 +14,8 @@ import { ReviewWorkspace } from "../review/ReviewWorkspace";
 import {
   type BrowserMicrophoneController,
   type BrowserMicrophoneState,
-  useBrowserMicrophone,
 } from "./useBrowserMicrophone";
+import { useMeetingMicrophone } from "./useMeetingMicrophone";
 
 interface LiveMeetingWorkbenchProps {
   meetingId: string | null;
@@ -62,6 +62,9 @@ function localInputIndicator(state: BrowserMicrophoneState): RuntimeIndicator | 
     return { state: "error", label: "不可用", level: 0, detail: state.error };
   }
   const active = state.phase === "recording";
+  if (active && state.inputLevelAvailable === false) {
+    return { state: "active", label: "已连接", level: null, detail: "系统麦克风" };
+  }
   return {
     state: active ? "active" : "busy",
     label: active ? (state.inputLevel >= 0.035 ? "有声音" : "声音较弱") : "检测中",
@@ -82,7 +85,7 @@ export function LiveMeetingWorkbench({
   microphoneController,
 }: LiveMeetingWorkbenchProps) {
   const { state, actions, transportKind } = useMeetingProjection(meetingId, api, transport);
-  const liveMicrophone = useBrowserMicrophone({ asrBaseUrl });
+  const liveMicrophone = useMeetingMicrophone({ asrBaseUrl });
   const microphone = microphoneController ?? liveMicrophone;
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
   const [message, setMessage] = useState("");
