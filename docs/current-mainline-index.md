@@ -1681,3 +1681,17 @@ V2 streaming suggestion and recording export = passed
 - `code/web_mvp/backend/tests/test_asr_stream.py`
 
 本轮仍不能称为公开发布：Phase 0 provenance 仍有 dirty/untracked、模型 immutable revision/再分发授权、FFmpeg bundle 及签名公证 blocker；native Tauri capture、Keychain、Windows 真机和 provider exactly-once 也未关闭。下一步只做本地零成本 gateway 的短主链路回归和 Phase 0 gate 更新。
+
+## 2026-07-16 Phase 0 clean source baseline
+
+Phase 0 的源码可追溯性缺口已经收口到独立分支：`codex/phase0-clean-baseline` 的候选源码提交为 `144c9bea037ca27c579b6146057f548eb31360fb`。原 `main` 大工作树没有被回滚或提交；用户/私密录音、运行录音、有效音频制品、模型、运行产物、`configs/local` 和密钥均未进入候选提交。基线原有的 4 个 `.wav` 路径只是 0-1B、无 WAV magic 的评测占位文件。
+
+clean checkout 的验证结果：后端 `901 passed, 1 warning`，前端 `40 passed` 且 typecheck/lint/build 通过，Rust `10 passed`，CycloneDX 1.5 SBOM 包含 888 个 components；根入口、provenance、SBOM 和桌面 runtime 合同为 `65 passed`，额外 lane-lock 回归为 `3 passed`。根验证入口已消除未声明的 `requests` 依赖，统一使用锁文件中的 `httpx`。
+
+权威 provenance：
+
+`/Users/chase/Documents/面试/meeting-copilot-phase0-clean/artifacts/tmp/release_provenance/phase0-clean-commit-20260716-r2/manifest.json`
+
+结果为 `dirty_tracked_count=0`、`untracked_source_count=0`、`tracked_sensitive_count=0`，DMG path/hash 一致，但总 verdict 仍为 `no_go`。剩余 blocker 只包括旧 evidence 非 release Go、4 个 FunASR 模型的不可变 revision/制品清单/再分发状态，以及 FFmpeg bundle 的 revision/hash/再分发状态。
+
+因此当前真实里程碑是：Phase 1A-1C 与 Phase 2 Browser Vertical/M2 功能出口已完成，Phase 0 clean source baseline 已完成；可公开发布的 Mac 客户端仍未完成。下一主线转入 Phase 3 native mic/system audio、bundle 内 runtime、Keychain 和 clean Mac E2E，不再重复已通过的 Browser Vertical 测评。

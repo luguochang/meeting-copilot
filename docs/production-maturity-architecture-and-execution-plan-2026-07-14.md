@@ -974,3 +974,13 @@ Streaming suggestion 增加 durable lease fencing：草稿 checkpoint 和最终 
 验证更新为 backend `901 passed, 2 warnings`，frontend `40 passed`，typecheck/lint/build、compile、Node syntax 和 `git diff --check` 通过。修正后的 25 秒 browser mic 短链路为 `go`，首文字约 `5.0s`、首 final/建议约 `20.0s`，录音、文字、建议、minutes/approach/index 和历史重开闭环；本地 fake gateway 不计真实 relay 证据，干净输入无 visible correction 也不冒充修正通过。
 
 长会 runner 同时改为 fail-closed 检查 network failure：只允许明确的 SSE/媒体卸载取消，其余网络错误进入 blocker。Phase 0 最新 `phase0-current-worktree-20260716-r4/manifest.json` 仍为 `no_go`，原因保持为 dirty/untracked source、非 release evidence、模型与 FFmpeg provenance/再分发未解决。下一主线不再重复 Browser Vertical 功能评测，转入 Phase 0 clean baseline 与 Phase 3 native desktop/Keychain/clean Mac 出口。
+
+### 17.2 Phase 0 clean source baseline 收口
+
+独立 clean worktree 已在 `codex/phase0-clean-baseline` 建立候选源码提交 `144c9bea037ca27c579b6146057f548eb31360fb`。候选提交包含当前 Phase 0-2 源码、测试、锁文件、LICENSE、NOTICE 和 SBOM，排除了用户/私密录音、运行录音、有效音频制品、模型、缓存、运行数据、安装包、`configs/local` 与密钥。基线原有的 4 个 `.wav` 路径只是 0-1B、无 WAV magic 的评测占位文件。原 `main` 大工作树不作为 release baseline，也没有被回滚。
+
+clean checkout 结果为 backend `901 passed, 1 warning`、frontend `40 passed`、typecheck/lint/build 通过、Rust `10 passed`、CycloneDX 1.5 SBOM 888 components；根入口、provenance、SBOM 和桌面合同 `65 passed`，额外 lane-lock 回归 `3 passed`。根验证脚本统一复用锁定的 `httpx`，关闭 clean environment 中未声明 `requests` 导致的导入失败。
+
+权威 manifest 为 `artifacts/tmp/release_provenance/phase0-clean-commit-20260716-r2/manifest.json`。源码状态已达到 `dirty=0`、`untracked source=0`、`tracked sensitive=0`，旧 DMG 的 path/hash 也匹配；verdict 仍为 `no_go`，因为 evidence 明确不是 release Go，4 个 FunASR 模型和 FFmpeg bundle 的不可变 revision、制品 hash/manifest、再分发状态尚未解决。
+
+Phase 0 因此只完成 clean source baseline，不完成公开发布。Phase 1A-1C 与 Phase 2 Browser Vertical 不再重开；下一实现阶段固定为 Phase 3：native mic + ScreenCaptureKit system audio、bundle 内 backend/ASR/model/ffmpeg、Keychain、本地 API 安全边界和 separate clean Mac E2E。
