@@ -47,3 +47,12 @@ def test_native_helper_environment_is_minimal_and_child_scoped(tmp_path):
         "LC_ALL": "C",
         "MEETING_COPILOT_SESSION_COOKIE": "meeting_copilot_session=redacted-test-cookie",
     }
+
+
+def test_runner_declares_provenance_compatible_artifact_binding():
+    source = TOOL_PATH.read_text(encoding="utf-8")
+
+    assert '"status": decision_status' in source
+    assert '"counts_as_public_release_package": False' in source
+    assert '"artifact_path": artifact_path' in source
+    assert '"artifact_sha256": artifact_sha256' in source

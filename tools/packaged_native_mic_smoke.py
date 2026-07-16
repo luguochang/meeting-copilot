@@ -373,9 +373,24 @@ def smoke_packaged_native_mic(
         and backend_exited
         and port_closed
     )
+    decision_status = (
+        "go_packaged_real_native_mic_helper_not_ui_not_public_release"
+        if passed
+        else "no_go_packaged_real_native_mic_helper"
+    )
+    artifact_path = str(binary.relative_to(repo_root))
+    artifact_sha256 = _sha256(binary)
     evidence = {
         "schema_version": "meeting_copilot.packaged_native_mic_smoke.v1",
         "run_id": run_id,
+        "status": decision_status,
+        "counts_as_public_release_package": False,
+        "artifact_path": artifact_path,
+        "artifact_sha256": artifact_sha256,
+        "artifact": {
+            "path": artifact_path,
+            "sha256": artifact_sha256,
+        },
         "host_platform": platform.platform(),
         "architecture": platform.machine(),
         "app_path": str(app_path.relative_to(repo_root)),
@@ -393,11 +408,7 @@ def smoke_packaged_native_mic(
             "backend_port_closed": port_closed,
         },
         "decision": {
-            "status": (
-                "go_packaged_real_native_mic_helper_not_ui_not_public_release"
-                if passed
-                else "no_go_packaged_real_native_mic_helper"
-            ),
+            "status": decision_status,
             "counts_as_real_native_microphone_evidence": passed,
             "counts_as_tauri_ipc_evidence": False,
             "counts_as_ui_evidence": False,
