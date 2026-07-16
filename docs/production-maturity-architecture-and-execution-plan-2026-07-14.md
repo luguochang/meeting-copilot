@@ -16,9 +16,9 @@
 
 项目没有“完全没做”，但当前只能定义为：
 
-> V2 已在未签名的本机 packaged `.app` 候选中，通过真实 browser 麦克风跑通本地中文 ASR、后台流式建议与原子校正、录音、会后复盘和历史重开；SQLite 任务、5 秒录音 journal、capture lease 与后台导出已通过真实 SIGKILL 恢复。当前已有自包含 runtime 技术候选，但尚未接入 Tauri native PCM/Keychain，也未满足 M1-M3 的统计、长会、供应链和分发出口。
+> V2 已在未签名的本机 packaged `.app` 候选中，通过真实 browser 麦克风跑通本地中文 ASR、后台流式建议与原子校正、录音、会后复盘和历史重开；SQLite 任务、5 秒录音 journal、capture lease 与后台导出已通过真实 SIGKILL 恢复。M1/M2 功能出口已完成；当前仍缺与 clean 候选绑定的受控 FunASR runtime/model、Tauri native PCM、Keychain、供应链与 clean Mac 分发出口，因此 M3 和公开发布均未完成。
 
-当前阶段定为 `L0 功能原型`，不能再使用“全部完成”“可公开发布”等表述。下一正式目标依次是补齐 `M1 Browser Vertical Alpha` 与 `M2 Recoverable Local Runtime` 的剩余出口；之后才进入 `M3 Mac Internal Alpha` 自包含安装包。
+当前发布等级仍定为 `L0 功能原型`，不能使用“全部完成”“可公开发布”等表述。`M1 Browser Vertical Alpha` 和 `M2 Recoverable Local Runtime` 的功能出口已达成，当前唯一主线是 `M3 Mac Internal Alpha`：受控 packaged FunASR runtime 真实 final、Tauri native microphone、ScreenCaptureKit system audio、Keychain 与 clean Mac E2E。
 
 ### 0.2 重构启动时的基线问题（历史）
 
@@ -68,6 +68,8 @@
 - macOS 原生 capture spike 已完成同场至少 60 秒双轨真实采集：约 60.7 秒 microphone 与约 60.5 秒 ScreenCaptureKit system audio 均形成非空 WAV。证据：`code/desktop_tauri/spikes/macos_capture/.build/phase0-both-60s-20260716/evidence.json`。这证明当前 Mac 的 capture API/权限路径可行，不代表 native PCM 已接入产品 WebSocket。
 - r7 本机可移动 runtime 已把 backend Python 3.12、FunASR Python 3.11、backend/core/frontend、worker 与 online 模型放入同一 2.107 GB 技术 bundle；移动到 `/tmp` clean env 后，三个 backend HTTP 入口均为 200，FunASR `34.752s` 真实加载模型并 ready，且没有仓库 sys.path 或外部 symlink。证据：`artifacts/tmp/macos_bundled_runtime/phase0-local-relocatable-full-20260716-r7/evidence.json`。r9 已进一步完成 Tauri resource/supervisor 与 packaged browser-mic 主链路，但仍不是 separate clean Mac 或公开发布证据。
 - 2026-07-16 r9 packaged 主链路完成当前纵向业务闭环：真实 browser microphone、packaged 本地 FunASR、远程非 mock `gpt-5.5`、实时文字/建议/校正、录音、纪要、方案和历史重开均通过。首次文字 `7055ms`、首 final `14071ms`、首建议 `17078ms`、首可见校正 `30117ms`；3 段 canonical 文字全部在会后容器可视区。证据：`artifacts/tmp/packaged_mainline/packaged-r9-final-real-mic-20260716/report.json`。该结果关闭“packaged 前后端业务是否能同场运行”的问题，不关闭 native capture、延迟 SLO、中文人工价值或公开发布门禁。
+- DEC-400 在 clean 代码候选 `6ea965f8922d80e1feae95d03c05fc3a269921da` 上完成 packaged runtime 合同收口：机器可读 manifest 统一 Python/venv/model 路径；Tauri 用每次启动的 256-bit token + HttpOnly bootstrap cookie 保护 loopback REST/SSE/WebSocket，并校验 `/health` HMAC instance proof；desktop startup 必须等到真实 FunASR worker ready；ASR 子进程环境移除 LLM/API 密钥与 local token。backend 全量 `910 passed, 1 warning`，runtime/package 合同 `67 passed`，Rust `15 passed`，Ruff/compile/fmt/diff-check 通过。
+- 当前 clean packaged preflight 是结构化 No-Go：前端 dist 存在，但 `code/asr_runtime/.venv-funasr` 和受控 online Paraformer model directory 不存在。因此新 smoke 还没有取得“app 启动 backend -> resident ready -> WebSocket -> non-empty `funasr_realtime` final -> 进程回收”证据；这是当前首个真实阻塞点，不是继续 Provider 横评的理由。
 - DEC-382 fresh follow-up 已修复规范化 EOS 漏判和 finalize 后浏览器断开导致的错误 `stream_interrupted`；20 秒、90 秒真实 browser microphone + 本地 FunASR + 本地 fake OpenAI-compatible gateway 均已重跑，90 秒严格 job/revision contract 为 `go`，录音 `90.488s`、会后处理 `1.522s`、RSS 增长 `7.09MB`。该证据只关闭当前 browser vertical 的结束竞态和本地协议闭环，不关闭 Phase 2 一小时、远端 provider、native capture 或发布出口。
 - 一小时 follow-up 已完成一次真实 wall-clock 运行：录音/ASR/录音块/快照延迟物理门槛通过，但重复短音频触发语义质量安全门禁，minutes/approach 被抑制，完整 Phase 2 出口保持 No-Go。runner 已默认对 `MEETING_COPILOT_REQUIRE_ONE_HOUR=1` 启用完整 review gate；证据和修复后尾部验证位于 `artifacts/tmp/mainline-rerun-20260716-120637/real-mic-one-hour/phase2-gate-assessment.json`。
 - DEC-383 已将 semantic-quality suppression 正确投影为会后“识别质量不足，已暂停”，不再误报 provider 生成失败；DEC-384 已增加长测输入 hash/时长/playlist/重复率资格，并压缩 correction job 累计输出和 ASR source snapshot。免费 46 秒完整 review 为 Go，82 秒远端链路已恢复 quality blocker 并生成建议、纪要和方案，但这些短证据不关闭 Phase 2。
@@ -814,10 +816,11 @@ DEC-382 已完成 90 秒真实 browser microphone 稳定性 smoke，并证明录
 
 ### Phase 3：自包含 Mac Internal Alpha（8-12 工程日）
 
-- [ ] 实现 native mic + ScreenCaptureKit system audio 双轨 adapter。
-- [ ] Tauri supervisor 启动 backend 与 warm ASR sidecar。
-- [ ] backend/ASR/model/ffmpeg 进入 app bundle，不依赖仓库/venv。
-- [ ] Keychain、随机端口 token、CSP、Origin 和 HTTPS-only。
+- [ ] 先实现 native microphone -> 现有 backend WebSocket 的单轨 adapter；完成真实主链路后再加 ScreenCaptureKit system audio，不在一个切片中同时开发双轨协议。
+- [ ] Tauri supervisor 启动 backend 与 warm ASR sidecar：启动、token、HMAC proof 和 resident-ready 代码合同已完成，仍缺受控 bundle 的真实 FunASR final 证据。
+- [ ] backend/ASR/model/ffmpeg 进入 app bundle，不依赖仓库/venv：runtime manifest 与 fail-fast preflight 已完成，当前 clean checkout 尚缺 FunASR Python 3.11 venv 与受控 model directory，FFmpeg 供应链也未闭环。
+- [x] 每次启动的 256-bit local API token、HttpOnly/SameSite=Strict bootstrap、Origin 校验和 backend instance HMAC proof。
+- [ ] Keychain 凭据存储、packaged CSP 和 HTTPS-only 策略。
 - [ ] App Support/Logs/Caches 路径与删除语义。
 - [ ] arm64 clean Mac 安装、启动、会议、退出、重启、卸载 E2E。
 - [ ] 本阶段固定当前 FunASR runtime，不同时切换 sherpa-onnx；只有 Phase 0/3 证明 FunASR 在包体、启动或资源上硬性 No-Go，才另开 Runtime Optimization ADR。
@@ -852,7 +855,8 @@ DEC-382 已完成 90 秒真实 browser microphone 稳定性 smoke，并证明录
 - [ ] 建议/校正任一 provider 失败不影响录音和文字。
 - [ ] 结束后自动复盘；录音、文字、状态和 usage 可恢复。
 - [ ] kill -9 恢复达到 RPO/RTO。
-- [ ] API key 只在 Keychain；本地 API 有 token/Origin/CSP。
+- [x] 本地 API 有每次启动 token、HttpOnly bootstrap、Origin 校验和 instance proof，token 不进入前端 status snapshot。
+- [ ] API key 只在 Keychain；packaged CSP 与 HTTPS-only 策略完成。
 
 ### 13.2 Pilot 额外要求
 

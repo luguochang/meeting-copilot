@@ -25515,3 +25515,37 @@ verdict=no_go
 - Phase 1A、1B、1C 和 Phase 2 浏览器纵向功能出口保持已完成，不再重复 provider 横评或短链路循环。
 - Phase 0 尚未完成公开发布：还需要正式 artifact 绑定、模型/FFmpeg 供应链结论、packaged native capture、Keychain、签名公证和 separate clean Mac。
 - 下一产品主线进入 Phase 3 Mac Internal Alpha；在 native mic/system audio、bundle 内 backend/ASR/model/ffmpeg 和 clean Mac E2E 完成前，不宣称 PC 客户端可交付发布。
+
+# DEC-400: 收口 packaged runtime 启动、loopback 认证和 FunASR readiness，但 native capture 与真实 clean packaged final 仍未完成
+
+时间：2026-07-16
+
+状态：Accepted / Runtime contracts implemented / Mac Internal Alpha No-Go
+
+## 决策
+
+1. 以 `code/desktop_tauri/runtime-bundle-manifest.json` 作为 packaged runtime 的唯一机器可读合同，统一 backend Python 3.13、FunASR Python 3.11、venv executable、site-packages、launcher、online model 目录和必需文件。package builder、Python runtime spike、Rust supervisor 与 process smoke 不得再各自硬编码 Python 版本或目录。
+2. packaged Tauri 每次启动生成 256-bit local API token，只通过子进程环境传给 backend，不暴露给 WebView JavaScript 或 `runtime_get_status`。WebView 先访问 `/desktop/bootstrap?token=...`，backend 设置 `HttpOnly; SameSite=Strict` cookie 后重定向 `/workbench`。REST、SSE 和 WebSocket 默认要求该 cookie，hostile Origin 必须拒绝。
+3. `/health` 保持可用于启动探针，但返回基于 token 的 HMAC instance proof；Rust supervisor 必须校验 proof，不能把任意 loopback HTTP 200 误判为自己启动的 backend。未设置 token 时保留现有开发模式兼容行为。
+4. desktop runtime 只有在 resident FunASR worker 真实产生 `ready` 事件后才能绿色启动。`GET /providers/asr/runtime` 必须报告 `spawned/process_running/process_ready/pid/generation/active_session_id/process_start_count/completed_session_count/last_exit_code/last_error`。`MEETING_COPILOT_DESKTOP_RUNTIME=1` 且 worker 未 ready 时 backend startup 必须失败，不得降级为假成功。
+5. FunASR 子进程环境必须移除 `*_API_KEY`、`AUTHORIZATION` 和 `MEETING_COPILOT_LOCAL_API_TOKEN`，避免本地 ASR worker 继承 LLM 中转站密钥或 desktop API token。
+6. packaged runtime smoke 必须经过 bootstrap/cookie 认证后访问 Workbench 和 provider 状态，确认 resident `process_ready=true`，并可以将指定的 16 kHz mono PCM WAV 经 app 启动的 backend WebSocket 送入，要求获得非空 final、`provider=funasr_realtime`、`provider_mode=real`、`is_mock=false` 且退出后 app/backend/端口全部回收。缺音频、runtime 或 model 时必须 No-Go。
+7. 原生采音按两个切片实现：先做 `native microphone -> existing backend WebSocket`，通过后再做 ScreenCaptureKit system audio 和 track/epoch/seq/timestamp 协议。当前产品真正可用的采音仍是 WebView `getUserMedia -> AudioWorklet -> 16 kHz mono Float32 -> backend WebSocket`；Swift capture spike 只产生 WAV/evidence，尚未连入 Tauri 主链路。
+
+## 验证
+
+- 代码候选：`6ea965f8922d80e1feae95d03c05fc3a269921da`。
+- backend 全量：`910 passed, 1 warning`。
+- 根级/runtime/package 合同：`67 passed`。
+- Tauri/Rust：`15 passed`。
+- local auth focused：`8 passed`；resident readiness focused：`11 passed`。
+- Ruff、Python compile、Rust fmt `--check` 和 `git diff --check` 通过。
+- 受控 runtime preflight：`artifacts/tmp/phase3-runtime-preflight-20260716.json`。`backend_venv/backend_python/frontend_dist=true`，`funasr_venv/funasr_python/model_dir/model_pt/model_config=false`，所以返回结构化 No-Go，没有用 traceback 掩盖前置条件。
+- clean provenance：`artifacts/tmp/release_provenance/phase0-clean-commit-20260716-r3/manifest.json`。`commit=6ea965f...`、`dirty_tracked_count=0`、`untracked_source_count=0`、`tracked_sensitive_count=0`、artifact path/hash 一致；由于 evidence 不是 release Go 且模型/FFmpeg 供应链未解决，`verdict=no_go`。
+
+## 后续边界
+
+- Phase 1A/1B/1C 和 Phase 2 的功能出口已完成，不再进行泛化 Provider 横评或重复短会评测。
+- 下一步是构建受控 FunASR Python 3.11 runtime 和固定模型目录，先让 clean packaged app smoke 获得真实 non-empty final，再开始 native microphone adapter。
+- Keychain、packaged CSP/HTTPS-only、entitlements、Developer ID 签名、notarization/Gatekeeper 和 separate clean Mac 仍是独立发布门禁。
+- 本决策未读取 `configs/local`、未读取用户录音或真实密钥、未调用远程 ASR/LLM，新增费用为 0。

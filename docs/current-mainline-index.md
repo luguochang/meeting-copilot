@@ -2,15 +2,19 @@
 
 ## 2026-07-16 V2 纵向主链路状态（当前唯一状态）
 
-> 当前等级：`L0 功能原型`
+> 当前等级：`L0 功能原型`；功能里程碑 `M2 Recoverable Local Runtime` 已达成，桌面交付里程碑尚未达成
 >
-> 下一里程碑：`M1 Browser Vertical Alpha`，不是 Mac Alpha 或公开发布
+> 下一里程碑：`M3 Mac Internal Alpha`，当前不是可公开发布的安装包
 >
 > 当前实施基线：`docs/production-maturity-architecture-and-execution-plan-2026-07-14.md`
 >
 > 文档真相与历史归档索引：`docs/archive/readiness-index.md`
 >
-> 最新 packaged 真实主链路证据：`artifacts/tmp/packaged_mainline/packaged-r9-final-real-mic-20260716/report.json`
+> 当前代码候选基线：`6ea965f8922d80e1feae95d03c05fc3a269921da`
+>
+> 最新 clean provenance：`artifacts/tmp/release_provenance/phase0-clean-commit-20260716-r3/manifest.json`
+>
+> 历史 packaged 业务证据：`artifacts/tmp/packaged_mainline/packaged-r9-final-real-mic-20260716/report.json`；它不绑定当前 clean 候选代码
 
 当前事实：
 
@@ -31,6 +35,7 @@
 - DEC-395 已用修复后代码完成 60 秒中文主链路回归：`artifacts/tmp/phase2-pure-chinese-fixture-20260716/post-hotpath-soak-60s/report.json` 为 `go`，首字 `5004ms`、首 final/首实时建议 `20005ms`、4 段文字、1 条正式建议、录音导出、minutes/approach/index、历史重开均成功，RSS 增长 `2.671875MB`，runtime/console/network/5xx 均为 0。纯净输入没有 visible correction，未将 correction job succeeded 冒充 revision evidence；本地 fake gateway 也不计生产 relay evidence。
 - DEC-397 已关闭 DEC-393 的 bounded-state backlog：V2 events 默认 200/最大 1000 分页并返回 `has_more/next_after_seq`，SSE 和 polling 都按 cursor 有界 drain；legacy live projection 固定最近 512 finals、32 partials、128 revisions，完整事实由 V2 normalized tables 提供；streaming suggestion 的草稿和 commit 都受 durable job lease 原子 fencing，provider retry 从已有 `draft_seq` 继续。
 - DEC-398 修复了长会 runner 未把 `network_failures` 纳入 blocker 的缺陷。首次修复后 60 秒运行的功能数据保留，但其空 URL `ERR_ABORTED` 不再算 strict clean evidence；修正后 `post-pagination-fencing-diagnostic-25s/report.json` 在真实 browser mic + 本地 FunASR + 本地 fake gateway 下为 `go`，runtime/console/network/5xx 均为 0，文字、实时建议、录音、会后产物和历史重开通过。local gateway 与无 visible correction 继续保持非生产证据边界。
+- DEC-400 已把 clean 候选的 packaged runtime 启动合同收口：单一 `runtime-bundle-manifest.json` 统一 backend/FunASR Python、venv、site-packages、launcher 和 model 路径；Tauri 每次启动生成 256-bit loopback token，通过 HttpOnly/SameSite=Strict bootstrap cookie 保护 REST、SSE 和 WebSocket，并用 HMAC instance proof 防止把其他 loopback HTTP 进程误判为自己的 backend；FunASR 必须收到 worker `ready` 才允许 desktop runtime 绿色启动，子进程不继承 LLM/API 密钥或 local token。当前代码合同已通过，但 clean checkout 没有受控 FunASR Python 3.11 runtime 和 online model，所以 packaged 真实 ASR final 仍为 No-Go。
 - 本次 ASR 为 packaged 本地 `funasr_realtime`、`provider_mode=real`、`is_mock=false`；LLM 为远程 OpenAI-compatible `gpt-5.5`、`is_mock=false`，5 次调用、3598 tokens；未启用远程 ASR。runtime exception、console error、network failure 和 HTTP 5xx 均为 0。
 - Phase 1C 的 20 个中文技术会议核心触发点已使用生产同源提示词和真实 `gpt-5.5` 完成两阶段价值门禁：先生成并记录 evidence/TTFT/usage，再逐条人工语义审查。结果为 provider success `20/20`、evidence correct `20/20`、可直接追问且总调用耗时 <=20s `20/20`、重复 `0`、无 evidence `0`、unsupported claim `0`；总用量 4665 tokens。证据：`artifacts/tmp/product_value_gate/phase1c-gpt55-20260716-r1/report.json`。
 - 录音采用默认 5 秒 chunk journal、独立 capture lease 和后台 WAV export job。每个 chunk 在触碰文件系统前先做 lease fence；fsync 后、SQLite commit 前崩溃产生的磁盘块会先由 journal 校验并补齐 SQLite，再恢复过期 capture；对账写入同时校验扫描时的 `capture_generation + expired lease`，续租或 resume 后的陈旧扫描不能越权补块。相同 epoch 的重复捕获使用递增 `capture_generation`，迟到 seal 只能同 journal 幂等返回，不能把 `ready/exporting/failed` 降级。WebSocket `END` 只封存 journal，不同步扫描整场录音。独立子进程真实 `SIGKILL` 证据仍为 `RPO=4000ms`、`RTO=15ms`，两个 durable AI job 同时恢复成功：`artifacts/tmp/v2_recovery_process/2026-07-15-recording-lease/report.json`。
@@ -39,13 +44,13 @@
 - current topic/open question 除生命周期状态外，SQLite 还持久化 `version/first_seen_seq/last_updated_seq`；超出页面最近三项的问题仍保留事实行，稍后 reopen 不会重置版本、首次出现位置或 evidence。结构化日志与 stdlib/uvicorn 最终 formatter 都执行脱敏，只保留稳定 `meeting_id_hash`；access query value 整段丢弃，异常 traceback 不写入，真实会议 ID、transcript/prompt/secret/error detail 和本地敏感路径不会进入新日志。
 - 首页已移除 mock 示例入口；`/v2/meetings`、`/live/asr/sessions` 和 `/sessions` 三类删除入口统一先持久化 tombstone，再取消并等待活跃采集任务，并在同一文件锁下清理剩余录音目录；所有迟到 create/final/chunk/seal 都被拒绝，不能在删除后重建 legacy/V2 meeting 或 WAV。会议文字时间戳可定位录音，纪要使用安全 Markdown 渲染；录音后台状态通过 SSE 从“整理中”自动刷新为可播放。前端已接收权威 `suggestion.superseded`/`suggestion.evidence.remapped`，旧 committed 卡不会遮蔽服务端终态。最新无付费回归 `artifacts/tmp/ui_screenshots/workbench-v2-recording-export-20260715/report.json` 在桌面与 375px 均为 `go`，console/runtime/HTTP 5xx 为 0。
 - 当前 r9 本机未签名 Tauri 候选包内含 backend Python 3.12、FunASR Python 3.11、应用代码和 online Paraformer 模型，逻辑体积 2,292,365,451 bytes。app 可在随机 loopback 端口自启动 backend，三个 HTTP 入口为 200，SIGTERM 后 parent watchdog 能回收 app、backend 与端口。supervisor 证据：`artifacts/tmp/packaged_runtime_supervisor_smoke/packaged-runtime-supervisor-smoke-20260716-r9/evidence.json`；完整业务证据为上方 r9 report。边界：当前 packaged GO 仍使用 WebView/browser `getUserMedia`，Tauri native mic/system audio PCM 尚未接正式 WebSocket；凭据仍由进程环境注入，不是 Keychain 产品配置。
-- 当前回归基线：backend 全量从 `code/web_mvp/backend` pytest 根目录执行为 `901 passed, 2 warnings`；常驻 worker/runtime 已包含在内；frontend V2 `40 passed`，lint/typecheck/production build 通过；Python compile、Node syntax 和 `git diff --check` 通过。最新免费真实浏览器链路的文字、建议、录音、纪要、方案、索引和历史重开通过，但因本地 gateway/输入条件为 no-cost evidence，不计真实 relay correction Go。仓库根目录 pytest 不作为正式入口，避免收集打包 runtime 内的第三方测试。
-- Phase 0 发布来源门禁已由 `tools/release_provenance_manifest.py` 落地，TDD 现为 `12 passed`。最新 `phase0-current-worktree-20260716-r4/manifest.json` 已重新绑定 Git/tree、开发 DMG、evidence run 和应用版本；`.env.example` 已正确作为模板排除，`tracked_sensitive_count=0`。当前工作树仍有 58 个 tracked 变更和 277 个未跟踪源码项，开发 DMG evidence 明确不是 release Go，四个模型不可变 revision/制品 manifest/再分发授权以及 FFmpeg provenance 未完成，因此 verdict=`no_go`。该门禁未读取 `configs/local`、未调用网络，也没有新增费用。
+- 当前 clean 候选回归基线：backend 全量 `910 passed, 1 warning`；根级/runtime/package 合同 `67 passed`；Tauri/Rust `15 passed`；Ruff、Python compile、Rust fmt 和 `git diff --check` 通过。frontend V2 仍沿用已通过的 `40 passed` + lint/typecheck/production build 基线。
+- Phase 0 发布来源门禁已重新绑定代码候选 `6ea965f8922d80e1feae95d03c05fc3a269921da`。`phase0-clean-commit-20260716-r3/manifest.json` 的 `dirty_tracked_count=0`、`untracked_source_count=0`、`tracked_sensitive_count=0`，artifact path/hash 一致，但历史 DMG evidence 明确不允许发布，四个模型与 FFmpeg 的 revision/hash/redistribution 仍未闭环，所以 `verdict=no_go`。该门禁未读取 `configs/local`、未读取密钥、未调用网络。
 - DEC-387 已新增只读本地供应链快照 `artifacts/tmp/release_provenance/local-supply-chain-snapshot-20260716.json`，TDD 为 `4 passed, 1 warning`。四个实际 ModelScope 缓存模型均存在，并记录了完整逐文件 `path/size_bytes/sha256` 与目录 manifest：SeACo `95204e09...`, online Paraformer `c405c0a2...`, VAD `4c4ffbf9...`, punctuation `5367251e...`；四个 `.mv` 的 revision 均为 `master`，因此 `immutable_revision=null`。本机 FFmpeg 已记录二进制 SHA-256 `00d01197...`、version/buildconf/license 输出，但 policy 仍为 `redistribution_status=unresolved`。该快照没有下载模型、没有调用网络、没有读取密钥，也没有把本地缓存事实升级为发布授权；Phase 0 继续 `no_go`。
 - Phase 0 的 Mac 高风险 spike 已完成本机正向验证：ScreenCaptureKit 同次采集得到约 60.7 秒麦克风和约 60.5 秒 system audio 非空 WAV；r7 可移动 runtime 在仓库外 clean env 启动三个 HTTP 入口并让 FunASR 34.752 秒 cold ready；r9 `.app` 已携带 runtime resource，并通过 supervisor smoke 和 browser-mic packaged 同场主链路。证据分别为 `code/desktop_tauri/spikes/macos_capture/.build/phase0-both-60s-20260716/evidence.json`、`artifacts/tmp/macos_bundled_runtime/phase0-local-relocatable-full-20260716-r7/evidence.json`、r9 supervisor smoke 和 r9 mainline report。separate clean Mac、native capture 到主链路连接、许可证与正式签名公证仍未完成。
-- DEC-390 已完成 DEC-384 后版本的纯中文、低重复一小时 browser vertical 主链路：`artifacts/tmp/phase2-pure-chinese-fixture-20260716/one-hour-run/report.json` 为 `go`，录音 `3600.491s`、最终音频 `3628.066s`、224 段文字、726 chunks、6 条正式建议、correction/suggestion/review 全部成功、minutes/approach/index 成功、历史重开通过，runtime/console/network/HTTP 5xx 均为 0。该证据关闭 M2 Browser Vertical 的一小时功能门禁，但 `post-run-audit.json` 明确记录数据根复用、旧 input_mode 标签、FunASR 进程树未纳入 RSS SLO 和本地 gateway 成本 rates 未配置；因此仍是内部功能证据，不是公开发布证据。当前形成 `M1 Browser Vertical Alpha` 与 `M2 Recoverable Local Runtime` 功能候选；Phase 1B 的 `20 warm + 5 cold` 分布、Phase 0 clean release/provenance、native capture/Keychain、separate clean Mac 和 Mac/Windows 分发仍未完成。
+- DEC-390 已完成 DEC-384 后版本的纯中文、低重复一小时 browser vertical 主链路：`artifacts/tmp/phase2-pure-chinese-fixture-20260716/one-hour-run/report.json` 为 `go`，录音 `3600.491s`、最终音频 `3628.066s`、224 段文字、726 chunks、6 条正式建议、correction/suggestion/review 全部成功、minutes/approach/index 成功、历史重开通过，runtime/console/network/HTTP 5xx 均为 0。该证据关闭 M2 Browser Vertical 的一小时功能门禁，但 `post-run-audit.json` 明确记录数据根复用、旧 input_mode 标签、FunASR 进程树未纳入 RSS SLO 和本地 gateway 成本 rates 未配置；因此仍是内部功能证据，不是公开发布证据。当前已关闭 `M1 Browser Vertical Alpha` 与 `M2 Recoverable Local Runtime` 功能出口；`20 warm + 5 cold` 分布保留为性能统计与 Pilot 证据，不重开功能里程碑。clean release/provenance、native capture/Keychain、separate clean Mac 和 Mac/Windows 分发仍未完成。
 
-后续只按新基线的 `Phase 0 -> 1A -> 1B -> 1C -> 2 -> 3 -> 4` 执行。以下 2026-07-13 及更早内容全部保留为历史证据，不再作为当前计划、当前完成率或发布结论。
+后续只按 `Phase 3 packaged runtime -> native mic -> system audio -> Keychain/签名/clean Mac -> Phase 4` 执行。Phase 1A/1B/1C 和 Phase 2 的功能出口不再重复测评；以下 2026-07-13 及更早内容全部保留为历史证据，不再作为当前计划、当前完成率或发布结论。
 
 > 日期：2026-07-13
 > 状态：历史短时 no-cost 证据已证明过一次真实麦克风录音、ASR、实时文字、确定性建议、方案、纪要和录音导出；production 文件链已证明本地离线 FunASR 后可由真实 `gpt-5.5` 生成带证据建议、方案和纪要；2026-07-13 新鲜受控多段音频已经在会议未结束时产生 5 个 final，并在本机 fake gateway lane 中通过录音期正式建议 gate，但这不计入 production LLM evidence。真实自然麦克风、真实远程 gateway、中文技术质量、20 分钟真实 gate、自然多人会议与发布验收仍为 No-Go。当前主线不把历史成功、本机 fake gateway 或会后有卡片等同于生产可用。
