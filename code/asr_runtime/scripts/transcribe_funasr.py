@@ -314,6 +314,109 @@ def transcribe_streaming_batch(
     }
 
 
+def transcribe_offline_batch(
+    *,
+    audio_paths: list[Path],
+    model_name: str,
+    vad_model: str | None = "fsmn-vad",
+    punc_model: str | None = "ct-punc",
+    device: str,
+    batch_size_s: int = 60,
+    merge_vad: bool = True,
+    merge_length_s: int = 15,
+) -> dict[str, Any]:
+    """Transcribe files with one reused offline FunASR model.
+
+    This is intended for imported recordings and post-meeting transcript repair,
+    where accuracy and punctuation matter more than sub-second live latency.
+    """
+    model_started = time.monotonic()
+    model_kwargs: dict[str, Any] = {
+        "model": model_name,
+        "device": device,
+        "disable_update": True,
+    }
+    if vad_model:
+        model_kwargs["vad_model"] = vad_model
+    if punc_model:
+        model_kwargs["punc_model"] = punc_model
+
+    with contextlib.redirect_stdout(sys.stderr):
+        from funasr import AutoModel
+
+        model = AutoModel(**model_kwargs)
+
+    model_load_latency_ms = int((time.monotonic() - model_started) * 1000)
+    items: list[dict[str, Any]] = []
+    total_audio_duration_seconds = 0.0
+    total_transcribe_latency_ms = 0
+
+    for audio_path in audio_paths:
+        item_started = time.monotonic()
+        with contextlib.redirect_stdout(sys.stderr):
+            result = model.generate(
+                input=str(audio_path),
+                batch_size_s=batch_size_s,
+                merge_vad=merge_vad,
+                merge_length_s=merge_length_s,
+            )
+        latency_ms = int((time.monotonic() - item_started) * 1000)
+        text = "".join(item.get("text", "") for item in result)
+        segments = _segments_from_result(result)
+        duration_seconds = _audio_duration_seconds(audio_path, segments)
+        total_audio_duration_seconds += duration_seconds
+        total_transcribe_latency_ms += latency_ms
+        items.append(
+            {
+                "status": "ok",
+                "audio_id": _audio_id_from_path(audio_path),
+                "text": text,
+                "latency_ms": latency_ms,
+                "audio_duration_seconds": round(duration_seconds, 6),
+                "rtf": round((latency_ms / 1000) / duration_seconds, 6) if duration_seconds else 0.0,
+                "entities": [],
+                "segments": segments,
+                "raw": {
+                    "provider": "funasr",
+                    "model_id": _safe_model_id(model_name),
+                    "model_resolution": "offline_model_argument",
+                    "model_download_status": "not_performed",
+                    "device": device,
+                    "mode": "file_batch_offline_transcript",
+                    "vad_model_status": "enabled" if vad_model else "disabled",
+                    "punc_model_status": "enabled" if punc_model else "disabled",
+                    "batch_model_load_excluded_from_latency": True,
+                    "batch_size_s": batch_size_s,
+                    "merge_vad": merge_vad,
+                    "merge_length_s": merge_length_s,
+                },
+            }
+        )
+
+    return {
+        "status": "ok",
+        "batch_mode": "single_process_reused_funasr_offline_model",
+        "model_id": _safe_model_id(model_name),
+        "model_resolution": "offline_model_argument",
+        "model_download_status": "not_performed",
+        "vad_model_status": "enabled" if vad_model else "disabled",
+        "punc_model_status": "enabled" if punc_model else "disabled",
+        "model_load_latency_ms": model_load_latency_ms,
+        "item_count": len(items),
+        "total_audio_duration_seconds": round(total_audio_duration_seconds, 6),
+        "total_transcribe_latency_ms": total_transcribe_latency_ms,
+        "transcribe_only_rtf": round((total_transcribe_latency_ms / 1000) / total_audio_duration_seconds, 6)
+        if total_audio_duration_seconds
+        else 0.0,
+        "items": items,
+        "safe_to_download_models": False,
+        "safe_to_read_user_audio": False,
+        "safe_to_read_configs_local": False,
+        "safe_to_call_remote_asr": False,
+        "safe_to_call_llm": False,
+    }
+
+
 def stream_events(
     audio_path: Path,
     model_name: str,
@@ -779,16 +882,46 @@ def _segments_from_result(result: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return segments
 
 
+def _audio_duration_seconds(audio_path: Path, segments: list[dict[str, Any]]) -> float:
+    try:
+        import soundfile as sf
+
+        info = sf.info(str(audio_path))
+        if info.samplerate:
+            return float(info.frames) / float(info.samplerate)
+    except Exception:
+        pass
+    return max((float(segment.get("end_ms") or 0) for segment in segments), default=0.0) / 1000.0
+
+
+def _audio_id_from_path(audio_path: Path) -> str:
+    stem = audio_path.stem
+    return stem.removesuffix(".16k")
+
+
+def _safe_model_id(model_id: str) -> str:
+    value = str(model_id)
+    if "/" in value or "\\" in value:
+        return Path(value).name
+    return value
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Transcribe audio with local FunASR.")
-    parser.add_argument("audio", type=Path)
+    parser.add_argument("audio", type=Path, nargs="+")
     parser.add_argument("--model", default="paraformer-zh")
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--vad-model", default="fsmn-vad")
     parser.add_argument("--punc-model", default="ct-punc")
     parser.add_argument(
         "--streaming",
         action="store_true",
         help="Replay the file through FunASR streaming chunks and emit streaming events.",
+    )
+    parser.add_argument(
+        "--offline-batch",
+        action="store_true",
+        help="Load one offline FunASR model and transcribe all input files for post-meeting transcripts.",
     )
     parser.add_argument(
         "--chunk-size",
@@ -822,11 +955,29 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
 
+    if args.offline_batch:
+        punc_model = None if args.no_punc else args.punc_model
+        print(
+            json.dumps(
+                transcribe_offline_batch(
+                    audio_paths=args.audio,
+                    model_name=args.model,
+                    vad_model=args.vad_model,
+                    punc_model=punc_model,
+                    device=args.device,
+                ),
+                ensure_ascii=False,
+            )
+        )
+        return
+
     if args.streaming:
+        if len(args.audio) != 1:
+            parser.error("--streaming accepts exactly one audio input")
         print(
             json.dumps(
                 transcribe_streaming(
-                    args.audio,
+                    args.audio[0],
                     args.model,
                     args.device,
                     chunk_size=args.chunk_size,
@@ -842,10 +993,12 @@ def main(argv: list[str] | None = None) -> None:
         )
         return
 
+    if len(args.audio) != 1:
+        parser.error("single-file transcription accepts exactly one audio input; use --offline-batch for multiple files")
     punc_model = None if args.no_punc else args.punc_model
     print(
         json.dumps(
-            transcribe(args.audio, args.model, args.device, punc_model=punc_model),
+            transcribe(args.audio[0], args.model, args.device, punc_model=punc_model),
             ensure_ascii=False,
         )
     )

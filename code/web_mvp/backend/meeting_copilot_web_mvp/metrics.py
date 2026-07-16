@@ -7,9 +7,12 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+from dotenv import load_dotenv
+
 from meeting_copilot_web_mvp.logging_config import get_logger
 
 _log = get_logger("meeting_copilot_web_mvp.metrics")
+REPO_ENV_FILE = Path(__file__).resolve().parents[4] / ".env"
 
 
 class Metrics:
@@ -50,6 +53,7 @@ metrics = Metrics()
 def validate_config() -> list[str]:
     """Check required env + paths. Returns a list of issue strings (empty = ok)."""
     issues: list[str] = []
+    load_dotenv(REPO_ENV_FILE, override=False)
     if not os.environ.get("LLM_GATEWAY_BASE_URL"):
         issues.append("LLM_GATEWAY_BASE_URL not set — LLM features (cards/minutes/approach) disabled")
     if not os.environ.get("LLM_GATEWAY_API_KEY"):

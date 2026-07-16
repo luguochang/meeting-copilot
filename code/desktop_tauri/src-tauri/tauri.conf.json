@@ -20,6 +20,7 @@
         "minWidth": 1024,
         "minHeight": 720,
         "resizable": true,
+        "visible": false,
         "url": "workbench.html"
       }
     ],
@@ -32,6 +33,7 @@
     "targets": ["app", "dmg"],
     "icon": ["icons/icon.png"],
     "macOS": {
+      "minimumSystemVersion": "13.0",
       "infoPlist": "Info.plist"
     }
   }

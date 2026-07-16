@@ -1,0 +1,24 @@
+{
+  "technical_entities": [
+    {
+      "normalized": "payment-gateway",
+      "text": "payment-gateway",
+      "type": "service"
+    },
+    {
+      "normalized": "request_id",
+      "text": "request_id",
+      "type": "field"
+    },
+    {
+      "normalized": "40012",
+      "text": "40012",
+      "type": "error_code"
+    },
+    {
+      "normalized": "P99",
+      "text": "P99",
+      "type": "metric"
+    }
+  ]
+}

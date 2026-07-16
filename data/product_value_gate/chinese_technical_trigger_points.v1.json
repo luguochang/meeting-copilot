@@ -1,0 +1,25 @@
+{
+  "schema_version": "meeting_copilot.chinese_technical_trigger_points.v1",
+  "scenarios": [
+    {"id":"trigger-01","title":"灰度发布缺少负责人","evidence":"checkout-service 计划周五晚先灰度 10%，P99 异常就暂停，但还没有明确发布负责人。","gap":"确认灰度发布 owner、异常阈值和回滚执行人","anchor_terms":["checkout-service","P99"],"expected_focus_terms":["负责人","阈值","回滚"]},
+    {"id":"trigger-02","title":"数据库迁移缺少回滚窗口","evidence":"orders 表下周执行在线字段迁移，方案提到了双写，但没有说明备份、锁表风险和回滚窗口。","gap":"确认迁移备份、锁表风险与回滚窗口","anchor_terms":["orders","双写"],"expected_focus_terms":["备份","锁表","回滚"]},
+    {"id":"trigger-03","title":"消息堆积止血无退出条件","evidence":"order-worker 的 lag 已到八万，团队准备临时扩容三倍，但没有定义恢复正常后的缩容条件。","gap":"确认扩容止血的观察指标和退出条件","anchor_terms":["order-worker","lag"],"expected_focus_terms":["指标","退出","缩容"]},
+    {"id":"trigger-04","title":"缓存切换缺少一致性方案","evidence":"商品详情准备从本地缓存切到 Redis Cluster，讨论了命中率，却没有确认失效策略和回源保护。","gap":"确认缓存失效、一致性和回源保护","anchor_terms":["Redis Cluster","命中率"],"expected_focus_terms":["失效","一致性","回源"]},
+    {"id":"trigger-05","title":"接口升级缺少消费者清单","evidence":"payment-api 的 v2 会删除 legacy_status 字段，目前只说保留两周兼容期，还没有消费者清单。","gap":"确认消费者、兼容期和下线判定","anchor_terms":["payment-api","legacy_status"],"expected_focus_terms":["消费者","兼容","下线"]},
+    {"id":"trigger-06","title":"告警延迟缺少整改 owner","evidence":"凌晨故障中 error rate 告警延迟了六分钟，原因可能是聚合窗口过长，但整改负责人还没确定。","gap":"确认告警窗口、目标延迟和整改负责人","anchor_terms":["error rate","六分钟"],"expected_focus_terms":["告警","延迟","负责人"]},
+    {"id":"trigger-07","title":"密钥轮换缺少失败回退","evidence":"鉴权服务准备轮换生产 JWT signing key，计划双 key 并行一天，但没有演练旧 token 验证失败时的回退。","gap":"确认密钥轮换验证、失败回退和 owner","anchor_terms":["JWT","signing key"],"expected_focus_terms":["验证","回退","owner"]},
+    {"id":"trigger-08","title":"数据对账缺少差异处置","evidence":"账单系统每天凌晨对账，目前只记录差异数量，没有定义差异超过阈值后的冻结和补偿流程。","gap":"确认对账阈值、冻结条件和补偿流程","anchor_terms":["对账","差异"],"expected_focus_terms":["阈值","冻结","补偿"]},
+    {"id":"trigger-09","title":"容量估算缺少流量假设","evidence":"双十一容量目标暂定每秒两万请求，但没有说明峰值持续时间、读写比例和冗余系数。","gap":"确认容量估算假设和冗余标准","anchor_terms":["每秒两万","双十一"],"expected_focus_terms":["峰值","读写","冗余"]},
+    {"id":"trigger-10","title":"性能优化缺少验收基线","evidence":"搜索接口准备通过并行查询降低 P99，目前没有固定数据集、并发量和优化前基线。","gap":"确认性能优化的测试数据、并发与基线","anchor_terms":["搜索接口","P99"],"expected_focus_terms":["数据","并发","基线"]},
+    {"id":"trigger-11","title":"依赖故障缺少降级策略","evidence":"recommendation-service 依赖画像服务，画像超时会拖慢首页，但会议里还没确定 fallback 数据和超时预算。","gap":"确认依赖超时预算和 fallback 行为","anchor_terms":["recommendation-service","画像"],"expected_focus_terms":["超时","fallback","降级"]},
+    {"id":"trigger-12","title":"功能开关缺少回收计划","evidence":"新结算流程会用 feature flag 控制，发布方案没有说明开关 owner、默认值和稳定后何时删除旧分支。","gap":"确认 feature flag 的 owner、默认值和回收时间","anchor_terms":["feature flag","结算"],"expected_focus_terms":["owner","默认","删除"]},
+    {"id":"trigger-13","title":"隐私数据缺少保留期限","evidence":"会议搜索计划保存原始录音和全文索引，目前没有确定录音保留天数、删除入口和审计记录。","gap":"确认录音保留、删除和审计边界","anchor_terms":["原始录音","全文索引"],"expected_focus_terms":["保留","删除","审计"]},
+    {"id":"trigger-14","title":"容灾目标未经过演练","evidence":"订单库提出 RTO 30 分钟、RPO 5 分钟，但最近半年没有做过跨可用区恢复演练。","gap":"确认容灾目标的演练时间、步骤和验收人","anchor_terms":["RTO","RPO"],"expected_focus_terms":["演练","验收","恢复"]},
+    {"id":"trigger-15","title":"模型上线缺少回退门槛","evidence":"客服分类模型的新版本离线准确率提升 2%，但线上误杀率、流量比例和回退阈值还没定。","gap":"确认模型灰度指标、误杀率和回退阈值","anchor_terms":["准确率","误杀率"],"expected_focus_terms":["灰度","误杀","回退"]},
+    {"id":"trigger-16","title":"批处理补偿缺少幂等键","evidence":"退款补偿任务失败后会自动重试三次，目前没有说明重复执行如何去重，也没有人工接管入口。","gap":"确认补偿重试的幂等策略和人工接管","anchor_terms":["退款补偿","重试三次"],"expected_focus_terms":["幂等","去重","人工"]},
+    {"id":"trigger-17","title":"日志改造缺少成本上限","evidence":"网关准备把 debug 日志保留七天用于排障，但没有估算每天写入量、脱敏规则和存储成本上限。","gap":"确认日志量、脱敏和成本上限","anchor_terms":["debug 日志","七天"],"expected_focus_terms":["写入量","脱敏","成本"]},
+    {"id":"trigger-18","title":"跨团队依赖没有承诺时间","evidence":"移动端登录改造依赖 identity-team 提供新 SDK，当前只有接口草案，没有交付日期和兼容版本。","gap":"确认依赖团队的交付日期、版本和联调 owner","anchor_terms":["identity-team","SDK"],"expected_focus_terms":["日期","版本","联调"]},
+    {"id":"trigger-19","title":"故障根因仍是猜测","evidence":"库存扣减偶发超卖，大家怀疑是锁续期失败，但还没有 trace、复现步骤或能够证伪的实验。","gap":"确认根因假设的证据、复现和验证实验","anchor_terms":["超卖","锁续期"],"expected_focus_terms":["证据","复现","实验"]},
+    {"id":"trigger-20","title":"上线决策缺少 Go No-Go 条件","evidence":"团队倾向于今晚发布 inventory-service，但当前还有两个 P1 缺陷，会议没有明确谁做最终 Go/No-Go 决策。","gap":"确认发布阻断条件、决策人和延期方案","anchor_terms":["inventory-service","P1"],"expected_focus_terms":["阻断","决策","延期"]}
+  ]
+}

@@ -15,18 +15,22 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install deps
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.28"
+          enable-cache: true
+          cache-dependency-glob: code/web_mvp/backend/uv.lock
+      - name: Sync locked backend environment
+        working-directory: code/web_mvp/backend
         run: |
-          python -m pip install --upgrade pip
-          pip install fastapi uvicorn "pydantic>=2" httpx python-dotenv structlog pytest httpx
+          uv lock --check
+          uv sync --frozen --group dev
       - name: web_mvp tests
-        run: |
-          cd code/web_mvp/backend
-          pytest -q
+        working-directory: code/web_mvp/backend
+        run: uv run --frozen pytest -q
       - name: core tests
-        run: |
-          cd code/core
-          pytest -q
+        working-directory: code/web_mvp/backend
+        run: uv run --frozen pytest -q ../../core
 
   mainline-tests:
     name: Mainline + workbench + approach tests
@@ -36,13 +40,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: |
-          python -m pip install --upgrade pip
-          pip install fastapi uvicorn "pydantic>=2" httpx python-dotenv structlog pytest
-      - name: mainline + frontend + approach + stream + llm tests
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.28"
+          enable-cache: true
+          cache-dependency-glob: code/web_mvp/backend/uv.lock
+      - name: Sync locked backend environment
+        working-directory: code/web_mvp/backend
         run: |
-          cd code/web_mvp/backend
-          pytest tests/test_e2e_mainline.py tests/test_workbench.py tests/test_approach_cards.py tests/test_asr_stream.py tests/test_llm_service.py -q
+          uv lock --check
+          uv sync --frozen --group dev
+      - name: mainline + frontend + approach + stream + llm tests
+        working-directory: code/web_mvp/backend
+        run: uv run --frozen pytest tests/test_e2e_mainline.py tests/test_workbench.py tests/test_approach_cards.py tests/test_asr_stream.py tests/test_llm_service.py -q
 
   lint:
     name: Ruff lint
@@ -52,8 +62,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install ruff
-      - run: ruff check code/web_mvp/backend/meeting_copilot_web_mvp/
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.28"
+          enable-cache: true
+          cache-dependency-glob: code/web_mvp/backend/uv.lock
+      - name: Sync locked backend environment
+        working-directory: code/web_mvp/backend
+        run: |
+          uv lock --check
+          uv sync --frozen --group dev
+      - name: Ruff lint
+        working-directory: code/web_mvp/backend
+        run: uv run --frozen ruff check meeting_copilot_web_mvp/
 
   workbench-smoke:
     name: Workbench UI smoke (Chrome)
@@ -63,12 +84,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: |
-          python -m pip install --upgrade pip
-          pip install fastapi "uvicorn[standard]" "pydantic>=2" httpx python-dotenv structlog websockets
-      - run: |
-          cd code/web_mvp/backend
-          node ../../e2e/workbench_smoke.mjs
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.28"
+          enable-cache: true
+          cache-dependency-glob: code/web_mvp/backend/uv.lock
+      - name: Sync locked backend environment
+        working-directory: code/web_mvp/backend
+        run: |
+          uv lock --check
+          uv sync --frozen --group dev
+      - name: Run browser smoke with locked backend
+        working-directory: code/web_mvp/backend
+        run: uv run --frozen node ../../e2e/workbench_smoke.mjs
 
   rust-check:
     name: Tauri desktop cargo check
@@ -77,4 +105,4 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: cargo check
-        run: cargo check --manifest-path code/desktop_tauri/src-tauri/Cargo.toml
+        run: cargo check --locked --manifest-path code/desktop_tauri/src-tauri/Cargo.toml

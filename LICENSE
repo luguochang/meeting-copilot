@@ -1,0 +1,16 @@
+Meeting Copilot Internal Evaluation License
+
+Copyright (c) 2026 Meeting Copilot project contributors.
+
+Permission is granted to use, copy, and modify the first-party source code in
+this repository for personal development, testing, and internal evaluation.
+
+Redistribution, sublicensing, public hosting, commercial distribution, or
+inclusion of this first-party source code in another product is not permitted
+without prior written permission from the copyright holder.
+
+This permission does not grant rights to any third-party dependency, model
+weight, dataset, binary, font, icon, or other asset. Those materials remain
+subject to their own licenses and distribution terms, which are listed in
+NOTICE and the generated SBOM where known. The software is provided "as is",
+without warranty of any kind, express or implied.

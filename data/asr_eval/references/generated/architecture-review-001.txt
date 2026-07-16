@@ -1,0 +1,1 @@
+新的 recommendation-service 会依赖 feature-store 和 redis cluster。QPS 峰值按两万估，缓存穿透时可能会打到 mysql。降级方案先写在设计文档里，压测 owner 还没安排。

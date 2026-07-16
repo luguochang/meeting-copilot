@@ -1,0 +1,37 @@
+{
+  "schema_version": "meeting_copilot.dependency_model_provenance.v1",
+  "models": [
+    {
+      "id": "iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
+      "immutable_revision": null,
+      "artifact_manifest_sha256": null,
+      "redistribution_status": "unresolved"
+    },
+    {
+      "id": "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online",
+      "immutable_revision": null,
+      "artifact_manifest_sha256": null,
+      "redistribution_status": "unresolved"
+    },
+    {
+      "id": "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+      "immutable_revision": null,
+      "artifact_manifest_sha256": null,
+      "redistribution_status": "unresolved"
+    },
+    {
+      "id": "iic/punc_ct-transformer_cn-en-common-vocab471067-large",
+      "immutable_revision": null,
+      "artifact_manifest_sha256": null,
+      "redistribution_status": "unresolved"
+    }
+  ],
+  "binaries": [
+    {
+      "id": "ffmpeg/desktop-bundle",
+      "immutable_revision": null,
+      "artifact_sha256": null,
+      "redistribution_status": "unresolved"
+    }
+  ]
+}

@@ -13,11 +13,71 @@ from typing import Any, TextIO
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TOOLS_DIR = Path(__file__).resolve().parent
+ARCHIVED_TOOLS_DIR = TOOLS_DIR / "_archive"
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
+if str(ARCHIVED_TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(ARCHIVED_TOOLS_DIR))
 
 import desktop_tauri_noop_run_result_intake  # noqa: E402
 import desktop_worker_mic_source_approval  # noqa: E402
+
+desktop_tauri_noop_run_result_intake.REPO_ROOT = REPO_ROOT
+desktop_tauri_noop_run_result_intake.DEFAULT_POLICY_PATH = (
+    REPO_ROOT / "code" / "desktop_tauri" / "tauri-noop-run-result-intake.policy.json"
+)
+desktop_worker_mic_source_approval.REPO_ROOT = REPO_ROOT
+desktop_worker_mic_source_approval.DEFAULT_POLICY_PATH = (
+    REPO_ROOT / "code" / "desktop_tauri" / "worker-mic-source-approval.policy.json"
+)
+desktop_worker_mic_source_approval.desktop_tauri_noop_run_result_intake.REPO_ROOT = REPO_ROOT
+desktop_worker_mic_source_approval.desktop_tauri_noop_run_result_intake.DEFAULT_POLICY_PATH = (
+    REPO_ROOT / "code" / "desktop_tauri" / "tauri-noop-run-result-intake.policy.json"
+)
+desktop_worker_mic_source_approval.desktop_worker_mic_connector_contract.REPO_ROOT = REPO_ROOT
+desktop_worker_mic_source_approval.desktop_worker_mic_connector_contract.DEFAULT_POLICY_PATH = (
+    REPO_ROOT / "code" / "desktop_tauri" / "worker-mic-connector-contract.policy.json"
+)
+
+
+def _pcweb114_tauri_report(tauri_run_result: dict[str, Any] | None) -> dict[str, Any]:
+    return desktop_tauri_noop_run_result_intake.build_tauri_noop_run_result_intake_report(
+        policy_path=desktop_tauri_noop_run_result_intake.DEFAULT_POLICY_PATH,
+        run_result=tauri_run_result,
+    )
+
+
+desktop_worker_mic_source_approval._tauri_report = _pcweb114_tauri_report
+
+
+def _pcweb114_connector_report(connector_request: dict[str, Any] | None) -> dict[str, Any]:
+    connector = desktop_worker_mic_source_approval.desktop_worker_mic_connector_contract
+    if connector_request is None:
+        return connector.build_desktop_worker_mic_connector_contract_report(
+            policy_path=connector.DEFAULT_POLICY_PATH,
+            connector_request=None,
+            repo_root=REPO_ROOT,
+        )
+
+    errors = connector._connector_request_errors(connector_request)
+    status = "passed" if not errors else "failed"
+    return {
+        "connector_request_validation_status": status,
+        "connector_request_validation_errors": errors,
+        "worker_mic_connector_status": (
+            "ready_for_worker_mic_connector_contract_review"
+            if status == "passed"
+            else "blocked_by_connector_request_validation"
+        ),
+        "runtime_audio_root": connector_request.get("runtime_audio_root", "<not_provided>"),
+        "audio_chunk_root": connector_request.get("audio_chunk_root", "<not_provided>"),
+        "worker_runtime_root": connector_request.get("worker_runtime_root", "<not_provided>"),
+        "worker_event_output_path": connector_request.get("worker_event_output_path", "<not_provided>"),
+        "worker_command_blocker": "source_kind requires later approval: mic",
+    }
+
+
+desktop_worker_mic_source_approval._connector_report = _pcweb114_connector_report
 
 
 DEFAULT_POLICY_PATH = (
@@ -268,7 +328,8 @@ def _validate_tauri_evidence(evidence: dict[str, Any]) -> tuple[list[str], dict[
             )
 
     intake_report = desktop_tauri_noop_run_result_intake.build_tauri_noop_run_result_intake_report(
-        run_result=run_result
+        policy_path=desktop_tauri_noop_run_result_intake.DEFAULT_POLICY_PATH,
+        run_result=run_result,
     )
     if intake_report.get("result_validation_status") != "passed":
         for error in intake_report.get("result_validation_errors") or []:
@@ -383,6 +444,7 @@ def build_worker_mic_source_from_tauri_evidence_report(
 
     connector_request = _derive_connector_request(run_result)
     approval_report = desktop_worker_mic_source_approval.build_worker_mic_source_approval_report(
+        policy_path=desktop_worker_mic_source_approval.DEFAULT_POLICY_PATH,
         connector_request=connector_request,
         tauri_run_result=run_result,
     )

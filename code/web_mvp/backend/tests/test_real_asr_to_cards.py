@@ -7,7 +7,6 @@ on mock sessions). Uses a fake recognizer + fake LLM but the REAL connection pat
 """
 import json
 
-import pytest
 from fastapi.testclient import TestClient
 
 from meeting_copilot_web_mvp import asr_stream, llm_service
@@ -16,6 +15,12 @@ from meeting_copilot_web_mvp.app import create_app
 
 class _EngineeringFakeRecognizer:
     """Fake recognizer whose final text triggers state/candidate detection."""
+    provider = "test_contract_real_asr"
+    provider_mode = "real"
+    is_mock = False
+    fallback_used = False
+    degradation_reasons = []
+
     def __init__(self, session_id):
         self._seq = 0
 

@@ -1,0 +1,74 @@
+{
+  "schema_version": "asr_semantic_quality_dataset.v1",
+  "language": "zh-CN",
+  "domain": "technical_meeting",
+  "required_entity_groups": {
+    "release_control": ["接口", "API", "灰度", "回滚", "发布", "上线", "变更"],
+    "reliability": ["错误率", "SLO", "P99", "延迟", "告警", "监控", "看板", "超时"],
+    "ownership": ["owner", "负责人", "张三", "李四", "王五", "谁负责"],
+    "deadline": ["deadline", "今天", "明天", "周三", "下午", "下周"],
+    "action": ["确认", "补充", "修复", "测试", "回归", "处理", "评估", "排查"]
+  },
+  "samples": [
+    {
+      "id": "tech_release_gray_rollback",
+      "text": "接口先灰度 5%，如果错误率超过 0.1% 就回滚，owner 张三今天补 SLO 和 P99 看板。",
+      "expected_status": "passed",
+      "expected_keywords": ["接口", "灰度", "错误率", "回滚", "owner", "张三", "SLO", "P99"]
+    },
+    {
+      "id": "tech_latency_incident",
+      "text": "P99 延迟超过阈值后先暂停发布，李四明天给回滚预案。",
+      "expected_status": "passed",
+      "expected_keywords": ["P99", "延迟", "发布", "李四", "明天", "回滚"]
+    },
+    {
+      "id": "tech_monitoring_owner",
+      "text": "这次 API 变更要补监控告警，负责人王五周三前确认回归测试。",
+      "expected_status": "passed",
+      "expected_keywords": ["API", "变更", "监控", "告警", "负责人", "王五", "周三", "回归", "测试"]
+    },
+    {
+      "id": "tech_slo_dashboard",
+      "text": "上线前先确认 SLO 看板，如果超时告警触发就暂停灰度。",
+      "expected_status": "passed",
+      "expected_keywords": ["上线", "确认", "SLO", "看板", "超时", "告警", "灰度"]
+    },
+    {
+      "id": "tech_short_incident",
+      "text": "P99 超了，先回滚。",
+      "expected_status": "passed",
+      "expected_keywords": ["P99", "回滚"]
+    },
+    {
+      "id": "tech_deadline_owner",
+      "text": "谁负责修复支付接口的错误率问题，deadline 是明天下午。",
+      "expected_status": "passed",
+      "expected_keywords": ["谁负责", "修复", "接口", "错误率", "deadline", "明天", "下午"]
+    },
+    {
+      "id": "negative_gibberish_fillers",
+      "text": "啊嗯这个那个然后就是可以吧可以吧一二三四五六七八。",
+      "expected_status": "blocked",
+      "expected_keywords": []
+    },
+    {
+      "id": "negative_daily_life",
+      "text": "今天天气不错，我们吃饭聊天，然后大家都很开心，下午去散步。",
+      "expected_status": "blocked",
+      "expected_keywords": []
+    },
+    {
+      "id": "negative_generic_meeting",
+      "text": "大家先讨论一下这个事情，后面再看看怎么安排，问题不大。",
+      "expected_status": "blocked",
+      "expected_keywords": []
+    },
+    {
+      "id": "negative_numbers_only",
+      "text": "一二三四五六七八九十，百分之一百分之二，重复重复重复。",
+      "expected_status": "blocked",
+      "expected_keywords": []
+    }
+  ]
+}

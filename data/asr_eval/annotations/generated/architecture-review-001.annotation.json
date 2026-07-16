@@ -1,0 +1,29 @@
+{
+  "technical_entities": [
+    {
+      "normalized": "recommendation-service",
+      "text": "recommendation-service",
+      "type": "service"
+    },
+    {
+      "normalized": "feature-store",
+      "text": "feature-store",
+      "type": "service"
+    },
+    {
+      "normalized": "redis cluster",
+      "text": "redis cluster",
+      "type": "component"
+    },
+    {
+      "normalized": "QPS",
+      "text": "QPS",
+      "type": "metric"
+    },
+    {
+      "normalized": "mysql",
+      "text": "mysql",
+      "type": "database"
+    }
+  ]
+}

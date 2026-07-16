@@ -1,0 +1,158 @@
+{
+  "schema_version": "asr_mainline_quality_batch_matrix.v1",
+  "description": "Aligned synthetic technical-meeting ASR quality matrix with local Provider variants. This matrix compares baseline FunASR streaming events, Sherpa streaming events, and existing FunASR batch/hotword chunk artifacts without remote ASR or LLM calls.",
+  "samples": [
+    {
+      "sample_id": "api-review-001",
+      "source_script_path": "data/asr_eval/synthetic_meetings/scripts/api-review.json",
+      "reference_path": "data/asr_eval/references/generated/api-review-001.txt",
+      "annotation_path": "data/asr_eval/annotations/generated/api-review-001.annotation.json",
+      "providers": [
+        {
+          "provider": "funasr_streaming",
+          "file_slug": "funasr",
+          "events_path": "artifacts/tmp/asr_events/api-review-001.funasr.events.json",
+          "transcript_report_path": "artifacts/tmp/asr_reports/api-review-001.funasr.transcript-report.json"
+        },
+        {
+          "provider": "funasr_batch_chunk10_hotword",
+          "file_slug": "funasr_batch_chunk10_hotword",
+          "events_path": "artifacts/tmp/asr_events/batch-runtime-chunk10_hotword/api-review-001.funasr.batch-events.json",
+          "transcript_report_path": "artifacts/tmp/asr_reports/api-review-001.funasr.batch-chunk10_hotword.transcript-report.json"
+        },
+        {
+          "provider": "funasr_batch_chunk20",
+          "file_slug": "funasr_batch_chunk20",
+          "events_path": "artifacts/tmp/asr_events/batch-runtime-chunk20/api-review-001.funasr.batch-events.json",
+          "transcript_report_path": "artifacts/tmp/asr_reports/api-review-001.funasr.batch-chunk20.transcript-report.json"
+        },
+        {
+          "provider": "funasr_batch_chunk20_hotword",
+          "file_slug": "funasr_batch_chunk20_hotword",
+          "events_path": "artifacts/tmp/asr_events/batch-runtime-chunk20_hotword/api-review-001.funasr.batch-events.json",
+          "transcript_report_path": "artifacts/tmp/asr_reports/api-review-001.funasr.batch-chunk20_hotword.transcript-report.json"
+        },
+        {
+          "provider": "sherpa_onnx_streaming",
+          "file_slug": "sherpa",
+          "events_path": "artifacts/tmp/asr_events/api-review-001.sherpa.events.json",
+          "transcript_report_path": "artifacts/tmp/asr_reports/api-review-001.sherpa.transcript-report.json"
+        }
+      ]
+    },
+    {
+      "sample_id": "release-review-001",
+      "source_script_path": "data/asr_eval/synthetic_meetings/scripts/release-review.json",
+      "reference_path": "data/asr_eval/references/generated/release-review-001.txt",
+      "annotation_path": "data/asr_eval/annotations/generated/release-review-001.annotation.json",
+      "providers": [
+        {
+          "provider": "funasr_streaming",
+          "file_slug": "funasr",
+          "events_path": "artifacts/tmp/asr_events/release-review-001.funasr.events.json",
+          "transcript_report_path": "artifacts/tmp/asr_reports/release-review-001.funasr.transcript-report.json"
+        },
+        {
+          "provider": "funasr_batch_chunk10_hotword",
+          "file_slug": "funasr_batch_chunk10_hotword",
+          "events_path": "artifacts/tmp/asr_events/batch-runtime-chunk10_hotword/release-review-001.funasr.batch-events.json",
+          "transcript_report_path": "artifacts/tmp/asr_reports/release-review-001.funasr.batch-chunk10_hotword.transcript-report.json"
+        },
+        {
+          "provider": "funasr_batch_chunk20",
+          "file_slug": "funasr_batch_chunk20",
+          "events_path": "artifacts/tmp/asr_events/batch-runtime-chunk20/release-review-001.funasr.batch-events.json",
+          "transcript_report_path": "artifacts/tmp/asr_reports/release-review-001.funasr.batch-chunk20.transcript-report.json"
+        },
+        {
+          "provider": "funasr_batch_chunk20_hotword",
+          "file_slug": "funasr_batch_chunk20_hotword",
+          "events_path": "artifacts/tmp/asr_events/batch-runtime-chunk20_hotword/release-review-001.funasr.batch-events.json",
+          "transcript_report_path": "artifacts/tmp/asr_reports/release-review-001.funasr.batch-chunk20_hotword.transcript-report.json"
+        },
+        {
+          "provider": "sherpa_onnx_streaming",
+          "file_slug": "sherpa",
+          "events_path": "artifacts/tmp/asr_events/release-review-001.sherpa.events.json",
+          "transcript_report_path": "artifacts/tmp/asr_reports/release-review-001.sherpa.transcript-report.json"
+        }
+      ]
+    },
+    {
+      "sample_id": "incident-review-001",
+      "source_script_path": "data/asr_eval/synthetic_meetings/scripts/incident-review.json",
+      "reference_path": "data/asr_eval/references/generated/incident-review-001.txt",
+      "annotation_path": "data/asr_eval/annotations/generated/incident-review-001.annotation.json",
+      "providers": [
+        {
+          "provider": "funasr_streaming",
+          "file_slug": "funasr",
+          "events_path": "artifacts/tmp/asr_events/incident-review-001.funasr.events.json",
+          "transcript_report_path": "artifacts/tmp/asr_reports/incident-review-001.funasr.transcript-report.json"
+        },
+        {
+          "provider": "funasr_batch_chunk10_hotword",
+          "file_slug": "funasr_batch_chunk10_hotword",
+          "events_path": "artifacts/tmp/asr_events/batch-runtime-chunk10_hotword/incident-review-001.funasr.batch-events.json",
+          "transcript_report_path": "artifacts/tmp/asr_reports/incident-review-001.funasr.batch-chunk10_hotword.transcript-report.json"
+        },
+        {
+          "provider": "funasr_batch_chunk20",
+          "file_slug": "funasr_batch_chunk20",
+          "events_path": "artifacts/tmp/asr_events/batch-runtime-chunk20/incident-review-001.funasr.batch-events.json",
+          "transcript_report_path": "artifacts/tmp/asr_reports/incident-review-001.funasr.batch-chunk20.transcript-report.json"
+        },
+        {
+          "provider": "funasr_batch_chunk20_hotword",
+          "file_slug": "funasr_batch_chunk20_hotword",
+          "events_path": "artifacts/tmp/asr_events/batch-runtime-chunk20_hotword/incident-review-001.funasr.batch-events.json",
+          "transcript_report_path": "artifacts/tmp/asr_reports/incident-review-001.funasr.batch-chunk20_hotword.transcript-report.json"
+        },
+        {
+          "provider": "sherpa_onnx_streaming",
+          "file_slug": "sherpa",
+          "events_path": "artifacts/tmp/asr_events/incident-review-001.sherpa.events.json",
+          "transcript_report_path": "artifacts/tmp/asr_reports/incident-review-001.sherpa.transcript-report.json"
+        }
+      ]
+    },
+    {
+      "sample_id": "architecture-review-001",
+      "source_script_path": "data/asr_eval/synthetic_meetings/scripts/architecture-review.json",
+      "reference_path": "data/asr_eval/references/generated/architecture-review-001.txt",
+      "annotation_path": "data/asr_eval/annotations/generated/architecture-review-001.annotation.json",
+      "providers": [
+        {
+          "provider": "funasr_streaming",
+          "file_slug": "funasr",
+          "events_path": "artifacts/tmp/asr_events/architecture-review-001.funasr.events.json",
+          "transcript_report_path": "artifacts/tmp/asr_reports/architecture-review-001.funasr.transcript-report.json"
+        },
+        {
+          "provider": "funasr_batch_chunk10_hotword",
+          "file_slug": "funasr_batch_chunk10_hotword",
+          "events_path": "artifacts/tmp/asr_events/batch-runtime-chunk10_hotword/architecture-review-001.funasr.batch-events.json",
+          "transcript_report_path": "artifacts/tmp/asr_reports/architecture-review-001.funasr.batch-chunk10_hotword.transcript-report.json"
+        },
+        {
+          "provider": "funasr_batch_chunk20",
+          "file_slug": "funasr_batch_chunk20",
+          "events_path": "artifacts/tmp/asr_events/batch-runtime-chunk20/architecture-review-001.funasr.batch-events.json",
+          "transcript_report_path": "artifacts/tmp/asr_reports/architecture-review-001.funasr.batch-chunk20.transcript-report.json"
+        },
+        {
+          "provider": "funasr_batch_chunk20_hotword",
+          "file_slug": "funasr_batch_chunk20_hotword",
+          "events_path": "artifacts/tmp/asr_events/batch-runtime-chunk20_hotword/architecture-review-001.funasr.batch-events.json",
+          "transcript_report_path": "artifacts/tmp/asr_reports/architecture-review-001.funasr.batch-chunk20_hotword.transcript-report.json"
+        },
+        {
+          "provider": "sherpa_onnx_streaming",
+          "file_slug": "sherpa",
+          "events_path": "artifacts/tmp/asr_events/architecture-review-001.sherpa.events.json",
+          "transcript_report_path": "artifacts/tmp/asr_reports/architecture-review-001.sherpa.transcript-report.json"
+        }
+      ]
+    }
+  ]
+}

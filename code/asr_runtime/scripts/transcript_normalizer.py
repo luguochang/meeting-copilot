@@ -201,6 +201,42 @@ def _normalize_observed_technical_near_misses(text: str) -> tuple[str, list[dict
     if count:
         changes.append({"alias": "p/pp + P99", "canonical": "P99"})
 
+    normalized, count = re.subn(
+        r"(?<![A-Za-z0-9._/-])check\s*out\s*service(?=[\s\u4e00-\u9fff]*(?:周五|灰度|指标|P99|p99|error))",
+        "checkout-service",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if count:
+        changes.append({"alias": "check outservice + release context", "canonical": "checkout-service"})
+
+    normalized, metric_rate_changes = _normalize_release_metric_rate_near_miss(normalized)
+    changes.extend(metric_rate_changes)
+
+    return normalized, changes
+
+
+def _normalize_release_metric_rate_near_miss(text: str) -> tuple[str, list[dict[str, str]]]:
+    changes: list[dict[str, str]] = []
+
+    def replace(match: re.Match[str]) -> str:
+        start, end = match.span()
+        context = text[max(0, start - 28) : min(len(text), end + 18)]
+        if re.search(r"(先看|指标|灰度|checkout-service)", context, flags=re.IGNORECASE) and re.search(
+            r"(P99|p99|指标|异常|和)",
+            context,
+            flags=re.IGNORECASE,
+        ):
+            changes.append({"alias": match.group(0), "canonical": "error_rate"})
+            return "error_rate"
+        return match.group(0)
+
+    normalized = re.sub(
+        r"(?<![A-Za-z0-9._/-])error\s+r\s*(?:ate|rate)(?![A-Za-z0-9._/-])",
+        replace,
+        text,
+        flags=re.IGNORECASE,
+    )
     return normalized, changes
 
 

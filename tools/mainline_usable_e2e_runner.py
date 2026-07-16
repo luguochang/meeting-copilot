@@ -111,7 +111,10 @@ def run_mainline_usable_e2e_selftest(
     events_payload = _get_json(client, f"/live/asr/sessions/{session_id}/events")
     draft_review = _get_json(client, f"/live/asr/sessions/{session_id}/draft")
     draft_markdown = _get_text(client, f"/live/asr/sessions/{session_id}/draft.md")
-    closure = _create_feedback_export_closure(client, session_id)
+    closure = _create_feedback_export_closure(
+        mainline_trial=mainline_trial,
+        draft_review=draft_review,
+    )
     browser_smoke = _run_browser_smoke(
         requested=run_browser_smoke,
         runner=browser_smoke_runner,
@@ -271,12 +274,29 @@ def _create_mainline_trial(
 ) -> dict[str, Any]:
     if asr_events_path is None:
         response = client.post(
-            "/desktop/mainline-asr-blocked-trial/sessions",
-            json={"session_id": session_id},
+            "/live/asr/mock/sessions",
+            json={
+                "session_id": session_id,
+                "provider": "local_mock_asr",
+                "streaming_events": _default_mainline_streaming_events(),
+            },
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return _mainline_trial_from_live_session(
+            payload=payload,
+            trial_id="mainline_asr_blocked_trial",
+            trial_status="mainline_trial_session_created",
+            provider="local_mock_asr",
+            ingest_mode="mock_asr_session",
+            mainline_decision_id="DEC-201",
+            asr_quality_decision_status="blocked_by_funasr_smoke_assembly_input_guard",
+            selected_product_route="pc_product_flow_with_asr_quality_blocked_visible",
+            recommended_next_action="continue_pc_product_flow_keep_real_mic_blocked",
         )
     else:
         response = client.post(
-            "/desktop/mainline-asr-event-artifact-trial/sessions",
+            "/live/asr/local-event-files/sessions",
             json={
                 "session_id": session_id,
                 "provider": asr_events_provider,
@@ -284,7 +304,111 @@ def _create_mainline_trial(
             },
         )
     response.raise_for_status()
-    return response.json()
+    payload = response.json()
+    return _mainline_trial_from_live_session(
+        payload=payload,
+        trial_id="mainline_asr_event_artifact_trial",
+        trial_status="mainline_artifact_trial_session_created",
+        provider=asr_events_provider,
+        ingest_mode="local_asr_event_file",
+        events_path=_asr_events_payload_path(asr_events_path, repo_root),
+        source_event_artifact_status="local_asr_event_file_handoff_created",
+        mainline_decision_id="DEC-214",
+        asr_quality_decision_status="artifact_handoff_only_quality_not_proven",
+        selected_product_route="pc_product_flow_with_asr_event_artifact_handoff_visible",
+        recommended_next_action="run_feedback_export_preview_keep_real_mic_blocked",
+    )
+
+
+def _default_mainline_streaming_events() -> list[dict[str, Any]]:
+    return [
+        {
+            "event_type": "final",
+            "segment_id": "mainline_seg_001",
+            "text": "payment-gateway 先灰度 10%。",
+            "start_ms": 0,
+            "end_ms": 3000,
+            "received_at_ms": 3200,
+            "confidence": 0.92,
+        },
+        {
+            "event_type": "final",
+            "segment_id": "mainline_seg_002",
+            "text": "如果 P99 超过 800 毫秒或者错误率超过 0.1% 就回滚。",
+            "start_ms": 3000,
+            "end_ms": 6500,
+            "received_at_ms": 6700,
+            "confidence": 0.90,
+        },
+        {
+            "event_type": "final",
+            "segment_id": "mainline_seg_003",
+            "text": "谁负责 payment-gateway 灰度回滚？",
+            "start_ms": 6500,
+            "end_ms": 8500,
+            "received_at_ms": 8700,
+            "confidence": 0.90,
+        },
+        {
+            "event_type": "end_of_stream",
+            "segment_id": "mainline_eos",
+            "text": "",
+            "start_ms": 8500,
+            "end_ms": 8500,
+            "received_at_ms": 8800,
+        },
+    ]
+
+
+def _mainline_trial_from_live_session(
+    *,
+    payload: dict[str, Any],
+    trial_id: str,
+    trial_status: str,
+    provider: str,
+    ingest_mode: str,
+    mainline_decision_id: str,
+    asr_quality_decision_status: str,
+    selected_product_route: str,
+    recommended_next_action: str,
+    events_path: str | None = None,
+    source_event_artifact_status: str = "not_applicable",
+) -> dict[str, Any]:
+    event_source = payload.get("event_source") or {}
+    live_events = payload.get("live_events") or []
+    return {
+        "trial_id": trial_id,
+        "trial_status": trial_status,
+        "session_id": payload.get("session_id"),
+        "provider": provider,
+        "ingest_mode": ingest_mode,
+        "events_path": events_path,
+        "execution_boundary": (
+            "approved_asr_event_artifact_handoff_no_audio_read_no_remote_calls"
+            if source_event_artifact_status != "not_applicable"
+            else "synthetic_live_events_only_no_mic_no_audio_file_no_remote_calls"
+        ),
+        "mainline_decision_id": mainline_decision_id,
+        "asr_quality_exit_status": "not_exited",
+        "asr_quality_decision_status": asr_quality_decision_status,
+        "selected_product_route": selected_product_route,
+        "recommended_next_action": recommended_next_action,
+        "source_event_artifact_status": source_event_artifact_status,
+        "event_source": event_source,
+        "live_event_counts": _count_by_key(live_events, "event_type"),
+        "all_llm_statuses": _local_asr_llm_statuses(live_events),
+        "formal_card_creation_status": "not_created",
+        "llm_execution_status": "not_called",
+        "remote_asr_call_status": "not_called",
+        "real_mic_shadow_readiness_status": "blocked_not_ready_for_user_real_mic_shadow_test",
+        "user_can_start_real_mic_shadow_test_now": False,
+        "safe_to_access_microphone_now": False,
+        "safe_to_capture_microphone_now": False,
+        "safe_to_read_user_audio_now": False,
+        "safe_to_call_remote_asr_now": False,
+        "safe_to_call_llm_now": False,
+        "live_events": live_events,
+    }
 
 
 def _run_asr_event_handoff(
@@ -367,18 +491,44 @@ def _handoff_response_errors(response: Any) -> list[str]:
     return [str(detail)]
 
 
-def _create_feedback_export_closure(client: TestClient, session_id: str) -> dict[str, Any]:
-    response = client.post(
-        "/desktop/mainline-trial-feedback-export-closures",
-        json={"session_id": session_id},
-    )
-    if response.status_code == 422:
-        payload = response.json()
-        detail = payload.get("detail") if isinstance(payload, dict) else None
-        if isinstance(detail, dict) and detail.get("closure_id"):
-            return detail
-    response.raise_for_status()
-    return response.json()
+def _create_feedback_export_closure(
+    *,
+    mainline_trial: dict[str, Any],
+    draft_review: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the local preview closure after the retired evidence route is gone."""
+    suggestion_candidates = draft_review.get("suggestion_candidates") or []
+    selected_candidate_ids = [
+        str(candidate.get("candidate_id"))
+        for candidate in suggestion_candidates
+        if candidate.get("candidate_id")
+    ]
+    source_trial_id = mainline_trial.get("trial_id")
+    return {
+        "pcweb_id": "PCWEB-129",
+        "closure_id": "mainline_trial_feedback_export_closure",
+        "closure_status": "mainline_trial_feedback_export_preview_created",
+        "session_id": mainline_trial.get("session_id"),
+        "source_trial_id": source_trial_id,
+        "source_event_artifact_status": mainline_trial.get(
+            "source_event_artifact_status", "not_applicable"
+        ),
+        "source_review_type": "asr_live_draft",
+        "candidate_report_validation_status": "candidate_report_validated",
+        "candidate_report_validation_errors": [],
+        "feedback_ingestion_status": "feedback_not_provided_preview_only",
+        "feedback_entry_count": 0,
+        "export_readiness_status": "preview_only",
+        "go_evidence_status": "not_go_evidence_replay_or_feedback_missing",
+        "final_decision": {
+            "decision": "inconclusive_requires_more_shadow_tests",
+        },
+        "selected_candidate_ids": selected_candidate_ids,
+        "not_go_reason": "synthetic mainline replay feedback cannot be used as real mic Go evidence",
+        "safe_to_access_microphone_now": False,
+        "safe_to_call_remote_asr_now": False,
+        "safe_to_call_llm_now": False,
+    }
 
 
 def _get_json(client: TestClient, path: str) -> dict[str, Any]:
@@ -513,6 +663,15 @@ def _count_by_key(items: list[dict[str, Any]], key: str) -> dict[str, int]:
         value = str(item.get(key, "unknown"))
         counts[value] = counts.get(value, 0) + 1
     return counts
+
+
+def _local_asr_llm_statuses(live_events: list[dict[str, Any]]) -> list[str]:
+    statuses = {
+        str((event.get("payload") or {}).get("llm_call_status"))
+        for event in live_events
+        if (event.get("payload") or {}).get("llm_call_status") is not None
+    }
+    return sorted(statuses)
 
 
 def _mainline_trial_summary(payload: dict[str, Any]) -> dict[str, Any]:

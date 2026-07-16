@@ -3,16 +3,16 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Meeting Copilot Workbench</title>
+<title>会议助手</title>
 <style>
 :root{
-  --bg-deep:#0B0F1A;--bg-base:#0F172A;--bg-elevated:#11182C;--bg-overlay:#161F36;
-  --fg-primary:#F1F5F9;--fg-secondary:#94A3B8;--fg-muted:#64748B;
-  --accent:#6366F1;--accent-glow:rgba(99,102,241,.18);--primary:#D97706;
-  --ok:#22C55E;--warn:#F59E0B;--risk:#EF4444;--info:#38BDF8;--approach:#a78bfa;
+  --bg-deep:#101213;--bg-base:#151819;--bg-elevated:#1B2021;--bg-overlay:#222829;
+  --fg-primary:#F4F7F5;--fg-secondary:#A9B3AF;--fg-muted:#78837F;
+  --accent:#14B8A6;--accent-glow:rgba(20,184,166,.16);--primary:#F59E0B;
+  --ok:#22C55E;--warn:#F59E0B;--risk:#EF4444;--info:#38BDF8;--approach:#C084FC;
   --border:rgba(255,255,255,.08);--border-strong:rgba(255,255,255,.14);
   --sp-1:4px;--sp-2:8px;--sp-3:12px;--sp-4:16px;--sp-5:24px;--sp-6:32px;
-  --r-sm:6px;--r-md:10px;--r-lg:14px;--shadow-card:0 8px 24px rgba(0,0,0,.4);
+  --r-sm:6px;--r-md:8px;--r-lg:8px;--shadow-card:0 8px 24px rgba(0,0,0,.34);
   --font-sans:"Lexend",-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
   --font-mono:"Fira Code",ui-monospace,Menlo,monospace;
   --ease:cubic-bezier(.16,1,.3,1);--t-fast:150ms;--t-base:220ms;
@@ -22,98 +22,493 @@
 body{font-family:var(--font-sans);background:var(--bg-deep);color:var(--fg-primary);font-size:14px;line-height:1.55;-webkit-font-smoothing:antialiased}
 button{font-family:inherit;cursor:pointer;border:none;background:none;color:inherit}
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:var(--r-sm)}
-.app{display:grid;grid-template-rows:56px 1fr 36px;grid-template-columns:248px 1fr 320px;grid-template-areas:"topbar topbar topbar" "left center right" "status status status";height:100vh;gap:1px;background:var(--border)}
+.app{display:grid;grid-template-rows:auto 1fr 36px;grid-template-columns:minmax(0,1.9fr) minmax(320px,1fr);grid-template-areas:"topbar topbar" "center right" "status status";height:100vh;gap:1px;background:var(--border)}
 .app>*{background:var(--bg-base)}
-.topbar{grid-area:topbar;display:flex;align-items:center;gap:var(--sp-5);padding:0 var(--sp-5)}
-.brand{display:flex;align-items:center;gap:var(--sp-3)}
-.brand-mark{width:28px;height:28px;border-radius:8px;background:linear-gradient(135deg,var(--accent),var(--primary));display:grid;place-items:center;color:#fff;font-weight:700}
+.topbar{grid-area:topbar;display:grid;grid-template-columns:auto minmax(0,1fr) auto;grid-template-areas:"brand meta actions" "strip strip strip";align-items:center;gap:var(--sp-2) var(--sp-5);padding:var(--sp-3) var(--sp-5)}
+.brand{grid-area:brand;display:flex;align-items:center;gap:var(--sp-3)}
+.brand-mark{width:28px;height:28px;border-radius:8px;background:var(--accent);display:grid;place-items:center;color:#06211d;font-weight:700}
 .brand-name{font-weight:600}
-.session-meta{display:flex;align-items:center;gap:var(--sp-3);color:var(--fg-secondary);font-size:13px}
+.session-meta{grid-area:meta;display:flex;align-items:center;gap:var(--sp-3);color:var(--fg-secondary);font-size:13px;min-width:0}
+#session-meta{min-width:0;overflow-wrap:anywhere}
+.live-status-field{display:inline-flex;align-items:center;gap:5px;white-space:nowrap;color:var(--fg-muted);font-size:12px}
+.live-status-field .value{font-family:var(--font-mono);color:var(--fg-primary)}
+.mic-device-control{display:inline-flex;align-items:center;max-width:220px}
+.mic-device-control select{height:26px;max-width:220px;padding:0 24px 0 8px;border:1px solid var(--border);border-radius:var(--r-sm);background:var(--bg-elevated);color:var(--fg-secondary);font:inherit;font-size:11px;overflow:hidden;text-overflow:ellipsis}
+.mic-device-control select:disabled{opacity:.55;cursor:not-allowed}
+#mic-level-meter{width:58px;height:10px;vertical-align:middle;accent-color:var(--accent)}
 .spacer{flex:1}
-.actions{display:flex;gap:var(--sp-2)}
-.btn{height:34px;padding:0 var(--sp-4);border-radius:var(--r-sm);font-size:13px;font-weight:500;display:inline-flex;align-items:center;gap:6px;border:1px solid var(--border);color:var(--fg-primary);transition:background var(--t-fast) var(--ease),border-color var(--t-fast) var(--ease)}
-.btn:hover{background:var(--bg-overlay);border-color:var(--border-strong)}
-.btn-primary{background:var(--accent);border-color:var(--accent);color:#fff}
-.btn-primary:hover{background:#5457e6}
-.left{grid-area:left;overflow-y:auto;padding:var(--sp-4)}
+.actions{grid-area:actions;display:flex;gap:var(--sp-2)}
+.actions .btn{white-space:nowrap}
+.stack-actions{display:grid;gap:var(--sp-2)}
+.stack-actions .btn{width:100%;justify-content:center}
+	.btn{height:34px;padding:0 var(--sp-4);border-radius:var(--r-sm);font-size:13px;font-weight:500;display:inline-flex;align-items:center;gap:6px;border:1px solid var(--border);color:var(--fg-primary);transition:background var(--t-fast) var(--ease),border-color var(--t-fast) var(--ease)}
+	.btn[hidden]{display:none!important}
+	.btn:hover{background:var(--bg-overlay);border-color:var(--border-strong)}
+	.btn:disabled,.btn[aria-disabled="true"]{cursor:not-allowed;opacity:.46;background:rgba(100,116,139,.08);border-color:var(--border);color:var(--fg-muted)}
+	.btn:disabled:hover,.btn[aria-disabled="true"]:hover{background:rgba(100,116,139,.08);border-color:var(--border)}
+	.btn-primary{background:var(--accent);border-color:var(--accent);color:#fff}
+	.btn-primary:hover{background:#0F9F90}
+	.btn-primary:disabled{background:rgba(20,184,166,.18);border-color:rgba(20,184,166,.26);color:var(--fg-muted)}
+	.btn-danger{border-color:rgba(239,68,68,.38);color:#FCA5A5}
+.btn-danger:hover{background:rgba(239,68,68,.12)}
+.meeting-status-strip{grid-area:strip;display:grid;grid-template-columns:auto repeat(6,minmax(88px,1fr));gap:var(--sp-2);align-items:center;padding-top:var(--sp-2);border-top:1px solid var(--border)}
+.status-chip{min-width:0;min-height:32px;display:flex;align-items:center;justify-content:space-between;gap:var(--sp-2);padding:5px 9px;border:1px solid transparent;border-radius:var(--r-sm);color:var(--fg-secondary);font-size:12px;text-align:left}
+.status-chip:hover{background:var(--bg-overlay);border-color:var(--border)}
+.status-chip .count{font-family:var(--font-mono);font-size:10px;color:var(--fg-primary);white-space:nowrap}
 .panel-title{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--fg-muted);margin:var(--sp-4) 0 var(--sp-3)}
 .panel-title:first-child{margin-top:var(--sp-1)}
-.state-row{display:flex;align-items:center;gap:var(--sp-3);padding:var(--sp-2) var(--sp-3);border-radius:var(--r-sm);font-size:13px}
-.state-row .name{flex:1}
+	.panel-title.with-stage{display:flex;align-items:center;justify-content:space-between;gap:var(--sp-2)}
+	.cockpit-stage{display:inline-flex;align-items:center;min-height:20px;padding:2px 7px;border-radius:999px;border:1px solid var(--border-strong);font-size:11px;font-weight:650;letter-spacing:0;color:var(--fg-secondary);background:rgba(100,116,139,.12)}
+.cockpit-stage[data-state="recording"]{color:var(--risk);background:rgba(239,68,68,.12)}
+.cockpit-stage[data-state="processing"]{color:var(--warn);background:rgba(245,158,11,.12)}
+.cockpit-stage[data-state="recorded"]{color:var(--info);background:rgba(56,189,248,.12)}
+.cockpit-stage[data-state="reviewed"]{color:var(--ok);background:rgba(34,197,94,.12)}
+	.state-row{display:flex;align-items:center;gap:var(--sp-3);padding:var(--sp-2) var(--sp-3);border-radius:var(--r-sm);font-size:13px}
+	button.state-row{width:100%;text-align:left;transition:background var(--t-fast) var(--ease),border-color var(--t-fast) var(--ease);border:1px solid transparent}
+		button.state-row:hover{background:var(--bg-overlay);border-color:var(--border)}
+		button.state-row[aria-pressed="true"]{background:var(--accent-glow);border-color:rgba(20,184,166,.36);color:var(--fg-primary)}
+		button.state-row:disabled{cursor:not-allowed;opacity:.46;background:transparent;border-color:transparent}
+		button.state-row:disabled:hover{background:transparent;border-color:transparent}
+		.state-row .name{flex:1}
 .state-row .count{font-family:var(--font-mono);font-size:11px;font-weight:600;min-width:20px;text-align:center;padding:2px 6px;border-radius:10px;background:rgba(100,116,139,.14);color:var(--fg-muted)}
 .c-decision .count{background:rgba(34,197,94,.14);color:var(--ok)}
 .c-action .count{background:rgba(56,189,248,.14);color:var(--info)}
 .c-risk .count{background:rgba(239,68,68,.14);color:var(--risk)}
 .c-question .count{background:rgba(245,158,11,.14);color:var(--warn)}
-.center{grid-area:center;overflow-y:auto;padding:var(--sp-5) var(--sp-6)}
-.center h2{font-size:15px;font-weight:600;margin-bottom:var(--sp-4)}
-.utterance{display:grid;grid-template-columns:56px 1fr;gap:var(--sp-4);padding:var(--sp-2) 0;font-size:14.5px;line-height:1.75}
+.c-transcript .count{background:rgba(20,184,166,.14);color:var(--accent)}
+.c-cards .count{background:rgba(56,189,248,.14);color:var(--info)}
+.c-audio .count{background:rgba(34,197,94,.14);color:var(--ok)}
+.c-minutes .count{background:rgba(245,158,11,.14);color:var(--warn)}
+	.center{grid-area:center;overflow-y:auto;padding:var(--sp-5) var(--sp-6);min-width:0}
+	.center h2{font-size:15px;font-weight:600;margin-bottom:var(--sp-4);display:flex;align-items:center;gap:var(--sp-2)}
+	.mode-label{display:inline-flex;align-items:center;min-height:20px;padding:2px 7px;border-radius:999px;border:1px solid var(--border-strong);font-size:11px;font-weight:650;color:var(--fg-secondary);background:rgba(100,116,139,.12)}
+	.utterance{display:grid;grid-template-columns:56px 1fr;gap:var(--sp-4);padding:var(--sp-2) 0;font-size:14.5px;line-height:1.75}
 .utterance .ts{font-family:var(--font-mono);font-size:11px;color:var(--fg-muted);padding-top:3px}
 .utterance .text .speaker{font-size:12px;color:var(--fg-secondary);margin-right:6px;font-weight:500}
-.utterance .text .entity{font-family:var(--font-mono);font-size:13px;background:var(--accent-glow);color:#a5b4fc;padding:1px 5px;border-radius:4px}
+	.utterance .text .entity{font-family:var(--font-mono);font-size:13px;background:var(--accent-glow);color:#a5b4fc;padding:1px 5px;border-radius:4px}
+	.utterance.partial-draft .text{color:var(--fg-secondary)}
+	.utterance.partial-draft .speaker{color:var(--accent)}
+	.utterance.live-partial .text{color:var(--fg-muted)}
+	.utterance.live-partial .speaker{color:var(--warn)}
+.transcript-document{max-width:78ch;margin:0 auto}
+.transcript-paragraph{display:grid;grid-template-columns:56px minmax(0,1fr);gap:var(--sp-4);padding:var(--sp-3) 0;font-size:15px;line-height:1.8;border-bottom:1px solid rgba(148,163,184,.08)}
+.transcript-paragraph:last-child{border-bottom:0}
+.transcript-paragraph .paragraph-time{font-family:var(--font-mono);font-size:11px;color:var(--fg-muted);padding-top:5px}
+.transcript-paragraph .paragraph-body{min-width:0;color:var(--fg-primary);white-space:pre-wrap;overflow-wrap:anywhere}
+.transcript-segment{display:inline;scroll-margin:88px}
+.transcript-segment.evidence-focus{outline:2px solid var(--info);outline-offset:3px;background:rgba(56,189,248,.08)}
+.transcript-active-tail{max-width:78ch;margin:var(--sp-2) auto 0;border-left:2px solid var(--warn);padding:var(--sp-3) var(--sp-4);background:rgba(245,158,11,.05)}
+.transcript-active-tail .tail-label{display:block;margin-bottom:3px;color:var(--warn);font-size:11px;font-weight:600}
+.transcript-active-tail .tail-text{color:var(--fg-secondary);white-space:pre-wrap;overflow-wrap:anywhere}
+.new-content-button{position:fixed;left:32.75vw;bottom:52px;z-index:120;margin:0;transform:translateX(-50%);background:var(--accent);border-color:var(--accent);color:#fff;box-shadow:var(--shadow-card)}
+.new-content-button:hover{background:#0F9F90}
+.utterance.transcript-revision{border-left:2px solid var(--info);padding-left:10px;background:rgba(56,189,248,.05)}
+.correction-badge{display:inline-flex;align-items:center;margin-left:8px;padding:1px 6px;border:1px solid rgba(56,189,248,.24);border-radius:999px;background:rgba(56,189,248,.08);color:var(--info);font-size:10px;font-weight:600;vertical-align:middle}
+.original-asr-text{margin-top:5px;color:var(--fg-muted);font-size:11px}
+.original-asr-text summary{cursor:pointer;color:var(--fg-secondary)}
+.original-asr-text div{margin-top:4px;padding:6px 8px;border-left:2px solid var(--border-strong);color:var(--fg-muted)}
+.revision-meta{margin-top:4px;font-size:12px;color:var(--fg-muted)}
+.utterance.evidence-focus{outline:2px solid var(--info);outline-offset:2px;background:rgba(56,189,248,.08)}
 .suggestion{margin:var(--sp-3) 0 var(--sp-3) 56px;background:var(--bg-elevated);border:1px solid var(--border);border-left:3px solid var(--warn);border-radius:var(--r-md);padding:var(--sp-3) var(--sp-4);box-shadow:var(--shadow-card)}
+.suggestion.suggestion-new{border-color:rgba(56,189,248,.42);background:rgba(56,189,248,.08);box-shadow:0 0 0 1px rgba(56,189,248,.12),var(--shadow-card)}
 .suggestion.approach{border-left-color:var(--approach)}
+.suggestion-fold{margin:var(--sp-3) 0;border-top:1px solid var(--border);padding-top:var(--sp-2)}
+.suggestion-fold>summary{cursor:pointer;color:var(--fg-secondary);font-size:12px}
+.suggestion-fold-content{padding-top:var(--sp-1)}
 .sug-head{display:flex;align-items:center;gap:var(--sp-2);margin-bottom:6px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.05em}
 .sug-head.gap{color:var(--warn)}.sug-head.approach{color:var(--approach)}
 .sug-body{font-size:13.5px;margin-bottom:var(--sp-2)}
 .sug-body strong{color:#fbbf24;font-weight:600}
 .evidence{display:flex;gap:8px;background:rgba(0,0,0,.25);border:1px solid var(--border);border-radius:var(--r-sm);padding:var(--sp-2) var(--sp-3);font-size:12.5px;color:var(--fg-secondary)}
 .evidence .quote{color:var(--fg-primary);font-style:italic}
+.evidence-link{display:block;width:100%;padding:6px 8px;border:1px solid var(--border);border-radius:var(--r-sm);background:rgba(15,23,42,.34);color:var(--fg-secondary);text-align:left;cursor:pointer}
+.evidence-link:hover{border-color:var(--info);color:var(--fg-primary)}
+.evidence-time{display:inline-block;margin-right:6px;color:var(--info);font-weight:650}
 .sug-meta{font-family:var(--font-mono);font-size:11px;color:var(--fg-muted);margin-top:6px}
-.right{grid-area:right;overflow-y:auto;padding:var(--sp-4);border-left:1px solid var(--border)}
+.history-source{display:inline-flex;align-items:center;min-height:18px;padding:1px 7px;border-radius:999px;font-size:11px;font-weight:650;border:1px solid var(--border-strong)}
+.history-source.demo{color:var(--warn);background:rgba(245,158,11,.12)}
+.history-source.degraded{color:var(--risk);background:rgba(239,68,68,.12)}
+.history-source.real{color:var(--ok);background:rgba(34,197,94,.12)}
+.history-source.file{color:var(--info);background:rgba(56,189,248,.12)}
+.history-source.simulated_realtime{color:var(--approach);background:rgba(167,139,250,.12)}
+.history-source.real_mic_recorded{color:var(--ok);background:rgba(20,184,166,.12)}
+.source-badge{display:inline-flex;align-items:center;min-height:22px;padding:2px 8px;border-radius:999px;border:1px solid var(--border-strong);font-size:12px;font-weight:650;color:var(--fg-secondary);background:rgba(100,116,139,.12)}
+.source-badge.demo{color:var(--warn);background:rgba(245,158,11,.12)}
+.source-badge.degraded{color:var(--risk);background:rgba(239,68,68,.12)}
+.source-badge.pending{color:var(--warn);background:rgba(245,158,11,.12)}
+.source-badge.real_mic{color:var(--ok);background:rgba(34,197,94,.12)}
+.source-badge.file{color:var(--info);background:rgba(56,189,248,.12)}
+.source-badge.simulated_realtime{color:var(--approach);background:rgba(167,139,250,.12)}
+.source-badge.real_mic_recorded{color:var(--ok);background:rgba(20,184,166,.12)}
+.source-badge.provider,.source-badge.local{color:var(--fg-primary);background:rgba(99,102,241,.12)}
+.history-warning{margin-top:4px;color:var(--warn);font-size:12px}
+.right{grid-area:right;overflow-y:auto;padding:var(--sp-4);border-left:1px solid var(--border);min-width:0}
+.rail-section{padding-bottom:var(--sp-3);border-bottom:1px solid var(--border);margin-bottom:var(--sp-3)}
+.rail-content{min-height:42px;padding:var(--sp-2) 0}
+.focus-toolbar{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;margin:var(--sp-2) 0}
+.focus-toolbar .focus-filter{min-height:30px;padding:4px 7px;border:1px solid var(--border);border-radius:var(--r-sm);color:var(--fg-secondary);font-size:11px;text-align:left}
+.focus-toolbar .focus-filter[aria-pressed="true"]{border-color:rgba(20,184,166,.36);background:var(--accent-glow);color:var(--fg-primary)}
+.focus-toolbar .focus-filter:disabled{opacity:.42;cursor:not-allowed}
+.post-meeting-workspace{max-width:78ch;margin:var(--sp-6) auto 0;padding-top:var(--sp-4);border-top:1px solid var(--border)}
+.post-meeting-workspace[hidden]{display:none!important}
+.post-meeting-header{display:flex;align-items:flex-start;justify-content:space-between;gap:var(--sp-4);margin-bottom:var(--sp-3)}
+.post-meeting-header .panel-title{margin:0}
+.post-meeting-summary{margin-top:var(--sp-1);color:var(--fg-secondary);font-size:12px}
+.post-meeting-workspace .session-tools{grid-template-columns:repeat(3,minmax(0,1fr))}.post-meeting-workspace .secondary-tools{grid-template-columns:repeat(2,minmax(0,1fr));margin-bottom:var(--sp-4)}
 .detail-card{background:var(--bg-elevated);border:1px solid var(--border);border-radius:var(--r-md);padding:var(--sp-4);margin-bottom:var(--sp-4);font-size:13px}
 .detail-card h3{font-size:13px;margin-bottom:var(--sp-2)}
+.session-tools[hidden],.secondary-tools[hidden]{display:none!important}
+.demo-disclosure{margin-bottom:var(--sp-4);color:var(--fg-secondary);font-size:13px}
+.demo-disclosure summary{cursor:pointer;list-style:none;color:var(--fg-muted)}
+.demo-disclosure summary::-webkit-details-marker{display:none}
+.demo-disclosure summary::before{content:"+";display:inline-block;width:18px;color:var(--fg-muted)}
+.demo-disclosure[open] summary::before{content:"-"}
 .status{grid-area:status;display:flex;align-items:center;gap:var(--sp-5);padding:0 var(--sp-5);font-size:12px;color:var(--fg-secondary)}
 .status .v{font-family:var(--font-mono);color:var(--fg-primary)}
 .status .ok{color:var(--ok)}.status .warn{color:var(--warn)}.status .err{color:var(--risk)}
 .empty{color:var(--fg-muted);font-size:13px;padding:var(--sp-4)}
 .toast{position:fixed;bottom:60px;left:50%;transform:translateX(-50%) translateY(20px);background:var(--bg-elevated);border:1px solid var(--border-strong);padding:var(--sp-3) var(--sp-5);border-radius:var(--r-md);box-shadow:var(--shadow-card);font-size:13px;opacity:0;pointer-events:none;transition:all var(--t-base) var(--ease);z-index:200}
 .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:300;padding:var(--sp-4)}
+.modal-overlay[hidden]{display:none!important}
+.modal-content{background:var(--bg-base);border:1px solid var(--border-strong);border-radius:var(--r-lg);box-shadow:var(--shadow-card);max-width:680px;width:100%;max-height:80vh;display:flex;flex-direction:column;overflow:hidden}
+.modal-header{display:flex;align-items:center;gap:var(--sp-3);padding:var(--sp-4) var(--sp-5);border-bottom:1px solid var(--border)}
+.modal-header h3{font-size:15px;font-weight:600;flex:1}
+.modal-search{flex:1;min-width:0;height:34px;padding:0 var(--sp-3);border:1px solid var(--border);border-radius:var(--r-sm);background:var(--bg-elevated);color:var(--fg-primary);font-size:13px;font-family:inherit}
+.modal-search:focus{outline:2px solid var(--accent);outline-offset:-1px}
+.modal-list{flex:1;overflow-y:auto;padding:var(--sp-3) var(--sp-5)}
+.modal-list .history-modal-item{display:flex;flex-direction:column;gap:4px;padding:var(--sp-3);border:1px solid var(--border);border-radius:var(--r-md);margin-bottom:var(--sp-2);background:var(--bg-elevated)}
+.modal-list .history-modal-item .item-meta{display:flex;align-items:center;gap:var(--sp-2);flex-wrap:wrap;font-size:12px;color:var(--fg-secondary)}
+.modal-list .history-modal-item .item-preview{font-size:12px;color:var(--fg-muted);white-space:pre-wrap;overflow-wrap:anywhere;max-height:48px;overflow:hidden}
+.modal-list .history-modal-item .item-actions{display:flex;gap:var(--sp-2);margin-top:4px}
+@media (max-width:900px){
+  body{font-size:14px}
+  .app{min-height:100vh;height:auto;grid-template-columns:1fr;grid-template-rows:auto auto auto auto;grid-template-areas:"topbar" "center" "right" "status"}
+  .topbar{min-height:56px;height:auto;grid-template-columns:1fr;grid-template-areas:"brand" "meta" "actions" "strip";align-items:flex-start;gap:var(--sp-3);padding:var(--sp-3)}
+  .brand{width:100%}
+  .session-meta{width:100%;flex-wrap:wrap;gap:var(--sp-2)}
+  .actions{width:100%;display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}
+  .btn{min-width:0;min-height:40px;height:auto;justify-content:center;white-space:normal;text-align:center;line-height:1.25}
+  .meeting-status-strip{grid-template-columns:repeat(2,minmax(0,1fr));width:100%}
+  .meeting-status-strip .cockpit-stage{grid-column:1/-1;justify-self:start}
+  .center,.right{overflow:visible;padding:var(--sp-4)}
+  .new-content-button{left:50%;bottom:16px}
+  .right{border-left:none;border-top:1px solid var(--border)}
+  .utterance{grid-template-columns:48px minmax(0,1fr);gap:var(--sp-3)}
+  .evidence{display:block}
+  .post-meeting-workspace .session-tools,.post-meeting-workspace .secondary-tools{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .status{height:auto;min-height:36px;flex-wrap:wrap;gap:var(--sp-3);padding:var(--sp-3)}
+}
+
+/* 历史记录弹窗样式 */
+.modal-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);display:flex;align-items:center;justify-content:center;z-index:1000}
+.modal-content{background:var(--bg-elevated);border:1px solid var(--border);border-radius:8px;width:90%;max-width:800px;max-height:80vh;display:flex;flex-direction:column;box-shadow:0 8px 32px rgba(0,0,0,0.3)}
+.modal-header{display:flex;align-items:center;gap:var(--sp-3);padding:var(--sp-4);border-bottom:1px solid var(--border)}
+.modal-header h3{flex:0 0 auto;margin:0}
+.modal-search{flex:1;padding:8px 12px;border:1px solid var(--border);border-radius:4px;background:var(--bg-overlay);color:var(--fg-primary)}
+.modal-list{flex:1;overflow-y:auto;padding:var(--sp-4)}
+.history-item{padding:var(--sp-3);border:1px solid var(--border);border-radius:4px;margin-bottom:var(--sp-3);background:var(--bg-overlay)}
+.history-item:hover{background:var(--bg-elevated)}
+.history-header{display:flex;justify-content:space-between;margin-bottom:var(--sp-2);font-size:0.9em}
+.history-time{color:var(--fg-muted)}
+.history-source{color:var(--accent);font-weight:500}
+.history-meta{font-size:0.85em;color:var(--fg-muted);margin-bottom:var(--sp-2)}
+.history-preview{font-size:0.9em;color:var(--fg-primary);margin-bottom:var(--sp-3);line-height:1.4}
+.history-actions{display:flex;gap:var(--sp-2)}
+.btn-sm{padding:6px 12px;font-size:0.85em}
+
+/* 设置面板样式 */
+.settings-modal .modal-content{max-width:900px}
+.settings-body{padding:var(--sp-4);overflow-y:auto}
+.settings-section{margin-bottom:var(--sp-5);padding-bottom:var(--sp-4);border-bottom:1px solid var(--border)}
+.settings-section:last-child{border-bottom:none}
+.settings-section h4{margin:0 0 var(--sp-3) 0;font-size:1.1em;color:var(--accent)}
+.form-group{margin-bottom:var(--sp-3)}
+.form-group label{display:block;margin-bottom:var(--sp-2);font-weight:500;color:var(--fg-primary)}
+.form-control{width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:4px;background:var(--bg-overlay);color:var(--fg-primary);font-size:0.9em}
+.form-control:focus{outline:none;border-color:var(--accent)}
+.form-hint{display:block;margin-top:var(--sp-1);font-size:0.85em;color:var(--fg-muted)}
+.checkbox-group label{display:flex;align-items:center;gap:var(--sp-2);cursor:pointer}
+.checkbox-group input[type="checkbox"]{width:auto;margin:0}
+.cost-dashboard{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:var(--sp-3)}
+.cost-item{padding:var(--sp-3);background:var(--bg-overlay);border:1px solid var(--border);border-radius:4px}
+.cost-label{display:block;font-size:0.85em;color:var(--fg-muted);margin-bottom:var(--sp-1)}
+.cost-value{display:block;font-size:1.3em;font-weight:600;color:var(--accent)}
+.cost-breakdown{grid-column:1/-1;margin-top:var(--sp-2)}
+.cost-table{width:100%;border-collapse:collapse;margin-top:var(--sp-2)}
+.cost-table th,.cost-table td{padding:8px;text-align:left;border-bottom:1px solid var(--border)}
+.cost-table th{font-weight:600;color:var(--accent)}
+.settings-actions{display:flex;gap:var(--sp-3);padding-top:var(--sp-4);border-top:1px solid var(--border)}
 </style>
 </head>
 <body>
 <div class="app">
   <header class="topbar">
-    <div class="brand"><div class="brand-mark">M</div><span class="brand-name">Meeting Copilot</span></div>
-    <div class="session-meta"><span id="rec-state" style="color:var(--fg-muted)">● 未开始</span> <span id="session-meta">未加载会议</span></div>
+    <div class="brand"><div class="brand-mark">M</div><span class="brand-name">会议助手</span></div>
+    <div class="session-meta"><span id="rec-state" style="color:var(--fg-muted)">● 还没有开始会议</span> <span class="live-status-field">录音时长 <span class="value" id="recording-duration">00:00</span></span> <span class="live-status-field">麦克风 <span class="value" id="mic-input-status">未连接</span></span> <label class="mic-device-control" for="mic-device-select"><span class="sr-only">选择麦克风输入设备</span><select id="mic-device-select" aria-label="选择麦克风输入设备" disabled><option value="">系统默认麦克风</option></select></label> <meter id="mic-level-meter" aria-label="麦克风输入电平" min="0" max="1" low="0.03" high="0.12" optimum="0.2" value="0"></meter> <span id="source-badge" class="source-badge neutral">未开始</span> <span id="session-meta">准备开始</span></div>
     <div class="spacer"></div>
-    <div class="actions">
-      <button class="btn" id="btn-load">加载样本会议</button>
-      <button class="btn btn-primary" id="btn-cards">生成建议卡片</button>
-      <button class="btn" id="btn-approach">方案考量</button>
-      <button class="btn btn-primary" id="btn-record">真实录音</button>
-      <button class="btn" id="btn-live">实时订阅</button>
-      <button class="btn" id="btn-delete" style="color:var(--risk)">删除会话</button>
+    <div class="actions" id="primary-actions">
+      <button class="btn btn-primary" id="btn-record">开始会议</button>
+      <button class="btn btn-danger" id="btn-stop" hidden>结束会议</button>
+      <button class="btn" id="btn-pause" hidden>暂停</button>
+      <button type="button" class="btn" id="btn-upload-label">导入录音</button>
+      <input type="file" id="btn-upload" accept="audio/*,video/mp4,video/quicktime,.mp4,.mov,.mkv,.avi,.webm" style="display:none" />
+      <button class="btn" id="btn-history">历史记录</button>
+    </div>
+    <div class="meeting-status-strip" id="meeting-status-strip" aria-label="本场会议状态与快捷导航">
+      <span class="cockpit-stage" id="c-cockpit-stage" data-state="idle">待开始</span>
+      <button type="button" class="status-chip overview-jump" data-overview-target="transcript" aria-label="查看实时文字"><span>文字记录</span><span class="count" id="c-transcript">0</span></button>
+      <button type="button" class="status-chip overview-jump" data-overview-target="reminders" aria-label="查看实时提醒"><span>实时提醒</span><span class="count" id="c-gap">0</span></button>
+      <button type="button" class="status-chip overview-jump" data-overview-target="suggestions" aria-label="查看 AI 建议"><span>AI 建议</span><span class="count" id="c-cards">0</span></button>
+      <button type="button" class="status-chip overview-jump" data-overview-target="approach" aria-label="查看方案分析"><span>方案分析</span><span class="count" id="c-approach">0</span></button>
+      <button type="button" class="status-chip overview-jump" data-overview-target="audio" aria-label="查看录音保存"><span>录音保存</span><span class="count" id="c-audio">未保存</span></button>
+      <button type="button" class="status-chip overview-jump" data-overview-target="minutes" aria-label="查看会后复盘"><span>会后复盘</span><span class="count" id="c-minutes">未生成</span></button>
     </div>
   </header>
-  <aside class="left">
-    <div class="panel-title">会议状态</div>
-    <div class="state-row c-decision"><span class="name">已确认决策</span><span class="count" id="c-decision">0</span></div>
-    <div class="state-row c-action"><span class="name">行动项</span><span class="count" id="c-action">0</span></div>
-    <div class="state-row c-risk"><span class="name">风险</span><span class="count" id="c-risk">0</span></div>
-    <div class="state-row c-question"><span class="name">未闭环问题</span><span class="count" id="c-question">0</span></div>
-    <div class="panel-title">建议卡片</div>
-    <div class="state-row"><span class="name">缺口卡</span><span class="count" id="c-gap">0</span></div>
-    <div class="state-row" style="color:var(--approach)"><span class="name">方案考量卡</span><span class="count" id="c-approach" style="background:rgba(167,139,250,.14);color:var(--approach)">0</span></div>
-  </aside>
-  <main class="center">
-    <h2>实时转写 · 建议卡片</h2>
-    <div id="stream"><div class="empty">点击「加载样本会议」开始。</div></div>
-  </main>
-  <aside class="right">
-    <div class="panel-title">系统状态</div>
-    <div class="detail-card" id="sys-status"><div class="empty">未加载。</div></div>
-    <div class="panel-title">说明</div>
-    <div class="detail-card"><p style="color:var(--fg-secondary);font-size:12px"><strong>数据流向</strong>：音频→本地 ASR（sherpa sidecar，不出本机）；建议卡片/纪要→LLM 网关（按 .env 配置）。可随时删除会话（级联清除转写/事件/卡片）。</p></div>
-    <div class="detail-card"><p>缺口卡（琥珀）来自规则候选；方案考量卡（紫）来自 LLM。点击「生成建议卡片」触发真实 LLM 执行（需配置 LLM_GATEWAY_*）；「方案考量」生成方案建议卡。</p></div>
-  </aside>
+	  <main class="center">
+	    <h2>实时文字 <span class="mode-label" id="transcript-mode-label">待开始</span></h2>
+	    <div id="transcript-stream">
+	      <div id="transcript-document" class="transcript-document"><div class="empty">开始会议后，我会实时记录发言，并提醒决策、待办、风险和待确认问题。</div></div>
+	      <div id="transcript-active-tail" class="utterance live-partial transcript-active-tail" hidden></div>
+	    </div>
+	    <button type="button" class="btn new-content-button" id="btn-new-transcript-content" hidden>↓ 有新内容</button>
+	    <div id="transcript-live-region" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+	    <section class="post-meeting-workspace" id="review-workspace" hidden aria-labelledby="post-meeting-title">
+	      <div class="post-meeting-header">
+	        <div>
+	          <div class="panel-title" id="post-meeting-title">会后复盘</div>
+	          <p class="post-meeting-summary">完整文字稿和录音状态已保留在本次会议，可从这里继续整理。</p>
+	        </div>
+	      </div>
+	      <div class="panel-title">会议操作</div>
+	      <div class="stack-actions session-tools" id="session-actions" hidden>
+	      <button class="btn btn-primary" id="btn-organize">整理会议</button>
+	      <button class="btn" id="btn-live">刷新文字</button>
+	      <button class="btn btn-danger" id="btn-delete">删除本次会议</button>
+	    </div>
+	    <div class="stack-actions secondary-tools" id="secondary-actions" hidden>
+	      <button class="btn" id="btn-cards">生成会议建议</button>
+	      <button class="btn" id="btn-approach">分析方案利弊</button>
+	      <button class="btn" id="btn-minutes">生成会议纪要</button>
+	      <button class="btn" id="btn-export-transcript">导出文字稿</button>
+	      <button class="btn" id="btn-export-minutes">导出纪要</button>
+	      <button class="btn" id="btn-export-audio">导出录音</button>
+	    </div>
+	    <div class="panel-title">方案分析</div>
+	    <div class="rail-content" id="approach-panel"><div class="empty">讨论到方案取舍后，可分析利弊与风险。</div></div>
+	    <div class="panel-title">会议纪要</div>
+	    <div class="rail-content" id="minutes-panel"><div class="empty">会议结束后，可生成会议纪要、决策、待办、风险和待确认问题。</div></div>
+	    <div class="panel-title">历史记录</div>
+	    <div class="rail-content" id="history-list"><div class="empty">还没有历史会议。</div></div>
+	    <div class="panel-title">数据与隐私</div>
+	    <div class="rail-content"><p style="color:var(--fg-secondary);font-size:12px">语音优先在本机识别；需要生成建议或复盘时，才会按当前设置调用 AI 分析服务。删除本次会议会同时删除文字、提醒、复盘和已保存录音。</p></div>
+	    </section>
+	  </main>
+	  <aside class="right">
+	    <section class="rail-section" id="realtime-guidance-panel">
+	      <div class="panel-title">当前状态</div>
+	      <div class="rail-content" id="sys-status"><div class="empty">还没有开始。</div></div>
+	      <div class="panel-title">实时提醒</div>
+	      <div class="focus-toolbar" aria-label="筛选实时提醒">
+	        <button type="button" class="focus-filter" data-focus-type="DecisionCandidate" aria-pressed="false" aria-label="只看决定了什么" disabled>决定了什么 <span id="c-decision">0</span></button>
+	        <button type="button" class="focus-filter" data-focus-type="ActionItem" aria-pressed="false" aria-label="只看待办事项" disabled>待办事项 <span id="c-action">0</span></button>
+	        <button type="button" class="focus-filter" data-focus-type="Risk" aria-pressed="false" aria-label="只看风险提醒" disabled>风险提醒 <span id="c-risk">0</span></button>
+	        <button type="button" class="focus-filter" data-focus-type="OpenQuestion" aria-pressed="false" aria-label="只看待确认问题" disabled>待确认问题 <span id="c-question">0</span></button>
+	      </div>
+	      <div id="reminder-live-region" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+	      <div class="rail-content" id="candidate-panel" role="region" aria-label="实时提醒"><div class="empty">会议中我会实时提醒风险、待办和待确认问题。</div></div>
+	      <div class="panel-title">AI 建议</div>
+	      <div id="auto-suggestion-status" class="empty">会议开始后，AI 建议会根据已确认文字运行。</div>
+	      <button class="btn" id="btn-auto-suggestion-toggle" style="margin-top:8px;width:100%;justify-content:center" disabled>暂停 AI 建议</button>
+	      <div class="rail-content" id="suggestions-panel" role="region" aria-live="polite" aria-atomic="false" aria-label="AI 建议和状态"><div class="empty">会议开始并确认发言后，AI 建议会自动出现。</div></div>
+	      <div class="panel-title">AI 文字修正</div>
+	      <div id="realtime-correction-status" class="empty" role="status" aria-live="polite">完整发言确认后，AI 会检查文字并保留原始识别。</div>
+	    </section>
+	    <details class="demo-disclosure" hidden>
+	      <summary>演示</summary>
+	      <div class="detail-card stack-actions" id="demo-actions">
+        <button class="btn" id="btn-load">试用示例</button>
+      </div>
+    </details>
+	  </aside>
   <footer class="status">
-    <span>ASR <span class="v" id="s-asr">—</span></span>
-    <span>LLM <span class="v" id="s-llm">—</span></span>
-    <span>卡片 <span class="v" id="s-cards">0</span></span>
+    <span>语音识别 <span class="v" id="s-asr">—</span></span>
+    <span>AI 分析 <span class="v" id="s-llm">—</span></span>
+    <span>实时提醒 <span class="v" id="s-candidates">0</span></span>
+    <span>AI 建议 <span class="v" id="s-cards">0</span></span>
+    <span>方案分析 <span class="v" id="s-approach-cards">0</span></span>
+    <span>桌面壳 <span class="v" id="s-desktop">浏览器模式</span></span>
   </footer>
 </div>
-<div class="toast" id="toast"></div>
-<script src="/static/workbench.js"></script>
+<div class="toast" id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
+<div id="history-modal" class="modal-overlay" hidden>
+  <div class="modal-content">
+    <div class="modal-header">
+      <h3>历史记录</h3>
+      <input type="text" id="history-search" placeholder="搜索会议..." class="modal-search" />
+      <button class="btn" id="btn-close-history">关闭</button>
+    </div>
+    <div id="history-modal-list" class="modal-list"></div>
+  </div>
+</div>
+<!-- 设置面板弹窗 -->
+<div id="settings-modal" class="modal-overlay" hidden>
+  <div class="modal-content settings-modal">
+    <div class="modal-header">
+      <h3>设置</h3>
+      <button class="btn" id="btn-close-settings">关闭</button>
+    </div>
+    <div class="modal-body settings-body">
+
+      <!-- ASR配置 -->
+      <section class="settings-section">
+        <h4>语音识别配置</h4>
+        <div class="form-group checkbox-group">
+          <label>
+            <input type="checkbox" id="setting-asr-l2-correction" checked />
+            <span>L2修正：LLM纠错（提升准确率，消耗tokens）</span>
+          </label>
+        </div>
+        <div class="form-group checkbox-group">
+          <label>
+            <input type="checkbox" id="setting-asr-l3-normalize" checked />
+            <span>L3规范化：标点符号修正</span>
+          </label>
+        </div>
+      </section>
+
+      <!-- AI建议配置 -->
+      <section class="settings-section">
+        <h4>AI建议配置</h4>
+        <div class="form-group checkbox-group">
+          <label>
+            <input type="checkbox" id="setting-suggestions-enabled" checked />
+            <span>启用录音期间AI建议</span>
+          </label>
+        </div>
+        <div class="form-group">
+          <label>建议生成时窗（秒）</label>
+          <input type="number" id="setting-suggestions-window" class="form-control" value="20" min="10" max="60" />
+          <small class="form-hint">每隔N秒检查一次是否需要生成建议</small>
+        </div>
+        <div class="form-group">
+          <label>同类建议冷却时间（分钟）</label>
+          <input type="number" id="setting-suggestions-cooldown" class="form-control" value="5" min="1" max="30" />
+          <small class="form-hint">同类建议生成后N分钟内不再重复</small>
+        </div>
+        <div class="form-group">
+          <label>最小置信度阈值</label>
+          <input type="range" id="setting-suggestions-confidence" class="form-control" min="0" max="1" step="0.05" value="0.7" />
+          <small class="form-hint">置信度低于此值的建议将被过滤（当前: <span id="setting-suggestions-confidence-value">0.7</span>）</small>
+        </div>
+      </section>
+
+      <!-- 成本看板 -->
+      <section class="settings-section">
+        <h4>成本统计</h4>
+        <div class="cost-dashboard">
+          <div class="cost-item">
+            <span class="cost-label">本次会议消耗</span>
+            <span class="cost-value" id="cost-current-session">¥0.00</span>
+          </div>
+          <div class="cost-item">
+            <span class="cost-label">今日总消耗</span>
+            <span class="cost-value" id="cost-today">¥0.00</span>
+          </div>
+          <div class="cost-item">
+            <span class="cost-label">本月总消耗</span>
+            <span class="cost-value" id="cost-month">¥0.00</span>
+          </div>
+          <div class="cost-breakdown">
+            <details>
+              <summary>详细分解</summary>
+              <table class="cost-table">
+                <thead>
+                  <tr>
+                    <th>项目</th>
+                    <th>Tokens</th>
+                    <th>金额</th>
+                  </tr>
+                </thead>
+                <tbody id="cost-breakdown-body">
+                  <tr><td colspan="3">暂无数据</td></tr>
+                </tbody>
+              </table>
+            </details>
+          </div>
+        </div>
+      </section>
+
+      <!-- LLM预算控制 -->
+      <section class="settings-section">
+        <h4>预算控制</h4>
+        <div class="form-group">
+          <label>单次会议预算上限（元）</label>
+          <input type="number" id="setting-budget-session" class="form-control" value="10" min="0" step="0.1" />
+          <small class="form-hint">超过此金额将降级（停止AI建议和修正）</small>
+        </div>
+        <div class="form-group">
+          <label>每日预算上限（元）</label>
+          <input type="number" id="setting-budget-daily" class="form-control" value="50" min="0" step="1" />
+        </div>
+        <div class="form-group">
+          <label>L3修正价值预评估</label>
+          <select id="setting-l3-value-check" class="form-control">
+            <option value="always">总是执行</option>
+            <option value="when_needed" selected>仅当识别质量低时</option>
+            <option value="never">从不执行</option>
+          </select>
+          <small class="form-hint">根据转写质量动态决定是否使用LLM修正</small>
+        </div>
+      </section>
+
+      <div class="settings-actions">
+        <button class="btn btn-primary" id="btn-save-settings">保存设置</button>
+        <button class="btn" id="btn-reset-settings">恢复默认</button>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+(function inlineDesktopFrontendProbe(){
+  try {
+    var tauriGlobal = window.__TAURI__;
+    var invoke = tauriGlobal && (tauriGlobal.core && tauriGlobal.core.invoke || tauriGlobal.tauri && tauriGlobal.tauri.invoke || tauriGlobal.invoke);
+    if (!invoke) return;
+    var ids = ["history-list", "session-meta", "transcript-stream", "suggestions-panel", "approach-panel", "minutes-panel", "s-desktop"];
+    var selectors = {};
+    ids.forEach(function(id){ selectors[id] = Boolean(document.getElementById(id)); });
+    invoke("runtime_write_frontend_probe", { payload: {
+      inline_probe: true,
+      ready_state: document.readyState,
+      title: document.title,
+      location_path: window.location.pathname,
+      desktop_status_text: document.getElementById("s-desktop") ? document.getElementById("s-desktop").textContent : "",
+      selectors: selectors
+    }});
+  } catch (err) {}
+})();
+</script>
+<script>
+(function loadWorkbenchScript(){
+  var tauriGlobal = window.__TAURI__;
+  var hasTauriInvoke = Boolean(tauriGlobal && (tauriGlobal.core && tauriGlobal.core.invoke || tauriGlobal.tauri && tauriGlobal.tauri.invoke || tauriGlobal.invoke));
+  var isTauri = hasTauriInvoke || window.location.protocol === "tauri:";
+  var script = document.createElement("script");
+  script.src = isTauri ? "workbench.js?v=20260714-mainline-status2" : "/static/workbench.js?v=20260714-mainline-status2";
+  script.onerror = function(){
+    if (this.dataset.fallback) return;
+    this.dataset.fallback = "1";
+    this.src = isTauri ? "/static/workbench.js?v=20260714-mainline-status2" : "workbench.js?v=20260714-mainline-status2";
+  };
+  script.onload = function(){
+    var settingsScript = document.createElement("script");
+    settingsScript.src = isTauri ? "settings-panel.js" : "/static/settings-panel.js";
+    document.body.appendChild(settingsScript);
+  };
+  document.body.appendChild(script);
+})();
+</script>
 </body>
 </html>

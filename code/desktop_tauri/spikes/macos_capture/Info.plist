@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.meetingcopilot.capture-spike</string>
+    <key>CFBundleName</key>
+    <string>Meeting Copilot Capture Spike</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Meeting Copilot needs microphone access to validate local meeting audio capture.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>Meeting Copilot needs screen recording access to validate local system audio capture.</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>Meeting Copilot needs system audio access to validate local meeting audio capture.</string>
+</dict>
+</plist>

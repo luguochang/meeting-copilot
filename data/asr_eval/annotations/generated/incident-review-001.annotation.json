@@ -1,0 +1,24 @@
+{
+  "technical_entities": [
+    {
+      "normalized": "order-worker",
+      "text": "order-worker",
+      "type": "service"
+    },
+    {
+      "normalized": "lag",
+      "text": "lag",
+      "type": "metric"
+    },
+    {
+      "normalized": "timeout",
+      "text": "timeout",
+      "type": "failure_mode"
+    },
+    {
+      "normalized": "监控阈值",
+      "text": "监控阈值",
+      "type": "metric_policy"
+    }
+  ]
+}

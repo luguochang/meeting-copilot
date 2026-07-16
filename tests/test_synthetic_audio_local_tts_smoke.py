@@ -77,3 +77,31 @@ def test_local_tts_smoke_explicit_execution_requires_allowed_script_and_root():
     assert report["generation_status"] == "execution_skipped_by_test_harness"
     assert report["tts_command_preview"][0] == "say"
     assert report["validation_errors"] == []
+
+
+def test_local_tts_smoke_supports_explicit_chinese_voice_and_rate():
+    tool = load_tool_module()
+
+    report = tool.build_synthetic_audio_local_tts_smoke_report(
+        script_id="incident-review-001",
+        target_root="artifacts/tmp/synthetic_audio/tingting_r130",
+        execute_local_tts=True,
+        run_commands=False,
+        voice="Tingting",
+        rate_wpm=130,
+    )
+
+    assert report["smoke_status"] == "ready_for_local_tts_execution"
+    assert report["tts_voice"] == "Tingting"
+    assert report["tts_rate_wpm"] == 130
+    assert report["tts_command_preview"] == [
+        "say",
+        "-v",
+        "Tingting",
+        "-r",
+        "130",
+        "-o",
+        "artifacts/tmp/synthetic_audio/tingting_r130/incident-review-001.aiff",
+        "<synthetic_script_text>",
+    ]
+    assert report["safe_to_call_remote_tts"] is False

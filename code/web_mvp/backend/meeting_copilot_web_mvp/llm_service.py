@@ -9,17 +9,25 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
+from dotenv import load_dotenv
 
 from meeting_copilot_web_mvp.logging_config import get_logger
+from meeting_copilot_web_mvp.streaming_llm_provider import provider_idempotency_header_value
 
 _log = get_logger("meeting_copilot_web_mvp.llm_service")
 
-PROMPT_VERSION = "web_mvp.suggestion_card.v1"
+PROMPT_VERSION = "web_mvp.suggestion_card.v2"
+REPO_ENV_FILE = Path(__file__).resolve().parents[4] / ".env"
+_PROVIDER_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_AUDIT_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$")
 
 
 class LlmClient(Protocol):
@@ -38,18 +46,36 @@ class HttpxLlmClient:
     """Default LLM client using httpx."""
 
     def post_json(self, url, headers, body, timeout):
-        with httpx.Client(timeout=timeout) as client:
+        with httpx.Client(timeout=timeout, trust_env=False) as client:
             resp = client.post(url, headers=headers, json=body)
             resp.raise_for_status()
             return resp.json()
 
 
-@dataclass
+@dataclass(repr=False)
 class LlmConfig:
     base_url: str
     api_key: str
     model: str
     timeout_seconds: float = 60.0
+    provider_label: str = "openai_compatible_gateway"
+    is_mock: bool = False
+    max_retries: int = 2
+
+    def __post_init__(self) -> None:
+        self.base_url = _validated_base_url(self.base_url)
+
+    def __repr__(self) -> str:
+        return (
+            "LlmConfig("
+            f"gateway_host={_gateway_host(self.base_url)!r}, "
+            "api_key='<redacted>', "
+            f"model={self.model!r}, "
+            f"timeout_seconds={self.timeout_seconds!r}, "
+            f"provider_label={self.provider_label!r}, "
+            f"is_mock={self.is_mock!r}"
+            ")"
+        )
 
     @classmethod
     def from_env(cls) -> "LlmConfig | None":
@@ -57,18 +83,184 @@ class LlmConfig:
         base = os.environ.get("LLM_GATEWAY_BASE_URL")
         key = os.environ.get("LLM_GATEWAY_API_KEY")
         if not base or not key:
+            load_dotenv(REPO_ENV_FILE, override=False)
+            base = os.environ.get("LLM_GATEWAY_BASE_URL")
+            key = os.environ.get("LLM_GATEWAY_API_KEY")
+        if not base or not key:
             return None
         return cls(
             base_url=base.rstrip("/"),
             api_key=key,
             model=os.environ.get("LLM_GATEWAY_MODEL", "gpt-5.5"),
             timeout_seconds=float(os.environ.get("LLM_GATEWAY_TIMEOUT_SECONDS", "60")),
+            provider_label=os.environ.get("LLM_GATEWAY_PROVIDER_LABEL", "openai_compatible_gateway"),
+            is_mock=_env_bool(os.environ.get("LLM_GATEWAY_IS_MOCK"), default=False),
         )
+
+
+def _env_bool(value: str | None, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def provider_metadata(config: LlmConfig | None) -> dict[str, Any]:
+    """Return non-secret LLM provider metadata for API responses and acceptance reports."""
+    if config is None:
+        return {
+            "provider": "not_configured",
+            "model": "not_called",
+            "is_mock": False,
+            "configured_from_env": False,
+        }
+    return {
+        "provider": provider_identifier(config),
+        "model": config.model,
+        "is_mock": bool(config.is_mock),
+        "configured_from_env": True,
+    }
+
+
+def provider_identifier(config: LlmConfig) -> str:
+    label = str(config.provider_label or "").strip()
+    if _PROVIDER_LABEL_RE.fullmatch(label) and not label.lower().startswith(("http:", "https:")):
+        return label
+    return _gateway_host(config.base_url)
+
+
+def gateway_base_url_kind(base_url: str | None) -> str:
+    """Classify a configured gateway without exposing its URL or credentials."""
+    parsed = urlsplit(str(base_url or "").strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return "not_configured"
+    if parsed.hostname.lower() in {"127.0.0.1", "localhost", "::1"}:
+        return "local"
+    return "remote"
+
+
+def provider_audit_metadata(config: LlmConfig, *, purpose: str) -> dict[str, str]:
+    return {
+        "provider": _safe_audit_value(provider_identifier(config), fallback="redacted_provider"),
+        "model": _safe_audit_value(config.model, fallback="redacted_model"),
+        "purpose": _safe_audit_value(purpose, fallback="llm_request"),
+    }
+
+
+def provider_error_payload(*, error_code: str, message: str) -> dict[str, str]:
+    return {
+        "error_code": _safe_audit_value(error_code, fallback="llm_provider_failed"),
+        "message": str(message or "LLM provider request failed")[:160],
+    }
+
+
+def probe_gateway(
+    config: LlmConfig,
+    client: LlmClient | None = None,
+) -> dict[str, Any]:
+    """Make one minimal production-shaped request to verify gateway operability."""
+    if config.is_mock:
+        raise ValueError("mock LLM provider cannot pass production verification")
+    client = client or HttpxLlmClient()
+    data = client.post_json(
+        f"{config.base_url}/v1/chat/completions",
+        {
+            "Authorization": f"Bearer {config.api_key}",
+            "Content-Type": "application/json",
+        },
+        {
+            "model": config.model,
+            "messages": [{"role": "user", "content": "只回复 OK"}],
+            "temperature": 0,
+            "reasoning_effort": "low",
+            "max_completion_tokens": 16,
+        },
+        min(float(config.timeout_seconds), 15.0),
+    )
+    choices = data.get("choices") if isinstance(data, dict) else None
+    content = (
+        ((choices or [{}])[0].get("message") or {}).get("content")
+        if isinstance(choices, list) and choices
+        else None
+    )
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("gateway returned no assistant content")
+    usage = data.get("usage") if isinstance(data, dict) else None
+    if not isinstance(usage, dict) or not {
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+    }.issubset(usage):
+        raise ValueError("gateway response missing usage metadata")
+    raw_usage = (
+        usage.get("prompt_tokens"),
+        usage.get("completion_tokens"),
+        usage.get("total_tokens"),
+    )
+    if any(type(value) is not int or value < 0 for value in raw_usage):
+        raise ValueError("gateway response reported invalid token usage")
+    prompt_tokens, completion_tokens, total_tokens = raw_usage
+    if total_tokens <= 0 or total_tokens != prompt_tokens + completion_tokens:
+        raise ValueError("gateway response reported inconsistent token usage")
+    return {
+        "operational": True,
+        "provider": provider_identifier(config),
+        "model": config.model,
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+        },
+    }
+
+
+def _safe_audit_value(value: Any, *, fallback: str) -> str:
+    normalized = str(value or "").strip()
+    lowered = normalized.lower()
+    if (
+        not _AUDIT_VALUE_RE.fullmatch(normalized)
+        or "://" in normalized
+        or "api_key" in lowered
+        or "authorization" in lowered
+        or re.search(r"(?:^|[^a-z0-9])sk-[a-z0-9_-]+", lowered)
+    ):
+        return fallback
+    return normalized
+
+
+def _validated_base_url(value: str) -> str:
+    raw = str(value or "").strip()
+    parsed = urlsplit(raw)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("LLM gateway base_url must be an absolute http(s) URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("LLM gateway base_url must not contain userinfo")
+    if parsed.query:
+        raise ValueError("LLM gateway base_url must not contain query parameters")
+    if parsed.fragment:
+        raise ValueError("LLM gateway base_url must not contain a fragment")
+    try:
+        parsed.port
+    except ValueError as exc:
+        raise ValueError("LLM gateway base_url contains an invalid port") from exc
+    normalized_path = parsed.path.rstrip("/")
+    return urlunsplit((parsed.scheme, parsed.netloc, normalized_path, "", ""))
+
+
+def _gateway_host(base_url: str) -> str:
+    parsed = urlsplit(base_url)
+    host = str(parsed.hostname or "invalid_gateway")
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    return f"{host}:{port}" if port is not None else host
 
 
 _SYSTEM_PROMPT = (
     "你是中文技术会议 Copilot 建议生成器。基于证据片段生成一张低打扰建议卡片。"
-    "只返回可解析 JSON：{\"suggestion_text\": str, \"confidence\": 0-1, \"trigger_reason\": str}。"
+    "只返回可解析 JSON：{\"suggestion_text\": str, \"confidence\": 0-1, \"trigger_reason\": str, "
+    "\"corrected_transcript\": str|null}。corrected_transcript 仅修正同一证据片段中的 ASR 术语和断句错误，"
+    "不得新增、删除或改写原意；不需要修正时返回 null。"
     "措辞用'建议确认/是否考虑过'，禁止'必须/一定/不可上线'等裁判式表达。"
 )
 
@@ -97,7 +289,7 @@ def _call_with_retry(client, url, headers, body, timeout, retries=2):
         except Exception as exc:
             last_exc = exc
             if attempt < retries:
-                _log.warning("llm.call.retry", attempt=attempt + 1, error=str(exc))
+                _log.warning("llm.call.retry", attempt=attempt + 1, error_code=type(exc).__name__)
                 time.sleep(0.5 * (2 ** attempt))
             else:
                 raise
@@ -111,13 +303,17 @@ def execute_candidate(
 ) -> dict[str, Any]:
     """Call LLM for one suggestion candidate preview; return a run with a real card."""
     client = client or HttpxLlmClient()
+    evidence_context = str(
+        preview.get("evidence_context")
+        or preview.get("input_summary", "")
+    )
     user_prompt = json.dumps(
         {
             "gap_rule_id": preview.get("gap_rule_id"),
             "target_type": preview.get("target_type"),
             "trigger_reason": preview.get("suggested_prompt")
             or preview.get("input_summary", ""),
-            "evidence_context": preview.get("input_summary", ""),
+            "evidence_context": evidence_context,
         },
         ensure_ascii=False,
     )
@@ -128,15 +324,31 @@ def execute_candidate(
             {"role": "user", "content": user_prompt},
         ],
         "temperature": 0,
+        "reasoning_effort": "low",
+        "max_completion_tokens": 512,
     }
     headers = {
         "Authorization": f"Bearer {config.api_key}",
         "Content-Type": "application/json",
     }
+    request_identity = provider_idempotency_header_value(
+        preview.get("idempotency_key")
+        or preview.get("request_id")
+        or preview.get("execution_id")
+    )
+    if request_identity is not None:
+        headers["Idempotency-Key"] = request_identity
     url = f"{config.base_url}/v1/chat/completions"
     candidate_id = str(preview.get("target_candidate_id", ""))
     _log.info("llm.call.start", candidate_id=candidate_id, model=config.model)
-    data = _call_with_retry(client, url, headers, body, config.timeout_seconds)
+    data = _call_with_retry(
+        client,
+        url,
+        headers,
+        body,
+        config.timeout_seconds,
+        retries=max(0, int(config.max_retries)),
+    )
     content = data["choices"][0]["message"]["content"]
     parsed = json.loads(_strip_json_fences(content))
     usage = data.get("usage", {})
@@ -145,6 +357,7 @@ def execute_candidate(
         "completion_tokens": int(usage.get("completion_tokens", 0)),
         "total_tokens": int(usage.get("total_tokens", 0)),
     }
+    provider = provider_identifier(config)
     card = {
         "card_id": f"suggestion_card_{candidate_id}",
         "card_status": "new",
@@ -160,9 +373,11 @@ def execute_candidate(
             parsed.get("trigger_reason", preview.get("gap_rule_id", ""))
         ),
         "evidence_span_ids": list(preview.get("evidence_span_ids") or []),
+        "evidence_spans": list(preview.get("evidence_spans") or []),
+        "evidence_context": evidence_context,
         "source_event_ids": list(preview.get("source_event_ids") or []),
         "llm_trace": {
-            "provider": config.base_url,
+            "provider": provider,
             "model": config.model,
             "prompt_version": PROMPT_VERSION,
             "call_count": 1,
@@ -175,7 +390,7 @@ def execute_candidate(
         "run_id": f"asr_llm_execution_run_enabled_{preview.get('execution_id', '')}",
         "run_status": "completed",
         "execution_status": "executed",
-        "provider": config.base_url,
+        "provider": provider,
         "model": config.model,
         "prompt_version": PROMPT_VERSION,
         "llm_call_status": "called",
@@ -185,12 +400,57 @@ def execute_candidate(
         "card": card,
         "llm_usage": usage_record,
     }
+    transcript_correction = _single_segment_transcript_correction(
+        preview,
+        corrected_text=parsed.get("corrected_transcript"),
+        usage=usage_record,
+    )
+    if transcript_correction is not None:
+        run["transcript_correction"] = transcript_correction
     _log.info(
         "llm.call.end",
         candidate_id=candidate_id,
         tokens=usage_record["total_tokens"],
     )
     return run
+
+
+def _single_segment_transcript_correction(
+    preview: dict[str, Any],
+    *,
+    corrected_text: Any,
+    usage: dict[str, int],
+) -> dict[str, Any] | None:
+    corrected = str(corrected_text or "").strip()
+    evidence_spans = [
+        dict(span)
+        for span in list(preview.get("evidence_spans") or [])
+        if isinstance(span, dict)
+    ]
+    if not corrected or not evidence_spans:
+        return None
+    segment_ids = {str(span.get("segment_id") or "").strip() for span in evidence_spans}
+    segment_ids.discard("")
+    evidence_span_ids = [str(value) for value in list(preview.get("evidence_span_ids") or []) if str(value)]
+    segment_batch = {str(value).strip() for value in list(preview.get("segment_batch") or []) if str(value).strip()}
+    if len(segment_ids) != 1 or len(evidence_spans) != 1 or len(evidence_span_ids) != 1:
+        return None
+    segment_id = next(iter(segment_ids))
+    if segment_batch and segment_batch != {segment_id}:
+        return None
+    evidence = evidence_spans[0]
+    evidence_span_id = str(evidence.get("id") or "")
+    original_text = str(evidence.get("quote") or "").strip()
+    if not evidence_span_id or evidence_span_id != evidence_span_ids[0] or not original_text:
+        return None
+    return {
+        "segment_id": segment_id,
+        "evidence_span_id": evidence_span_id,
+        "original_text": original_text,
+        "corrected_text": corrected,
+        "source": "combined_suggestion",
+        "usage": dict(usage),
+    }
 
 
 def build_enabled_execution_runs(
@@ -211,8 +471,12 @@ def build_enabled_execution_runs(
             _log.error(
                 "llm.call.error",
                 candidate_id=preview.get("target_candidate_id"),
-                error=str(exc),
+                error_code=type(exc).__name__,
                 exc_info=True,
+            )
+            safe_error = provider_error_payload(
+                error_code="llm_provider_failed",
+                message="LLM provider request failed",
             )
             run = {
                 **preview,
@@ -221,7 +485,7 @@ def build_enabled_execution_runs(
                 "execution_status": "error",
                 "llm_call_status": "error",
                 "card_status": "not_created",
-                "error": str(exc),
+                **safe_error,
             }
         runs.append(run)
     return runs
@@ -284,6 +548,7 @@ def build_approach_cards(
     }
     items = parsed if isinstance(parsed, list) else [parsed]
     cards: list[dict[str, Any]] = []
+    provider = provider_identifier(config)
     for idx, item in enumerate(items):
         if not isinstance(item, dict):
             continue
@@ -307,7 +572,7 @@ def build_approach_cards(
             "trigger_reason": str(item.get("trigger_reason", "")),
             "evidence_quote": evidence_quote,
             "llm_trace": {
-                "provider": config.base_url,
+                "provider": provider,
                 "model": config.model,
                 "prompt_version": APPROACH_PROMPT_VERSION,
                 "call_count": 1,

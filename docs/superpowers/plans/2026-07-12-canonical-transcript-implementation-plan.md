@@ -8,6 +8,51 @@
 
 **Tech Stack:** FastAPI, Python 3.14, vanilla JavaScript, HTML/CSS, pytest, Node/Chrome CDP browser E2E, local FunASR realtime ASR.
 
+## Execution Status - 2026-07-13
+
+Implemented and verified:
+
+- backend canonical transcript projector and events API snapshot;
+- internally consistent FunASR incremental `text` / `normalized_text` fields;
+- continuous committed document plus one `active_tail`;
+- stable `projection_key` namespace separated from ASR `segment_id`;
+- one render transaction for committed paragraphs plus active tail;
+- 96px scroll-follow boundary and visible `↓ 有新内容` resume control;
+- latest recoverable real-session restoration using wall-clock activity timestamps;
+- honest interrupted real-microphone recovery state;
+- canonical evidence clickback, in-place revision and original-text expansion;
+- reconciled FunASR source snapshots remain correct after the active tail becomes final;
+- provider errors preserve the complete visible transcript and only change status messaging;
+- normal stream completion is recovered from the persisted evaluation summary;
+- browser reload, scroll preservation, responsive layout and all visible button regression.
+
+Fresh evidence:
+
+```text
+Python canonical / ASR / API / Workbench regression: 315 passed, 2 warnings
+Python correction / suggestion / Workbench regression: 256 passed, 2 warnings
+Real-microphone gate evaluator: 18 passed
+Workbench all-buttons browser E2E: go_workbench_all_buttons_smoke
+Browser screenshots: 25
+Reconciled-final browser probe: exact canonical full text, active tail=0
+Provider-error browser probe: canonical text and committed segments preserved
+Real persisted session rec_mrh7w0eb:
+  canonical segments=53
+  active tail=1
+  committed chars=2065
+  full chars=2068
+  duplicate visible 发言 label=0
+Live page screenshot:
+  artifacts/tmp/ui_screenshots/canonical-transcript-live-8767.png
+```
+
+Not claimed by this execution:
+
+- a fresh controlled real-microphone acoustic run;
+- production-grade Chinese ASR accuracy;
+- recording-time formal AI suggestion production Go;
+- 20-minute real meeting soak completion.
+
 ---
 
 ### Task 1: Add The Backend Canonical Transcript Projector
@@ -18,7 +63,7 @@
 - Modify: `code/web_mvp/backend/meeting_copilot_web_mvp/app.py`
 - Modify: `code/web_mvp/backend/tests/test_app.py`
 
-- [ ] **Step 1: Write failing reducer tests**
+- [x] **Step 1: Write failing reducer tests**
 
 Cover one active partial, final authority, revision replacement, unresolved revision supplement, ordering and `full_text` invariants. The primary cumulative case must assert:
 
@@ -36,7 +81,7 @@ assert snapshot["full_text"] == "第一段第二段第三段正在说"
 assert snapshot["active_tail"]["segment_id"] == "seg_3"
 ```
 
-- [ ] **Step 2: Run the new tests and verify RED**
+- [x] **Step 2: Run the new tests and verify RED**
 
 Run:
 
@@ -47,7 +92,7 @@ PYTHONPATH=code/web_mvp/backend python3 -m pytest \
 
 Expected: import failure because `canonical_transcript.py` does not exist.
 
-- [ ] **Step 3: Implement the projector**
+- [x] **Step 3: Implement the projector**
 
 Expose:
 
@@ -67,7 +112,7 @@ The projector must:
 - produce ordered `segments`, `committed_text`, `full_text` and character counts;
 - never mutate input events.
 
-- [ ] **Step 4: Add canonical snapshot to the events API**
+- [x] **Step 4: Add canonical snapshot to the events API**
 
 When returning `/live/asr/sessions/{session_id}/events`, append:
 
@@ -80,7 +125,7 @@ body["canonical_transcript"] = project_canonical_transcript(
 
 Keep all existing response fields unchanged.
 
-- [ ] **Step 5: Verify projector and API tests GREEN**
+- [x] **Step 5: Verify projector and API tests GREEN**
 
 Run:
 
@@ -99,7 +144,7 @@ Expected: PASS.
 - Modify: `code/web_mvp/backend/meeting_copilot_web_mvp/asr_stream.py`
 - Modify: `code/web_mvp/backend/tests/test_asr_stream.py`
 
-- [ ] **Step 1: Extend the cumulative FunASR regression test**
+- [x] **Step 1: Extend the cumulative FunASR regression test**
 
 Require both fields to contain only the new suffix:
 
@@ -111,7 +156,7 @@ assert second_partial["source_snapshot_text"] == first + second
 
 Also test a small cumulative re-recognition where the newest snapshot changes the last few characters. The result must preserve all source text through reconciliation and must not silently return an empty tail.
 
-- [ ] **Step 2: Run focused tests and verify RED**
+- [x] **Step 2: Run focused tests and verify RED**
 
 Run:
 
@@ -123,7 +168,7 @@ PYTHONPATH=code/web_mvp/backend python3 -m pytest \
 
 Expected: FAIL because `normalized_text` still contains the cumulative snapshot and `source_snapshot_text` is absent.
 
-- [ ] **Step 3: Implement safe incremental presentation events**
+- [x] **Step 3: Implement safe incremental presentation events**
 
 For `funasr_realtime` partials:
 
@@ -136,11 +181,11 @@ event["normalized_text"] = _normalize_text(display_text)
 
 Use exact prefix removal first. For bounded re-recognition, use a conservative longest common prefix/overlap calculation and mark `projection_reconciled=True`. Never fabricate text or discard an unmatched source snapshot.
 
-- [ ] **Step 4: Verify persistence and end-of-stream behavior**
+- [x] **Step 4: Verify persistence and end-of-stream behavior**
 
 Assert that persisted finals reconstruct the complete transcript, the final FunASR cumulative event does not duplicate already committed text, and non-FunASR Provider event IDs remain unchanged.
 
-- [ ] **Step 5: Run the ASR stream suite**
+- [x] **Step 5: Run the ASR stream suite**
 
 ```bash
 PYTHONPATH=code/web_mvp/backend python3 -m pytest \
@@ -158,7 +203,7 @@ Expected: PASS.
 - Modify: `tests/test_workbench_productized_ui.py`
 - Modify: `code/web_mvp/e2e/workbench_all_buttons_smoke.mjs`
 
-- [ ] **Step 1: Add failing canonical renderer contract tests**
+- [x] **Step 1: Add failing canonical renderer contract tests**
 
 Require these helpers:
 
@@ -172,7 +217,7 @@ upsertCanonicalActiveTail
 
 Tests must reject direct append rendering of raw partial/final events. They must require one `#transcript-document`, one `#transcript-active-tail`, paragraph markup with segment spans, and no visible repeated `发言：` label on every endpoint.
 
-- [ ] **Step 2: Run focused tests and verify RED**
+- [x] **Step 2: Run focused tests and verify RED**
 
 ```bash
 PYTHONPATH=code/web_mvp/backend python3 -m pytest \
@@ -181,7 +226,7 @@ PYTHONPATH=code/web_mvp/backend python3 -m pytest \
   -k 'canonical or active_tail or transcript_document'
 ```
 
-- [ ] **Step 3: Add stable transcript containers**
+- [x] **Step 3: Add stable transcript containers**
 
 Use:
 
@@ -193,15 +238,15 @@ Use:
 
 Keep `#transcript-stream` as the containing compatibility boundary so existing navigation and evidence tests continue to work.
 
-- [ ] **Step 4: Implement canonical frontend state**
+- [x] **Step 4: Implement canonical frontend state**
 
 State must store committed segments, one active tail and original/revision metadata. Partial updates only mutate the tail node. Final/revision updates rebuild committed paragraphs, then remove or replace the tail. Snapshot loading must prefer `body.canonical_transcript` and fall back to projecting legacy events.
 
-- [ ] **Step 5: Implement bounded paragraph grouping**
+- [x] **Step 5: Implement bounded paragraph grouping**
 
 Group adjacent committed segments when gap is at most 3000ms and combined display text is at most 180 characters. Render each underlying segment as a span carrying `data-segment-id`, evidence attributes and correction state so evidence clickback remains precise.
 
-- [ ] **Step 6: Update browser projection probes**
+- [x] **Step 6: Update browser projection probes**
 
 The browser smoke must inject `A -> AB -> ABC` source behavior as canonical segments and prove:
 
@@ -212,7 +257,7 @@ active tail count <= 1
 revision changes text without increasing segment count
 ```
 
-- [ ] **Step 7: Run Workbench and browser regression**
+- [x] **Step 7: Run Workbench and browser regression**
 
 ```bash
 PYTHONPATH=code/web_mvp/backend python3 -m pytest \
@@ -233,27 +278,27 @@ Expected: Python PASS and browser status `go_workbench_all_buttons_smoke`.
 - Modify: `code/web_mvp/backend/tests/test_workbench.py`
 - Modify: `code/web_mvp/e2e/workbench_all_buttons_smoke.mjs`
 
-- [ ] **Step 1: Add failing scroll-follow tests**
+- [x] **Step 1: Add failing scroll-follow tests**
 
 Require a 96px near-bottom threshold, no forced scroll while reading older content, a visible new-content button, click-to-resume and reduced-motion handling.
 
-- [ ] **Step 2: Add failing session recovery tests**
+- [x] **Step 2: Add failing session recovery tests**
 
 Require startup to load non-demo sessions, choose the newest session containing transcript or audio when no current session exists, fetch its events, apply its canonical snapshot and show `已恢复最近会议`.
 
-- [ ] **Step 3: Implement scroll-follow state**
+- [x] **Step 3: Implement scroll-follow state**
 
 Track whether the transcript center is following the bottom. Before each update record the prior position; after updates scroll only when following. Show `#btn-new-transcript-content` otherwise.
 
-- [ ] **Step 4: Implement latest-session recovery**
+- [x] **Step 4: Implement latest-session recovery**
 
 Add `restoreLatestRealSession()` after readiness loading and before the idle empty state is finalized. Do not restore mock/demo sessions. If the recovered session was interrupted, retain its transcript and show an honest disconnected status rather than `录音中`.
 
-- [ ] **Step 5: Add browser E2E coverage**
+- [x] **Step 5: Add browser E2E coverage**
 
 Test user-scroll-up preservation, new-content button behavior, page reload and restoration of the same canonical full text.
 
-- [ ] **Step 6: Verify focused and all-buttons tests**
+- [x] **Step 6: Verify focused and all-buttons tests**
 
 Run the Workbench suites and browser smoke. Expected: PASS with no console/network errors.
 
@@ -267,7 +312,7 @@ Run the Workbench suites and browser smoke. Expected: PASS with no console/netwo
 - Modify: `docs/current-mainline-index.md`
 - Modify: `docs/real-mic-workbench-mainline-report-2026-07-10.md`
 
-- [ ] **Step 1: Add canonical transcript evidence fields**
+- [x] **Step 1: Add canonical transcript evidence fields**
 
 Record:
 
@@ -282,15 +327,17 @@ latest_session_restore_status
 scroll_follow_status
 ```
 
-- [ ] **Step 2: Run controlled no-cost audio verification**
+- [x] **Step 2: Run controlled no-cost audio verification**
 
-Use a three-section Chinese technical source with two pauses. Require continuous recording-time text, one active tail, no cumulative duplication, complete export and recording SHA match.
+Use a multi-section Chinese technical source with pauses. The fresh controlled lane produced continuous recording-time text, one active tail at a time, no cumulative duplication, complete export and a matching recording SHA. The lane used local FunASR and a local fake OpenAI-compatible gateway, so it is chain evidence rather than production LLM evidence.
 
-- [ ] **Step 3: Run bounded real-microphone verification**
+- [x] **Step 3: Run bounded real-microphone verification**
+
+The bounded runs were executed and classified fail-closed: one run passed the audio-health gate but produced no non-empty FunASR final, and another was blocked by the audio-health gate. Both preserved the recording and matching export SHA. This step is complete as an evidence exercise, not as a production Go gate.
 
 Use the current local microphone path only after the deterministic gate passes. Do not repeat paid LLM calls unless the first run exposes a transient rather than deterministic failure.
 
-- [ ] **Step 4: Run full regression**
+- [x] **Step 4: Run full regression**
 
 ```bash
 PYTHONPATH=code/web_mvp/backend python3 -m pytest \
@@ -308,7 +355,33 @@ node --check code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbe
 git diff --check
 ```
 
-- [ ] **Step 5: Record the decision and actual result**
+- [x] **Step 5: Record the decision and actual result**
 
 Document the canonical transcript contract, cumulative reconciliation, complete-document UX, session restore behavior, artifacts and remaining No-Go items. Do not claim production completion unless full text, export equality, real microphone and recording-time AI gates all pass.
 
+## Reconciled Result - 2026-07-13
+
+The implementation and evidence steps in this plan are complete. The product release is not.
+
+Fresh workspace verification:
+
+- backend package regression: 642 passed, 2 warnings
+- root regression: 351 passed, 2 warnings
+- ASR runtime regression: 89 passed, 1 warning
+- Node syntax checks: passed
+- git diff --check: passed
+- 8767 /health: status ok, service meeting-copilot-web-mvp
+
+The deterministic correction fixture also passed the real backend API to canonical UI path:
+
+- status: go_deterministic_correction_e2e
+- revision_count: 1
+- canonical target: det_corr_seg_1
+- canonical source: det_corr_seg_1:rtc-v1
+- original ASR disclosure: true
+- original evidence clickback: true
+- counts_as_production_llm_evidence: false
+- remote_asr_called: false
+- local_gateway_called: true
+
+Remaining release gates are intentionally outside this plan: a newly rotated, explicitly authorized remote OpenAI-compatible gateway run; natural Chinese multi-speaker microphone quality; Chinese technical terminology and sentence-boundary quality; real wall-clock long-meeting soak; and Mac/Windows package acceptance. Any credential previously exposed in chat must be rotated and supplied only through an ignored environment/config mechanism before the remote gateway gate is run.

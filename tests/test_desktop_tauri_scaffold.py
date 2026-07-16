@@ -53,10 +53,16 @@ FORBIDDEN_GENERATED_SUFFIXES = (
     ".app",
 )
 
-EXPECTED_NOOP_COMMANDS = {
+EXPECTED_BRIDGE_COMMANDS = {
     "runtime_get_status": "runtime.get_status",
+    "runtime_write_frontend_probe": "runtime.write_frontend_probe",
     "session_prepare": "session.prepare",
-    "asr_worker_health": "asr_worker.health",
+    "asr_worker_prepare": "worker.prepare",
+    "asr_worker_start": "worker.start",
+    "asr_worker_health": "worker.health",
+    "asr_worker_collect_events": "worker.collect_events",
+    "asr_worker_stop": "worker.stop",
+    "asr_worker_cleanup": "worker.cleanup",
     "mic_adapter_prepare": "mic_adapter.prepare",
     "mic_adapter_status": "mic_adapter.status",
     "mic_adapter_start": "mic_adapter.start",
@@ -64,6 +70,28 @@ EXPECTED_NOOP_COMMANDS = {
     "mic_adapter_resume": "mic_adapter.resume",
     "mic_adapter_stop": "mic_adapter.stop",
     "mic_adapter_delete_audio_chunks": "mic_adapter.delete_audio_chunks",
+}
+
+EXPECTED_STILL_NOOP_MIC_COMMANDS = {
+    "mic_adapter_prepare",
+    "mic_adapter_status",
+    "mic_adapter_pause",
+    "mic_adapter_resume",
+}
+
+EXPECTED_AUDIO_CHUNK_RUNTIME_COMMANDS = {
+    "mic_adapter_start": "desktop_audio_chunk_runtime::start_recording",
+    "mic_adapter_stop": "desktop_audio_chunk_runtime::stop_recording",
+    "mic_adapter_delete_audio_chunks": "desktop_audio_chunk_runtime::delete_audio_chunks",
+}
+
+EXPECTED_ASR_WORKER_LIFECYCLE_RUNTIME_COMMANDS = {
+    "asr_worker_prepare": "desktop_asr_worker_lifecycle_runtime::prepare_worker",
+    "asr_worker_start": "desktop_asr_worker_lifecycle_runtime::start_worker",
+    "asr_worker_health": "desktop_asr_worker_lifecycle_runtime::worker_health",
+    "asr_worker_collect_events": "desktop_asr_worker_lifecycle_runtime::collect_events",
+    "asr_worker_stop": "desktop_asr_worker_lifecycle_runtime::stop_worker",
+    "asr_worker_cleanup": "desktop_asr_worker_lifecycle_runtime::cleanup_worker",
 }
 
 
@@ -106,7 +134,7 @@ def test_required_tauri_scaffold_files_exist_without_generated_artifacts():
     assert forbidden_directories == []
 
 
-def test_tauri_config_points_to_existing_web_mvp_and_keeps_spike_safe():
+def test_tauri_config_points_to_existing_web_mvp_and_declares_mac_dev_bundle_targets():
     config = _tauri_config()
 
     assert config["productName"] == "Meeting Copilot"
@@ -126,10 +154,21 @@ def test_tauri_config_points_to_existing_web_mvp_and_keeps_spike_safe():
     main_window = app["windows"][0]
     assert main_window["title"] == "Meeting Copilot"
     assert main_window["resizable"] is True
+    assert main_window["visible"] is False
     assert main_window["minWidth"] >= 1024
     assert main_window["minHeight"] >= 720
 
-    assert config["bundle"]["active"] is False
+    bundle = config["bundle"]
+    assert bundle["active"] is True
+    assert set(bundle["targets"]) == {"app", "dmg"}
+    assert bundle["icon"] == ["icons/icon.png"]
+    assert bundle["macOS"]["infoPlist"] == "Info.plist"
+    assert bundle["macOS"]["minimumSystemVersion"] == "13.0"
+
+    info_plist = (TAURI_ROOT / "Info.plist").read_text(encoding="utf-8")
+    assert "NSMicrophoneUsageDescription" in info_plist
+    assert "NSAudioCaptureUsageDescription" in info_plist
+    assert "NSScreenCaptureUsageDescription" in info_plist
 
 
 def test_tauri_default_icon_exists_for_generate_context_without_bundle_artifacts():
@@ -185,14 +224,14 @@ def test_tauri_capability_stays_minimal_for_noop_shell():
         assert permission not in permission_text
 
 
-def test_tauri_lib_binds_noop_bridge_and_mic_adapter_commands():
+def test_tauri_lib_binds_bridge_and_mic_adapter_commands():
     lib_rs = _read("src-tauri/src/lib.rs")
 
     public_command_functions = re.findall(r"#\[tauri::command\]\s*pub fn ([a-z0-9_]+)\(", lib_rs)
     assert public_command_functions == []
 
     command_functions = re.findall(r"#\[tauri::command\]\s*fn ([a-z0-9_]+)\(", lib_rs)
-    assert set(command_functions) == set(EXPECTED_NOOP_COMMANDS)
+    assert set(command_functions) == set(EXPECTED_BRIDGE_COMMANDS)
 
     handler_match = re.search(r"generate_handler!\s*\\?\[\s*(.*?)\s*\]", lib_rs, re.S)
     assert handler_match is not None
@@ -201,25 +240,38 @@ def test_tauri_lib_binds_noop_bridge_and_mic_adapter_commands():
         for name in handler_match.group(1).split(",")
         if name.strip()
     }
-    assert handler_names == set(EXPECTED_NOOP_COMMANDS)
+    assert handler_names == set(EXPECTED_BRIDGE_COMMANDS)
 
-    for rust_function, command_id in EXPECTED_NOOP_COMMANDS.items():
+    for rust_function, command_id in EXPECTED_BRIDGE_COMMANDS.items():
         assert rust_function in lib_rs
         assert f'"{command_id}"' in lib_rs
 
-    for mic_function in [
-        "mic_adapter_prepare",
-        "mic_adapter_status",
-        "mic_adapter_start",
-        "mic_adapter_pause",
-        "mic_adapter_resume",
-        "mic_adapter_stop",
-        "mic_adapter_delete_audio_chunks",
-    ]:
+    for mic_function in EXPECTED_STILL_NOOP_MIC_COMMANDS:
         assert re.search(
             rf"#\[tauri::command\]\s*fn {mic_function}\(\) -> NoopBridgeResponse",
             lib_rs,
         )
+
+    for mic_function, runtime_call in EXPECTED_AUDIO_CHUNK_RUNTIME_COMMANDS.items():
+        assert re.search(
+            rf"#\[tauri::command\]\s*fn {mic_function}\(\s*session_id: Option<String>,?\s*\) -> desktop_audio_chunk_runtime::AudioChunkCommandResponse",
+            lib_rs,
+        )
+        assert runtime_call in lib_rs
+
+    for worker_function, runtime_call in EXPECTED_ASR_WORKER_LIFECYCLE_RUNTIME_COMMANDS.items():
+        assert re.search(
+            rf"#\[tauri::command\]\s*fn {worker_function}\(\s*session_id: Option<String>,?\s*\) -> desktop_asr_worker_lifecycle_runtime::AsrWorkerLifecycleResponse",
+            lib_rs,
+        )
+        assert runtime_call in lib_rs
+
+
+def test_tauri_runtime_status_exposes_packaged_same_chain_probe_flag():
+    lib_rs = _read("src-tauri/src/lib.rs")
+
+    assert "packaged_same_chain_probe_enabled" in lib_rs
+    assert "MEETING_COPILOT_PACKAGED_SAME_CHAIN_PROBE" in lib_rs
 
 
 def test_noop_bridge_response_contract_declares_no_side_effects():
@@ -260,7 +312,34 @@ def test_noop_bridge_response_contract_declares_no_side_effects():
     assert "writes_local_files: false" in lib_rs
 
 
-def test_scaffold_keeps_audio_worker_secret_remote_and_process_boundaries_unbound():
+def test_desktop_frontend_probe_command_is_bound_to_safe_artifact_runtime():
+    lib_rs = _read("src-tauri/src/lib.rs")
+    probe_rs = _read("src-tauri/src/desktop_frontend_probe_runtime.rs")
+
+    assert "runtime.write_frontend_probe" in lib_rs
+    assert "runtime_write_frontend_probe" in lib_rs
+    assert "desktop_frontend_probe_runtime::write_frontend_probe" in lib_rs
+    assert "runtime_write_frontend_probe" in lib_rs.split("generate_handler!")[1]
+    assert "FRONTEND_PROBE_ROOT" in probe_rs
+    assert "artifacts/tmp/desktop_frontend_probe_runtime" in probe_rs
+    assert "latest-page-load.json" in probe_rs
+    assert "latest-inline-dom.json" in probe_rs
+    assert "latest-workbench-runtime.json" in probe_rs
+    assert "serde_json::to_string_pretty" in probe_rs
+    assert "calls_remote_provider: false" in probe_rs
+    assert "captures_audio: false" in probe_rs
+
+
+def test_desktop_frontend_probe_records_packaged_page_load_from_rust_side():
+    lib_rs = _read("src-tauri/src/lib.rs")
+
+    assert ".on_page_load(" in lib_rs
+    assert "rust_page_load_probe" in lib_rs
+    assert "PageLoadEvent::Finished" in lib_rs
+    assert "desktop_frontend_probe_runtime::write_frontend_probe" in lib_rs
+
+
+def test_scaffold_binds_local_backend_supervisor_without_remote_client_or_secret_reads():
     checked_paths = [
         "src-tauri/Cargo.toml",
         "src-tauri/build.rs",
@@ -268,6 +347,7 @@ def test_scaffold_keeps_audio_worker_secret_remote_and_process_boundaries_unboun
         "src-tauri/capabilities/default.json",
         "src-tauri/src/main.rs",
         "src-tauri/src/lib.rs",
+        "src-tauri/src/desktop_backend_supervisor.rs",
     ]
     scaffold_text = "\n".join(_read(path) for path in checked_paths)
 
@@ -283,15 +363,9 @@ def test_scaffold_keeps_audio_worker_secret_remote_and_process_boundaries_unboun
         "getUserMedia",
         "enumerateDevices",
         "MediaRecorder",
-        "asr_worker_start",
         "asr_worker.start",
-        "Command::new",
-        "std::process",
         "tokio::process",
-        "std::fs",
         "File::create",
-        "OpenOptions",
-        "env::var",
         "CoreAudio",
         "coreaudio",
         "ScreenCaptureKit",
@@ -311,3 +385,23 @@ def test_scaffold_keeps_audio_worker_secret_remote_and_process_boundaries_unboun
     ]
     for snippet in forbidden_snippets:
         assert snippet not in scaffold_text
+
+    for required in [
+        "BackendSupervisor",
+        "start_packaged",
+        "reserve_loopback_port",
+        "wait_for_health",
+        "stop_child_process_group",
+        'Command::new("/bin/sh")',
+        'env_remove("PYTHONPATH")',
+        "RunEvent::Exit",
+        "WindowEvent::CloseRequested",
+        'navigate(url)',
+    ]:
+        assert required in scaffold_text
+
+    env_reads = set(re.findall(r'env::var\("([^"]+)"\)', scaffold_text))
+    assert env_reads == {
+        "MEETING_COPILOT_DESKTOP_API_BASE_URL",
+        "MEETING_COPILOT_PACKAGED_SAME_CHAIN_PROBE",
+    }

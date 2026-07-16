@@ -1,0 +1,47 @@
+Meeting Copilot Third-Party and Supply-Chain Notice
+
+Copyright (c) 2026 Meeting Copilot project contributors.
+
+1. First-party code
+
+First-party source code in this repository is provided under the Meeting
+Copilot Internal Evaluation License in LICENSE. This license does not grant
+rights to third-party materials.
+
+2. Dependency inventory
+
+The machine-readable dependency inventory is sbom.cdx.json. It is generated
+without network access from the repository lockfiles and the dependency/model
+provenance policy. A component marked unresolved has not been approved for
+redistribution merely because it appears in the inventory.
+
+3. Runtime and model materials
+
+The project currently references FunASR and ModelScope runtime packages, the
+following Chinese ASR model identifiers, and an FFmpeg runtime:
+
+- iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch
+- iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online
+- iic/speech_fsmn_vad_zh-cn-16k-common-pytorch
+- iic/punc_ct-transformer_cn-en-common-vocab471067-large
+- imageio-ffmpeg and an FFmpeg executable used for audio conversion
+
+At the time of this notice, the immutable model revisions, complete artifact
+manifests, FFmpeg build provenance, and redistribution approvals are recorded
+as unresolved in configs/release-provenance.json. These materials must not be
+copied into a public or commercial package until that policy is changed to
+approved with source, revision, hash, license, and distribution evidence.
+
+4. Source and copyright materials
+
+Upstream copyright and license texts must be retained with any approved
+redistribution. The SBOM and dependency/model provenance documents identify
+the source family and current lockfile. This NOTICE is not a substitute for
+an upstream license, model card, or binary source offer.
+
+5. User data
+
+This repository does not grant permission to redistribute meeting recordings,
+microphone captures, transcripts, prompts, API credentials, or other private
+user data. Generated evidence under artifacts/tmp is local test output and is
+not part of a public release.

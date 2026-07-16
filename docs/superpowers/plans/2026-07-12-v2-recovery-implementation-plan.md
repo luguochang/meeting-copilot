@@ -8,6 +8,80 @@
 
 **Tech Stack:** Python 3.14, FastAPI, SQLite, vanilla JavaScript, local FunASR/Sherpa, OpenAI-compatible LLM gateway, pytest, Node/Chrome CDP, Tauri.
 
+## Current Execution Status (2026-07-13, refreshed)
+
+The V2 recovery is being verified with package-scoped test entrypoints. The latest
+browser evidence is green for the Workbench and the fixture-only long-meeting UI
+flow, but these results do not close the production gates below.
+
+- [x] Canonical transcript counting in the long-meeting verifier excludes empty-state
+  `.utterance` placeholders after delete.
+- [x] The all-buttons verifier uses the same canonical selector for import waits,
+  delete assertions, and screenshot state reports.
+- [x] Root regression: `python3 -m pytest -q tests` -> `351 passed, 2 warnings`.
+- [x] Backend regression: `PYTHONPATH=.:../../core python3 -m pytest -q` from
+  `code/web_mvp/backend` -> `642 passed, 2 warnings`.
+- [x] All-buttons browser E2E: `go_workbench_all_buttons_smoke`, 25 screenshots,
+  no runtime exceptions, console errors, loading failures, or HTTP 5xx responses.
+- [x] Long-meeting Workbench fixture E2E: `go_long_meeting_ui_evidence`, 12
+  canonical segments, 1 correction, 4 suggestion cards, 2 approach cards,
+  minutes, evidence clickback, exports, and delete reset.
+- [x] Deterministic 20-minute synthetic soak: `artifacts/tmp/soak/v2-recovery-synthetic-20260713/soak_report.json`, 600 chunks, RTF `0.1`, RSS growth `12 MB`, no remote ASR/LLM.
+- [x] Existing public Chinese ASR baseline was rechecked from
+  `artifacts/tmp/asr_reports/public_chinese_asr_baseline_20260710.json`; it remains
+  `needs_asr_optimization_before_release`, so no additional public audio was downloaded.
+- [x] Existing real-microphone recording export SHA was independently rehashed:
+  `realtime-focus-speaker-to-real-mic-production-20260711-final`, HTTP `200`,
+  `3194924` bytes, computed SHA matched the session SHA.
+- [x] Fresh controlled real-microphone no-cost evidence was recorded and classified
+  honestly: the 30-second run had audio health pass but no ASR final; the 60-second
+  run was `blocked_audio_too_quiet`; both saved audio and matched export SHA, with
+  zero browser runtime/console/network errors.
+- [x] Real-microphone verifier report counts now use canonical transcript rows; the
+  historical No-Go JSON was not rewritten.
+- [x] Local FunASR streaming worker uses an explicit `ready` event and an existing
+  local Paraformer model directory; direct worker evidence produced 11 non-empty
+  partials and 1 final without model download.
+- [x] Controlled Chrome browser microphone evidence: `browser_live_mic` captured
+  non-empty real FunASR final, saved audio with matching SHA, and passed the local
+  audio health gate. This is controlled speaker/TTS evidence, not natural
+  multi-speaker meeting acceptance.
+- [x] Same-segment stable-partial -> final candidate upgrade: confirmed final now
+  produces a `_final` queued candidate, and a local fake OpenAI-compatible gateway
+  generated one formal card with usage `170` tokens. The user gateway was not called
+  in this verification.
+- [x] FunASR readiness gate: backend waits for explicit local worker `ready`, the
+  Workbench queues audio until `asr_ready`, and `asr_ready_timeout` stops retrying.
+  Real 8767 handshake passed with `asr_starting -> asr_ready -> partial` and
+  `ready_latency_ms=5278.7`.
+- [x] Deterministic correction fixture: the real backend correction endpoint,
+  canonical corrected target/source IDs, original ASR disclosure and evidence
+  clickback all passed with two screenshots. The local fake gateway result is
+  explicitly excluded from production LLM evidence.
+- [ ] One root-level regression command that configures all package paths; bare
+  `python3 -m pytest -q` still fails collection because this repository contains
+  multiple package-local test namespaces. Use the package-scoped commands above.
+- [ ] Real microphone acoustic gate and non-empty non-fake ASR final.
+- [ ] Recording-time formal AI suggestion gate in production mode.
+- [ ] Real wall-clock 20-minute soak.
+- [ ] Mac package production acceptance and Windows real-machine acceptance.
+
+Fresh evidence reports: `docs/v2-funasr-real-mic-evidence-2026-07-13.md` and
+`docs/v2-ready-gate-followup-2026-07-13.md`. The ready gate is implemented, but
+the fresh browser follow-up captured zero input samples (`rms=0`, `peak=0`) and
+therefore remains No-Go for non-empty ASR final. Chinese technical term quality,
+model warmup latency, natural multi-speaker audio, real-gateway recording-time AI,
+and wall-clock soak remain open.
+
+The fixture long-meeting run is explicitly not a real audio runtime, production
+soak, paid LLM run, or real-microphone acceptance. See `DEC-336` in
+`docs/decision-log.md` for the decision and evidence paths.
+
+The historical task checkboxes below remain an implementation backlog and are
+not rewritten merely because package regressions pass. Only the reconciled
+status block above and dated decision-log entries represent current evidence.
+Unpassed release gates remain unchecked.
+
 ---
 
 ### Task 1: Restore The Persistence Contract
@@ -105,3 +179,25 @@
 - [ ] Run fresh real-microphone, recording-time AI and long-meeting gates.
 - [ ] Produce and smoke-test the Mac package.
 - [ ] Rewrite completion documents from current evidence and leave unpassed gates unchecked.
+
+## 2026-07-13 Execution Reconciliation
+
+本计划的历史任务清单不能直接作为“全部完成”标志；以下是本轮新鲜证据对主线的校准：
+
+已验证：
+
+- FunASR 显式 `ready`、后端 readiness gate、前端 ready 前有界缓存和 ready timeout fail-closed。
+- backend `641 passed, 2 warnings`、root `342 passed, 2 warnings`、ASR runtime `89 passed, 1 warning`。
+- Workbench all-buttons `go_workbench_all_buttons_smoke`，25 张截图，浏览器 runtime/console/network/HTTP 5xx 均为 0。
+- 非静音受控浏览器输入的实时文字、final、录音保存/导出 SHA、会后建议/方案/纪要。
+- 多段受控输入的录音期正式建议：5 个 final，首张正式建议约 15028ms 可见；使用本机 fake gateway，不计入 production LLM evidence。
+
+仍未完成：
+
+- 真实远程 gateway 的录音期正式建议和真实费用/usage 验收；本轮没有读取或调用用户 key。
+- 当前 Chrome 默认 sandbox 下 fake-file 输入的有效采样问题；`--no-sandbox` 仅是诊断参数，不得进入生产启动配置。
+- 自然多人中文会议的 ASR 术语、数字、断句和口音质量门禁。
+- 真实麦克风自然声源、真实 wall-clock 20 分钟 soak、Mac 公测签名/公证/Gatekeeper、Windows 真机。
+- 根目录裸 `python3 -m pytest -q` 的多包收集契约；当前必须使用 package-scoped 回归命令。
+
+本轮主线结论：正式建议业务链路已经有可重复的受控闭环，下一步不再重复单段音频实验；只在成本/隐私明确后做一次真实远程 provider 验收，其他开发回归继续使用本机 fake gateway 或 no-cost deterministic lane。

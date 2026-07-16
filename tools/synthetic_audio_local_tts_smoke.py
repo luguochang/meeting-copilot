@@ -73,6 +73,8 @@ def _run_local_tts(
     text: str,
     aiff_output_path: str,
     wav_output_path: str,
+    voice: str | None = None,
+    rate_wpm: int | None = None,
 ) -> tuple[str, list[str], dict[str, int | None]]:
     errors: list[str] = []
     artifact_sizes: dict[str, int | None] = {
@@ -86,7 +88,7 @@ def _run_local_tts(
     wav_path = REPO_ROOT / wav_output_path
     aiff_path.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(
-        ["say", "-o", str(aiff_path), text],
+        _say_command(text=text, aiff_output_path=str(aiff_path), voice=voice, rate_wpm=rate_wpm),
         check=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
@@ -108,15 +110,66 @@ def _run_local_tts(
     return "generated_wav", errors, artifact_sizes
 
 
+def _say_command(
+    *,
+    text: str,
+    aiff_output_path: str,
+    voice: str | None,
+    rate_wpm: int | None,
+) -> list[str]:
+    command = ["say"]
+    if voice:
+        command.extend(["-v", voice])
+    if rate_wpm is not None:
+        command.extend(["-r", str(rate_wpm)])
+    command.extend(["-o", aiff_output_path, text])
+    return command
+
+
+def _say_command_preview(
+    *,
+    aiff_output_path: str,
+    voice: str | None,
+    rate_wpm: int | None,
+) -> list[str]:
+    return _say_command(
+        text="<synthetic_script_text>",
+        aiff_output_path=aiff_output_path,
+        voice=voice,
+        rate_wpm=rate_wpm,
+    )
+
+
+def _voice_errors(voice: str | None) -> list[str]:
+    if voice is None:
+        return []
+    if not voice.strip():
+        return ["voice must not be blank"]
+    if any(char in voice for char in {"/", "\\", "\n", "\r", "\t"}):
+        return ["voice must be a simple macOS say voice name"]
+    return []
+
+
+def _rate_errors(rate_wpm: int | None) -> list[str]:
+    if rate_wpm is None:
+        return []
+    if rate_wpm < 80 or rate_wpm > 220:
+        return ["rate_wpm must be between 80 and 220"]
+    return []
+
+
 def build_synthetic_audio_local_tts_smoke_report(
     *,
     script_id: str,
     target_root: str,
     execute_local_tts: bool,
     run_commands: bool = True,
+    voice: str | None = None,
+    rate_wpm: int | None = None,
 ) -> dict[str, object]:
     scripts = _load_scripts()
     errors: list[str] = []
+    voice = voice.strip() if isinstance(voice, str) and voice.strip() else None
     script_tuple = scripts.get(script_id)
     if script_tuple is None:
         errors.append("script_id is not approved")
@@ -134,6 +187,8 @@ def build_synthetic_audio_local_tts_smoke_report(
         errors.append("target_root is not allowed")
     if _is_under_any_root(target_root, FORBIDDEN_TARGET_ROOTS):
         errors.append("target_root is forbidden")
+    errors.extend(_voice_errors(voice))
+    errors.extend(_rate_errors(rate_wpm))
 
     aiff_output_path = f"{target_root}/{script_id}.aiff"
     wav_output_path = f"{target_root}/{script_id}.wav"
@@ -161,6 +216,8 @@ def build_synthetic_audio_local_tts_smoke_report(
                 text=_script_text(script),
                 aiff_output_path=aiff_output_path,
                 wav_output_path=wav_output_path,
+                voice=voice,
+                rate_wpm=rate_wpm,
             )
             smoke_status = "generated" if generation_status.startswith("generated") else "failed"
         except subprocess.CalledProcessError as exc:
@@ -181,7 +238,13 @@ def build_synthetic_audio_local_tts_smoke_report(
         "turn_count": turn_count,
         "text_character_count": text_character_count,
         "tts_engine": "macos_say",
-        "tts_command_preview": ["say", "-o", aiff_output_path, "<synthetic_script_text>"],
+        "tts_voice": voice,
+        "tts_rate_wpm": rate_wpm,
+        "tts_command_preview": _say_command_preview(
+            aiff_output_path=aiff_output_path,
+            voice=voice,
+            rate_wpm=rate_wpm,
+        ),
         "wav_conversion_command_preview": [
             "afconvert",
             "-f",
@@ -215,6 +278,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--script-id", required=True)
     parser.add_argument("--target-root", default="artifacts/tmp/synthetic_audio")
     parser.add_argument("--execute-local-tts", action="store_true")
+    parser.add_argument("--voice")
+    parser.add_argument("--rate-wpm", type=int)
     return parser.parse_args(argv)
 
 
@@ -224,6 +289,8 @@ def main(argv: list[str] | None = None, *, out: TextIO = sys.stdout) -> int:
         script_id=args.script_id,
         target_root=args.target_root,
         execute_local_tts=args.execute_local_tts,
+        voice=args.voice,
+        rate_wpm=args.rate_wpm,
     )
     json.dump(report, out, ensure_ascii=False, indent=2)
     print(file=out)

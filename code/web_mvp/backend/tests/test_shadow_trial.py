@@ -74,15 +74,15 @@ def test_shadow_trial_real_asr_to_cards_with_metrics(monkeypatch, tmp_path):
         found = [e for e in EXPECTED_ENTITIES if e.lower() in normalized.lower() or (e == "error_rate" and "错误率" in normalized)]
         entity_recall = len(found) / len(EXPECTED_ENTITIES)
 
-        # 3. real LLM execution -> real suggestion cards
-        cards_resp = client.post("/live/asr/sessions/shadow_trial/llm-execution-runs", json={"mode": "enabled"})
+        # 3. demo LLM execution on a non-acceptance mock session -> suggestion cards
+        cards_resp = client.post("/live/asr/demo/sessions/shadow_trial/llm-execution-runs", json={"mode": "enabled"})
         assert cards_resp.status_code == 200
         cards_body = cards_resp.json()
         completed_cards = [r for r in cards_body["runs"] if r.get("card_status") == "new"]
 
         # 4. approach cards + minutes
-        approach = client.post("/live/asr/sessions/shadow_trial/approach-cards", json={"mode": "enabled"}).json()
-        minutes = client.post("/live/asr/sessions/shadow_trial/minutes", json={"mode": "enabled"}).json()
+        approach = client.post("/live/asr/demo/sessions/shadow_trial/approach-cards", json={"mode": "enabled"}).json()
+        minutes = client.post("/live/asr/demo/sessions/shadow_trial/minutes", json={"mode": "enabled"}).json()
 
         # 5. technical metrics
         report = {

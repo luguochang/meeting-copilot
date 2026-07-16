@@ -3,6 +3,48 @@
 > 日期：2026-06-19  
 > 用途：记录 Meeting Copilot 的重要产品、技术、成本、隐私和阶段决策。后续所有关键方向变化必须追加到本文档，并同步更新相关专项文档。
 
+## DEC-368: 真实麦克风与远程中转站主链路通过
+
+日期：2026-07-14
+
+状态：Accepted / Implemented
+
+背景：
+
+- 需要确认主流程是否真实可用，而不是只通过 mock 或局部边界测试。
+- 用户反馈页面把底层 partial/event 数量误显示为大量“实时文字”，且实时 ASR ready 与 AI 修正状态不准确。
+
+决策：
+
+- 将 2026-07-14 的真实 `getUserMedia` 麦克风、扬声器播放中文会议声源、本地 FunASR/Paraformer streaming、远程 OpenAI-compatible LLM 中转站验证认定为当前 PC Workbench 的 clean mainline pass。
+- Workbench 的用户可见文字计数统一使用 canonical 已确认段落，不使用底层审计事件数。
+- ASR `asr_ready` 到达后立即显示“已就绪”；实时修正状态累计保留已应用修正，后续无修改批次不得覆盖“AI 已校正”。
+
+证据：
+
+- 报告：`docs/real-mic-remote-mainline-report-2026-07-14.md`。
+- 会话：`rec_mrk6n8kk`；证据目录：`artifacts/tmp/browser_live_mic/real-remote-mainline-20260714-130017`。
+- 真实浏览器麦克风采集通过：94 个音频块，RMS `0.0586`，FunASR real provider，3 个 final。
+- 录音中展示 10 个 partial、3 个确认段、1 张 evidence-backed AI 建议和 1 段 AI 修正；结束后录音 SHA 一致、3 张方案分析、421 字符会议纪要。
+- 首个实时文字 `3367ms`，首个 final `8709ms`，首张实时建议 `25136ms`；console/network errors 均为 0。
+
+成本与隐私：
+
+- ASR 全部本地执行，不产生远程 ASR 费用。
+- 本次只使用已有远程 LLM 中转站配置，6 次调用、3565 tokens；API key 未写入日志、截图或报告。
+
+限制与复审：
+
+- 受控扬声器声源不等同于自然多人远场会议；中文术语、口音、串音和抢话仍需独立验收。
+- 首张建议约 25.1 秒，后续优化目标是降低现场等待，不宣称毫秒级。
+- 远程中转站的额度、费用、SLA、网络波动稳定性，以及 macOS 签名公证和 Windows 实机发布仍是独立门禁。
+- 上一场 `rec_mrk08gl0` 因浏览器未正常点击结束而产生 `stream_interrupted`，只保留为异常收尾证据，不计入本次 clean pass。
+
+回归：
+
+- `code/web_mvp/backend/tests`：683 passed，2 warnings。
+- `node --check workbench.js`、`python3 -m compileall`、`git diff --check`：通过。
+
 ## 记录规则
 
 重要决策必须落文档，不能只停留在聊天记录或临时实验输出中。
@@ -28,6 +70,4777 @@
 - 验证方式：测试、smoke、评测或后续验收。
 - 关联文档：同步更新或依赖的文档。
 - 复审条件：什么情况下需要重新评估。
+
+## DEC-366: Mainline-First Workbench Information Architecture
+
+日期：2026-07-13
+
+状态：Accepted / Implemented
+
+背景：
+
+- 用户实际使用反馈显示，结束会议后右侧的“会后复盘与工具”位于关闭的 `details` 和右侧长列表底部，整理、纪要、历史和导出入口难以发现。
+- 这不是 ASR 或 LLM 评测边界问题，而是主流程的信息架构问题：用户完成会议后首先需要看到完整文字稿、录音状态和下一步操作。
+
+决策：
+
+- 实时文字稿继续作为 Workbench 主视区的第一内容。
+- 会后复盘区移动到文字稿主区之后，改为普通 `section`，结束会议进入 ready/recorded 状态后直接显示，不再依赖折叠 `details`。
+- 会议操作使用桌面三列布局；生成和导出操作使用两列布局；移动端统一降为两列，避免按钮堆成一条长柱。
+- 右侧只保留实时状态、实时提醒和录音期间 AI 建议；历史和会后操作不再藏在右侧底部。
+- 页面顶部状态条继续显示文字、实时提醒、AI 建议、方案、录音保存和会后复盘的摘要计数，用作快速跳转入口。
+
+影响范围：
+
+- `frontend_static/workbench.html`：会后区域结构、响应式按钮布局和首屏信息层级。
+- `frontend_static/workbench.js`：session ready 后同步显示会后工作区。
+- Workbench productized UI、全按钮 smoke 和移动端布局验收。
+
+验证方式：
+
+- Workbench/backend focused `173 passed`；productized UI `11 passed`。
+- `go_workbench_all_buttons_smoke` 通过，25 张截图，runtime exceptions、console errors、network loading failures、HTTP 5xx 均为 0。
+- 375x812 移动布局：文档宽度等于视口宽度，无横向溢出、按钮重叠或主要文字裁切。
+- 结束态截图：`code/web_mvp/backend/artifacts/tmp/ui_screenshots/workbench-all-buttons-layout-final-20260713/24-organize_completed.png`。
+
+成本/隐私影响：
+
+- 无新增远程调用、ASR provider 或数据上传；仅调整本地页面结构和已有状态展示。
+
+复审条件：
+
+- 若真实长会议中完整文字稿过长导致会后入口仍需滚动，优先增加主区内的固定“会后复盘”跳转，不恢复右侧折叠长列表设计。
+
+## DEC-367: Enumerate Microphone Devices After Permission
+
+日期：2026-07-13
+
+状态：Accepted / Implemented
+
+背景：
+
+- 为解决真实系统麦克风静音/错误路由问题，Workbench 需要提供输入设备选择和可见电平。
+- 在页面启动阶段调用 `enumerateDevices()` 会在当前 Chrome fake-media 环境中让后续 `getUserMedia()` 权限请求保持 pending，阻断会议开始。
+
+决策：
+
+- 启动时只保留系统默认麦克风入口，不阻塞页面启动。
+- 首次 `getUserMedia()` 成功后再枚举设备并填充选择器；用户选择的设备通过 `deviceId` 约束传入下一次会议。
+- 录音期间显示输入电平和“未检测到声音/输入正常”状态，低音量仍然 fail-closed，不把静音标记为 ASR 成功。
+
+验证方式：
+
+- 新增设备选择、电平、权限时序测试，WorkBench focused 测试通过。
+- 受控音频主流程和全按钮 smoke 在该改动后保持通过；真实系统麦克风仍需要有效中文声源才能进入 ASR Go。
+
+## DEC-368: E2E Assertions Must Follow Canonical Product Contracts
+
+日期：2026-07-13
+
+状态：Accepted / Implemented
+
+背景：
+
+- 旧验收脚本依赖已删除或不稳定的 UI 文案、泛 `.utterance` 计数、固定 `workbench_` session 前缀和 `<pre>` 结构，导致真实页面已经产生内容时仍长时间等待或误报失败。
+- 继续增加等待时间会掩盖产品状态，不能解决契约漂移。
+
+决策：
+
+- E2E 使用 canonical transcript selector、结构化 cockpit 状态、历史项 `data-session-id`、纪要生成状态和会议停止后的按钮状态作为验收契约。
+- 质量不足的整理结果必须作为可解释的终态处理，不能为了通过 gate 把质量阻塞改写为成功。
+- runner 只验证产品行为，不用旧文案或隐藏 DOM 文本替代可见状态。
+
+验证方式：
+
+- `workbench_browser_live_mic_gate.test.mjs`：23 passed。
+- `test_workbench_all_buttons_smoke.py` 与 productized UI tests：26 passed。
+- `workbench_smoke.mjs` 和 `workbench_all_buttons_smoke.mjs` 在最新布局后均完成主流程验证；后者为 `go_workbench_all_buttons_smoke`、25 张截图。
+- 完整新的 live-mic production runner 尚未在本决策后重新执行，不能把契约测试结果等同于真实麦克风 Go。
+
+## DEC-369: Preserve Actual Operation Errors In The Workbench
+
+日期：2026-07-13
+
+状态：Accepted / Implemented
+
+背景：
+
+- 用户反馈页面在 AI 建议、实时校正和会后整理失败时，界面经常统一显示“语音质量不足”或“暂不可用”，无法区分麦克风权限、音频静音、ASR 门禁、LLM 网关错误、HTTP 409/5xx 和网络失败。
+- 这会把真实的接口故障误判成 ASR 语义质量问题，也会让用户无法知道应该重试哪个动作。
+- 空会话的 AI 区域原先显示“正在根据已确认发言分析”，与没有会议的状态相矛盾。
+
+决策：
+
+- Workbench 使用统一的 `operationErrorMessage()` 从 HTTP error body、`detail`、网络错误和 fallback 中提取用户可见错误；AI 建议请求失败记录为 `provider_error`，不伪装成 `acceptance_blocked`。
+- 实时校正失败和会后整理失败必须把实际原因写入当前状态区；会后整理失败时保留已确认文字，并提示可以刷新文字重试。
+- 只有服务端明确返回 `asr_semantic_quality_blocked` 时，页面才显示语义质量降级文案。
+- 空会话 AI 区域改为“会议开始并确认发言后，AI 建议会自动出现”。
+
+验证方式：
+
+- TDD：新增两个 Workbench 行为测试，先得到 `2 failed`，实现后 `2 passed`。
+- `workbench_all_buttons_smoke.mjs`：`go_workbench_all_buttons_smoke`，导入、历史、刷新、建议、方案、纪要、三类导出、AI 暂停/恢复、整理、删除和 375x812 布局均通过；runtime、console、network loading、HTTP 5xx 均为 0。
+- 受控音频主链路：`code/web_mvp/backend/artifacts/tmp/browser_live_mic/current-mainline-repro-nosandbox-20260713/summary.json`；ASR final `5`、录音期正式建议 `1`、录音期可见修正 `1`、方案 `3`、纪要 `695` 字符、录音导出 HTTP `200` 且 SHA 匹配。
+
+成本/隐私影响：
+
+- 不新增 provider、网络上传或付费调用；错误展示只使用当前请求已经返回的非 secret 错误摘要。
+- Chrome `--no-sandbox` 只作为本机 fake-media 诊断的测试参数，不写入产品运行时，也不作为自然麦克风 Go 证据。
+
+边界：
+
+- 当前 in-app browser 若没有麦克风权限，开始会议仍会正确返回 `NotAllowedError` 并停止录音；必须在浏览器和 macOS 设置中授权后才能做自然麦克风验收。
+- 受控音频不等于自然多人会议；中文 ASR 断句/术语质量、真实远程 gateway 长会和发布验收仍需单独验证。
+
+## DEC-361: Session Snapshot Must Carry Non-Secret Production LLM Evidence
+
+日期：2026-07-13
+
+状态：Accepted / Implemented
+
+背景：
+
+- 真实受控会议 session 已产生正式建议、方案、纪要和 usage ledger 记录，但浏览器 verifier 只读取 Node 进程环境变量。
+- 后端从项目 `.env` 加载 LLM 配置，而 verifier 的环境被刻意清空以避免泄露密钥，导致 `gateway_base_url_kind=not_configured` 和 `production_llm_evidence_missing` 假失败。
+
+决策：
+
+- `/live/asr/sessions/{session_id}/events` 返回 `llm_evidence` 摘要。
+- 摘要只允许包含 provider、model、remote/local 分类、mock 标记、调用次数和 token 总量；不得返回 base URL、API key 或请求体。
+- 摘要必须由运行时配置和 session-scoped usage ledger 共同推导；只有非 mock、远程网关且存在正 token usage 时，验收器才可判为 production LLM evidence。
+
+影响范围：
+
+- `app.py` 新增会话级安全 evidence projection。
+- `llm_service.py` 提供 URL 分类函数。
+- `workbench_browser_live_mic_verify.mjs` 优先读取 backend evidence，旧字段只作为兼容回退。
+
+验证方式：
+
+- backend 测试验证 provider/usage 统计正确且响应不含网关地址和密钥。
+- focused verifier、Node syntax 和主线回归必须通过；真实远程 gateway 仍需新鲜一次运行确认，不得用历史 artifact 代替。
+
+## DEC-362: Partial Realtime Correction Is A First-Class Accepted Outcome
+
+日期：2026-07-13
+
+状态：Accepted / Implemented
+
+背景：
+
+- FunASR 可能把一句话拆成多个 final endpoint；LLM 可以安全修正其中一部分，但另一部分因缺少上下文或事实保护规则被拒绝。
+- 旧状态会在后续拒绝时覆盖此前已接受的 revision，验收器也把整个批次判成失败，掩盖了真实的部分结果。
+
+决策：
+
+- 当前批次或跨批次只要已有安全接受的 revision，同时存在拒绝片段，状态为 `partially_completed`。
+- 已接受 revision、原始 ASR、rejected segment IDs 和 rejection reason 必须全部保留。
+- 部分结果不能被显示为“全部校正成功”，也不能为了通过门禁而绕过事实指纹、相似度或映射校验。
+
+影响范围：
+
+- realtime correction status、batch audit 和 verifier 状态分类同步采用 partial 语义。
+- `passed_partial_correction_visible` 只有在页面可见的 canonical corrected target 与 backend revised target 相交时成立；没有可见 revision 仍失败。
+
+## DEC-363: Workbench Must Explain Partial Correction At Meeting Stop
+
+日期：2026-07-13
+
+状态：Accepted / Implemented
+
+决策：
+
+- 结束会议后的状态提示区分三种情况：全部整理完成、部分文字已校正且拒绝片段保留原始识别、AI 校正未完成。
+- 原始文字不会被隐藏或删除，用户可以继续复盘并稍后重试安全校正。
+
+验证方式：
+
+- Workbench 静态测试验证 stop drain 传播 `partialCorrection`，并验证页面提示包含“部分文字已校正”和“原始识别”。
+- 该决策不改变正式建议必须由 persisted final 触发的门禁，也不放宽生产发布 Go 条件。
+
+## DEC-364: Controlled Browser Mainline Is Production-LLM Go, Natural Meeting Release Is Not
+
+日期：2026-07-13
+
+状态：Accepted / Verified
+
+证据：
+
+- Artifact：`code/web_mvp/backend/artifacts/tmp/browser_live_mic/current-mainline-evidence-fix2-20260713/summary.json`。
+- 本地 FunASR 产生 9 个录音期 partial、4 个 final；首字 5932ms，首 final 12305ms。
+- 录音期正式建议可见，首卡 20148ms；会后建议 1、方案 3、纪要 836 字符；录音 HTTP 200、SHA 一致；Workbench 同 session 可见；browser console/network error 为 0。
+- `llm_evidence` 记录真实远程 OpenAI-compatible `gpt-5.5`、非 mock、4 次调用、2871 tokens，新的 verifier 判定 `passed_production_mainline`。
+
+边界：
+
+- 输入是本地受控非静音 WAV，经 Chrome fake media device 注入，Chrome 使用 `--no-sandbox` 诊断参数；不等于自然多人真实麦克风或生产默认 Chrome sandbox。
+- 本次 L2 实时校正关闭，校正状态为 `correction_disabled_by_setting`；不能把该 artifact 当作 correction Go。
+- 中文 ASR 语义质量、20 分钟 wall-clock、Mac/Windows 安装包和自然多人会议仍 No-Go。
+
+## DEC-365: Merge Automatic And Formal Suggestions By Candidate Identity
+
+日期：2026-07-13
+
+状态：Accepted / Implemented
+
+背景：
+
+- 新鲜主线截图显示录音期自动建议与停止后正式建议对同一会议候选各渲染一张，文案略有差异导致原有文案级去重失效。
+
+决策：
+
+- 前端使用 `target_type + target_id + gap_rule_id` 作为候选身份；同一身份的正式卡替换临时自动卡，不改变后端事件、usage ledger 或候选证据。
+- 没有候选身份的卡继续使用原有语义 key 去重；不同候选始终保留。
+
+验证方式：
+
+- Workbench focused `161 passed`。
+- Node VM 行为探针验证同一候选输入 `[auto] + [formal, other]` 输出为 `[formal, other]`。
+- 后续 fresh browser screenshot 应确认同一候选只出现一张正式卡。
+
+## DEC-331: Gate Recording-Time Formal AI Suggestions And Generalize Chinese Technical Semantics
+
+日期：2026-07-11
+
+状态：Accepted / Implemented
+
+背景：
+
+- DEC-329 的 verifier 已能分别判断实时文字体验和停止后的完整主链路，但 production 模式仍可能在“录音期间没有正式 AI 建议卡、停止并整理后才有卡片”时通过完整主链路，不能证明产品核心价值“会议中实时建议”。
+- 三次受控 production 真实浏览器麦克风运行都出现了录音期文字，但 `recording_phase_ui_samples[].cockpit_counts.ai_suggestions` 始终为 0；旧 summary 没有把这个事实提升为独立失败项。
+- 旧中文语义质量策略主要覆盖发布、SLO、Kafka、owner 等固定场景，导致包含 `SDK / toolkit / 工具封装 / 客户端 / 权限 / bug` 的普通中文技术讨论可能被错误拦截。
+- OpenQuestion 状态提取与 suggestion candidate 发射使用了两份不同的工程关键词表，可能出现状态已经识别为工程问题、但候选事件仍被第二份旧表压制的漂移。
+- Chrome `--use-file-for-fake-audio-capture` 在当前 macOS/Chrome 环境中连续得到零 RMS；本机也没有 BlackHole/Loopback 类虚拟输入设备，继续深挖该路线不会推进主链路。
+
+决策：
+
+- 新增 `buildRealtimeAiSuggestionReport()` 和 `realtimeAiSuggestionStatusFails()`：
+  - `no_cost_deterministic` 明确返回 `not_required_no_cost`，不要求付费正式卡。
+  - `production_enabled` 必须在录音阶段至少一个 UI sample 中看到 `ai_suggestions > 0`，否则返回 `failed_realtime_ai_suggestion_not_visible_during_recording` 并令 verifier 非零退出。
+  - summary 固定记录 `realtime_ai_suggestion_status/report`、`max_recording_ai_suggestions` 和 `first_ai_suggestion_visible_latency_ms`。
+- verifier 支持 `MEETING_COPILOT_E2E_USE_EXISTING_SERVER=true`，复用已经带 production provider 环境启动的 8765 服务；它只管理自己的 Chrome，不启动或终止外部后端。
+- 中文技术语义策略升级为 `general_chinese_technical_meeting.v2`：新增软件架构、开发流程、产品设计三类技术实体；至少跨两个技术组命中，或在受限的硬技术组内命中至少两个实体，才允许进入正式派生。单个孤立技术词和普通生活对话继续阻塞。
+- OpenQuestion 增加 `如何 / 还是 / 哪种 / 哪个`，并统一状态提取与候选发射的工程上下文词表，覆盖 SDK、toolkit、工具、封装、组件、模块、架构、插件、依赖、客户端、页面、交互、代码、配置、权限、登录等。
+- Chrome fake-audio-file 在当前设备上关闭为环境 No-Go，不再作为主线验收路线；没有虚拟输入设备前，不继续重复该诊断。
+- production 文件链只做一次有界验证，不重复消耗：66 秒中文技术 WAV 经本地离线 FunASR 后，真实 `gpt-5.5` suggestion/approach/minutes 均成功，已捕获三次派生合计 `15188` tokens；上传转写修正调用的 usage 当前未由 endpoint 暴露，因此不计入该数字。
+
+证据：
+
+```text
+Production real-mic offline reclassification:
+  production-existing-server-real-mic-20260711
+    samples=18, max_recording_ai_suggestions=0, status=failed
+  production-general-tech-policy-v2-real-mic-20260711
+    samples=19, max_recording_ai_suggestions=0, status=failed
+  production-general-tech-single-group-v2-real-mic-20260711
+    samples=25, max_recording_ai_suggestions=0, status=failed
+
+Production file chain:
+  artifact=artifacts/tmp/production_file_chain/general-tech-policy-v2-20260711
+  semantic_quality=passed
+  suggestion_cards=1
+  approach_cards=3
+  minutes_chars=909
+  all_cards_have_evidence=true
+  captured_derivation_tokens=15188
+  session_audio_delete=true
+
+Fake audio diagnostics:
+  fake-audio-flag-diagnostic-20260711 -> RMS=0, peak=0
+  fake-audio-visible-diagnostic-20260711 -> RMS=0, peak=0
+```
+
+TDD 与验证：
+
+```text
+RED:
+  workbench_browser_live_mic_gate.mjs did not export buildRealtimeAiSuggestionReport
+
+GREEN:
+  Node verifier gate tests = 15 passed
+  Python static verifier contract = passed
+  Node syntax checks = passed
+```
+
+边界：
+
+- 当前可以声明：production gateway 和会后派生链路可用；真实麦克风录音期有实时文字；录音保存、导出和 SHA 校验已有成功证据。
+- 当前不能声明：production 真实麦克风会议中已经出现正式 AI 建议卡。三次最新证据均由新门禁判定为 No-Go。
+- 不把任意 partial 直接提升为永久正式卡。下一步优先验证更可靠的 final/endpoint；如仍无法满足实时性，再设计带 `provisional -> confirm/update/retract` 生命周期的临时卡。
+- 仍未完成 20 分钟 production 真实麦克风 gate、自然多人中文技术会议质量、真实用户会议验收和安装包发布验收。
+
+关联文档：
+
+- `docs/current-mainline-index.md`
+
+## DEC-340 - Local FunASR ready contract and same-segment final candidate upgrade
+
+时间：2026-07-13
+
+背景：
+
+- 本轮修复前，FunASR worker 虽然可以输出文本，但后端把第一条任意 ASR 事件当成 worker ready；无声或冷启动场景会错误地被当作模型已就绪。
+- 真实 FunASR 的 stable partial 与 final 会使用同一个 `segment_id`。事件投影层用 `emitted_state_event_ids` 去重时，会把 final 误判为已处理，候选一直停留在 `llm_candidate_deferred`，所以 Workbench 能显示本地提醒但正式 AI 建议为 0。
+
+决策：
+
+- FunASR worker 必须先输出独立 `event_type=ready` 控制事件；后端只有收到该事件才设置 `ready_event`，ASR partial/final 不能冒充 ready。
+- 对同一个 segment 的 final，如果此前已产生 stable-partial 状态，则生成带 `_final` 后缀的状态、候选和 request draft ID；partial 提醒仍保留，final 候选进入 `llm_candidate_queued`，由正式调度器决定是否调用 LLM。
+- 真实麦克风自测优先使用本地受控中文声源验证声学和传输链路；本轮正式建议路径只使用本机 fake OpenAI-compatible gateway，禁止把该结果写成用户中转站已验证。
+
+证据：
+
+```text
+worker_ready_latency_ms=3549.2
+worker_partial_event_count=11
+worker_final_event_count=1
+browser_session=rec_mrih83en
+browser_input_source=browser_live_mic
+browser_acceptance_eligible=true
+browser_audio_health=audio_capture_health_passed
+browser_final_count=1
+browser_audio_sha_matches=true
+same_segment_queued_candidate=asr_suggestion_candidate_asr_risk_event_vad_endpoint_001_final
+local_fake_gateway_generated_cards=1
+local_fake_gateway_total_tokens=170
+remote_user_gateway_called=false
+```
+
+回归：
+
+```text
+code/asr_runtime: 89 passed, 1 warning
+code/web_mvp/backend: 636 passed, 2 warnings
+```
+
+边界：
+
+- 受控扬声器/TTS 只证明本机真实麦克风输入、实时 ASR、页面展示、录音保存和候选升级，不证明自然多人会议的远场语义准确率。
+- 当前 FunASR 冷启动约 3.55 秒，最终文本仍有中文技术术语和断句错误；中文质量门禁不能标 Go。
+- 真实用户 gateway 的录音期间正式 AI 建议、自然多人会议、真实 20 分钟 wall-clock soak、Mac/Windows 发布验收仍未通过。
+
+关联文档：
+
+- `docs/v2-funasr-real-mic-evidence-2026-07-13.md`
+- `docs/superpowers/plans/2026-07-12-v2-recovery-implementation-plan.md`
+
+## DEC-348 - Production runtime entry must default to durable local storage
+
+时间：2026-07-13
+
+问题：
+
+- `create_app()` 需要继续支持测试和依赖注入使用的 in-memory repository。
+- 但模块级 uvicorn 入口在没有 `MEETING_COPILOT_DATA_DIR` 时曾直接调用 `create_app(data_dir=None)`，会让生产进程落到内存仓储；进程重启后会议、实时文字和设置可能丢失。
+
+决策：
+
+- 新增 `create_runtime_app()` 和 `_runtime_data_dir()`，模块级 `app` 只通过该生产入口创建。
+- 配置了 `MEETING_COPILOT_DATA_DIR` 时使用该路径；未配置时回退到仓库内的 `artifacts/tmp/web_mvp_data`，始终初始化 SQLite session/live/settings repositories。
+- `create_app()` 的显式 repository 注入和默认 in-memory 行为保留给测试、fixture 和隔离 runner，不把测试便利混入生产启动入口。
+- `app.state.session_repository` 显式暴露当前会话仓储，便于启动探针和运行时诊断确认实际持久化类型。
+
+TDD 与验证：
+
+- RED：新增 runtime factory 测试时，入口函数和默认数据目录均不存在，2 个测试失败。
+- GREEN：backend 全量 `644 passed, 2 warnings`；root `352 passed, 2 warnings`；ASR runtime `89 passed, 1 warning`。
+- 发现并修复启动器的第二个主线 bug：`workbench_server.py` 现在把相对 `--data-dir` 按仓库根目录解析为绝对路径，避免子进程 cwd 导致数据目录漂移。
+- 8767 已重启并加载新入口，health=ok，PID=53530，数据目录为 `/Users/chase/Documents/面试/meeting-copilot/code/web_mvp/backend/artifacts/tmp/web_mvp_data`，SQLite 文件存在，schema version=1。
+- 浏览器主流程 `go_workbench_all_buttons_smoke` 通过，25 张截图，runtime/console/network/HTTP 5xx 均为 0。
+
+边界：
+
+- 该决策解决的是会话持久化入口，不等同于真实远程 LLM、自然多人中文麦克风、中文质量、长会和 Mac/Windows 发布门禁通过。
+- 远程 gateway 仍使用安全模式；此前暴露的旧 key 不读取、不复用，真实远程验收必须使用轮换后的新 key。
+
+## DEC-350 - Workbench history surfaces share one client cache
+
+时间：2026-07-13
+
+问题：
+
+- Workbench 顶部历史弹窗和会后复盘区的历史列表分别请求并维护数据，打开、删除、恢复或快速切换会话时可能出现短暂的排序/内容不一致。
+
+决策：
+
+- 新增 `_historySessions` 作为前端唯一历史缓存，所有历史请求统一经过 `fetchSessionHistory()` 和 `sortHistorySessions()`。
+- 只有当前 session operation 仍有效时，compact history loader 才更新缓存，旧请求不得覆盖新结果。
+- 顶部历史弹窗和会后复盘区继续保留各自的展示形态，但都从同一缓存读取；删除后重新拉取并同步两处状态。
+
+验证：
+
+- TDD focused：共享缓存契约测试通过。
+- Workbench/backend focused：`173 passed, 2 warnings`。
+- UI/productized tests：`24 passed, 1 warning`。
+- 浏览器主流程：`go_workbench_all_buttons_smoke`，25 张截图，runtime/console/network/HTTP 5xx 均为 0。
+- 当前生产远程 gateway、自然多人中文麦克风和发布包门禁状态不受本次前端缓存修复改变。
+- `docs/current-mainline-index.md`
+- `docs/real-mic-workbench-mainline-report-2026-07-10.md`
+- `docs/full-chain-completion-implementation-plan-2026-07-09.md`
+
+## DEC-351 - Low-quality Chinese ASR must fail closed before formal inference
+
+时间：2026-07-13
+
+问题：
+
+- 真实麦克风 session `rec_mrh7w0eb` 的最终文字包含大量中英混杂、音译和断裂英文片段，但旧质量策略只统计技术关键词，因此命中了 18 个技术词、3 个技术分组，错误判定为 `passed`。
+- 该误判允许自动建议继续生成，页面显示 9 张正式建议卡；这违反了产品核心边界：识别不可靠时可以保留文字和录音，但不能把猜测包装成实时建议。
+
+决策：
+
+- 将 ASR 质量拆成“技术主题命中”和“转写可靠性”两个独立条件；技术关键词命中不能单独放行。
+- 新增 `mixed_language_fragmentation` 指标：对足够长文本统计英文 token 与已知技术词白名单的偏离，只有达到多个异常片段、最小 token 数和异常比例的组合才阻断，保留正常 `API/SDK/Redis/request/response` 等术语。
+- 质量策略版本升级为 `general_chinese_technical_meeting.v3`；输出 `quality_failure_reasons`、异常 token 摘要和可审计分数。
+- 读取历史 session 时重新按当前策略计算 canonical transcript 质量，避免旧 JSON 中的 `passed` 结果绕过新门禁。
+- `asr_semantic_quality_blocked` 继续通过既有 `acceptance_blockers` 传递到自动建议、实时修正、方案和纪要链路；低质量 session 不调用 LLM。
+- Workbench 在质量阻断时保留完整连续文字和录音入口，但隐藏已有正式建议、方案分析、纪要和本地提醒计数，并明确显示“识别语义质量不足，正式建议暂停”。
+
+验证：
+
+```text
+RED: 真实错误转写 fixture 被旧策略错误判定为 passed
+GREEN: ASR semantic quality 11 passed
+GREEN: ASR stream + file quality regression 5 passed
+GREEN: auto suggestion low-quality integration 1 passed，LLM calls=0
+GREEN: Workbench/backend focused 256 passed, 2 warnings
+GREEN: browser 8767 reload：完整文字 53 段可见，正式建议/方案/纪要/提醒=0，console errors=0
+GREEN: API formal derivation projection：visible cards/approach/minutes=0，stored suggestion card count=9，status=suppressed_by_asr_semantic_quality
+```
+
+边界：
+
+- 这是安全门禁和产品行为修复，不代表中文 ASR 本身已经达到生产准确率；当前 session 仍然是 No-Go 的质量证据。
+- 该启发式不是通用语义理解器；后续应在真实中文技术会议样本上校准白名单和阈值，但不能为了提高通过率而删除 blocker。
+- 当前 8767 以 `provider_mode=safe` 运行，没有调用远程 LLM，也没有复用历史 API key。
+
+## DEC-341: Gate Browser Audio On Explicit Local ASR Readiness
+
+日期：2026-07-13
+
+状态：Accepted / Implemented
+
+背景：
+
+- FunASR worker 已有独立 `ready` 控制事件和 `wait_ready()`，但 WebSocket handler 之前没有等待它；浏览器在 socket open 后立即发送 PCM，冷启动时可能把“连接建立”误认为“模型可用”。
+- 如果模型超时，前端原本会把 provider failure 当作普通断线，可能重复重连并重复启动本地模型。
+- 当前浏览器 fake-audio-file 和可见 Chrome 系统麦克风复测都返回零 RMS；必须把输入层失败与 ASR/页面失败区分记录。
+
+决策：
+
+- FunASR 真实 recognizer 必须经过 `wait_ready()`；默认等待上限为 30 秒。
+- 后端在 ready 前发送 `asr_starting`，成功后发送 `asr_ready`，超时发送 `provider_error(error_code=asr_ready_timeout)` 并关闭连接；ready 前不读取音频帧。
+- Workbench 用 `_micAsrReady` 分离 socket open、ASR ready 和 audio capture；ready 前只进入有界 unsent queue，ready 后按序 flush。
+- `asr_ready_timeout` 是明确 provider failure，前端停止自动重连并保留失败状态；没有 readiness API 的正式兼容 provider 使用隐式 ready，fake/test recognizer 不改变原事件序列。
+- 本轮浏览器输入为零音量的运行统一判为 No-Go，不调整音量门禁，不生成虚假的 transcript/card 证据。
+
+原因：
+
+- 该协议直接保护首段音频不被冷启动吞掉，并使用户能看到“正在准备识别”和“识别不可用”的真实状态。
+- 有界缓存保留原有内存上限，ready 超时不会无限积压音频或无限重启 worker。
+- 将输入音量失败单独暴露，避免把“录音文件保存成功”误解为“ASR 已识别成功”。
+
+替代方案：
+
+- socket open 后立即 flush：Rejected，会在 FunASR 冷启动期间产生竞态。
+- 未 ready 时静默丢弃音频：Rejected，会损失会议开头且用户无法解释。
+- 超时后无限重连：Rejected，会重复启动模型并增加资源抖动。
+
+影响范围：
+
+- 修改 `asr_stream.py`、`workbench.js` 和对应 backend/Workbench TDD。
+- 新增 `docs/v2-ready-gate-followup-2026-07-13.md`，并更新 V2 plan/current mainline index。
+- 不改变同 segment final candidate upgrade、远程 LLM 协议或远程 ASR 默认关闭策略。
+
+成本/隐私影响：
+
+- readiness gate、录音和本地 FunASR 不增加付费服务。
+- 本轮 browser runs 的 `remote_asr_called=false`、`llm_called=false`；未读取或提交用户 API key/原始音频到仓库。
+
+验证方式：
+
+```text
+test_asr_stream.py + test_funasr_sidecar.py = 56 passed
+focused Workbench readiness/timeout tests = 3 passed
+node --check workbench.js = passed
+real 8767 handshake = asr_starting -> asr_ready -> partial, ready_latency_ms=5278.7
+browser no-cost runs = No-Go at audio health, RMS=0/peak=0, audio SHA export still matched
+```
+
+关联文档：
+
+- `docs/v2-ready-gate-followup-2026-07-13.md`
+- `docs/v2-funasr-real-mic-evidence-2026-07-13.md`
+- `docs/superpowers/plans/2026-07-12-v2-recovery-implementation-plan.md`
+- `docs/current-mainline-index.md`
+
+复审条件：
+
+- 用户确认有效中文声源已进入浏览器麦克风后，重新执行一次真实非空 final gate。
+- 如果 ready 后仍无 final，下一步审查 FunASR endpoint/finalization 和音频采样，不放宽 readiness 或 audio health 门禁。
+
+## DEC-342: Recording-Time Formal Suggestions Require Final Boundaries And Are Proven In A Controlled Local Lane
+
+日期：2026-07-13
+
+状态：Accepted / Controlled-lane verified; production remote lane remains open
+
+背景：
+
+- DEC-331 已把“录音期间必须看到正式 AI 建议”设为 production gate，但此前单段受控语音和真实麦克风运行只在音频结束附近产生 final，录音期 sample 中正式卡为 0。
+- 如果把这种单段输入直接解释成调度器失效，会把“没有可供正式建议消费的 final”与“final 后调度失败”混为一谈。
+- 产品边界仍要求 partial 只做本地实时提醒；正式建议只能基于已持久化 final，避免对不稳定文字付费调用。
+
+决策：
+
+- 录音期正式建议 gate 的受控音频必须包含至少两个带静音边界的发言段，以便在会议未结束时产生 final；单段连续音频只有结束 final 时，不作为实时建议 gate 的有效输入。
+- 保持现有触发顺序：`persisted final -> suggestion candidate -> auto-suggestion executor -> evidence-backed card -> Workbench render`。不把 partial hint 直接升级为正式卡。
+- 使用本机 fake OpenAI-compatible gateway 只验证业务调用时序和 UI 可见性，不计入 production LLM evidence，不消耗用户远程 gateway 额度。
+- 当前 controlled lane 通过不清除 production blocker；真实远程 provider、自然多人麦克风、中文技术准确率和真实 wall-clock soak 仍须单独验收。
+
+证据：
+
+```text
+artifact=artifacts/tmp/browser_live_mic/v2-local-gateway-two-turn-20260713
+input=release-review speech + 2s silence + incident-review speech + 2s silence
+provider=funasr_realtime
+provider_mode=real
+is_mock=false
+asr_final_count=5
+health_status=audio_capture_health_passed
+realtime_ai_suggestion_status=passed_realtime_ai_suggestion_visible
+max_recording_ai_suggestions=1
+first_ai_suggestion_visible_latency_ms=15028
+audio_sha256_matches_session=true
+remote_asr_called=false
+counts_as_production_llm_evidence=false
+```
+
+对照证据：
+
+- 单段 `v2-local-gateway-recording-ai-20260713`：`asr_final_count=1`，final 约在录音结束附近，录音期正式卡为 0，gate 正确失败。
+- 默认 Chrome sandbox 的零采样运行：`blocked_audio_too_quiet`，不进入 ASR/LLM 结论。
+
+验证：
+
+```text
+backend regression=641 passed, 2 warnings
+root regression=342 passed, 2 warnings
+ASR runtime regression=89 passed, 1 warning
+all-buttons browser smoke=go_workbench_all_buttons_smoke, 25 screenshots
+controlled two-turn browser lane=5 finals + recording-time local formal card
+remote user gateway called=false
+```
+
+边界：
+
+- 本决策证明的是实时 final 到正式建议的业务时序，不证明本地 FunASR 中文语义质量达到发布标准。
+- 本决策不授权自动读取、保存或调用用户提供的远程 API key；真实远程 provider 验收仍需要单独的明确成本/隐私确认。
+
+关联文档：
+
+- `docs/v2-ready-gate-followup-2026-07-13.md`
+- `docs/current-mainline-index.md`
+- `docs/superpowers/plans/2026-07-12-v2-recovery-implementation-plan.md`
+
+复审条件：
+
+- 受控多段 lane 出现实时卡失败，或真实远程 provider 的录音期正式卡与本机 lane 行为不一致时，回到 candidate persistence、executor claim 和 frontend snapshot data flow 调查。
+
+## DEC-330: Bound Realtime Auto-Suggestion Cost And Remove Finalization Races
+
+日期：2026-07-11
+
+状态：Accepted / Implemented
+
+背景：
+
+- 多 Agent 数据流审查确认，正式 AI suggestion card 只能基于已持久化、可接受的 final；partial hint 本身明确是本地 deterministic reminder。
+- 旧 Workbench 在 production LLM 已配置时会对 `partial_hint_event` 调 `/auto-suggestions/run-once`，但只有 partial 的 session 必然被 `asr_final_missing/asr_transcript_empty` 拦截，造成无价值远端请求和“AI 暂不可用”误状态。
+- `auto_suggestion_orchestrator.run_once()` 会遍历全部 previews；候选时间间隔超过 cooldown 时，一个 HTTP 请求可连续触发多次远端 LLM，长会首次打开存在成本突发风险。
+- chunk 内 final 已经是“先持久化再推浏览器”，但 END/finalize final 仍先推送后持久化；前端收到 final 立即调用自动建议时可能读到旧 session。
+- 前端只用 `autoSuggestionInFlight` single-flight；请求期间到来的新 final 触发会直接丢失。
+
+决策：
+
+- `auto_suggestion_orchestrator.run_once()` 每个 API 请求最多执行 1 个远端 candidate。未执行候选不提前标记 processed/suppressed，保留给后续触发；30 秒 cooldown 和每小时 80 次总预算继续生效。
+- `partial_hint_event` 只更新“实时提醒”面板，不再触发正式 LLM。正式建议只由已持久化 final 或 session snapshot 触发，避免 partial-only 空跑。
+- END/finalize 返回的非空 final 先进入 accumulated finals 并写入 live session，再按 `final -> 新 candidate event` 顺序发送给浏览器；前端触发时后端 record 已存在。
+- Workbench 增加单个 `autoSuggestionPending`：请求在途时只合并为一个 pending trigger；当前请求结束后通过 microtask 补跑一次，避免重复并发，也避免 final 触发静默丢失。
+- Workbench JS cache key 升级为 `20260711-auto-suggestion-reliability1`，避免页面继续使用旧自动建议逻辑。
+
+TDD 与回归：
+
+```text
+RED/GREEN:
+  test_auto_suggestion_orchestrator_executes_at_most_one_candidate_per_request
+  test_workbench_partial_hint_does_not_call_formal_llm_before_a_persisted_final
+  test_asr_stream_persists_finalize_final_before_sending_to_browser
+  test_workbench_auto_suggestion_queues_one_pending_trigger_while_request_is_in_flight
+  test_workbench_route_serves_html (cache key)
+
+Test maintenance:
+  两条 live auto-suggestion 测试改为读取到指定 event_type=final；
+  原因是 DEC-320 后 final 后会合法追加 suggestion_candidate_event，旧测试未消费该帧。
+
+Current focused results:
+  test_auto_suggestions.py = 10 passed
+  finalize/live-final/auto-suggestion integration = 3 passed
+
+Final related regression:
+  Python mainline suites = 172 passed, 2 warnings
+  Node verifier gate = 12 passed
+  workbench_all_buttons_smoke = go_workbench_all_buttons_smoke
+  screenshot_count = 23
+  Node syntax checks = passed
+  git diff --check = passed
+```
+
+边界：
+
+- 本决策控制远端调用突发、修复触发丢失和 END 竞态，不改变“正式卡必须基于 final”的安全边界。
+- 连续讲话且长期没有 provider final/900ms 静音 endpoint 时，正式卡仍可能延后；解决该问题需要 provisional card 生命周期或更可靠的 endpoint 策略，不能简单允许低质量 partial 直接变正式卡。
+- 当前 8765 进程已有用户配置的 production LLM 环境；本轮不读取 `configs/local/`、不提取进程 secret，也不为加载新后端代码而擅自重启该进程。`/static/workbench.js` 已直接服务新逻辑，但 `/workbench` HTML 在进程启动时缓存，当前仍引用旧 cache key；源码 HTML 和后端 Python 改动都需在保留原配置的下一次受控重启后完整生效。
+
+关联文档：
+
+- `docs/current-mainline-index.md`
+- `docs/real-mic-workbench-mainline-report-2026-07-10.md`
+- `docs/full-chain-completion-implementation-plan-2026-07-09.md`
+
+## DEC-329: Fail-Closed Realtime And Full-Mainline Verifier Gates
+
+日期：2026-07-11
+
+状态：Accepted / Implemented
+
+背景：
+
+- DEC-328 首版把 realtime text 与 final latency 分开，但独立多 Agent 审查发现首版仍可能把“停止后才出现文字”判为通过，也没有把 audio health、录音期样本和非法 SLO 纳入 fail-closed 判断。
+- 首版测试只检查 `.mjs` 源码中是否存在状态字符串，没有执行分类行为。
+- 新鲜真实麦克风复验进一步暴露：即使实时文字门禁通过，ASR 语义质量被阻塞、建议/方案/纪要全为 0 时，verifier 仍可能以 0 退出，不能代表用户要求的完整会议主链路。
+
+决策：
+
+- 把发布证据判定抽到 `code/web_mvp/e2e/workbench_browser_live_mic_gate.mjs`，由 Node `node:test` 直接执行纯函数行为测试。
+- realtime experience 必须同时满足：
+  - `health_status=audio_capture_health_passed`；
+  - 存在 recording-phase UI sample；
+  - 至少一个录音期 sample 已有 utterance、partial draft、live partial 或 cockpit transcript；
+  - 首字延迟不超过配置的 text SLO；
+  - SLO 必须是正有限数，非法配置直接失败。
+- live reminder gate 只允许 `passed` 或“录音中确实没有后端候选”的显式 waived 状态；缺失录音样本、缺失后端 probe、未知状态和前后端漂移全部非零退出。
+- 新增 `mainline_completion_status/report`。no-cost 主链路也必须同时具备：ASR acceptance eligible、派生已生成、至少 1 条建议、至少 1 条方案、有效纪要、证据卡、同 session UI、已复盘状态、录音导出 200 且 SHA 一致、console/network error 为 0。
+- production 模式在上述条件之外，还必须有 remote non-mock OpenAI-compatible LLM 调用和非零 token usage evidence。
+- realtime gate 通过只说明会中能看到文字；`mainline_completion_status=failed_mainline_completion` 时不得宣称“实时会议 + 实时建议 + 复盘”完整闭环。
+
+TDD：
+
+```text
+RED 1:
+node --test code/web_mvp/e2e/workbench_browser_live_mic_gate.test.mjs
+ERR_MODULE_NOT_FOUND: workbench_browser_live_mic_gate.mjs
+
+GREEN 1:
+8 tests passed
+覆盖：录音期文字、停止后才出字、无效音频、缺失录音样本、非法 SLO、慢 final、提醒探针 fail-closed。
+
+RED 2:
+node --test code/web_mvp/e2e/workbench_browser_live_mic_gate.test.mjs
+SyntaxError: module does not provide buildMainlineCompletionReport
+
+GREEN 2:
+12 tests passed
+新增覆盖：no-cost 完整主链路、ASR semantic block、production LLM evidence、录音导出/SHA。
+```
+
+历史成功 artifact 严格重算：
+
+```text
+realtime-experience-gate-real-mic-20260711:
+  realtime=passed_realtime_full
+  mainline=passed_no_cost_mainline
+
+real-mic-normalizer-v5-10min-nocost-20260711-135007:
+  realtime=passed_realtime_partial_final_slow
+  mainline=passed_no_cost_mainline
+  warning=final_latency_slo_exceeded
+```
+
+新鲜真实麦克风 No-Go：
+
+```text
+artifact=artifacts/tmp/browser_live_mic/realtime-experience-gate-v2-real-mic-success-20260711
+input_mode=real_browser_mic
+health_status=audio_capture_health_passed
+first_text_after_audio_active_latency_ms=7219
+first_final_after_audio_active_latency_ms=70354
+realtime_experience_status=passed_realtime_partial_final_slow
+mainline_completion_status=failed_mainline_completion
+acceptance_blockers=[asr_semantic_quality_blocked,degraded_asr_session]
+suggestion_card_count=0
+approach_card_count=0
+minutes_char_count=0
+audio_export_http_status=200
+audio_sha256_matches_session=true
+exit_code=1
+```
+
+该次 transcript 主要识别为现场其他人在讨论“加密货币、美股、交易”，而不是本机技术会议 TTS，因此 semantic quality gate 正确拒绝生成误导建议。这是输入环境 No-Go，不是建议/纪要接口静默丢失。
+
+虚拟麦克风诊断 No-Go：
+
+```text
+artifact=artifacts/tmp/browser_live_mic/realtime-mainline-gate-v2-fake-audio-20260711
+input_mode=fake_audio_file_browser_mic
+health_status=blocked_audio_too_quiet
+realtime_experience_status=failed_audio_capture_health
+live_reminder_drift_status=not_evaluated_missing_recording_backend_probe
+mainline_completion_status=failed_mainline_completion
+exit_code=1
+```
+
+边界：
+
+- 历史真实麦克风成功 artifact 证明主链路曾在真实输入条件下闭合；本轮严格重算没有推翻该证据。
+- 当前现场声音持续干扰，无法把本轮 No-Go 变成新的真实麦克风 Go；不能通过放宽 semantic quality gate 或伪造卡片解决。
+- Chrome fake-audio-file route 在当前机器仍输出近静音，只保留为 fail-closed 诊断，不计入产品成功证据。
+- production LLM 最新变更后复测、20 分钟真实麦克风、自然多人会议 ASR 质量和真实用户验收仍未完成。
+
+关联文档：
+
+- `docs/current-mainline-index.md`
+- `docs/real-mic-workbench-mainline-report-2026-07-10.md`
+- `docs/full-chain-completion-implementation-plan-2026-07-09.md`
+
+## DEC-328: Separate Realtime Text UX Gate From ASR Final Latency
+
+日期：2026-07-11
+
+状态：Accepted / Implemented
+
+背景：
+
+- DEC-327 的 10 分钟真实麦克风证据同时出现 `first_text_after_audio_active_latency_ms=6694` 和 `first_final_after_audio_active_latency_ms=288627`。
+- 用户在会中实际依赖的是 partial/revision 持续追加后的可见文字与实时提醒；如果只看 final latency，会把“会中已有文字但最终定稿慢”误报成整个实时体验失败。
+- 反过来，如果只看最终 session 有 transcript，也可能掩盖“录音中一直没有文字，停止后才出现”的产品失败。
+
+决策：
+
+- `workbench_browser_live_mic_verify.mjs` 新增独立的 `realtime_experience_status` 和 `realtime_experience_report`。
+- 默认实时文字 SLO 为有效声音后 15 秒，final latency 观察线为 60 秒；可通过 `MEETING_COPILOT_TEXT_LATENCY_SLO_MS` 和 `MEETING_COPILOT_FINAL_LATENCY_SLO_MS` 显式覆盖。
+- 录音中没有任何 partial/final，或首字超过实时文字 SLO，属于 hard failure，并让 verifier 非零退出。
+- partial/revision 已按 SLO 可见但 final 缺失或超过 60 秒，分别标记 `passed_realtime_partial_final_missing` / `passed_realtime_partial_final_slow`；主实时体验可通过，但必须保留 warning，不能宣称 final latency 已达生产级。
+- 只有实时文字和 final 均在各自观察线内时，标记 `passed_realtime_full`。
+
+TDD：
+
+```text
+RED:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_workbench.py::test_browser_live_mic_summary_classifies_realtime_experience_separately_from_final_latency -q
+
+失败原因：verifier 尚无 buildRealtimeExperienceReport/realtime_experience_status。
+
+GREEN:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_workbench.py::test_browser_live_mic_summary_classifies_realtime_experience_separately_from_final_latency -q
+1 passed, 2 warnings
+
+Workbench regression:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest code/web_mvp/backend/tests/test_workbench.py -q
+106 passed, 2 warnings
+```
+
+真实麦克风验证：
+
+```text
+artifact=artifacts/tmp/browser_live_mic/realtime-experience-gate-real-mic-20260711
+session_id=rec_mrg0po1o
+input_mode=real_browser_mic
+health_status=audio_capture_health_passed
+chunk_count=150
+asr_final_count=1
+derivation_mode=no_cost_deterministic
+counts_as_production_llm_evidence=false
+suggestion_card_count=3
+approach_card_count=1
+minutes_char_count=252
+audio_export_http_status=200
+audio_file_size_bytes=1433644
+audio_sha256_matches_session=true
+frontend_utterance_count=4
+frontend_card_count=4
+frontend_minutes_visible=true
+first_text_after_audio_active_latency_ms=8247
+first_final_after_audio_active_latency_ms=45059
+partial_visible_count=2
+final_visible_count=1
+realtime_experience_status=passed_realtime_full
+live_reminder_drift_status=passed
+browser_console_error_count=0
+network_error_count=0
+```
+
+诊断边界：
+
+- fake-audio-file browser-mic 诊断 artifact `artifacts/tmp/browser_live_mic/realtime-experience-gate-fake-audio-20260711` 因输入音量过低得到 `health_status=blocked_audio_too_quiet`、`realtime_experience_status=failed_realtime_text_not_visible`。该单次样本被正确拒绝；DEC-329 进一步把 audio health 显式纳入 fail-closed 门禁。
+- 本轮是真实麦克风短测和 no-cost deterministic 派生，不替代 DEC-327 的 10 分钟稳定性证据，也不替代生产 LLM、20 分钟真实麦克风、自然噪声多人中文会议或真实用户验收。
+- 10 分钟 artifact 的首字延迟已满足新的实时文字 SLO，但 final 仍会被分类为 `passed_realtime_partial_final_slow`；final latency 仍是独立生产阻塞项。
+
+关联文档：
+
+- `docs/current-mainline-index.md`
+- `docs/real-mic-workbench-mainline-report-2026-07-10.md`
+- `docs/full-chain-completion-implementation-plan-2026-07-09.md`
+
+## DEC-327: 10-Minute Real Mic No-Cost Soak And ASR Normalizer v6
+
+日期：2026-07-11
+
+状态：Accepted / Implemented
+
+背景：
+
+- DEC-326 完成 3 分钟真实浏览器麦克风 no-cost 主链路复测，但它不能替代长会议证据。
+- 用户要求不要继续停留在边界评估，要持续推进真实会议主链路、页面可见文字追加、实时建议、录音保存和会后复盘。
+- 3 分钟复测后的 normalizer v5 仍需要用更长会议 artifact 验证，避免只修短样本。
+
+决策：
+
+- 追加 10 分钟真实浏览器麦克风 no-cost soak，仍使用本机外放中文技术会议脚本和 Chrome `getUserMedia`，不调用中转站，不新增付费 ASR。
+- 本轮证据可证明真实麦克风、实时 ASR、录音中 partial 追加、实时提醒、建议卡、方案卡、纪要、录音保存和导出在 10 分钟主链路中闭环。
+- 本轮不计入生产 LLM 证据；`counts_as_production_llm_evidence=false` 必须保留。
+- 针对 10 分钟真实 artifact 暴露的新残留近音，追加 bounded normalizer v6；只在发布评审、负责人、回滚 checklist、工程风险、通知值班群等上下文中修正，不做全局替换。
+- 不继续无限扩展 regex 作为长期策略。若后续真实会议继续出现大量新错词，下一步应转向热词/profile、ASR provider 参数、或轻量 post-ASR correction 策略。
+
+10 分钟真实麦克风 no-cost 证据：
+
+```text
+artifact=artifacts/tmp/browser_live_mic/real-mic-normalizer-v5-10min-nocost-20260711-135007
+session_id=rec_mrfy3swm
+input_mode=real_browser_mic
+ui_coverage=headless_chrome
+health_status=audio_capture_health_passed
+chunk_count=2000
+asr_final_count=1
+derivation_mode=no_cost_deterministic
+counts_as_production_llm_evidence=false
+suggestion_card_count=3
+approach_card_count=1
+minutes_char_count=402
+audio_export_http_status=200
+audio_file_size_bytes=19193900
+audio_sha256_matches_session=true
+workbench_same_session_visible=true
+frontend_utterance_count=37
+frontend_card_count=4
+frontend_minutes_visible=true
+meeting_cockpit_stage=已复盘/reviewed
+meeting_cockpit_counts.transcript=37
+meeting_cockpit_counts.realtime_reminders=46
+meeting_cockpit_counts.ai_suggestions=3
+meeting_cockpit_counts.approach=1
+meeting_cockpit_counts.audio=已保存
+meeting_cockpit_counts.minutes=已生成
+first_text_after_audio_active_latency_ms=6694
+first_final_after_audio_active_latency_ms=288627
+partial_visible_count=252
+final_visible_count=3
+browser_console_error_count=0
+network_error_count=0
+recording_phase_ui_samples=121
+live_reminder_drift_status=passed
+session_audio_duration_ms=599808
+exported_audio_artifact=artifacts/tmp/browser_live_mic/real-mic-normalizer-v5-10min-nocost-20260711-135007/exported-audio.wav
+```
+
+录音中证据：
+
+```text
+before_stop:
+  cockpit_stage=录音中/recording
+  cockpit_counts.transcript=43
+  cockpit_counts.realtime_reminders=11
+  partial_draft_count=41
+  live_partial_exists=true
+  backend_reminders=7
+
+event distribution:
+  llm_request_draft_event=45
+  scheduler_event=45
+  state_event=45
+  suggestion_candidate_event=45
+  transcript_revision=36
+  transcript_partial=1
+  transcript_final=1
+```
+
+ASR normalizer v6 修复：
+
+```text
+新增覆盖：
+  picture er -> feature flag
+  featurelag -> feature flag
+  row/raw/rall/ll back checklist -> rollback checklist
+  dicloster/closter/ster + 缓存穿透 -> Redis cluster
+  havect/haveg + 通知值班群上下文 -> Kafka lag
+  orourer/order + 消费堆积 -> order-worker
+  下一步 honor/那or -> owner
+  ror 超过百分之零点一 -> error_rate超过百分之零点一
+  负责 low看板 -> SLO看板
+```
+
+TDD 和回归证据：
+
+```text
+RED:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_transcript_normalizer.py::test_normalize_recovers_ten_minute_v5_real_mic_remaining_variants -q
+
+失败现象:
+  ror 超过 / low看板 / rall back checklist / haveg如超 等真实 10 分钟残留仍存在。
+
+GREEN:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_transcript_normalizer.py::test_normalize_recovers_ten_minute_v5_real_mic_remaining_variants -q
+1 passed, 1 warning
+
+Normalizer regression:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest code/web_mvp/backend/tests/test_transcript_normalizer.py -q
+23 passed, 1 warning
+
+10-minute artifact spot-check after v6:
+  picture er=false
+  row backst=false
+  raw back checklist=false
+  rall back checklist=false
+  dicloster=false
+  havect=false
+  haveg如超=false
+  orourer=false
+  featurelag=false
+  ll back checklist=false
+  honor要在=false
+  那or要在=false
+  ror 超过=false
+  low看板=false
+  SLO看板=true
+  feature flag=true
+  rollback checklist=true
+  Redis cluster=true
+  Kafka lag=true
+  order-worker=true
+  owner=true
+```
+
+关联回归：
+
+```text
+PYTHONPATH=code/web_mvp/backend python3 -m pytest code/web_mvp/backend/tests/test_workbench.py -q
+105 passed, 2 warnings
+
+PYTHONPATH=code/web_mvp/backend python3 -m pytest code/web_mvp/backend/tests/test_asr_stream.py -q
+23 passed, 2 warnings
+
+python3 -m pytest tests/test_workbench_all_buttons_smoke.py -q
+8 passed, 1 warning
+
+node --check code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js
+node --check code/web_mvp/e2e/workbench_all_buttons_smoke.mjs
+node --check code/web_mvp/e2e/workbench_browser_live_mic_verify.mjs
+git diff --check
+all exit 0
+```
+
+影响范围：
+
+- `code/web_mvp/backend/meeting_copilot_web_mvp/transcript_normalizer.py`
+- `code/web_mvp/backend/tests/test_transcript_normalizer.py`
+- `docs/current-mainline-index.md`
+- `docs/real-mic-workbench-mainline-report-2026-07-10.md`
+- `docs/full-chain-completion-implementation-plan-2026-07-09.md`
+
+成本/隐私影响：
+
+- 本轮不读取用户私有录音，不读取 `configs/local/`，不提交 secret。
+- 本轮为本机外放合成中文会议脚本进入真实麦克风，artifact 位于 ignored/local `artifacts/tmp`。
+- no-cost deterministic 派生不调用中转站，不产生生产 LLM 成本。
+
+复审条件：
+
+- 生产 LLM recheck 仍未完成，不能用本轮 no-cost evidence 替代。
+- 20 分钟真实麦克风 gate 仍未完成，不能声明生产级长会议稳定性。
+- ASR final latency 仍是阻塞：10 分钟 run 的 `first_final_after_audio_active_latency_ms=288627`。
+- ASR 语义质量仍需 provider/profile/hotword/post-ASR correction 策略；normalizer v6 只是当前真实 release-review 脚本的 bounded 修复。
+
+## DEC-326: Post-Overview-Jump Real Mic Recheck And ASR Normalizer v5
+
+日期：2026-07-11
+
+状态：Accepted / Implemented
+
+背景：
+
+- DEC-325 已把左侧 `本场会议` 升级为可点击会议驾驶舱导航，但真实麦克风主链路仍不能因为 UI E2E 通过就视为完成。
+- 用户的原始目标仍是：真实麦克风长会议 Workbench 主链路，实时文字、建议卡、录音保存、会后复盘都要可自测并逐步逼近生产级。
+- 因此需要在最新左侧导航修复之后，重新跑一次真实浏览器麦克风主链路，确认没有破坏录音/ASR/UI/建议/方案/纪要/录音导出。
+
+决策：
+
+- 追加一轮本机外放中文技术会议脚本 + Chrome `getUserMedia` 真实麦克风 no-cost deterministic 复测。
+- 本轮只验证真实麦克风、ASR、Workbench UI、确定性建议/方案/纪要、录音保存和导出，不调用中转站，不计入生产 LLM 证据。
+- 本轮暴露的 ASR 近音错词进入 bounded normalizer v5：只在发布评审/回滚/checklist/owner/SLO 看板上下文中修正 `flow看板`、`ure fly`、`feature fly`、`roll backlist`、`ll back checklist`、`ononor` 等新变体。
+- 不把这轮 3 分钟 no-cost 复测包装为 20 分钟长会议 Go，也不声明 ASR final latency 已达生产级。
+
+真实麦克风复测证据：
+
+```text
+artifact=artifacts/tmp/browser_live_mic/real-mic-post-overview-jump-3min-nocost-20260711-123349
+session_id=rec_mrfvdof3
+input_mode=real_browser_mic
+ui_coverage=headless_chrome
+health_status=audio_capture_health_passed
+chunk_count=600
+asr_final_count=1
+derivation_mode=no_cost_deterministic
+counts_as_production_llm_evidence=false
+suggestion_card_count=3
+approach_card_count=1
+minutes_char_count=354
+audio_export_http_status=200
+audio_file_size_bytes=5759020
+audio_sha256_matches_session=true
+workbench_same_session_visible=true
+frontend_utterance_count=12
+frontend_card_count=4
+frontend_minutes_visible=true
+meeting_cockpit_stage=已复盘/reviewed
+meeting_cockpit_counts.transcript=12
+meeting_cockpit_counts.realtime_reminders=21
+meeting_cockpit_counts.ai_suggestions=3
+meeting_cockpit_counts.approach=1
+meeting_cockpit_counts.audio=已保存
+meeting_cockpit_counts.minutes=已生成
+first_text_after_audio_active_latency_ms=7195
+first_final_after_audio_active_latency_ms=180336
+partial_visible_count=17
+final_visible_count=1
+browser_console_error_count=0
+network_error_count=0
+recording_phase_ui_samples=37
+live_reminder_drift_status=passed
+```
+
+录音中 UI 样本结论：
+
+```text
+before_stop:
+  cockpit_stage=录音中/recording
+  cockpit_counts.transcript=41
+  cockpit_counts.realtime_reminders=5
+  partial_draft_count=41
+  live_partial_exists=true
+
+说明：
+  页面录音中已有稳定 partial draft 持续追加，不是等会议结束才显示文字。
+  final 仍接近停止时才出现，first_final_after_audio_active_latency_ms=180336ms，仍是生产级 ASR latency 缺口。
+```
+
+ASR normalizer v5 修复：
+
+```text
+新增红灯:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_transcript_normalizer.py::test_normalize_recovers_post_overview_jump_real_mic_release_review_variants -q
+
+红灯原因:
+  feature flag王五 不存在，说明 feature fly / ure fly / roll backlist / ll back checklist / flow看板 等新真实麦克风近音未覆盖。
+
+绿灯:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_transcript_normalizer.py::test_normalize_recovers_post_overview_jump_real_mic_release_review_variants -q
+1 passed, 1 warning
+
+Normalizer regression:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_transcript_normalizer.py -q
+22 passed, 1 warning
+
+Artifact text spot-check:
+  SLO看板=true
+  feature flag=true
+  rollback checklist=true
+  owner=true
+  flow看板_removed=true
+  ure fly_removed=true
+  feature fly_removed=true
+  roll backlist_removed=true
+  ll back checklist_removed=true
+```
+
+影响范围：
+
+- `code/web_mvp/backend/meeting_copilot_web_mvp/transcript_normalizer.py`
+- `code/web_mvp/backend/tests/test_transcript_normalizer.py`
+- `docs/current-mainline-index.md`
+- `docs/real-mic-workbench-mainline-report-2026-07-10.md`
+- `docs/full-chain-completion-implementation-plan-2026-07-09.md`
+
+成本/隐私影响：
+
+- 本轮真实麦克风使用本机外放合成中文会议脚本，不读取用户私有音频。
+- `derivation_mode=no_cost_deterministic`，不调用中转站，不产生生产 LLM 成本。
+- 不新增默认付费 ASR，不读取 `configs/local/`。
+- artifact 仅保存在 ignored/local `artifacts/tmp` 路径。
+
+复审条件：
+
+- 必须继续跑更长真实麦克风会议 gate，不能用本轮 3 分钟替代 10/20 分钟验收。
+- 如果生产 LLM 复测失败，按 LLM provider/config 或提示词链路处理，不把 no-cost evidence 当作生产 LLM evidence。
+- 如果后续真实会议仍出现大量新近音错词，不再无限堆 regex；需要评估热词/profile、ASR provider 配置、post-ASR LLM 轻纠错和真实中文评测集门槛。
+- 如果 final latency 继续接近 stop 时才出现，需要专门处理 VAD/streaming final 策略，而不是只做 normalizer。
+
+## DEC-325: Meeting Overview Rows Must Be Actionable Navigation, Not Static Metrics
+
+日期：2026-07-11
+
+状态：Accepted / Implemented
+
+背景：
+
+- 用户继续指出 Workbench 左侧“本场会议”这一列看起来没有实际作用，并要求补进计划。
+- 多 Agent 只读审查结论一致：左侧列的数据来源是真实的，不是 mock；但上半区 `文字记录 / 实时提醒 / AI 建议 / 方案分析 / 录音保存 / 会后复盘` 只是 `<div class="state-row">` 状态数字，不能改变主内容，也不能把用户带到对应产物。
+- 当前产品目标是实时会议 Copilot，不是音频转文字工具；左侧会议驾驶舱必须帮助用户确认主链路，并快速到达对应业务区。
+
+决策：
+
+- 左侧 `本场会议` 六行升级为可点击导航入口，保留会议驾驶舱定位。
+- 六行分别使用 `data-overview-target="transcript|reminders|suggestions|approach|audio|minutes"`。
+- 点击后跳转并聚焦到对应业务区：
+  - `文字记录` -> `#transcript-stream`
+  - `实时提醒` -> `#candidate-panel`
+  - `AI 建议` -> `#suggestions-panel`
+  - `方案分析` -> `#approach-panel`
+  - `录音保存` -> `#btn-export-audio` 或会议操作区
+  - `会后复盘` -> `#minutes-panel`
+- 每个入口根据当前 session 内容设置 `title` 和 toast：有内容时说明当前数量或已保存状态；无内容时解释为什么还没有内容。
+- 这次只做 P0 导航和空态反馈，不新增“复制追问/忽略/标误报/状态对象处理”等更重操作；这些进入 P1/P2。
+
+影响范围：
+
+- `code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.html`
+- `code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js`
+
+## DEC-370 - Use localhost when the 127.0.0.1 browser permission is cached as denied
+
+时间：2026-07-13
+
+背景：
+
+- 在 `http://127.0.0.1:8767/workbench` 点击“开始会议”时，浏览器直接返回 `NotAllowedError`，没有再次弹出授权框。
+- macOS“隐私与安全性 → 麦克风”列表中 `ChatGPT` 与 `Google Chrome` 均已开启，因此本机系统级麦克风开关不是阻塞点。
+- 同一服务切换到 `http://localhost:8767/workbench` 后，浏览器按新的来源重新请求权限并成功进入录音。
+
+决策：
+
+- 本地真实麦克风验收优先使用 `http://localhost:8767/workbench`，直到提供明确的浏览器站点权限重置入口。
+- 产品错误提示需要区分“系统权限关闭”“浏览器来源已拒绝”和“ASR/后端失败”，不能把三者合并为一个语音质量错误。
+- 本次结果只证明权限、录音和本地 FunASR 实时流已打通；不能据此宣称自然中文会议语义质量或实时 AI 建议已通过。
+
+验证证据：
+
+```text
+url=http://localhost:8767/workbench
+session_id=rec_mrjbrzku
+provider=funasr_realtime
+provider_mode=real
+is_mock=false
+microphone=MacBook Air 麦克风 (Built-in)
+audio_input=normal
+partial_count=1
+final_count=1
+final_text=六六六
+recording_duration=03:21
+audio_saved=true
+ai_suggestions=0 (输入只有一条环境语音，未达到有意义的建议上下文)
+```
+
+边界：
+
+- `127.0.0.1` 来源的拒绝状态仍存在；本轮没有通过系统命令修改浏览器权限或 macOS 隐私设置。
+- 本轮没有自然中文技术会议、多人发言、实时修正和实时建议的有效语义样本，因此这些能力仍需使用清晰中文音频或真实会议继续验收。
+
+关联证据：
+
+- `docs/real-mic-permission-retry-2026-07-13.md`
+- `artifacts/tmp/workbench_server/workbench_server_8767.log`
+
+## DEC-353 - Mainline recovery: readable meetings are not semantic blockers
+
+时间：2026-07-13
+
+问题：
+
+- 历史会话可能保存旧版 `asr_semantic_quality_blocked` 和 `degraded_asr_session`，即使当前质量策略已判定文字可读，页面仍显示“降级”，正式建议和 L2 可能被误抑制。
+- 缺少技术关键词不能证明声音不可用；普通中文会议也必须可以进入 L2、建议和会后纪要。
+
+决策：
+
+- 只有空文本、明显非语音或达到混杂碎片阈值时才硬阻断；技术领域不明确只产生 `technical_context_not_detected` warning。
+- 读取历史、会话列表和派生接口前统一重新计算质量，并迁移清除仅由旧语义策略产生的降级状态。
+- 生产远端 LLM 的错误、抑制、no-op 和安全拒绝必须通过结构化状态表达，不再把所有 HTTP 200 当成“已生成”。
+
+## DEC-354 - Realtime L2 batch and paid-call ordering
+
+时间：2026-07-13
+
+决策：
+
+- L2 只处理确认的 final，不处理 partial；达到 80 个字符或等待 15 秒即可触发一批，停止会议使用 `force=true` 清空剩余 final。
+- 前端把“实时修正 -> 实时建议”串成单一队列。多个 final 到达时只保留一个 pending 标记，修正锁竞争结束后继续处理，不把 `in_flight` 当成成功或静默丢弃建议。
+- 远端模型返回不安全或事实不一致的修正时继续保留原始识别，并把该片段标为部分完成；禁止为通过验收而强行替换文字。
+
+## DEC-355 - New meeting view isolation
+
+时间：2026-07-13
+
+问题：
+
+- 开始新会议时，旧会议仍暂时显示在文字、提醒和建议区域；真实浏览器验证因此出现旧卡和新录音混在同一屏的假象。
+
+决策：
+
+- 旧会话只保留在内存中用于麦克风失败恢复，开始新会议的第一帧立即清空可见工作区。
+- 新会议在识别到第一条文字前显示明确空状态；失败时再恢复上一场会话并标记失败原因。
+- 同一片段的 provisional reminder 和 final reminder 按“片段 + 规则”合并，final 版本替换 provisional 版本。
+
+验证证据：
+
+```text
+targeted backend/workbench tests: passed
+fresh browser mainline: exit 0
+session=rec_mrj7xx2e
+provider=funasr_realtime, provider_mode=real, is_mock=false
+first_text_after_audio_active_latency_ms=5652
+first_final_after_audio_active_latency_ms=12315
+first_ai_suggestion_visible_latency_ms=20143
+first_correction_visible_latency_ms=20143
+frontend_utterance_count=5
+frontend_card_count=3
+audio_sha256_matches_session=true
+minutes_visible=true
+browser_console_error_count=0
+network_error_count=0
+mainline_completion_status=passed_production_mainline
+realtime_ai_suggestion_status=passed_realtime_ai_suggestion_visible
+realtime_transcript_compaction_status=passed_partial_correction_visible
+artifact=artifacts/tmp/browser_live_mic/mainline-fix-final2-20260713
+```
+
+边界：
+
+- 这次是受控中文技术会议 WAV 通过浏览器 fake microphone 输入，不等同于自然多人麦克风验收。
+- 录音期建议和校正的首个可见延迟约 20 秒，远端 gateway 响应时间仍是生产体验的主要性能约束。
+- 本地安全校验拒绝的片段仍保留原文；当前结果是部分校正可见，不宣称 ASR 语义准确率已经达到发布标准。
+
+## DEC-353 - Persist realtime audio independently of ASR readiness
+
+时间：2026-07-13
+
+根因：服务端 WebSocket 在调用 `recognizer.wait_ready()` 时阻塞了音频接收；前端已发送的 PCM 只停留在浏览器队列，ready 超时或用户提前结束时既没有被服务端消费，也没有可靠落盘。把 writer 简单前移只能产生空 WAV，不能解决数据流丢失。
+
+决策：
+
+- 服务端在 readiness 等待前创建 `RealtimeWavAssetWriter`。
+- readiness 等待与 WebSocket 接收并发进行；每个 PCM 先写录音，再最多缓存 64 条给 ASR，超过上限只丢 ASR 待处理项，不丢录音。
+- `END` 先于 ready 时保存录音、写入 `end_of_stream`，标记 `asr_not_ready_at_stop`，关闭 ASR，不生成正式 transcript final、建议或纪要。
+- readiness timeout 时保存已接收录音，标记 `asr_ready_timeout`，发送明确 provider error；断连路径继续标记 `stream_interrupted`。
+- 录音落盘结果必须能通过 `saved`、时长、文件大小和 SHA 校验；不能用空 WAV 或页面退出等待代替保存成功。
+
+验证：
+
+- ready 前收到 PCM 后 END：WAV `duration_ms > 0`、`file_size_bytes > 44`、SHA 与 metadata 一致、session 可读、无 `transcript_final`。
+- readiness timeout：相同录音完整性条件通过，`degradation_reasons` 含 `asr_ready_timeout`。
+- ASR stream 聚焦回归、后端全量 `655 passed`、仓库主目录 `tests/` `353 passed` 均通过；`workbench_all_buttons_smoke` 通过并留下 25 张截图。
+
+## DEC-354 - Allow FunASR graceful shutdown to drain burst audio
+
+时间：2026-07-13
+
+根因：真实本地 FunASR worker 直接运行时能在 EOF 输出 final，但 sidecar graceful 关闭仍使用固定 2 秒 writer drain 和 5 秒 process wait。把十几秒音频瞬时发送后立即 END，会在 worker 处理完输入前杀死进程，最终只得到前几段 partial 和 `asr_no_final`。
+
+决策：
+
+- graceful 关闭的 writer 排空和子进程等待共用按已接收 chunk 数估算的 bounded window：音频量越大等待越长，最小 5 秒，最大 120 秒。
+- abort、crash 和异常断连保持原有快速强制关闭，不让错误路径无限等待。
+- worker 本身不改为伪造 final；只有 worker 实际输出的 final 才进入正式 transcript。
+
+验证：
+
+- sidecar focused tests 通过；直接 worker probe 输出 10 个 partial 和 1 个 final。
+- 真实 8767 按 150ms 节奏发送 60 个中文受控音频 chunk：`asr_ready=true`、`partial_count=60`、`session_final_count=1`、录音时长 `17929ms`、SHA 匹配、`degradation_reasons=[]`。
+- 瞬时 burst 在 ready 前结束仍明确返回 `asr_not_ready_at_stop` 并保存录音，不被误报为 ASR 成功。
+
+边界：
+
+- 这两项决策推进了实时 ASR 和录音主链，但不改变中文技术语义质量、自然多人麦克风、真实远程 LLM、录音期正式 AI、真实 wall-clock 长会和 Mac/Windows 发布验收的 No-Go 状态。
+
+## DEC-348 - Mainline persistence and derivation projection contract closure
+
+时间：2026-07-13
+
+背景：
+
+- `minutes` Markdown endpoint 会写入 live session，但 `minutes.json` 只返回结构化结果，未写回 session；因此重启或历史 reopen 后结构化纪要会消失。
+- demo/mock 方案卡可以被 POST 生成并持久化，但 GET projection 曾对所有 ASR semantic quality blocker 清空卡片，形成 `POST 200` 后历史读取为空的契约不一致。
+- 旧 JSON session 迁移到 SQLite 时缺失 epoch 字段会落成 0，导致历史排序/时间展示不可靠。
+
+决策与实现：
+
+1. `record.minutes` 作为同一会话的派生物容器，Markdown 与结构化 JSON 共存。`minutes.json` 写入 `minutes_json`、`minutes_json_llm_usage`、`minutes_json_degraded`；不覆盖已有 Markdown 纪要。
+2. ASR 质量 fail-closed 只作用于正式输入源。mock/demo 是非验收 UI/业务回归链路，可以读取自己生成的派生物；真实麦克风、浏览器麦克风、上传和受控实时音频仍在质量 blocker 时隐藏正式建议/方案/纪要。该策略让生成和读取契约一致，同时不削弱真实质量门禁。
+3. JSON 迁移使用遗留文件 mtime 补齐缺失的 `created_at_epoch_ms` 和 `last_activity_at_epoch_ms`，保留已有正时间戳。
+
+TDD/验证：
+
+```text
+RED:
+  test_g5_minutes_json_returns_structured_json_and_persists_across_restart
+  test_approach_cards_endpoint_persists_cards_for_history
+  test_json_migration_hydrates_legacy_live_timestamps_for_history
+
+GREEN:
+  backend full pytest: 650 passed, 2 warnings
+  focused minutes/approach/G3-G5: 18 passed
+  Workbench tests: 157 passed, 2 warnings
+  browser long-meeting fixture: go_long_meeting_ui_evidence
+```
+
+证据：`artifacts/tmp/ui_screenshots/workbench-long-meeting-mainline-current-20260713/`。
+
+边界：本轮未调用真实远程 LLM、未读取 configs/local 或真实密钥、未进行新的泛化 ASR 横评；fake gateway/fixture 证据不计生产 LLM 验收。Workbench 的有界等待已由 DEC-352 完成；下一主线工作是服务端 readiness 失败前的录音可靠落盘，再进入一次明确授权的真实远程 gateway 验收。
+
+## DEC-349 - History open must be transactional from the user's perspective
+
+时间：2026-07-13
+
+问题：`openHistorySession()` 过去先调用 `prepareNewSession()` 清空当前视图，再请求目标会话。如果请求失败，当前 session 可能仍保留，但正文、建议和纪要已经被清空，用户看到的是不可恢复的半状态。
+
+决策：历史打开采用“先读后替换”：先请求 `/live/asr/sessions/{id}/events`，确认 operation 未过期后再调用 `prepareNewSession()`、设置 `currentSession` 并渲染目标会话。失败时只提示错误，保留当前会话和页面内容。同步将旧 `workbench_session_verify.mjs` 的历史断言迁移到实际 modal DOM 契约：`history-modal-list`、`.history-modal-item` 和 `button[data-action="open"]`。
+
+TDD/验证：
+
+```text
+RED: test_workbench_open_history_keeps_current_view_until_fetch_succeeds 失败
+GREEN: focused test 1 passed
+node --check workbench.js 通过
+node --check workbench_session_verify.mjs 通过
+git diff --check 通过
+```
+
+边界：本决策不改变 mock/demo 默认历史隔离，不把旧右侧 `history-list` 验证当作 modal 交互证据，也不解决 ASR provider 未 ready 时的录音保存问题；后者仍需要独立实现和测试。
+
+## DEC-352 - Bound the Workbench stop wait when ASR is not ready
+
+时间：2026-07-13
+
+问题：停止会议时，若 WebSocket 已连接但 ASR provider 尚未发送 `asr_ready`，前端会停止采集并进入 `processing`，依赖服务端 readiness timeout 或 close 事件。服务端/sidecar 异常时页面可能永久停留在等待状态，且停止按钮已不可用。
+
+决策与实现：
+
+- Workbench 增加 `STOP_WAIT_FOR_ASR_READY_MS=35s` deadline。
+- 等待 ready 的两个停止分支统一调用 `scheduleAsrReadyStopTimeout(sessionId)`。
+- 收到 ready、`asr_ready_timeout`、WebSocket close 或新会议开始时清理 timer。
+- deadline 到期后设置主动停止状态、停止本地采集、关闭仍打开的 WebSocket、退出无限等待，并提示用户重试；正常 close 仍沿用既有历史恢复流程。
+
+TDD/验证：
+
+```text
+RED: test_workbench_stop_wait_for_asr_ready_has_bounded_recovery_path 失败
+GREEN: focused test 1 passed
+node --check workbench.js 通过
+  backend full pytest: 652 passed, 2 warnings
+```
+
+重要边界：这是 UI 状态和资源释放修复，不是录音保存修复。当前服务端在 readiness 完成后才进入音频消费循环并使用 realtime writer；readiness 失败前已经在浏览器队列中的音频不能被本轮修复直接宣称已落盘。下一步需单独实现服务端“录音 writer 与 ASR readiness 解耦”的异步接收/持久化方案，并补充真实音频 SHA 证据。
+
+## DEC-347 - Workspace verification refresh and remote-gateway boundary
+
+时间：2026-07-13
+
+背景：
+
+- 当前确定性修正链路已经有独立 fixture 和浏览器证据，但计划文档中的部分回归数字仍停留在旧运行，容易让后续判断发生漂移。
+- 用户此前在对话中暴露过远程网关凭据；该凭据不应再次使用，也不应写入仓库、日志、截图或本地持久化数据。
+
+决策：
+
+- 本轮只做工作区收口和文档同步，不调用远程 ASR/LLM，不读取或复用已暴露的旧凭据。
+- 新鲜 package-scoped 回归作为当前代码基线：backend `642 passed, 2 warnings`；root `351 passed, 2 warnings`；ASR runtime `89 passed, 1 warning`；Node syntax checks passed；`git diff --check` passed。
+- `http://127.0.0.1:8767/health` 返回 `status=ok`，只有主 uvicorn 进程保持运行；deterministic correction 的临时 fake gateway、Chrome 调试进程和临时 runner 已清理。
+- deterministic correction 报告 `status=go_deterministic_correction_e2e`，revision 数量为 1，canonical target/source、原始 ASR disclosure 和 evidence clickback 均有浏览器截图；`counts_as_production_llm_evidence=false`、`remote_asr_called=false`、`local_gateway_called=true` 必须保留。
+- canonical transcript 计划的证据步骤已勾选并补充 No-Go 说明；V2 recovery 计划的历史任务清单仍保留未完成项，不能因为回归全绿而误报发布完成。
+
+仍未通过：
+
+- 新鲜、授权且使用新轮换凭据的真实远程 OpenAI-compatible gateway 录音期建议验收；
+- 自然中文多人麦克风的非空 ASR final、术语/数字/断句质量；
+- 真实 wall-clock 长会议内存、录音增长与恢复；
+- Mac 签名/公证/安装包和 Windows 真机发布验收。
+
+下一步约束：
+
+- 远程 gateway 验收前，必须由用户先轮换已经暴露的旧 key，并通过 ignored environment/config 注入新 key；代码、文档和报告只允许出现 provider/model/usage 的脱敏信息。
+- 远程验收只跑一次明确授权的主链路；其余回归继续使用本机 fake gateway 或 no-cost deterministic lane，并继续写明 `counts_as_production_llm_evidence=false`。
+
+关联证据：
+
+- `code/web_mvp/backend/artifacts/tmp/ui_screenshots/workbench-deterministic-correction-20260713-retry5/deterministic_correction_report.json`
+- `docs/superpowers/plans/2026-07-12-canonical-transcript-implementation-plan.md`
+- `docs/superpowers/plans/2026-07-12-v2-recovery-implementation-plan.md`
+
+## DEC-345 - Realtime correction verifier must fail closed on missing UI evidence
+
+时间：2026-07-13
+
+背景：
+
+- 旧 verifier 只看 corrected_transcript_row_count 和宽泛的 backend status，可能把“后台产生了 revision 但页面没有对应修正文案”“页面残留旧 revision 但本次 backend 没有 revision”“处理中断/映射拒绝”误判为成功或 no_revision_needed。
+- Workbench 当前 canonical transcript 的修正文案位于 .transcript-segment[data-status="corrected"]，其中 data-segment-id 是修正目标，data-source-segment-id 是修正来源；旧式 .transcript-revision 只保留为兼容取证。
+
+决策：
+
+- backend revised_segment_ids 是修正是否发生的权威事实，UI 只负责证明目标段是否可见；只有两者存在交集时才允许 passed_compacted_realtime_correction_visible。
+- correction_disabled_by_setting 优先于残留 UI 行；明确的 no_revision_needed 只有在没有 revision/rejection/failure/UI orphan evidence 时才成立。
+- completed 但没有 revised_segment_ids、correctionEnabled=null 且 correction evidence 缺失、partially_completed、mapping_rejected、provider_error、provider_failed_terminal、degraded 等状态全部 fail-closed，并在报告中写入 classification_reason。
+- 录音期 sample 同时写入 corrected_transcript_segment_ids 和 corrected_transcript_source_segment_ids；不再以单纯的 corrected row 数量作为成功证据。
+- 保持 _correction_is_safe() 的事实等价与相似度边界，不为让 E2E 通过而放宽修正规则。
+
+TDD 与验证：
+
+```text
+RED:
+  新增缺失/陈旧/处理中断/映射拒绝用例，旧实现出现 2 个预期失败。
+GREEN:
+  tests/test_workbench_browser_live_mic_verify.py -> 5 passed, 1 warning
+  backend correction/API/canonical focused -> 42 passed, 2 warnings
+  backend 全量 -> 642 passed, 2 warnings
+  root tests -> 349 passed, 2 warnings
+  ASR runtime -> 89 passed, 1 warning
+  node --check -> passed
+  git diff --check -> passed
+```
+
+受控主链路复测：
+
+```text
+artifact=code/web_mvp/backend/artifacts/tmp/browser_live_mic/v2-correction-verifier-retry2-20260713
+input=two-turn-release-incident-16k.wav
+provider=funasr_realtime / provider_mode=real / remote_asr_called=false
+health_status=audio_capture_health_passed
+asr_final_count=3 / partial_visible_count=8
+first_text_after_audio_active_latency_ms=4364
+first_final_after_audio_active_latency_ms=12304
+realtime_ai_suggestion_status=passed_realtime_ai_suggestion_visible
+first_ai_suggestion_visible_latency_ms=16110
+live_reminder_drift_status=passed
+audio_sha256_matches_session=true
+browser_console_error_count=0 / network_error_count=0
+realtime_transcript_compaction_status=failed_realtime_correction_not_visible
+classification_reason=correction_rejected
+correction_enabled=true / correction_attempted=true
+rejected_segment_count=1 / revised_segment_ids=[]
+counts_as_production_llm_evidence=false
+```
+
+8 秒采样 v2-correction-verifier-retry-20260713 只捕获到 1 个 final；16 秒采样才在录音期显示正式建议。这说明采样窗口必须覆盖至少一个可持久化 final 后的调度窗口，不能把单段音频停止后才有卡片当成实时建议通过。
+
+边界：
+
+- 当前通过的是本地 FunASR + 本机 fake OpenAI-compatible gateway 的受控证据；counts_as_production_llm_evidence=false，不代表真实远程模型验收。
+- 本轮 L2 的失败是安全拒绝证据，不是页面回归：backend 已调用 correction，safe mapping 拒绝了一个漂移 segment，页面没有伪造“AI 已校正”。
+- 当前仍未完成：独立 deterministic correction fixture 的真实 revision 浏览器证据、真实远程 gateway、自然多人中文麦克风、中文技术语义质量、真实 wall-clock 长会、Mac/Windows release。
+- 临时 fake gateway、8771 验证服务和 Chrome 已关闭；8767 主服务保持运行。
+
+关联文件：
+
+- code/web_mvp/e2e/workbench_browser_live_mic_compaction.mjs
+- code/web_mvp/e2e/workbench_browser_live_mic_verify.mjs
+- tests/test_workbench_browser_live_mic_verify.py
+
+## DEC-346 - Deterministic correction must exercise the real backend API before UI evidence
+
+时间：2026-07-13
+
+背景：
+
+- 旧的 revision evidence clickback fixture 直接预置 transcript_revision，只能证明页面投影和 evidence clickback，不能证明 realtime-corrections/run-once、LLM response mapping、safe correction 和 persistence 真的工作。
+- 本轮新增 deterministic correction fixture，初始 session 只有一个中文 transcript_final，没有任何 transcript_revision；fixture 只预置一张带原始 evidence 的建议卡，用于验证已有 evidence clickback 契约，不预置修正结果。
+
+决策：
+
+- deterministic correction runner 必须先从 backend events 确认 revision_count=0，再调用 realtime-corrections/run-once，之后从 backend events 确认 revision_count=1、status=completed 和 revised_segment_ids。
+- 浏览器必须验证 canonical corrected target ID、revision payload source ID、AI 已校正文案、原始 ASR disclosure、原始 evidence clickback 和截图。
+- 本机 fake OpenAI-compatible gateway 只作为 deterministic provider harness；counts_as_production_llm_evidence=false、remote_asr_called=false 永远写入报告。
+- canonical source ID 的契约是 revision payload.segment_id，即 det_corr_seg_1:rtc-v1；不是 transcript_revision event 的完整 ID。event ID 仍保留在事件审计层。
+
+最终证据：
+
+artifact：code/web_mvp/backend/artifacts/tmp/ui_screenshots/workbench-deterministic-correction-20260713-retry5/
+
+结果：
+
+status=go_deterministic_correction_e2e
+provider=funasr_realtime
+provider_mode=real
+is_mock=false
+backend correction called=true
+backend correction status=completed
+revision_count=1
+revised_segment_ids=[det_corr_seg_1]
+correction usage total_tokens=170
+canonical corrected target=det_corr_seg_1
+canonical corrected source=det_corr_seg_1:rtc-v1
+original_asr_disclosure=true
+original_evidence_clickback=true
+clickback_focus_count=1
+counts_as_production_llm_evidence=false
+remote_asr_called=false
+browser screenshots=2
+
+中间失败证据没有覆盖：
+
+- workbench-deterministic-correction-20260713：runner CSS selector 拼接错误，backend 尚未被判定失败。
+- workbench-deterministic-correction-20260713-retry2：runner 错把 canonical source ID 当成 transcript_revision 完整 event ID。
+- workbench-deterministic-correction-20260713-retry3：关闭 details 时读取 innerText，误把折叠内容判为空。
+- workbench-deterministic-correction-20260713-retry4：fixture 没有提供原始 evidence 建议卡，页面没有可点击的原始 evidence；这不是伪造 revision，而是 fixture 没覆盖既有 evidence-card 契约。
+
+以上四项均已修正为 runner/fixture 契约问题；最终 retry5 才作为唯一 Go 证据。
+
+验证：
+
+tests/test_workbench_deterministic_correction_fixture.py：2 passed
+backend：642 passed, 2 warnings
+root tests：351 passed, 2 warnings
+ASR runtime：89 passed, 1 warning
+node --check：passed
+git diff --check：passed
+8767 health：ok
+
+边界：
+
+- 这条证据证明 L2 correction 的 backend 到 canonical UI 主链路可实现，不证明真实远程 LLM 质量、不证明自然多人麦克风、不证明生产 wall-clock 长会，也不证明 Mac/Windows 发布包。
+- 生产流程仍必须使用用户明确配置的远程 OpenAI-compatible gateway；本机 fake gateway 不得进入生产验收报告。
+
+关联文件：
+
+- code/web_mvp/e2e/deterministic_correction_fixture.mjs
+- code/web_mvp/e2e/workbench_deterministic_correction_e2e.mjs
+- tests/test_workbench_deterministic_correction_fixture.py
+
+## DEC-344 - Preserve source identity for unresolved revision supplements
+
+时间：2026-07-13
+
+背景：
+
+- DEC-343 为 canonical transcript 增加了目标 ID和来源 ID，以支持原始/修正 evidence clickback。
+- fresh all-buttons smoke 的 namespace collision probe 发现：无目标修正补充也走了目标 ID分支，导致 `data-segment-id` 变成 `revision-supplement:*`，丢失原始事件 ID；普通合法段和补充段的 projection key 虽然不同，来源追踪却不再符合既有契约。
+
+决策：
+
+- 有明确 revision target 的 canonical segment：`data-segment-id=target`，`data-source-segment-id=revision source`。
+- 没有 revision target 的 supplement：`data-segment-id=source event id`，`data-transcript-segment-id=revision-supplement:*` 负责唯一 DOM projection，`data-revision-supplement=true` 保留补充语义。
+- 不改后端 transcript event 或 canonical schema；这是前端 DOM projection 语义修复。
+
+验证：
+
+```text
+fresh all-buttons: go_workbench_all_buttons_smoke
+screenshot_count=25
+revision_supplement_probe=passed
+transcript_namespace_collision_probe=passed
+backend=642 passed, 2 warnings
+root tests=347 passed, 2 warnings
+asr runtime=89 passed, 1 warning
+```
+
+边界：该修复不改变真实麦克风、中文 ASR 质量、L2 revision 是否生成或 production LLM evidence；当前 goal 继续保持 active。
+- `code/web_mvp/backend/tests/test_workbench.py`
+- `code/web_mvp/e2e/workbench_all_buttons_smoke.mjs`
+- `tests/test_workbench_all_buttons_smoke.py`
+- `docs/full-chain-completion-implementation-plan-2026-07-09.md`
+- `docs/current-mainline-index.md`
+- `docs/real-mic-workbench-mainline-report-2026-07-10.md`
+
+成本/隐私影响：
+
+- 纯本地前端和 E2E 验收变更。
+- 不读取 `configs/local/`，不读取用户私有音频，不调用远程付费 ASR。
+- 浏览器 all-buttons 验证使用本地假 OpenAI-compatible gateway，不计入生产 LLM 证据。
+
+验证方式：
+
+```text
+RED:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_meeting_overview_rows_are_actionable_navigation -q
+
+失败原因:
+  data-overview-target="transcript" 不存在，说明本场会议上半区仍是静态状态行。
+
+GREEN:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_meeting_overview_rows_are_actionable_navigation -q
+1 passed, 2 warnings
+
+Focused regression:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_route_serves_html \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_left_cockpit_disables_empty_focus_filters_and_names_business_role \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_meeting_overview_rows_are_actionable_navigation -q
+3 passed, 2 warnings
+
+python3 -m pytest tests/test_workbench_all_buttons_smoke.py -q
+8 passed, 1 warning
+
+node --check code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js
+node --check code/web_mvp/e2e/workbench_all_buttons_smoke.mjs
+exit 0
+
+Browser all-buttons evidence:
+artifact=artifacts/tmp/ui_screenshots/workbench-all-buttons-overview-jump-focus-20260711-122831
+status=go_workbench_all_buttons_smoke
+overview_jump_coverage:
+  transcript=clicked_navigation
+  reminders=clicked_navigation
+  suggestions=clicked_navigation
+  approach=clicked_navigation
+  audio=clicked_navigation
+  minutes=clicked_navigation
+overview_jump_focus_state:
+  transcript/reminders/suggestions/approach/audio/minutes all active_element_matches=true
+  transcript/reminders/suggestions/approach/audio/minutes all target_in_viewport=true
+  transcript/reminders/suggestions/approach/audio/minutes all toast_after_click_matches=true
+screenshot_count=23
+```
+
+复审条件：
+
+- 如果用户仍觉得左侧没有实际作用，下一步不再增加数字，而是做 P1“下一步行动栏”和提醒处理动作：复制追问、忽略/已处理、标记误报、跳到对应原话证据。
+- 如果真实会议中点击左侧入口跳到空内容，但对应 session 实际已有数据，则按主链路同步 bug 处理。
+- 如果后续要做到“点击某类提醒直接跳到原话证据”，必须补充后端事件定位字段和键盘/可访问性测试。
+
+## DEC-324: Workbench Snapshot Must Preserve Visible Revision Segments
+
+日期：2026-07-11
+
+状态：Accepted / Implemented
+
+背景：
+
+- 真实浏览器麦克风 no-cost 测试显示，录音中可以看到多条实时草稿；停止后同一 session snapshot 一度只显示 1 条很长的 final，用户会感到“文字没了”。
+- 后端实际保存了 `transcript_revision` 事件，但前端 snapshot renderer 的 `resolvedRevisionKeysFromEvents()` 错把 final segment id 当作已解决 revision key，导致修正文稿行被隐藏。
+
+决策：
+
+- 只有后续 `transcript_revision` 才能 supersede 早期 revision；普通 `transcript_final/final` 不再隐藏后续 revision 行。
+- snapshot renderer 使用 `transcriptSegmentKey()` 和 `revisionSupersededSegmentKey()` 区分“当前行 segment id”和“revision supersedes 的 segment id”。
+- 这解决的是会后可读性和证据可见性，不改变 ASR provider 的 final latency。
+
+影响范围：
+
+- `code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js`
+- `code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.html`
+- `code/web_mvp/backend/tests/test_workbench.py`
+- `docs/current-mainline-index.md`
+- `docs/real-mic-workbench-mainline-report-2026-07-10.md`
+
+成本/隐私影响：
+
+- 纯前端渲染和测试变更，不读取 `configs/local/`，不读取用户私有音频，不调用远程 ASR/LLM。
+- 最新证据为 no-cost deterministic，不计入生产 LLM 质量证明。
+
+验证方式：
+
+```text
+Before fix:
+artifact=artifacts/tmp/browser_live_mic/real-mic-cockpit-ux-current-nocost-20260711-113618
+frontend_utterance_count=1
+transcript_revision events existed in backend, but revision rows were hidden.
+
+After fix:
+artifact=artifacts/tmp/browser_live_mic/real-mic-revision-visible-nocost-20260711-114824
+frontend_utterance_count=9
+meeting_cockpit_counts.transcript=9
+audio_sha256_matches_session=true
+browser_console_error_count=0
+network_error_count=0
+
+Regression:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest code/web_mvp/backend/tests/test_workbench.py -q
+103 passed, 2 warnings
+
+python3 -m pytest tests/test_workbench_all_buttons_smoke.py -q
+7 passed, 1 warning
+
+node --check code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js
+node --check code/web_mvp/e2e/workbench_browser_live_mic_verify.mjs
+node --check code/web_mvp/e2e/workbench_all_buttons_smoke.mjs
+exit 0
+```
+
+复审条件：
+
+- 如果后续 real-mic 或导入录音 snapshot 再出现“会后文字条数缩水”，优先检查 revision/final/partial draft 的显示合并规则。
+- ASR final latency 仍是独立生产缺口：最新 150 秒真实麦克风 no-cost run 中 `first_final_after_audio_active_latency_ms=150310`，不能把本决策误认为已经解决实时 final 延迟。
+
+## DEC-323: Workbench Browser Verification Must Check Served Static Version
+
+日期：2026-07-11
+
+状态：Accepted / Implemented
+
+背景：
+
+- 用户在当前 in-app browser 中继续指出左侧栏“好像没有实际作用”。
+- 代码和测试已经包含 DEC-322 的新文案与禁用态，但浏览器页面仍显示旧版 `会议状态 / 会议重点`。
+- 复核发现 8765 端口的旧 uvicorn 进程仍在服务旧 HTML：`/workbench` 返回 `workbench.js?v=20260711-focus-filter2`，而源码已是 `workbench.js?v=20260711-cockpit-ux1`。
+- 这类问题会制造假象：看起来像 UI 方案没生效，实际是本地服务进程未刷新。
+
+决策：
+
+- 后续凡是验证 Workbench UI，必须同时检查源码文件和 8765 实际 served HTML / script cache buster。
+- 如果两者不一致，先用 `tools/workbench_server.py stop/start --port 8765` 重启受控本地服务，再刷新浏览器。
+- 当前已重启 8765 服务，`curl http://127.0.0.1:8765/workbench` 已返回 `本场会议`、`会议驾驶舱`、`transcript-mode-label` 和 `workbench.js?v=20260711-cockpit-ux1`。
+- 当前 in-app browser 正常 Workbench 标签已刷新并截图留痕：
+  `artifacts/tmp/ui_screenshots/current-workbench-cockpit-reload-20260711/01-current-workbench-after-server-restart.png`。
+
+影响范围：
+
+- `tools/workbench_server.py` 的使用规范。
+- Workbench UI 手工/自动验收流程。
+- `docs/current-mainline-index.md`
+- `docs/real-mic-workbench-mainline-report-2026-07-10.md`
+
+成本/隐私影响：
+
+- 只重启本地 8765 开发服务，不读取 `configs/local/`，不读取用户私有音频，不调用远程 ASR/LLM，不增加费用。
+
+验证方式：
+
+```text
+before restart:
+curl -fsS http://127.0.0.1:8765/workbench | rg "workbench.js\?v=|会议状态|本场会议|会议驾驶舱|transcript-mode-label"
+served script=/static/workbench.js?v=20260711-focus-filter2
+served labels=会议状态 / 会议重点
+
+restart:
+python3 tools/workbench_server.py stop --port 8765
+python3 tools/workbench_server.py start --port 8765
+
+after restart:
+served script=/static/workbench.js?v=20260711-cockpit-ux1
+served labels=本场会议 / 重点筛选
+served aria=会议驾驶舱：查看本场会议主流程状态并筛选实时提醒
+served transcript mode label=待开始
+
+in-app browser refreshed state:
+leftAria=会议驾驶舱：查看本场会议主流程状态并筛选实时提醒
+leftText includes 本场会议 / 重点筛选
+transcriptMode=待开始
+all zero-count focus filters disabled=true
+```
+
+复审条件：
+
+- 如果后续用户看到的页面和源码/测试结论不一致，优先检查服务进程、served static cache buster 和浏览器标签状态，再判断产品/代码是否有缺陷。
+
+## DEC-322: Meeting Cockpit Empty-State And Live Transcript Projection Must Be Understandable
+
+日期：2026-07-11
+
+状态：Accepted / Implemented
+
+背景：
+
+- 用户再次指出 Workbench 页面左侧栏“好像没有实际作用”，并追问实时文字是不是一直替换、用户是否要等会议结束才能看到完整内容。
+- 只读复核和并行 Agent 审查一致：左侧栏的数据通路是真实的，问题主要在产品表达和空态交互。
+- 旧 UI 空态显示 `会议状态 / 会议重点` 加一串 `0 / 未保存 / 未生成`，四个 0 条重点筛选也像可用按钮，会让用户感到这列是装饰。
+- 旧实时文字投影虽然已有 append-first 机制，但文案仍用 `临时稿` 和一条不断变化的 `实时` 尾巴，用户容易理解成“文字被替换了”。
+
+决策：
+
+- 左侧栏继续作为 Meeting Cockpit，但可见文案收敛为更直接的 `本场会议` 和 `重点筛选`。
+- `aside.left` 增加可访问名称：`会议驾驶舱：查看本场会议主流程状态并筛选实时提醒`。
+- `重点筛选` 的 0 条类型默认禁用，不再让用户点击没有任何结果的假操作；对应类型出现提醒后自动启用。
+- 浏览器 all-buttons smoke 的重点筛选覆盖改为：
+  - 非零类型必须可点击并过滤右侧实时提醒。
+  - 零计数类型必须记录为 `disabled_zero_count_filter`。
+- 实时文字区增加 `transcript-mode-label`，显示 `待开始 / 已记录 + 正在听 / 整理中 / 已记录`。
+- 稳定 partial 用户文案从 `临时稿` 改为 `已记录`，当前可变 ASR 尾巴从 `实时` 改为 `正在听`。
+- 稳定 partial 可见追加阈值从 24 个 compact 字符降到 12 个 compact 字符，让用户更早看到会议上下文增长；final/revision 仍按 segment 清理对应 provisional chunks，避免重复。
+- 当前不把 `本场会议` 六行直接改成跳转入口；click-to-evidence 仍作为生产前 P1 决策，升级前必须先补键盘顺序、可访问性和证据跳转测试。
+
+影响范围：
+
+- `code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.html`
+- `code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js`
+- `code/web_mvp/backend/tests/test_workbench.py`
+- `code/web_mvp/e2e/workbench_all_buttons_smoke.mjs`
+- `tests/test_workbench_all_buttons_smoke.py`
+- `docs/full-chain-completion-implementation-plan-2026-07-09.md`
+- `docs/current-mainline-index.md`
+- `设计稿/design-system/meeting-copilot/pages/workbench.md`
+
+成本/隐私影响：
+
+- 纯前端和本地 E2E 验收变更，不新增远程 ASR/LLM 调用，不读取 `configs/local/`，不读取用户私有录音，不上传原始音频。
+
+验证方式：
+
+```text
+RED:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_left_cockpit_disables_empty_focus_filters_and_names_business_role \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_realtime_transcript_labels_stable_append_and_live_tail -q
+
+失败原因:
+  HTML 缺少 meeting cockpit aria label / transcript-mode-label，JS 缺少 0 条筛选禁用和实时文字模式文案。
+
+GREEN:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_left_cockpit_disables_empty_focus_filters_and_names_business_role \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_realtime_transcript_labels_stable_append_and_live_tail -q
+
+2 passed, 2 warnings
+```
+
+Regression:
+
+```text
+PYTHONPATH=code/web_mvp/backend python3 -m pytest code/web_mvp/backend/tests/test_workbench.py -q
+102 passed, 2 warnings
+
+python3 -m pytest tests/test_workbench_all_buttons_smoke.py -q
+7 passed, 1 warning
+
+node --check code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js
+exit 0
+
+node --check code/web_mvp/e2e/workbench_all_buttons_smoke.mjs
+exit 0
+
+ARTIFACT_ROOT=artifacts/tmp/ui_screenshots/workbench-all-buttons-cockpit-ux-disabled-20260711-112328 \
+node code/web_mvp/e2e/workbench_all_buttons_smoke.mjs
+status=go_workbench_all_buttons_smoke
+focus_filter_coverage includes ActionItem=disabled_zero_count_filter
+downloads verified: transcript.txt / minutes.md / audio.wav
+```
+
+复审条件：
+
+- 如果用户仍觉得左侧栏“不知道干嘛”，下一步应优先把 `本场会议` 六行升级为 click-to-evidence 或改成更直接的状态组，而不是继续堆更多数字。
+- 如果真实麦克风长会显示稳定 partial 过于碎片化或滚动体验差，需要调整 `PARTIAL_DRAFT_MIN_CHARS` 和滚动策略。
+- 如果产品正式承诺 `AI 建议` 也必须在录音中实时增长，需要新增 production-enabled 录音期 formal card latency gate；当前本轮只解决实时提醒和文字可见性。
+
+## DEC-321: Browser Real-Mic Verifier Fails On Recording-Phase Reminder Drift
+
+日期：2026-07-11
+
+状态：Accepted / Implemented
+
+背景：
+
+- DEC-320 修复了 WebSocket 不推送派生候选提醒的问题，但如果后续代码退化，单看最终 `meeting_cockpit_counts.realtime_reminders` 仍可能掩盖问题。
+- 上一次 10 分钟长会漂移的本质是：录音期后端 session snapshot 已经有候选提醒，但前端 cockpit 仍长期停在低值；最终会后 snapshot 又把数字补齐。
+- 因此真实麦克风 verifier 必须在录音期间同时采集前端 cockpit 和后端 session snapshot，而不是只比较会后最终数字。
+
+决策：
+
+- `workbench_browser_live_mic_verify.mjs` 的 `recording_phase_ui_samples.json` 每个 sample 增加后端探针字段：
+  - `backend_probe_status`
+  - `backend_event_count`
+  - `backend_suggestion_candidate_count`
+  - `backend_partial_hint_count`
+  - `backend_live_reminder_count`
+- `summary.json` 增加：
+  - `live_reminder_drift_status`
+  - `live_reminder_drift_report`
+- `buildLiveReminderDriftReport()` 比较录音期最大后端候选数和前端 `c-gap`，允许 2 条以内异步延迟；如果后端录音期候选明显领先前端，则输出 `failed_backend_candidates_not_visible` 并让脚本 `process.exitCode = 1`。
+- 该 gate 只判断录音期已经存在的候选是否可见，不要求 stop 后才生成的 final/revision 候选在录音期提前出现。
+
+影响范围：
+
+- `code/web_mvp/e2e/workbench_browser_live_mic_verify.mjs`
+- `code/web_mvp/backend/tests/test_workbench.py`
+- `docs/current-mainline-index.md`
+- `docs/decision-log.md`
+- `docs/real-mic-workbench-mainline-report-2026-07-10.md`
+
+成本/隐私影响：
+
+- 只读取本地测试 server 的同 session `/live/asr/sessions/{sid}/events`，不读取用户私有音频，不读取 `configs/local/`，不新增远程调用或付费 ASR/LLM。
+
+验证方式：
+
+```text
+RED:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_workbench.py::test_browser_live_mic_verify_detects_live_reminder_drift_during_recording -q
+
+失败原因:
+  verifier 缺少 readRecordingBackendReminderProbe / live_reminder_drift_report / drift failure status。
+
+GREEN:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_workbench.py::test_browser_live_mic_verify_detects_live_reminder_drift_during_recording -q
+
+1 passed, 2 warnings
+```
+
+Regression:
+
+```text
+node --check code/web_mvp/e2e/workbench_browser_live_mic_verify.mjs
+exit 0
+
+PYTHONPATH=code/web_mvp/backend python3 -m pytest code/web_mvp/backend/tests/test_workbench.py -q
+99 passed, 2 warnings
+
+PYTHONPATH=code/web_mvp/backend python3 -m pytest code/web_mvp/backend/tests/test_asr_stream.py -q
+23 passed, 2 warnings
+
+python3 -m pytest tests/test_workbench_all_buttons_smoke.py -q
+7 passed, 1 warning
+```
+
+Real-mic no-cost recheck:
+
+```text
+artifact=artifacts/tmp/browser_live_mic/real-mic-live-reminder-drift-gate-nocost-20260711-110137
+input_mode=real_browser_mic
+ui_coverage=visible_chrome
+health_status=audio_capture_health_passed
+chunk_count=200
+derivation_mode=no_cost_deterministic
+counts_as_production_llm_evidence=false
+audio_sha256_matches_session=true
+browser_console_error_count=0
+network_error_count=0
+live_reminder_drift_status=passed
+max_recording_backend_live_reminders=3
+max_recording_frontend_realtime_reminders=3
+final_session_live_reminder_count=7
+```
+
+复审条件：
+
+- 如果录音期采样频率改变、前端改成批量渲染、或后端 session snapshot 改为延迟写入，需要重新校准 `tolerated_delta` 和 failure 条件。
+- 如果未来实时建议卡不再来自 `suggestion_candidate_event`，必须同步更新 backend probe 计数规则。
+
+## DEC-320: Live ASR WebSocket Streams Derived Candidate Reminders During Recording
+
+日期：2026-07-11
+
+状态：Accepted / Implemented
+
+背景：
+
+- 10 分钟真实浏览器麦克风 no-cost soak `artifacts/tmp/browser_live_mic/real-mic-summary-ui-fields-10min-nocost-20260711-102156` 显示录音期文字和临时稿持续增长，但左侧会议驾驶舱 `实时提醒` 大部分时间停在 3；停止并整理后，同一 session 最终显示 `realtime_reminders=47`。
+- 证据拆解显示后端 session snapshot 中已有 `suggestion_candidate_event=46` 和 `partial_hint_event=1`，但录音中的 WebSocket 只推 ASR 原始 `partial/final` 和少量 `partial_hint_event`，没有把 `_upsert_live_session()` 派生出的 `suggestion_candidate_event` 推给前端。
+- 这会让产品在会中退化成“实时转写 + 会后补提醒”，偏离最初“实时会议 + 实时建议”的核心价值。
+
+决策：
+
+- `asr_stream.handle_stream()` 在每次 `_upsert_live_session()` 后返回本轮完整 `live_events`，并通过同一条 WebSocket 补发新增的 `suggestion_candidate_event`。
+- 只推用户会中需要看到的业务候选提醒，不推 `state_event`、`scheduler_event`、`llm_request_draft_event` 等内部流水事件。
+- 使用 `sent_live_candidate_event_ids` 按 event id 去重，避免长会议中重复候选刷屏。
+- 前端不新增轮询。Workbench 已有 `appendLiveEvent()` 对 `suggestion_candidate_event` 的消费路径，修复应优先保证实时事件通道语义一致。
+
+影响范围：
+
+- `code/web_mvp/backend/meeting_copilot_web_mvp/asr_stream.py`
+- `code/web_mvp/backend/tests/test_asr_stream.py`
+- `docs/current-mainline-index.md`
+- `docs/full-chain-completion-implementation-plan-2026-07-09.md`
+- `docs/real-mic-workbench-mainline-report-2026-07-10.md`
+- `设计稿/design-system/meeting-copilot/pages/workbench.md`
+
+成本/隐私影响：
+
+- 本地 WebSocket 事件契约修复，不新增付费 ASR，不新增远程调用，不读取密钥，不上传原始音频。
+- 真实麦克风复测使用 no-cost deterministic 派生；`counts_as_production_llm_evidence=false`，不冒充生产 LLM 质量。
+
+验证方式：
+
+```text
+RED:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_asr_stream.py::test_asr_stream_sends_stable_partial_candidate_over_same_websocket -q
+
+失败原因:
+  session 已持久化派生候选事件，但 WebSocket sent 里没有 suggestion_candidate_event。
+
+GREEN:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_asr_stream.py::test_asr_stream_sends_stable_partial_candidate_over_same_websocket -q
+
+1 passed, 2 warnings
+```
+
+Regression:
+
+```text
+PYTHONPATH=code/web_mvp/backend python3 -m pytest code/web_mvp/backend/tests/test_asr_stream.py -q
+23 passed, 2 warnings
+
+PYTHONPATH=code/web_mvp/backend python3 -m pytest code/web_mvp/backend/tests/test_workbench.py -q
+98 passed, 2 warnings
+
+python3 -m pytest tests/test_workbench_all_buttons_smoke.py -q
+7 passed, 1 warning
+
+node --check code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js
+node --check code/web_mvp/e2e/workbench_all_buttons_smoke.mjs
+node --check code/web_mvp/e2e/workbench_browser_live_mic_verify.mjs
+all exit 0
+
+node code/web_mvp/e2e/workbench_all_buttons_smoke.mjs
+status=go_workbench_all_buttons_smoke
+screenshot_count=17
+```
+
+Real-mic no-cost rechecks:
+
+```text
+artifact=artifacts/tmp/browser_live_mic/real-mic-live-candidates-ws-nocost-20260711-104608
+input_mode=real_browser_mic
+ui_coverage=visible_chrome
+health_status=audio_capture_health_passed
+chunk_count=300
+recording_phase_ui_samples=19
+recording realtime_reminders: 0 -> 4 -> 5 -> 6
+final meeting_cockpit_counts.realtime_reminders=13
+audio_sha256_matches_session=true
+browser_console_error_count=0
+network_error_count=0
+
+artifact=artifacts/tmp/browser_live_mic/real-mic-live-candidates-ws-short-sentences-nocost-20260711-104824
+input_mode=real_browser_mic
+ui_coverage=visible_chrome
+health_status=audio_capture_health_passed
+chunk_count=501
+recording_phase_ui_samples=31
+recording realtime_reminders: 0 -> 1 -> 2 -> 3 -> 4
+final meeting_cockpit_counts.realtime_reminders=15
+audio_sha256_matches_session=true
+browser_console_error_count=0
+network_error_count=0
+```
+
+复审条件：
+
+- 如果后续实时 ASR provider 能在录音中稳定产出多段 final/revision，应再跑 10 分钟 no-cost 或 production-enabled soak，确认 final/revision 派生候选也会中可见。
+- 如果正式建议卡要在候选出现后自动调用生产 LLM，必须单独跑 production-enabled evidence 并记录成本/调用次数。
+- 如果左侧会议驾驶舱改成交互式导航或 click-to-evidence，需要另开 UI/可访问性测试，不得混入本次 WS 契约修复。
+
+## DEC-319: Real-Mic Summary Promotes UI Acceptance Metrics
+
+日期：2026-07-11
+
+状态：Accepted / Implemented
+
+背景：
+
+- DEC-318 已让真实麦克风 E2E 写入 `summary.json`，但该 summary 仍缺少实时文字延迟、最终 cockpit 阶段、浏览器错误、网络错误等验收字段。
+- 这会迫使后续验收散读 `summary.json`、`ui_verification.json`、`recording_phase_ui_samples.json` 和 `audio_export_probe.json`，容易再次造成“主线到底完成什么”的沟通成本。
+- 当前目标强调真实麦克风主链路和可追溯自测，因此 `summary.json` 必须能作为第一入口回答主问题。
+
+决策：
+
+- `workbench_browser_live_mic_verify.mjs` 的 `summary.json` 顶层新增：
+  - `workbench_same_session_visible`
+  - `frontend_utterance_count`
+  - `frontend_card_count`
+  - `frontend_minutes_visible`
+  - `meeting_cockpit_stage`
+  - `meeting_cockpit_counts`
+  - `first_text_after_audio_active_latency_ms`
+  - `first_final_after_audio_active_latency_ms`
+  - `partial_visible_count`
+  - `final_visible_count`
+  - `browser_console_error_count`
+  - `network_error_count`
+- 这些字段来自 `ui_verification.json`，不改变底层 ASR/LLM/录音行为。
+
+影响范围：
+
+- `code/web_mvp/e2e/workbench_browser_live_mic_verify.mjs`
+- `code/web_mvp/backend/tests/test_workbench.py`
+- `docs/current-mainline-index.md`
+- `docs/real-mic-workbench-mainline-report-2026-07-10.md`
+
+成本/隐私影响：
+
+- 本地 evidence schema 增强，不新增付费调用，不读取密钥，不上传音频。
+
+验证方式：
+
+```text
+RED:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_workbench.py::test_browser_live_mic_summary_promotes_ui_acceptance_fields -q
+
+失败原因:
+  summary block 缺少 workbench_same_session_visible 等 UI 验收字段
+
+GREEN:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_workbench.py::test_browser_live_mic_summary_promotes_ui_acceptance_fields -q
+
+1 passed, 2 warnings
+```
+
+```text
+Regression:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest code/web_mvp/backend/tests/test_workbench.py -q
+98 passed, 2 warnings
+
+python3 -m pytest tests/test_workbench_all_buttons_smoke.py -q
+7 passed, 1 warning
+
+node --check code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js
+exit 0
+
+node --check code/web_mvp/e2e/workbench_all_buttons_smoke.mjs
+exit 0
+
+node --check code/web_mvp/e2e/workbench_browser_live_mic_verify.mjs
+exit 0
+```
+
+Real-mic no-cost recheck:
+
+```text
+artifact=artifacts/tmp/browser_live_mic/real-mic-summary-ui-fields-nocost-20260711-101557
+session_id=rec_mrfqgcol
+input_mode=real_browser_mic
+health_status=audio_capture_health_passed
+chunk_count=200
+asr_final_count=1
+suggestion_card_count=3
+approach_card_count=1
+minutes_char_count=252
+audio_export_http_status=200
+audio_sha256_matches_session=true
+workbench_same_session_visible=true
+frontend_card_count=4
+frontend_minutes_visible=true
+meeting_cockpit_stage={label:已复盘,state:reviewed}
+first_text_after_audio_active_latency_ms=8473
+first_final_after_audio_active_latency_ms=59310
+browser_console_error_count=0
+network_error_count=0
+```
+
+复审条件：
+
+- 后续 release/long-soak gate 应优先读取 `summary.json`，只有需要细节时再读 `ui_verification.json` 和 `recording_phase_ui_samples.json`。
+- 如果新增核心验收项，例如 ASR semantic score、LLM cost、hotword profile 命中率，也应提升到 summary 顶层。
+
+## DEC-318: Real-Mic Evidence Records Cockpit Stage And Summary JSON
+
+日期：2026-07-11
+
+状态：Accepted / Implemented
+
+背景：
+
+- DEC-317 已在 Workbench 左侧会议驾驶舱加入阶段标签，但真实麦克风 E2E 只记录 cockpit counts，没有机器可读的 cockpit stage。
+- `workbench_browser_live_mic_verify.mjs` 以前只把 summary 打印到 stdout，没有写 `summary.json`。一旦外层 shell 或终端截断出问题，关键 Go/No-Go 摘要不够可追溯。
+- 当前目标要求真实麦克风长会议主链路持续自测和修复，因此 real-mic evidence 必须能直接证明录音中和会后阶段，而不是依赖人工看截图。
+
+决策：
+
+- `recording_phase_ui_samples.json` 的每个 sample 增加 `cockpit_stage`，记录 `label/state`。
+- `ui_verification.json` 增加 `meeting_cockpit_stage`，记录最终会后阶段。
+- `workbench_browser_live_mic_verify.mjs` 把终端 summary 同步写入 `summary.json`。
+- 本改动只增强 evidence，不改变录音、ASR、建议卡、方案、纪要或远程调用边界。
+
+影响范围：
+
+- `code/web_mvp/e2e/workbench_browser_live_mic_verify.mjs`
+- `code/web_mvp/backend/tests/test_workbench.py`
+- `docs/current-mainline-index.md`
+- `docs/real-mic-workbench-mainline-report-2026-07-10.md`
+
+成本/隐私影响：
+
+- no-cost 本地证据增强，不调用付费 LLM，不读取 `configs/local/`，不读取未授权用户录音。
+- 真实麦克风复测只写 ignored artifact 目录；录音导出用于 SHA 验证，不提交仓库。
+
+验证方式：
+
+```text
+RED:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_workbench.py::test_browser_live_mic_verify_records_meeting_cockpit_counts -q
+
+失败原因:
+  workbench_browser_live_mic_verify.mjs 缺少 readMeetingCockpitStage()
+
+RED:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_workbench.py::test_browser_live_mic_verify_writes_machine_readable_summary_file -q
+
+失败原因:
+  workbench_browser_live_mic_verify.mjs 只 console.log summary，没有写 summary.json
+```
+
+```text
+GREEN:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_workbench.py::test_browser_live_mic_verify_writes_machine_readable_summary_file \
+  code/web_mvp/backend/tests/test_workbench.py::test_browser_live_mic_verify_records_meeting_cockpit_counts -q
+
+2 passed, 2 warnings
+```
+
+```text
+Regression:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest code/web_mvp/backend/tests/test_workbench.py -q
+96 passed, 2 warnings
+
+python3 -m pytest tests/test_workbench_all_buttons_smoke.py -q
+7 passed, 1 warning
+
+node --check code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js
+exit 0
+
+node --check code/web_mvp/e2e/workbench_all_buttons_smoke.mjs
+exit 0
+
+node --check code/web_mvp/e2e/workbench_browser_live_mic_verify.mjs
+exit 0
+```
+
+Real-mic no-cost recheck:
+
+```text
+artifact=artifacts/tmp/browser_live_mic/real-mic-cockpit-stage-summary-nocost-20260711-100829
+summary.json exists=true
+session_id=rec_mrfq6rmj
+input_mode=real_browser_mic
+ui_coverage=visible_chrome
+health_status=audio_capture_health_passed
+chunk_count=200
+asr_final_count=1
+derivation_mode=no_cost_deterministic
+counts_as_production_llm_evidence=false
+suggestion_card_count=3
+approach_card_count=1
+minutes_char_count=252
+audio_export_http_status=200
+audio_file_size_bytes=1916972
+audio_sha256_matches_session=true
+recording_phase_ui_samples=13
+```
+
+Cockpit stage evidence:
+
+```text
+recording_phase_ui_samples:
+  recording_started -> cockpit_stage={label:录音中,state:recording}
+  before_stop -> cockpit_stage={label:录音中,state:recording}
+  late recording counts: transcript=6, realtime_reminders=2, partial_draft_count=5
+
+ui_verification:
+  meeting_cockpit_stage={label:已复盘,state:reviewed}
+  meeting_cockpit_counts:
+    transcript=1
+    realtime_reminders=9
+    ai_suggestions=3
+    approach=1
+    audio=已保存
+    minutes=已生成
+```
+
+复审条件：
+
+- 下一次长会议真实麦克风 gate 应继续检查 `summary.json`、`recording_phase_ui_samples[].cockpit_stage` 和 `ui_verification.meeting_cockpit_stage`。
+- 如果后续启用 production LLM，必须仍保留 `counts_as_production_llm_evidence=true/false` 的严格区分。
+
+## DEC-317: Meeting Cockpit Shows A Phase Badge Instead Of Only Zero Counts
+
+日期：2026-07-11
+
+状态：Accepted / Implemented
+
+背景：
+
+- DEC-316 明确左侧栏业务上是会议驾驶舱，但当前空态全是 `0 / 未保存 / 未生成`，用户仍会合理感知为“没有实际作用”。
+- 不应通过增加长说明文字解决这个问题；会议工具界面应低学习成本、状态清晰、信息密度克制。
+- 现有 E2E 依赖 0 条筛选仍可点击并显示右侧空态，所以本轮不禁用 0 条筛选，避免破坏既有行为和测试。
+
+决策：
+
+- 在左侧 `会议状态` 标题旁新增 `c-cockpit-stage` 阶段标签。
+- 阶段由前端当前 session 状态自动推导：
+  - `待开始`：没有当前会议或已删除后回到空态。
+  - `录音中`：真实麦克风录音中。
+  - `整理中`：导入/整理/停止会议后的处理阶段。
+  - `已记录`：当前 session 已有文字、录音、建议或方案，但还没有生成复盘。
+  - `已复盘`：当前 session 已生成会议纪要。
+- `syncMeetingOverview()` 负责同步阶段标签文本和 `data-state`，`setMeetingPhase()` 在阶段变化时触发一次会议驾驶舱同步。
+- 浏览器 smoke 的 `safeReadPageState()` 增加 `cockpitStage`，后续截图报告可以机器读取阶段变化。
+
+影响范围：
+
+- `code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.html`
+- `code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js`
+- `code/web_mvp/backend/tests/test_workbench.py`
+- `code/web_mvp/e2e/workbench_all_buttons_smoke.mjs`
+- `tests/test_workbench_all_buttons_smoke.py`
+- `docs/current-mainline-index.md`
+- `docs/full-chain-completion-implementation-plan-2026-07-09.md`
+
+成本/隐私影响：
+
+- 纯前端本地 UI 状态同步和 E2E 证据增强，不调用远端 ASR/LLM，不读取密钥，不上传音频。
+
+验证方式：
+
+```text
+RED:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_meeting_cockpit_stage_tracks_mainline_phase -q
+
+失败原因:
+  workbench.js 尚无 meetingCockpitStage()
+
+GREEN:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_meeting_cockpit_stage_tracks_mainline_phase \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_left_column_explains_meeting_mainline_status -q
+
+2 passed, 2 warnings
+```
+
+```text
+Regression:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest code/web_mvp/backend/tests/test_workbench.py -q
+96 passed, 2 warnings
+
+python3 -m pytest tests/test_workbench_all_buttons_smoke.py -q
+7 passed, 1 warning
+
+node --check code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js
+exit 0
+
+node --check code/web_mvp/e2e/workbench_all_buttons_smoke.mjs
+exit 0
+
+node code/web_mvp/e2e/workbench_all_buttons_smoke.mjs
+status=go_workbench_all_buttons_smoke
+screenshot_count=17
+```
+
+Browser evidence:
+
+```text
+artifact=artifacts/tmp/ui_screenshots/workbench-all-buttons-smoke/workbench_visual_acceptance_report.json
+cockpitStage sequence includes:
+  initial_page -> 待开始
+  import_recording/history/suggestions/approach -> 已记录
+  minutes_generated/exports/organize -> 已复盘
+  delete_reset -> 待开始
+```
+
+复审条件：
+
+- 如果用户仍觉得左侧栏负担大，下一步应优先考虑把 `会议状态` 六行压缩成更清晰的状态组，或把 `会议状态` 行升级为 click-to-evidence；不要继续增加更多数字指标。
+- 如果后续真实麦克风 E2E 中 `录音中` 标签没有被捕获，需要把 `workbench_browser_live_mic_verify.mjs` 的 UI report 也加入 `cockpitStage` 字段。
+
+## DEC-316: Meeting Cockpit Must Be Useful In Empty, Recording, And Review States
+
+日期：2026-07-11
+
+状态：Accepted / Planning Clarification
+
+背景：
+
+- 用户在当前 Workbench 页面再次指出左侧一列“好像没有实际作用”，要求说明业务是什么并补进计划。
+- 浏览器只读复核显示，当前可见左侧文本为 `会议状态 / 文字记录 0 / 实时提醒 0 / AI 建议 0 / 方案分析 0 / 录音保存 未保存 / 会后复盘 未生成 / 会议重点 / 决定了什么 0 / 待办事项 0 / 风险提醒 0 / 待确认问题 0`。
+- 代码复核确认左侧不是 mock：上半区从当前 transcript、candidate events、suggestion cards、approach cards、audio asset、minutes state 同步；下半区四个 `data-focus-type` 按 `suggestion_candidate_event/partial_hint_event` 分类筛选右侧实时提醒。
+- 但用户感知仍然成立：空会话或刚进页面时全是 `0/未保存/未生成`，四个 0 条筛选按钮仍然可点击，业务角色没有在体验上自然显现，容易被误认为是装饰数字列。
+
+决策：
+
+- 左侧栏业务定位不变：它是会议驾驶舱，不是转写列表、广告栏或 mock 展示。
+- 生产前必须覆盖三种状态，而不能只证明“有数据时能显示数字”：
+  - 空态/待开始：不能让用户误以为左栏无作用；如果继续保留可点击 0 条筛选，必须在右侧筛选空态给出明确反馈。
+  - 录音中：`文字记录`、`实时提醒` 和四类重点计数必须随实时文字追加和候选提醒持续增长。
+  - 会后复盘：`AI 建议`、`方案分析`、`录音保存`、`会后复盘` 必须能反映同一 session 的正式产物状态。
+- 暂不直接禁用 0 条筛选按钮，因为当前浏览器 E2E 会点击四类筛选并验证空态筛选行为；如果后续改为“0 条不可点/有条才可点”，必须同步改 `workbench_all_buttons_smoke.mjs` 和相关 HTML/JS 测试。
+- `会议状态` 六行暂时继续作为状态投影；是否升级为 click-to-evidence 快捷入口放入生产前 P1 计划，升级前必须补键盘顺序、可访问性和证据跳转测试。
+
+影响范围：
+
+- `docs/full-chain-completion-implementation-plan-2026-07-09.md`
+- `docs/current-mainline-index.md`
+- `docs/real-mic-workbench-mainline-report-2026-07-10.md`
+- 后续若改交互，将影响 `code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.html`
+- 后续若改交互，将影响 `code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js`
+- 后续若改交互，将影响 `code/web_mvp/e2e/workbench_all_buttons_smoke.mjs`
+
+成本/隐私影响：
+
+- 本决策只约束本地 UI/文档/验收，不新增远端 ASR/LLM 调用，不读取 `configs/local/`，不读取用户私有录音，不上传音频。
+
+验证方式：
+
+```text
+Current browser observation:
+url=http://127.0.0.1:8765/workbench?demo=1&verify=responsive-cockpit-final
+leftText=会议状态 文字记录0 实时提醒0 AI 建议0 方案分析0 录音保存未保存 会后复盘未生成 会议重点 决定了什么0 待办事项0 风险提醒0 待确认问题0
+focus buttons exist and are clickable with data-focus-type=DecisionCandidate/ActionItem/Risk/OpenQuestion.
+```
+
+```text
+Long-meeting post-fix evidence:
+artifact=artifacts/tmp/browser_live_mic/real-mic-cockpit-fix-10min-nocost-20260711-092525
+record_seconds=600
+input_mode=real_browser_mic
+provider=funasr_realtime
+provider_mode=real
+is_mock=false
+health_status=audio_capture_health_passed
+suggestion_card_count=3
+approach_card_count=1
+minutes_char_count=391
+audio_sha256_matches_session=true
+final meeting_cockpit_counts:
+  transcript=1
+  realtime_reminders=32
+  ai_suggestions=3
+  approach=1
+  audio=已保存
+  minutes=已生成
+  decisions=7
+  actions=3
+  risks=22
+  questions=0
+recording samples show growth from transcript=0/reminders=0 to transcript=25/reminders=2 before stop.
+```
+
+关联文档：
+
+- `docs/full-chain-completion-implementation-plan-2026-07-09.md`
+- `docs/current-mainline-index.md`
+- `docs/real-mic-workbench-mainline-report-2026-07-10.md`
+
+复审条件：
+
+- 如果用户继续认为左侧没有实际作用，下一步优先做交互层收敛：更清晰的空态、0 条筛选的可点击策略、或 `会议状态` click-to-evidence，而不是继续增加指标数量。
+- 如果后续真实会议显示左侧与中间实时文字/右侧建议不同步，按主链路 bug 处理。
+- 如果正式产品改为窄屏/单栏优先，左侧驾驶舱应上移或合并为顶部状态带，不能藏在长页面后部。
+
+## DEC-314: Left Column Remains A Meeting Cockpit, Not A Decorative Side List
+
+日期：2026-07-11
+
+状态：Accepted / Planning Clarification
+
+背景：
+
+- 用户再次指出 Workbench 左侧一列“好像没有实际作用”，要求说明业务是什么并补进计划。
+- 代码和页面状态复核显示，左侧栏当前读取的不是 mock：`c-transcript/c-gap/c-cards/c-approach/c-audio/c-minutes` 来自当前 session、DOM transcript projection、candidate events、cards、audio asset 和 minutes state；`c-decision/c-action/c-risk/c-question` 来自 `suggestion_candidate_event` 和 `partial_hint_event` 分类。
+- 但用户感知仍然成立：如果只看到一列数字，没有明确产品定位和验收 checklist，后续开发容易把它当成装饰或与右侧建议区重复。
+
+决策：
+
+- 左侧栏继续定义为 Workbench 的会议驾驶舱。
+- `会议状态` 是主链路进度灯：实时文字、实时提醒、AI 建议、方案分析、录音保存、会后复盘。
+- `会议重点` 是会议中 triage 入口：决定、待办、风险、待确认问题四类候选提醒筛选。
+- 左侧栏不承载长文本、raw event ids、mock/demo-only 展示、最终纪要正文或复杂说明；这些仍归属于中间实时文字区和右侧建议/方案/纪要/历史区。
+- 生产验收前必须验证长会议录音中左侧状态持续更新；如果要把 `会议状态` 六行也升级为点击跳转证据，需要先补键盘顺序和可访问性测试。
+
+影响范围：
+
+- `docs/full-chain-completion-implementation-plan-2026-07-09.md`
+- `docs/current-mainline-index.md`
+- `code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.html`
+- `code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js`
+- `code/web_mvp/backend/tests/test_workbench.py`
+
+成本/隐私影响：
+
+- 本决策是产品边界和计划补充，不新增远端 ASR/LLM 调用，不读取 `configs/local/`，不读取用户私有录音，不上传音频。
+
+验证方式：
+
+- 代码级：`test_workbench_left_column_explains_meeting_mainline_status` 覆盖左侧主链路状态项，`test_workbench_meeting_focus_rows_are_actionable_candidate_filters` 覆盖四类重点筛选，`test_workbench_mobile_layout_keeps_meeting_cockpit_before_detail_panels` 覆盖窄屏可发现性。
+- 浏览器级：继续使用 `workbench_all_buttons_smoke.mjs` 和正在进行的真实麦克风长会 evidence 检查左侧计数、筛选和录音保存状态是否随主链路变化。
+
+关联文档：
+
+- `docs/full-chain-completion-implementation-plan-2026-07-09.md`
+- `docs/current-mainline-index.md`
+- `docs/real-mic-workbench-mainline-report-2026-07-10.md`
+
+复审条件：
+
+- 如果长会 evidence 显示左侧计数与实时文字/建议/录音状态不一致，必须按主链路 bug 修复，而不能把它降级成装饰。
+- 如果用户测试确认左侧仍难理解，应优先调整命名和交互层级，而不是继续堆叠更多解释文字。
+
+## DEC-315: Meeting Cockpit Default Counts Must Fall Back To Live State
+
+日期：2026-07-11
+
+状态：Accepted / Implemented
+
+背景：
+
+- 20 分钟真实浏览器麦克风 no-cost 长测录音中，页面实际已有 `31` 个可见文字片段、`3` 个候选提醒事件、右侧 `candidate-panel` 可见提醒，但左侧 `会议状态` 仍显示 `文字记录 0 / 实时提醒 0`。
+- CDP 只读探针证明 `visibleTranscriptCount()` 返回 `31`、`currentReminderCount()` 返回 `3`，但手动调用 `syncMeetingOverview()` 后左侧仍不更新。
+- 根因是 `syncMeetingOverview({ transcriptCount = null, reminderCount = null })` 使用 `Number.isFinite(Number(transcriptCount))` 判断 override。JavaScript 中 `Number(null) === 0`，导致默认 `null` 被误判成显式 0，直播分支默认同步永远写回 0。
+
+决策：
+
+- 新增 `numericCountOverride()`：只有显式数字值才作为 override；`null`、`undefined`、空字符串都回退到实时 DOM/session state。
+- `syncMeetingOverview()` 默认路径必须使用 `visibleTranscriptCount()` 和 `currentReminderCount()`，显式传入 `0` 的重置/空态路径仍保持有效。
+- 这属于主链路 bug 修复，不是纯 UX 文案问题。
+
+影响范围：
+
+- `code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js`
+- `code/web_mvp/backend/tests/test_workbench.py`
+
+成本/隐私影响：
+
+- 纯前端状态同步修复和本地测试，不调用远端 ASR/LLM，不读取密钥，不上传音频。
+
+验证方式：
+
+```text
+RED:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_overview_defaults_do_not_treat_null_as_zero -q
+
+失败原因:
+  缺少 numericCountOverride；syncMeetingOverview 默认仍把 Number(null) 当成 0。
+
+GREEN:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_overview_defaults_do_not_treat_null_as_zero \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_overview_reminder_count_derives_from_current_events_not_stale_dom -q
+
+2 passed, 2 warnings
+
+node --check code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js
+exit 0
+
+Post-fix real-mic recheck:
+artifact=artifacts/tmp/browser_live_mic/real-mic-cockpit-fix-nocost-20260711-022550
+session_id=rec_mrf9nsgc
+input_mode=real_browser_mic
+provider=funasr_realtime
+provider_mode=real
+is_mock=false
+health_status=audio_capture_health_passed
+chunk_count=400
+derivation_mode=no_cost_deterministic
+suggestion_card_count=3
+approach_card_count=1
+minutes_char_count=403
+audio_export_http_status=200
+audio_sha256_matches_session=true
+meeting_cockpit_counts={
+  transcript: "1",
+  realtime_reminders: "11",
+  ai_suggestions: "3",
+  approach: "1",
+  audio: "已保存",
+  minutes: "已生成",
+  decisions: "4",
+  actions: "1",
+  risks: "6",
+  questions: "0"
+}
+```
+
+关联文档：
+
+- `docs/current-mainline-index.md`
+- `docs/real-mic-workbench-mainline-report-2026-07-10.md`
+
+复审条件：
+
+- 修复后的新浏览器主链路测试必须证明录音中左侧 `文字记录/实时提醒` 不再卡 0。
+- 如果后续把左侧状态改为点击导航，仍要保持默认计数回退语义，避免重现 stale cockpit。
+
+## DEC-313: Workbench Responsive Layout Keeps Meeting Cockpit Discoverable
+
+日期：2026-07-11
+
+状态：Accepted / Implemented
+
+背景：
+
+- DEC-311/DEC-312 已把 Workbench 左侧栏定义并实现为“会议状态 + 会议重点筛选”的会议驾驶舱。
+- 当前 in-app browser 截图显示，在窄屏/移动布局下 CSS 顺序为 `topbar -> center -> right -> left -> status`，会议驾驶舱会掉到实时文字和右侧详情面板之后。
+- 这会让用户感知为“左侧有一列内容没有实际作用”，即使业务逻辑已经存在。根因不是数据假或筛选未实现，而是响应式可发现性不符合会议驾驶舱的产品定位。
+
+决策：
+
+- 窄屏布局必须保持会议驾驶舱优先级：`topbar -> left -> center -> right -> status`。
+- `left` 仍作为桌面左栏；在窄屏下它变成顶部操作区之后的第一个状态/筛选区，先告诉用户主链路是否工作，再展示实时文字和详细建议。
+- 本决策不改变候选提醒、session trace、录音保存、ASR/LLM provider 或任何远程调用边界。
+
+影响范围：
+
+- `code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.html`
+- `code/web_mvp/backend/tests/test_workbench.py`
+- `docs/full-chain-completion-implementation-plan-2026-07-09.md`
+- `docs/current-mainline-index.md`
+- `docs/real-mic-workbench-mainline-report-2026-07-10.md`
+
+成本/隐私影响：
+
+- 纯 CSS 布局与本地测试，不调用远程 ASR/LLM，不读取密钥，不上传音频，不读取私有录音。
+
+验证方式：
+
+```text
+RED:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_mobile_layout_keeps_meeting_cockpit_before_detail_panels -q
+
+失败原因:
+  @media (max-width:900px) 仍是
+  grid-template-areas:"topbar" "center" "right" "left" "status"
+
+GREEN:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_mobile_layout_keeps_meeting_cockpit_before_detail_panels -q
+
+1 passed, 2 warnings
+
+Regression:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest code/web_mvp/backend/tests/test_workbench.py -q
+93 passed, 2 warnings
+
+python3 -m pytest tests/test_workbench_all_buttons_smoke.py -q
+7 passed, 1 warning
+
+node code/web_mvp/e2e/workbench_all_buttons_smoke.mjs
+status=go_workbench_all_buttons_smoke
+screenshot_count=17
+
+In-app browser:
+url=http://127.0.0.1:8765/workbench?demo=1&verify=responsive-cockpit-final
+gridTemplateAreas="topbar" "left" "center" "right" "status"
+viewport=696x761
+artifact=artifacts/tmp/ui_screenshots/left-column-responsive-20260711/browser-report.json
+screenshot=artifacts/tmp/ui_screenshots/left-column-responsive-20260711/workbench-responsive-cockpit.png
+```
+
+关联文档：
+
+- `docs/full-chain-completion-implementation-plan-2026-07-09.md`
+- `docs/current-mainline-index.md`
+- `docs/real-mic-workbench-mainline-report-2026-07-10.md`
+
+复审条件：
+
+- 如果后续把 Workbench 桌面布局改成完全不同的信息架构，需要重新检查窄屏首屏顺序。
+- 如果“会议状态”六行也变成可点击导航，需要新增键盘顺序和可访问性测试，保证 Tab 顺序与视觉顺序一致。
+
+## DEC-312: Workbench Meeting Focus Rows Filter Realtime Candidate Reminders
+
+日期：2026-07-11
+
+状态：Accepted / Implemented
+
+背景：
+
+- DEC-311 已把 Workbench 左侧栏从裸信号计数器改成“会议状态 + 会议重点”，但用户继续指出左侧一列看起来没有实际作用。
+- 多 Agent 只读审查结论一致：左侧“会议状态”适合作为主链路状态投影；左侧“会议重点”如果仍只是数字，就会被用户理解成装饰。它必须成为实时候选提醒的操作入口。
+- 实时会议 Copilot 的价值不只是显示转写，而是让用户在会议中快速看到决定、待办、风险和待确认问题，并能把注意力切到对应提醒。
+
+决策：
+
+- “会议重点”四行改为可点击、可键盘访问的筛选按钮：
+  - `DecisionCandidate`：决定了什么。
+  - `ActionItem`：待办事项。
+  - `Risk`：风险提醒。
+  - `OpenQuestion`：待确认问题。
+- 点击某一类后，右侧 `candidate-panel` 只显示对应类型的实时候选提醒，并在面板顶部显示“正在查看：xxx / 显示全部”。
+- 筛选只影响用户当前视图，不删除底层事件，不改变 session trace，不改变 `c-gap` / `s-candidates` 的全场提醒总数。
+- 候选提醒先按筛选条件过滤，再执行去重和最多 8 条可见上限，避免长会议中某一类提醒被先截断后误判为空。
+- 快照渲染路径和直播增量路径统一通过 `syncCandidateFocusCounts()` 更新 `c-decision/c-action/c-risk/c-question/c-gap/s-candidates`，避免真实会议中右侧已有提醒但左侧分类计数仍停留在旧值。
+- `syncMeetingOverview()` 默认提醒总数不再从旧 DOM 数字回读，而是优先从 `currentEvents` 计算；如果异步流程导致事件状态暂时为空但候选面板已有提醒，则回退到 `visibleCandidateReminderCount()`，避免左侧 `实时提醒` 显示 0 而右侧已有提醒。
+- 开始新会议、导入录音、删除/重置页面时清空筛选状态，避免上一场会议的筛选污染下一场。
+
+影响范围：
+
+- `code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.html`
+- `code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js`
+- `code/web_mvp/backend/tests/test_workbench.py`
+- `docs/current-mainline-index.md`
+- `docs/real-mic-workbench-mainline-report-2026-07-10.md`
+
+成本/隐私影响：
+
+- 纯本地前端交互和状态投影，不调用远程 ASR/LLM，不读取密钥，不上传音频，不读取私有录音。
+
+验证方式：
+
+```text
+RED:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_meeting_focus_rows_are_actionable_candidate_filters \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_candidate_filter_shows_clear_state_without_changing_counts \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_live_candidate_events_refresh_focus_counts_with_snapshot_path \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_overview_reminder_count_derives_from_current_events_not_stale_dom -q
+
+失败原因:
+  左侧会议重点仍是 div/span，只读；JS 没有 currentCandidateFocusType、filteredCandidateReminders、
+  setCandidateFocusFilter、clearCandidateFocusFilter、syncCandidateFocusCounts；
+  总提醒数仍可能从旧 DOM 数字回读。
+
+GREEN:
+同一 focused suite 通过：
+4 passed, 2 warnings
+
+Browser E2E:
+node code/web_mvp/e2e/workbench_all_buttons_smoke.mjs
+status=go_workbench_all_buttons_smoke
+focus_filter_coverage:
+  DecisionCandidate clicked_filter
+  ActionItem clicked_empty_filter
+  Risk clicked_filter
+  OpenQuestion clicked_filter
+  all clicked_clear_filter
+screenshot_count=17
+screenshots:
+  artifacts/tmp/ui_screenshots/workbench-all-buttons-smoke/05-candidate_filter_risk.png
+  artifacts/tmp/ui_screenshots/workbench-all-buttons-smoke/06-candidate_filter_all.png
+
+In-app browser focused check:
+artifact=artifacts/tmp/ui_screenshots/workbench-left-focus-filter-20260711/browser-report.json
+screenshots:
+  artifacts/tmp/ui_screenshots/workbench-left-focus-filter-20260711/risk-filter.png
+  artifacts/tmp/ui_screenshots/workbench-left-focus-filter-20260711/all-reminders.png
+```
+
+复审条件：
+
+- 如果候选提醒需要点击回原话，应在不暴露工程 ID 的前提下补 `click-to-evidence`。
+- 如果未来“会议重点”改为会后纪要最终结果而非实时提醒候选，需要重新定义实时筛选和最终纪要字段的关系。
+- 如果长会议筛选后仍难以处理，应把候选提醒升级为可关闭/已处理/稍后处理的轻量任务队列。
+
+## DEC-311: Workbench Left Column Must Show Mainline Meeting Status, Not Bare Signal Counts
+
+日期：2026-07-11
+
+状态：Accepted / Implemented
+
+背景：
+
+- 用户指出 Workbench 页面左侧有一列内容“好像没有实际作用”，要求补进计划。
+- 根因审查确认：左侧栏原本不是假数据，`c-decision/c-action/c-risk/c-question/c-gap/c-approach` 来自 `state_event`、`suggestion_candidate_event`、`partial_hint_event` 和方案卡数量；但它只是裸计数，不能说明“实时会议、实时建议、录音保存、会后复盘”主流程是否完成。
+- 真实会议 Copilot 的第一屏/侧栏必须帮助用户判断主链路状态，而不是让用户理解内部事件分类。
+
+决策：
+
+- 左侧栏产品语义改为“会议状态 + 会议重点”。
+- 新增并同步 `c-transcript`、`c-cards`、`c-audio`、`c-minutes`：
+  - 文字记录：当前可见文字条数。
+  - 实时提醒：候选提醒/partial hint 数量。
+  - AI 建议：正式建议卡数量。
+  - 方案分析：方案分析卡数量。
+  - 录音保存：已保存 / 未保存。
+  - 会后复盘：已生成 / 未生成。
+- 保留“会议重点”的决定、待办、风险、待确认问题，但明确它们仍是实时候选分类计数，不再承担主流程完成度表达。
+- 自动建议返回卡片时必须同步 `currentSuggestionCards`，避免右侧显示了建议卡但左侧 `AI 建议` 仍为旧值。
+
+影响范围：
+
+- `code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.html`
+- `code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js`
+- `code/web_mvp/backend/tests/test_workbench.py`
+- `docs/current-mainline-index.md`
+- `docs/real-mic-workbench-mainline-report-2026-07-10.md`
+
+成本/隐私影响：
+
+- 纯前端状态投影修复，不调用远程 ASR/LLM，不读取密钥，不上传音频。
+
+验证方式：
+
+```text
+RED:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_left_column_explains_meeting_mainline_status -q
+
+失败原因:
+  左侧仍只有 会议重点 / 实时建议 裸计数，没有 会议状态、录音保存、会后复盘。
+
+GREEN:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_left_column_explains_meeting_mainline_status \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_auto_suggestion_updates_left_ai_suggestion_count_state \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_auto_suggestion_uses_session_orchestrator_api_not_manual_button_click \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_auto_suggestion_triggers_after_final_and_session_snapshot -q
+
+4 passed, 2 warnings
+
+node --check code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js
+exit 0
+```
+
+浏览器验证：
+
+```text
+url=http://127.0.0.1:8765/workbench
+service_restart_required=true
+reason=/workbench HTML is loaded into WORKBENCH_HTML at process startup, while /static/workbench.js is served live
+leftText includes:
+  会议状态
+  文字记录 0
+  实时提醒 0
+  AI 建议 0
+  方案分析 0
+  录音保存 未保存
+  会后复盘 未生成
+  会议重点
+artifact=artifacts/tmp/ui_screenshots/workbench-left-status-20260711/workbench-left-status-mobile.png
+```
+
+复审条件：
+
+- 如果左侧栏继续承担行动入口，应补可点击筛选/证据跳转，不要只扩展计数。
+- 如果会议重点来自会后纪要而非实时候选，需要重新定义 `DecisionCandidate/ActionItem/Risk/OpenQuestion` 与最终纪要字段的边界。
+
+## DEC-310: Mixed-Topic No-Cost Minutes Must Preserve Product And Release Topics
+
+日期：2026-07-11
+
+状态：Accepted / Implemented
+
+背景：
+
+- DEC-308 修复了普通中文会议被固定发布评审模板污染的问题。
+- 10 分钟真实麦克风 mixed no-cost soak 暴露另一个问题：同一场会议同时包含产品反馈和发布风险时，no-cost 纪要可能被单一模板或 4 条 key point 截断，导致发布项或产品项丢失。
+
+决策：
+
+- `deterministic_demo` 仍保持 no-cost / local / not_called。
+- mixed-topic transcript 的建议、方案和纪要必须同时保留产品反馈和技术发布主题。
+- 纪要 key points 上限从 4 扩到 6，避免产品反馈占满所有条目后丢掉灰度、P99、错误率、回滚 owner 等发布门禁。
+- no-cost mixed-topic evidence 不计入 production LLM evidence。
+
+验证证据：
+
+```text
+10min finding:
+artifact=artifacts/tmp/browser_live_mic/real-mic-mixed-10min-nocost-20260710-210533
+input_mode=real_browser_mic
+provider=funasr_realtime
+acceptance_eligible=true
+session_audio_duration_ms=599808
+partial_draft_count≈0 -> 87
+finding=candidate reminders repeated; minutes skewed toward release template / mixed topics not fully preserved
+
+post-fix:
+artifact=artifacts/tmp/browser_live_mic/real-mic-mixed-minutes-both-nocost-20260710-212729
+derivation_mode=no_cost_deterministic
+counts_as_production_llm_evidence=false
+suggestion_card_count=3
+approach_card_count=1
+minutes_char_count=514
+audio_sha256_matches_session=true
+minutes include both:
+  用户访谈反馈 / 首页 / 持续看到上下文 / 录音文字稿会议纪要
+  小流量灰度 / 错误率阈值 / 回滚负责人 / 观察窗口 / 兼容性测试
+```
+
+复审条件：
+
+- no-cost mixed-topic output 再次被单一模板覆盖。
+- 生产 LLM path 稳定后，需要用同一 mixed transcript 做 production evidence，对比 no-cost 仅作 UI/链路 smoke。
+
+## DEC-309: Long Meetings Fold Duplicate Candidate Reminders Instead Of Repeating The Same Prompt
+
+日期：2026-07-11
+
+状态：Accepted / Implemented
+
+背景：
+
+- 10 分钟真实麦克风 mixed no-cost soak 中，候选提醒面板重复显示几十条语义相同的提醒。
+- 这会让产品像事件日志，不像实时会议 Copilot，也会放大用户对“页面复杂、名词难懂”的感受。
+
+决策：
+
+- 用户可见候选提醒按 `event_type + gap/hint/target + reminder text` 去重，保留最新语义提醒。
+- 可见提醒数量上限为 `MAX_CANDIDATE_REMINDERS_VISIBLE = 8`。
+- 被折叠的较早或重复提醒显示一行摘要：`N 条较早或重复提醒已收起`。
+- 事件总数仍保留在 session/events 中，折叠只影响用户可见面板。
+
+验证方式：
+
+```text
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_candidate_reminders_are_deduped_and_capped_for_long_meetings -q
+
+post-fix evidence:
+artifact=artifacts/tmp/browser_live_mic/real-mic-mixed-context-dedupe-nocost-20260710-212125
+visible text includes: 20 条较早或重复提醒已收起
+
+artifact=artifacts/tmp/browser_live_mic/real-mic-mixed-minutes-both-nocost-20260710-212729
+visible text includes: 11 条较早或重复提醒已收起
+```
+
+复审条件：
+
+- 如果候选提醒要变成可点击行动队列，需要在去重后保留 evidence refs / source ids，用于点击回原话。
+
+## DEC-308: No-Cost Deterministic Derivations Must Be Transcript-Aware
+
+日期：2026-07-10
+
+状态：Accepted / Implemented
+
+背景：
+
+- DEC-307 后运行真实浏览器麦克风普通中文会议自测，录音、ASR、实时追加和导出都闭环，但 no-cost deterministic 会后纪要仍输出“灰度 / 回滚 / P99 / 错误率”发布模板。
+- 这类 no-cost 派生不计入生产 LLM evidence，但它会用于高频自测、打包探针和主链路 smoke。如果内容与当前 transcript 无关，会误导我们对产品体验的判断。
+- 用户的核心目标是实时会议 Copilot，不是只在发布评审样例上表现正常。
+
+决策：
+
+- `deterministic_demo` 继续保持 no-cost / not_called / deterministic，不读取密钥、不调用中转站、不新增付费。
+- 但 deterministic 派生必须读取当前 session transcript，并按 transcript 生成建议、方案和纪要。
+- 发布/灰度/回滚/P99 语境可以保留发布模板；普通会议必须走上下文模板，例如用户访谈反馈、首页引导、实时上下文展示、录音/文字稿/会议纪要、行动项等。
+- 默认历史仍隐藏 demo/mock；测试需要验证 demo 历史时必须显式 `include_demo=true`。
+
+原因：
+
+- no-cost 自测的价值是验证主链路形态和产品可读性，不能用固定发布模板伪装成有效复盘。
+- 生产 LLM evidence 和 no-cost deterministic evidence 必须继续区分；修复 no-cost 内容不代表生产 LLM 质量验收完成。
+- 本地上下文派生可以在不增加成本的前提下提升自测可信度。
+
+替代方案：
+
+- 保留固定发布模板：Rejected。真实麦克风普通会议已证明它会生成错域纪要。
+- 每次自测都调用生产 LLM：Rejected。会增加成本，也不适合高频回归。
+- no-cost 模式只展示空纪要：Rejected。无法验证会后复盘 UI、导出和保存链路。
+
+影响范围：
+
+- `code/web_mvp/backend/meeting_copilot_web_mvp/app.py`
+- `code/web_mvp/backend/tests/test_packaged_no_cost_demo_derivation.py`
+- 本文档、主线索引和真实麦克风报告。
+
+成本/隐私影响：
+
+- 不调用远程 LLM，不调用远程 ASR，不读取 `configs/local/`，不上传原始音频。
+- 仅使用当前本地 session 中已存在的 transcript/event trace 做 deterministic 派生。
+
+验证方式：
+
+```text
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_packaged_no_cost_demo_derivation.py::test_demo_no_cost_derivation_uses_transcript_context_for_ordinary_meeting -q
+red first:
+  failed because suggestion/approach/minutes still contained the fixed 灰度/回滚 template
+
+green after implementation:
+  1 passed, 2 warnings
+
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_packaged_no_cost_demo_derivation.py -q
+4 passed, 2 warnings
+```
+
+真实麦克风 no-cost 复测：
+
+```text
+artifact=artifacts/tmp/browser_live_mic/real-mic-ordinary-context-nocost-20260710-205801
+session_id=rec_mrexy7fd
+input_mode=real_browser_mic
+ui_coverage=visible_chrome
+provider=funasr_realtime
+provider_mode=real
+is_mock=false
+asr_fallback_used=false
+acceptance_eligible=true
+acceptance_blockers=[]
+derivation_mode=no_cost_deterministic
+counts_as_production_llm_evidence=false
+suggestion_card_count=1
+approach_card_count=1
+minutes_char_count=431
+audio_export_http_status=200
+audio_file_magic=RIFF
+audio_sha256_matches_session=true
+session_audio_saved=true
+session_audio_duration_ms=69888
+recording_phase_ui_samples=15
+partial_draft_count progression=0 -> 9
+final visible approach/minutes mention 用户访谈反馈、首页、持续看到、录音/文字稿/会议纪要
+final visible approach/minutes no longer contain 灰度、回滚、P99、错误率
+```
+
+复审条件：
+
+- no-cost 派生开始被误认为生产 LLM evidence。
+- 普通会议类型扩展后，当前启发式生成的 action/risk/question 明显错域。
+- 生产 LLM 路线稳定后，需要减少 no-cost 文案暴露，仅保留 smoke/evidence 模式。
+
+## DEC-307: Stable Partial Transcript Visibility Must Not Depend On Semantic Keywords
+
+日期：2026-07-10
+
+状态：Accepted / Implemented
+
+背景：
+
+- 用户再次追问“页面一直没有追加、一直说替换”的方向问题：如果实时会议中只替换一条尾巴，用户无法持续看到整场会议上下文，产品会退化成会后转写。
+- DEC-305 已把 Workbench 收敛为 append-first user projection，但实现里 `shouldCommitPartialDraft()` 仍要求 partial 文本包含发布、灰度、回滚、P99 等技术会议关键词后才会追加 `临时稿`。
+- 这个门槛会把“可见转写”错误地绑定到“是否像技术发布评审”，导致普通会议、闲聊会议、非工程会议仍可能只看到 `实时` 尾巴不断替换。
+
+决策：
+
+- 稳定 partial 是否可见追加，只看基础可读性条件：segment 存在、文本长度达到阈值、置信度未低于阈值。
+- 技术关键词、语义质量、风险/待办识别只用于候选提醒和建议卡触发，不再作为主文字区追加的前置条件。
+- 后端继续保存 append-only session/events/audio trace；前端渲染时继续使用 `escapeHtml(...)` 做安全展示。转义不是追加策略，不能把转义后的字符串当作后台存储或业务语义。
+
+原因：
+
+- 实时会议产品的第一价值是“会议中能持续读到上下文”，这必须覆盖所有会议内容，而不是只覆盖带技术关键词的片段。
+- ASR partial 本身允许修正，因此 UI 仍保留双层投影：稳定增量追加为 `临时稿`，当前不稳定尾巴在 `实时` 行内替换。
+- final/revision 到来后仍按 segment 清掉对应临时稿，避免重复和跳字。
+
+替代方案：
+
+- 继续用技术关键词限制 `临时稿`：Rejected。会让非技术片段看起来没有追加，违背实时会议助手定位。
+- 所有 partial 每次都追加完整文本：Rejected。会产生大量重复内容和 ASR 假设抖动。
+- 只等 final 再展示：Rejected。final 延迟在真实麦克风证据中可达数十秒，不满足实时体验。
+
+影响范围：
+
+- `code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js`
+- `code/web_mvp/backend/tests/test_workbench.py`
+- 本文档、主线索引和真实麦克风报告。
+
+成本/隐私影响：
+
+- 不新增远程 ASR，不新增 LLM 调用，不读取 `configs/local/`，不上传原始音频。
+- 只是前端投影规则变化；session event trace 仍按既有本地存储和导出规则处理。
+
+验证方式：
+
+```text
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_partial_draft_visibility_is_not_gated_by_semantic_markers -q
+1 passed, 2 warnings
+
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_workbench.py \
+  -q -k 'partial_draft or partial_drafts or live_partial or snapshot_renderer_hides_resolved_partial_drafts or revision_rows_without_engineering_metadata or candidate_reminders_hide_engineering_evidence_ids'
+6 passed, 79 deselected, 2 warnings
+
+node --check code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js
+exit 0
+```
+
+复审条件：
+
+- 长会议真实麦克风验证发现 `临时稿` 过多、滚动跳动或噪音文本严重影响阅读。
+- ASR provider 提供更可靠的 segment stability / endpointing 信号，可以替换当前长度和置信度启发式。
+- 需要把“全部实时文字”和“仅关键摘要”做成两个用户可切换视图。
+
+## DEC-306: User-Facing Workbench Must Hide Engineering Event IDs
+
+日期：2026-07-10
+
+状态：Accepted / Implemented
+
+背景：
+
+- DEC-305 修复了实时文字追加语义后，真实麦克风 E2E 仍显示 `修正原话：rec_...`、`asr_ev_...`、`transcript_partial:...` 等工程 ID。
+- 这些 ID 对调试和 evidence 追踪有价值，但对会议用户是噪音，会让产品看起来像内部事件日志。
+
+决策：
+
+- 主文字区不显示 `修正原话`、`revision_of`、`supersedes_segment_id` 或任何 `rec_...` segment id。
+- `transcript_revision` 仍保留在事件和 DOM dataset 中用于 evidence clickback；当同一 segment 已有 final 时，用户主文字投影隐藏对应 revision，避免重复。
+- 实时建议面板不再显示 raw evidence/source event id，只显示 `来自会议原话` 或 `来自实时文字`。
+
+原因：
+
+- 用户需要的是会议内容和建议，不是事件流调试信息。
+- Evidence metadata 应保留给系统和点击定位，但不能作为默认可见文案。
+- 真实 E2E 已证明主文字、实时建议、录音保存和会后复盘可以在隐藏工程 ID 后继续闭环。
+
+替代方案：
+
+- 保留 `修正原话` 但换中文解释：Rejected。仍然把内部修正机制推给用户。
+- 完全删除 revision/evidence metadata：Rejected。会破坏建议卡依据和后续复盘追踪。
+
+影响范围：
+
+- `code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js`
+- `code/web_mvp/backend/tests/test_workbench.py`
+- `code/web_mvp/e2e/workbench_browser_live_mic_verify.mjs`
+- 本文档、主线索引和真实麦克风报告。
+
+验证方式：
+
+```text
+PYTHONPATH=code/web_mvp/backend python3 -m pytest code/web_mvp/backend/tests/test_workbench.py -q
+84 passed, 2 warnings
+
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_app.py \
+  code/web_mvp/backend/tests/test_workbench.py \
+  code/web_mvp/backend/tests/test_llm_service.py \
+  code/web_mvp/backend/tests/test_asr_stream.py \
+  code/web_mvp/backend/tests/test_auto_suggestions.py \
+  code/web_mvp/backend/tests/test_transcript_normalizer.py \
+  code/web_mvp/backend/tests/test_live_events.py \
+  tests/test_workbench_all_buttons_smoke.py \
+  -q -k 'history or sessions_list or persists_cards or workbench_full_flow or demo_load or llm_execution_runs or approach or minutes or live_mic or organize or workbench_all_buttons or auto_suggestion or partial_hint or transcript_normalizer or stable_partial or suggestion_candidate or provisional_transcript_draft or snapshot_renderer_hides_resolved_partial_drafts or partial_drafts_append_chunks or final_removes_all_provisional_partial_chunks or revision_rows_without_engineering_metadata or hides_revisions_covered_by_final_segment or live_final_removes_revision_rows or candidate_reminders_hide_engineering_evidence_ids'
+102 passed, 184 deselected, 2 warnings
+```
+
+真实麦克风 no-cost E2E:
+
+```text
+artifact=artifacts/tmp/browser_live_mic/real-mic-clean-ui-nocost-20260710-203134
+input_mode=real_browser_mic
+ui_coverage=visible_chrome
+provider=funasr_realtime
+provider_mode=real
+is_mock=false
+asr_fallback_used=false
+acceptance_eligible=true
+audio_export_http_status=200
+audio_sha256_matches_session=true
+recording_phase_ui_samples=12
+partial_draft_count grew from 1 to 8 during recording
+frontend_utterance_count=1
+frontend_card_count=4
+frontend_minutes_visible=true
+browser_console_error_count=0
+network_error_count=0
+final visible transcript/candidate text contains no `修正原话`, `修正：`, `rec_`, `asr_ev_`, or `transcript_partial:`
+```
+
+复审条件：
+
+- 用户需要打开“开发者/证据详情”模式查看 evidence id。
+- 建议卡点击定位因为隐藏 ID 出现回归。
+- 长会中隐藏 revision 后用户丢失必要上下文，需要设计显式“查看修正历史”入口。
+
+## DEC-305: Workbench Transcript Is an Append-First User Projection, Not a Replace-Only ASR Tail
+
+日期：2026-07-10
+
+状态：Accepted / Implemented
+
+背景：
+
+- 用户再次指出页面“没有追加、一直替换”的体验风险：如果会议中只能看到当前被替换的尾巴，用户要等会议结束才能看到完整上下文，产品就退化成会后转写工具。
+- DEC-304 已经要求 FunASR partial 发累积文本并支持 `临时稿`，但前端实现仍偏向同一临时稿节点更新，长会时阅读体验不够像持续会议流。
+- 这不是 HTML 转义问题。转义只负责安全展示，不能替代事件追加、片段合并、UI 去重和 final/revision 清理。
+
+决策：
+
+- Workbench 主文字区采用“append-first user projection”：稳定 partial 增量作为多个可见临时片段追加，当前不稳定尾巴只在 `实时` 行内更新。
+- 同一 segment 的 final/revision 到来后，移除该 segment 下所有临时片段，再展示正式发言/修正，避免重复内容。
+- 后台仍保留事件化 session 和录音资产；前台可以从事件快照重建视图，但不得让用户在会议中失去已稳定可读的上下文。
+- 同步恢复此前主线前端契约：`partial_hint_event` 仅在生产 LLM 可用且非 no-cost self-test 时触发自动建议；`整理会议` 继续使用 `ORGANIZE_FAST_SUGGESTION_BUDGET=1`；历史列表普通模式默认隐藏 demo/mock。
+
+原因：
+
+- 产品价值是“实时会议 Copilot”，必须会议中可读、可跟随、可触发建议，而不是结束后一次性生成全文。
+- ASR partial 天然会修正假设，因此允许当前尾巴更新；但已稳定增长的内容应转成用户可读追加片段，降低“文字消失/替换”的感知。
+- 把演示历史、无限候选 LLM 调用、partial hint 自动建议边界恢复好，能避免页面继续偏离主线。
+
+替代方案：
+
+- 只显示一个不断增长的 live partial：Rejected。短会可用，长会阅读和滚动体验差。
+- 只等 final 显示：Rejected。final 延迟仍高，不满足实时产品目标。
+- 把每个 ASR partial 全量追加：Rejected。会造成大量重复文本。
+
+影响范围：
+
+- `code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js`
+- `code/web_mvp/backend/tests/test_workbench.py`
+- `docs/current-mainline-index.md`
+- `docs/real-mic-workbench-mainline-report-2026-07-10.md`
+
+成本/隐私影响：
+
+- 不新增远程 ASR，不新增默认付费项目。
+- 本轮变更不读取用户私有录音，不上传音频。
+- 自动建议仍只在已有生产 LLM 配置下触发；no-cost self-test 不会误触生产 LLM。
+
+验证方式：
+
+```text
+PYTHONPATH=code/web_mvp/backend python3 -m pytest code/web_mvp/backend/tests/test_workbench.py -q
+80 passed, 2 warnings
+
+node --check code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js
+exit 0
+```
+
+复审条件：
+
+- 20 分钟真实长会中临时片段过多、滚动卡顿、final 替换造成明显跳屏。
+- 后端需要把 provisional chunks 持久化为更正式的 transcript projection，而不只是前端 live projection。
+- 真实会议中 partial 错误率高到临时片段误导用户，需要引入更严格稳定性阈值或 UI 置信标识。
+
+## DEC-304: Public Audio Is Regression Aid; Real-Time Partial Transcript Must Accumulate
+
+日期：2026-07-10
+
+状态：Accepted / Implemented
+
+背景：
+
+- 用户指出当前方向有偏差：如果页面一直替换临时文字，用户不能在会议中持续看到完整上下文，就算会后能总结也失去实时会议 Copilot 的产品价值。
+- 公开中文音频评测曾用于验证 ASR 质量，但继续下载公开音频不能直接解决 Workbench 主线问题。
+- 真实麦克风短跑显示 FunASR final 延迟仍高，实时体验必须依赖 partial/revision，而不能等待 final。
+
+决策：
+
+- 公开音频只保留为少量、可重复、无默认下载扩张的中文 ASR 回归辅助；不得把公开音频下载/评测当成当前产品主线。
+- 当前主线固定为：真实浏览器麦克风 -> 本地实时 ASR -> Workbench 实时追加文字 -> 实时建议候选/建议卡 -> 录音保存 -> 会后复盘。
+- FunASR streaming worker 向前端发出的 `partial` 必须是累积文本，而不是当前 rolling 短片段。
+- Workbench 可以把 stable partial 显示成 `临时稿`，但 final/revision 到来后必须移除或在快照渲染时过滤对应临时稿，避免用户看到重复会议内容。
+
+原因：
+
+- 产品亮点是“会议进行中给上下文和建议”，不是会后单纯转写。
+- 短 rolling partial 会造成页面像在不断替换，用户无法建立会议上下文。
+- 默认引入远程付费 ASR 不符合成本边界；先把本地 FunASR + 前端事件形态修到可用。
+
+替代方案：
+
+- 继续扩大公开音频下载和 bake-off：Rejected。它能做质量基线，但不能替代真实 Workbench 链路。
+- 只等 final 再显示完整稿：Rejected。FunASR final 延迟在短跑约 48s，在 5 分钟跑中过高，不满足实时体验。
+- 直接默认接付费远程 ASR：Rejected for default。后续可作为可选 provider，但不作为当前默认成本方案。
+
+影响范围：
+
+- `code/asr_runtime/scripts/funasr_stream_worker.py`
+- `code/asr_runtime/tests/test_transcribe_funasr.py`
+- `code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js`
+- `code/web_mvp/backend/tests/test_workbench.py`
+- 已有后端 stable partial retention / partial hint / candidate 逻辑继续作为同一主链路的一部分。
+
+成本/隐私影响：
+
+- 本决策不新增远程 ASR，不上传原始音频。
+- 本轮真实麦克风验证使用 no-cost deterministic derivation，不新增生产 LLM 调用。
+- 录音仍保存在本地 ignored artifact/session 路径，导出音频 hash 与 session 匹配。
+
+验证方式：
+
+```text
+python3 -m pytest code/asr_runtime/tests/test_transcribe_funasr.py -q
+21 passed, 1 warning
+
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_live_events.py \
+  code/web_mvp/backend/tests/test_asr_stream.py \
+  code/web_mvp/backend/tests/test_auto_suggestions.py \
+  code/web_mvp/backend/tests/test_workbench.py \
+  -q -k 'partial_hint or stable_partial or auto_suggestion or live_final or suggestion_candidate or llm_request_draft or workbench_auto_suggestion or provisional_transcript_draft or snapshot_renderer_hides_resolved_partial_drafts or raw_realtime_asr_partial'
+30 passed, 126 deselected, 2 warnings
+
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_app.py \
+  code/web_mvp/backend/tests/test_workbench.py \
+  code/web_mvp/backend/tests/test_llm_service.py \
+  code/web_mvp/backend/tests/test_asr_stream.py \
+  code/web_mvp/backend/tests/test_auto_suggestions.py \
+  code/web_mvp/backend/tests/test_transcript_normalizer.py \
+  code/web_mvp/backend/tests/test_live_events.py \
+  tests/test_workbench_all_buttons_smoke.py \
+  -q -k 'history or sessions_list or persists_cards or workbench_full_flow or demo_load or llm_execution_runs or approach or minutes or live_mic or organize or workbench_all_buttons or auto_suggestion or partial_hint or transcript_normalizer or stable_partial or suggestion_candidate or provisional_transcript_draft or snapshot_renderer_hides_resolved_partial_drafts'
+95 passed, 185 deselected, 2 warnings
+```
+
+真实麦克风证据：
+
+```text
+artifact=artifacts/tmp/browser_live_mic/real-mic-merged-partial-snapshot-filter-nocost-20260710-193221
+input_mode=real_browser_mic
+ui_coverage=visible_chrome
+provider=funasr_realtime
+provider_mode=real
+acceptance_eligible=true
+health_status=audio_capture_health_passed
+chunk_count=160
+asr_final_count=1
+transcript_partial=long_accumulated_text
+partial_hint_event=present_before_final
+stable_partial_candidate_origin=local_deterministic_asr_stable_partial_skeleton
+audio_sha256_matches_session=true
+frontend_utterance_count=4
+frontend_partial_hint_count=1
+browser_console_error_count=0
+network_error_count=0
+```
+
+关联文档：
+
+- `docs/current-mainline-index.md`
+- `docs/real-mic-workbench-mainline-report-2026-07-10.md`
+
+复审条件：
+
+- 如果后续 ASR provider 能稳定低延迟输出 segment-final，可减少 provisional draft 权重。
+- 如果真实多人会议中 partial 累积导致明显重复或错乱，需要引入更明确的 segment/window alignment。
+- 如果用户明确接受额外成本，可复审付费远程实时 ASR 作为可选 provider，而不是默认方案。
+
+## DEC-266: Windows Real-Machine Verification Requires Validator Evidence
+
+日期：2026-07-09
+
+状态：Accepted / Implemented To Intake Boundary
+
+背景：
+
+- Windows 仍是 P2 public release 的外部 blocker。
+- 不能在当前 Mac 上伪造 Windows Tauri/WebView/audio/installer 结果。
+- External preflight 之前只看 `windows_real_machine_verified=true`，太容易被裸布尔值误清除 blocker。
+
+决策：
+
+- 新增 `tools/windows_real_machine_verification.py` 和 `tests/test_windows_real_machine_verification.py`。
+- 该工具只读 `artifacts/tmp/**` 下 caller-provided Windows observation JSON。
+- 完整 GO 需要 observation 证明：
+  - `machine_kind=real_windows_machine`
+  - `host_os` 包含 Windows
+  - Tauri WebView opened
+  - backend health OK
+  - Workbench loaded
+  - provider health visible
+  - microphone permission path verified
+  - realtime ASR -> suggestions -> minutes -> history -> delete mainline GO
+  - file import/export GO
+  - installer or portable launch smoke GO
+  - delete verified
+  - no secret values included
+  - privacy payload 不包含 raw user audio / `configs/local`
+- External preflight 只接受 `status=go_windows_real_machine_verified` 且 `windows_real_machine_verified=true` 的 validator evidence。
+
+当前真实结果：
+
+```text
+artifact=artifacts/tmp/windows_real_machine_verification_20260709/evidence.json
+status=blocked_windows_real_machine_verification
+windows_real_machine_verified=false
+remaining_blockers=[
+  windows_real_machine_not_observed,
+  windows_host_os_not_observed,
+  windows_tauri_webview_not_verified,
+  windows_backend_health_not_verified,
+  windows_workbench_not_verified,
+  windows_provider_health_not_verified,
+  windows_microphone_permission_path_not_verified,
+  windows_realtime_mainline_not_verified,
+  windows_file_import_export_not_verified,
+  windows_installer_or_portable_launch_not_verified,
+  windows_delete_not_verified,
+  windows_secret_redaction_not_verified
+]
+```
+
+External preflight result:
+
+```text
+artifact=artifacts/tmp/release_external_preflight_20260709/evidence.json
+windows.evidence_path=artifacts/tmp/windows_real_machine_verification_20260709/evidence.json
+windows.validator_status=blocked_windows_real_machine_verification
+windows.windows_real_machine_verified=false
+remaining_blockers includes windows_real_machine_not_verified
+```
+
+验证方式：
+
+```text
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q tests/test_windows_real_machine_verification.py
+3 passed, 1 warning
+
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q tests/test_macos_release_external_preflight.py
+6 passed, 1 warning
+```
+
+影响：
+
+- Windows blocker 已从“需要真机”变成可提交、可校验、可追踪的 evidence contract。
+- 当前仍不能完成 Windows blocker，因为没有 Windows 真机 observation。
+- 完整 P0-P2 目标仍不能标记完成。
+
+复审条件：
+
+- 有 Windows 真机/虚拟机能够实际运行 Tauri Windows build、Workbench、音频路径和 installer smoke。
+- 需要调整 Windows GO 所需 checks。
+
+## DEC-265: Release External Preflight Consumes Mac Public Release Runner Evidence
+
+日期：2026-07-09
+
+状态：Accepted / Implemented
+
+背景：
+
+- DEC-264 新增了 Mac public release runner。
+- 原 external preflight 只检查 notarytool/profile 是否存在，容易把 “tooling ready” 误读为 “notarization completed”。
+- Public release preflight 必须以 signed/notarized/stapled/Gatekeeper runner evidence 为准。
+
+决策：
+
+- `tools/macos_release_external_preflight.py` 新增 `--macos-release-evidence`，默认读取 `artifacts/tmp/macos_public_release_20260709/evidence.json`。
+- 只有 Mac public release runner 同时满足：
+  - `status=go_public_release_signed_notarized_gatekeeper`
+  - `counts_as_public_release_package=true`
+  才视为 Mac public release ready。
+- `notarization.tooling_ready` 表示 `notarytool` 和 profile 可用。
+- `notarization.ready` / `notarization.notarization_completed` 表示 runner 已经证明公证完成。
+
+当前真实结果：
+
+```text
+artifact=artifacts/tmp/release_external_preflight_20260709/evidence.json
+status=blocked_external_release_requirements
+macos_public_release.ready=false
+macos_public_release.status=blocked_public_release_execution_requirements
+notarization.tooling_ready=true
+notarization.ready=false
+notarization.notarization_completed=false
+counts_as_public_release_package=false
+remaining_blockers=[
+  developer_id_signing_not_done,
+  notarization_not_done,
+  gatekeeper_acceptance_not_done,
+  windows_real_machine_not_verified
+]
+```
+
+验证方式：
+
+```text
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q tests/test_macos_release_external_preflight.py
+5 passed, 1 warning
+
+python3 tools/macos_release_external_preflight.py \
+  --run-id release-external-preflight-20260709 \
+  --output-root artifacts/tmp/release_external_preflight_20260709 \
+  --macos-release-evidence artifacts/tmp/macos_public_release_20260709/evidence.json \
+  --notary-profile meeting-copilot-notary
+status=blocked_external_release_requirements
+```
+
+影响：
+
+- Notary profile 存在不再清除 `notarization_not_done`。
+- Gatekeeper blocker 只有 public release runner GO 后才清除。
+- 当前剩余 blocker 仍是四项：Developer ID signing、notarization、Gatekeeper、Windows 真机。
+
+复审条件：
+
+- Mac public release runner 生成 GO evidence。
+- Windows 真机 evidence 生成 GO evidence。
+
+## DEC-264: Mac Public Release Runner Added For Signing Notarization Gatekeeper
+
+日期：2026-07-09
+
+状态：Accepted / Implemented To External Blocker
+
+背景：
+
+- DEC-262/263 已经把 P2 public release blocker 固定为 Developer ID signing、notarization、Gatekeeper 和 Windows 真机。
+- 其中 Mac 侧三个 blocker 不能只停留在人工说明；需要一个可执行 runner，在凭据可用时直接执行签名、公证、staple 和 Gatekeeper 验收，在凭据缺失时输出结构化 blocker。
+
+决策：
+
+- 新增 `tools/macos_public_release_runner.py` 和 `tests/test_macos_public_release_runner.py`。
+- Runner 只在 `--execute`、Developer ID Application identity 可用、notary profile 已提供、`notarytool` 可用时执行 mutating release 命令。
+- 完整命令链：
+  - `ditto` stage app
+  - `codesign --options runtime --timestamp --sign <Developer ID Application>` sign app
+  - `codesign --verify` verify app
+  - Tauri generated `bundle_dmg.sh --skip-jenkins` create DMG
+  - `codesign --sign <Developer ID Application>` sign DMG
+  - `xcrun notarytool submit --keychain-profile <profile> --wait`
+  - `xcrun stapler staple`
+  - `spctl --assess --type execute` app
+  - `spctl --assess --type open` DMG
+- 缺 Developer ID 或 notary profile 时必须在任何 mutating command 之前停止。
+
+真实运行结果：
+
+```text
+artifact=artifacts/tmp/macos_public_release_20260709/evidence.json
+status=blocked_public_release_execution_requirements
+remaining_blockers=[
+  developer_id_signing_not_done
+]
+developer_id_application_count=0
+notarytool_available=true
+notary_profile_provided=true
+counts_as_public_release_package=false
+executed_mutating_command_count=0
+privacy_safety.secret_values_read=false
+privacy_safety.keychain_password_read=false
+privacy_safety.notarization_submitted=false
+privacy_safety.remote_service_called=false
+```
+
+验证方式：
+
+```text
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q tests/test_macos_public_release_runner.py
+3 passed, 1 warning
+
+python3 tools/macos_public_release_runner.py \
+  --run-id macos-public-release-20260709 \
+  --output-root artifacts/tmp/macos_public_release_20260709 \
+  --notary-profile meeting-copilot-notary \
+  --execute
+status=blocked_public_release_execution_requirements
+```
+
+影响：
+
+- Mac public release 不再缺执行路径；当前缺的是本机 Developer ID Application 证书。
+- 在证书可用后，可直接重跑 runner 生成 signed/notarized/Gatekeeper evidence。
+- 完整 P0-P2 目标仍不能完成，因为 Developer ID、notarization/Gatekeeper 实际结果和 Windows 真机 evidence 仍缺。
+
+复审条件：
+
+- 本机安装 Developer ID Application 证书。
+- notary profile 已通过 `xcrun notarytool store-credentials` 配置。
+- 需要把 runner 接入 CI 或发布脚本。
+
+## DEC-263: Packaged Screenshot Evidence Reclassified As Visual QA Gap
+
+日期：2026-07-09
+
+状态：Accepted / Implemented
+
+背景：
+
+- macOS 当前环境阻止自动屏幕/窗口截图，导致 packaged screenshot evidence 不能稳定自动生成。
+- DEC-260/DEC-261 已经通过 Tauri 内部 DOM/runtime/backend API/same-chain probe 证明 packaged WebView 内 Workbench 和同链路业务可运行。
+- 截图证据是视觉 QA 证据，不是 Apple Developer ID、notarization、Gatekeeper 或 Windows 真机这类 public distribution 外部条件。
+
+决策：
+
+- `tools/macos_release_external_preflight.py` 将 `packaged_screenshot_evidence_still_missing` 从 public release `remaining_blockers` 拆出。
+- 当 packaged same-chain/mainline evidence 已通过时，外部预检写入：
+  - `visual_evidence.packaged_screenshot_evidence_present=false`
+  - `visual_evidence.packaged_screenshot_requirement_status=waived_by_internal_dom_runtime_probe`
+  - `visual_evidence.waiver_reason=packaged DOM/runtime/same-chain evidence is stronger than OS-level screenshot evidence for release preflight`
+- 如果后续没有内部 DOM/runtime/same-chain evidence，截图缺失仍可作为 visual release review blocker。
+
+验证方式：
+
+```text
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q tests/test_macos_release_external_preflight.py
+3 passed, 1 warning
+
+python3 tools/macos_release_external_preflight.py \
+  --run-id release-external-preflight-20260709 \
+  --output-root artifacts/tmp/release_external_preflight_20260709
+
+remaining_blockers=[
+  developer_id_signing_not_done,
+  notarization_not_done,
+  gatekeeper_acceptance_not_done,
+  windows_real_machine_not_verified
+]
+visual_evidence.packaged_screenshot_requirement_status=waived_by_internal_dom_runtime_probe
+```
+
+影响：
+
+- Public release external blockers 当前只剩四项：Developer ID signing、notarization、Gatekeeper acceptance、Windows real-machine verification。
+- 视觉截图仍可作为人工 QA 补充，但不再阻断自动化外部发布预检。
+- 完整 P0-P2 目标仍未完成，因为四个外部发布 blocker 仍存在。
+
+复审条件：
+
+- 后续明确要求“必须有真实 packaged screenshot 才能发布”。
+- Tauri/WebView 内部 probe 被移除或不再覆盖 packaged mainline。
+- macOS 屏幕录制/辅助功能权限可稳定用于自动截图。
+
+## DEC-262: Release External Preflight Freezes Remaining Public Distribution Blockers
+
+日期：2026-07-09
+
+状态：Accepted / Implemented
+
+背景：
+
+- DEC-261 已经移除 `packaged_same_chain_realtime_meeting_flow_not_verified`，证明 packaged `.app` 内可跑 no-cost same-chain Workbench/backend/session/history/delete 链路。
+- 当前仍不能宣称完整 P0-P2 目标完成，因为公开分发依赖 Apple Developer ID signing、notarization、Gatekeeper acceptance，以及 Windows real-machine verification。
+- 这些 blocker 需要机器可读 evidence，而不是继续停留在聊天总结或散落文档里。
+
+决策：
+
+- 新增 macOS release external preflight 工具：
+  - `tools/macos_release_external_preflight.py`
+  - `tests/test_macos_release_external_preflight.py`
+- 该工具只做外部发布条件预检：
+  - 读取既有 packaged same-chain evidence。
+  - 读取既有 development DMG evidence。
+  - 运行 `security find-identity -v -p codesigning` 统计 Developer ID 身份。
+  - 运行 `xcrun --find notarytool` 判断 notarytool 是否可用。
+  - 可选读取 Windows real-machine evidence。
+  - 输出 `artifacts/tmp/**/evidence.json`。
+- 该工具不得读取 secret、不得读取 keychain password、不得提交 notarization、不得调用远程服务、不得把 development DMG 误标为 public release package。
+
+真实预检结果：
+
+```text
+artifact=artifacts/tmp/release_external_preflight_20260709/evidence.json
+status=blocked_external_release_requirements
+counts_as_packaged_same_chain_no_cost_evidence=true
+counts_as_public_release_package=false
+developer_id_application_count=0
+developer_id_installer_count=0
+notarytool_available=true
+notary_profile_provided=false
+spctl_app_exit_code=3
+spctl_dmg_exit_code=3
+windows_real_machine_verified=false
+privacy_safety.secret_values_read=false
+privacy_safety.keychain_password_read=false
+privacy_safety.notarization_submitted=false
+privacy_safety.remote_service_called=false
+remaining_blockers=[
+  developer_id_signing_not_done,
+  notarization_not_done,
+  gatekeeper_acceptance_not_done,
+  windows_real_machine_not_verified
+]
+visual_evidence.packaged_screenshot_requirement_status=waived_by_internal_dom_runtime_probe
+```
+
+验证方式：
+
+```text
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q tests/test_macos_release_external_preflight.py
+3 passed, 1 warning
+
+python3 tools/macos_release_external_preflight.py \
+  --run-id release-external-preflight-20260709 \
+  --output-root artifacts/tmp/release_external_preflight_20260709
+status=blocked_external_release_requirements
+```
+
+影响：
+
+- 当前 P2 public release 状态从“口头剩余 blocker”升级为可审计 evidence。
+- DEC-261 的 packaged same-chain 主链路证据保持有效。
+- 完整 P0-P2 目标仍保持 active，不能标记 complete。
+- 后续若要真正完成 P2 public release，需要：
+  - 配置 Apple Developer ID Application/Installer 证书。
+  - 使用 notarytool profile 完成 notarization 和 staple。
+  - 重新跑 Gatekeeper acceptance。
+  - 在 Windows 真机生成独立 evidence。
+- 截图证据已按 DEC-263 重分类为 visual QA gap，不再阻断 public release external preflight。
+
+关联文档：
+
+- `docs/current-mainline-index.md`
+- `docs/p0-p2-full-completion-execution-plan-2026-07-09.md`
+- `docs/p0-p2-mainline-closure-checklist-2026-07-09.md`
+- `docs/p0-p2-progress-update-2026-07-09-real-mic-and-mac-packaging.md`
+
+复审条件：
+
+- Apple Developer ID 证书可用。
+- notarytool profile 配置完成。
+- Gatekeeper `spctl` 通过。
+- Windows real-machine smoke evidence 可用。
+- packaged screenshot/manual visual evidence 可用。
+
+## DEC-261: Packaged Mac Same-Chain No-Cost Probe Accepted As P2 Desktop Mainline Evidence
+
+日期：2026-07-09
+
+状态：Accepted / Implemented
+
+背景：
+
+- P2 最大剩余 blocker 是 `packaged_same_chain_realtime_meeting_flow_not_verified`：此前 packaged `.app` 已证明 DOM/runtime/backend API 可用，但没有证明 packaged WebView 内能跑同一套会议业务链路。
+- 用户明确要求尽量不要增加额外费用，不能为了自测重复调用中转站。
+- 现有 demo endpoints 能绕过 production acceptance blockers，但 `enabled` 模式仍需要 LLM gateway；直接使用 fake gateway 会增加 packaged runtime 复杂度。
+
+决策：
+
+- 新增后端 demo-only `deterministic_demo` derivation mode，仅允许 `/live/asr/demo/sessions/{id}/llm-execution-runs`、`/approach-cards`、`/minutes` 使用。
+- `deterministic_demo` 生成建议卡、方案卡和纪要，写回同一个 ASR live session，并明确标记：
+  - `execution_boundary=demo_no_cost_execution`
+  - `llm_provider.provider=deterministic_demo`
+  - `llm_call_status=not_called`
+  - `cost_status=no_cost`
+  - `llm_usage.total_tokens=0`
+- 生产 `/live/asr/sessions/{id}/...` endpoints 继续拒绝 `deterministic_demo`。
+- Tauri `runtime_get_status` 新增 `packaged_same_chain_probe_enabled`，只在 `MEETING_COPILOT_PACKAGED_SAME_CHAIN_PROBE=1` 时允许 packaged Workbench 执行 self-probe。
+- Workbench packaged self-probe 调用：
+  `mock session -> events -> render transcript -> deterministic suggestions -> deterministic approach -> deterministic minutes -> history -> delete -> history removed`，最后写入 `latest-same-chain.json`。
+- `tools/packaged_frontend_probe_evidence.py` 新增 `latest-same-chain.json` 验证，并在完整通过时将 `packaged_same_chain_realtime_meeting_flow_not_verified` 从 `remaining_blockers` 移除。
+
+原因：
+
+- 这条路径能在 packaged `.app` 内证明同一套 Workbench/backend/session/history/delete 链路完整可运行。
+- 它避免读 `.env`、避免调用中转站、避免新增 fake gateway 进程，也避免把 demo self-test 冒充生产真实 LLM。
+- 它比仅 API probe 更强，因为 packaged WebView 里会调用现有前端渲染函数并验证 DOM 可见的转写、建议、方案、纪要。
+
+成本/隐私影响：
+
+- 不访问麦克风。
+- 不上传音频。
+- 不读取 `configs/local/`。
+- 自测后端以 `PYTHON_DOTENV_DISABLED=1` 启动，避免读取 `.env`。
+- 不调用远程 ASR/LLM，不消耗中转站费用。
+
+验证方式：
+
+```text
+code/web_mvp/backend/tests/test_packaged_no_cost_demo_derivation.py:
+2 passed
+
+tests/test_workbench_desktop_runtime_probe.py + tests/test_packaged_frontend_probe_evidence.py + tests/test_desktop_tauri_scaffold.py focused:
+7 passed
+
+cargo test desktop_frontend_probe_runtime:
+4 passed
+
+node --check workbench.js:
+passed
+
+cargo tauri build --bundles app:
+Finished 1 bundle at artifacts/tmp/desktop_tauri_target/release/bundle/macos/Meeting Copilot.app
+
+packaged self-probe:
+artifacts/tmp/desktop_frontend_probe_runtime/latest-same-chain.json
+transcript_visible=true
+suggestion_card_count=3
+approach_card_count=1
+minutes_visible=true
+history_visible=true
+delete_verified=true
+remote_llm_called=false
+paid_provider_called=false
+
+aggregate evidence:
+artifacts/tmp/desktop_tauri_current_run/packaged-same-chain-no-cost-20260709/evidence.json
+status=go_packaged_webview_runtime_probe
+blockers=[]
+counts_as_packaged_same_chain_no_cost_evidence=true
+counts_as_packaged_mainline_evidence=true
+same_chain_blockers=[]
+remaining_blockers=[
+  developer_id_signing_not_done,
+  notarization_not_done,
+  gatekeeper_acceptance_not_done,
+  windows_real_machine_not_verified
+]
+
+final focused regression:
+204 passed, 2 warnings
+
+refreshed development DMG:
+artifacts/tmp/desktop_dmg_skip_finder_current_20260709/Meeting Copilot_0.1.0_aarch64.skip-finder.signed-local.dmg
+sha256=f5e047cdf7f1cdd13d9777bccc0ac39e648b549c40b1eede539bf74929dac435
+remaining_blockers=[
+  developer_id_codesign_not_done,
+  notarization_not_done,
+  gatekeeper_rejects_unsigned_or_adhoc_artifacts,
+  packaged_screenshot_evidence_still_missing
+]
+```
+
+边界：
+
+- 该证据不等于生产真实 LLM 证据。
+- 该证据不等于生产真实麦克风证据。
+- 该证据不等于公开分发的签名/公证安装包。
+- macOS screenshot evidence 仍受当前权限/策略限制。
+- Windows 仍未实机验证。
+
+关联文档：
+
+- `docs/current-mainline-index.md`
+- `docs/p0-p2-full-completion-execution-plan-2026-07-09.md`
+- `docs/p0-p2-mainline-closure-checklist-2026-07-09.md`
+- `docs/p0-p2-progress-update-2026-07-09-real-mic-and-mac-packaging.md`
+
+复审条件：
+
+- 要把 no-cost packaged self-probe 升级为真实 LLM packaged evidence。
+- 要把 WebView getUserMedia route 升级为 Rust 原生 PCM 麦克风采集。
+- 进入 Developer ID signing、notarization、Gatekeeper 或 Windows 实机阶段。
+
+## DEC-259: Completion Target Implemented And Self-Tested To Documented Boundaries
+
+日期：2026-07-08
+
+状态：Accepted / Implemented
+
+背景：
+
+- 用户要求把 `docs/meeting-copilot-completion-target-and-selftest-plan-2026-07-08.md` 中定义的事项作为目标完整实现并自测完成。
+- P0/P1/P2/P3 已分别完成到各自文档边界，但真实签名桌面生产版仍不能过度宣称完成。
+
+决策：
+
+- 新增 `docs/completion-target-implementation-and-selftest-report-2026-07-08.md` 作为最终自测报告。
+- `docs/meeting-copilot-completion-target-and-selftest-plan-2026-07-08.md` 顶部状态更新为 P0/P1/P2/P3 completion target implemented to documented boundaries。
+- 生成 final no-cost release summary：`artifacts/tmp/release_acceptance/final-completion-target-20260708-nocost-summary/summary.json`。
+- 该 summary 复用既有 P0 lane manifests，避免重复触发付费 LLM/ASR lane；本轮新鲜验证覆盖 tests、Workbench smoke、health、JS version 和 git diff check。
+- 继续保持 `Production MVP: Conditional No-Go`，因为真实 native 桌面麦克风/worker/签名打包还不是当前完成范围。
+
+验证方式：
+
+```text
+P1/P2 tool regression = 40 passed, 2 warnings
+Core backend / Workbench regression = 176 passed, 2 warnings
+ASR bakeoff tests = 19 passed, 1 warning
+P1 export/provider/delete focused = 65 passed, 2 warnings
+Python py_compile = passed
+Node syntax checks = passed
+Workbench smoke = passed
+git diff --check = passed
+health endpoint = ok
+final no-cost release summary verdict = go / blockers=[]
+```
+
+成本/隐私影响：
+
+- 本 final summary 不重新调用 LLM/ASR lanes。
+- `remote_asr_called=false`。
+- `configs_local_read=false`。
+- `user_audio_committed_to_repo=false`。
+
+关联文档：
+
+- `docs/completion-target-implementation-and-selftest-report-2026-07-08.md`
+- `docs/meeting-copilot-completion-target-and-selftest-plan-2026-07-08.md`
+- `docs/current-mainline-index.md`
+
+复审条件：
+
+- 要把 `Conditional No-Go` 升级为生产桌面版 Go。
+- 进入 Mac native mic/worker/package milestone。
+- 重新跑付费 lane release acceptance 或刷新 browser live mic semantic-quality evidence。
+
+## DEC-258: Mobile App Future Plan 作为 P3-1 完成
+
+日期：2026-07-08
+
+状态：Accepted / Implemented
+
+背景：
+
+- 用户希望提前理解 iOS/Android 上架、费用、权限和审核风险，但移动端不是当前 PC/Mac MVP 主线。
+- 录音、麦克风、转写文本、会议纪要和 AI 建议都属于高隐私数据，不能只按“交开发者账号费即可上架”理解。
+
+决策：
+
+- 新增 `docs/mobile-app-future-plan.md`。
+- 移动端定位为 companion app：查看会议纪要、管理历史会议、线下会议麦克风录音、行动项提醒。
+- iOS/Android 不作为当前 P0/P1/P2 blocker。
+- 记录官方账号费用、隐私 disclosure、审核风险和中国市场差异。
+
+成本/隐私影响：
+
+- Apple Developer Program 官方费用参考 99 USD/年。
+- Google Play Console 官方注册费参考 25 USD 一次性。
+- 移动端进入实现前必须新增独立 App Privacy / Data Safety / 权限说明设计。
+
+验证方式：
+
+```text
+docs/mobile-app-future-plan.md 已落地。
+官方参考链接已记录到文档。
+```
+
+关联文档：
+
+- `docs/mobile-app-future-plan.md`
+- `docs/meeting-copilot-completion-target-and-selftest-plan-2026-07-08.md`
+
+复审条件：
+
+- PC/Mac 主链路进入可发布状态。
+- 决定移动端从 companion app 变为录音主链路。
+- 开始注册账号、创建 iOS/Android 工程或提交应用市场。
+
+## DEC-257: Windows Compatibility Plan 作为 P2-2 完成
+
+日期：2026-07-08
+
+状态：Accepted / Implemented
+
+背景：
+
+- 当前用户本机是 Mac，主线优先 Mac；但代码不能写死成只适配 macOS。
+- Windows 的音频、安装包、权限、驱动、杀软、SmartScreen 和分发路径差异必须提前纳入架构边界。
+
+决策：
+
+- 新增 `docs/desktop-windows-compatibility-plan.md`。
+- 保持 shared UI/backend/core，一切平台差异封装在 desktop adapter。
+- 记录 Windows 麦克风权限、WASAPI loopback、系统音频、installer/signing、Microsoft Store 和 Windows smoke checklist。
+
+成本/隐私影响：
+
+- 当前不新增 Windows 实现成本。
+- 不启动 Windows 音频采集，不读取用户音频，不调用远程 ASR/LLM。
+
+验证方式：
+
+```text
+docs/desktop-windows-compatibility-plan.md 已落地。
+```
+
+关联文档：
+
+- `docs/desktop-windows-compatibility-plan.md`
+- `docs/meeting-copilot-completion-target-and-selftest-plan-2026-07-08.md`
+
+复审条件：
+
+- Windows 进入实现阶段。
+- 需要捕获 Windows 系统音频。
+- 准备 Microsoft Store 或企业安装包分发。
+
+## DEC-256: Mac Tauri Dev Shell And No-op IPC Evidence 作为 P2-1 完成
+
+日期：2026-07-08
+
+状态：Accepted / Implemented
+
+背景：
+
+- P2-1 原目标是 Mac 桌面客户端；当前代码已有 Tauri v2 scaffold 和历史 no-op WebView evidence，但不能过度宣称真实麦克风/worker/打包完成。
+- 本轮发现桌面测试漂移：源码目录存在误生成 `src-tauri/target`，PCWEB-120 工具因 archived dependency 和 policy 缺失而失败。
+
+决策：
+
+- 将 P2-1 当前完成边界定义为 `Mac dev shell + no-op IPC evidence`。
+- 新增 `docs/desktop-mac-mvp-plan.md`。
+- 清理 `code/desktop_tauri/src-tauri/target` 生成物，继续要求 build target 使用 ignored `artifacts/tmp/desktop_tauri_target`。
+- 更新 `tests/test_desktop_tauri_scaffold.py` 以匹配当前 Mac `app/dmg` bundle config，但仍禁止生成产物落在源码树。
+- 修复 `tools/desktop_worker_mic_source_from_tauri_evidence.py` 的 archived helper path，并补齐 PCWEB-112/113/114/120 policy JSON。
+- 当前 PCWEB-120 只生成 `ready_for_manual_review_not_executable` packet，不批准真实麦克风/worker 执行。
+
+成本/隐私影响：
+
+- 不启动真实麦克风，不请求音频权限，不启动 ASR worker。
+- 不读取 `configs/local/`、不读取用户音频、不调用远程 ASR/LLM。
+
+验证方式：
+
+```text
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q \
+  tests/test_desktop_tauri_scaffold.py \
+  tests/test_desktop_worker_mic_source_from_tauri_evidence.py
+result=13 passed, 1 warning
+
+python3 -m py_compile tools/desktop_worker_mic_source_from_tauri_evidence.py
+result=passed
+
+PYTHONDONTWRITEBYTECODE=1 python3 tools/desktop_worker_mic_source_from_tauri_evidence.py \
+  --tauri-evidence-path artifacts/tmp/desktop_tauri_noop_run_results/tauri-noop-webview-2026-07-03T13-15-25-808Z.pcweb-119-tauri-noop-run-validation.json
+result=policy_validation_status=passed / tauri_evidence_validation_status=passed / worker_mic_source_approval_packet_status=ready_for_manual_review_not_executable
+```
+
+边界：
+
+- 该决策不证明真实麦克风采集、系统音频、ASR worker spawn、audio chunk lifecycle、签名、notarization 或 `.app/.dmg` 交付完成。
+- 当前本机 `rustup` 默认 toolchain 未配置，所以本轮未重新跑 `cargo check`；保留历史 PCWEB-118 证据。
+
+关联文档：
+
+- `docs/desktop-mac-mvp-plan.md`
+- `docs/meeting-copilot-completion-target-and-selftest-plan-2026-07-08.md`
+
+复审条件：
+
+- 开始把 `mic_adapter.start` 从 no-op 改为真实采集。
+- 重新跑 real Tauri WebView。
+- 进入 `.app/.dmg` 构建、签名、notarization。
+
+## DEC-255: Long Meeting Synthetic Soak Gate 作为 P1-4 完成
+
+日期：2026-07-08
+
+状态：Accepted / Implemented
+
+背景：
+
+- 用户要求主线不要继续陷入零散边界测试，需要对 20-60 分钟会议的卡片刷屏、指标缺失和资源膨胀风险建立固定 gate。
+- 当前不能为了 P1-4 自动跑真实 20-60 分钟麦克风或真实 LLM/远程 ASR；默认额外成本必须保持为零。
+
+决策：
+
+- 新增 `tools/long_meeting_soak_runner.py` 和 `tests/test_long_meeting_soak_runner.py`。
+- runner 默认构造 20 分钟 deterministic simulated realtime meeting plan：`chunk_seconds=2`、`chunk_count=600`。
+- runner 通过 metrics 注入记录 `asr_rtf`、`llm_call_count`、`llm_usage_total_tokens`、`memory_rss`、`card_count` 和 `suppression_count`。
+- 超过 `max_cards_per_10_minutes` 时输出 `suggestion_frequency_cap_exceeded`，release 前必须视为 No-Go 风险。
+- 缺失或非法 metrics 输出 `verdict=blocked`。
+- 输出 `artifacts/tmp/soak/<run-id>/soak_report.json`，并对 secret-like 字符串做 redaction。
+
+原因：
+
+- synthetic soak gate 能在不等待 20 分钟、不启动麦克风、不新增 provider 成本的情况下，把长会稳定性的关键判定逻辑固化成可重复测试。
+- 频率上限 gate 直接保护产品价值：实时建议不能在长会中刷屏。
+
+成本/隐私影响：
+
+- 默认不调用远程 ASR，不调用真实 LLM，不读取用户音频，不启动真实麦克风。
+- report 默认 `remote_asr_called=false / raw_audio_uploaded=false / real_microphone_started=false / configs_local_read=false`。
+
+验证方式：
+
+```text
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q tests/test_long_meeting_soak_runner.py
+result=5 passed, 1 warning
+
+python3 -m py_compile tools/long_meeting_soak_runner.py tests/test_long_meeting_soak_runner.py
+result=passed
+
+python3 tools/long_meeting_soak_runner.py --run-id p1-4-long-meeting-soak-20260708 --duration-minutes 20
+artifact=artifacts/tmp/soak/p1-4-long-meeting-soak-20260708/soak_report.json
+verdict=go
+
+python3 tools/long_meeting_soak_runner.py --run-id p1-4-frequency-cap-20260708 --duration-minutes 20 --fake-metrics-json <24-card-over-cap-metrics>
+artifact=artifacts/tmp/soak/p1-4-frequency-cap-20260708/soak_report.json
+verdict=no_go
+blockers=[suggestion_frequency_cap_exceeded]
+```
+
+边界：
+
+- 该决策完成 P1-4 deterministic soak decision gate。
+- 该决策不等于真实 backend 进程连续运行 20-60 分钟的生产压测；真实 RSS/CPU 采样应在 release candidate 或桌面端集成阶段单独执行。
+
+关联文档：
+
+- `docs/meeting-copilot-completion-target-and-selftest-plan-2026-07-08.md`
+
+复审条件：
+
+- 引入真实 service-level long-run harness。
+- 自动建议频率策略从总窗口改为滑动窗口。
+- 桌面端后台 worker 或真实 ASR provider 进入长会压测。
+
+## DEC-254: Privacy Retention Delete Policy 作为 P1-3 完成
+
+日期：2026-07-08
+
+状态：Accepted / Implemented
+
+背景：
+
+- 用户要求所有操作可追溯、可实现，尤其会议音频、转写、建议、纪要和 evidence 的保存与删除边界不能靠口头说明。
+- 删除 API 不能过度宣称删除了未追踪的原始音频、导出文件或 evidence bundle。
+
+决策：
+
+- 新增 `docs/privacy-retention-and-delete-policy.md`。
+- `DELETE /live/asr/sessions/{session_id}` 返回结构化 `delete_scope`，明确 session record、transcript events、suggestion cards、approach cards、minutes 随 session 删除。
+- `audio`、`exports`、`evidence_bundle` 当前标记为 `not_tracked_by_live_session_repo`。
+- Workbench 删除确认展示来源、文字数、AI 建议、方案分析、纪要状态和删除范围，并提示不会删除电脑上另存的原始音频。
+- `mainline_evidence_bundle_runner` 和 `release_acceptance_runner` 的 JSON writer 在落盘前 redacts secret。
+
+成本/隐私影响：
+
+- 不读取 `configs/local/`。
+- 不读取未授权 `.m4a` 或私人录音。
+- Evidence 不写入 API key、authorization、token、secret 或 `LLM_GATEWAY_API_KEY` 明文。
+
+验证方式：
+
+```text
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q \
+  tests/test_mainline_evidence_bundle_runner.py \
+  tests/test_release_acceptance_runner.py \
+  code/web_mvp/backend/tests/test_app.py::test_delete_asr_live_session_reports_exact_delete_scope_without_overclaiming
+result=23 passed, 2 warnings
+
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q \
+  tests/test_release_acceptance_runner.py::test_release_summary_writer_redacts_secret_values
+result=1 passed, 2 warnings
+```
+
+关联文档：
+
+- `docs/privacy-retention-and-delete-policy.md`
+- `docs/meeting-copilot-completion-target-and-selftest-plan-2026-07-08.md`
+
+复审条件：
+
+- 开始持久化原始音频 chunk。
+- 实现 artifact lifecycle/delete。
+- 引入远程 ASR 或桌面后台 audio worker。
+
+## DEC-253: Provider Config And Cost Policy 作为 P1-2 完成
+
+日期：2026-07-08
+
+状态：Accepted / Implemented
+
+背景：
+
+- 产品默认应尽量只把费用花在 LLM gateway，远程 ASR 不默认启用。
+- UI、provider health 和 evidence 不能泄露 API key。
+
+决策：
+
+- 新增 `GET /providers/health`，只返回非密钥 readiness：configured、provider、model、is_mock、credential_configured、本地 ASR 可用性和 remote ASR disabled 默认策略。
+- Workbench 启动时读取 `/providers/health`，只展示 provider/model/configured。
+- `docs/provider-config-and-cost-policy.md` 记录默认成本策略：`LLM gateway only when AI analysis is enabled`。
+- Evidence bundle 和 release acceptance summary 记录 `llm_call_count` 与 `llm_usage_total_tokens`。
+- 远程 ASR adapter 只保留接口边界，不默认启用。
+
+成本/隐私影响：
+
+- 默认 `remote_asr_default_enabled=false`。
+- 默认 `raw_audio_uploaded_by_default=false`。
+- API key 不进入 UI、provider health、evidence 或 release report。
+
+验证方式：
+
+```text
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q \
+  code/web_mvp/backend/tests/test_app.py::test_provider_health_endpoint_masks_llm_secret_and_disables_remote_asr_by_default \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_runs_startup_audio_check_and_explains_provider_readiness \
+  tests/test_mainline_evidence_bundle_runner.py::test_simulated_realtime_lane_bundle_streams_wav_to_ws_and_writes_traceable_bundle \
+  tests/test_release_acceptance_runner.py::test_release_acceptance_sums_lane_llm_usage
+result=4 passed, 2 warnings
+
+node --check code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js
+result=passed
+```
+
+关联文档：
+
+- `docs/provider-config-and-cost-policy.md`
+- `docs/meeting-copilot-completion-target-and-selftest-plan-2026-07-08.md`
+
+复审条件：
+
+- 启用远程 ASR。
+- 更换 LLM gateway 配置方式。
+- 需要在 UI 展示更细粒度 token/cost 估算。
+
+## DEC-252: Recording Import Export Productization 作为 P1-1 完成
+
+日期：2026-07-08
+
+状态：Accepted / Implemented
+
+背景：
+
+- 录音导入不能只停留在“音频转文字”，需要能进入同一套 session、建议、方案、纪要、导出和删除链路。
+- 用户需要会后复盘可用的文字稿和纪要下载入口。
+
+决策：
+
+- Workbench 保留录音导入入口，支持 `.wav/.m4a/.mp3` 文件选择，并通过 `/live/asr/transcribe-file/sessions` 生成 ASR live session。
+- 导入成功后使用完整 session snapshot 渲染，不在上传成功前清空上一场会议。
+- 新增 `GET /live/asr/sessions/{session_id}/transcript.txt`，按 `[mm:ss] text` 导出 final transcript。
+- `GET /live/asr/sessions/{session_id}/minutes.md` 增加 attachment header。
+- Workbench 新增 `导出文字稿` 和 `导出纪要` 按钮，并根据当前 session 状态控制提示。
+
+成本/隐私影响：
+
+- 导入录音默认走本地 ASR；不默认上传原始音频到远程 ASR。
+- 导出文件由用户浏览器下载，删除 session 不宣称删除用户另存文件。
+
+验证方式：
+
+```text
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q \
+  code/web_mvp/backend/tests/test_file_convert.py \
+  code/web_mvp/backend/tests/test_workbench.py
+result=63 passed, 2 warnings
+
+node --check code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js
+result=passed
+```
+
+关联文档：
+
+- `docs/meeting-copilot-completion-target-and-selftest-plan-2026-07-08.md`
+- `docs/privacy-retention-and-delete-policy.md`
+
+复审条件：
+
+- 增加更完整的音频格式转换矩阵。
+- 导出文件进入应用内托管或自动清理。
+- 引入远程 ASR 或云端文件上传。
+
+## DEC-251: Release Acceptance Runner 作为 C10/P0-5 完成
+
+日期：2026-07-08
+
+状态：Accepted / Implemented
+
+背景：
+
+- 用户明确要求停止“无止境评估循环”，需要一个固定发布门禁命令汇总主链路证据。
+- P0-1 到 P0-4 已分别证明 browser live mic、实时自动建议、ASR 语义质量和 Workbench 产品化，但仍缺少统一发布前 Go/No-Go 聚合器。
+- 不能只看命令退出码；必须读取 lane manifest 的 `verdict`、`degradation_reasons`、browser live mic Go evidence 和 privacy/cost flags。
+
+决策：
+
+- 新增 `tools/release_acceptance_runner.py` 作为 release 聚合器。
+- runner 默认串联并汇总：backend mainline pytest、Workbench smoke、`git diff --check`、`/health`、Workbench JS 版本、file lane、simulated realtime lane、real mic recorded realtime lane、browser live mic Go bundle。
+- browser live mic 未证明时，release 层必须输出 `blocked_browser_live_mic_not_proven`，不能用 `real_mic_recorded_wav` 替代。
+- 任一 required check 失败、任一 required lane `verdict != go`、或 lane degradation reason 非空，release verdict 必须是 `no_go`。
+- release report 固定写入 `artifacts/tmp/release_acceptance/<run-id>/summary.json` 和 `report.md`。
+- 新增 `docs/release-acceptance-checklist.md` 作为固定操作清单。
+
+原因：
+
+- 一个固定 runner 能避免后续继续靠人工记忆串多个脚本。
+- 复用 `mainline_evidence_bundle_runner.py` 可避免复制 ASR/LLM/UI 判定逻辑。
+- 明确 browser live mic blocker 可防止把录音回放误判成真实浏览器开麦 Go。
+
+替代方案：
+
+- 手动跑多个命令后人工汇总：未选，容易漏掉 browser live mic、delete、semantic quality 和 privacy/cost flags。
+- 在 release runner 中重新实现每条 lane：未选，会造成验收逻辑漂移。
+- 只跑 unit tests 不跑真实 lane：未选。P0-5 需要可消费 evidence bundle。
+
+影响范围：
+
+- 新增 `tools/release_acceptance_runner.py`。
+- 新增 `tests/test_release_acceptance_runner.py`。
+- 新增 `docs/release-acceptance-checklist.md`。
+- `tools/mainline_evidence_bundle_runner.py` 继续作为 lane evidence 来源。
+
+成本/隐私影响：
+
+- 本次真实 release acceptance CLI 调用了 OpenAI-compatible LLM 中转站生成 file/simulated/real-mic-recorded lanes 的修正、建议、方案和纪要。
+- 未调用远程 ASR：`remote_asr_called=false`。
+- 未读取 `configs/local/`：`configs_local_read=false`。
+- 未提交用户音频：`user_audio_committed_to_repo=false`。
+- 汇总层修复了 `privacy_cost_flags.llm_called`，现在会从 lane 顶层 `llm_called=true` 正确聚合为 true。
+
+验证方式：
+
+```text
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q \
+  tests/test_release_acceptance_runner.py \
+  tests/test_mainline_evidence_bundle_runner.py \
+  code/web_mvp/backend/tests/test_asr_semantic_quality.py \
+  code/web_mvp/backend/tests/test_asr_stream.py \
+  code/web_mvp/backend/tests/test_file_convert.py \
+  code/web_mvp/backend/tests/test_workbench.py
+result=95 passed, 2 warnings
+
+PYTHONPATH=code/asr_bakeoff:code/web_mvp/backend:code/core pytest -q code/asr_bakeoff/tests
+result=19 passed, 1 warning
+
+python3 -m py_compile \
+  tools/release_acceptance_runner.py \
+  tools/mainline_evidence_bundle_runner.py \
+  code/asr_bakeoff/asr_bakeoff/semantic_quality_report.py
+result=passed
+```
+
+真实 release acceptance CLI：
+
+```text
+command=PYTHONPATH=code/web_mvp/backend:code/core python3 tools/release_acceptance_runner.py \
+  --run-id p0-5-release-acceptance-20260708 \
+  --real-mic-recorded-audio artifacts/tmp/audio_health/p0-real-mic-afplay-20260708-214203.wav \
+  --real-mic-health-report artifacts/tmp/audio_health/p0-real-mic-afplay-20260708-214203.health.json \
+  --browser-live-mic-bundle artifacts/tmp/acceptance/p0-browser-live-mic-tech-audio-20260708-231952
+
+raw_cli_artifact=artifacts/tmp/release_acceptance/p0-5-release-acceptance-20260708
+raw_cli_verdict=go
+
+corrected_summary_artifact=artifacts/tmp/release_acceptance/p0-5-release-acceptance-20260708-corrected-summary
+corrected_summary_verdict=go
+blockers=[]
+required_checks=pytest_backend_mainline, workbench_smoke, git_diff_check, health_endpoint, workbench_js_version
+required_lane_verdicts=file_lane:go, simulated_realtime:go, real_mic_recorded_realtime:go, browser_live_mic:go
+privacy_cost_flags.llm_called=true
+privacy_cost_flags.remote_asr_called=false
+privacy_cost_flags.configs_local_read=false
+privacy_cost_flags.user_audio_committed_to_repo=false
+```
+
+关联文档：
+
+- `docs/current-mainline-index.md`
+- `docs/meeting-copilot-completion-target-and-selftest-plan-2026-07-08.md`
+- `docs/release-acceptance-checklist.md`
+
+复审条件：
+
+- 新增 required lane、桌面客户端打包、长会 soak 或 provider health 成为发布 blocker。
+- Browser live mic 证据过期或语义质量 gate 改版。
+- LLM/ASR provider 默认策略变化。
+
+## DEC-250: ASR Semantic Quality Gate 作为 C3/P0-3 完成
+
+日期：2026-07-08
+
+状态：Accepted / Implemented
+
+背景：
+
+- 产品不能只凭 transcript 非空就生成正式建议，否则会退化成“听到一些字就调用大模型”的录音转文字工具。
+- 中文技术会议的价值点在于识别接口、灰度、回滚、错误率、owner、deadline、SLO/P99 等关键工程语义，再基于这些语义实时给出建议。
+- P0-2 自动建议已经能在会议中触发，但必须补上 P0-3 质量门禁，防止无意义或非技术内容继续进入正式 LLM 派生链路。
+
+决策：
+
+- 新增 deterministic `asr_semantic_quality` gate，不调用 LLM，不新增远程 ASR 费用。
+- 质量门禁要求至少命中 2 个技术实体、2 个实体组，并且 gibberish score 低于阈值；不达标时输出 `asr_semantic_quality_blocked`。
+- `asr_semantic_quality_blocked` 会写入 realtime/file lane session 的 `event_source.asr_semantic_quality`、`degradation_reasons` 和 acceptance blockers。
+- 正式 LLM 建议、方案、纪要和自动建议在该 blocker 存在时必须被阻断。
+- `tools/mainline_evidence_bundle_runner.py` 的 manifest 新增 `asr_semantic_quality_status`、`asr_semantic_quality_blocked` 和 `asr_semantic_quality`，并在 Go/No-Go 中把语义质量 blocked 作为阻断项。
+- `code/asr_bakeoff/asr_bakeoff/semantic_quality_report.py` 输出 P0-3 语义质量报告，记录默认不启用远程 ASR、默认零额外 ASR 费用、file ASR 默认 `local_funasr_batch`、realtime ASR 默认顺序 `sherpa_onnx_realtime -> funasr_realtime`。
+
+原因：
+
+- 该 gate 是产品价值边界：只有“听清了可行动的技术会议语义”才值得实时生成建议。
+- deterministic gate 可本地运行、可测试、可解释，不会为 P0 额外引入付费 ASR 或 LLM 调用。
+- 将结果写入 evidence bundle 后，发布验收可以追踪“为什么不生成建议”，而不是只看到 LLM 没调用。
+
+替代方案：
+
+- 直接让 LLM 修正所有 transcript：未选。会增加成本，且不能解决 ASR 语义太差时的 evidence 可信度问题。
+- 默认接入阿里/讯飞等远程实时 ASR：未选。仍可作为后续可选对照 provider，但不作为 MVP 默认依赖。
+- 只用 transcript 字数或 final segment 数做 gate：未选。会放过流畅但非技术、或有字但无业务含义的内容。
+
+影响范围：
+
+- 后端新增 `meeting_copilot_web_mvp/asr_semantic_quality.py`。
+- realtime ASR 和文件导入 session 都写入 `asr_semantic_quality`。
+- Workbench 显示“识别语义质量不足：声音可用，但没有听清关键业务内容，先不生成正式建议。”
+- evidence bundle manifest 记录语义质量字段。
+- 新增 10 条中文技术会议短句评测集：`data/asr_eval/semantic_quality/chinese_technical_short_phrases.json`。
+- 新增语义质量报告工具和测试：`code/asr_bakeoff/asr_bakeoff/semantic_quality_report.py`、`code/asr_bakeoff/tests/test_semantic_quality_report.py`。
+
+成本/隐私影响：
+
+- `remote_asr_default_enabled=false`。
+- `cost_status=no_paid_remote_service`。
+- `raw_audio_uploaded=false`、`remote_asr_called=false`、`llm_called=false`、`configs_local_read=false`。
+- 本决策不读取用户私人录音、不访问麦克风、不读取 `configs/local/`。
+
+验证方式：
+
+```text
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q \
+  code/web_mvp/backend/tests/test_asr_semantic_quality.py \
+  code/web_mvp/backend/tests/test_asr_stream.py \
+  code/web_mvp/backend/tests/test_file_convert.py \
+  code/web_mvp/backend/tests/test_workbench.py \
+  tests/test_mainline_evidence_bundle_runner.py
+result=89 passed, 2 warnings
+
+PYTHONPATH=code/asr_bakeoff:code/web_mvp/backend:code/core pytest -q code/asr_bakeoff/tests
+result=19 passed, 1 warning
+
+PYTHONPATH=code/asr_bakeoff:code/web_mvp/backend:code/core python3 -m asr_bakeoff.semantic_quality_report \
+  --dataset data/asr_eval/semantic_quality/chinese_technical_short_phrases.json \
+  --output artifacts/tmp/asr_eval/semantic_quality/p0-3-semantic-quality-report-20260708.json
+result=sample_count 10, expected_status_match_count 10, false_pass_count 0, false_block_count 0, keyword_recall_average 1.0
+```
+
+关联文档：
+
+- `docs/current-mainline-index.md`
+- `docs/meeting-copilot-completion-target-and-selftest-plan-2026-07-08.md`
+- `docs/asr-provider-strategy.md`
+
+复审条件：
+
+- 真实会议样本中连续出现技术实体漏召回、专有名词错误或中英混排严重错听。
+- 默认 realtime ASR provider 从 sherpa/funasr 变为其他模型。
+- 用户明确选择启用远程 ASR 作为付费高质量模式。
+
+## DEC-249: 实时自动建议 Orchestrator 作为 C2/P0-2 完成
+
+日期：2026-07-08
+
+状态：Accepted / Implemented
+
+背景：
+
+- 产品初心不是“录音转文字工具”，而是会议中根据实时上下文自动给出建议、风险、待办和复盘依据。
+- 旧路径主要依赖用户会后点击“生成会议建议”或“整理会议”，不能满足 C2/P0-2 的“ASR final 或稳定快照后自动触发正式建议”。
+- 自动建议不能通过前端点击 `btn-cards` 伪装实现，必须有 session-level 状态、冷却、频率上限、低质量抑制、验收 blocker 和暂停/恢复。
+
+决策：
+
+- 新增后端 `auto_suggestion_orchestrator.py`，把自动建议执行收束为一个可测状态机。
+- 自动建议只处理 `scheduler_event_type=llm_candidate_queued` 的候选；正式调用前再次检查：
+  - production acceptance blockers；
+  - paused 状态；
+  - processed candidate 去重；
+  - candidate confidence / degradation；
+  - cooldown；
+  - max calls per hour。
+- 新增生产 API：
+
+```text
+GET /live/asr/sessions/{session_id}/auto-suggestions/status
+PATCH /live/asr/sessions/{session_id}/auto-suggestions/status
+POST /live/asr/sessions/{session_id}/auto-suggestions/run-once
+```
+
+- Workbench 新增“自动建议”状态卡和暂停/恢复按钮；session snapshot 与 live final 到达后调用 `runAutoSuggestionsOnce()`，不再通过 `btn-cards.click()` 实现自动化。
+- 旧“生成会议建议”按钮仍保留为手动补偿入口，但不作为 C2 自动建议证据。
+
+验证：
+
+```text
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q code/web_mvp/backend/tests/test_auto_suggestions.py
+9 passed, 2 warnings
+
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q \
+  code/web_mvp/backend/tests/test_auto_suggestions.py \
+  code/web_mvp/backend/tests/test_workbench.py \
+  code/web_mvp/backend/tests/test_real_asr_to_cards.py \
+  code/web_mvp/backend/tests/test_asr_stream.py
+75 passed, 2 warnings
+
+node --check code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js
+passed
+
+node --check code/web_mvp/e2e/workbench_smoke.mjs
+passed
+```
+
+影响范围：
+
+- `code/web_mvp/backend/meeting_copilot_web_mvp/auto_suggestion_orchestrator.py`
+- `code/web_mvp/backend/meeting_copilot_web_mvp/app.py`
+- `code/web_mvp/backend/meeting_copilot_web_mvp/asr_stream.py`
+- `code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.html`
+- `code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js`
+- `code/web_mvp/backend/tests/test_auto_suggestions.py`
+- `code/web_mvp/backend/tests/test_workbench.py`
+
+边界：
+
+- P0-2 证明“录音中 live final / 已有 ASR session / session snapshot 可以自动进入正式建议 orchestrator”，不代表 C3 ASR 语义质量 gate 已完成。
+- WebSocket 收到非空 live final 后会在 `END` 前增量 upsert ASR live session，因此自动建议 run-once 和暂停/恢复在会议中可用；browser live mic 的完整 Go 证据仍以 C1/DEC-248 bundle 为准。
+- 生产 MVP 仍保持 `Conditional No-Go`，因为 C3/P0-3、C10/P0-5 和 P1/P2/P3 尚未全部完成。
+
+复审修复：
+
+- 只读复审发现旧实现实际只能在 `END` 后的 session snapshot 自动生成，live final 阶段后端 record 不存在，暂停/恢复也会 404。
+- 已新增测试覆盖 `END` 前 live final 生成卡、录音中暂停/恢复、cooldown、acceptance blocker、每小时滑动窗口 rate-limit。
+- `asr_stream.handle_stream()` 现在在 chunk final 阶段增量 upsert live session，`END` 最终快照会保留已生成卡片和自动建议状态。
+- `auto_suggestion_orchestrator` 的 `max_calls_per_hour` 改为按 1 小时滑动窗口剪枝，不再永久累计。
+- Workbench 正式建议卡展示触发原因和置信度。
+
+复审条件：
+
+- P0-3 接入 `asr_semantic_quality_blocked` 后，自动建议必须把该 blocker 显示为低质量/不可生成状态。
+- 长会 soak 发现 LLM 调用过频或刷屏时，需下调 `DEFAULT_MAX_CALLS_PER_HOUR` 或 cooldown。
+
+## DEC-248: Browser Live Mic Evidence Lane 作为 C1/P0-1 Go
+
+日期：2026-07-08
+
+状态：Accepted / Implemented
+
+背景：
+
+- `real_mic_recorded_wav` 只能证明真实麦克风录音回放可进入实时协议，不等于 Workbench 浏览器 `getUserMedia` 路径已通过。
+- C1/P0-1 要求真实浏览器开麦、实时 ASR、正式建议卡、方案卡、会议纪要、同 session UI、历史恢复和删除验证在同一证据 bundle 中闭合。
+
+决策：
+
+- `tools/mainline_evidence_bundle_runner.py --lane browser-live-mic` 必须同时消费 browser mic health、ASR probe、UI report，并要求 `browser_live_mic_go_evidence=true`。
+- browser live mic Go 不能只凭 health pass；若 ASR final 缺失、transcript 少于 30 字、cards/minutes/UI/delete 缺任一项，均为 No-Go。
+- `workbench_browser_live_mic_verify.mjs` 即使页面等待失败，也必须写出 health/asr/ui/session/screenshot 等 partial evidence，避免“跑了但没证据”。
+
+验证证据：
+
+```text
+artifact=artifacts/tmp/browser_live_mic/p0-browser-live-mic-tech-audio-20260708-231952/
+bundle=artifacts/tmp/acceptance/p0-browser-live-mic-tech-audio-20260708-231952/
+verdict=go
+audio_source=browser_live_mic
+browser_live_mic_go_evidence=true
+counts_as_real_mic_go_evidence=true
+asr_provider=sherpa_onnx_realtime
+asr_provider_mode=real
+asr_fallback_used=false
+llm_provider=real_gateway
+transcript_char_count=58
+final_segment_count=1
+suggestion_card_count=3
+approach_card_count=2
+minutes_char_count=273
+workbench_same_session_visible=true
+frontend_card_count=5
+delete_verified=true
+degradation_reasons=[]
+```
+
+边界：
+
+- 该 Go 只完成 C1/P0-1；不代表 C2 自动建议、C3 ASR 语义质量、C10 release acceptance 已完成。
+- 后续 release acceptance 必须重新读取 C1 bundle 或重新跑 browser live mic verifier，不能把旧 evidence 自动外推为最终发布 Go。
+
+## DEC-247: Workbench 产品化 UI 作为 C4/P0-4 Gate 完成
+
+日期：2026-07-08
+
+状态：Accepted / Implemented
+
+背景：
+
+- 用户多次反馈 Workbench 页面理解成本高、按钮和名词太工程化，偏离“实时会议 + 实时建议”的产品初心。
+- `docs/meeting-copilot-completion-target-and-selftest-plan-2026-07-08.md` 将 C4/P0-4 定义为 Workbench 产品化 UI：首屏 4 个核心动作、session 后才出现整理会议、减少工程词、移动/桌面不重叠、全按钮 smoke。
+- P0-4 必须先完成，否则后续 browser live mic 验证仍会落在一个不可用的研发测试台上。
+
+决策：
+
+- Workbench 首屏主操作只保留：
+
+```text
+开始会议
+结束会议
+导入录音
+历史记录
+```
+
+- `整理会议`、刷新文字、删除本次会议、生成会议建议、分析方案利弊、生成会议纪要全部变成有 session 后才显示的会议操作。
+- 页面主分区统一为：
+
+```text
+实时文字
+实时建议
+AI 建议
+方案分析
+会议纪要
+历史记录
+```
+
+- 普通用户界面避免继续暴露 `ASR/LLM/export/evidence/session` 等工程词，改用“语音识别、AI 分析、依据、本次会议、会议纪要”等产品词；底层 evidence 字段保留给 C1/C10 验收使用。
+- demo 入口下沉到折叠的“演示”，不能和真实会议入口同级。
+
+实现：
+
+- `workbench.html` 重构主操作区、session-only 操作区、文案分区和移动端 CSS。
+- `workbench.js` 增加 `syncSessionToolVisibility()`、独立 `btn-stop` 停止入口，并把用户可见文案改成产品语言。
+- `test_workbench.py` 增加 P0-4 静态和状态约束测试。
+- `workbench_smoke.mjs` 扩展为全按钮主流程 smoke，并保存 desktop/mobile screenshot。
+
+验证：
+
+```text
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q code/web_mvp/backend/tests/test_workbench.py
+47 passed, 2 warnings
+
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q code/web_mvp/backend/tests/test_workbench.py code/web_mvp/backend/tests/test_app.py -k 'workbench or delete_asr_live_session or privacy'
+48 passed, 87 deselected, 2 warnings
+
+node code/web_mvp/e2e/workbench_smoke.mjs
+workbench smoke OK: 4 utterances, 9 suggestions, history/minutes/delete verified
+
+git diff --check
+clean
+```
+
+截图证据：
+
+```text
+artifacts/tmp/ui_screenshots/workbench-p0-4-smoke/workbench-desktop.png
+artifacts/tmp/ui_screenshots/workbench-p0-4-smoke/workbench-mobile.png
+```
+
+影响：
+
+- `C4 Workbench 产品化 UI` 改为 completed for P0-4 UI gate。
+- `Production MVP` 仍保持 `Conditional No-Go`，因为 C1 browser live mic、C2 自动正式建议、C3 ASR 语义质量 gate、C10 release acceptance runner 尚未完成。
+- 下一主线改为 `P0-1 Browser live mic evidence lane`。
+
+## DEC-246: 下一阶段完成目标以总计划文档为准
+
+- 日期：2026-07-08
+- 状态：Accepted
+
+背景：
+
+P0 主链路已经从 file lane、simulated realtime wav 推进到 real mic recorded realtime Go，但用户再次确认前后端并未全部完成，需要把剩余工作、完成目标和自测标准集中记录，避免后续继续在零散评估、边界试探或聊天记忆里漂移。
+
+决策：
+
+新增并采用 `docs/meeting-copilot-completion-target-and-selftest-plan-2026-07-08.md` 作为下一阶段完成目标入口。后续所有“还要做什么”“做到什么算完成”“怎么自测”的回答和执行都必须优先对齐该文档。
+
+核心内容：
+
+- 当前状态基线：file lane Go、simulated realtime wav Go、real mic recorded realtime Go、browser live mic not yet proven、Production MVP Conditional No-Go。
+- 生产级 MVP 的 10 个完成条件。
+- P0/P1/P2/P3 剩余工作总清单。
+- 每项工作的涉及文件、步骤和自测命令。
+- 固定回归命令、release candidate gates 和 stop rules。
+- 下一阶段推荐目标：`Workbench 产品化 UI 重构和全按钮自测`，随后再推进 `Browser live mic evidence lane`。
+
+原因：
+
+当前项目已经证明主链路可跑通，但前端产品化、浏览器 live mic、实时自动建议、ASR 语义质量、桌面客户端、发布门禁仍未完成。集中计划能把“主线可跑通”和“生产级完成”分开，避免把已有 Go 证据外推成全部完成。
+
+影响范围：
+
+- `docs/meeting-copilot-completion-target-and-selftest-plan-2026-07-08.md`
+- `docs/current-mainline-index.md`
+- `docs/current-status-and-p0-execution-plan-2026-07-08.md`
+
+验证方式：
+
+文档自检必须满足：
+
+```text
+覆盖当前已完成状态
+覆盖 browser live mic 未完成边界
+覆盖前端、后端、桌面客户端、移动端远期工作
+包含固定自测命令
+包含 Stop Rules
+无占位符
+```
+
+复审条件：
+
+- Browser live mic bundle Go 后更新当前状态和下一阶段目标。
+- Workbench 产品化 UI 完成后更新 P0 顺序。
+- 若选择远程 ASR 或桌面客户端技术栈发生变化，必须新增决策记录。
+
+## DEC-245: Real Mic Recorded Realtime Lane 作为 P0 真实麦克风录音主链路证据
+
+- 日期：2026-07-08
+- 状态：Accepted
+
+背景：
+
+此前 P0 主链路已经有 file lane 和 simulated realtime wav lane 通过，但真实麦克风只停留在 Gate A 健康检查或静音/空 final No-Go。用户要求继续真实麦克风全自测，并明确不希望继续陷入边界试探。需要一个可追溯 lane，把已授权的真实麦克风录音文件按实时 chunk 送入同一条 WebSocket ASR 和 Copilot 业务链路，同时不能把它伪装成浏览器 live mic。
+
+决策：
+
+新增 `real-mic-recorded-realtime` evidence lane：
+
+- CLI：`tools/mainline_evidence_bundle_runner.py --lane real-mic-recorded-realtime --audio <wav> --health-report <health.json> --run-id <id>`。
+- 输入必须包含 `tools/audio_capture_healthcheck.py` 生成且 `health_status=audio_capture_health_passed` 的健康报告。
+- `audio_source=real_mic_recorded_wav`。
+- 后端 acceptance lane 允许 `real_mic_recorded_wav` 进入正式建议卡、方案卡和纪要派生端点。
+- Workbench 展示为“真实麦克风录音”，并记录 `browser_live_mic_go_evidence=false`。
+- 健康检查未通过时 fail closed，不继续 ASR/LLM/UI，不产生误导性 Go。
+
+原因：
+
+这个 lane 能把真实麦克风采集、实时 ASR 协议、正式 LLM 派生、前端同 session 可见、持久化和删除验证串成一份 evidence bundle，解决“Gate A 通过后没有推进到 Gate B/C”的主线缺口。它同时保留边界，不把录音回放写成浏览器 `getUserMedia` live mic。
+
+替代方案：
+
+- 继续只跑浏览器 live mic：保真度最高，但当前环境曾出现浏览器采样全 0，容易继续空转。
+- 把模拟 realtime wav 当 real mic：已拒绝；`simulated_realtime_wav` 必须保留 `counts_as_real_mic_go_evidence=false`。
+- 默认接入付费远程 ASR：暂不采用；当前阶段仍优先免费本地 ASR，远程 ASR 只作为后续可选 provider。
+
+验证方式：
+
+TDD 红灯：
+
+```text
+test_real_mic_recorded_realtime_lane_requires_passed_health_before_streaming -> AttributeError
+test_real_mic_recorded_realtime_lane_streams_real_mic_wav_to_ws_and_writes_traceable_bundle -> AttributeError
+test_workbench_labels_real_mic_recorded_wav_as_recorded_not_browser_live -> missing real_mic_recorded_wav
+```
+
+Focused green：
+
+```text
+2 passed, 2 warnings
+1 passed, 2 warnings
+```
+
+真实麦克风主链路通过证据：
+
+```text
+artifact_root=artifacts/tmp/acceptance/p0-real-mic-recorded-realtime-afplay-20260708-01
+verdict=go
+audio_source=real_mic_recorded_wav
+counts_as_real_mic_go_evidence=true
+browser_live_mic_go_evidence=false
+asr_provider=sherpa_onnx_realtime
+asr_provider_mode=real
+asr_fallback_used=false
+llm_provider=real_gateway
+transcript_char_count=86
+final_segment_count=1
+suggestion_card_count=3
+approach_card_count=3
+minutes_char_count=404
+workbench_same_session_visible=true
+frontend_utterance_count=1
+frontend_card_count=6
+frontend_minutes_visible=true
+delete_verified=true
+degradation_reasons=[]
+```
+
+自测过程中还记录了两个 No-Go 对照：
+
+- 当前外放环境录到非技术内容，ASR 有 final，但候选为 0，合理 No-Go。
+- `say` 实时外放技术文案时，真实麦克风录入语义混乱，候选为 0；FunASR streaming probe 更差。
+- 干净 TTS WAV 直喂 Sherpa 能识别关键工程语义，说明最终成功样本需要足够清晰的声学路径。
+
+成本/隐私影响：
+
+- 本轮完整 Go 使用了已配置 OpenAI-compatible LLM gateway；未新增远程 ASR 费用。
+- 真实麦克风音频只写入 ignored `artifacts/tmp/audio_health/...` 和 acceptance bundle，未提交到仓库。
+- 未读取 `configs/local/`，未打印 API key。
+- 健康报告 privacy flags 仍为 `raw_audio_uploaded=false / remote_asr_called=false / user_audio_committed_to_repo=false`。
+
+影响范围：
+
+- `tools/mainline_evidence_bundle_runner.py`
+- `tests/test_mainline_evidence_bundle_runner.py`
+- `code/web_mvp/backend/meeting_copilot_web_mvp/app.py`
+- `code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js`
+- `code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.html`
+- `code/web_mvp/backend/tests/test_workbench.py`
+- `docs/p0-real-mic-recorded-realtime-selftest-report-2026-07-08.md`
+- `docs/current-mainline-index.md`
+
+复审条件：
+
+- 浏览器 `getUserMedia` live mic 全链路通过后，应新增单独 DEC，并把 `Browser live mic` 状态从 `Not yet proven` 改为对应 Go/No-Go。
+- 如果后续默认引入远程实时 ASR、系统音频/虚拟声卡，必须重新评估费用、隐私和平台权限边界。
+- 如果真实会议样本连续出现 ASR 语义质量不足，应新增 ASR semantic quality gate，不允许只凭非空 transcript 判 Go。
 
 ## DEC-001: 产品定位为中文技术会议实时 Copilot
 
@@ -15047,3 +19860,5612 @@ PYTHONDONTWRITEBYTECODE=1 python3 tools/mainline_usable_e2e_runner.py \
 - 真实麦克风 shadow test readiness gate 变为可启动。
 - LLM execution 从 disabled/not_called 进入可审计的受控执行。
 - Formal cards/report 从 preview/not-Go 变成真实会议 feedback-backed Go evidence。
+
+## DEC-219：P0 主线恢复以真实/演示隔离和真实麦克风有效采集为唯一下一步
+
+- 日期：2026-07-08
+- 状态：Accepted
+
+背景：
+
+用户指出项目已经多轮执行仍感觉陷入循环：前端没有稳定可见内容，后端结构复杂，mock/demo 与真实链路混在一起，真实麦克风全链路仍未完成。2026-07-08 多 Agent 复审后确认：项目不是没有主线能力，文件导入 lane 已经有可信 Go evidence，但真实麦克风实时 Copilot 仍然 No-Go，不能宣布 Production MVP。
+
+决策：
+
+当前唯一 P0 执行基线切换到：
+
+```text
+docs/p0-mainline-recovery-execution-plan-2026-07-08.md
+```
+
+当前可声明状态固定为：
+
+```text
+Local Web Demo: 可用
+文件导入 P0 子链路: Go
+真实麦克风实时 Copilot: No-Go
+Production MVP: No-Go
+```
+
+文件导入可信 Go evidence 为：
+
+```text
+artifacts/tmp/acceptance/p0-file-lane-20260708-ui/
+```
+
+关键事实：
+
+```text
+audio_source=uploaded_wav
+asr_provider=local_funasr_batch
+llm_provider=real_gateway
+ui_coverage=headless_chrome
+delete_verified=true
+degradation_reasons=[]
+```
+
+真实麦克风 No-Go evidence 为：
+
+```text
+artifacts/tmp/real_mic_shadow_tests/p0_real_mic_20260708/full_chain_summary.json
+```
+
+关键事实：
+
+```text
+mean_volume=-91.0 dB
+max_volume=-91.0 dB
+asr.text=""
+event_counts.final=0
+candidate_count=0
+```
+
+后续 P0 只允许做直接改变主线状态的工作：
+
+- 修复真实 WebSocket ASR 入口 Fake fallback 被标成 real 的风险。
+- Workbench 主流程产品化，稳定显示实时文字、建议、方案分析、复盘和历史。
+- 真实麦克风先过有效采集门槛，再进入完整 ASR/LLM/UI/delete bundle。
+- evidence bundle 严格区分 file lane、demo lane、real mic lane。
+
+禁止事项：
+
+- 不再新增 readiness/preflight/approval wrapper 作为主线进展。
+- 不把 demo smoke 当真实 Go。
+- 不把 file lane Go 外推成 real mic Go。
+- 不在 real mic 没有 ASR final 前做 LLM 质量扩展评测。
+- 不在 P0 主链路未通前推进 Tauri/Mac/Windows/iOS/Android。
+
+原因：
+
+- 原始产品目标是中文技术会议实时 Copilot，而不是转写工具或会后总结工具。
+- file lane 已经证明下游 ASR session、LLM、Workbench、删除链路可工作，继续重复 file lane 收益低。
+- real mic 当前失败在采集层近静音，必须先解决有效音频输入。
+- 后端当前存在真实 WS fallback Fake 的误导风险，必须作为 P0 边界修复。
+
+成本/隐私影响：
+
+- 不新增默认收费项。
+- 默认仍不接远程 ASR。
+- LLM 调用仍只来自用户显式配置的 OpenAI-compatible 中转站。
+- 真实麦克风采集产物必须留在 ignored artifact 目录，并在报告中声明是否调用远程 ASR/LLM。
+
+验证方式：
+
+```bash
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q \
+  code/web_mvp/backend/tests/test_asr_stream.py \
+  code/web_mvp/backend/tests/test_real_asr_to_cards.py \
+  code/web_mvp/backend/tests/test_workbench.py
+```
+
+```bash
+node code/web_mvp/e2e/workbench_smoke.mjs
+```
+
+```bash
+PYTHONPATH=code/web_mvp/backend:code/core \
+python3 tools/mainline_evidence_bundle_runner.py \
+  --audio code/asr_runtime/outputs/simulated-release-review.16k.wav \
+  --run-id <new-file-lane-run-id>
+```
+
+复审条件：
+
+- real mic lane 的音频 `max_volume > -50 dB` 且 ASR final_count >= 1。
+- real mic lane 产生同一 session 的 cards、minutes、Workbench screenshot 和 delete evidence。
+- evidence bundle 同时有 file lane Go 和 real mic lane Go，才能把整体 P0 从 Partial / No-Go 改为 Go。
+
+## DEC-220：Workbench P0 优先修复文字消失和真实/演示入口混淆，而不是继续扩评测
+
+- 日期：2026-07-08
+- 状态：Accepted
+
+背景：
+
+用户在 in-app browser 看到 `http://127.0.0.1:8765/workbench` 无法访问，且反馈“打开麦克风文字又没有了”。复核发现实际后端服务监听 `127.0.0.1:8000`，用户页面停在旧端口；Workbench 代码还存在开麦后清空主内容、停止/刷新时用空快照覆盖已有实时文字、快照渲染只认 `transcript_final` 而实时渲染兼容 raw `final`、导入录音和历史/刷新渲染路径不一致等问题。
+
+决策：
+
+本轮 P0 Workbench 修复只聚焦用户可感知主流程：
+
+- 开始会议后主内容必须显示“正在听/等待语音”，不能裸空。
+- 实时 WS 收到 raw `final` 后，刷新/历史快照也必须能渲染同类事件。
+- 停止录音或刷新时，如果服务端最终快照暂空，必须保留已有实时文字，不能把用户刚看到的文字清掉。
+- 导入录音成功后必须使用同一套 `applySessionEvents()` 完整快照渲染，避免导入/历史/刷新三条路径行为分叉。
+- 端口混乱必须作为 P0 风险记录：当前用户页面可能停在旧 `8765`，实际服务为 `8000`。
+
+已新增/更新回归测试：
+
+```text
+test_workbench_snapshot_render_supports_raw_final_events
+test_workbench_recording_start_keeps_non_empty_waiting_state
+test_workbench_empty_snapshot_preserves_existing_realtime_text
+test_workbench_upload_uses_full_session_snapshot_renderer
+```
+
+验证结果：
+
+```bash
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q \
+  code/web_mvp/backend/tests/test_workbench.py
+```
+
+```text
+23 passed, 2 warnings
+```
+
+影响：
+
+- 这轮修复不把真实麦克风 lane 改成 Go。
+- 这轮修复只降低“页面没内容/文字消失/路径不一致”的产品主流程风险。
+- 整体 P0 仍然是 Partial / No-Go，直到真实麦克风有效采集、非 fake ASR final、LLM cards/minutes、Workbench 同 session 和 delete evidence 全部通过。
+
+## DEC-221：真实 ASR 空 final 必须落库为 No-Go 证据，Workbench 必须显示麦克风静音诊断
+
+- 日期：2026-07-08
+- 状态：Accepted
+
+背景：
+
+真实浏览器开麦链路曾出现 WebSocket 持续收到音频 chunk，但 ASR sidecar 最终返回空 final。旧逻辑只在 `accumulated_finals` 非空时创建 live ASR session，所以 final text 为空时不会落库，随后 `/live/asr/sessions/{sid}/events` 返回 404。用户看到的是“开麦后没有文字/文字没了/历史也没有”，无法区分是页面 bug、ASR 慢，还是麦克风实际没有有效输入。
+
+决策：
+
+- `handle_stream()` 在 END 后必须创建可追溯 record，即使没有非空 final。
+- 非空 final 才能进入 transcript pipeline。
+- 空 final 不创建 `transcript_final`，只创建 `evaluation_summary`。
+- 空 final session 必须标记 `degradation_reasons=["asr_final_empty"]` 或等价原因。
+- 空 final session 的 `final_count=0`，`evaluation_summary.payload.passes_minimum_gate=false`。
+- 该 session 是 No-Go 证据，不能让 evidence bundle 或报告把它误判为 Go。
+- Workbench 必须显示麦克风 peak/rms 诊断；持续静音时提示检查浏览器权限、macOS 输入设备和输入音量，并明确“外放声音不一定会进入麦克风输入”。
+
+已新增/更新回归测试：
+
+```text
+test_asr_stream_empty_real_final_is_persisted_as_degraded_session
+test_workbench_real_mic_level_status_explains_silent_input
+test_workbench_degraded_empty_asr_session_is_not_shown_as_success
+```
+
+验证结果：
+
+```bash
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q \
+  code/web_mvp/backend/tests/test_asr_stream.py \
+  code/web_mvp/backend/tests/test_real_asr_to_cards.py \
+  code/web_mvp/backend/tests/test_workbench.py \
+  code/web_mvp/backend/tests/test_file_convert.py \
+  tests/test_mainline_evidence_bundle_runner.py
+```
+
+```text
+36 passed, 2 warnings
+```
+
+```bash
+node code/web_mvp/e2e/workbench_smoke.mjs
+```
+
+```text
+workbench smoke OK: 4 utterances, 9 suggestions, history/minutes/delete verified
+```
+
+影响：
+
+- 这修复的是真实麦克风 No-Go 的可追溯性，不是把 real mic lane 改成 Go。
+- 如果麦克风仍然静音，UI 会解释输入层问题，历史和 `/events` 也能保存 degraded record。
+- 真实 Workbench 页面自测已产出 `rec_mrbh7ml8`：`provider=sherpa_onnx_realtime`、`provider_mode=real`、`degradation_reasons=["asr_final_empty"]`、`passes_minimum_gate=false`、`final_event_count=0`。打开历史后页面显示未识别到有效语音，并禁用建议/方案/复盘按钮。
+- 整体 P0 仍是 Partial / No-Go，直到真实麦克风有效采集、非 fake ASR final、LLM cards/minutes、Workbench 同 session 和 delete evidence 全部通过。
+
+## DEC-226：ASR live source/provenance contract 第一层落地，mock/local-event/degraded 默认不可作为验收 Go
+
+- 日期：2026-07-08
+- 状态：Accepted
+
+背景：
+
+DEC-225 确认下一步必须先防止 mock/demo/local-event/degraded 污染真实 Go/No-Go。本轮按 TDD 先补失败断言，要求 mock ASR session、local-event-file session、fake fallback session 和 degraded empty-final real session 都在 `event_source` 中带明确 provenance 和验收状态。
+
+决策：
+
+- ASR live `event_source` 增加：
+  - `input_source`
+  - `acceptance_eligible`
+  - `acceptance_blockers`
+- `mock_asr_session`、`local_asr_event_file`、fake fallback、包含 `degradation_reasons` 的 session 默认 `acceptance_eligible=false`。
+- `local_event_file` 即使 `provider_mode=real`，也必须带 `local_event_file_not_real_input` blocker，不能作为真实输入验收。
+- `fake` fallback 必须同时带 `mock_or_demo_session`、`asr_fallback_used` 等 blocker。
+- 空 final/degraded session 必须带 `degraded_asr_session` blocker。
+
+实现：
+
+- 更新 `_asr_live_event_source_metadata()`，统一为 create/events/list 返回 provenance。
+- 新增 `_asr_live_input_source()` 和 `_asr_live_acceptance_blockers()`。
+- 补充测试覆盖 mock、local-event、fake fallback、degraded empty-final。
+
+验证：
+
+```text
+失败断言红灯：4 failed，均为 input_source / acceptance_eligible 缺失。
+实现后 focused：4 passed, 2 warnings。
+test_app.py + test_asr_stream.py：87 passed, 2 warnings。
+Workbench/主线相关回归：37 passed, 2 warnings。
+8765 运行态 mock session: input_source=mock, acceptance_eligible=false, delete=true。
+Workbench smoke: 4 utterances, 9 suggestions, history/minutes/delete verified。
+```
+
+影响：
+
+- 这不是把真实麦克风改成 Go。
+- 这只是在证据层先防止旁路污染。
+- 下一步必须继续做真实会议模式 sidecar 不可用 hard fail，避免真实入口静默 fake fallback 成功。
+
+## DEC-225：三路审查和运行态复核后，把 P0 入口收束到当前状态与 Gate A/B/C 执行计划
+
+- 日期：2026-07-08
+- 状态：Accepted
+
+背景：
+
+用户指出当前项目像陷入循环，前端没有清晰实际内容，mock 数据与真实链路混淆，后端结构复杂，并要求多 Agent 溯源审查和可执行计划。本轮启动前端/产品、后端主链路、文档/需求三路只读 Agent，同时主线程复核服务、测试、WorkBench 页面和关键代码。
+
+复核事实：
+
+```text
+Demo/mock: Go for demo only
+File lane: Go
+Real mic: No-Go
+Production MVP: No-Go
+```
+
+新增运行态发现：
+
+- 旧 8765 进程启动后把 `workbench.html` 缓存在 `WORKBENCH_HTML` 常量中，导致源码已改成 `#transcript-stream/#suggestions-panel/#approach-panel`，但浏览器仍拿到旧 `id="stream"` 页面。
+- 已停止旧进程并重启 8765，`GET /workbench` 现在返回新版容器。
+- 应用内浏览器验证当前有效页 `http://127.0.0.1:8765/workbench` 为新版页面，旧 `ERR_CONNECTION_REFUSED` 标签只是历史错误页。
+- 点击 `试用示例` 能渲染 4 条演示转写和 4 条候选提醒，但 session 明确标记“示例内容，不计入真实验收”。
+
+决策：
+
+- 新的当前 P0 执行入口为 `docs/current-status-and-p0-execution-plan-2026-07-08.md`。
+- 继续保留 `docs/p0-real-product-mainline-plan-2026-07-08.md` 作为上一轮计划，但后续执行以当前状态文档为准。
+- 不再新增 readiness/preflight/approval wrapper，不扩 ASR provider 横评，不用 demo smoke 或 file lane Go 证明真实麦克风。
+- 后续只按真实麦克风 Gate A/B/C 推进：
+  - Gate A：真实输入有效。
+  - Gate B：非 fake ASR final >= 1。
+  - Gate C：同 session 建议、方案、复盘、历史、删除、evidence bundle。
+- 下一步只做 source/provenance contract，确保 mock/demo/local-event/degraded 默认 `acceptance_eligible=false`，防止验收污染。
+
+本轮验证：
+
+```text
+Focused 主线回归: 42 passed, 2 warnings
+test_app.py 全量: 82 passed, 2 warnings
+Workbench 浏览器检查: hasOldStream=false, hasTranscriptStream=true, hasSuggestionsPanel=true, hasApproachPanel=true
+Demo click smoke: 4 utterances, 4 candidate reminders, demo only
+```
+
+影响：
+
+- 这不是把 real mic 改成 Go，而是把“为什么页面和源码不一致、为什么主线仍 No-Go、下一步只做什么”钉死。
+- Production MVP 仍是 No-Go，直到真实麦克风 Gate C 通过。
+
+## DEC-222：四路审查后 P0 只按真实麦克风三段 Gate 推进，并先修 Workbench/后端证据混淆
+
+- 日期：2026-07-08
+- 状态：Accepted
+
+背景：
+
+用户指出项目经历多轮执行后仍像陷入循环：前端看不到清晰主流程，后端结构复杂，mock/demo 和真实证据混杂，真实麦克风没有文字。2026-07-08 启动产品/文档、前端 Workbench、后端架构、证据自测四路只读审查，结论一致：项目已有一条导入录音可用子链路，但真实麦克风同 session Copilot 主链路仍未通过。
+
+当前可信状态固定为：
+
+```text
+导入录音 file lane: Go
+Workbench demo smoke: Go for demo only
+真实麦克风 real mic lane: No-Go
+Production MVP: No-Go
+```
+
+新增执行入口：
+
+```text
+docs/p0-product-mainline-recovery-checklist-2026-07-08.md
+```
+
+决策：
+
+后续 P0 不再新增 readiness/preflight/approval wrapper，也不继续把 demo、mock、replay、API-only 或 file lane Go 包装成真实主线进展。真实麦克风主线只按三段 Gate 串行推进：
+
+1. Gate A：真实麦克风输入健康，必须有设备列表、明确 `audio_device_index`、health report、WAV 和音量证据。
+2. Gate B：真实麦克风 -> 本地 ASR -> Web handoff，必须有非空 ASR text 和 `transcript_final >= 1`。
+3. Gate C：真实麦克风 P0 product lane，必须同一 session 生成 transcript、建议、方案、复盘、Workbench 可见、历史可恢复和删除证据。
+
+本轮立即执行范围只做高收益小修：
+
+- 显式 mock endpoint 必须持久化 `is_mock=true`、`provider_mode=mock`、`ingest_mode=mock_asr_session`，即使 provider 名不是 `local_mock_asr`。
+- Workbench 首屏必须显示麦克风、ASR、AI 分析可用性检查。
+- 历史记录必须显式区分演示、导入录音、真实麦克风和降级 No-Go。
+- WebSocket 关闭后不能短暂显示“已生成文字”，必须等待 persisted snapshot 判定。
+- real mic degraded bundle 的 Go/No-Go 报告必须只列实际存在的证据文件。
+
+后端架构边界：
+
+- 现阶段确认 `/live/asr/sessions` 是 P0 主线 session API，旧 `/sessions` 暂保留为历史/core snapshot path。
+- 不做大拆，但后续必须补 live record -> core contract/schema 的投影或明确 No-Go reason。
+- live suggestion card 如果继续称为 `SuggestionCardV1`，必须对齐 core contract；否则应改名为 live lightweight card，避免证据污染。
+
+原因：
+
+- 用户价值来自真实会议中实时发现工程缺口，而不是继续证明 mock/replay 能跑。
+- 当前 real mic 失败证据集中在输入近静音：`rms=0.0`、`peak=0.0`、`active_sample_ratio=0.0`、`final_event_count=0`。
+- 没有有效 transcript 前继续跑 LLM/card/minutes 只会制造 No-Go 噪音。
+
+验证方式：
+
+```bash
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q \
+  code/web_mvp/backend/tests/test_app.py \
+  code/web_mvp/backend/tests/test_workbench.py \
+  code/web_mvp/backend/tests/test_asr_stream.py
+```
+
+```bash
+node code/web_mvp/e2e/workbench_smoke.mjs
+```
+
+复审条件：
+
+整体 P0 只有在 file lane 仍 Go 且 real mic lane Gate C 也 Go 后，才能从 `Partial / No-Go` 改成 `Go`。
+
+## DEC-223：以 Real Product Mainline Plan 替换旧 P0 入口，并先做 Workbench/ASR readiness 止血
+
+- 日期：2026-07-08
+- 状态：Accepted
+
+背景：
+
+用户指出当前前端没有实际内容、按钮复杂、mock 数据混杂，后端结构不像生产级，并质疑项目是否忘记最初“实时会议 + 实时建议”的产品初心。本轮重新启动产品、前端、后端多 Agent 只读审查，同时主线程审查 `/workbench`、`app.py`、`asr_stream.py`、evidence runner 与当前文档。结论一致：项目已有 file lane Go 和 ASR live 主线骨架，但真实麦克风 lane 仍 No-Go，Workbench 仍像研发实验台，后端 mock/demo/local-file/legacy snapshot 与真实 live API 尚未生产隔离。
+
+决策：
+
+- 当前唯一 P0 执行入口改为 `docs/p0-real-product-mainline-plan-2026-07-08.md`。
+- 旧 `docs/p0-mainline-recovery-execution-plan-2026-07-08.md` 与 `docs/p0-product-mainline-recovery-checklist-2026-07-08.md` 保留为历史，不再作为唯一入口。
+- 先做 P0 止血，不做大拆：
+  - `/audio/check` 必须区分 file ASR 与 realtime ASR。
+  - Workbench 必须把 fake fallback 显示为 `降级/非真实识别`，不能显示成普通演示成功。
+  - raw empty final 不能清掉最后一条 live partial，避免用户看到“文字又没了”。
+  - real mic Gate A 不过，不继续跑 LLM/cards/minutes 下游。
+
+本轮已实现：
+
+- `/audio/check` 新增 `file_asr_available`、`realtime_asr_available`、`realtime_asr_providers`、`asr_readiness_summary`。
+- Workbench 启动检查文案区分 `实时识别可用`、`实时识别不可用；导入录音可用`。
+- `sessionSourceInfo()` 中 fallback/degraded 优先级高于 mock，fake fallback 变成 `降级 / 非真实识别`。
+- `appendLiveEvent()` 对空 final 保留最后 `live-partial`，并提示“最终识别暂时为空，已保留最后一条临时文字”。
+
+新增回归测试：
+
+```text
+test_audio_check_distinguishes_file_asr_and_realtime_asr
+test_workbench_runs_startup_audio_check_and_explains_provider_readiness
+test_workbench_history_labels_demo_degraded_and_live_mic_sessions
+test_workbench_empty_final_preserves_last_live_partial
+```
+
+focused 验证：
+
+```text
+1 passed, 2 warnings
+3 passed, 2 warnings
+```
+
+影响：
+
+- 这不是把 real mic 改成 Go，而是减少 UI 与证据误导。
+- Production MVP 仍是 No-Go，直到真实麦克风 Gate C 通过。
+- 后续后端生产边界收敛按新计划推进：统一 live ASR record schema、阻断 mock/degraded 默认进入真实 LLM execution、明确 `/live/asr/sessions` 为 P0 主线。
+
+## DEC-224：三路复审后收束为唯一生产主链路，并把 Workbench 正式建议/方案从转写流分离
+
+- 日期：2026-07-08
+- 状态：Accepted
+
+背景：
+
+用户再次指出：当前页面没有清楚的实际内容，mock 数据和真实链路混在一起，后端结构复杂，项目像陷入评测循环。为避免主线程单点误判，本轮启动前端 Workbench、后端生产边界、测试/真实链路三路只读 Agent 复审，并由主线程核对当前文档、代码和 `/audio/check`。
+
+复审结论：
+
+```text
+Demo/mock: Go for demo only
+File upload: Go
+Real mic browser/command-line: No-Go
+Production MVP: No-Go
+```
+
+关键判断：
+
+- Workbench 已有真实功能入口，但仍偏工程验证台：`试用示例` 是 mock，`生成会议建议` 是手动批量 LLM，不等于会议中自动实时建议。
+- 后端当前有 `/live/asr/sessions` 主线骨架，但旧 `/sessions`、demo fixture、mock ASR、local-event-file、file upload、real mic 共存；生产主链路缺少统一 `LiveSessionRecord` schema、source policy gate 和 core card contract。
+- 测试里许多 real/mainline 名称实际使用 fake recognizer、fake LLM、mock session 或 local server，只能证明连接路径，不能证明真实麦克风产品主链路。
+
+决策：
+
+- 后续只按三段 Gate 推进：Gate A 有效真实输入，Gate B 非 fake ASR final，Gate C 同 session 建议/方案/复盘/历史/删除/evidence。
+- 不再新增横向评测、readiness wrapper 或 synthetic preview 来替代真实主链路。
+- 前端先做最小产品化：正式 `suggestion_cards` 与 `approach_cards` 不再追加到 transcript 流，而是渲染到稳定的 `suggestions-panel` 与 `approach-panel`。实时文字容器改为 `transcript-stream`。
+- 此变更只降低页面理解成本，不改变 real mic Go/No-Go：真实麦克风仍未通过。
+
+已实现：
+
+- Workbench HTML 新增独立 `#transcript-stream`、`#suggestions-panel`、`#approach-panel`。
+- `renderSuggestionCards()` 改为渲染到会议建议面板。
+- `renderApproachCardList()` 改为渲染到方案分析面板。
+- reset/prepare session 会同时清空文字、建议、方案和复盘面板。
+- 新增测试 `test_workbench_has_stable_copilot_panels_outside_transcript_stream`，先红后绿。
+
+验证：
+
+```text
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q code/web_mvp/backend/tests/test_workbench.py
+30 passed, 2 warnings
+```
+
+影响：
+
+- 页面仍不是 Production MVP，但已经避免把正式 AI 建议/方案混在实时文字下面。
+- 下一步 P0 前端应继续收敛顶栏主动作、明确 demo/dev 区域，并补真实麦克风 Gate A 的浏览器 UI 证据。
+
+## DEC-227：真实会议入口默认 hard fail，mock/degraded 默认禁止 enabled LLM 派生
+
+- 日期：2026-07-08
+- 状态：Accepted
+
+背景：
+
+后端二次只读审查确认，当前主链路最大风险不是“没有 metadata”，而是 metadata 没有变成 enforcement：mock/demo/local-event/fake fallback/degraded session 会被标为不可验收，但仍可默认进入 enabled LLM cards、approach 和 minutes；真实会议 WebSocket 在 realtime ASR sidecar 不可用时也会落到 `FakeStreamRecognizer`，产生可被用户误解的 partial/final 文本。
+
+决策：
+
+- `create_app()` 默认代表真实 Workbench/真实会议模式，不允许 fake ASR fallback。
+- WebSocket `/live/asr/stream/ws/{session_id}` 如果只能拿到 fake/mock/fallback recognizer，必须立即返回 `provider_error`，错误码为 `real_asr_sidecar_unavailable`，并关闭连接，不创建 ASR live session。
+- 只有显式 `allow_fake_asr_fallback=True` 的 demo/test app 才能继续使用 fake recognizer，避免破坏确定性单元测试。
+- enabled LLM 派生默认只允许验收安全 session。mock/demo、local-event、fake fallback、degraded session 默认不能调用：
+  - `/live/asr/sessions/{id}/llm-execution-runs`
+  - `/live/asr/sessions/{id}/approach-cards`
+  - `/live/asr/sessions/{id}/minutes`
+  - `/live/asr/sessions/{id}/minutes.json`
+- 旧 mock wiring 测试若确实要验证 LLM HTTP/parse/persist 代码路径，必须在请求体显式传 `allow_non_acceptance_execution=true`，语义改为 demo/test，不再代表生产默认路径。
+
+实现：
+
+- `asr_stream.handle_stream(..., allow_fake_fallback=False)` 默认阻断 fake/mock/fallback recognizer。
+- 新增 `_blocked_recognizer_event()`，返回前端可识别的 `provider_error`。
+- `create_app(..., allow_fake_asr_fallback=False)` 将策略注入 WebSocket route。
+- `CreateLlmExecutionRunsRequest` 新增 `allow_non_acceptance_execution: bool = False`。
+- 新增 `_ensure_enabled_llm_allowed()`，在读取 LLM config 和发起任何远程调用前阻断不可验收 session。
+
+验证：
+
+```bash
+PYTHONPATH=code/web_mvp/backend:code/core LLM_GATEWAY_BASE_URL= LLM_GATEWAY_API_KEY= pytest -q \
+  code/web_mvp/backend/tests/test_app.py \
+  code/web_mvp/backend/tests/test_asr_stream.py
+```
+
+```text
+90 passed, 2 warnings
+```
+
+```bash
+PYTHONPATH=code/web_mvp/backend:code/core LLM_GATEWAY_BASE_URL= LLM_GATEWAY_API_KEY= pytest -q \
+  code/web_mvp/backend/tests/test_asr_stream.py \
+  code/web_mvp/backend/tests/test_approach_cards.py \
+  code/web_mvp/backend/tests/test_minutes.py \
+  code/web_mvp/backend/tests/test_workbench.py \
+  code/web_mvp/backend/tests/test_real_llm_path.py \
+  code/web_mvp/backend/tests/test_metrics.py \
+  code/web_mvp/backend/tests/test_g3_g4_g5.py \
+  code/web_mvp/backend/tests/test_e2e_mainline.py \
+  code/web_mvp/backend/tests/test_shadow_trial.py
+```
+
+```text
+61 passed, 2 warnings
+```
+
+影响：
+
+- 真实会议入口不再用 fake 文本营造“有文字”的错觉。
+- mock/demo 仍可用于 UI 演示和测试，但必须显式标注非验收执行。
+- File lane Go 不受影响，因为 `local_funasr_batch` 会推断为 `uploaded_file`、`provider_mode=real`。
+- Real mic 仍是 No-Go；下一步必须转向 Workbench 前端 P0：避免开始麦克风清空旧文字，避免空 snapshot 覆盖 live partial，并让主按钮受 realtime ASR readiness 和 source badge 约束。
+
+## DEC-228：Workbench P0 止血，provider error/readiness/live partial 不再伪装成功
+
+- 日期：2026-07-08
+- 状态：Accepted
+
+背景：
+
+前端 Agent 审查指出，“文字又没了”最可能来自两条路径：开始新录音时 `prepareNewSession()` 直接替换当前文字区；录音中显示过 `live-partial`，结束后空 snapshot 又把它覆盖成“没有有效语音”。同时后端 DEC-227 已经把真实会议模式下的 fake fallback 改成 `provider_error`，前端必须用产品语言解释这个错误，不能继续表现为普通录音流程。
+
+决策：
+
+- Workbench 必须识别 `provider_error`，展示“实时识别不可用”，并回到 idle，不显示成功录音。
+- `renderTranscriptAndCandidates(..., { preserveExistingTranscript: true })` 必须保留最后的 `live-partial`，并明确标注“临时实时文字”，不能被空 snapshot 覆盖。
+- `/audio/check` 的 `realtime_asr_available=false` 必须影响 `开始会议` 主按钮；用户仍可导入录音。
+- Workbench demo 可以显式调用 demo/test LLM 派生路径，但必须通过 `allow_non_acceptance_execution=true` 表示不计入真实验收；降级/非验收 session 不默认绕过后端门禁。
+
+实现：
+
+- 新增 `updateRecordButtonReadiness()` 与 `currentMeetingPhase`，让 realtime ASR readiness 参与录音按钮状态。
+- `btn-record` 开始分支在 realtime ASR 不可用时提前提示并返回。
+- `appendLiveEvent()` 新增 `provider_error` 分支，展示错误并设置 `s-asr=不可用`。
+- `renderTranscriptAndCandidates()` 使用 `stream.querySelector(".live-partial")` 参与保留逻辑。
+- 前端 enabled LLM 请求统一走 `enabledLlmRequestBody()`，只有 demo session 带 `allow_non_acceptance_execution=true`。
+
+验证：
+
+```bash
+PYTHONPATH=code/web_mvp/backend:code/core LLM_GATEWAY_BASE_URL= LLM_GATEWAY_API_KEY= pytest -q \
+  code/web_mvp/backend/tests/test_workbench.py
+```
+
+```text
+31 passed, 2 warnings
+```
+
+```bash
+PYTHONPATH=code/web_mvp/backend:code/core LLM_GATEWAY_BASE_URL= LLM_GATEWAY_API_KEY= pytest -q \
+  code/web_mvp/backend/tests/test_app.py \
+  code/web_mvp/backend/tests/test_asr_stream.py \
+  code/web_mvp/backend/tests/test_workbench.py \
+  code/web_mvp/backend/tests/test_file_convert.py \
+  code/web_mvp/backend/tests/test_real_asr_to_cards.py \
+  code/web_mvp/backend/tests/test_approach_cards.py \
+  code/web_mvp/backend/tests/test_minutes.py
+```
+
+```text
+136 passed, 2 warnings
+```
+
+```bash
+node code/web_mvp/e2e/workbench_smoke.mjs
+```
+
+```text
+workbench smoke OK: 4 utterances, 9 suggestions, history/minutes/delete verified
+```
+
+影响：
+
+- 这降低“开麦后文字消失”和“fake/degraded 被看成成功”的概率。
+- 这仍不是 real mic Go；真实麦克风 Gate A/B/C 尚未通过。
+- 下一步前端还要继续收敛顶栏、下沉 demo、补 source badge 和删除确认上下文。
+
+## DEC-229：四路 Agent 再审查后收束 P0，只做能改变 Gate 状态的主线工作
+
+- 日期：2026-07-08
+- 状态：Accepted
+
+背景：
+
+用户再次指出：前端看起来没有实际内容，页面仍有 mock/demo，后端结构不像生产规范，开发像陷入评测/边界循环。为避免主线程继续单点误判，本轮启动四路只读 Agent 分别审查：
+
+- 前端/产品体验：Workbench 按钮、页面状态、mock/demo 混入、文字消失原因。
+- 后端架构/主链路：ASR WebSocket、file lane、LLM derivation、history/delete、生产边界。
+- 文档/需求追溯：产品初心、旧文档冲突、主线入口。
+- 测试/真实链路：测试可信度、real mic Gate A/B/C、公开音频 lane。
+
+复审结论：
+
+```text
+Demo/mock: Go for demo only
+File lane: Go
+Real mic: No-Go
+Production MVP: No-Go
+```
+
+关键判断：
+
+- 项目不是空壳。Workbench、file upload、ASR live session、LLM cards、approach、minutes、history、delete 都有局部可运行实现。
+- 项目也没有完成主线。真实麦克风仍没有 Gate A/B/C 证据，不能发布或宣称生产可用。
+- 产品初心没有丢，但旧文档、readiness wrapper、synthetic/replay、demo smoke 和 file lane Go 堆在一起，容易让后续开发偏离“中文技术会议实时 Copilot”。
+- 当前最大假成功风险不再是 FakeRecognizer 直接冒充真实 ASR，而是空 final、降级 session、local-event、手动 LLM 按钮、删除 cascade 文案和 fake 测试 Go 被误读成真实主链路。
+
+决策：
+
+- `docs/current-status-and-p0-execution-plan-2026-07-08.md` 继续作为唯一活文档，并更新为 P0 恢复 checklist。
+- 旧 `p0-*`、`mainline-*`、`workbench-*`、`pcweb-*readiness/preflight/wrapper*` 和 2026-07-07 real mic selftest 只能作为 historical context 或 evidence archive。
+- 后续只做能改变以下 state 的工作：
+  - `real_mic_gate_a`
+  - `real_mic_gate_b`
+  - `real_mic_gate_c`
+  - `formal_card_evidence`
+  - `delete_evidence`
+  - `workbench_real_demo_separation`
+  - `backend_acceptance_enforcement`
+- 禁止继续把 demo smoke、file lane Go、synthetic/replay、readiness wrapper 包装成真实会议主链路完成。
+
+下一步执行顺序：
+
+1. 文档收束：更新主线索引和本决策日志。
+2. 后端 TDD：非空 final/provenance/delete 语义 hardening。
+3. 前端 TDD：source badge、demo 下沉、候选/正式建议分离、删除确认。
+4. 回归测试：核心 pytest 与 Workbench demo smoke 只作为 sanity，不作为 real mic Go。
+5. Real mic Gate A/B/C：先证明真实输入非静音，再证明非 fake final，最后闭合建议/方案/复盘/历史/删除/evidence。
+
+替代方案：
+
+- 继续扩 ASR/provider 横评：拒绝，当前 blocker 是真实主链路 evidence，不是更多横评。
+- 先做 Tauri/安装包/系统音频/移动端：拒绝，P0 未通前会继续稀释主线。
+- 再新建一个大而全的主线文档目录：暂不采用，先更新唯一活文档，避免入口继续分裂。
+
+影响范围：
+
+- `docs/current-mainline-index.md`
+- `docs/current-status-and-p0-execution-plan-2026-07-08.md`
+- `docs/decision-log.md`
+- 后续代码改动将集中在 Workbench 前端、ASR acceptance policy、live session provenance/delete 语义。
+
+成本/隐私影响：
+
+- 不新增默认收费 ASR。
+- Real mic 测试只允许在用户授权、本地 ignored artifact 路径下产生 evidence。
+- 不读取 `configs/local/`、`.env`、私有用户音频或未授权 `.m4a`。
+- LLM 远程调用必须受 session eligibility 和用户配置约束。
+
+验证方式：
+
+- 文档层：唯一活文档和本决策日志均记录本轮结论。
+- 测试层：新增 TDD 测试覆盖非空 final/provenance/delete/source badge/demo 下沉/候选正式分离。
+- 自测层：核心 pytest + Workbench smoke 通过后，进入 real mic Gate A/B/C evidence bundle。
+
+复审条件：
+
+- Real mic Gate C 通过后，可以重新评估 Production MVP。
+- 如果 Gate A 连续失败，需要先处理麦克风输入/浏览器权限/系统输入设备，而不是继续做 LLM 或 UI 扩展。
+- 如果本地 ASR 中文技术会议长期不能稳定产生非空 final，再重新评估可选远程 ASR，但仍不能变成默认收费项。
+
+## DEC-230：enabled LLM 与验收 gate 必须要求非空 ASR final，删除接口不得夸大删除范围
+
+- 日期：2026-07-08
+- 状态：Accepted
+
+背景：
+
+四路 Agent 审查后确认，后端已经阻断 fake fallback 和 mock/degraded 默认 LLM 派生，但仍有两个残余假成功风险：
+
+- provider/source 看起来是真实或 file lane 时，如果 ASR final 文本为空，仍可能被误读成可继续生成正式建议、方案或复盘。
+- `/live/asr/sessions/{id}` 删除接口返回 `cascade: transcript, events, candidates, cards`，容易让用户误以为音频、导出文件和 evidence bundle 也被完整删除。
+
+决策：
+
+- ASR live session 的 `event_source` 必须显式携带：
+  - `final_count`
+  - `non_empty_final_count`
+  - `non_empty_transcript`
+  - `transcript_chars`
+- enabled LLM 派生和真实验收 gate 必须阻断：
+  - `asr_final_missing`
+  - `asr_transcript_empty`
+- file lane 即使 provider 是 `local_funasr_batch`，只要 ASR 文本为空，也不能进入正式建议、方案或复盘。
+- live session 删除接口必须精确返回实际删除范围：
+  - `session_record: deleted`
+  - `transcript_events/suggestion_cards/approach_cards/minutes: deleted_with_session_record`
+  - `audio/exports/evidence_bundle: not_tracked_by_live_session_repo`
+- 删除响应不得继续返回模糊 `cascade` 字段。
+
+实现：
+
+- `get_asr_live_session_events()` 返回 `final_count`、`non_empty_final_count` 和 `non_empty_transcript`。
+- 新增 `_asr_live_transcript_stats()`，统一从 persisted live events 计算非空 transcript 状态。
+- `_asr_live_acceptance_blockers()` 纳入 final/non-empty transcript gate。
+- `/live/asr/sessions/{session_id}` 删除响应改为结构化 `delete_scope`。
+
+验证：
+
+```bash
+PYTHONPATH=code/web_mvp/backend:code/core LLM_GATEWAY_BASE_URL= LLM_GATEWAY_API_KEY= pytest -q \
+  code/web_mvp/backend/tests/test_file_convert.py::test_transcribe_file_empty_asr_result_is_not_eligible_for_enabled_llm \
+  code/web_mvp/backend/tests/test_app.py::test_delete_asr_live_session_reports_exact_delete_scope_without_overclaiming
+```
+
+```text
+2 passed, 2 warnings
+```
+
+核心回归：
+
+```bash
+PYTHONPATH=code/web_mvp/backend:code/core LLM_GATEWAY_BASE_URL= LLM_GATEWAY_API_KEY= pytest -q \
+  code/web_mvp/backend/tests/test_app.py \
+  code/web_mvp/backend/tests/test_asr_stream.py \
+  code/web_mvp/backend/tests/test_workbench.py \
+  code/web_mvp/backend/tests/test_file_convert.py \
+  code/web_mvp/backend/tests/test_real_asr_to_cards.py \
+  code/web_mvp/backend/tests/test_approach_cards.py \
+  code/web_mvp/backend/tests/test_minutes.py
+```
+
+```text
+138 passed, 2 warnings
+```
+
+影响：
+
+- 降低“空 ASR 结果 + 真实 LLM”被包装成产品主线成功的风险。
+- 删除接口开始如实表达当前 live repo 只删除 session record，不再暗示删除未追踪的音频、导出文件或 evidence bundle。
+- 真实麦克风仍是 No-Go；该决策只是 P0 主链路验收边界加固。
+
+复审条件：
+
+- 后续如果 live session repo 增加音频、导出文件或 evidence bundle 管理，删除响应必须从 `not_tracked_by_live_session_repo` 升级为真实删除状态，并增加对应 evidence。
+
+## DEC-231：Workbench 主流程收敛，demo 下沉，候选提醒与正式建议分离
+
+- 日期：2026-07-08
+- 状态：Accepted
+
+背景：
+
+四路 Agent 审查一致指出，Workbench 不是空壳，但顶栏九个按钮同级、`试用示例` 与真实会议同级、候选提醒混在实时文字流、删除确认过于笼统，会让用户认为页面复杂且 mock/真实混在一起。
+
+决策：
+
+- 顶栏只保留主动作：
+  - `开始/结束会议`
+  - `导入录音`
+  - `整理会议`
+  - `历史记录`
+  - `删除本次会议`
+- `试用示例` 下沉到右侧 `演示区`，继续可用于 demo smoke，但不再与真实会议主动作同级。
+- 右侧新增 `候选提醒` 面板，`suggestion_candidate_event` 不再渲染到实时文字流。
+- 右侧 `会议建议` 只承载正式 AI suggestion cards。
+- 首屏新增 `source-badge`，用于显示 `真实麦克风 / 导入录音 / 演示 / 降级`。
+- 删除确认必须展示 session 来源、文字条数、正式建议、方案分析、会后复盘状态和删除范围，并明确音频/export/evidence 当前不由 live session repo 追踪。
+
+实现：
+
+- `workbench.html` 新增：
+  - `#primary-actions`
+  - `#secondary-actions`
+  - `#demo-actions`
+  - `#source-badge`
+  - `#candidate-panel`
+- `workbench.js` 新增：
+  - `renderSourceBadge()`
+  - `renderCandidateReminders()`
+  - `deleteConfirmationText()`
+  - `btn-organize` 聚合入口
+- `renderTranscriptAndCandidates()` 不再把候选提醒 append 到 `#transcript-stream`。
+
+验证：
+
+Focused TDD：
+
+```bash
+PYTHONPATH=code/web_mvp/backend:code/core LLM_GATEWAY_BASE_URL= LLM_GATEWAY_API_KEY= pytest -q \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_prioritizes_real_meeting_actions_and_downshifts_demo \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_has_source_badge_and_candidate_panel \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_candidate_reminders_do_not_render_inside_transcript_stream \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_delete_confirmation_includes_source_counts_and_scope
+```
+
+```text
+4 passed, 2 warnings
+```
+
+核心回归：
+
+```bash
+PYTHONPATH=code/web_mvp/backend:code/core LLM_GATEWAY_BASE_URL= LLM_GATEWAY_API_KEY= pytest -q \
+  code/web_mvp/backend/tests/test_workbench.py \
+  code/web_mvp/backend/tests/test_app.py \
+  code/web_mvp/backend/tests/test_asr_stream.py \
+  code/web_mvp/backend/tests/test_file_convert.py \
+  code/web_mvp/backend/tests/test_real_asr_to_cards.py \
+  code/web_mvp/backend/tests/test_approach_cards.py \
+  code/web_mvp/backend/tests/test_minutes.py
+```
+
+```text
+142 passed, 2 warnings
+```
+
+Workbench demo smoke：
+
+```bash
+node code/web_mvp/e2e/workbench_smoke.mjs
+```
+
+```text
+workbench smoke OK: 4 utterances, 9 suggestions, history/minutes/delete verified
+```
+
+影响：
+
+- 页面主流程更接近用户开会时的实际路径，减少“研发控制台”感觉。
+- demo 仍存在，但被明确下沉，不能计入真实验收。
+- 候选提醒和正式建议不再混放，降低“AI 到底做了什么”的理解成本。
+- 真实麦克风仍是 No-Go；本决策不改变 Gate A/B/C 状态。
+
+复审条件：
+
+- Real mic Gate B/C 通过后，需要再检查 `整理会议` 是否应从手动聚合升级为自动/准自动低频建议策略。
+
+## DEC-232：P0 主线只承认 7 个 release-decisive 状态，下一轮先修 Workbench 产品语义
+
+- 日期：2026-07-08
+- 状态：Accepted
+
+背景：
+
+用户指出项目执行轮次过多但主线不清，前端仍像研发控制台，后端仍有 demo/mock/local-event 与真实会议边界混杂，担心当初“中文技术会议实时 AI Copilot”的产品初心被 readiness、preflight、wrapper、demo smoke 和 file lane 重复验证稀释。
+
+四路 Agent 最新审查结论：
+
+- 前端不是空壳，但仍会误导：麦克风刚开始时先显示“真实麦克风”，候选提醒与正式建议/方案计数混在 `#s-cards`，`整理会议` 只是三个按钮 `.click()` 拼装。
+- 后端已有非空 ASR final gate、mock/degraded 默认禁用 enabled LLM、delete scope 精确化，但 `allow_non_acceptance_execution` 仍作为产品端点字段存在，长期必须迁移到 dev-only/demo-only 边界。
+- 测试与真实链路仍有层级差异：Workbench smoke 只算 demo；file lane Go 只算导入录音子链路；real mic Gate A/B/C 仍 No-Go。
+- 文档主线应继续只以 `docs/current-status-and-p0-execution-plan-2026-07-08.md` 为唯一活计划，旧 P0/mainline/workbench/readiness/preflight/wrapper 文档只能作为 historical context 或 evidence archive。
+
+决策：
+
+P0 主线只承认以下 7 个 release-decisive 状态：
+
+- `backend_acceptance_enforcement`
+- `workbench_real_demo_separation`
+- `formal_card_evidence`
+- `delete_evidence`
+- `real_mic_gate_a`
+- `real_mic_gate_b`
+- `real_mic_gate_c`
+
+任何新任务若不能改变以上状态之一，只能记为 supporting work，不能写成 P0 主线完成。
+
+下一轮实现优先级：
+
+1. 麦克风开始阶段显示 `待确认`，不能在服务端确认前标记为真实可验收。
+2. 拆分候选提醒、正式建议、方案分析计数；候选提醒不计入正式建议数量。
+3. `整理会议` 改为独立 orchestration，统一 loading、失败汇总和按钮禁用，不再 `.click()` 三连发。
+4. 短期保留 demo 显式 `allow_non_acceptance_execution=true`，但只允许 demo/test 使用；中期从生产端点 schema 中移除或隔离。
+
+影响：
+
+- 把后续开发从“继续评估/继续 wrapper”拉回能改变 Go/No-Go 的主线。
+- 降低用户看到页面时把 demo、候选提醒、正式建议、真实麦克风误解为同一层级能力的风险。
+- 不改变当前 real mic 状态：`Real mic: No-Go`，`Production MVP: No-Go`。
+
+复审条件：
+
+- Workbench 三个 P0 产品语义缺口修完并通过测试后，更新 `workbench_real_demo_separation` 状态。
+- 后续如果 demo/test 绕过仍停留在产品端点 schema，应单独打开 `backend_acceptance_enforcement` P0 项继续处理。
+
+## DEC-233：Workbench P0 产品语义修复完成，真实麦克风 Gate A 仍 No-Go
+
+- 日期：2026-07-08
+- 状态：Accepted
+
+背景：
+
+DEC-232 锁定后，下一步必须先修 Workbench 三个用户可感知的 P0 产品语义问题，再进入真实麦克风 Gate A/B/C。修复目标不是重写全站，而是降低真实/演示、候选/正式建议、按钮堆叠的混淆。
+
+决策与实现：
+
+- 麦克风开始阶段改为 `pending` 来源状态：
+  - 前端新增 `pendingMicSource()`。
+  - 浏览器拿到麦克风权限和 WebSocket 建立前后，source badge 显示 `待确认`。
+  - 只有服务端 snapshot 提供可验收 event source 后，才允许显示真实麦克风可验收语义。
+- footer 计数拆分：
+  - `s-candidates`：候选提醒。
+  - `s-cards`：正式建议。
+  - `s-approach-cards`：方案分析。
+  - `suggestion_candidate_event` 不再增加正式建议数。
+- `整理会议` 改为独立 orchestration：
+  - 新增 `organizeCurrentSession()`。
+  - 顺序调用 `generateSuggestionCards()`、`generateApproachCards()`、`generateMinutes()`。
+  - 统一 loading、失败摘要和按钮禁用。
+  - 删除旧的 `$("btn-cards").click(); $("btn-approach").click(); $("btn-minutes").click();` 拼装逻辑。
+
+验证：
+
+Focused TDD：
+
+```bash
+PYTHONPATH=code/web_mvp/backend:code/core LLM_GATEWAY_BASE_URL= LLM_GATEWAY_API_KEY= pytest -q \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_real_mic_source_badge_stays_pending_until_server_snapshot \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_footer_separates_candidate_formal_and_approach_counts \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_organize_meeting_uses_real_orchestrator_not_button_clicks
+```
+
+```text
+3 passed, 2 warnings
+```
+
+Workbench 全量：
+
+```bash
+PYTHONPATH=code/web_mvp/backend:code/core LLM_GATEWAY_BASE_URL= LLM_GATEWAY_API_KEY= pytest -q code/web_mvp/backend/tests/test_workbench.py
+```
+
+```text
+38 passed, 2 warnings
+```
+
+核心回归：
+
+```bash
+PYTHONPATH=code/web_mvp/backend:code/core LLM_GATEWAY_BASE_URL= LLM_GATEWAY_API_KEY= pytest -q \
+  code/web_mvp/backend/tests/test_workbench.py \
+  code/web_mvp/backend/tests/test_app.py \
+  code/web_mvp/backend/tests/test_asr_stream.py \
+  code/web_mvp/backend/tests/test_file_convert.py \
+  code/web_mvp/backend/tests/test_real_asr_to_cards.py \
+  code/web_mvp/backend/tests/test_approach_cards.py \
+  code/web_mvp/backend/tests/test_minutes.py
+```
+
+```text
+145 passed, 2 warnings
+```
+
+Workbench demo smoke：
+
+```bash
+node code/web_mvp/e2e/workbench_smoke.mjs
+```
+
+```text
+workbench smoke OK: 4 utterances, 9 suggestions, history/minutes/delete verified
+```
+
+运行态 HTTP 验证：
+
+```text
+GET /workbench -> has_s_candidates=true, has_s_cards=true, has_s_approach_cards=true, has_pending_mic_source=true, organize_orchestrator=true, old_stream_id=false
+```
+
+真实麦克风 Gate A：
+
+```text
+artifacts/tmp/audio_health/gate-a-real-mic-20260708-140009.health.json
+health_status=blocked_audio_too_quiet
+duration_seconds=15.893
+rms=0.0
+peak=0.0
+active_sample_ratio=0.0
+```
+
+evidence bundle：
+
+```text
+artifacts/tmp/acceptance/p0-real-mic-gate-a-20260708-140009/manifest.json
+verdict=no_go
+audio_source=real_mic
+real_mic_health_status=blocked_audio_too_quiet
+llm_called=false
+final_segment_count=0
+```
+
+影响：
+
+- `workbench_real_demo_separation` 从“部分 Go，仍混淆”推进到“P0 语义止血完成，仍需真实失败不清空上一场和结构化复盘”等后续项。
+- `real_mic_gate_a` 仍为 No-Go。原因不是 ASR/LLM，而是当前 MacBook Air 麦克风采集到全静音输入。
+- 按 Stop Rule，Gate A 失败时不继续 Gate B/C，不调用 ASR/LLM 下游，避免“无效音频 + 后续产物”伪造成真实主链路成功。
+
+复审条件：
+
+- 用户调整 macOS 输入权限/输入音量/麦克风来源，或改用能进入麦克风的授权音频后，重新跑 Gate A。
+- Gate A 通过后才能继续 Gate B：非 fake ASR final。
+
+## DEC-234：Workbench 真实麦克风失败时保留上一场可读会议
+
+- 日期：2026-07-08
+- 状态：Accepted
+
+背景：
+
+用户反馈真实麦克风测试时“文字又没有了”。前端 Agent 审查和真实页面复测确认：此前 Workbench 在拿到麦克风权限后会立即把 `currentSession` 切到新的 `rec_*`，并调用 `prepareNewSession()` 清空页面。如果随后真实麦克风没有有效输入、ASR final 为空或 provider error，页面会停留在降级/空文字 session，用户正在看的上一场会议文字被覆盖。
+
+决策：
+
+Workbench 在启动真实麦克风前，如果当前页面已经打开一场有文字的会议，就保存一份前端会话快照。新的麦克风会话如果失败、provider error 或最终 ASR 为空，则恢复上一场会议文字、正式建议、方案分析和复盘，同时把失败原因留在当前状态区。失败的麦克风 session 仍然进入历史，并标记为降级，不把失败吞掉。
+
+实现：
+
+- 新增 `preservedSessionBeforeRecording` 和 `restoredRecordingFailureSessionId` 状态。
+- 新增 `preserveSessionBeforeRecording()`：只在当前 session 有 transcript 时保存。
+- 新增 `restorePreservedSessionAfterRecordingFailure()`：恢复上一场可读会议，并显示“已保留上一场会议”。
+- `provider_error` 分支优先恢复上一场会议。
+- `refreshRecordedSession()` 在空 ASR 或 snapshot 读取失败时恢复上一场会议。
+- WebSocket `onclose` 遇到已经恢复过的失败 session 时，不再把页面重新切回 processing/降级空会话。
+
+验证：
+
+Focused TDD：
+
+```bash
+PYTHONPATH=code/web_mvp/backend:code/core LLM_GATEWAY_BASE_URL= LLM_GATEWAY_API_KEY= pytest -q \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_real_mic_failure_restores_previous_readable_session
+```
+
+```text
+1 passed, 2 warnings
+```
+
+Workbench 全量：
+
+```bash
+PYTHONPATH=code/web_mvp/backend:code/core LLM_GATEWAY_BASE_URL= LLM_GATEWAY_API_KEY= pytest -q \
+  code/web_mvp/backend/tests/test_workbench.py
+```
+
+```text
+39 passed, 2 warnings
+```
+
+核心回归：
+
+```bash
+PYTHONPATH=code/web_mvp/backend:code/core LLM_GATEWAY_BASE_URL= LLM_GATEWAY_API_KEY= pytest -q \
+  code/web_mvp/backend/tests/test_app.py \
+  code/web_mvp/backend/tests/test_asr_stream.py \
+  code/web_mvp/backend/tests/test_file_convert.py \
+  code/web_mvp/backend/tests/test_real_asr_to_cards.py \
+  code/web_mvp/backend/tests/test_approach_cards.py \
+  code/web_mvp/backend/tests/test_minutes.py
+```
+
+```text
+107 passed, 2 warnings
+```
+
+Workbench demo smoke：
+
+```bash
+node code/web_mvp/e2e/workbench_smoke.mjs
+```
+
+```text
+workbench smoke OK: 4 utterances, 9 suggestions, history/minutes/delete verified
+```
+
+真实页面复测：
+
+```text
+previous_session=workbench_mrboukhq
+failed_mic_session=rec_mrboum34
+before=示例会议 4 条文字可见
+during=麦克风待确认；页面提示没有检测到麦克风声音
+after=页面恢复并保留 workbench_mrboukhq 的 4 条文字
+history=rec_mrboum34 作为降级会话保留
+```
+
+影响：
+
+- 修复“真实麦克风失败/空输入导致当前页面文字消失”的直接体验问题。
+- 不改变真实麦克风 Go/No-Go：`rec_mrboum34` 仍为 `final_count=0`、`acceptance_eligible=false`，Real Mic 仍 No-Go。
+- P0 仍按 Gate A/B/C 串行推进。当前下一步不是继续 LLM，而是解决有效麦克风输入或提供用户授权的可识别音频。
+
+复审条件：
+
+- 如果未来真实麦克风 session 成功产生非空 final，应确认保存的上一场快照不会错误恢复，当前页面应切到成功的新 session。
+- Gate A/B 通过后，才允许进入同 session 的正式建议、方案、复盘和 evidence bundle。
+
+## DEC-235：全站溯源审查后，P0 执行从“评估循环”收束为 5 类生产交付修复
+
+日期：2026-07-08
+
+状态：Accepted
+
+背景：
+
+- 用户再次指出：前端没有足够真实内容、仍有 mock 数据、后端结构不像生产规范、项目好像越写越复杂、主线没有跑通。
+- 本轮结合旧多 Agent 审查结果和本地代码核对确认：项目不是空壳，但真实麦克风主链路仍未完成，生产级交付边界也未完成。
+- 继续新增 readiness/preflight/wrapper/report 只会扩大评估循环，不能改变发布判断。
+
+决策：
+
+- 当前唯一活计划仍是 `docs/current-status-and-p0-execution-plan-2026-07-08.md`。
+- 在该文档新增第 15 节，作为“全站溯源审计后的生产交付恢复计划”。
+- 保留 demo/mock，但只允许用于 UI 回归和示例，不能作为真实验收。
+- 后续只执行 5 类 P0 工作：
+  - 隔离生产端点中的 `allow_non_acceptance_execution`，把 demo/test 绕过迁到 demo/dev-only 边界。
+  - 补正式建议卡 evidence quote、timestamp、segment id 和 transcript 回跳。
+  - 补删除/evidence/audio retention 的逐项状态展示和验收。
+  - 继续压低 Workbench 主流程复杂度，把低频工程按钮收进高级操作。
+  - 按 Gate A/B/C 串行跑真实麦克风，Gate A/B 失败即停止下游。
+
+当前状态：
+
+```text
+Demo/mock: Go for demo only
+File lane: Go
+Real mic: No-Go
+Production MVP: No-Go
+```
+
+影响：
+
+- 不再新建同类总控计划。
+- 不再把 demo smoke、file lane Go、synthetic/replay、readiness wrapper 写成 P0 主线进展。
+- 不做大爆炸式重构；`app.py` 只允许围绕 P0 policy/service 小步拆分。
+- 每次能改变 Go/No-Go、生产/演示边界、隐私/成本边界、真实麦克风验收状态的决策，必须继续追加到本 decision log。
+
+复审条件：
+
+- `backend_acceptance_enforcement`、`formal_card_evidence`、`delete_evidence`、`workbench_real_demo_separation`、`real_mic_gate_a/b/c` 任一状态改变时，更新唯一活计划和主线索引。
+- Gate C 通过前，不能讨论 Production MVP Go。
+
+## DEC-236：生产 LLM 派生端点移除 `allow_non_acceptance_execution`，demo 迁到专用边界
+
+日期：2026-07-08
+
+状态：Accepted / Implemented
+
+背景：
+
+- DEC-235 将 `backend_acceptance_enforcement` 列为下一批 P0 修复的第一项。
+- 旧实现中，`allow_non_acceptance_execution` 位于产品请求模型 `CreateLlmExecutionRunsRequest`，任何调用者都能在生产端点请求体里传该字段，绕过 mock/demo/local/degraded/空 ASR gate。
+- 这会制造“无效 ASR + 真 LLM”的假成功风险，也是用户质疑 mock 数据和生产边界混乱的核心原因之一。
+
+决策：
+
+- `CreateLlmExecutionRunsRequest` 移除 `allow_non_acceptance_execution`。
+- 生产端点：
+  - `/live/asr/sessions/{id}/llm-execution-runs`
+  - `/live/asr/sessions/{id}/approach-cards`
+  - `/live/asr/sessions/{id}/minutes`
+  - `/live/asr/sessions/{id}/minutes.json`
+  一律走正式验收 gate。请求体带 `allow_non_acceptance_execution` 会被 Pydantic extra-forbid 拒绝为 422。
+- 新增 demo 专用端点：
+  - `/live/asr/demo/sessions/{id}/llm-execution-runs`
+  - `/live/asr/demo/sessions/{id}/approach-cards`
+  - `/live/asr/demo/sessions/{id}/minutes`
+  - `/live/asr/demo/sessions/{id}/minutes.json`
+  内部显式使用 non-acceptance execution，并返回 `execution_boundary=demo_non_acceptance_execution`。
+- Workbench demo session 的建议、方案、复盘请求改走 demo 专用端点；真实麦克风和导入录音 session 继续走生产端点。
+- Workbench HTML 脚本版本更新到 `20260708-p0-boundary`，避免浏览器缓存旧 JS 造成“页面又不是最新”的运行态问题。
+
+验证：
+
+Focused TDD：
+
+```bash
+PYTHONPATH=code/web_mvp/backend:code/core LLM_GATEWAY_BASE_URL= LLM_GATEWAY_API_KEY= pytest -q \
+  code/web_mvp/backend/tests/test_app.py::test_asr_live_production_derivation_endpoints_reject_non_acceptance_bypass_field \
+  code/web_mvp/backend/tests/test_app.py::test_demo_derivation_endpoint_can_execute_mock_session_without_public_bypass_field
+```
+
+```text
+2 passed, 2 warnings
+```
+
+核心回归：
+
+```bash
+PYTHONPATH=code/web_mvp/backend:code/core LLM_GATEWAY_BASE_URL= LLM_GATEWAY_API_KEY= pytest -q \
+  code/web_mvp/backend/tests/test_app.py \
+  code/web_mvp/backend/tests/test_asr_stream.py \
+  code/web_mvp/backend/tests/test_workbench.py \
+  code/web_mvp/backend/tests/test_file_convert.py \
+  code/web_mvp/backend/tests/test_real_asr_to_cards.py \
+  code/web_mvp/backend/tests/test_approach_cards.py \
+  code/web_mvp/backend/tests/test_minutes.py \
+  code/web_mvp/backend/tests/test_real_llm_path.py \
+  code/web_mvp/backend/tests/test_metrics.py \
+  code/web_mvp/backend/tests/test_g3_g4_g5.py \
+  code/web_mvp/backend/tests/test_e2e_mainline.py \
+  code/web_mvp/backend/tests/test_shadow_trial.py
+```
+
+```text
+161 passed, 2 warnings
+```
+
+Workbench demo smoke：
+
+```bash
+node code/web_mvp/e2e/workbench_smoke.mjs
+```
+
+```text
+workbench smoke OK: 4 utterances, 9 suggestions, history/minutes/delete verified
+```
+
+质量检查：
+
+```bash
+git diff --check
+```
+
+```text
+passed with no output
+```
+
+影响：
+
+- demo/mock 能力仍可用于 UI 回归和示例，但不再污染生产端点 schema。
+- `backend_acceptance_enforcement` 前进一步，但仍不是完整 Go：fake recognizer factory、正式建议 evidence quote 输入、生产/demo router 物理隔离仍待处理。
+- `Real mic` 仍为 No-Go，`Production MVP` 仍为 No-Go。
+
+复审条件：
+
+- 后续若新增任何派生产物 API，必须默认接生产验收 gate；demo/test 绕过只能出现在 demo/dev-only 路由。
+- Gate C 通过前，不能把 demo 专用端点产物写成真实会议 Go evidence。
+
+## DEC-237：正式建议卡补齐 EvidenceSpan quote/timestamp/回跳
+
+日期：2026-07-08
+
+状态：Accepted / Implemented
+
+背景：
+
+- 原始产品要求每张建议卡必须能引用证据时间戳和原始文本片段。
+- 旧实现里，后端 LLM preview/card 主要携带 `evidence_span_ids` 和 `input_summary`，前端只显示 evidence id，例如 `asr_ev_asr_seg_001`。
+- 这会让正式建议看起来像 AI 文本卡片，而不是可复盘、可验证的会议证据。
+
+决策：
+
+- 后端 `_execution_previews_from_record()` 从 transcript final events 的 `payload.evidence_spans` 解析出 `evidence_spans`。
+- execution preview/run/card 新增 `evidence_spans` 和 `evidence_context`。
+- `llm_service.execute_candidate()` 使用 `evidence_context` 作为 LLM prompt 的证据上下文，并把 `evidence_spans` 写入 `SuggestionCardV1`。
+- Workbench 正式建议卡展示 evidence quote 和时间窗；点击证据后定位并高亮对应 transcript utterance。
+
+验证：
+
+Focused TDD：
+
+```bash
+PYTHONPATH=code/web_mvp/backend:code/core LLM_GATEWAY_BASE_URL= LLM_GATEWAY_API_KEY= pytest -q \
+  code/web_mvp/backend/tests/test_app.py::test_asr_live_llm_execution_previews_endpoint_returns_preview_queue_without_calling_llm \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_formal_suggestions_render_evidence_quotes_and_clickback
+```
+
+```text
+both focused tests passed
+```
+
+核心回归：
+
+```bash
+PYTHONPATH=code/web_mvp/backend:code/core LLM_GATEWAY_BASE_URL= LLM_GATEWAY_API_KEY= pytest -q \
+  code/web_mvp/backend/tests/test_app.py \
+  code/web_mvp/backend/tests/test_asr_stream.py \
+  code/web_mvp/backend/tests/test_workbench.py \
+  code/web_mvp/backend/tests/test_file_convert.py \
+  code/web_mvp/backend/tests/test_real_asr_to_cards.py \
+  code/web_mvp/backend/tests/test_approach_cards.py \
+  code/web_mvp/backend/tests/test_minutes.py \
+  code/web_mvp/backend/tests/test_llm_service.py \
+  code/web_mvp/backend/tests/test_real_llm_path.py \
+  code/web_mvp/backend/tests/test_metrics.py \
+  code/web_mvp/backend/tests/test_g3_g4_g5.py \
+  code/web_mvp/backend/tests/test_e2e_mainline.py \
+  code/web_mvp/backend/tests/test_shadow_trial.py
+```
+
+```text
+169 passed, 2 warnings
+```
+
+Workbench demo smoke：
+
+```bash
+node code/web_mvp/e2e/workbench_smoke.mjs
+```
+
+```text
+workbench smoke OK: 4 utterances, 9 suggestions, history/minutes/delete verified
+```
+
+质量检查：
+
+```bash
+git diff --check
+```
+
+```text
+passed with no output
+```
+
+影响：
+
+- `formal_card_evidence` 从 No-Go 改为结构性部分 Go。
+- 仍不能把 real mic 改成 Go：真实麦克风还没有有效输入和非空 ASR final。
+- approach/minutes 的 evidence quote 输入还没有同等结构化，后续仍需补。
+
+## DEC-238：生产派生端点拒绝 mock LLM provider
+
+日期：2026-07-08
+
+状态：Accepted / Implemented
+
+背景：
+
+- 三路多 Agent 全站审计后，当前结论收敛为：项目不是空壳，但真实麦克风完整产品链路仍 No-Go；file lane 是唯一可信 Go 子链路；demo/file/real mic/degraded 仍有混淆风险。
+- 后端此前已经阻断 mock ASR、local-event、degraded 和空 ASR 进入生产派生端点。
+- 但 LLM provider 只在 metadata 中暴露 `is_mock`，生产 `/live/asr/sessions/{id}/llm-execution-runs|approach-cards|minutes|minutes.json` 没有阻断 `LLM_GATEWAY_IS_MOCK=true`。
+- 这会导致“合格 ASR session + mock LLM provider”生成看似正式的生产派生产物，影响 `backend_acceptance_enforcement` 的可信度。
+
+决策：
+
+- 生产派生端点读取 `LlmConfig` 后，如果 `config.is_mock=true`，统一返回 409。
+- demo 路由 `/live/asr/demo/sessions/*` 继续允许 mock LLM，用于 UI 回归和示例演示。
+- 该变更只收紧生产验收边界，不改变 demo/mock 演示能力。
+- 三路审计与后续执行计划落到 `docs/p0-fullstack-audit-and-mainline-execution-report-2026-07-08.md`，作为当前主线审计报告。
+
+验证：
+
+Focused TDD 先红后绿：
+
+```bash
+PYTHONPATH=code/web_mvp/backend:code/core LLM_GATEWAY_BASE_URL= LLM_GATEWAY_API_KEY= pytest -q \
+  code/web_mvp/backend/tests/test_app.py::test_asr_live_production_derivation_endpoints_reject_mock_llm_provider
+```
+
+```text
+1 passed, 2 warnings
+```
+
+相关边界回归：
+
+```bash
+PYTHONPATH=code/web_mvp/backend:code/core LLM_GATEWAY_BASE_URL= LLM_GATEWAY_API_KEY= pytest -q \
+  code/web_mvp/backend/tests/test_app.py::test_asr_live_production_derivation_endpoints_reject_mock_llm_provider \
+  code/web_mvp/backend/tests/test_app.py::test_demo_derivation_endpoint_can_execute_mock_session_without_public_bypass_field \
+  code/web_mvp/backend/tests/test_app.py::test_asr_live_llm_execution_runs_enabled_rejects_mock_session_without_explicit_demo_allowance \
+  code/web_mvp/backend/tests/test_app.py::test_asr_live_enabled_approach_and_minutes_reject_mock_session_without_explicit_demo_allowance
+```
+
+```text
+4 passed, 2 warnings
+```
+
+影响：
+
+- `backend_acceptance_enforcement` 更接近 Go。
+- demo/mock 仍只能算 demo，不计入真实验收。
+- Real mic 仍 No-Go；Production MVP 仍 No-Go。
+
+## DEC-239：recognizer metadata 必须 fail closed，Workbench 开麦失败不得清空主视图
+
+日期：2026-07-08
+
+状态：Accepted / Planned for immediate TDD execution
+
+背景：
+
+- 用户反馈 Workbench 开麦后“文字又没有了”，并质疑前后端是否偏离原始产品主线。
+- 前端 Agent 审计确认：开麦会立即创建 `rec_*` 新 session 并调用 `prepareNewSession()` 清空当前主视图；若真实 ASR 没有非空 final，停止后空 snapshot 会让用户看到“未识别到有效语音”，形成“文字没了”的体验。
+- 后端 Agent 审计确认：`asr_stream._recognizer_provider_metadata()` 对缺少 `provider/is_mock/fallback_used/provider_mode` 的 recognizer 默认推导为 `provider_mode=real`、`is_mock=false`、`fallback_used=false`，可能让测试/自定义 fake recognizer 被 production acceptance gate 误认为 real ASR。
+- 运行态复核发现 8765 旧孤儿进程，已重新拉起受控 screen；demo Workbench smoke 通过，但只算 demo/mock UI 回归。
+
+决策：
+
+- Production-eligible recognizer 必须显式声明 provider metadata。
+- recognizer metadata 缺失时必须 fail closed，不能默认当作 real ASR。
+- Workbench 开麦流程要区分“录音草稿”和“已保存会议文字”；真实开麦失败或空 final 时，不能清空上一场已可见会议文字。
+- 下一轮执行顺序：先 TDD 修后端 metadata fail-closed，再 TDD 修 Workbench 开麦不丢字，之后再跑真实麦克风 Gate A/B/C。
+
+当前状态：
+
+```text
+Demo/mock: Go for demo only
+File lane: Go
+Real mic: No-Go
+Production MVP: No-Go
+```
+
+## DEC-240：缺失 metadata 的 recognizer 默认不再算 real ASR
+
+日期：2026-07-08
+
+状态：Accepted / Implemented
+
+背景：
+
+- 后端审计发现 `_recognizer_provider_metadata()` 会把缺少 metadata 的 recognizer 默认推导为 real。
+- 这使测试或未来自定义 recognizer 可以在未声明 provider 真实性的情况下进入 production ASR session。
+
+决策：
+
+- Production-eligible recognizer 必须显式声明 `provider`、`provider_mode`、`is_mock`、`fallback_used`。
+- 任一字段缺失时，metadata fail closed：`provider_mode=unknown`、`is_mock=true`、`fallback_used=true`、`degradation_reasons` 包含 `recognizer_metadata_missing`。
+- 默认生产 WebSocket 因该 metadata 返回 `provider_error`，不持久化 session。
+- 测试里需要证明连接线的 fake recognizer 必须显式标为 `test_contract_real_asr`，不能再依赖默认真实推导。
+
+验证：
+
+```bash
+PYTHONPATH=code/web_mvp/backend:code/core LLM_GATEWAY_BASE_URL= LLM_GATEWAY_API_KEY= pytest -q \
+  code/web_mvp/backend/tests/test_asr_stream.py \
+  code/web_mvp/backend/tests/test_real_asr_to_cards.py
+```
+
+```text
+8 passed, 2 warnings
+```
+
+影响：
+
+- `backend_acceptance_enforcement` 更接近 Go。
+- 真实麦克风仍需 Gate A/B/C 证明。
+- Production MVP 仍 No-Go。
+
+## DEC-241：Workbench 开麦先保留上一场文字，收到新文字后再切换主视图
+
+日期：2026-07-08
+
+状态：Accepted / Implemented
+
+背景：
+
+- 用户反馈“打开麦克风看看，文字又没有了”。
+- 前端审计确认：开始录音时旧逻辑立即创建 `rec_*` session 并调用 `prepareNewSession()` 清空主视图；真实 ASR 如果没有非空 final，页面会显示“未识别到有效语音”，造成用户感知为文字丢失。
+
+决策：
+
+- Workbench 增加录音草稿状态，不再在有上一场可读会议时立即清空主视图。
+- 只有收到新会议第一条非空 partial/final/transcript_final 时，才认领主视图并切到新会议文字。
+- provider_error、空 final、空 snapshot 优先恢复上一场会议。
+- 该修复只改善前端真实/失败态体验，不把真实麦克风改判为 Go。
+
+验证：
+
+```bash
+PYTHONPATH=code/web_mvp/backend:code/core LLM_GATEWAY_BASE_URL= LLM_GATEWAY_API_KEY= pytest -q \
+  code/web_mvp/backend/tests/test_workbench.py
+```
+
+```text
+41 passed, 2 warnings
+```
+
+影响：
+
+- `workbench_real_demo_separation` 更接近 Go。
+- Real mic 仍 No-Go；还需要 Gate A/B/C 证据。
+
+## DEC-242：真实页面麦克风 Gate A 增加浏览器侧健康证据
+
+日期：2026-07-08
+
+状态：Accepted / Implemented
+
+背景：
+
+- 系统级 `ffmpeg avfoundation` Gate A 复测显示 `rms=0.0 / peak=0.0 / active_sample_ratio=0.0`，但用户看到的问题发生在 Workbench 页面。
+- 只靠系统录音健康检查无法区分“页面没有采到声音”还是“页面采到了但 ASR 没转出文字”。
+- 浏览器自动化隔离环境无法稳定读取挂在 `window` 上的自定义对象，因此健康证据需要同时落到 DOM dataset 和 JSON console log。
+
+决策：
+
+- Workbench 在真实麦克风路径中累计浏览器侧样本数、chunk 数、RMS、peak、active sample ratio。
+- 停止录音或 WebSocket 关闭时发布 `workbench_browser_mic_health`。
+- 该报告明确声明 `raw_audio_uploaded=false`、`remote_asr_called=false`、`llm_called=false`。
+- 报告同步写入 `document.body.dataset.browserMicHealth`，并以 JSON 字符串写入 console，便于自动化取证。
+- 该证据只用于 Gate A，不把真实麦克风改判为 Go。
+
+真实页面复测：
+
+```text
+URL: http://127.0.0.1:8765/workbench?reload=browser-health2
+script: /static/workbench.js?v=20260708-p0-browser-health2
+session_id=rec_mrbtjiwq
+sample_count=163840
+chunk_count=35
+rms=0
+peak=0
+active_sample_ratio=0
+health_status=blocked_audio_too_quiet
+raw_audio_uploaded=false
+remote_asr_called=false
+llm_called=false
+```
+
+后端同 session 结果：
+
+```text
+provider=sherpa_onnx_realtime
+provider_mode=real
+is_mock=false
+asr_fallback_used=false
+degradation_reasons=[asr_final_empty]
+final_count=0
+non_empty_final_count=0
+acceptance_eligible=false
+acceptance_blockers=[degraded_asr_session, asr_final_missing, asr_transcript_empty]
+```
+
+证据文件：
+
+```text
+artifacts/tmp/audio_health/workbench-browser-mic-health-20260708-163131.json
+```
+
+验证：
+
+```text
+test_workbench.py::test_workbench_tracks_browser_mic_health_for_gate_a_evidence = passed
+Workbench 页面真实开麦 10 秒 -> 停止 -> DOM dataset/console/session snapshot 均可取证
+```
+
+影响：
+
+- `real_mic_gate_a` 仍为 No-Go。
+- 当前问题已缩小到 macOS/浏览器输入路径没有有效声音，而不是 LLM、建议卡或页面按钮主链路未接。
+- 下一步不继续 Gate B/C；必须先让浏览器侧 `rms/peak/active_sample_ratio` 非 0，或改用系统音频/虚拟声卡输入方案。
+
+## DEC-243：真实麦克风暂停，新增 no-mic simulated realtime 主链路
+
+日期：2026-07-08
+
+状态：Accepted / In progress
+
+背景：
+
+- 用户当前不方便配合真实麦克风收音。
+- 最新 Workbench 浏览器麦克风健康证据仍为 `rms=0 / peak=0 / active_sample_ratio=0 / blocked_audio_too_quiet`。
+- 继续反复跑真实麦克风会重复 Gate A No-Go，不能推进产品主业务链路。
+
+决策：
+
+- 暂停真实麦克风 Gate A/B/C 自动推进，等待用户后续可配合。
+- 新增 `simulated_realtime_wav` lane：使用仓库内合成/公开授权 WAV，按实时 chunk 发送到 `/live/asr/stream/ws/{session_id}`。
+- 该 lane 必须进入同一套 ASR live session、建议卡、方案卡、纪要、Workbench 同 session、历史/删除和 evidence bundle 流程。
+- 该 lane 必须明确 `counts_as_real_mic_go_evidence=false`，不能把模拟音频伪装为真实麦克风。
+
+执行计划：
+
+- 当前执行文档：`docs/p0-no-mic-simulated-realtime-mainline-plan-2026-07-08.md`。
+
+影响：
+
+- `File lane` 仍为 Go。
+- `Simulated realtime wav lane` 进入 P0 当前执行。
+- `Real mic` 仍为 No-Go / deferred until user can cooperate。
+- `Production MVP` 仍为 No-Go。
+
+## DEC-244：no-mic simulated realtime 主链路自测 Go
+
+日期：2026-07-08
+
+状态：Accepted / Implemented
+
+背景：
+
+- DEC-243 后，当前目标从真实麦克风 Gate A/B/C 转为先跑通无麦克风主业务链路。
+- 需要证明“音频按实时 chunk 输入 WebSocket 后，是否能进入同一套 ASR live session、建议、方案、纪要、Workbench、历史和删除”。
+
+实现：
+
+- `tools/mainline_evidence_bundle_runner.py` 新增 `--lane simulated-realtime` 和 `run_simulated_realtime_lane_bundle(...)`。
+- runner 复用 `mic_capture.pcm_chunks_from_wav()`，通过 FastAPI `TestClient.websocket_connect()` 发送 WAV chunk 和 `END`。
+- `/live/asr/stream/ws/{session_id}` 支持 `audio_source=simulated_realtime_wav`，持久化 session 时写入 `audio_source/input_source`。
+- `event_source.input_source=simulated_realtime_wav` 可进入 no-mic lab lane 的 production derivation endpoints，但 evidence bundle 必须声明 `counts_as_real_mic_go_evidence=false`。
+- Workbench 新增 `模拟实时` 来源标签，避免把 sherpa/funasr provider 下的模拟音频误标为真实麦克风。
+
+自测结果：
+
+```text
+artifact_root=artifacts/tmp/acceptance/p0-simulated-realtime-20260708-01
+verdict=go
+audio_source=simulated_realtime_wav
+counts_as_real_mic_go_evidence=false
+asr_provider=sherpa_onnx_realtime
+asr_provider_mode=real
+asr_fallback_used=false
+llm_provider=real_gateway
+ui_coverage=headless_chrome
+transcript_char_count=68
+final_segment_count=1
+suggestion_card_count=3
+approach_card_count=3
+minutes_char_count=407
+all_cards_have_evidence=true
+workbench_same_session_visible=true
+frontend_utterance_count=1
+frontend_card_count=6
+frontend_minutes_visible=true
+delete_verified=true
+degradation_reasons=[]
+```
+
+验证：
+
+```text
+focused TDD = 3 passed
+related backend/mainline regression = 180 passed, 2 warnings
+node code/web_mvp/e2e/workbench_smoke.mjs = passed
+```
+
+影响：
+
+- `Simulated realtime wav lane` 改为 Go。
+- `Real mic` 仍为 No-Go / deferred until user can cooperate。
+- `Production MVP` 仍为 No-Go。
+- 后续应把 no-mic lane 作为日常回归，并继续补“会中准实时建议自动调度”和 Workbench UI 简化。
+
+## DEC-260：Packaged Mac WebView runtime/backend API probe 作为 P2 v1 桌面可用性证据
+
+日期：2026-07-09
+
+状态：Accepted / Implemented
+
+背景：
+
+- P0/P1 Web 主链路已经有 release acceptance GO 证据，但 P2 Mac packaged `.app` 仍缺包内 Workbench 可用性证据。
+- macOS 当前阻止 `screencapture` 和 Accessibility/System Events 窗口自动化，导致截图/DOM 外部取证不可用。
+- 旧 packaged frontend probe 写到了 `code/artifacts/tmp/...`，根因是 `CARGO_MANIFEST_DIR=code/desktop_tauri/src-tauri` 时只向上爬两层，得到的是 `meeting-copilot/code` 而不是仓库根。
+- 旧 probe 还只写单个 `latest.json`，Rust page-load、HTML inline probe、Workbench runtime probe 会互相覆盖，不能稳定证明 `workbench.js` 和后端 API 可用。
+
+决策：
+
+- P2 v1 Mac 桌面路线继续采用 Tauri packaged WebView + 本地 Web MVP 后端；Rust 原生 PCM 麦克风采集不作为 v1 阻塞项，保留为 P2+/P3。
+- packaged 可用性证据优先走 Tauri 内部 runtime probe，而不是依赖 macOS 屏幕录制权限。
+- probe artifact 统一落在仓库根 `artifacts/tmp/desktop_frontend_probe_runtime/`，并拆分为：
+  - `latest-page-load.json`
+  - `latest-inline-dom.json`
+  - `latest-workbench-runtime.json`
+  - `latest-backend-api.json`
+- Workbench 在 Tauri packaged 环境加载相对 `workbench.js`，Web 服务环境加载 `/static/workbench.js`。
+- Workbench bootstrap 必须先等待 `runtime_get_status` 设置 `apiBaseUrl=http://127.0.0.1:8765`，再请求本地后端。
+- 后端允许 `Origin: tauri://localhost` 的本地 CORS preflight，供 packaged WebView 调用本地 `/health`、`/audio/check`、`/providers/health`、`/live/asr/sessions` 等 API。
+
+证据：
+
+```text
+artifact=artifacts/tmp/desktop_tauri_current_run/packaged-webview-runtime-probe-20260709-backend-api/evidence.json
+status=go_packaged_webview_runtime_probe
+counts_as_packaged_runtime_probe_evidence=true
+counts_as_packaged_dom_evidence=true
+counts_as_packaged_backend_api_evidence=true
+counts_as_packaged_screenshot_evidence=false
+counts_as_packaged_mainline_evidence=false
+packaged_workbench_loaded=true
+packaged_inline_dom_selectors_present=true
+packaged_workbench_runtime_connected=true
+packaged_backend_api_connected=true
+desktop_api_base_url=http://127.0.0.1:8765
+latest-backend-api.health_ok=true
+latest-backend-api.sessions_loaded=true
+latest-backend-api.errors=[]
+```
+
+验证：
+
+```text
+focused no-cost regression=187 passed, 2 warnings
+cargo test desktop_frontend_probe_runtime=3 passed
+cargo check=passed
+node --check workbench.js=passed
+cargo tauri build --bundles app=passed
+codesign --verify --deep --strict=passed
+development DMG=artifacts/tmp/desktop_dmg_skip_finder_current_20260709/Meeting Copilot_0.1.0_aarch64.skip-finder.signed-local.dmg
+dmg_sha256=187741d19d4d35b5d75cfe2b03afc2ee52e5c1eb027455fd6b5073404e4c41d6
+```
+
+边界：
+
+- 该决策证明 packaged WebView DOM/runtime 和本地后端 API 连接可用。
+- 该决策仍不证明 packaged app 内完整实时会议主链路；`packaged_same_chain_realtime_meeting_flow_not_verified` 仍是 P2 blocker。
+- 该决策仍不完成 Developer ID 签名、公证、Gatekeeper，也不完成 Windows 实机。
+- 该决策不访问麦克风、不读取真实音频、不调用远程 ASR/LLM、不读取 `.env` 或 `configs/local`。
+
+## DEC-267：实时会议原始录音必须作为本地复盘资产保存
+
+日期：2026-07-09
+
+状态：Accepted / Implemented
+
+背景：
+
+- 产品初心不是只做实时转写，而是支持会中辅助和会后复盘。
+- 会后复盘必须能回听原始录音，用于校验 ASR 误识别、补录遗漏上下文、复核 AI 建议是否基于真实发言。
+- 旧 Web MVP 实时麦克风链路已经持久化 live ASR session JSON、转写事件、建议卡、方案卡和纪要，但实时麦克风 WebSocket 流尚未把原始音频文件纳入正式 session 仓库管理。
+- 旧删除接口曾标记 `audio=not_tracked_by_live_session_repo`，不能宣称实时会议录音已经完整保存和可删除。
+
+决策：
+
+- 实时会议原始录音保存列为 P0 产品要求，不再作为 P2+/可选能力处理。
+- 默认策略是本地保存，不上传原始音频；远程 LLM 只接收必要文字上下文，不接收原始录音。
+- 每个实时会议 session 必须关联一个本地音频资产记录，至少包含：`audio_asset_id`、相对路径、格式、采样率、声道数、时长、文件大小、sha256、创建时间、来源类型、保存策略。
+- 首版格式优先保存为本地 WAV/PCM 容器，保证可回放、可重新跑 ASR、可做质量诊断；后续可以增加压缩归档格式。
+- UI 必须展示录音保存状态，并提供回放、导出和删除入口。
+- 删除会话时必须同步清理转写、建议、纪要和关联录音文件；如果音频删除失败，接口必须返回可追溯错误，不允许静默成功。
+
+本轮实现：
+
+- 新增 `meeting_copilot_web_mvp/audio_assets.py`，负责实时 float32 PCM -> 本地 WAV、上传音频资产保存、sha256/大小/时长/格式元数据、路径越界保护和删除。
+- `browser_live_mic` WebSocket 流会同步写入本地 WAV，并把 `record["audio"]` 关联到同一 live ASR session。
+- 导入录音文件会保存原始上传音频为本地 audio asset，不再只临时转写后丢弃。
+- `/live/asr/sessions/{session_id}/events` 返回 `audio` 元数据；`/live/asr/sessions` 返回 `has_audio`。
+- 新增 `/live/asr/sessions/{session_id}/audio.wav` 导出接口。
+- 删除 live session 时先删除关联录音资产，再删除 session record；旧 `/sessions/{session_id}` 兼容删除路径也会清理音频。
+- Workbench 增加“导出录音”按钮，历史列表显示“已保存录音”，隐私文案说明删除会同时删除录音。
+
+验证：
+
+```text
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q \
+  code/web_mvp/backend/tests/test_asr_stream.py::test_asr_stream_browser_live_mic_source_is_acceptance_lane \
+  code/web_mvp/backend/tests/test_file_convert.py::test_file_converted_session_saves_uploaded_recording_for_review \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_has_recording_export_buttons_and_download_handlers \
+  code/web_mvp/backend/tests/test_app.py::test_delete_asr_live_session_reports_exact_delete_scope_without_overclaiming
+
+4 passed, 2 warnings
+```
+
+剩余边界：
+
+- 尚未对 20-60 分钟真实长会议做录音文件大小、磁盘占用和长时写入 soak。
+- 尚未做真实多人自然会议人工复盘验收。
+- 首版只保证本地保存和导出，不做云端同步。
+
+后续实现边界：
+
+- 不把原始音频提交进 git。
+- 不默认上传原始音频到远端。
+- 不读取用户未选择的私有音频文件。
+- 测试和证据文件中的音频路径必须脱敏或限制在本地 runtime/artifacts 目录。
+
+## DEC-268：真实长录音通过不等于实时建议生产可用
+
+日期：2026-07-09
+
+状态：Accepted
+
+背景：
+
+- 用户要求在当前外部环境有声音时执行长会议录音，验证真实浏览器麦克风主链路。
+- 本轮执行 300 秒可见 Chrome + `getUserMedia` 真实麦克风录音，使用 no-cost deterministic 派生路径避免远程中转站费用。
+- 证据显示录音链路通过：`health_status=audio_capture_health_passed`、`duration_seconds=299.776`、`audio_file_size_bytes=9592876`、`audio_export_http_status=200`、`audio_sha256_matches_session=true`。
+- 但 ASR 转写内容来自非技术会议外部声音，semantic quality gate 返回 `blocked`，`acceptance_eligible=false`，blockers 包含 `asr_semantic_quality_blocked` 和 `degraded_asr_session`。
+- no-cost deterministic 派生仍能产生示例 suggestion/approach/minutes，用于验证同一条 UI/数据链路，但这些卡片不应被理解为基于真实技术会议语义的生产建议。
+
+决策：
+
+- “真实麦克风 5 分钟录音保存/导出通过”和“实时技术会议建议生产可用”必须分开验收。
+- 当 `asr_semantic_quality.status=blocked` 或 `acceptance_eligible=false` 时，任何 no-cost/demo/deterministic 卡片只能算链路证据，不算产品价值 Go 证据。
+- 后续 UI/报告必须显式标记这种状态，避免用户把演示建议误认为正式会议建议。
+- 正式 Go evidence 必须来自清晰中文技术会议内容，并满足 `ASR final/revision -> EvidenceSpan -> suggestion card -> minutes/export/delete` 全链路。
+
+本轮证据：
+
+```text
+artifact=artifacts/tmp/browser_live_mic/long-real-mic-20260709-213403/
+session_id=rec_mrdjspjy
+input_mode=real_browser_mic
+record_seconds=300
+provider=sherpa_onnx_realtime
+provider_mode=real
+audio_capture=passed
+audio_export=passed
+semantic_quality=blocked
+production_llm_called=false
+counts_as_production_llm_evidence=false
+```
+
+后续：
+
+- 对 no-cost/demo 卡片增加更强的降级标识或抑制策略，防止 ASR blocked 时展示看起来像正式建议的内容。
+- 使用清晰中文技术会议音频再跑真实建议验收。
+- 20-60 分钟 soak 仍未完成；5 分钟只算 longer-than-smoke 录音写入验证。
+
+## DEC-270：中文会议识别优化第一阶段先修质量门禁和降级派生
+
+日期：2026-07-09
+
+状态：Accepted / Implemented
+
+背景：
+
+- 用户确认“开始中文优化会议识别优化”，并关心当前识别效果是否偏差。
+- 上一轮 5 分钟真实麦克风长录音证明录音保存/导出链路可用，但外部环境声被识别成非技术会议内容，semantic quality gate 返回 blocked。
+- 当前首要风险不是“没有卡片”，而是 no-cost/demo 自测路径在 ASR blocked 时仍可能生成看似正式的建议、方案和纪要，误导用户以为产品真的理解了会议。
+- 中文技术会议词表此前偏向灰度、回滚、错误率、SLO/P99，对后端会议常见的数据库、Redis、Kafka、缓存、P95、限流、幂等等召回不足。
+
+决策：
+
+- 第一阶段不默认引入额外收费 ASR；仍保持本地/免费优先。
+- 对真实或准真实输入 session，如果 `asr_semantic_quality_blocked`，即使走 no-cost deterministic 自测路径，也不再持久化正式 `suggestion_cards`、`approach_cards` 或 `minutes`。
+- 后端返回 `execution_boundary=demo_no_cost_quality_blocked`、`derivation_blocked=true`、`degraded=true`、`acceptance_blockers` 和明确中文提示，作为前端可追溯状态。
+- Workbench 遇到 `derivation_blocked` 时显示“识别语义质量不足，先不生成正式建议”，不再弹出“生成成功/复盘已生成”。
+- 扩充 `asr_semantic_quality` 中文技术词表，增加 `data_infra` 组以及 Redis、Kafka、数据库、缓存、连接池、P95、SLA、QPS、限流、幂等、排期、值班等常见技术会议词。
+
+验证：
+
+```text
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q code/web_mvp/backend/tests/test_packaged_no_cost_demo_derivation.py
+3 passed, 2 warnings
+
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q code/web_mvp/backend/tests/test_workbench.py::test_workbench_handles_quality_blocked_demo_derivation_without_success_copy
+1 passed, 2 warnings
+
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q code/web_mvp/backend/tests/test_asr_semantic_quality.py
+5 passed, 1 warning
+
+node --check code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js
+passed
+```
+
+边界：
+
+- 该阶段提升的是中文技术会议语义门禁和降级派生可信度，不等于更换声学 ASR 模型。
+- 仍需下一阶段对本地实时 ASR 的 VAD/分段/final 频率和 provider bake-off 做优化。
+- 仍不默认调用远程收费 ASR；远程 provider 只能作为显式 bake-off 或用户开启的高准确模式。
+
+## DEC-271：中文长会议停止后必须按句切成可复盘 final
+
+日期：2026-07-09
+
+状态：Superseded by DEC-286
+
+背景：
+
+- 真实麦克风长录音中，后端会在 `END` 后把累积 finals 做一次 L2/L3 修正并持久化为 `corrected_full`。
+- 旧行为会把数分钟中文会议压成一条超长 `transcript_final`，导致历史记录只显示 1 条文字，EvidenceSpan 粒度过粗，建议卡证据绑定和会后复盘都很难使用。
+- 这不是完整的实时 VAD/endpoint 优化，但它能先解决停止后复盘和证据粒度问题，并为后续 provider bake-off 提供更稳定的评价单元。
+
+决策：
+
+- 历史决策：`corrected_full` 不再无条件作为单条 final 落库。
+- 停止录音后，将修正后的中文长文本按中文/英文句末标点切句；单句过长时按逗号/顿号和最大长度继续切分。
+- 多段输出使用 `corrected_full_001`、`corrected_full_002` 等稳定 segment id。
+- 总时长按文本长度比例分配到各段，保证 `start_ms/end_ms/received_at_ms` 单调递增。
+- 短文本仍保留单条 `corrected_full`，避免不必要 churn。
+
+2026-07-10 复审结论：该策略会在 END 后替换原始 realtime final，可能导致实时建议/执行预览引用的 evidence id 消失。DEC-286 修订为“原始 final 保留，END 后修正作为 revision 追加”。
+
+验证：
+
+```text
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q \
+  code/web_mvp/backend/tests/test_asr_stream.py::test_asr_stream_splits_long_corrected_chinese_meeting_final_for_review_granularity
+1 passed, 2 warnings
+
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q code/web_mvp/backend/tests/test_asr_stream.py
+12 passed, 2 warnings
+```
+
+边界：
+
+- 该阶段改善的是停止后持久化的 final 粒度，不代表 ASR worker 已经在会议中实时输出更多 endpoint final。
+- 下一步仍需要在实时 worker/handler 层做 VAD、静音切句、长句强制 endpoint 或 provider bake-off。
+
+## DEC-272：稳定 partial 遇到静音边界可提升为实时 final
+
+日期：2026-07-09
+
+状态：Accepted / Implemented
+
+背景：
+
+- 中文会议实时建议需要会议中持续产生可用 `transcript_final`，不能长期只显示 partial 或等到 `END` 后才落库。
+- 现有 sherpa/FunASR worker 的 endpoint 取决于底层模型；在外放/环境声场景里可能长时间只有 partial 或停止后才有最终文本。
+- 已有 DEC-271 解决了停止后的长文本复盘粒度，但还没有解决会中实时 final 频率。
+
+决策：
+
+- 在 WebSocket handler 层增加轻量本地 VAD endpoint：计算浏览器上传的 float32 PCM RMS。
+- 当识别器已有稳定非空 partial，且后续连续静音达到阈值时，服务端生成 `vad_endpoint_001` 等实时 final。
+- 该 final 会立即发送给前端，并持久化到同一 live ASR session，使自动建议可以在会议中继续工作。
+- 空 partial、短文本、重复文本不会触发；真实 recognizer 后续返回同一文本 final 时会去重，避免重复落库。
+- 该策略不调用远程 ASR/LLM，不增加费用，只使用本地 PCM 能量和已有 partial 文本。
+
+实现参数：
+
+```text
+VAD_SILENCE_RMS_THRESHOLD=0.003
+VAD_ENDPOINT_SILENCE_MS=900
+VAD_MIN_FINAL_TEXT_CHARS=6
+endpoint_source=server_vad_stable_partial
+```
+
+验证：
+
+```text
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q \
+  code/web_mvp/backend/tests/test_asr_stream.py::test_asr_stream_promotes_stable_partial_to_realtime_final_after_silence
+1 passed, 2 warnings
+
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q code/web_mvp/backend/tests/test_asr_stream.py
+13 passed, 2 warnings
+```
+
+边界：
+
+- 该方案提升的是“有稳定 partial 后的 endpoint 落库”，不是替代底层 ASR 模型。
+- 真实嘈杂会议仍需要后续 provider bake-off、输入源优化和真机长会验证。
+
+## DEC-273：中文技术会议真实浏览器麦克风 TTS 验证与术语修正
+
+日期：2026-07-09
+
+状态：Accepted / Implemented
+
+背景：
+
+- 用户要求继续推进中文会议识别优化，重点不是泛泛评估，而是让“实时会议文字 + 实时建议”主链路逐步可用。
+- 2026-07-09 的 5 分钟真实麦克风长录音证明录音保存/导出链路可用，但外部环境声不是清晰技术会议，语义质量 gate blocked。
+- 本轮使用可见 Chrome 真实浏览器麦克风，同时通过 macOS `say -v Tingting` 外放清晰中文技术会议内容，以 no-cost deterministic 模式验证本地 ASR、会话持久化、录音导出和页面整理链路。
+
+实测证据：
+
+```text
+artifact=artifacts/tmp/browser_live_mic/tech-vad-nocost-20260709-223621/
+session_id=rec_mrdm0ttx
+input_mode=real_browser_mic
+provider=sherpa_onnx_realtime
+provider_mode=real
+is_mock=false
+asr_fallback_used=false
+health_status=audio_capture_health_passed
+chunk_count=200
+final_count=5
+semantic_quality.status=passed
+technical_entity_hit_count=29
+technical_group_hit_count=6
+acceptance_eligible=true
+audio_export_http_status=200
+audio_file_magic=RIFF
+audio_sha256_matches_session=true
+derivation_mode=no_cost_deterministic
+llm_called=false
+counts_as_production_llm_evidence=false
+```
+
+复测证据：
+
+```text
+artifact=artifacts/tmp/browser_live_mic/tech-normalizer-nocost-20260709-224324/
+session_id=rec_mrdm9vc5
+input_mode=real_browser_mic
+provider=sherpa_onnx_realtime
+provider_mode=real
+is_mock=false
+asr_fallback_used=false
+health_status=audio_capture_health_passed
+chunk_count=200
+final_count=3
+semantic_quality.status=passed
+technical_entity_hit_count=30
+technical_group_hit_count=6
+acceptance_eligible=true
+audio_export_http_status=200
+audio_file_magic=RIFF
+audio_sha256_matches_session=true
+derivation_mode=no_cost_deterministic
+llm_called=false
+counts_as_production_llm_evidence=false
+```
+
+决策：
+
+- 继续保持默认本地/免费 ASR，不在该阶段默认引入额外收费 ASR。
+- 把真实浏览器麦克风 TTS 暴露的中文技术会议误识加入 Web 实时链路的保守 normalizer：
+  - `P 九九/P 九五` -> `P99/P95`
+  - `SLO/owner` 被识别为 `<unk>` 或被吞掉时，在强上下文中恢复。
+  - `Redis/Kafka` 在“回滚后缓存穿透/王五今天处理消费堆积”上下文中恢复。
+  - `李四补监控看板`、`checkout-service 接口` 等本轮真实技术会议近似误识做精确片段修复。
+- Web normalizer 增加中文字符间空格折叠，修复 `监 控`、`观 察` 这类切段/拼接后常见断词。
+- 扩充 hotwords：`P95`、`SLO`、`owner`、`Kafka`、`Redis`。
+
+验证：
+
+```text
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q code/web_mvp/backend/tests/test_transcript_normalizer.py
+8 passed, 1 warning
+
+PYTHONPATH=code/web_mvp/backend:code/core python3 - <<'PY'
+...
+source_contains_unk=true
+normalized_contains_unk=false
+normalized_contains_cjk_split_spaces=false
+contains_checkout_service=true
+contains_redis=true
+contains_kafka=true
+contains_slo=true
+contains_owner=true
+PY
+```
+
+边界：
+
+- 本轮证明清晰中文技术会议外放 + 真实浏览器麦克风下，本地 sherpa ASR 可以保住主要技术语义，并能触发 no-cost 建议/方案/纪要链路。
+- 本轮不证明生产 LLM 建议质量，因为 no-cost deterministic 未调用远程 LLM。
+- 本轮也不证明真实多人会议已达标；仍需要自然多人会议、系统音频/麦克风输入源、长会 soak 和 provider bake-off。
+- 当前 `partial_count=0`、`vad_finals=0` 仍说明 sherpa 本身在这两轮没有持续输出 partial，实时性还需要继续优化或切换更合适的中文 provider。
+
+## DEC-274：FunASR 可进入 bake-off，但当前不替换默认 sherpa
+
+日期：2026-07-09
+
+状态：Accepted
+
+背景：
+
+- DEC-273 的真实 browser mic TTS 结果显示 sherpa 在清晰中文技术会议中能保住主要技术语义，但 partial/final 实时粒度仍不足。
+- FunASR 本地 venv 和 modelscope 缓存中已有 `speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online`，可通过离线 `local_model_dir` 路径运行 file-replayed streaming，不需要远程 ASR。
+- 用户要求尽量不增加额外收费项目，因此 provider bake-off 必须优先使用本地模型，且要记录是否下载/调用远程服务。
+
+探针证据：
+
+```text
+source_audio=artifacts/tmp/browser_live_mic/tech-normalizer-nocost-20260709-224324/exported-audio.wav
+provider=funasr
+mode=file_replayed_streaming_events
+model_id=paraformer-zh-streaming
+model_resolution=local_model_dir
+model_download_status=not_performed
+safe_to_download_models=false
+hotword_status=enabled
+hotword_count=18
+audio_duration_seconds=59.904
+latency_ms=41925
+rtf=0.69987
+partial_event_count=69
+final_event_count=16
+semantic_quality.status=passed
+technical_entity_hit_count=26
+technical_group_hit_count=6
+```
+
+观察：
+
+- FunASR streaming 在同一段真实麦克风外放音频上能生成更多 partial/final，实时粒度明显好于本轮 sherpa 持久化结果。
+- 但文本质量当前不稳定，出现 `tap er`、`t九五`、`t一九`、`LO板`、`安尔` 等误识，且 CPU RTF 约 0.70，明显慢于 sherpa。
+- 语义质量 gate 仍通过，说明它能抓到一部分技术实体，但目前还不能证明比 sherpa 更适合作为默认实时 provider。
+
+决策：
+
+- 不把 FunASR 立即设为默认实时 ASR。
+- 下一轮 provider bake-off 可以继续比较：
+  - sherpa realtime：低延迟、语义基本可用，但 partial/final 粒度不足。
+  - FunASR streaming：partial/final 多，但当前中文技术词质量和 CPU 性能不足。
+  - FunASR/SenseVoice/Paraformer 其他本地配置：只在明确本地模型、无远程 ASR 费用、可记录模型来源时纳入。
+
+边界：
+
+- 该探针是 file-replayed streaming，不是直接替代 browser live realtime worker。
+- 不能把 `semantic_quality.status=passed` 单独当成 provider Go；还要看术语保真、实时延迟、final 稳定性、资源占用和真实多人会议表现。
+
+## DEC-275：Provider 结果汇总必须脚本化，默认 provider 不凭口头切换
+
+日期：2026-07-09
+
+状态：Accepted / Implemented
+
+背景：
+
+- DEC-273/DEC-274 已经有 sherpa 与 FunASR 的真实 browser mic 证据，但如果每次都靠人工读 JSON，很容易回到“反复评估但没有主线结论”的状态。
+- 用户要求所有重要决策可追溯，并避免把效果差的 provider 草率切成默认。
+- 当前需要一个低成本、可重复的汇总层：读取已经生成的 provider/session JSON，不调用模型、不读取密钥、不产生额外费用。
+
+决策：
+
+- 新增 `asr_bakeoff.provider_result_report`，输入多个 provider/session JSON，输出统一报告：
+  - 支持 `live_asr_session_events` 和普通 `provider_json`。
+  - 统一记录 provider、input kind、final/partial 数、语义质量、文本质量、latency/RTF、录音保存、远程 ASR/LLM/model download flags。
+  - 文本质量拆分 `raw_contains_unk` 与 `normalized_contains_unk`；默认风险判断使用归一化后文本，同时保留 raw 事实。
+  - 默认 provider 决策永远保守：在自然多人会议、长会和完整 provider bake-off 证明前，`replacement_allowed=false`。
+- 真实证据报告已生成：
+
+```text
+artifact=artifacts/tmp/browser_live_mic/tech-normalizer-nocost-20260709-224324/provider-result-report.json
+candidate_count=2
+semantic_pass_count=2
+remote_asr_call_count=0
+remote_llm_call_count=0
+model_download_count=0
+decision.recommended_action=keep_current_default
+decision.replacement_allowed=false
+decision.blockers=[
+  candidate_not_proven_on_natural_meeting,
+  funasr_has_quality_or_latency_risk
+]
+sherpa.risk_flags=[no_partial_events]
+funasr.risk_flags=[rtf_above_realtime_margin]
+```
+
+验证：
+
+```text
+PYTHONPATH=code/asr_bakeoff:code/web_mvp/backend:code/core pytest -q code/asr_bakeoff/tests/test_provider_result_report.py
+3 passed, 1 warning
+
+PYTHONPATH=code/asr_bakeoff:code/web_mvp/backend:code/core pytest -q code/asr_bakeoff/tests
+21 passed, 1 warning
+```
+
+边界：
+
+- 该报告脚本不负责启动真实 ASR provider；它只汇总既有结果。
+- 报告中的排名不是上线批准，只是当前证据下的候选排序。
+- 下一步仍要增加自然会议样本、系统音频/麦克风输入源样本、长会样本和更多本地中文 provider 配置。
+
+## DEC-276：Provider bake-off 必须量化实时性，而不只看语义通过
+
+日期：2026-07-09
+
+状态：Accepted / Implemented
+
+背景：
+
+- DEC-275 已经把 sherpa/FunASR 结果汇总成统一报告，但只看 `final_count/partial_count/semantic_status/RTF` 还不足以判断实时会议产品可用性。
+- 产品核心是“开会中实时展示文字并生成建议”，因此 provider 选择必须看首个 partial、首个 final、final 间隔和 final latency。
+- 上一轮真实证据显示 sherpa 语义过关但出 final 慢，FunASR final/partial 多但 CPU RTF 高；必须把这个差异结构化记录。
+
+决策：
+
+- `asr_bakeoff.provider_result_report` 增加 `realtime_metrics`：
+  - `first_partial_received_at_ms`
+  - `first_final_received_at_ms`
+  - `first_final_latency_ms`
+  - `final_latency_ms.count/p50_ms/p95_ms/max_ms`
+  - `final_interval_ms.count/p50_ms/p95_ms/max_ms`
+  - `timing_source`
+- 对 live ASR `session_events.json`，直接从 top-level `at_ms` 与 payload `start_ms/end_ms` 计算。
+- 对 provider JSON，自动寻找同目录 sibling events 文件，例如 `funasr-streaming-provider.json` -> `funasr-streaming-events.json`。
+- 新增实时性风险 flags：
+  - `first_final_after_10s`
+  - `final_interval_above_15s`
+  - `final_latency_above_5s`
+
+真实报告结论：
+
+```text
+artifact=artifacts/tmp/browser_live_mic/tech-normalizer-nocost-20260709-224324/provider-result-report.json
+
+sherpa_onnx_realtime:
+  final_count=3
+  partial_count=0
+  first_final_received_at_ms=27000
+  final_interval_ms.max_ms=27000
+  final_latency_ms.max_ms=0
+  risk_flags=[
+    no_partial_events,
+    first_final_after_10s,
+    final_interval_above_15s
+  ]
+
+funasr:
+  final_count=16
+  partial_count=69
+  first_partial_received_at_ms=6850
+  first_final_received_at_ms=7566
+  final_interval_ms.p95_ms=1978
+  final_latency_ms.p95_ms=4566
+  rtf=0.69987
+  risk_flags=[
+    rtf_above_realtime_margin
+  ]
+```
+
+验证：
+
+```text
+PYTHONPATH=code/asr_bakeoff:code/web_mvp/backend:code/core pytest -q \
+  code/asr_bakeoff/tests/test_provider_result_report.py::test_provider_result_report_records_realtime_metrics_from_live_and_sibling_event_files
+1 passed, 1 warning
+
+PYTHONPATH=code/asr_bakeoff:code/web_mvp/backend:code/core pytest -q code/asr_bakeoff/tests/test_provider_result_report.py
+4 passed, 1 warning
+```
+
+边界：
+
+- 这些是 file/live event timing 指标，不等于完整端到端 UI latency。
+- CPU/RSS、长会稳定性、多人自然会议仍未覆盖。
+- 当前报告更支持“继续保守默认 + 扩展 bake-off”，不支持立即切换默认 provider。
+
+## DEC-277：Provider bake-off 必须记录资源占用，FunASR 当前存在内存风险
+
+日期：2026-07-09
+
+状态：Accepted / Implemented
+
+背景：
+
+- 用户明确关心笔记本电脑本地运行，不能让 ASR provider 把 CPU/内存拖垮。
+- DEC-276 已经补了实时性指标，但还缺本机资源指标。
+- FunASR 在同一段 60 秒真实 browser mic 音频上实时切分更好，但 RTF 高；需要进一步确认 RSS/peak footprint。
+
+决策：
+
+- `asr_bakeoff.provider_result_report` 支持 sibling resource JSON：
+  - `funasr-streaming-provider.json` -> `funasr-streaming-resource.json`
+  - 支持 `max_rss_bytes/max_rss_mb`
+  - 支持 `peak_memory_footprint_bytes/peak_memory_footprint_mb`
+  - 支持 `wall_seconds/user_cpu_seconds/system_cpu_seconds/cpu_time_ratio`
+- 新增 summary 字段 `resource_measured_count`。
+- 新增资源风险 flags：
+  - `max_rss_above_2gb`
+  - `cpu_time_ratio_above_2`
+
+资源探针：
+
+```text
+source_audio=artifacts/tmp/browser_live_mic/tech-normalizer-nocost-20260709-224324/exported-audio.wav
+provider=funasr
+resource_artifact=artifacts/tmp/browser_live_mic/tech-normalizer-nocost-20260709-224324/funasr-streaming-resource.json
+provider_output=artifacts/tmp/browser_live_mic/tech-normalizer-nocost-20260709-224324/funasr-streaming-provider.resource-run.json
+events_output=artifacts/tmp/browser_live_mic/tech-normalizer-nocost-20260709-224324/funasr-streaming-events.resource-run.json
+time_log=artifacts/tmp/browser_live_mic/tech-normalizer-nocost-20260709-224324/funasr-streaming-resource-time.log
+command_exit_status=0
+model_download_status=not_performed
+provider_latency_ms=40566
+provider_rtf=0.677183
+wall_seconds=41.02
+user_cpu_seconds=20.23
+system_cpu_seconds=26.57
+cpu_time_ratio=1.140907
+max_rss_mb=2974.234375
+peak_memory_footprint_mb=2987.737396
+```
+
+真实报告结论：
+
+```text
+artifact=artifacts/tmp/browser_live_mic/tech-normalizer-nocost-20260709-224324/provider-result-report.json
+summary.resource_measured_count=1
+
+funasr:
+  rtf=0.69987
+  max_rss_mb=2974.234375
+  peak_memory_footprint_mb=2987.737396
+  risk_flags=[
+    rtf_above_realtime_margin,
+    max_rss_above_2gb
+  ]
+```
+
+验证：
+
+```text
+PYTHONPATH=code/asr_bakeoff:code/web_mvp/backend:code/core pytest -q \
+  code/asr_bakeoff/tests/test_provider_result_report.py::test_provider_result_report_records_resource_metrics_from_sibling_resource_file
+1 passed, 1 warning
+
+PYTHONPATH=code/asr_bakeoff:code/web_mvp/backend:code/core pytest -q code/asr_bakeoff/tests/test_provider_result_report.py
+5 passed, 1 warning
+```
+
+边界：
+
+- 这次只测了 FunASR resource；sherpa resource 仍未在同口径下测量。
+- RSS 约 3GB 对笔记本长期会议是明显风险，FunASR 不能直接作为默认 provider。
+- 仍需长会 20-60 分钟资源曲线、真实多人会议、端到端 UI latency 与更多本地模型配置。
+
+## DEC-278：中文识别现状不是生产级，优化优先级收束为 partial 实时展示和术语纠错
+
+日期：2026-07-09
+
+状态：Accepted
+
+背景：
+
+- 用户反馈当前识别效果可能较差，需要明确是否还有优化空间，以及是否偏离“实时会议 + 实时建议”的产品初心。
+- 当前项目已有真实浏览器麦克风/本机外放中文技术会议语料证据，但用户体验仍可能表现为“文字很久不出来”或“术语错很多”。
+- 需要避免继续无边界 provider 测评，把下一步收束到能改善主链路体验的动作。
+
+证据：
+
+```text
+artifact=artifacts/tmp/browser_live_mic/tech-normalizer-nocost-20260709-224324
+
+sherpa browser live run:
+  final_count=3
+  partial_count=0
+  first_final_received_at_ms≈27000
+  semantic_quality.status=passed
+  risk_flags=[no_partial_events, first_final_after_10s, final_interval_above_15s]
+
+sherpa same-audio resource probe:
+  provider_latency_ms=953
+  provider_rtf=0.015909
+  max_rss_mb=185.96875
+  peak_memory_footprint_mb=154.110085
+  partial_event_count=55 in file replay
+  final_event_count=3
+
+funasr same-audio probe:
+  partial_event_count=69
+  final_event_count=16
+  rtf≈0.68-0.70
+  max_rss_mb≈2974
+```
+
+决策：
+
+- 当前识别效果结论为“可抓主语义，但不达生产级实时会议体验”。
+- 不把 FunASR 切成默认 provider；它作为可选高资源 bake-off provider 保留。
+- 默认路线继续使用 sherpa 本地 ASR，但必须优先修：
+  - browser live 链路 partial 展示；
+  - 中文技术术语热词/纠错；
+  - `<unk>`、P95/P99、SLO、owner、Redis、Kafka、服务名等上下文恢复；
+  - 首字可见延迟和分段节奏。
+- 下一轮工作不再扩散到更多 provider，除非上述主链路优化被证明无效。
+
+边界：
+
+- 当前证据不等于真实多人自然会议生产验收。
+- 仍需 20-60 分钟长会、多人、噪声、说话人交错样本验证。
+- 远程 ASR 继续不默认启用，避免增加额外收费项目。
+
+## DEC-279：中文优化第一轮先修 partial 持久化和保守术语纠错
+
+日期：2026-07-09
+
+状态：Accepted / Implemented
+
+背景：
+
+- DEC-278 判断当前主要体验问题是“出字慢/partial 不稳定可见”和“中文技术术语错词”。
+- 真实/准真实 sherpa 证据显示：WebSocket 可能收到有效 partial，但 session/report 仍显示 `partial_count=0`，原因包括：
+  - 只在 final/VAD endpoint final 时持久化 session；
+  - finalize 阶段从 sidecar 队列 drain 出来的 partial 未进入 live session events；
+  - sidecar wrapper 把 worker 的 `segment_id` 覆盖成同一个 `stream_seg_<session>`，不利于区分多个 sherpa segment。
+- 用户要求不要继续陷入无边界评估，要把优化落到产品主链路。
+
+决策：
+
+- WebSocket raw `partial/final/revision` event 发给前端前统一带 `normalized_text`。
+- Workbench 前端显示转写时优先使用：
+  - `payload.normalized_text`
+  - `payload.text`
+  - `event.normalized_text`
+  - `event.text`
+- 非空 partial 进入 live session event 流，空 partial 不持久化。
+- finalize 阶段 drain 出来的 partial 也进入 live session event 流。
+- `event_source` 暴露 `partial_count`，用于报告和验收判断。
+- sherpa/FunASR sidecar 保留 worker 原始 `segment_id`，只加 session 前缀。
+- 中文技术术语纠错继续采用保守词典，不做高风险泛化规则。
+
+实现范围：
+
+```text
+code/web_mvp/backend/meeting_copilot_web_mvp/asr_stream.py
+code/web_mvp/backend/meeting_copilot_web_mvp/asr_live_events.py
+code/web_mvp/backend/meeting_copilot_web_mvp/app.py
+code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js
+configs/asr_terms.json
+code/web_mvp/backend/tests/test_asr_stream.py
+code/web_mvp/backend/tests/test_sherpa_sidecar.py
+code/web_mvp/backend/tests/test_transcript_normalizer.py
+code/web_mvp/backend/tests/test_workbench.py
+```
+
+真实/准真实证据：
+
+```text
+artifact=artifacts/tmp/asr_cn_optimization/partial-persistence-sherpa-20260709-rerun
+provider=sherpa_onnx_realtime
+input_source=simulated_realtime_wav
+source_audio=artifacts/tmp/browser_live_mic/tech-normalizer-nocost-20260709-224324/exported-audio.wav
+ws_non_empty_partial_count=55
+persisted_partial_count=3
+persisted_final_count=5
+event_source.partial_count=3
+event_source.final_count=5
+semantic_quality.status=passed
+```
+
+```text
+artifact=artifacts/tmp/asr_cn_optimization/partial-persistence-sherpa-paced-20260709
+provider=sherpa_onnx_realtime
+input_source=simulated_realtime_wav
+sent_chunks_before_end=90
+ws_non_empty_partial_count=28
+mid_persisted_partial_count=2
+mid_persisted_final_count=1
+final_persisted_partial_count=2
+final_persisted_final_count=3
+semantic_quality.status=passed
+```
+
+验证：
+
+```text
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q \
+  code/web_mvp/backend/tests/test_asr_stream.py \
+  code/web_mvp/backend/tests/test_sherpa_sidecar.py \
+  code/web_mvp/backend/tests/test_live_events.py \
+  code/web_mvp/backend/tests/test_transcript_normalizer.py \
+  code/web_mvp/backend/tests/test_workbench.py
+
+135 passed, 2 warnings
+```
+
+影响：
+
+- 当前默认本地 sherpa 路线继续成立：低资源、本地、无额外 ASR 费用。
+- UI 和 session/report 不再把有效 partial 丢掉，减少用户看到“没字”的概率。
+- 中文技术会议样本中的 Redis/Kafka/SLO/owner/P95/P99/限流/幂等等术语恢复率提高。
+
+边界：
+
+- 这不是完整生产级 ASR 完成声明。
+- 真实浏览器 UI 首字 latency、真实多人自然会议、长会 soak、说话人分离仍未完成。
+- 远程 ASR 仍不默认启用；FunASR 仍只作为高资源可选 bake-off provider。
+
+## DEC-280：当前中文识别效果按“可跑主语义但非生产级”处理
+
+日期：2026-07-10
+
+状态：Accepted
+
+背景：
+
+- 用户追问当前识别效果是否偏差、是否还有优化空间。
+- 最新证据显示：干净中文技术会议样本可以驱动转写、建议卡、纪要、历史主链路；真实外放、环境音、长会议样本仍会出现明显识别和体验问题。
+- 项目初心不是做普通音频转文字，而是在会议中实时显示文字并实时给程序员有价值的建议，因此“最终能出一段文字”不能作为完成标准。
+
+决策：
+
+- 当前中文识别效果结论为：能抓住受控技术会议主语义，但不达真实自然会议生产级。
+- 默认 provider 继续保持本地 sherpa，因为它低资源、无额外 ASR 费用，适合笔记本默认路径。
+- 不把 FunASR/Paraformer 切为默认 provider；它们只作为显式开启的高质量/高资源候选。
+- 下一轮优化必须优先处理用户可感知体验：
+  - 首字、首个 partial、首个 final UI latency；
+  - partial 连续可见；
+  - 中文技术术语保守纠错；
+  - VAD/分段和环境声鲁棒性；
+  - 建议卡对 ASR 低质量上下文的降级提示。
+- 远程 ASR 继续不默认启用，避免除 LLM 中转站外新增固定收费项目。
+
+证据：
+
+```text
+controlled technical audio:
+  provider=sherpa_onnx_realtime
+  semantic_quality.status=passed
+  transcript includes 灰度/回滚/P95/P99/缓存/负责人/回归测试
+  cards/minutes/history chain can run
+
+real ambient/long audio:
+  observed issues include unrelated speech capture, <unk>, rough segmentation, delayed or sparse visible text
+  conclusion=not production-grade
+```
+
+影响：
+
+- 后续不能把“ASR acceptance_eligible=true”单独解释为生产可用。
+- 发布判断必须同时看：识别质量、UI 首字延迟、partial/final 数、录音保存、建议生成、资源占用和长会议稳定性。
+- 如果本地 sherpa 优化后仍不能满足真实会议体验，再重新评审是否引入可选远程 ASR 或更重的本地中文模型。
+
+## DEC-281：中文实时识别优化进入 UI latency gate
+
+日期：2026-07-10
+
+状态：Accepted / Implemented
+
+背景：
+
+- DEC-280 判断当前中文识别能抓主语义但不达生产级。
+- 用户最直接的体验问题是会议中“文字又没有了”或出字太慢，因此仅看最终 transcript 不足以判断产品价值。
+- 浏览器自测原先只记录 utterance/card/minutes 数量，缺少首字、partial、final 可见延迟。
+- `no_cost_deterministic` 页面自测仍可能继承 shell 中的 `LLM_GATEWAY_*`，导致实时 ASR 结束时的 L2 修正误调用中转站。
+
+决策：
+
+- Workbench 增加本地 UI latency telemetry：
+  - `first_text_visible_latency_ms`
+  - `first_partial_visible_latency_ms`
+  - `first_final_visible_latency_ms`
+  - `partial_visible_count`
+  - `final_visible_count`
+- 浏览器自测脚本读取 `window.__meetingCopilotRealtimeUiMetrics()`，并写入 `ui_verification.json`。
+- no-cost 浏览器自测启动后端时清空远程 LLM gateway env：
+  - `LLM_GATEWAY_BASE_URL=""`
+  - `LLM_GATEWAY_API_KEY=""`
+  - `LLM_GATEWAY_MODEL=""`
+  - `LLM_GATEWAY_PROVIDER_LABEL="not_configured_no_cost_browser_mic_selftest"`
+- production 模式仍保留原来的 OpenAI-compatible gateway 判断；no-cost 模式不得计入 production LLM evidence。
+
+实现范围：
+
+```text
+code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js
+code/web_mvp/e2e/workbench_browser_live_mic_verify.mjs
+code/web_mvp/backend/tests/test_workbench.py
+```
+
+证据：
+
+```text
+artifact=artifacts/tmp/browser_live_mic/cn-ui-latency-speaker-real-mic-nocost-isolated-20260710-004334
+input_mode=real_browser_mic
+ui_coverage=visible_chrome
+health_status=audio_capture_health_passed
+provider=sherpa_onnx_realtime
+acceptance_eligible=true
+asr_semantic_quality.status=passed
+frontend_utterance_count=2
+frontend_card_count=3
+frontend_minutes_visible=true
+first_text_visible_latency_ms=10266
+first_partial_visible_latency_ms=10266
+first_final_visible_latency_ms=28954
+partial_visible_count=33
+final_visible_count=3
+llm_called=false
+gateway_base_url_kind=not_configured
+audio_sha256_matches_session=true
+```
+
+验证：
+
+```text
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q \
+  code/web_mvp/backend/tests/test_workbench.py \
+  code/web_mvp/backend/tests/test_asr_stream.py \
+  code/web_mvp/backend/tests/test_transcript_normalizer.py
+
+95 passed, 2 warnings
+
+node --check code/web_mvp/e2e/workbench_browser_live_mic_verify.mjs
+node --check code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js
+```
+
+影响：
+
+- 后续中文识别优化必须看 UI latency，不允许只用最终 transcript 判断“实时体验已完成”。
+- 当前首字约 10.3 秒、首个 final 约 29 秒，结论是主链路可跑，但实时体验仍不达标。
+- 下一轮优先优化 endpoint/VAD/partial 推送节奏和术语纠错，不继续扩散 provider 横评。
+
+## DEC-282：Realtime latency 改用 speech-active gate 补充 recording-start gate
+
+日期：2026-07-10
+
+状态：Accepted / Implemented
+
+背景：
+
+- DEC-281 增加了 UI latency gate，但首字指标从点击开始会议/录音开始计时。
+- 浏览器自测使用 `sleep 5; afplay ...` 让本机外放进入真实麦克风，因此 recording-start latency 会混入“测试音频尚未播放”的等待。
+- 第一次 speech-active 实现用单点采样峰值触发，导致环境噪声把 `first_audio_active_offset_ms` 错误记录为约 270ms。
+
+决策：
+
+- 保留 recording-start latency，用于表达用户点击后等待。
+- 新增 speech-active latency，用于表达真正有声音进入麦克风后多久能看到文字：
+  - `first_audio_active_offset_ms`
+  - `first_text_after_audio_active_latency_ms`
+  - `first_partial_after_audio_active_latency_ms`
+  - `first_final_after_audio_active_latency_ms`
+- 首次有效声音必须满足帧级 RMS、peak 和 active ratio 三个条件，避免环境噪声误触发。
+- 本轮保守扩充中文技术术语词典，只覆盖真实证据中出现的具体错词，不引入泛化替换。
+
+证据：
+
+```text
+artifact=artifacts/tmp/browser_live_mic/cn-speech-active-latency-fixed-speaker-real-mic-nocost-20260710-010650
+input_mode=real_browser_mic
+ui_coverage=visible_chrome
+health_status=audio_capture_health_passed
+provider=sherpa_onnx_realtime
+acceptance_eligible=true
+asr_semantic_quality.status=passed
+frontend_utterance_count=3
+frontend_card_count=3
+frontend_minutes_visible=true
+first_audio_active_offset_ms=4114
+first_text_visible_latency_ms=5151
+first_partial_visible_latency_ms=5151
+first_final_visible_latency_ms=9763
+first_text_after_audio_active_latency_ms=1039
+first_partial_after_audio_active_latency_ms=1039
+first_final_after_audio_active_latency_ms=5649
+partial_visible_count=37
+final_visible_count=4
+llm_called=false
+gateway_base_url_kind=not_configured
+audio_sha256_matches_session=true
+```
+
+验证：
+
+```text
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q \
+  code/web_mvp/backend/tests/test_workbench.py \
+  code/web_mvp/backend/tests/test_asr_stream.py \
+  code/web_mvp/backend/tests/test_transcript_normalizer.py
+
+96 passed, 2 warnings
+
+python3 -m json.tool configs/asr_terms.json
+node --check code/web_mvp/e2e/workbench_browser_live_mic_verify.mjs
+node --check code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js
+git diff --check -- <touched files>
+```
+
+影响：
+
+- 之后判断“实时识别是否慢”必须同时看 recording-start 和 speech-active 两个指标。
+- 当前从有效声音到首字/partial 可见约 1 秒，前端显示链路不是主要瓶颈。
+- 当前从有效声音到 final 约 5.6 秒，若实时建议完全依赖 final 仍然偏慢；下一轮应评审 partial 驱动的轻量建议/确认提示。
+- 中文错词仍需持续用真实证据补保守词典，但不能用词典结果宣称 ASR 已生产级。
+
+## DEC-283：Partial 驱动实时提醒先做 no-cost confirmation hint
+
+日期：2026-07-10
+
+状态：Accepted / Implemented
+
+背景：
+
+- DEC-282 显示从有效声音到 partial 可见可以较快，但从有效声音到 final 仍可能约 5-6 秒。
+- 若实时建议完全依赖 final，会议中“及时提醒”的产品价值会下降。
+- 直接对 partial 调远程 LLM 会增加成本、延迟和误触发风险，不符合当前“尽量只花费在必要中转站调用上”的约束。
+
+决策：
+
+- 新增 `partial_hint_event`，由本地 deterministic 规则从工程风险/行动项/未闭环问题类 partial 生成。
+- `partial_hint_event` 只用于会议中轻量提醒：
+  - 不调用 LLM。
+  - 不生成正式建议卡。
+  - 不作为最终会议结论。
+  - 必须标注 `partial_not_final` 和 `needs_confirmation`。
+- 后端通过同一 WebSocket 在 raw partial 后实时发送 hint，同时 session 快照保留该事件。
+- 前端在候选提醒区显示为“实时提醒”，区别于 final 派生的“实时建议”。
+
+证据：
+
+```text
+artifact=artifacts/tmp/browser_live_mic/cn-partial-hint-speaker-real-mic-nocost-20260710-013127
+input_mode=real_browser_mic
+ui_coverage=visible_chrome
+health_status=audio_capture_health_passed
+provider=sherpa_onnx_realtime
+asr_fallback_used=false
+acceptance_eligible=true
+asr_semantic_quality.status=passed
+frontend_partial_hint_count=1
+partial_hint_count_in_session=1
+candidate_panel_text includes:
+  实时提醒
+  实时识别到风险条件，建议确认触发阈值、回滚动作、监控口径和负责人。
+llm_called=false
+gateway_base_url_kind=not_configured
+audio_sha256_matches_session=true
+```
+
+验证：
+
+```text
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q \
+  code/web_mvp/backend/tests/test_live_events.py \
+  code/web_mvp/backend/tests/test_asr_stream.py \
+  code/web_mvp/backend/tests/test_workbench.py \
+  code/web_mvp/backend/tests/test_transcript_normalizer.py
+
+139 passed, 2 warnings
+
+node --check code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js
+node --check code/web_mvp/e2e/workbench_browser_live_mic_verify.mjs
+git diff --check -- <touched files>
+```
+
+影响：
+
+- Meeting Copilot 不再只能等 final 才给会议中提醒。
+- partial hint 是 no-cost、低置信、需要确认的提示，不会污染正式建议卡/纪要。
+- 下一轮需要扩展 partial hint 的误触发/漏触发评测，并观察真实会议中用户是否觉得提醒足够及时但不过度打扰。
+
+## DEC-284：Partial hint 增加 precision/recall 小样本准入
+
+日期：2026-07-10
+
+状态：Accepted / Implemented
+
+背景：
+
+- DEC-283 新增了 partial 驱动的 no-cost confirmation hint。
+- 该能力如果误触发太多，会干扰会议；如果漏掉风险/行动项/未闭环问题，又无法体现实时助手价值。
+- 当前阶段不应直接上大模型或远程 ASR 做质量兜底，先用本地规则和可追溯小样本准入收敛。
+
+决策：
+
+- 增加 partial hint 小样本评测：
+  - 非工程闲聊不得触发。
+  - 已明确无风险/已确认的工程上下文不得触发。
+  - 行动项缺口应触发 `action_confirmation`。
+  - 未闭环问题应触发 `question_followup`。
+  - 风险阈值应触发 `risk_confirmation`。
+- 调整 hint 类型优先级：`question_followup` 高于 `risk_confirmation`，避免“有没有 owner”这类问题被误归为普通风险。
+
+证据：
+
+```text
+artifact=artifacts/tmp/partial_hint_eval/partial-hint-balance-20260710-013959/summary.json
+case_count=5
+passed_count=5
+failed_count=0
+remote_llm_called=false
+remote_asr_called=false
+```
+
+验证：
+
+```text
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q \
+  code/web_mvp/backend/tests/test_live_events.py \
+  code/web_mvp/backend/tests/test_asr_stream.py \
+  code/web_mvp/backend/tests/test_workbench.py \
+  code/web_mvp/backend/tests/test_transcript_normalizer.py
+
+140 passed, 2 warnings
+
+node --check code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js
+node --check code/web_mvp/e2e/workbench_browser_live_mic_verify.mjs
+git diff --check -- <touched files>
+```
+
+影响：
+
+- partial hint 从“能触发”推进到“有最小 precision/recall 准入”。
+- 当前仍不能宣称生产级，后续需要扩大样本并观察真实会议打扰度。
+
+## DEC-285：中文识别优化优先保护可信度，不用 normalizer 注入未说出的实体
+
+日期：2026-07-10
+
+状态：Accepted / Implemented
+
+背景：
+
+- 真实麦克风收外放证据显示：本地 sherpa 对中文技术会议可恢复部分主语义，但仍会出现错词、`<unk>`、英文服务名/中间件漏识。
+- 旧的 `configs/asr_terms.json` 含有若干整句级修正，会把某次样例音频中的错词直接改成 `checkout-service`、`Redis`、`Kafka`、`王五`、`李四`、`SLO` 等具体实体。
+- 这种做法会让演示看起来更准，但真实会议复盘时可能生成未说出的事实，比普通漏识更伤用户信任。
+- partial hint 已进入实时提醒链路，如果不去重，连续增长的 partial 会重复刷相同提醒。
+
+决策：
+
+- normalizer 默认只做稳定术语级修正，不再从模糊片段补出未在原文出现的受保护实体。
+- 受保护实体当前包括：`checkout-service`、`Kafka`、`Redis`、`SLO`、`王五`、`李四`。
+- 保留安全修正，例如：
+  - `P 九九 -> P99`
+  - `先恢度 -> 先灰度`
+  - `零点一旧回<unk> -> 零点一就回滚`
+  - `限流合密等 -> 限流和幂等`
+- partial hint 增加语义 `dedupe_key`，后端事件构造和 WebSocket 实时推送都按该 key 去重。
+- final/revision 的状态候选抽取使用 normalized analysis text，但 evidence quote 继续保留 raw ASR 文本，保证可追溯。
+- 增加 `data/asr_eval/partial_hint/partial_hint_cases.json` 和 `tools/partial_hint_eval_runner.py` 作为 no-cost 小样本质量门禁。
+
+证据：
+
+```text
+artifact=artifacts/tmp/partial_hint_eval/partial-hint-dedupe-normalizer-guard-20260710-091138/summary.json
+status=passed
+case_count=14
+passed_count=14
+failed_count=0
+precision=1.0
+recall=1.0
+progressive_duplicate_hint_count=1
+remote_llm_called=false
+remote_asr_called=false
+```
+
+验证：
+
+```text
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q \
+  code/web_mvp/backend/tests/test_live_events.py \
+  code/web_mvp/backend/tests/test_asr_stream.py \
+  code/web_mvp/backend/tests/test_workbench.py \
+  code/web_mvp/backend/tests/test_transcript_normalizer.py \
+  tests/test_partial_hint_eval_runner.py
+
+148 passed, 2 warnings
+
+python3 -m py_compile \
+  tools/partial_hint_eval_runner.py \
+  code/web_mvp/backend/meeting_copilot_web_mvp/asr_live_events.py \
+  code/web_mvp/backend/meeting_copilot_web_mvp/asr_stream.py \
+  code/web_mvp/backend/meeting_copilot_web_mvp/transcript_normalizer.py
+
+node --check code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js
+node --check code/web_mvp/e2e/workbench_browser_live_mic_verify.mjs
+git diff --check -- <touched files>
+```
+
+影响：
+
+- 当前中文识别效果仍不能宣称生产级，但不会再靠样例答案注入伪装准确。
+- 实时提醒在错词场景下更偏向“请确认”而非“直接下结论”。
+- 后续如果需要恢复某些服务名/owner，需要来自会议上下文、项目词表或用户显式配置，而不是通用 normalizer 默认补写。
+
+## DEC-286：END 后转写修正必须保留原始 final evidence，以 revision 追加
+
+日期：2026-07-10
+
+状态：Accepted / Implemented
+
+背景：
+
+- DEC-271 曾把 END 后修正文案重切成 `corrected_full_*` final，以解决长会议停止后只有一条超长 final 的问题。
+- 后续复审发现该策略会替换 session events：实时阶段已经产生的 `asr_ev_<original_segment>` 可能在会后记录里消失。
+- 产品主线要求“实时建议 + 录音保存 + 会话复盘”可追溯；如果实时建议卡或 execution preview 的 evidence 在 END 后无法点回原始 transcript，可信度会下降。
+- 中文 ASR 仍有错词，修正是必要的，但修正不能抹掉会议中真实捕获的原始证据。
+
+决策：
+
+- `asr_stream` 不再在 END 后用 corrected finals 替换 `accumulated_finals`。
+- 原始 realtime final 和原始 evidence span 必须保留。
+- END 后 L2/L3 修正文案如有变化，追加为 `revision` streaming event。
+- `build_asr_live_events()` 继续把 revision 转为 `transcript_revision`，并携带 `revision_of`、`supersedes_segment_id`、`superseded_evidence_spans` 和新 evidence span。
+- 长修正文案仍可按句切分，但切分结果是多个 revision，不是多个替换 final。
+- LLM execution preview 必须仍能读到原始 evidence span，保证会后建议/复盘 clickback 不断链。
+
+证据：
+
+```text
+test=test_asr_stream_end_correction_preserves_original_final_evidence_and_adds_revision
+assertions:
+  original transcript_final remains in session events
+  original asr_ev_<segment_id> remains available
+  transcript_revision references revision_of/supersedes_segment_id
+  superseded_evidence_spans includes original evidence id
+  llm-execution-previews can still resolve original evidence_context
+```
+
+验证：
+
+```text
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q \
+  code/web_mvp/backend/tests/test_asr_stream.py::test_asr_stream_end_correction_preserves_original_final_evidence_and_adds_revision
+
+1 passed, 2 warnings
+
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q code/web_mvp/backend/tests/test_asr_stream.py
+
+18 passed, 2 warnings
+
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q \
+  code/web_mvp/backend/tests/test_live_events.py \
+  code/web_mvp/backend/tests/test_asr_stream.py \
+  code/web_mvp/backend/tests/test_workbench.py \
+  code/web_mvp/backend/tests/test_transcript_normalizer.py \
+  tests/test_partial_hint_eval_runner.py
+
+149 passed, 2 warnings
+```
+
+影响：
+
+- 会后修正不再破坏实时 evidence/clickback 的基本可追溯性。
+- `corrected_full_*` 替换 final 的策略停止作为当前实现目标。
+- 仍需后续 UI 截图级验证 revision 关系和 evidence-link 高亮是否足够清晰。
+
+## DEC-287：Workbench 必须显式渲染 transcript_revision 并支持 revision evidence 点击回看
+
+日期：2026-07-10
+
+状态：Accepted / Implemented
+
+背景：
+
+- DEC-286 已决定 END 后修正不能替换原始 realtime final，只能作为 revision 追加。
+- 复审发现 Workbench 的历史/快照渲染只展示 `transcript_final/final`，实时 append 也没有 `transcript_revision` 分支。
+- 因此原始 evidence 点击回看可以成立，但 revision evidence 即使出现在建议卡里，也缺少对应 `.utterance` 行可供高亮定位。
+- 如果用户在复盘时只能看到“AI 修正文本”，但无法定位这条修正对应哪段原始 ASR，产品会退化成不可审计的会后改写。
+
+决策：
+
+- Workbench 把 `transcript_revision` 渲染为 `.utterance.transcript-revision`，不替换原始 `.utterance`。
+- revision 行保留自己的 `segment_id/evidence_spans`，并通过 `data-revision-of`、`data-supersedes-segment-id` 展示修正关系。
+- 建议卡继续使用统一的 `.evidence-link` 和 `focusEvidenceSpan()`，原始 evidence 与 revision evidence 点击后分别高亮对应转写行。
+- 实时流 `appendLiveEvent()` 同样支持 `transcript_revision`，避免真实会议停止整理时 UI 和历史快照行为不一致。
+- `sessionHasTranscript()` 和删除确认文字条数计入 revision，避免可见转写行和状态/删除提示不一致。
+
+证据：
+
+```text
+artifact_root=artifacts/tmp/ui_screenshots/workbench-revision-evidence-clickback-20260710-094808
+report=artifacts/tmp/ui_screenshots/workbench-revision-evidence-clickback-20260710-094808/revision_evidence_clickback_report.json
+status=go_revision_evidence_clickback
+utterance_count=2
+revision_utterance_visible=true
+original_clickback.focused_segment_id=raw_release_revision_clickback
+revision_clickback.focused_segment_id=raw_release_revision_clickback_rev1
+screenshot_count=5
+remote_llm_called=false
+remote_asr_called=false
+```
+
+验证：
+
+```text
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q \
+  code/web_mvp/backend/tests/test_workbench.py::test_workbench_renders_transcript_revision_rows_for_evidence_clickback \
+  tests/test_workbench_revision_evidence_clickback.py
+
+3 passed, 2 warnings
+
+node --check code/web_mvp/e2e/workbench_revision_evidence_clickback.mjs
+node --check code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js
+
+MEETING_COPILOT_ARTIFACT_ROOT=artifacts/tmp/ui_screenshots/workbench-revision-evidence-clickback-20260710-094808 \
+  node code/web_mvp/e2e/workbench_revision_evidence_clickback.mjs
+
+status=go_revision_evidence_clickback
+screenshot_count=5
+```
+
+影响：
+
+- 用户现在能区分“实时听到的原始 ASR”与“END 后整理出的修正文稿”，并能点击建议卡证据回到各自来源。
+- 这一步解决的是 evidence UI 闭环，不等价于中文 ASR 已生产级。
+- 后续长会议/真实麦克风验证仍必须覆盖多条 revision、多张建议卡、录音保存和导出/删除流程。
+
+## DEC-288：长会议主链路先用 fixture-only Workbench 自测验证 UI/会话承载，不冒充生产 soak
+
+日期：2026-07-10
+
+状态：Accepted / Implemented
+
+背景：
+
+- 用户明确指出当前工作不能继续陷入无止境局部评测，必须回到“实时会议 + 实时建议 + 录音/文字复盘”的产品主线。
+- DEC-287 已修复短样本的原始/revision evidence clickback，但仍缺少更长上下文下多转写、多建议卡、revision、纪要、导出和删除的同会话证据。
+- 现有 `tools/long_meeting_soak_runner.py` 是指标判定器，不会打开 Workbench，也不能证明 UI 主链路承载。
+- 真实 20-60 分钟 wall-clock soak 会引入麦克风、音频文件、ASR 质量、内存和时间成本；在 UI 主链路未先闭合前直接跑真实 soak 会把问题混在一起。
+
+决策：
+
+- 新增长会议 Workbench browser E2E，采用 fixture-only 方式预置 ASR live session JSON。
+- 该测试固定禁用远程网关，不点击生成建议/方案/纪要按钮，不调用真实 ASR/LLM。
+- fixture 覆盖 20 分钟语义跨度，但明确 `counts_as_20_60_min_production_soak=false`。
+- Workbench 必须在同一会话中显示：
+  - 多条 `transcript_final`
+  - 至少一条 `transcript_revision`
+  - 多张 suggestion card
+  - approach card
+  - minutes
+  - 普通 evidence clickback
+  - revision evidence clickback
+  - transcript/minutes export
+  - delete reset 和后端 404
+- 报告必须写明不算真实麦克风证据、不算真实长时间生产 soak、不算生产 LLM 证据。
+
+证据：
+
+```text
+artifact_root=artifacts/tmp/ui_screenshots/workbench-long-meeting-evidence-20260710-095836
+report=artifacts/tmp/ui_screenshots/workbench-long-meeting-evidence-20260710-095836/long_meeting_ui_report.json
+status=go_long_meeting_ui_evidence
+synthetic_duration_minutes=20
+counts_as_20_60_min_production_soak=false
+counts_as_real_mic_go_evidence=false
+remote_llm_called=false
+remote_asr_called=false
+utterance_count=13
+revision_utterance_count=1
+suggestion_card_count=4
+approach_card_count=2
+evidence_link_count=8
+minutes_visible=true
+original_clickback.focused_segment_id=long_seg_03
+revision_clickback.focused_segment_id=long_seg_06_rev1
+delete_probe_status=404
+screenshot_count=7
+```
+
+验证：
+
+```text
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q tests/test_workbench_long_meeting_evidence.py
+
+2 passed, 1 warning
+
+node --check code/web_mvp/e2e/workbench_long_meeting_evidence_verify.mjs
+
+MEETING_COPILOT_ARTIFACT_ROOT=artifacts/tmp/ui_screenshots/workbench-long-meeting-evidence-20260710-095836 \
+  node code/web_mvp/e2e/workbench_long_meeting_evidence_verify.mjs
+
+status=go_long_meeting_ui_evidence
+screenshot_count=7
+```
+
+影响：
+
+- 主线从“短句能点击证据”推进到“长会议会话能承载多类产物和复盘动作”。
+- 仍不能据此宣称生产级中文 ASR、真实麦克风或 20-60 分钟稳定性达标。
+- 下一阶段应把同一链路接到真实/公开音频或真实麦克风 wall-clock soak，重点验证真实 ASR 延迟、录音保存、内存增长和建议频率控制。
+
+## DEC-289：ASR 产物主链路闭合不能替代中文识别质量 Go 证据
+
+日期：2026-07-10
+
+状态：Accepted / Implemented
+
+背景：
+
+- Workbench 长会议 fixture 已证明 UI/会话层能承载多转写、多建议、revision、纪要、导出和删除。
+- 但用户最担心的核心风险仍是：如果中文技术会议 ASR 本身识别差，实时建议会变成误导。
+- 现有 `release-review-001` 已有 FunASR/Sherpa ASR event 与 transcript report，可在不读取用户私有录音、不重新跑模型、不调用远程服务的前提下复核主链路和质量。
+- 复核发现：FunASR/Sherpa 都能进入 `EvidenceSpan -> state -> suggestion candidate -> llm_request_draft`，但关键术语召回和文本质量仍不足。
+
+决策：
+
+- 新增 `tools/asr_mainline_quality_report.py`，把“pipeline 是否闭合”和“ASR 质量是否达标”拆成两个独立结论。
+- 质量门槛当前为：
+  - `term_recall >= 0.75`
+  - `char_error_rate <= 0.45`
+  - hypothesis 不含 `<unk>`
+- 报告必须输出：
+  - provider 数量
+  - pipeline_closed_count
+  - quality_pass_count
+  - remote_asr_call_count
+  - llm_call_count
+  - missing_terms
+  - default decision
+- 若 pipeline 闭合但 quality 未过，默认决策必须是 `no_go_quality_not_production`。
+
+证据：
+
+```text
+funasr_replay=artifacts/tmp/asr_reports/release-review-001.funasr.live-pipeline-replay-20260710.json
+sherpa_replay=artifacts/tmp/asr_reports/release-review-001.sherpa.live-pipeline-replay-20260710.json
+quality_report=artifacts/tmp/asr_reports/release-review-001.asr-mainline-quality-20260710.json
+
+provider_count=2
+pipeline_closed_count=2
+quality_pass_count=0
+remote_asr_call_count=0
+llm_call_count=0
+decision_status=no_go_quality_not_production
+blocker=pipeline_closed_but_asr_quality_insufficient
+best_quality_provider=funasr_streaming
+
+funasr:
+  term_recall=0.5
+  missing_terms=0.1%,800ms,Grafana,payment-gateway
+  evidence_span_count=4
+  suggestion_candidate_count=2
+  first_partial_latency_ms=3733
+  first_final_latency_ms=5358
+
+sherpa:
+  term_recall=0.375
+  missing_terms=0.1%,800ms,Grafana,payment-gateway,错误率
+  contains_unk=true
+  evidence_span_count=1
+  suggestion_candidate_count=2
+  first_partial_latency_ms=273
+  first_final_latency_ms=386
+```
+
+验证：
+
+```text
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q tests/test_asr_mainline_quality_report.py
+
+2 passed, 1 warning
+
+python3 -m py_compile tools/asr_mainline_quality_report.py
+```
+
+影响：
+
+- 当前主线结论更清楚：系统可以把本地 ASR 事件接到 Copilot 主链路，但中文技术会议识别质量仍是生产 blocker。
+- FunASR 当前更适合作为质量优化候选；Sherpa 当前更适合作为低延迟实时预览候选，但 `<unk>` 和长 final 需要继续处理。
+- 后续优化不应只追求更快出字，还必须提升服务名、指标阈值、owner、工具名等关键语义召回。
+
+## DEC-290：ASR 批量质量门禁必须使用显式 matrix，禁止按文件名硬配 reference 与 ASR 产物
+
+日期：2026-07-10
+
+状态：Accepted / Implemented
+
+背景：
+
+- 单样本 `release-review-001` 主链路质量报告证明 pipeline 和 ASR quality 必须拆开判断。
+- 多 Agent 只读审查发现：`data/asr_eval/references/S01-S04` 与 `artifacts/tmp/asr_events/{api,release,incident}-review-001.*` 不能简单按名字映射。
+- 例如 `S02-release-review` reference 是 `payment-gateway / 800ms / Grafana`，但 `release-review-001` synthetic script 是 `checkout-service / error_rate / staging`。
+- 若继续靠文件名猜测，会污染 CER、术语召回和 Go/No-Go 判断。
+
+决策：
+
+- 新增 `tools/asr_mainline_quality_batch_report.py`，作为单样本 `tools/asr_mainline_quality_report.py` 之上的批量编排 wrapper。
+- 批量报告优先读取显式 matrix：
+  - `sample_id`
+  - `reference_path`
+  - `annotation_path`
+  - `provider`
+  - `events_path`
+  - `transcript_report_path`
+- 若只有 events，wrapper 可本地调用 `asr_live_pipeline_replay` 生成 replay report；仍禁止远程 ASR/LLM。
+- 新增 `data/asr_eval/manifests/asr-mainline-quality-synthetic.json`，其 reference/annotation 来源明确对齐 `data/asr_eval/synthetic_meetings/scripts/*.json`。
+
+证据：
+
+```text
+matrix=data/asr_eval/manifests/asr-mainline-quality-synthetic.json
+batch_tool=tools/asr_mainline_quality_batch_report.py
+test=tests/test_asr_mainline_quality_batch_report.py
+```
+
+影响：
+
+- 后续 ASR 质量结论只能来自显式 matrix 或同等显式映射，不能用 glob/文件名相似性拼接。
+- `S01-S04` public/smoke sample 保留为另一套评测资料，不与 synthetic ASR 产物混用。
+- 批量脚本会显式输出 `missing_inputs`，宁可 No-Go，也不补假数据。
+
+## DEC-291：当前本地 ASR 主链路已 8/8 闭合，但中文技术会议质量仍 No-Go
+
+日期：2026-07-10
+
+状态：Accepted / Implemented
+
+背景：
+
+- 用户关心的是“实时会议 + 实时建议”，不是一个普通音频转文字工具。
+- 因此要同时证明：
+  - ASR event 能进入 Copilot 建议链路；
+  - ASR 文本足够准，不会让建议建立在错误术语上。
+- 初次批量门禁显示 `incident-review-001` 的 FunASR event 有事故信号，但 live pipeline 未产生候选。
+
+决策：
+
+- 对已观察到的事故类 ASR near-miss 做保守修复：
+  - 只有 `autoker/auder` 后接 `消费堆积/lag/告警` 时，才恢复为 `order-worker`。
+  - `消费堆积/告警延迟/临时扩容/根因` 且具备工程上下文时进入 Risk state。
+- 继续保留 raw evidence：
+  - `transcript_final.payload.text` 保留 raw ASR。
+  - `evidence.quote` 保留 raw ASR。
+  - 修正只进入 `normalized_text` 和 state description。
+- 不用 normalizer/LLM 补 `timeout` 或 `监控阈值` 等 ASR 没识别出来的关键事实。
+
+证据：
+
+```text
+report=artifacts/tmp/asr_reports/asr-mainline-quality-synthetic-batch-20260710-after-runtime-risk.json
+decision_status=no_go_quality_not_production
+blockers=["some_samples_have_no_quality_passing_provider"]
+sample_provider_count=8
+pipeline_closed_sample_provider_count=8
+quality_pass_sample_provider_count=3
+samples_with_quality_pass_count=3
+remote_asr_call_count=0
+llm_call_count=0
+
+incident-review-001.funasr:
+  before=pipeline_not_closed
+  after=pipeline_closed_quality_insufficient
+  missing_terms=timeout,监控阈值
+```
+
+验证：
+
+```text
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q \
+  tests/test_asr_mainline_quality_batch_report.py \
+  code/web_mvp/backend/tests/test_transcript_normalizer.py::test_normalize_recovers_order_worker_only_in_backlog_context \
+  code/web_mvp/backend/tests/test_live_events.py::test_build_asr_live_events_extracts_runtime_incident_risk_from_backlog_final
+
+python3 tools/asr_mainline_quality_batch_report.py \
+  --matrix data/asr_eval/manifests/asr-mainline-quality-synthetic.json \
+  --output artifacts/tmp/asr_reports/asr-mainline-quality-synthetic-batch-20260710-after-runtime-risk.json \
+  --replay-run-id 20260710-runtime-risk
+```
+
+影响：
+
+- 当前可以说“本地 ASR event 到实时建议候选的主链路已在合成技术会议 batch 中闭合”。
+- 当前不能说“中文技术会议识别质量已生产可用”。
+- FunASR 是质量优先候选；Sherpa 是低延迟预览候选；二者都还需要继续优化才能进入真实长会议生产验收。
+## DEC-292：ASR 批量门禁必须审计 reference/artifact 覆盖，不把短音频误判为模型质量失败
+
+日期：2026-07-10
+
+状态：Accepted / Implemented
+
+背景：
+
+- DEC-290/291 把 ASR 主链路推进到显式 matrix，但结果仍是 `no_go_quality_not_production`。
+- 后续审计发现旧 `release-review-001` 与 `incident-review-001` 的 ASR artifacts 只覆盖 reference 前半段：
+  - `release-review-001` 旧 coverage 约 `0.698925`，未覆盖 `staging 跑过` 与第三轮验收用例。
+  - `incident-review-001` 旧 coverage 约 `0.634146`，未覆盖 `timeout 增多` 与第三轮 `监控阈值`。
+- 如果继续把这些尾部词算成 provider 漏识别，会把优化方向带偏，形成无限评估循环。
+
+决策：
+
+- `tools/asr_mainline_quality_batch_report.py` 新增 `reference_artifact_coverage` 审计。
+- batch aggregate 新增：
+  - `suspected_reference_artifact_mismatch_sample_count`
+  - `samples_with_suspected_reference_artifact_mismatch`
+- 一旦 coverage mismatch 存在，默认决策加入 `suspected_reference_artifact_mismatch` blocker，并把下一步指向 `repair_or_regenerate_aligned_synthetic_audio_artifacts_before_provider_judgment`。
+- 禁止裁剪 reference 来制造通过；reference/annotation/script 继续保持完整三轮语义。
+
+证据：
+
+```text
+test=tests/test_asr_mainline_quality_batch_report.py::test_reference_artifact_coverage_flags_suffix_terms_missing_after_truncated_transcript
+report=artifacts/tmp/asr_reports/asr-mainline-quality-synthetic-variants-20260710-coverage-audit-v2.json
+
+samples_with_suspected_reference_artifact_mismatch=[
+  release-review-001,
+  incident-review-001
+]
+remote_asr_call_count=0
+llm_call_count=0
+```
+
+影响：
+
+- DEC-291 的 No-Go 仍保留为历史事实，但已被本决策 refine：No-Go 中包含合成音频 artifact 覆盖不足，不应继续作为最终本地 ASR 质量判断。
+- 后续 ASR 质量门禁必须先确认 reference/audio/events/transcript_report 覆盖关系，再判断 provider 优劣。
+
+## DEC-293：本地重生成 release/incident 合成音频并通过 repaired local synthetic ASR 质量门禁
+
+日期：2026-07-10
+
+状态：Accepted / Implemented
+
+背景：
+
+- 用户要求不要继续陷入评估循环，要把主线跑通并修复可修问题。
+- 旧 release/incident 音频约 11 秒，无法支撑完整三轮 reference 的质量判断。
+- 不能引入默认远程 ASR，也不能增加额外付费项目。
+
+决策：
+
+- 使用本机 macOS `say` 做本地、无远程 TTS 重生成，仅写入 ignored artifact：
+  - `voice=Tingting`
+  - `rate_wpm=130`
+  - `target_root=artifacts/tmp/synthetic_audio/tingting_r130`
+- 只重生成旧 coverage mismatch 的 `release-review-001` 与 `incident-review-001`。
+- 使用本地缓存 FunASR streaming model + chunk20 + hotword manifest 重跑 ASR events/provider/transcript report。
+- 对可观察近音做 bounded normalizer/quality alias：
+  - `check outservice -> checkout-service`，仅发布/灰度/指标上下文。
+  - `error r ate -> error_rate`，仅指标/P99/灰度上下文。
+  - 不把 `ing` 硬补为 `staging`。
+  - 不把 `timeet` 硬补为 `timeout`。
+
+证据：
+
+```text
+new_audio:
+  artifacts/tmp/synthetic_audio/tingting_r130/release-review-001.wav duration=21.792313s
+  artifacts/tmp/synthetic_audio/tingting_r130/incident-review-001.wav duration=21.060875s
+
+targeted_report=artifacts/tmp/asr_reports/asr-mainline-quality-tingting-r130-20260710-after-normalizer.json
+targeted_status=candidate_for_next_real_audio_gate
+targeted_quality_pass_sample_provider_count=2/2
+targeted_suspected_reference_artifact_mismatch_sample_count=0
+
+repaired_matrix=data/asr_eval/manifests/asr-mainline-quality-synthetic-repaired-local.json
+repaired_report=artifacts/tmp/asr_reports/asr-mainline-quality-synthetic-repaired-local-20260710-final-verify.json
+decision_status=candidate_for_next_real_audio_gate
+blockers=[]
+sample_count=4
+pipeline_closed_sample_provider_count=4
+quality_pass_sample_provider_count=4
+samples_with_quality_pass_count=4
+suspected_reference_artifact_mismatch_sample_count=0
+remote_asr_call_count=0
+llm_call_count=0
+raw_audio_uploaded=false
+```
+
+验证：
+
+```text
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q tests/test_asr_mainline_quality_batch_report.py
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q tests/test_asr_mainline_quality_report.py::test_quality_report_counts_visible_release_near_miss_aliases_without_staging_backfill code/web_mvp/backend/tests/test_transcript_normalizer.py::test_normalize_recovers_release_review_visible_near_misses_in_metric_context
+PYTHONPATH=code/asr_runtime pytest -q code/asr_runtime/tests/test_transcript_normalizer.py::test_normalize_transcript_text_recovers_tingting_release_visible_near_misses_without_staging_backfill
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q tests/test_synthetic_audio_local_tts_smoke.py tests/test_synthetic_audio_batch_smoke.py
+python3 tools/asr_mainline_quality_batch_report.py --matrix data/asr_eval/manifests/asr-mainline-quality-synthetic-repaired-local.json --output artifacts/tmp/asr_reports/asr-mainline-quality-synthetic-repaired-local-20260710-final-verify.json --replay-run-id 20260710-repaired-final-verify
+```
+
+影响：
+
+- 当前可以声明：repaired local synthetic 中文技术会议 ASR -> 实时建议候选主链路在 4 场景质量门禁中候选通过。
+- 当前不能声明：真实多人会议、真实麦克风或公开会议音频 ASR 已生产可用。
+- 下一步固定为真实/公开音频 wall-clock soak 与真实麦克风验收，不再继续扩开放式 provider 横评。
+- 生产/离线包必须把 ASR/VAD/Punc 等模型依赖纳入可审计缓存或安装包管理，禁止运行时静默联网。
+
+## DEC-294：真实/公开音频 wall-clock gate 防止把局部 Go 误报成真实长会 Go
+
+日期：2026-07-10
+
+状态：Accepted / Implemented
+
+背景：
+
+- DEC-293 已证明 repaired local synthetic ASR 质量门禁候选通过。
+- 仓库里同时已有 20 分钟 deterministic synthetic soak Go，以及短真实 browser mic 生产链路 Go。
+- 但这三类证据不能相加成“真实/公开长会议 ASR 可用”：
+  - synthetic soak 不证明真实/公开音频声学。
+  - 短真实 browser mic 不证明 20 分钟级 wall-clock 稳定性。
+  - repaired synthetic ASR 不证明真实多人会议。
+
+决策：
+
+- 新增 `tools/real_public_audio_wall_clock_gate.py`。
+- 新增 `tests/test_real_public_audio_wall_clock_gate.py`。
+- Gate 消费已有 JSON evidence，不读取音频、不打开麦克风、不下载公开数据、不调用 ASR/LLM。
+- 只有存在 `real_public_audio_wall_clock_soak.v1` 风格证据，且满足：
+  - `source_kind in {real_microphone, public_audio}`
+  - `duration_minutes >= 20`
+  - `asr_provider_mode=real`
+  - `pipeline_closed=true`
+  - `quality_gate_passed=true`
+  - `remote_asr_called=false`
+  - `raw_audio_uploaded=false`
+  - `configs_local_read=false`
+  才允许进入 `candidate_for_real_meeting_pilot`。
+
+当前真实结果：
+
+```text
+report=artifacts/tmp/asr_reports/real-public-audio-wall-clock-gate-20260710-final-verify.json
+gate_status=blocked_real_or_public_wall_clock_soak_missing
+blockers=[real_or_public_wall_clock_soak_missing]
+recommended_next_action=run_real_microphone_or_public_audio_wall_clock_soak
+
+repaired_synthetic_quality.ready=true
+synthetic_soak.ready=true
+synthetic_soak.counts_as_real_or_public_wall_clock_soak=false
+real_mic_short.ready=true
+real_mic_short.duration_status=missing_or_too_short
+wall_clock_soak.ready=false
+```
+
+公开音频来源状态：
+
+```text
+report=artifacts/tmp/asr_reports/public-audio-source-whitelist-20260710-final-verify.json
+source_validation_status=passed
+source_count=3
+safe_to_download_now=false
+next_action=create_bounded_sample_extraction_plan
+```
+
+官方来源复核：
+
+- AliMeeting / OpenSLR SLR119：CC BY-SA 4.0，真实多通道多方会议；Eval 包约 3.42G，不默认下载。
+- AISHELL-4 / OpenSLR SLR111：CC BY-SA 4.0，会议场景语音；test 包约 5.2G，不默认下载。
+- AISHELL-1 / OpenSLR SLR33：Apache 2.0，普通话朗读；data 包约 15G，只能作普通话 ASR smoke，不证明会议声学。
+
+验证：
+
+```text
+PYTHONPATH=code/web_mvp/backend:code/core pytest -q tests/test_real_public_audio_wall_clock_gate.py
+3 passed, 1 warning
+
+python3 tools/real_public_audio_wall_clock_gate.py \
+  --quality-report artifacts/tmp/asr_reports/asr-mainline-quality-synthetic-repaired-local-20260710-final-verify.json \
+  --synthetic-soak-report artifacts/tmp/soak/p1-4-long-meeting-soak-20260708/soak_report.json \
+  --real-mic-manifest artifacts/tmp/acceptance/real-speaker-mic-production-usage-20260709-171209-refresh2/manifest.json \
+  --output artifacts/tmp/asr_reports/real-public-audio-wall-clock-gate-20260710-final-verify.json
+exit=2
+```
+
+影响：
+
+- 当前项目状态不是回退，而是进入下一道真实/公开音频 evidence gate。
+- 下一步要么用户配合 20 分钟级真实麦克风 wall-clock soak，要么先做公开音频 bounded sample extraction approval。
+- 禁止默认自动下载 OpenSLR GB 级大包，禁止把短真实麦克风或 synthetic soak 当作真实长会 Go。
+
+## DEC-295：中文公开音频 bounded sample extraction approval 恢复为 live 工具
+
+日期：2026-07-10
+
+状态：Accepted / Implemented
+
+背景：
+
+- 用户确认公开样本方向必须以中文为主。
+- 旁路审查确认 `public_audio_sample_extraction_plan` 存在 archive 实现和 live 文档/测试引用漂移：文档仍把它当作下一步，但顶层 `tools/public_audio_sample_extraction_plan.py` 缺失。
+- 当前真实/公开音频 wall-clock gate 仍 blocked，缺 20 分钟级真实/公开音频证据。
+
+决策：
+
+- 恢复 live 工具：`tools/public_audio_sample_extraction_plan.py`。
+- 新增 live 测试：`tests/test_public_audio_sample_extraction_plan.py`。
+- 更新 schema 示例：`data/asr_eval/public_sample_plan.example.json`。
+- 公开音频候选排序固定为中文/普通话：
+  - AliMeeting / OpenSLR SLR119：第一中文会议声学候选。
+  - AISHELL-4 / OpenSLR SLR111：第二中文会议声学补充。
+  - AISHELL-1 / OpenSLR SLR33：普通话朗读 baseline，只能做 runtime smoke，不计入会议声学或 public meeting wall-clock evidence。
+- planned sample 一旦提供，必须具体到安全相对 `archive_member_path`、clip start/end、expected duration、license citation、cleanup_required 和 64 位 lowercase sha256；`archive_member_path` 不得包含 placeholder/TODO/TBD 文本。
+- 工具只产出 no-download approval/report，不下载、不抽取、不转码、不读取音频、不调用本地/远程 ASR、不调用 LLM、不读取 `configs/local`，不读取真实用户音频。
+
+当前真实结果：
+
+```text
+report=artifacts/tmp/asr_reports/public-audio-sample-extraction-approval-20260710-final-verify.json
+plan_status=blocked_no_planned_samples
+source_id=alimeeting_openslr_slr119
+source_language=zh-CN Mandarin
+dataset_role=primary_mandarin_meeting_acoustics
+meeting_acoustics_evidence=true
+counts_toward_public_meeting_wall_clock_candidate=true
+planned_sample_count=0
+planned_samples_status=not_planned
+safe_to_download_now=false
+safe_to_extract_now=false
+remote_asr_call_count=0
+llm_call_count=0
+raw_audio_uploaded=false
+next_action=create_concrete_public_audio_sample_manifest
+recommended_next_gate=public_audio_wall_clock_soak_after_post_extraction_evidence
+```
+
+验证：
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python3 -m pytest tests/test_public_audio_sample_extraction_plan.py -q -p no:cacheprovider
+9 passed, 1 warning
+
+python3 -m py_compile tools/public_audio_sample_extraction_plan.py
+passed
+
+python3 tools/public_audio_sample_extraction_plan.py \
+  --source-id alimeeting_openslr_slr119 \
+  --target-root artifacts/tmp/public_audio \
+  --max-duration-seconds 1200 \
+  --max-download-bytes 900000000 \
+  --sample-budget-count 10 \
+  --sample-budget-minutes 20 \
+  --max-clip-seconds 300 \
+  --output artifacts/tmp/asr_reports/public-audio-sample-extraction-approval-20260710-final-verify.json
+exit=0
+```
+
+影响：
+
+- 当前可以声明：中文公开会议音频抽样审批链路已恢复为可运行、可测试、可追溯的 no-download gate。
+- 当前不能声明：公开音频已下载、已抽取、已转写、已通过 20 分钟 wall-clock，或真实多人会议 ASR 已生产可用。
+- 下一步若不走真实麦克风长会，就需要人工形成具体 planned sample manifest，然后才可能进入 post-extraction evidence 和 public wall-clock soak。
+
+## DEC-296：公开中文音频小样本基线已完成，停止继续下载并转向 ASR 主链路修复
+
+日期：2026-07-10
+
+状态：Accepted / Implemented
+
+背景：
+
+- 用户质疑“下载公开音频干嘛，是否为了下载而下载”。
+- 本轮目标不是扩大数据集，而是用低成本、可复现、中文为主的小样本确认本地 ASR 中文准确率和实时性瓶颈。
+- 继续下载 AliMeeting/AISHELL-4 等 GB 级大包不会直接修复当前产品主链路，反而可能让项目回到开放式评测循环。
+
+决策：
+
+- 公开音频只作为中文 ASR baseline，不是产品功能，不进入产品数据链路。
+- 本轮停止继续下载更多公开音频；后续只有在完成明确 ASR 修复后，才允许用同一批样本复跑对比。
+- 不把 OSR 普通话句子中的误识别硬编码进产品 normalizer，避免“背测试集”污染真实会议。
+- 产品 normalizer 继续只做上下文保守的中文技术会议术语修正。
+- 下一步固定转向本地流式 runtime、常驻模型复用、断句/标点可读性、同一套 Workbench 实时 ASR -> 建议卡链路修复。
+
+真实结果：
+
+```text
+doc=docs/public-chinese-asr-baseline-report-2026-07-10.md
+json_report=artifacts/tmp/asr_reports/public_chinese_asr_baseline_20260710.json
+tool=tools/public_chinese_asr_baseline_report.py
+tests=tests/test_public_chinese_asr_baseline_report.py
+
+item_count=5
+referenced_item_count=4
+qualitative_only_item_count=1
+weighted_cer=0.047794
+avg_cer=0.049955
+max_rtf=1.169649
+avg_rtf=0.999683
+release_gate_status=needs_asr_optimization_before_release
+
+batch_reuse_total_audio_duration_seconds=153.594
+batch_reuse_total_transcribe_latency_ms=166598
+batch_reuse_transcribe_only_rtf=1.084665
+batch_reuse_magichub_rtf=1.511296
+
+remote_asr_call_count=0
+llm_call_count=0
+raw_audio_uploaded=false
+```
+
+验证：
+
+```text
+python3 -m pytest tests/test_public_chinese_asr_baseline_report.py -q
+3 passed, 1 warning
+
+python3 tools/public_chinese_asr_baseline_report.py \
+  --provider-dir artifacts/tmp/asr_reports/public_audio_baseline \
+  --output artifacts/tmp/asr_reports/public_chinese_asr_baseline_20260710.json
+exit=0
+
+code/asr_runtime/.venv-funasr/bin/python <batch reuse probe>
+status=ok
+transcribe_only_rtf=1.084665
+```
+
+影响：
+
+- 当前可以声明：公开中文小样本 ASR 基线已完成并证明本地中文实时 ASR 仍需优化。
+- 当前不能声明：真实中文会议 ASR 已生产可用、公开音频 wall-clock 已通过、或继续下载更多音频能解决主线问题。
+- 下一步不是继续找/下载音频，而是修实时会议主链路。
+
+## DEC-297：中文 ASR 优化落为实时/会后双路线，不再扩大公开音频数据集
+
+日期：2026-07-10
+
+状态：Accepted / Implemented
+
+背景：
+
+- DEC-296 已确认公开中文小样本足以暴露问题，继续下载更多公开音频不能直接提升产品价值。
+- 用户关注点是中文技术会议实时文字、实时建议、录音保存和会后复盘，不是做一个普通音频转文字工具。
+- 本轮实测发现：同一条 ASR 路线无法同时最优满足“低延迟实时建议”和“会后高准确完整稿”。
+
+决策：
+
+- 产品采用双 ASR 路线。
+- 实时会议路径继续走流式 ASR，Workbench 后端优先选择 `funasr_realtime`，sherpa 作为 fallback；FunASR sidecar 显式使用 `balanced_chinese_meeting` profile，对应 `chunk_size=0,30,15`。
+- 会后复盘/导入录音路径走离线高质量 ASR，调用 `transcribe_funasr.py --offline-batch`，优先使用本地缓存 SeACo Paraformer + VAD + 标点模型。
+- 上传录音创建 session 时保存 `post_meeting_asr_profile`，让后续事件源、报告和 UI 能追溯实际使用的 ASR 模式、RTF、标点状态和安全边界。
+- 不新增默认远端 ASR，不下载更多公开音频，不读取 `configs/local`，不读取用户私有录音，不上传原始音频，不把公开样本误识别硬编码进 normalizer。
+
+真实结果：
+
+```text
+实时路径：
+FunASR streaming baseline MagicHub RTF=1.169649
+chunk 0,20,10 MagicHub RTF=0.466800
+chunk 0,30,15 MagicHub RTF=0.389919
+product_profile=balanced_chinese_meeting
+product_chunk_size=0,30,15
+provider_selection=funasr_realtime_first_sherpa_fallback
+product_sidecar_probe_artifact=artifacts/tmp/asr_reports/realtime_funasr_sidecar_public_probe_20260710_after_merge.json
+product_sidecar_probe_rtf=0.552726
+product_sidecar_probe_partial_count=11
+product_sidecar_probe_final_text_chars=68
+product_sidecar_final_merge_status=fixed_non_cumulative_partial_merge
+
+会后路径：
+batch_mode=single_process_reused_funasr_offline_model
+provider=offline SeACo Paraformer + VAD + punctuation
+weighted_cer=0.014706
+avg_cer=0.014910
+max_rtf=0.063102
+avg_rtf=0.048278
+release_gate_status=baseline_passed_for_current_public_samples
+
+remote_asr_call_count=0
+llm_call_count_for_asr_eval=0
+raw_audio_uploaded=false
+```
+
+代码落点：
+
+```text
+code/asr_runtime/scripts/funasr_stream_worker.py
+code/web_mvp/backend/meeting_copilot_web_mvp/asr_stream.py
+code/web_mvp/backend/meeting_copilot_web_mvp/batch_transcribe.py
+code/web_mvp/backend/meeting_copilot_web_mvp/app.py
+```
+
+验证：
+
+```text
+python3 -m pytest code/asr_runtime/tests/test_transcribe_funasr.py -q
+20 passed, 1 warning
+
+PYTHONPATH=code/web_mvp/backend python3 -m pytest code/web_mvp/backend/tests/test_funasr_sidecar.py -q
+4 passed, 1 warning
+
+PYTHONPATH=code/web_mvp/backend python3 -m pytest code/web_mvp/backend/tests/test_file_convert.py -q
+7 passed, 2 warnings
+
+PYTHONPATH=code/web_mvp/backend python3 -m pytest code/web_mvp/backend/tests/test_asr_stream.py -q
+18 passed, 2 warnings
+
+PYTHONPATH=code/web_mvp/backend python3 - <<'PY'
+from pathlib import Path
+from meeting_copilot_web_mvp import batch_transcribe
+report = batch_transcribe.transcribe_file_report(
+    Path('artifacts/tmp/public_audio/prepared_16k/OSR_cn_000_0072_8k.16k.wav'),
+    timeout=240,
+)
+assert report['raw']['mode'] == 'file_batch_offline_transcript'
+assert report['raw']['punc_model_status'] == 'enabled'
+assert report['batch']['batch_mode'] == 'single_process_reused_funasr_offline_model'
+assert report['batch']['safe_to_call_remote_asr'] is False
+assert report['rtf'] <= 0.1
+PY
+rtf=0.059046
+
+PYTHONPATH=code/web_mvp/backend:code/core python3 <product sidecar public WAV probe>
+provider=funasr_realtime
+asr_profile=balanced_chinese_meeting
+chunk_size=0,30,15
+duration_seconds=19.967625
+rtf=0.552726
+partial_count=11
+final_text_chars=68
+safe_to_call_remote_asr=false
+safe_to_call_llm=false
+```
+
+影响：
+
+- 当前可以声明：中文 ASR 优化已不再停留在评测阶段，已经落到真实产品入口：实时会议优先使用 FunASR 中文会议 balanced profile，会后导入使用离线高质量稿。
+- 当前不能声明：真实麦克风长会已经最终生产可用，或 `0,30,15` 是所有会议场景的最终最优参数。
+- 下一步应围绕 Workbench 真实麦克风/外放会议主链路继续验收实时文字延迟、建议卡触发和录音保存，而不是继续扩大公开音频样本。
+
+## DEC-298 - Workbench organize fast path for real-mic mainline
+
+时间：2026-07-10
+
+问题：
+
+- 真实浏览器麦克风链路已经能采集音频、实时显示文字、保存录音并生成至少 1 条正式建议，但 `整理会议` 仍会在长/准长会议中超时。
+- 根因是 Workbench `整理会议` 串行执行 `llm-execution-runs -> approach-cards -> minutes`，而第一步对多个 `llm_request_draft_event` 顺序调用远端 LLM。5 分钟真实麦克风会话出现 33 个候选，2 分钟会话也出现 14 个候选，后续方案和纪要被候选级 LLM 调用拖住。
+
+决策：
+
+- 保留单独“生成会议建议”的普通预算，但为 `整理会议` 增加快路径：只先执行 1 条最高价值正式建议，然后立即进入方案分析和会议纪要。
+- 后端新增 `llm-execution-candidate-selection.v1`，`/llm-execution-runs` 支持受控 `max_candidates`，并返回 `candidate_selection` 说明总候选、选中、跳过、上限和原因。
+- 前端新增 `ORGANIZE_FAST_SUGGESTION_BUDGET = 1`，`organizeCurrentSession()` 调用 `generateSuggestionCards({ showToast: false, maxCandidates: ORGANIZE_FAST_SUGGESTION_BUDGET })`。
+
+实现落点：
+
+```text
+code/web_mvp/backend/meeting_copilot_web_mvp/app.py
+code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js
+code/web_mvp/backend/tests/test_app.py
+code/web_mvp/backend/tests/test_workbench.py
+docs/real-mic-workbench-mainline-report-2026-07-10.md
+docs/current-mainline-index.md
+```
+
+验证：
+
+```text
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_app.py \
+  code/web_mvp/backend/tests/test_workbench.py \
+  -q -k 'request_candidate_budget or fast_suggestion_candidate_budget'
+
+2 passed, 164 deselected, 2 warnings
+
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_app.py \
+  code/web_mvp/backend/tests/test_llm_service.py \
+  code/web_mvp/backend/tests/test_workbench.py \
+  code/web_mvp/backend/tests/test_asr_stream.py \
+  -q -k 'llm_execution_runs or llm_execution or approach or minutes or caps_long_meeting or request_candidate_budget or fast_suggestion_candidate_budget or organize or live_mic'
+
+40 passed, 151 deselected, 2 warnings
+```
+
+真实链路证据：
+
+```text
+artifact=artifacts/tmp/browser_live_mic/real-mic-workbench-2min-fast-organize-20260710-173727
+input_mode=real_browser_mic
+ui_coverage=visible_chrome
+provider=funasr_realtime
+provider_mode=real
+acceptance_eligible=true
+health_status=audio_capture_health_passed
+first_text_after_audio_active_latency_ms=7197
+first_final_after_audio_active_latency_ms=32304
+suggestion_card_count=1
+approach_card_count=3
+minutes_char_count=668
+llm_call_count=3
+llm_usage_total_tokens=15364
+audio_export_http_status=200
+audio_sha256_matches_session=true
+organize_wait_status=matched
+```
+
+影响：
+
+- 当前可以声明：2 分钟真实浏览器麦克风 Workbench 主链路已经闭合到实时文字、正式建议、方案分析、会议纪要、录音保存和录音导出。
+- 当前不能声明：20 分钟长会议生产验收已完成，或中文技术词 ASR 准确率已达到生产级。
+- 下一步固定为 mock/demo 历史隔离、全按钮 E2E、5 分钟再验证、再进入 20 分钟 wall-clock soak，而不是继续扩大公开音频下载或候选建议数量。
+
+## DEC-299 - Default Workbench history excludes mock/demo records
+
+时间：2026-07-10
+
+问题：
+
+- Workbench 正常历史列表和 mock/demo/selftest 共用 `/live/asr/sessions`。
+- 即使 UI 有“演示会议”标签，用户正常打开页面时仍可能看到旧 mock/demo 记录，污染“真实会议主链路是否可用”的判断。
+
+决策：
+
+- 后端 `GET /live/asr/sessions` 默认只返回用户真实历史。
+- 只有显式 `?include_demo=true` 才返回 mock/demo/local-event/simulated selftest records。
+- 前端 `loadSessionHistory()` 通过 `sessionHistoryPath()` 判断：普通模式请求默认历史；`?demo=1` 或 demo localStorage opt-in 才请求 `include_demo=true`。
+
+默认隐藏范围：
+
+```text
+mock_asr_session
+local_asr_event_file
+input_source=mock
+input_source=local_event_file
+input_source=simulated_realtime_wav
+provider=local_mock_asr
+provider=fake
+acceptance_blocker=mock_or_demo_session
+acceptance_blocker=local_event_file_not_real_input
+```
+
+实现落点：
+
+```text
+code/web_mvp/backend/meeting_copilot_web_mvp/app.py
+code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js
+code/web_mvp/backend/tests/test_app.py
+code/web_mvp/backend/tests/test_workbench.py
+docs/current-mainline-index.md
+docs/real-mic-workbench-mainline-report-2026-07-10.md
+```
+
+验证：
+
+```text
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_app.py \
+  code/web_mvp/backend/tests/test_workbench.py \
+  -q -k 'hides_mock_sessions_by_default or history_requests_demo_sessions_only_after_demo_opt_in'
+
+2 passed, 165 deselected, 2 warnings
+
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_app.py \
+  code/web_mvp/backend/tests/test_workbench.py \
+  code/web_mvp/backend/tests/test_llm_service.py \
+  code/web_mvp/backend/tests/test_asr_stream.py \
+  -q -k 'history or sessions_list or persists_cards or workbench_full_flow or demo_load or llm_execution_runs or approach or minutes or live_mic or organize'
+
+40 passed, 152 deselected, 2 warnings
+
+node code/web_mvp/e2e/workbench_smoke.mjs
+workbench smoke OK: 4 utterances, 9 suggestions, history/minutes/delete verified
+```
+
+影响：
+
+- 当前可以声明：正常 Workbench 历史不会默认混入 mock/demo/local-event/selftest records。
+- 当前不能声明：全按钮 E2E 已完成，或真实 20 分钟长会议验收已完成。
+- 下一步应进入更长真实麦克风复测和全按钮 E2E，而不是继续让 demo/selftest 污染正常产品视图。
+
+## DEC-300 - 5-minute real browser microphone Workbench fast-organize recheck
+
+时间：2026-07-10
+
+问题：
+
+- DEC-298 已证明 2 分钟真实麦克风主链路闭环，但仍需要更接近长会的复测，确认 24+ 候选不会再次拖住 `整理会议`。
+- DEC-299 已完成历史隔离，应在该边界下复测真实主链路。
+
+决策：
+
+- 使用 visible Chrome Workbench + real browser getUserMedia microphone + 本机 `say -v Tingting` 中文技术会议脚本外放，跑 5 分钟 fast-organize 主链路。
+- 继续使用 `production_enabled` derivation mode，保留 session 和录音证据。
+
+证据：
+
+```text
+artifact=artifacts/tmp/browser_live_mic/real-mic-workbench-5min-fast-organize-history-filter-20260710-175608
+session_id=rec_mrergapj
+input_mode=real_browser_mic
+ui_coverage=visible_chrome
+provider=funasr_realtime
+provider_mode=real
+is_mock=false
+acceptance_eligible=true
+acceptance_blockers=[]
+health_status=audio_capture_health_passed
+events_count=116
+drafts=24
+suggestion_card_count=1
+approach_card_count=3
+minutes_char_count=817
+llm_call_count=3
+llm_usage_total_tokens=16332
+audio.duration_ms=299776
+audio.file_size_bytes=9592876
+audio_export_http_status=200
+audio_sha256_matches_session=true
+organize_wait_status=matched
+```
+
+Realtime metrics:
+
+```text
+first_audio_active_offset_ms=254
+first_text_after_audio_active_latency_ms=7178
+first_final_after_audio_active_latency_ms=175636
+partial_visible_count=165
+final_visible_count=2
+frontend_utterance_count=19
+frontend_card_count=4
+frontend_minutes_visible=true
+```
+
+结论：
+
+- 当前可以声明：5 分钟真实浏览器麦克风主链路已跑通到实时文字、正式建议、方案分析、会议纪要、录音保存和录音导出；organize 快路径没有被 24 个候选拖住。
+- 当前不能声明：20 分钟长会议生产 gate 完成，或实时 ASR final latency 已达生产级。
+- 下一步：先补全按钮 E2E 和 ASR 术语/latency 优化，再进入 20 分钟 wall-clock soak。
+
+## DEC-301 - Workbench browser all-buttons E2E coverage includes audio export
+
+时间：2026-07-10
+
+问题：
+
+- 用户要求页面每个按钮都要触发自测并截图留痕，不能只用口头说明“页面可用”。
+- 现有 `workbench_all_buttons_smoke.mjs` 覆盖了导入录音、历史、建议、方案、纪要、刷新、导出文字稿/纪要、自动建议、整理和删除，但漏掉 `btn-export-audio`，也没有输出明确的 `button_coverage` 表。
+- `btn-record` / `btn-stop` 属于真实浏览器麦克风链路，不能在导入录音 smoke 中伪造点击，应在覆盖表中明确由真实麦克风 E2E 负责。
+
+决策：
+
+- `workbench_all_buttons_smoke.mjs` 增加 `buttonCoverage` / `button_coverage`，将用户可见主按钮逐项列出。
+- 导入录音 smoke 继续使用本地固定中文技术会议音频作为回归输入，只验证浏览器页面链路，不调用付费 LLM；LLM 使用 fake gateway。
+- 录音导出纳入同一下载拦截验证，和文字稿、纪要一起确认下载目标。
+- 对 `btn-record` / `btn-stop` 标记为 `covered_by_real_browser_mic_e2e`，证据为 `workbench_browser_live_mic_verify.mjs`，避免把真实麦克风按钮混入导入录音 lane。
+- 公开/固定音频仅作为最小可复现回归夹具，不作为主线验收目标；主线验收仍以真实麦克风长会议链路为准。
+
+证据：
+
+```text
+artifact=artifacts/tmp/ui_screenshots/workbench-all-buttons-smoke
+status=go_workbench_all_buttons_smoke
+imported_session_id=file_28aae6711d74
+fake_llm_request_count=10
+screenshot_count=15
+downloads=[
+  file_28aae6711d74.transcript.txt,
+  file_28aae6711d74.minutes.md,
+  file_28aae6711d74.audio.wav
+]
+```
+
+按钮覆盖：
+
+```text
+btn-record -> covered_by_real_browser_mic_e2e
+btn-stop -> covered_by_real_browser_mic_e2e
+btn-upload -> file_input_triggered
+btn-history -> clicked
+btn-cards -> clicked
+btn-approach -> clicked
+btn-minutes -> clicked
+btn-live -> clicked
+btn-export-transcript -> clicked
+btn-export-minutes -> clicked
+btn-export-audio -> clicked
+btn-auto-suggestion-toggle -> clicked_pause_and_resume
+btn-organize -> clicked
+btn-delete -> clicked_confirmed
+```
+
+验证：
+
+```text
+python3 -m pytest tests/test_workbench_all_buttons_smoke.py -q
+6 passed, 1 warning
+
+node --check code/web_mvp/e2e/workbench_all_buttons_smoke.mjs
+exit 0
+
+node code/web_mvp/e2e/workbench_all_buttons_smoke.mjs
+exit 0
+```
+
+结论：
+
+- 当前可以声明：Workbench 浏览器层主按钮已有可追溯 E2E 覆盖和截图证据，录音导出已纳入验证。
+- 当前不能声明：Tauri 安装包内的所有按钮点击流已完成，或 20 分钟真实长会议生产 gate 已完成。
+
+## DEC-302 - Persist realtime ASR final before sending it to the browser
+
+时间：2026-07-10
+
+问题：
+
+- Workbench 前端在收到 `final` / `transcript_final` 后会立即调用 `/live/asr/sessions/{sid}/auto-suggestions/run-once`，用于会议中实时建议。
+- 旧 `asr_stream.handle_stream()` 顺序是先 `websocket.send_text(final)`，再把 final 写入 live session repo。
+- 这会产生竞态：浏览器已经收到 final 并触发自动建议时，后端同 session 记录和候选事件可能还没持久化，导致实时建议偶发 404/空候选，只能等结束后 `refreshRecordedSession()` 再补。
+
+决策：
+
+- 对 chunk 内的 raw `partial` / `final` 和服务端 VAD endpoint final，改为先更新内存状态并 `_upsert_live_session()`，再把事件发送给浏览器。
+- partial hint 继续随同一个 websocket 返回，但通过 `outgoing_events=[ev, partial_hint]` 保持 raw event 先于 hint 的发送顺序。
+- 不改变 ASR provider、LLM provider、录音保存或派生接口语义。
+
+TDD 证据：
+
+```text
+新增红灯:
+test_asr_stream_persists_live_final_before_sending_to_browser
+
+红灯现象:
+发送 final 的 send_text hook 中 repo.get(session_id) 仍为 KeyError
+
+修复后:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_asr_stream.py \
+  -q -k 'persists_live_final_before_sending_to_browser'
+
+1 passed, 18 deselected, 2 warnings
+```
+
+回归：
+
+```text
+PYTHONPATH=code/web_mvp/backend python3 -m pytest code/web_mvp/backend/tests/test_asr_stream.py -q
+19 passed, 2 warnings
+
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_app.py \
+  code/web_mvp/backend/tests/test_workbench.py \
+  code/web_mvp/backend/tests/test_llm_service.py \
+  code/web_mvp/backend/tests/test_asr_stream.py \
+  code/web_mvp/backend/tests/test_auto_suggestions.py \
+  tests/test_workbench_all_buttons_smoke.py \
+  -q -k 'history or sessions_list or persists_cards or workbench_full_flow or demo_load or llm_execution_runs or approach or minutes or live_mic or organize or workbench_all_buttons or auto_suggestion or partial_hint'
+
+60 passed, 148 deselected, 2 warnings
+
+node code/web_mvp/e2e/workbench_all_buttons_smoke.mjs
+status=go_workbench_all_buttons_smoke
+screenshot_count=15
+downloads=[transcript.txt, minutes.md, audio.wav]
+```
+
+短真实麦克风 no-cost 复测：
+
+```text
+artifact=artifacts/tmp/browser_live_mic/real-mic-order-fix-nocost-20260710-183032
+session_id=rec_mresojzc
+input_mode=real_browser_mic
+ui_coverage=visible_chrome
+provider=funasr_realtime
+provider_mode=real
+is_mock=false
+acceptance_eligible=true
+acceptance_blockers=[]
+health_status=audio_capture_health_passed
+sample_count=479232
+chunk_count=100
+active_sample_ratio=0.7804591513087606
+derivation_mode=no_cost_deterministic
+counts_as_production_llm_evidence=false
+suggestion_card_count=3
+approach_card_count=1
+minutes_char_count=252
+audio_export_http_status=200
+audio_file_size_bytes=958508
+audio_sha256_matches_session=true
+```
+
+Realtime UI metrics:
+
+```text
+first_audio_active_offset_ms=264
+first_text_after_audio_active_latency_ms=6158
+first_final_after_audio_active_latency_ms=30258
+partial_visible_count=16
+final_visible_count=1
+frontend_utterance_count=1
+frontend_card_count=4
+frontend_minutes_visible=true
+```
+
+结论：
+
+- 当前可以声明：实时 final 发送给浏览器前，后端同 session live record 已存在，降低会议中自动建议触发竞态。
+- 当前可以声明：短真实浏览器麦克风 no-cost 主链路仍可跑通到实时文字、建议、方案、纪要、录音保存和导出。
+- 当前不能声明：这次 no-cost 复测是生产 LLM 证据；也不能声明 20 分钟真实长会议 gate 或中文技术词识别质量已达生产级。
+
+## DEC-303 - Bound latest real-mic Chinese technical term near-miss normalization
+
+时间：2026-07-10
+
+问题：
+
+- 短真实浏览器麦克风 no-cost 复测后，主链路没有新增“页面按钮/录音保存/建议卡触发”级别 blocker，但暴露出中文技术会议 ASR 近音错词：
+  - `发布庭审` 应为 release-review 语境下的 `发布评审`
+  - `t九九` 被通用词典后处理成 `tP99`
+  - `斯隆看板` 应为 `SLO看板`
+- 修复第三波后，短真实浏览器麦克风 no-cost 复测 `artifacts/tmp/browser_live_mic/real-mic-normalizer-v3-nocost-20260710-185357` 证明主链路仍可跑通，但又暴露出第四波近音：
+  - `t九` / `t一九` 应为指标语境下的 `P99`
+  - `四low看板` 应为 `SLO看板`
+  - `ure flap` 应为 `feature flag`
+- 这些错词会直接影响实时文字可读性、EvidenceSpan、建议候选和 LLM 上下文质量。
+- 用户已明确质疑公开音频下载不能变成“为了下载而下载”，因此本轮不能继续扩大公开音频评测范围来包装进展。
+
+决策：
+
+- 公开音频只作为少量、可重复、中文优先的回归辅助，不作为当前主线。
+- 当前主线仍是真实浏览器麦克风 Workbench 主链路。
+- 在 `meeting_copilot_web_mvp.transcript_normalizer` 中只补 bounded contextual rules：
+  - `发布庭审 -> 发布评审` 仅限发布/灰度/错误率/回滚/延迟/毫秒上下文。
+  - `t九九/t九/t一九 -> P99` 仅限指标上下文，并在通用词典前处理，避免 `九九延迟 -> P99延迟` 先命中造成 `tP99`。
+  - `斯隆看板/四low看板 -> SLO看板` 作为真实麦克风观测到的精确近音修正。
+  - `ure flap -> feature flag` 仅限后续存在 `和`、`roll`、`回滚`、`王五`、`补充`、`确认` 等发布评审连接语境。
+- 不改通用词典排序，不新增远端 ASR，不新增默认收费项，不读取用户私有录音，不读取 `configs/local`。
+
+真实麦克风 no-cost 复测证据：
+
+```text
+artifact=artifacts/tmp/browser_live_mic/real-mic-normalizer-v3-nocost-20260710-185357
+session_id=rec_mretintu
+input_mode=real_browser_mic
+ui_coverage=visible_chrome
+provider=funasr_realtime
+provider_mode=real
+is_mock=false
+acceptance_eligible=true
+acceptance_blockers=[]
+health_status=audio_capture_health_passed
+sample_count=765952
+chunk_count=160
+active_sample_ratio=0.7612631078709893
+derivation_mode=no_cost_deterministic
+derivations_generated=true
+counts_as_production_llm_evidence=false
+suggestion_card_count=3
+approach_card_count=1
+minutes_char_count=252
+audio_export_http_status=200
+audio_file_size_bytes=1531948
+audio_sha256_matches_session=true
+workbench_same_session_visible=true
+frontend_utterance_count=4
+frontend_card_count=4
+frontend_minutes_visible=true
+browser_console_error_count=0
+network_error_count=0
+first_text_after_audio_active_latency_ms=7003
+first_final_after_audio_active_latency_ms=47283
+```
+
+TDD 证据：
+
+```text
+红灯:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_transcript_normalizer.py \
+  -q -k 'third_real_browser_mic_release_review_variants'
+
+失败现象:
+发布庭审 remains unchanged
+t九九 becomes tP99
+斯隆看板 remains unchanged
+
+绿灯:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_transcript_normalizer.py \
+  -q -k 'third_real_browser_mic_release_review_variants'
+
+1 passed, 17 deselected, 1 warning
+
+红灯:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_transcript_normalizer.py \
+  -q -k 'fourth_real_browser_mic_release_review_variants'
+
+失败现象:
+t九 remains unchanged
+四low看板 remains unchanged
+ure flap remains unchanged
+t一九 remains unchanged
+
+绿灯:
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_transcript_normalizer.py \
+  -q -k 'fourth_real_browser_mic_release_review_variants'
+
+1 passed, 18 deselected, 1 warning
+```
+
+回归：
+
+```text
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_transcript_normalizer.py -q
+
+19 passed, 1 warning
+
+PYTHONPATH=code/web_mvp/backend python3 -m pytest \
+  code/web_mvp/backend/tests/test_app.py \
+  code/web_mvp/backend/tests/test_workbench.py \
+  code/web_mvp/backend/tests/test_llm_service.py \
+  code/web_mvp/backend/tests/test_asr_stream.py \
+  code/web_mvp/backend/tests/test_auto_suggestions.py \
+  code/web_mvp/backend/tests/test_transcript_normalizer.py \
+  tests/test_workbench_all_buttons_smoke.py \
+  -q -k 'history or sessions_list or persists_cards or workbench_full_flow or demo_load or llm_execution_runs or approach or minutes or live_mic or organize or workbench_all_buttons or auto_suggestion or partial_hint or transcript_normalizer'
+
+79 passed, 148 deselected, 2 warnings
+```
+
+结论：
+
+- 当前可以声明：短真实麦克风 no-cost 主链路仍可跑通到实时文字、建议、方案、纪要、录音保存和导出。
+- 当前可以声明：已把本轮真实麦克风暴露的 release-review 技术词近音错误纳入自动化回归，并修复到 Workbench realtime normalizer。
+- 当前不能声明：中文 ASR 已达到生产级，或 20 分钟真实长会议 gate 已完成。
+- 下一步不继续扩公开音频下载，也不继续无限追逐单个错词；需要转向 20 分钟真实麦克风 soak、ASR final latency 优化、热词/profile 调优或轻量 post-ASR 修正。
+
+## DEC-332 - FunASR cumulative realtime text must be segmented before browser delivery
+
+时间：2026-07-12
+
+问题：
+
+- 用户真实会议截图显示，同一段累计中文转写被页面重复显示为多条“发言”。
+- 现场事件表明 FunASR worker 使用固定 segment 输出从会议开始累计到当前的 partial；服务端 VAD 每次静音却创建新的 `vad_endpoint_*` final，并把累计全文直接发送给浏览器。
+- 前端按 segment ID 正确 upsert，但不同 endpoint ID 使累计全文成为多条独立行；最终仓储又会替换累计 final，导致会中视图与历史视图不一致。
+- `.btn` 的 author CSS 覆盖了 `hidden`，同时 recording phase 把 start 按钮改名为“结束会议”，所以页面出现两个没有业务差异的结束入口。
+
+决策：
+
+- 只对 `funasr_realtime` 的累计输出做增量切分，不改变 Fake、Sherpa 或其他可插拔 Provider 的事件协议。
+- VAD endpoint 保存已提交的累计源文本，后续 partial/final 仅发送新增后缀。
+- 同一个待提交语音段的 partial 与 final 使用相同 endpoint segment ID，使前端原位替换。
+- 最终落库保存增量分段，不再保存 `第一段`、`第一段+第二段` 形式的重复累计 final。
+- 为 `.btn[hidden]` 增加 `display:none!important`，录音阶段只显示独立 `btn-stop`，不再把隐藏的 `btn-record` 改名为结束按钮。
+
+TDD 与回归：
+
+```text
+RED:
+2 failed
+- duplicate end-meeting control contract missing
+- second cumulative endpoint returned first+second instead of second
+
+GREEN focused:
+2 passed
+
+ASR + Workbench + product UI regression:
+183 passed, 2 warnings
+
+git diff --check: clean
+workbench.js syntax: passed
+```
+
+边界：
+
+- 本决策修复页面重复和控制重复，不代表中文 ASR 准确率或录音中正式 AI 建议已经达到 production Go。
+- 重启服务后必须用两段连续中文语音验证：页面不出现累计全文重复、每段最多一个活动 partial、录音期间只出现一个结束按钮。
+
+## DEC-333 - Canonical Transcript is the only user-visible meeting document
+
+时间：2026-07-12
+
+问题：
+
+- 原 Workbench 将 ASR partial、final、revision 当成可见事件行，导致累计内容重复、修正后旧文仍占一行、刷新后文字为空，以及用户向上阅读时被新内容强制拉回底部。
+- ASR `segment_id` 与修正补充的内部身份共用一个字符串命名空间，合法 segment 可能与 `revision-supplement:*` 冲突。
+- 会话列表缺少墙钟活动时间；如果把任意仓储更新都算作会议活动，旧会议生成纪要后会被错误恢复为“最近会议”。
+
+决策：
+
+- 用户可见文字只有一个权威：`committed segments + optional active_tail`。原始事件继续保留用于审计，但不得直接追加为 UI 行。
+- partial 只更新唯一 active tail；final 提交正文；revision 原位替换目标 segment，并保留可展开的原始识别。
+- Canonical Segment 同时保存 `projection_key` 与 `segment_id`。普通段落使用 `segment:<segment_id>`，无法定位目标的修正补充使用独立 `revision-supplement:<identity>`。
+- 正文和 active tail 必须在一次渲染事务中更新，只捕获一次滚动状态、只同步一次滚动结果。
+- 用户距底部不超过 96px 时自动跟随；用户向上阅读或点击证据后暂停跟随，并显示 `↓ 有新内容`。
+- ASR Live Repository 在 create 时补齐墙钟时间，但普通 AI 建议、修正、纪要更新不得推进会议 `last_activity_at_epoch_ms`；只有 ASR/音频主链路显式推进。
+- 页面启动时恢复最新 `recoverable && !is_mock` 的真实会话。真实麦克风会话没有 `end_of_stream` 时明确显示录音连接已中断；只有 `audio.saved=true` 才声明录音已保留，否则明确说明该历史会话未保存录音。
+- 启动恢复只加载已保存结果，不自动重复触发付费 AI 调用。
+
+TDD 与验收：
+
+```text
+新增 RED：8 个恢复/滚动/时间戳测试按预期失败
+最终相关 Python 回归：311 passed, 2 warnings
+Workbench all-buttons browser E2E：go_workbench_all_buttons_smoke
+浏览器验证：
+  revision segment count remains 1
+  active tail count <= 1
+  duplicate final visible count = 1
+  scroll-up position preserved
+  new-content button visible and click resumes bottom follow
+  reload restores same session and identical canonical full text
+  console/runtime/network 5xx errors = 0
+```
+
+真实数据核验：
+
+```text
+session=rec_mrh7w0eb
+event_count=91
+canonical_segment_count=53
+canonical_active_tail_count=1
+canonical_committed_char_count=2065
+canonical_full_char_count=2068
+visible_duplicate_发言_label_count=0
+status=已恢复最近会议。录音连接已中断，已保留截至断开时的文字；本场历史会话未保存录音。
+screenshot=artifacts/tmp/ui_screenshots/canonical-transcript-live-8767.png
+```
+
+边界：
+
+- 本决策解决“完整文字如何持续展示、修正、恢复和滚动”的产品主线，不代表中文 ASR 准确率已达到生产 Go。
+- 新一轮真实麦克风录音、长会议 soak 和录音期正式 AI 建议 gate 仍需独立验收，不得用历史会话恢复结果替代。
+
+## DEC-334 - Canonical transcript must survive ASR re-recognition, provider failure and honest recovery
+
+时间：2026-07-12
+
+问题：
+
+- 独立审查发现，FunASR 累计快照在已提交边界内小范围回改时，partial 阶段可以临时协调，但 tail 转为 final 后 `source_snapshot_text` 与 `projection_reconciled` 会在持久化转换中丢失，历史 canonical 正文会永久拼成旧前缀加新后缀。
+- `provider_error` 分支直接覆盖 `#transcript-stream.innerHTML`，会删除已确认正文和固定 canonical 容器。
+- 正常结束事件被转换为 `evaluation_summary`，前端只查原始 `end_of_stream`，导致正常结束的真实麦克风会话刷新后被误报为连接中断。
+- 只有 active tail 的 canonical 会话在后端可恢复，但前端只把 final/revision 视为文字；当 `audio.saved=false` 时可能落入错误的“录音已保存”文案。
+
+决策：
+
+- FunASR final 持久化必须保留 `source_snapshot_text` 和 `projection_reconciled`。Backend projector 与 frontend reducer 使用同一规则：源快照以前文为前缀时只取新增后缀；发生边界回改时按公共前缀截断旧 committed segments，再从权威源快照补齐正文。
+- 该协调同时覆盖 active tail 和 committed final，不能只修瞬时 partial 展示。
+- `provider_error` 只改变 ASR 状态、来源徽标和会话阶段；已有 canonical 正文与 `#transcript-document`、`#transcript-active-tail` 必须保留。只有正文为空时才在固定文档容器中显示错误空态。
+- 每次正常流结束都把 `end_of_stream` 纳入持久化输入；恢复时同时接受原始 `end_of_stream` 或 `evaluation_summary.payload.end_of_stream_event_count > 0`。
+- `sessionHasTranscript` 优先读取 `canonical_transcript.full_text`，因此 active tail 也算可恢复文字。恢复文案分别判断 `hasTranscript`、`audio.saved` 与是否中断，任何 `audio.saved=false` 分支都不得宣称录音已保存。
+
+TDD 与验收：
+
+```text
+RED focused: 6 failed
+GREEN focused: 6 passed
+Canonical / ASR / API / Workbench regression: 315 passed, 2 warnings
+Correction / suggestion / Workbench regression: 256 passed, 2 warnings
+Workbench all-buttons browser E2E: go_workbench_all_buttons_smoke
+
+reconciled_final_probe:
+  full_text=我们讨论产品目的和实现计划
+  active_tail_count=0
+
+provider_error_preservation_probe:
+  canonical full text unchanged
+  committed segment count unchanged
+  transcript containers preserved
+  status=实时识别不可用
+```
+
+边界：
+
+- 本决策关闭的是 canonical 正文一致性和恢复状态误报，不等于新一轮真实麦克风声学验收已经完成。
+- 生产中文 ASR 准确率、20 分钟长会 soak、录音期正式 AI 建议延迟仍保持 No-Go，必须由后续真实会议门禁给出证据。
+
+## DEC-335 - Retired scaffolding tests are excluded explicitly from current regression
+
+时间：2026-07-12
+
+问题：
+
+- 根目录回归仍收集 9 个依赖已退休文件的历史测试：旧 ASR event-generation plan、旧 FunASR execution packet assembler，以及已删除的 Rust toolchain installation policy。
+- 这些失败不是当前产品回归，也不应通过恢复空壳脚本或放宽安全策略来“修绿”。
+
+决策：
+
+- 保留历史测试文件作为审计材料，在 `tests/conftest.py` 中用显式 `collect_ignore` 排除；每条排除项注明对应的退休 commit 和原因。
+- 当前回归只对 V2 主线代码、当前 API 合同和仍受支持的验证工具负责。
+- 旧工具继续保留在 `tools/_archive/`，不恢复旧 `/desktop/...` endpoint，不把“测试被排除”宣称为功能实现。
+
+证据：
+
+```text
+retired_tests=9
+retired_tools=tools/_archive/asr_event_generation_plan.py,tools/_archive/funasr_synthetic_smoke_execution_packet.py
+retired_policy=code/desktop_tauri/rust-toolchain-installation.policy.json
+collection_policy=tests/conftest.py
+```
+
+边界：
+
+- 这项决策只处理测试集合与历史契约的边界，不代表 FunASR 中文质量、真实麦克风、长会议 soak 或录音期正式 AI 已通过生产验收。
+
+## DEC-336 - Canonical transcript counts must exclude empty-state placeholders
+
+时间：2026-07-13
+
+问题：
+
+- 长会议 Workbench verifier 在删除会话后检查 `.utterance` 数量。
+- 页面删除后的空态提示“本次会议已删除”复用了 `.utterance` 类，因此验证器报出 `actual utterances=1`，尽管 `currentSession=null` 且后端已返回 404。
+- all-buttons verifier 的截图状态也使用同一旧选择器，会让交付报告把空态提示记录成会议正文。
+
+决策：
+
+- 所有当前 Workbench E2E 的正文数量统一按 canonical transcript 统计：
+  `transcript-segment[data-transcript-segment-id]` 加一个可见的
+  `#transcript-active-tail`。
+- 不再用通用 `.utterance` 作为会议正文数量或删除后空态断言；`.utterance` 仍可作为兼容性的存在性等待条件，但不作为业务计数。
+- 长会议 verifier 与 all-buttons verifier 共用同一统计口径，避免不同报告对同一页面给出不同数量。
+
+TDD 与验收：
+
+```text
+RED:
+  tests/test_workbench_long_meeting_evidence.py -> 1 expected failure
+  tests/test_workbench_all_buttons_smoke.py -> 1 expected failure
+GREEN:
+  long-meeting static tests -> 5 passed, 1 warning
+  all-buttons static tests -> 15 passed, 1 warning
+  long-meeting browser E2E -> go_long_meeting_ui_evidence
+  all-buttons browser E2E -> go_workbench_all_buttons_smoke
+  root tests -> 341 passed, 2 warnings
+  backend tests -> 633 passed, 2 warnings
+```
+
+证据：
+
+- `artifacts/tmp/ui_screenshots/workbench-long-meeting-evidence/long_meeting_ui_report.json`
+- `artifacts/tmp/ui_screenshots/workbench-all-buttons-smoke/workbench_all_buttons_report.json`
+- `code/web_mvp/e2e/workbench_long_meeting_evidence_verify.mjs`
+- `code/web_mvp/e2e/workbench_all_buttons_smoke.mjs`
+
+边界：
+
+- 该决策修复的是 E2E 证据口径，不是 ASR 识别质量修复，也不是音频采集修复。
+- 长会议报告仍是 fixture-only；它不计入真实麦克风、生产正式 AI、真实 wall-clock soak、录音导出 SHA 或 Mac/Windows 发布验收。
+
+关联文档：
+
+- `docs/superpowers/plans/2026-07-12-v2-recovery-implementation-plan.md`
+- `docs/current-mainline-index.md`
+
+## DEC-337 - Synthetic soak and existing audio SHA are supporting evidence only
+
+时间：2026-07-13
+
+背景：
+
+- V2 恢复计划还需要补齐低风险的长会模拟、公开中文基线核对和录音导出完整性证据。
+- 如果把 deterministic synthetic soak 或历史真实录音 SHA 直接写成生产长会验收，会重新制造“测试通过但产品未通过”的状态误读。
+
+决策：
+
+- 执行一次 20 分钟 deterministic synthetic soak，作为调度/指标/成本边界证据；它不替代真实 wall-clock 20 分钟进程 soak。
+- 复用并核对 2026-07-10 中文公开音频基线，不继续下载公开音频；当前 CER/RTF 仍保持发布前需优化。
+- 独立重算已有真实麦克风录音导出文件的 SHA，与 session 保存的 SHA 对比；通过只说明录音导出完整性，不说明录音期正式 AI 或 ASR 质量已通过。
+
+证据：
+
+```text
+synthetic_soak:
+  artifact=artifacts/tmp/soak/v2-recovery-synthetic-20260713/soak_report.json
+  verdict=go
+  duration_minutes=20
+  chunk_count=600
+  asr_rtf=0.1
+  rss_growth_mb=12
+  remote_asr_called=false
+  llm_called=false
+  wall_clock_production_soak=false
+
+public_chinese_baseline:
+  artifact=artifacts/tmp/asr_reports/public_chinese_asr_baseline_20260710.json
+  weighted_cer=0.047794
+  max_rtf=1.169649
+  release_gate_status=needs_asr_optimization_before_release
+  additional_download=false
+
+audio_export_sha:
+  artifact=artifacts/tmp/browser_live_mic/realtime-focus-speaker-to-real-mic-production-20260711-final/audio_export_probe.json
+  session_id=rec_mrgp2xo1
+  http_status=200
+  bytes=3194924
+  computed_sha_matches_session=true
+```
+
+边界：
+
+- 真实麦克风声学 gate、中文技术语义 Go、录音期间 production 正式 AI 建议、真实 wall-clock 长会、Mac/Windows 发布验收仍未完成。
+
+关联文档：
+
+- `docs/superpowers/plans/2026-07-12-v2-recovery-implementation-plan.md`
+- `docs/current-mainline-index.md`
+
+## DEC-338 - Fresh real-microphone runs remain No-Go at the ASR input/final boundary
+
+时间：2026-07-13
+
+背景：
+
+- V2 canonical transcript 和 Workbench UI 证据已经通过 fixture/all-buttons 验证，但生产价值仍取决于真实麦克风能否稳定产生非空 ASR final。
+- 用户要求真实麦克风全链路自测，因此本轮在当前 `8767` 服务上执行了两次 no-cost、可见 Chrome、独立证据目录的复测；没有调用生产 LLM。
+
+决策：
+
+- 30 秒运行虽然通过音频健康门禁，但 `funasr_realtime` 没有产生 partial/final，`final_event_count=0`，因此判定 `failed_realtime_text_not_visible`，不进入建议/方案/纪要。
+- 60 秒运行在有效音量门禁处失败，判定 `blocked_audio_too_quiet`，不继续下游 ASR/LLM 验收。
+- 两次运行都保留录音并通过导出 SHA 校验，说明录音保存/导出链路正常；这不能抵消 ASR final 缺失，也不能宣称实时 Copilot 完成。
+- 当前不再盲目重复相同环境的录音。下一次真实验收必须先提供可控、可确认含中文技术语音的输入源，并继续保留非 fake ASR final、实时文字和录音期正式卡门禁。
+
+证据：
+
+```text
+run_30s:
+  artifact=artifacts/tmp/browser_live_mic/v2-recovery-real-mic-nocost-20260713
+  session_id=rec_mrifrspa
+  health_status=audio_capture_health_passed
+  rms=0.0170214441
+  peak=0.5828479528
+  active_sample_ratio=0.1938873030
+  final_event_count=0
+  audio_saved=true
+  audio_sha256_matches_session=true
+  browser_console_errors=0
+  network_errors=0
+
+run_60s:
+  artifact=artifacts/tmp/browser_live_mic/v2-recovery-real-mic-60s-nocost-20260713
+  session_id=rec_mriftu01
+  health_status=blocked_audio_too_quiet
+  rms=0.0036352410
+  peak=0.1493300795
+  active_sample_ratio=0.0549389440
+  final_event_count=0
+  audio_saved=true
+  audio_sha256_matches_session=true
+  browser_console_errors=0
+  network_errors=0
+```
+
+边界：
+
+- 当前真实麦克风主链路仍为 No-Go；不能用已有历史成功 artifact、synthetic soak、导入文件链或会后 no-cost 卡片替代新鲜真实验收。
+- 当前未执行生产远端 LLM，录音期正式 AI 建议门禁仍未通过；真实中文 ASR 质量和 final latency 仍是主 blocker。
+
+关联文档：
+
+- `docs/superpowers/plans/2026-07-12-v2-recovery-implementation-plan.md`
+- `docs/current-mainline-index.md`
+
+## DEC-339 - Real-microphone verifier must use canonical counts too
+
+时间：2026-07-13
+
+问题：
+
+- DEC-338 的两份真实麦克风报告已经正确判定 No-Go，但 verifier 的 `frontend_utterance_count` 仍使用通用 `.utterance`。
+- 当页面只有“本次没有识别到有效语音”的空态提示时，该字段会写成 `1`，与 cockpit transcript `0` 和截图不一致。
+
+决策：
+
+- `workbench_browser_live_mic_verify.mjs` 的录音期样本、失败页状态、最终 UI report 和 `workbench_same_session_visible` 全部改用 canonical transcript selector：已提交 `data-transcript-segment-id` 加可见 active tail。
+- 不重写 DEC-338 的历史报告 JSON；它们保留原始运行时证据。下一次新鲜真实运行将使用修复后的统计口径。
+- 这个修复只修正报告计数，不放宽 `audio_capture_health`、非空 ASR final、实时文字或 production AI 门禁。
+
+TDD 与验证：
+
+```text
+RED:
+  tests/test_workbench_browser_live_mic_verify.py -> 1 expected failure
+GREEN:
+  focused test -> 1 passed, 1 warning
+  node --check workbench_browser_live_mic_verify.mjs -> passed
+  root tests -> 341 passed, 2 warnings
+```
+
+边界：
+
+- DEC-338 的真实麦克风 No-Go 结论不变；本轮没有为了刷新报告字段重复采集相同环境的音频。
+- 真实麦克风下一次验收仍必须先证明有效中文声源和非 fake ASR final，再进入录音期正式 AI 建议验证。
+
+关联文档：
+
+- `docs/superpowers/plans/2026-07-12-v2-recovery-implementation-plan.md`
+- `docs/current-mainline-index.md`
+## DEC-343 - Canonical evidence clickback and correction verifier must follow current product contracts
+
+时间：2026-07-13
+
+背景：
+
+- revision evidence clickback fixture 写入 `{data_dir}/live_asr_sessions` 后，SQLite migration 和 `/live/asr/sessions?include_demo=true` 实际都能返回记录；脚本却等待普通历史列表，因此误把 demo history isolation 当成 persistence failure。
+- Workbench 已经切换到 canonical transcript：修正文案在原行内显示，原始 ASR 通过“查看原始识别”展开；旧 E2E 仍期待两条旧式 `.utterance.transcript-revision`。
+- realtime compaction verifier 过去只要 `derivation_mode=production_enabled` 且没有 visible revision 就失败，无法区分 L2 关闭、LLM 没有提出安全修正和真正的 correction pipeline failure。
+
+决策：
+
+- 测试 fixture 必须显式使用 `?demo=1`，并通过当前历史 modal 的 `data-action="open"` 打开；不得放宽默认真实历史过滤。
+- canonical transcript span 同时暴露修正目标 `data-segment-id` 和来源 `data-source-segment-id`。evidence 定位按目标 ID、来源 ID或 evidence ID查找；原始目标点击时展开同段原始 ASR disclosure。
+- 将 `buildRealtimeTranscriptCompactionReport` 提取到无副作用纯模块，分类为 `correction_disabled_by_setting`、`no_revision_needed`、`passed_compacted_realtime_correction_visible` 和 `failed_realtime_correction_not_visible`；duplicate active rows 仍硬失败。
+- `combined_rejected_segment_ids`、provider failure 或 correction rejected 在没有安全 revision 时仍判失败；这不是强行显示修正文，而是 fail-closed。
+
+验证证据：
+
+```text
+tests/test_workbench_revision_evidence_clickback.py: 5 passed
+tests/test_workbench_browser_live_mic_verify.py: 6 passed
+workbench canonical clickback browser: go_revision_evidence_clickback
+artifact=artifacts/tmp/ui_screenshots/workbench-revision-evidence-clickback-20260713-final
+```
+
+受控双段音频的主链路证据：
+
+```text
+artifact=artifacts/tmp/browser_live_mic/v2-local-gateway-two-turn-correction-enabled-current-20260713-retry
+provider=funasr_realtime
+provider_mode=real
+is_mock=false
+asr_final_count=5
+partial_visible_count=17
+realtime_ai_suggestion_status=passed_realtime_ai_suggestion_visible
+first_ai_suggestion_visible_latency_ms=15131
+audio_sha256_matches_session=true
+realtime_transcript_compaction_status=failed_realtime_correction_not_visible
+correction_enabled=true
+rejected_segment_count=1
+counts_as_production_llm_evidence=false
+remote_asr_called=false
+```
+
+边界：
+
+- 受控本机 fake gateway 只证明正式建议调度和页面链路，不是生产远程 LLM evidence。
+- L2 本轮没有形成可接受 revision；safe-correction 规则没有被绕过。
+- 同一输入在无 `--no-sandbox` Chrome 环境中采样为 `rms=0/peak=0`，得到 `blocked_audio_too_quiet`；该输入层失败证据保留，不改写为业务链路失败。
+- 真实远程 gateway、自然多人麦克风、中文技术语义质量、真实 wall-clock soak、Mac/Windows 发布验收仍未完成，goal 保持 active。
+
+关联文件：
+
+- `code/web_mvp/e2e/workbench_revision_evidence_clickback.mjs`
+- `code/web_mvp/e2e/workbench_browser_live_mic_compaction.mjs`
+- `code/web_mvp/e2e/workbench_browser_live_mic_verify.mjs`
+- `code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js`
+
+## DEC-345 - Continuous speech must confirm bounded segments, and LLM outcomes must be visible
+
+时间：2026-07-14
+
+背景：
+
+- FunASR 长连续发言通常只产生累计 `partial`，原实现只在自然静音或停止会议时产生 `final`。
+- 正式实时链路是 `final -> realtime transcript correction -> auto suggestions`；没有 `final`，会议进行中就不会触发正式 LLM。
+- 即使后端已经调用模型，前端也没有显示 `no_revision_needed`、安全拒绝或 provider 失败，用户会误以为模型没有运行。
+
+决策：
+
+- 在服务端 VAD 增加 `VAD_MAX_SEGMENT_MS = 15_000`。连续发言达到 15 秒且文字达到最小长度时，生成一个受控 `final`；继续使用增量投影，禁止累计 partial 重复写入文字稿。
+- 自然静音 `900ms` 的原有断句保持不变；任意 `partial` 不直接调用远程 LLM，只有稳定确认的 `final` 才进入付费修正和建议链路。
+- Workbench 增加独立的“AI 文字修正”状态区域，明确展示：`AI 校正中`、`AI 已校正`、`无需修改`、`校正未应用`、`校正失败`、`AI 校正已关闭`。
+- 历史会话只恢复已保存的建议和修正状态，不自动重复执行付费建议分析；新的实时 `final` 和停止会议收尾仍按原有调度器运行。
+- 前端静态资源版本升级为 `20260714-realtime-ai-status1`，避免浏览器继续使用旧 Workbench JS。
+
+验证：
+
+```text
+RED:
+  连续 partial 在 END 前没有 final -> 失败
+  Workbench 没有修正状态区域/历史状态投影 -> 失败
+  历史会话没有关闭自动付费建议 -> 失败
+
+GREEN:
+  test_asr_stream.py bounded continuous final -> passed
+  Workbench focused tests -> 2 passed
+  ASR stream + realtime correction API + Workbench -> 230 passed, 2 warnings
+  Workbench full test file -> 173 passed, 2 warnings
+  node --check workbench.js -> passed
+  git diff --check -> passed
+```
+
+实际页面证据：
+
+- 新鲜真实麦克风测试 `rec_mrjw5v0z` 能启动浏览器采集并保存录音，但本次 FunASR 未完成 `asr_ready`，停止后没有有效 final；页面诚实显示“校正失败 / final 缺失”，未伪造 LLM 成功。
+- 已有真实会议 `rec_mrivjtba` 打开后，页面显示 `AI 已校正 · 已应用 2 段文字`，并显示 AI 建议卡；这证明历史状态恢复、修正结果展示和建议卡渲染均已接通。
+
+边界：
+
+- 15 秒是实时性与成本的初始生产参数，不代表中文断句质量已经最终验收；后续需要真实中文多人会议确认段长是否需要调整。
+- 本轮不绕过语义质量门禁。ASR 混杂或无法确认业务语义时，正式建议应保持抑制并显示原因。
+- 真实麦克风的 FunASR ready 冷启动仍是独立的可用性问题；这不是通过隐藏错误或强制调用 LLM 解决的。
+
+关联文件：
+
+- `code/web_mvp/backend/meeting_copilot_web_mvp/asr_stream.py`
+- `code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.js`
+- `code/web_mvp/backend/meeting_copilot_web_mvp/frontend_static/workbench.html`
+- `code/web_mvp/backend/tests/test_asr_stream.py`
+- `code/web_mvp/backend/tests/test_workbench.py`
+
+## DEC-346 - Fresh simulated realtime mainline is executable; real microphone remains a separate gate
+
+时间：2026-07-14
+
+本轮目标：
+
+- 不使用历史会议数据，模拟一场新会议。
+- 使用仓库内 WAV 按实时 WebSocket 音频块送入本地 FunASR。
+- 使用本地 OpenAI-compatible fake gateway 验证修正和建议调度，避免产生额外远程中转站费用。
+- 用独立浏览器 E2E 验证修正文案实际渲染和原始识别回看。
+
+新鲜模拟 ASR/LLM 主链路结果：
+
+```text
+session_id=simulated_mainline_live_1783989380
+audio_source=simulated_realtime_wav
+provider=funasr_realtime
+provider_mode=real
+is_mock=false
+asr_starting=1
+asr_ready=1
+partial_count=69
+final_count=1
+audio_saved=true
+degradation_reasons=[]
+semantic_quality=passed
+realtime_correction_http=200
+realtime_correction_called=true
+realtime_correction_status=no_revision_needed
+realtime_suggestion_http=200
+generated_card_count=1
+llm_gateway_kind=local
+remote_asr_called=false
+```
+
+说明：本次修正结果是 `no_revision_needed`，代表模型已经被调用并检查了文字，但判断无需替换原文；不能把 `revision_count=0` 误判成“模型没有调用”。
+
+浏览器修正链路结果：
+
+```text
+status=go_deterministic_correction_e2e
+correction_called=true
+revision_count=1
+corrected_visible=true
+corrected_status=corrected
+corrected_text_contains=灰度,P99,AI 已校正
+original_asr_disclosure=true
+original_evidence_clickback=true
+local_gateway_called=true
+counts_as_production_llm_evidence=false
+```
+
+截图和报告：
+
+- `artifacts/tmp/ui_screenshots/simulated-mainline-correction-20260714/deterministic_correction_report.json`
+- `artifacts/tmp/ui_screenshots/simulated-mainline-correction-20260714/deterministic-correction-before-clickback.png`
+- `artifacts/tmp/ui_screenshots/simulated-mainline-correction-20260714/deterministic-correction-original-clickback.png`
+
+结论：
+
+- “本地实时 ASR -> final -> LLM 修正接口 -> AI 建议接口 -> 结果持久化”模拟主链路可执行。
+- “AI 已校正”页面状态、修正文案、原始文字展开和 evidence clickback 可执行。
+- 本地 fake gateway 只用于零成本功能验证，不代表生产远程 gateway 的可用性、质量或计费证据。
+- 真实麦克风仍需要单独通过浏览器采集、FunASR ready、非空 final 和中文语义质量门禁；模拟 WAV 不能替代真实麦克风验收。
+# DEC-2026-07-14-REAL-MIC-REMOTE-MAINLINE
+
+## 决策
+
+将 2026-07-14 的真实麦克风 + 中文受控声源 + 本地 FunASR + 远程 OpenAI-compatible 中转站验证认定为当前 PC Workbench 的主链路通过证据；后续开发以该链路为基线，不再把底层 partial/event 数量作为用户可见的会议文字数量，也不允许后续“无需修改”状态覆盖已经完成的实时 AI 修正。
+
+## 证据
+
+- 报告：`docs/real-mic-remote-mainline-report-2026-07-14.md`
+- 会话：`rec_mrk6n8kk`
+- 证据目录：`artifacts/tmp/browser_live_mic/real-remote-mainline-20260714-130017`
+- `provider=funasr_realtime`、`provider_mode=real`、`is_mock=false`
+- `acceptance_eligible=true`、`acceptance_blockers=[]`、`degradation_reasons=[]`
+- 录音中：10 个 partial、3 个 final、1 张 evidence-backed AI 建议、1 段实时 AI 修正
+- 结束后：录音导出 HTTP 200 且 SHA 一致、3 张方案分析、421 字符会议纪要
+- 浏览器 console/network errors 均为 0
+
+## 成本边界
+
+- ASR 使用本机 FunASR/Paraformer，不产生远程 ASR 费用。
+- 本次只调用已配置的远程 LLM 中转站；证据记录 6 次调用、3565 tokens。
+- 不在日志、截图和报告中记录 API key。
+
+## 已知限制
+
+- 受控扬声器声源不能替代自然多人会议验收。
+- 首张实时建议延迟约 25.1 秒，属于当前需要继续优化的体验指标。
+- 上一场 `rec_mrk08gl0` 曾因浏览器没有正常点击结束而产生 `stream_interrupted`；该会话只作为异常收尾证据，不计入本次 clean mainline pass。
+
+## 回归
+
+- `code/web_mvp/backend/tests`：683 passed，2 warnings。
+- `node --check workbench.js`：通过。
+- `python3 -m compileall`：通过。
+- `git diff --check`：通过。
+
+# DEC-371: 以 durable 实时管线和纵向里程碑替代浏览器编排与边界膨胀
+
+时间：2026-07-14
+
+## 背景
+
+- 受控真实麦克风主链路已经证明本地中文 ASR、远程 LLM 建议/校正、录音和会后整理可以运行，但用户仍持续感受到页面混乱、实时 AI 不可见、功能像玩具。
+- 实际代码由浏览器在 final 后先 correction、再 suggestion；LLM 同步等待完整 JSON；`app.py/workbench.js/asr_stream.py` 分别达到 4933/4571/2069 行。
+- 当前 `.app` 不包含 backend、ASR runtime、模型或真实 desktop capture，不能把浏览器链路通过写成桌面产品完成。
+- 多 Agent 分别完成实时后端、产品 UX、生产工程、开源方案和对抗审查；共同结论是不能继续增加 readiness、policy、dry-run 和边界测试，必须建立可恢复的后台纵向主链路。
+
+## 决策
+
+1. 当前产品等级锁定为 `L0 功能原型`；下一目标依次为 `M1 Browser Vertical Alpha`、`M2 Recoverable Local Runtime`、`M3 Mac Internal Alpha`、`M4 Controlled Pilot`。
+2. 保留 `Tauri + FastAPI/Python + SQLite + local ASR sidecar`，采用模块化单体，不引入微服务、Kafka、Redis 或 Celery，也不做语言重写。
+3. ASR final 只有在同一 SQLite 事务完成 `final outbox + transcript segment + minimum state + correction/suggestion jobs` 后才确认；内存 queue 不是权威事实源。
+4. 正式 AI 调度从 Workbench 移到 durable executor。Correction 与 suggestion 分 lane 并行，SQLite lease/CAS 提供幂等和恢复，不再共享 session `threading.Lock` 作为业务可靠性。
+5. Suggestion 使用 `generation_id/draft_seq` 流式草稿和 commit barrier；正式卡必须通过 evidence hash、input version、时效和安全校验。Correction 只在完整结果通过 meaning-preserved 校验后原子替换正文。
+6. M1 分为 1A 后台可靠执行、1B 流式与重连、1C 单屏 V2 产品体验；每个切片都必须用同一个真实/受控会话跑通 `audio/final/job/AI/UI`，不能等大重构结束才首次验收。
+7. M1 的会议状态先只承诺 `current_topic/open_question` 两个可证据化实体；决策、行动项和风险达到人工质量门槛后才启用。
+8. 当前中文默认 ASR 继续使用 FunASR。Meetily 只作为 MIT 桌面工程参考；sherpa-onnx 移到 Mac Alpha 后的独立 runtime optimization；whisper.cpp 只作多语言/离线 fallback；screenpipe 当前许可证下禁止直接集成。
+9. OpenAI-compatible 只代表最小线协议。Provider 使用显式 capability/fallback；付费 probe 只在用户点击“测试连接”时执行，费用继续只来自用户配置的 LLM 中转站。
+10. 每个纵向切片只维护一份 living spec，每个 Phase 只产生一份 evidence manifest；源码字符串断言、mock、synthetic soak 和旧截图不能计入产品完成率或发布证据。
+
+## 实施基线
+
+- `docs/production-maturity-architecture-and-execution-plan-2026-07-14.md`
+- `docs/current-mainline-index.md` 顶部的 2026-07-14 状态是当前唯一进度入口；其余历史内容只作追溯。
+
+## 发布边界
+
+- M1/M2 完成后仍不得写 Mac Alpha、可安装或可发布。
+- M3 必须由干净 Mac 上的自包含安装包证明 mic/system audio -> local ASR -> AI -> recording -> review。
+- M4 必须完成签名、公证、真实 4 小时 soak、故障注入和累计 Pilot 证据；silent data loss 始终为 0。
+
+# DEC-372: V2 成为权威 Workbench，并以真实麦克风和 SIGKILL 证据作为 Phase 0-2 当前基线
+
+时间：2026-07-15
+
+## 背景
+
+- DEC-371 锁定了 durable pipeline、流式建议、V2 单屏体验和可恢复录音的实施顺序，但当时仍是目标架构。
+- 旧主线索引仍写浏览器 `run-once` 串行触发、非流式和轮询默认，与当前代码相反。
+- 对抗审查发现 correction 修改正文后没有更新 `evidence_hash`，不可重试 provider 错误会重复执行，真实 V2 mic、进程级恢复和当前 UI 证据也尚未归档。
+
+## 决策
+
+1. `/workbench` 是 V2 权威入口；`/workbench-v2` 为别名，旧页面只在 `/workbench-legacy` 保留。
+2. SSE 默认启用；只有 `VITE_EVENT_TRANSPORT=poll` 才回退轮询。浏览器只提交命令和显示投影，不触发付费 correction/suggestion。
+3. v1 -> v2 历史迁移固定 `enqueue_jobs=False`。历史文字迁移不得创建 correction/suggestion 或会后 AI jobs，不得产生隐形中转站费用。
+4. correction 原子提交新的 evidence hash。已通过 meaning-preserved 校验的**已提交**建议可以显式 remap；草稿和其他旧证据默认 supersede/cancel，并在新 revision 上重排。stale evidence、401/422 等 `retryable=false` 错误一次进入 failed 终态。
+5. 生产首页不暴露 mock 示例入口；历史删除调用 durable deletion，完整文字时间戳可定位录音，会议纪要使用安全 Markdown 渲染。
+6. runtime 日志写入 `data_dir/logs/backend.log`，单文件 10 MiB、5 份备份；日志写失败不得让会议请求崩溃。
+7. 当前里程碑仍为 `L0`。真实纵向主流程通过不等于正式 M1/M2，更不等于 Mac Alpha、安装包或公开发布。
+
+## 真实 V2 麦克风证据
+
+会话：`rec_mrm0iqrd_c6a2fde311e0`
+
+证据：`artifacts/tmp/browser_live_mic/v2-real-mic-mainline-20260715/report.json`
+
+```text
+verdict=go
+ui_coverage=visible_chrome
+input_mode=real_browser_microphone_with_acoustic_speaker_source
+fake_media_device_used=false
+first_text_latency_ms=8065
+first_final_latency_ms=13075
+first_suggestion_latency_ms=16079
+transcript_segment_count=4
+transcript_revision_count=1
+committed_suggestion_count=1
+audio_duration_ms=30084
+audio_chunk_count=7
+minutes_ready=true
+approach_card_count=3
+history_reopened=true
+browser runtime/console/http_5xx=0
+```
+
+Provider 事实：本地 `funasr_realtime` 为 `provider_mode=real/is_mock=false`；远程 OpenAI-compatible `gpt-5.5` 为 `is_mock=false`，4 次调用、3048 tokens；远程 ASR 关闭。声源是扬声器播放仓库内受控中文技术会议 WAV，声音实际经过 Mac 麦克风和浏览器采集；它不替代自然多人会议质量验收。
+
+## 恢复证据
+
+证据：`artifacts/tmp/v2_recovery_process/2026-07-15/report.json`
+
+```text
+termination=SIGKILL
+rpo_ms=4000
+rto_ms=16
+audio_duration_ms=10000
+chunk_count=2
+job_count=2
+jobs_succeeded=true
+```
+
+独立子进程在 9 秒输入中只确认已 fsync 的 5 秒 chunk，并保留两个 pending jobs；父进程真实 `SIGKILL` 后，新 persistence/writer/executor 重开，重放 chunk 幂等，继续 5 秒录音并完成两个任务。该证据满足 RPO/RTO，但不替代 1 小时真实会议和后台导出/recording lease 出口。
+
+## UI 与回归
+
+- 真实会话响应式产品 smoke：`artifacts/tmp/ui_screenshots/workbench-v2-real-mic-20260715/report.json`，桌面和 375px 均无横向溢出或按钮重叠，四个会后 tab、完整文字和录音播放通过。
+- frontend：30 tests passed，lint/typecheck/build passed；构建 JS 334.00 kB，gzip 103.80 kB。
+- correction/persistence/migration/app focused：42 passed；旧失败根因修复集：53 passed；日志轮转：24 passed；SIGKILL recovery：2 passed。
+
+## 未完成出口
+
+- clean release commit/source-artifact hash 绑定；
+- Phase 0 的 60 秒 system audio 与 clean Mac bundled sidecar；
+- 20 warm + 5 cold 延迟分布和 20 个中文技术触发点人工价值门禁；
+- 独立 recording lease、后台录音导出和 1 小时真实会议；
+- Phase 3 自包含 Mac 包、Keychain、本地 API token/CSP、签名和公证。
+
+这些缺口禁止把本决策解释为 M1/M2、Mac Alpha 或公开发布完成。
+
+# DEC-373: 实时录音采用封存边界、独立租约与后台 WAV 导出
+
+时间：2026-07-15
+
+## 背景
+
+V2 已有 5 秒 PCM chunk journal 和真实 SIGKILL 恢复，但实时 WebSocket 的 `END` 仍同步拼接整场 WAV 并再次扫描文件计算 SHA-256。长会议停止操作因此是 O(整场录音)，同时启动恢复只按 meeting 的 `live` 状态粗粒度标记，不能区分仍由有效进程持有的录音与真正过期的捕获会话。
+
+## 决策
+
+- 新增规范化 `recording_sessions` 与 `recording_exports`，不把无 transcript 的录音任务伪装成通用 AI job。
+- capture 使用 `(meeting_id, track, epoch)` 主键和 `lease_owner/lease_until_ms`；连接存活期间由服务端独立心跳续租，chunk commit 同时做 owner/expiry CAS。
+- WebSocket 正常结束或异常断开只调用 `RealtimeWavAssetWriter.seal()`：提交尾块、fsync chunk/manifest 并清空 capture lease，不同步组装 WAV。
+- seal 与 export enqueue 在同一个 SQLite transaction 内完成。export job 绑定 `input_chunk_count/input_sample_count/input_journal_sha256`，相同长度但内容不同的旧任务不得发布。
+- `RecordingExportExecutor` 在后台线程组装、fsync、原子替换并计算成品 SHA-256；claim、heartbeat、retry、expired lease recovery 和终态提交均由 SQLite CAS 约束。
+- 录音 export 与删除会议共享 meeting 级文件锁，避免已 claim 的 worker 在删除后重新生成 WAV。
+- V2 audio contract 以 recording/export 行为权威状态；`sealed/exporting/interrupted` 显示“录音整理中”，只有 `ready` 且文件存在时才允许播放。SSE 增加 sealed/queued/ready/failed 事件，页面在 ready 后自动重拉音频。
+- 旧 `close()` 保留给兼容和非实时调用；正式实时主链不得调用同步 close。
+
+## TDD 与证据
+
+- audio/persistence/export/ASR/V2/provider/storage 权威组：`186 passed, 1 warning`。
+- frontend：`31 passed`；lint、typecheck、production build 通过；构建 JS `334.89 kB`，gzip `103.97 kB`。
+- 真实进程恢复：`artifacts/tmp/v2_recovery_process/2026-07-15-recording-lease/report.json`。
+
+```text
+termination=SIGKILL
+rpo_ms=4000
+rto_ms=15
+audio_duration_ms=5000
+chunk_count=1
+job_count=2
+jobs_succeeded=true
+```
+
+该测试在 9 秒输入中只确认已经 fsync 的 5 秒 chunk；真实 SIGKILL 后由过期 capture lease 自动创建 export job，后台 worker 直接生成可播放 WAV，不再手工重建 writer 或继续补录，因此 4 秒内存尾部是明确 RPO，不被伪装为恢复成功的数据。
+
+- 无新增 LLM 调用的产品回归：`artifacts/tmp/ui_screenshots/workbench-v2-recording-export-20260715/report.json`。桌面和 375px 移动端均无横向溢出/按钮重叠，四个会后 tab、完整文字、纪要和录音播放通过，runtime exception、console error、network failure、HTTP 5xx 均为 0。
+
+## 边界
+
+- 本决策关闭 Phase 2 的 recording lease 与后台导出实现项，但不替代 1 小时真实会议性能出口。
+- 旧会话在新表存在前已经生成的 WAV 继续通过兼容读路径播放；只有新 capture 才具备 recording session/export job 全量审计字段。
+- 当前仍缺 clean release commit、60 秒 ScreenCaptureKit system audio、clean Mac bundled sidecar、20 warm + 5 cold 延迟分布和 20 个中文人工价值门禁；不得据此宣称 M1/M2、Mac Alpha 或公开发布。
+
+# DEC-374: 状态实体版本化并在日志写盘前统一脱敏
+
+时间：2026-07-15
+
+## 决策
+
+- `meeting_entities` additive 增加 `version/first_seen_seq/last_updated_seq`。问题创建、重复提问合并、明确回答、过期和 reopen 都以 transcript seq 推进版本；刷新和 correction 重算后仍可追溯实体首次出现与最后变化位置。
+- state extractor 继续是纯函数，页面合同不增加工程名词；版本元数据由 SQLite writer 维护，避免把存储职责塞回语义提取器。
+- structlog 在 JSON renderer 之前执行统一 redaction：`meeting_id/session_id` 只保留 16 位稳定 SHA-256 hash；meeting/session 路由参数替换为 `<meeting>`；transcript、prompt、credential、authorization、relative path 和 error/exception detail 不写入 stdout 或 managed log。
+- `total_tokens` 等非敏感用量指标继续保留，保证成本与性能可观测性。
+
+## 验证
+
+- 状态实体测试覆盖 `created(version=1) -> merged(version=2) -> answered(version=3)`，并断言 first/last transcript seq。
+- redaction 测试断言完整 ID、中文会议原文和 API key 均不出现在序列化日志中。
+- 重启 `8767` 后，真实请求路径写入为 `/v2/meetings/<meeting>/snapshot`，不再出现实际 meeting ID。
+- 合并后的权威后端组为 `186 passed, 1 warning`；ruff 通过。
+
+## 边界
+
+- 历史 log 仍保留旧版本已经写入的完整 ID；本决策保证新进程的新日志，不篡改历史证据。
+- 该决策关闭当前机器可完成的 state version 与 managed-log privacy 实现缺口，但不替代 clean commit、外部许可证、系统音频权限、clean Mac、付费延迟分布、人工价值门禁或 1 小时真实会议。
+
+# DEC-375: 录音恢复、删除和前端终态使用持久化 fence 收口
+
+时间：2026-07-15
+
+## 背景
+
+Phase 2 录音 lease 与后台导出已经可运行，但最终对抗审查仍发现七个 P1：租约丢失后 writer 仍可能先写文件；fsync 与 SQLite commit 之间的崩溃块无法恢复；同 epoch 第二次过期会复用 interruption key；迟到 WebSocket 回调可在删除后复活会议；前端漏收 suggestion supersede/remap；最近三项投影会删除旧问题版本；stdlib/uvicorn 日志不经过 structlog processor。
+
+## 决策
+
+1. `RealtimeWavAssetWriter` 每次 commit 在创建 temp/PCM 文件前调用授权 fence；WebSocket capture 心跳丢失会主动关闭连接。chunk fsync 后仍保留原有 SQLite commit 回调，崩溃窗口由恢复对账处理，不伪装成原子跨介质事务。
+2. 新增只读 journal inspector 与 `recording_recovery`：完整验证连续序号、文件大小、PCM 对齐、SHA-256 和 manifest 后，以扫描时的 `capture_generation + expired lease` 做 CAS 并幂等补齐 `audio_chunks`，再将过期 capture 标为 interrupted 并排队后台 WAV export；期间续租或 resume 的陈旧扫描不得写入。半初始化/损坏 journal 按单条 recording 隔离，不能让排序靠后的健康录音永久无法恢复。
+3. `recording_sessions.capture_generation` 每次真正 resume 递增；interruption 事件绑定 generation/journal。非 active recording 的 late seal 只能在同 journal 下返回现有 recording/export，不能降低 `sealed/exporting/ready/failed`，不同 journal fail closed。
+4. 删除创建 `meeting_tombstones` durable fence，且 tombstone 在 facts purge 后保留。V2、legacy live 和 generic session 三类删除入口共用 fence：先 tombstone，再 cancel/await 活跃采集任务，最后在 meeting 文件锁内清理并 purge V2 facts；SQLite legacy live repository 也拒绝 tombstoned ID 再 create。create/final/begin/chunk/seal、录音恢复和 export claim 都拒绝 tombstoned meeting。
+5. 前端 named SSE 加入 `suggestion.superseded` 与 `suggestion.evidence.remapped`；这两个服务端权威事件可以更新 committed projection，普通迟到 delta 仍不能覆盖终态。
+6. `meeting_entities` 保存完整事实历史，只在读取时投影最近三项。旧问题 reopen 保留 version、first_seen_seq 和历史 evidence。
+7. stdlib/root/uvicorn/fastapi handler 执行 `RedactingFormatter`；access query value 统一替换，异常只保留 error class、不渲染 traceback，常见 Linux/macOS/Windows 本地路径统一脱敏；录音恢复日志只输出计数，不输出 meeting ID 列表。
+8. 本轮不调用中转站、不新增远程 ASR、不重启 provider bake-off；费用为 0。
+
+## 验证与边界
+
+- 新增 TDD 覆盖写盘前 fence、fsync orphan 对账、同 epoch 二次过期、late seal、tombstone late write、活跃 capture cancel、旧问题 reopen、stdlib handler 渲染和前端权威 suggestion 终态。
+- 最终全量：backend `856 passed, 1 warning`；frontend `33 passed`，lint/typecheck/production build 通过；Ruff 与 `git diff --check` 通过。
+- 本决策关闭七个已知 P1 正确性缺口，但不改变里程碑：仍是 `L0 / Browser Vertical Alpha 功能候选`。
+- 正式 M1/M2 仍受 clean release commit、source/artifact/evidence 绑定、许可证/provenance、60 秒 native mic/system audio、clean Mac sidecar、20 warm + 5 cold、20 个中文人工价值门禁、远程 provider 幂等契约和 1 小时真实会议阻断。
+
+# DEC-376: 发布结论必须绑定源码、产物、证据和供应链状态
+
+时间：2026-07-15
+
+状态：Accepted / Implemented as fail-closed gate / Current result No-Go
+
+## 背景
+
+- 旧 `release_acceptance_runner.py` 可以证明功能 lane，但只记录 HEAD commit 和证据路径；`git diff --check` 不能证明工作树干净，路径也不能证明文件字节未变化。
+- 当前仓库存在大量 tracked/untracked 实现，历史报告和开发 DMG 不能自动解释为当前源码的公开发布证据。
+- 根级 LICENSE/NOTICE/SBOM、FunASR 模型权重和 FFmpeg 再分发材料尚未闭环，不能用“代码能运行”代替供应链授权。
+
+## 决策
+
+1. 新增 `tools/release_provenance_manifest.py`；最终发布必须显式传入 artifact、evidence manifest 和 evidence run id，禁止按 mtime 自动选择旧证据。
+2. 门禁同时绑定 Git commit/tree、实际 source tree SHA-256、artifact path/size/SHA-256、evidence path/SHA-256/run id、evidence 中声明的 artifact path/hash 和 app metadata。
+3. 仓库产物只接受 approved artifact roots；仓库外 runtime artifact 必须显式声明。symlink、路径越界、缺失文件、哈希/run id/产物关联不符全部 fail closed。
+4. `configs/local`、`.env*` 和 local/secret 配置不参与 source hash，也不读取内容；如果敏感路径已经被 Git 跟踪，则单独阻断，不能静默排除。
+5. 新增 `configs/release-provenance.json`，将实时 online、会后 offline、VAD、标点四个实际运行 FunASR 模型和 FFmpeg 的 revision、artifact hash、redistribution status 机器可读化。`null/unresolved` 是 blocker，不是占位完成。
+6. `release_acceptance_runner.py` 的历史 `go` 只表示功能 lane 通过。公开发布必须再通过本 provenance gate；当前不宣称 M1/M2、Mac Alpha 或 production-ready。
+
+## 当前证据
+
+- TDD：`tests/test_release_provenance_manifest.py = 11 passed`；Ruff 和 `git diff --check` 通过。
+- 清单：`artifacts/tmp/release_provenance/phase0-current-worktree-20260715/manifest.json`。
+- 绑定的开发 DMG：2,814,083 bytes，SHA-256 `f5e047cdf7f1cdd13d9777bccc0ac39e648b549c40b1eede539bf74929dac435`；其 evidence 声明的路径和哈希均匹配。
+- verdict=`no_go`：evidence 明确 `counts_as_public_release_package=false`；工作树仍有 tracked/untracked source 和 tracked sensitive path；root LICENSE/NOTICE/SBOM、四个实际运行模型及 FFmpeg provenance 未解决。精确计数以该次 manifest 为准。
+- 本轮没有读取 `configs/local`，没有网络或 provider 调用，新增费用为 0。
+
+## 边界与后续
+
+- 本门禁提供内容绑定与 fail-closed 决策，不是签名或可信 CI attestation；正式分发仍需要 clean release commit、可复现构建、Developer ID 签名、公证和 Gatekeeper 证据。
+- 第一方根许可证需要产品所有者选择，工具不得代写或猜测。
+- 下一阶段先形成 clean release baseline，再完成 native mic/system audio 60 秒和 clean Mac bundled sidecar spike；不重启 ASR bake-off。
+
+# DEC-377: Mac runtime 采用双 Python 可移动资源，并以本机 relocation spike 先验证
+
+时间：2026-07-15
+
+状态：Accepted / Local relocation implemented / Tauri and clean Mac pending
+
+## 背景
+
+- 旧 Tauri `.app` 只有 8.2 MB 壳、图标和静态前端，不包含 backend、core、FunASR runtime、worker 或模型。
+- Tauri `mic_adapter.start` 与 `worker.start` 仍只写空 chunk/synthetic event；真实 macOS 采音只存在独立 Swift spike，真实 FunASR process lifecycle 只存在 Python backend。
+- backend Python 3.12 与 FunASR/Torch Python 3.11 的原 venv 都含绝对解释器 symlink；backend 的 FunASR 路径还绑定仓库和用户 ModelScope cache，不能直接复制到 `.app`。
+
+## 决策
+
+1. Mac runtime 先采用 backend CPython 3.12 + FunASR CPython 3.11 双 runtime，不在当前阶段强行合并环境或切换 ASR 引擎。
+2. backend 新增 `MEETING_COPILOT_FUNASR_PYTHON`、`MEETING_COPILOT_FUNASR_WORKER`、`MEETING_COPILOT_FUNASR_MODEL_DIR` 路径注入；开发默认路径保持兼容，bundle launcher 使用 resource-relative 路径。
+3. 新增 `tools/macos_bundled_runtime_spike.py`：clone 两套 Python/venv、backend/core/frontend、ASR scripts 与 online 模型；重写 venv 解释器为 bundle 内相对 symlink；拒绝输出到 `artifacts/tmp` 外、外部 symlink 和继承父进程 secret。
+4. spike 必须把 bundle 移到仓库外 `/tmp`，使用 clean `HOME/PATH/PYTHONPATH` 启动 backend 与 FunASR；仅 `/health`、`/workbench`、`/providers/health` 全部 200、sys.path 无仓库路径、模型真实 ready 才算 local relocation Go。
+5. 该证据永远设置 `counts_as_clean_mac_evidence=false` 和 `counts_as_public_release_package=false`。模型本机 clone 只用于技术验证，不解决再分发授权。
+6. Tauri 正式最低系统版本固定为 macOS 13；Info.plist 同时声明 microphone、system audio 与 ScreenCaptureKit 用途。下一步再接 resource_dir/app_data_dir/backend supervisor 和退出回收。
+
+## 真实证据
+
+- 原生麦克风：`code/desktop_tauri/spikes/macos_capture/.build/phase0-mic-60s-20260715/evidence.json`；63.8 秒 WAVE、48 kHz mono Float32、3,062,400 帧、mean `-40.9 dB`、max `-19.8 dB`、SHA-256 `8fa6a8954d161500c6ca65fe6c6ef6d865d10808edfd64d807e35ca5034eab82`。
+- system audio：授权请求返回 `screenRecording=not_authorized`、exit 2、0 帧、无 WAV，继续 No-Go。
+- runtime：`artifacts/tmp/macos_bundled_runtime/phase0-local-relocatable-full-20260715/evidence.json`；逻辑体积 2,107,051,721 bytes，外部 symlink 0。
+- backend：仓库外启动 1.618 秒完成，三个 HTTP 入口 200，sys.path 不含仓库。
+- FunASR：离线本地模型 36.511 秒发出 `ready`，return code 0。
+- TDD：bundle tool `6 passed`；FunASR path/sidecar focused `20 passed`。没有 LLM、远程 ASR、用户音频或网络服务调用。
+
+## 边界
+
+- 当前不是 Tauri 自启动：`.app` 尚未携带 resources，也没有 backend child supervisor、随机端口/token、TERM/KILL/reap。
+- 当前不是 separate clean Mac：仍需另一台或干净用户环境验证无仓库、Homebrew、用户 venv/cache 依赖。
+- 四个实际运行模型、Python/Torch wheels、imageio FFmpeg、根 LICENSE/NOTICE/SBOM、Developer ID 和公证仍阻断公开分发。
+
+# DEC-378: Tauri packaged runtime 使用 base Python，并以父进程 watchdog 收口生命周期
+
+时间：2026-07-16
+
+状态：Accepted / Local packaged supervisor smoke passed / Full packaged mainline pending
+
+## 背景
+
+- 首个带 runtime resource 的 `.app` 能完成构建，但真实启动立即崩溃。Tauri resource copy 将 `runtime/backend-venv/bin/python` 的相对 symlink 解引用为普通 Mach-O；解释器不再识别 bundle 内 `pyvenv.cfg`，`sys.base_prefix=/install`，最终报 `ModuleNotFoundError: No module named 'encodings'`。
+- 首次修复后 `.app` 可启动动态 loopback backend，但真实 packaged ASR 回放又暴露两个主流程缺陷：backend 的 Python 3.12 `PYTHONHOME` 会污染 FunASR Python 3.11 子进程；`ASR_READY_TIMEOUT_S=30` 和 64 个 300ms pending chunk 小于本机约 33-35 秒 cold start，首场会议会 timeout 或丢弃预就绪音频。
+- `SIGTERM` 直接终止旧 app 时 bundled backend 会被 reparent 到 PID 1 并继续监听。尝试在 Tauri 进程内安装 Unix signal bridge 两次均未通过真实 packaged smoke，因此不保留该实现。
+
+## 决策
+
+1. backend launcher 放弃 venv interpreter，固定执行 `runtime/backend-python/bin/python3.12`，设置 `PYTHONHOME=runtime/backend-python`，并把 `runtime/backend-venv/lib/python3.12/site-packages` 与应用源码加入 `PYTHONPATH`。
+2. FunASR 固定执行 `runtime/funasr-python/bin/python3.11`。backend 通过 `MEETING_COPILOT_FUNASR_PYTHON_HOME` 和 `MEETING_COPILOT_FUNASR_PYTHONPATH` 为子进程覆盖 3.12 环境，防止跨版本污染；独立 worker launcher 使用相同规则。
+3. runtime spike、Tauri runtime inventory、package inventory 和 key artifact hash 都以两个 base interpreter 为准，不再把已知会被 Tauri 解引用的 venv symlink 作为启动入口。
+4. packaged build 使用 `--locked`。主窗口 `CloseRequested` 进入 `app.exit(0)`，正常退出继续由 `RunEvent::Exit` 回收 backend process group。
+5. supervisor 启动 backend 时注入 `MEETING_COPILOT_PARENT_PID`。bundled backend 每 500ms 校验直接父进程和 PID 存活；app 崩溃、SIGTERM 或 SIGKILL 后，backend 在 reparent 后自退出。该 watchdog 不在普通 Web 开发模式启用。
+6. ASR ready timeout 提高到 60 秒，pending audio 上限提高到 240 个 chunk，按当前 300ms chunk 约覆盖 72 秒、内存量级为数 MB。它只保证 cold start 期间不丢输入，不把 33 秒 cold TTFT 写成可接受延迟；常驻单 worker/会话复用仍需后续架构实现。
+
+## 真实证据
+
+- 修复后的 relocation bundle：`artifacts/tmp/macos_bundled_runtime/phase0-local-relocatable-full-20260716-r3/evidence.json`。backend 三个 HTTP 入口均为 200，仓库外 sys.path 无仓库路径，外部 symlink 为 0；FunASR local model cold ready 为 33.211 秒。
+- 修复后的 app：`artifacts/tmp/tauri_runtime_package/packaged-runtime-supervisor-20260716-r5/Meeting Copilot.app`，逻辑体积 2,292,359,512 bytes；package evidence 为同目录 `evidence.json`，build 使用 `--locked`。
+- supervisor smoke：`artifacts/tmp/packaged_runtime_supervisor_smoke/packaged-runtime-supervisor-smoke-20260716-r5/evidence.json`。app PID 80095、backend PID 80115、随机端口 53966；`/health`、`/workbench`、`/providers/health` 均为 200；SIGTERM 后 app、backend 与监听端口全部消失，状态为 `go_packaged_runtime_supervisor_smoke_not_public_release`。
+- packaged ASR 的人工回放证据显示 base Python/FunASR 子进程链路确实运行：预热后 ready 5.342 秒，33.6 秒录音保存为 7 个 chunk/WAV，V2 产生 3 个 transcript final。该次客户端发送期间未并发读取 WebSocket，最终 BrokenPipe 并标记 `stream_interrupted`；中文文本存在明显专有词错误，且 packaged app 未加载中转站配置，correction/suggestion job 重试后失败。该次只能证明 packaged local ASR/recording path，不计 full packaged mainline Go。
+
+## TDD 与边界
+
+- bundle/package/FunASR focused：31 passed；parent watchdog/app/scaffold focused：131 passed；ASR stream/FunASR/watchdog/app focused：184 passed；packaged supervisor smoke tool：3 passed；Rust：10 passed。Ruff 与 `git diff --check` 通过。
+- 本轮没有调用远程 ASR 或 LLM，没有读取用户私密录音，新增费用为 0。
+- Phase 0 的 native mic/system audio 60 秒和 local packaged supervisor 已有正向证据，但 Tauri native PCM 尚未接入 backend WebSocket；packaged app 的持久化中转站配置、真实 LLM 修正/建议、同场结束/纪要/历史闭环尚未完成。
+- separate clean Mac、20 warm + 5 cold、20 个中文人工价值门禁、1 小时会议、root LICENSE/NOTICE/SBOM、模型与 FFmpeg 再分发、Developer ID/公证/Gatekeeper 和 Windows 真机仍未完成。不得据此宣称 M1/M2、Mac Alpha、production-ready 或公开发布。
+
+# DEC-379: Packaged 纵向主链路以真实可见 correction 和会后文字容器可见性收口
+
+时间：2026-07-16
+
+状态：Accepted / Local packaged browser-mic mainline passed / Public release No-Go
+
+## 背景与失败证据
+
+- 旧验收只要会后存在 revision 就可能报告通过，不能证明 correction 在会议仍进行时可见；`visible` 也只检查 DOM 有尺寸，没有检查每一行是否落在 `.transcript-scroll` 的可视边界内。
+- 第一次严格运行 `artifacts/tmp/packaged_mainline/packaged-r6-realtime-visible-real-mic-20260716/report.json` 明确为 `no_go`，blocker=`realtime_correction_not_visible`。它虽然会后有 1 个 persisted revision，但录音期没有看到 correction，不能把会后补结果冒充实时能力。
+- 第二次严格运行 `artifacts/tmp/packaged_mainline/packaged-r7-realtime-correction-real-mic-20260716/` 只产生开始前和实时阶段两张截图，没有完成会后报告。按 fail-closed 规则，没有 `report.json` 就是 No-Go，不用截图或人工推断补成功。该运行推动修复 correction revision 的目标 segment CAS、legacy revision 到 V2 的补偿投影和被后续证据取代 job 的显式 `cancelled/evidence_superseded` 终态。
+- r8 首次得到完整业务 `go`，但视觉复核发现“3 段已确认”时截图只看到 2 段。API 与 DOM 都有 3 段，根因是会后复用实时 `TranscriptPane` 后隐藏了标题，却仍保留 `62px` grid track；`.transcript-scroll` 实际只有 `98px`，第三段被内层滚动区裁掉。因此 r8 不作为最终 UI 候选。
+
+## 决策与实现
+
+1. correction job 提交使用 revision 自身的目标 `segment_id + original_text` 计算 CAS hash；每次 correction 批次扫描已经持久化的 legacy revision 并幂等补偿到 V2。旧 job 的目标若已由新批次满足，终态固定为 `cancelled/evidence_superseded`。
+2. snapshot 提供不含正文、prompt、hash 或 provider output 的安全 `jobs` 摘要。严格 E2E 要求 correction job 成功或仅以 `evidence_superseded` 取消，persisted revision 数与 `transcript.segment.revised` 事件一致，实时阶段真实出现 correction mark。
+3. 前端只有 `segment.revision > 1` 才显示“AI 已校正”，普通标点规范化不得冒充 LLM 修正；revision event 同步更新已加载的完整 transcript。
+4. 会后 transcript tab 使用独立 `review-tab-panel--transcript` 滚动责任；隐藏实时标题时同时把 `.transcript-pane` 改成单一 `minmax(0, 1fr)` 轨道。桌面只保留文字内层滚动，移动端回到页面自然滚动。
+5. E2E 逐行记录 row top/bottom 和 scroll container top/bottom，只有每一行完整落在容器可视边界内才算 `all_rows_visible=true`。DOM 行数还必须等于 transcript API 数量，且逐段 canonical text、corrected IDs 完全一致。
+6. Chrome 临时 profile 在最终报告写盘后曾因扩展仍写文件触发 `ENOTEMPTY`。测试工具现先等待 Chrome 退出，并使用 `rm(maxRetries=10,retryDelay=200)`；清理失败只给 warning，不覆盖已经落盘的业务门禁结果。该工具尾错不改写为产品成功或失败。
+
+## 最终真实证据
+
+- runtime：`artifacts/tmp/macos_bundled_runtime/phase0-local-relocatable-full-20260716-r7/evidence.json`。三个 HTTP 入口 200，FunASR cold ready `34.752s`，外部 symlink 0，未调用 LLM/远程 ASR或读取用户音频。
+- app：`artifacts/tmp/tauri_runtime_package/packaged-runtime-supervisor-20260716-r9/Meeting Copilot.app`，arm64，逻辑体积 2,292,365,451 bytes，unsigned/unnotarized。
+- supervisor：`artifacts/tmp/packaged_runtime_supervisor_smoke/packaged-runtime-supervisor-smoke-20260716-r9/evidence.json`。三个 HTTP 入口 200；SIGTERM 后 app、backend 和端口全部回收。
+- 严格主链路：`artifacts/tmp/packaged_mainline/packaged-r9-final-real-mic-20260716/report.json`，verdict=`go`、blockers=`[]`。输入为真实 browser microphone + 扬声器受控中文技术音频，`fake_media_device_used=false`；ASR 为本地真实 `funasr_realtime`，LLM 为远程非 mock `gpt-5.5`，远程 ASR 关闭。
+- 性能：首文字 `7055ms`、首 final `14071ms`、首实时建议 `17078ms`、首可见校正 `30117ms`。LLM 5 次、3598 tokens。
+- 产物：3 段 transcript、2 段 persisted revision、2 个 revised event、1 张 committed suggestion、会议纪要、3 张方案卡、29.761 秒/6 chunk WAV、历史重开全部通过。会后 DOM/API canonical text 一致，3/3 行位于容器可视区；runtime exception、console error、network failure、HTTP 5xx 均为 0。
+- 回归：backend `868 passed, 1 warning`；frontend `35 passed`，lint、typecheck、production build 通过；Node syntax 与 `git diff --check` 通过。
+
+## 发布边界
+
+- 当前是本机 packaged browser-mic mainline candidate，不是 production/public release。Tauri native mic/system audio PCM 仍未接正式 WebSocket；凭据仍依赖环境注入，Keychain 配置入口未完成。
+- 首次可见 correction `30.117s`、首次 suggestion `17.078s` 仍偏慢；FunASR cold ready `34.752s` 要通过常驻/复用 worker 优化，不能靠提高 timeout 掩盖。
+- 本次受控音频文字仍有专有词和中英混杂误识别，LLM correction 只安全修正 2/3 段。20 个中文技术会议人工价值门禁和 1 小时真实会议出口仍未完成。
+- separate clean Mac、root LICENSE/NOTICE/SBOM、模型/FFmpeg 再分发、Developer ID 签名、公证、Gatekeeper、Windows 真机仍是公开发布 blocker。
+
+# DEC-380: Durable LLM job 的远程重试复用脱敏 Idempotency-Key
+
+时间：2026-07-16
+
+状态：Accepted / Implemented / Provider guarantee remains external
+
+## 背景
+
+- V2 已能用 SQLite unique key、lease 和 CAS 避免重复 final 与重复本地提交，但远程请求没有携带 durable job identity。
+- provider 在已接收请求后若连接超时，backend retry/restart 可能再次调用中转站。没有稳定远程幂等提示时，本地 exactly-once 不能扩展成 provider exactly-once。
+
+## 决策
+
+1. suggestion 使用 durable job `idempotency_key`；correction/legacy execution 使用 preview `idempotency_key`，缺失时才回退到稳定 request/execution id。
+2. 原始 key 不发送到网络。统一计算 SHA-256，并只发送 `meeting-copilot-` 加 40 位摘要，避免 meeting/job 标识泄漏。
+3. OpenAI-compatible streaming 请求、显式 non-streaming fallback 和同步 retry 复用完全相同的 `Idempotency-Key`。
+4. header 是能力提示，不是假定所有国产模型或中转站都支持。provider 忽略该 header 时，系统仍诚实标记为本地幂等 + 远程 at-least-once。
+
+## TDD 与边界
+
+- RED：流式 fallback、durable suggestion 透传和同步 retry 三条用例均失败，证明旧实现没有 header。
+- GREEN：三条 focused 用例通过；provider/suggestion/LLM/pipeline/persistence/app integration 相关套件 `85 passed, 1 warning`；Ruff 与 `git diff --check` 通过。
+- 已有同组测试覆盖 duplicate final、expired lease/backend restart、429/503 分类、双 lane 并行和单 lane failure。Phase 1A 对应实现清单关闭。
+- 本轮没有调用中转站、远程 ASR或用户音频。服务端 exactly-once 必须由中转站 capability/协议确认，不能由客户端测试替代。
+
+# DEC-381: 20 个中文技术会议触发点通过生产同源建议价值门禁
+
+时间：2026-07-16
+
+状态：Accepted / Phase 1C value gate passed
+
+## 决策
+
+1. 建立 `data/product_value_gate/chinese_technical_trigger_points.v1.json`，固定 20 个中文技术会议核心缺口，覆盖灰度、回滚、数据库迁移、消息堆积、缓存一致性、接口兼容、告警、安全、对账、容量、性能、依赖降级、feature flag、隐私、容灾、模型上线、补偿幂等、日志成本、跨团队依赖和根因验证。
+2. 生产实时建议 prompt 从 app 内提取为 `build_realtime_suggestion_messages()`，产品链路和价值 gate 共用同一实现，避免测试用更容易的提示词。
+3. `tools/chinese_suggestion_value_gate.py` 第一阶段只负责真实 provider 生成、延迟、usage 和 evidence 绑定；第二阶段读取独立人工标注。缺少 20 条完整标注时只能输出 `awaiting_manual_review`，不能自动判 Go。
+4. 门槛固定为正确 evidence >=18/20、可直接追问且总调用耗时 <=20s >=16/20、重复 <=2/20、无 evidence 正式结果=0。
+
+## 真实结果
+
+- artifact：`artifacts/tmp/product_value_gate/phase1c-gpt55-20260716-r1/`，包含 `results.json`、`manual-review.json` 和 `report.json`。
+- provider：远程非 mock `gpt-5.5`；20 次请求全部成功；远程 ASR、音频上传和用户音频读取均为 0。
+- 用量：prompt 3373、completion 1292、total 4665 tokens。
+- 人工语义审查：evidence correct `20/20`、directly askable and timely `20/20`、duplicates `0`、unsupported claims `0`、formal without evidence `0`；verdict=`go`、blockers=`[]`。
+- 最慢总调用约 `7.505s`，最慢 TTFT 约 `6.207s`。第 14 条没有复述字面 `RTO/RPO`，自动 anchor 规则判 false，但准确追问了订单库跨可用区演练时间、步骤和验收人，人工 evidence 审查通过；这说明自动关键词只作提示，不替代语义判断。
+
+## TDD 与边界
+
+- prompt 单一来源和 gate fail-closed/threshold 测试 `10 passed`；standalone CLI 导入路径已验证；Ruff、JSON 和 `git diff --check` 通过。
+- 该门禁关闭 Phase 1C 的 20 场核心建议价值出口，不代表自然多人真实会议、ASR 专有词质量或长期打扰率已经通过。Phase 2 一小时真实会议和 Pilot 用户反馈仍需独立证据。
+
+# DEC-382: 结束链以规范化 EOS 收口，长会报告分离录音与会后时间
+
+时间：2026-07-16
+
+状态：Accepted / Implemented / 90 秒本地无付费主链路通过 / Phase 2 一小时门槛未完成
+
+## 背景
+
+- 旧长会 runner 把结束确认、ASR drain 和会后处理计入“录音时间”，历史 90 秒报告中的 `wall_clock_recording_seconds=376.995` 不能作为真实录音时长证据。
+- 真实 20 秒重跑发现：FunASR sidecar 已完成 EOF，66/66 音频块写入、11 次推理和多个 final 已持久化，但 `/v2/meetings/{id}/end` 只检查原始 `end_of_stream`，而规范化 live event 已转换为 `evaluation_summary(end_of_stream_event_count=1)`，接口错误返回 `409 asr_finalization_pending`，会议停留在 live。
+- 同一主链路还发现浏览器在 final 发送阶段先关闭 WebSocket 时，异常处理会把已经完成 `recognizer.finalize()` 的会话标为 `stream_interrupted`，从而阻断纪要和方案任务。之前的宽松 soak runner 也允许 review jobs 为 failed/cancelled 后仍输出 `go`。
+
+## 决策
+
+1. `/v2/meetings/{meeting_id}/end` 的 ASR 完成判定同时接受原始 `end_of_stream` 和规范化 `evaluation_summary.payload.end_of_stream_event_count > 0`；未达到完成条件时继续返回 409，不提前结束会议或创建会后任务。
+2. ASR handler 一旦进入 `recognizer.finalize()`，即使浏览器在发送 final 时断开，也必须在异常路径持久化规范化 EOS；只有 finalize 尚未开始的异常才标记 `stream_interrupted`。录音、canonical transcript 和会后任务不依赖浏览器连接是否仍在线。
+3. 长会计时固定拆成 `recording_wall_clock_seconds`、`post_processing_seconds` 和 `total_wall_clock_seconds`。Phase 2 一小时门禁必须同时满足目标录音至少 3600 秒、真实录音 wall clock 至少 3590 秒、最终音频至少 3590 秒；会后等待不能补足录音时长。
+4. 真实 confirm 通过 CDP dialog 处理，runner 通过异步 click 调度避免原生 `window.confirm` 阻塞 CDP；ASR shutdown 记录队列、写入、未处理块、worker inference 和单一总 deadline telemetry。
+5. correction 的 `cancelled/evidence_superseded` 只表示旧证据被成功 replacement 取代；同一 lane 必须存在 succeeded replacement，普通 failed/cancelled/retry_wait 不得放行会后任务。严格 job/revision contract 与宽松长会时间 runner 分开执行。
+
+## TDD 与真实主链路证据
+
+- 新增 `_live_asr_record_is_finalized()` 规范化 EOS 判定回归；新增浏览器在 finalize final 发送阶段断开仍持久化 EOS 的 ASR stream 回归。相关 focused tests `2 passed`，ASR stream 套件 `43 passed`；Ruff、`git diff --check` 通过。
+- 首轮 20 秒真实浏览器麦克风重跑确实失败并留下根因：结束接口 409，会议保持 live。修复后第二轮 20 秒本地 fake OpenAI-compatible lane 通过：录音 `19.957s`、会后处理 `1.012s`、校正和建议 job succeeded、minutes/approach/index succeeded、历史重开和浏览器诊断均通过。
+- 新鲜 90 秒主链路 artifact：`artifacts/tmp/mainline-rerun-20260716-120637/real-mic-90s/report.json`；输入为真实浏览器 `getUserMedia` 麦克风路径和扬声器受控中文技术会议音频，ASR 为本地真实 `funasr_realtime`，LLM 为本地 fake OpenAI-compatible gateway（`is_mock=false` 仅用于执行真实协议和 job 链路，未产生中转站费用）。录音 `90.488s`、19 chunks、首字 `15005ms`、首 final `20006ms`、首实时建议 `45009ms`、首实时校正 `50008ms`、9 个 transcript segments、建议 1 条、方案 1 条、纪要非空、RSS 增长 `7.09MB`、console/runtime/HTTP 5xx 均为 0。
+- 同一 artifact 额外保存 `snapshot.json`、`events.json`、`traces.json` 和 `strict-contract.json`；严格 job/revision contract 为 `go`：correction lane 仅含 succeeded 或 `evidence_superseded`，suggestion lane 全部 succeeded，minutes/approach/index 全部 succeeded，revision projection 完整。该证据不计为真实远端 gpt-5.5 生产 provider 证据。
+- 最新全量 backend 回归为 `882 passed, 2 warnings`；frontend `36 passed`，lint/typecheck/build 通过；V2 runner contract tests `6 passed, 1 warning`，Ruff 与 `git diff --check` 通过。
+
+## 未关闭边界
+
+- 一小时真实 wall-clock run：`artifacts/tmp/mainline-rerun-20260716-120637/real-mic-one-hour/report.json`。录音 `3600.104s`、最终音频 `3627.792s`、726 chunks、256 段文字、会后处理 `6.794s`、RSS 增长 `226.44MB`、晚期 snapshot median `80.76ms`，这些物理稳定性指标通过；修复后的尾部验证 `04-complete-transcript-tail-final.png` 确认 256 段文字最后一行可见。
+- 该一小时会话的完整产品出口仍为 No-Go：重复播放的短音频在长会中触发 `asr_semantic_quality_blocked`，legacy formal status 为 `suppressed_by_asr_semantic_quality`，minutes/approach jobs 为 failed，approach card 为 0。这个结果证明安全质量门禁在坏输入上阻止正式推断，没有把低质量文字继续生成虚假纪要；不能把一小时录音/ASR 通过写成完整会议副驾驶通过。完整结论：`artifacts/tmp/mainline-rerun-20260716-120637/real-mic-one-hour/phase2-gate-assessment.json`。
+- 长会 runner 已增加 `MEETING_COPILOT_REQUIRE_FULL_REVIEW`，一小时自动启用严格 review gate，要求 correction replacement、suggestion succeeded、minutes/approach/index 全部 succeeded、至少一条 committed suggestion，且不能被语义质量门禁抑制；后续变体音频或自然会议应使用该门禁，不再接受“review jobs failed 但 runner go”。
+- 本决策不关闭 Phase 2 一小时真实 wall-clock soak；不关闭 20 warm + 5 cold 的分布式延迟 SLO；不关闭 native Tauri PCM、Keychain、clean Mac、签名公证、许可证/SBOM/model/FFmpeg provenance 或公开发布门禁。
+- 本地 fake gateway 只证明 OpenAI-compatible 请求、异步 job、校正/建议/纪要/方案和恢复语义；不能替代真实远端中转站的 TTFT、幂等兑现和费用证据。本轮没有再次调用收费中转站或远程 ASR。
+
+# DEC-383: 会后质量门禁显示为“已暂停”，不得误报 provider 生成失败
+
+时间：2026-07-16
+
+状态：Accepted / Implemented / Browser UI verified / 不改变 Phase 2 No-Go
+
+## 决策与证据
+
+1. `/v2/meetings/{id}/snapshot` 只投影 allowlist 后的 `formal_derivation_status` 和 `degradation_reasons`；不得把 transcript、prompt、provider output 或任意未知内部原因暴露到 diagnostics。
+2. V2 会后区在 `suppressed_by_asr_semantic_quality` 或 `asr_semantic_quality_blocked` 成立时，将 failed/cancelled 的 minutes 和 approach 显示为“识别质量不足，已暂停”，不再误报普通 provider“生成失败”；会议文字和录音继续保留。
+3. backend 安全投影测试和 frontend 组件测试通过；frontend 当前 `37 passed`，lint/typecheck/production build 通过。新鲜浏览器复核截图为 `artifacts/tmp/mainline-rerun-20260716-120637/real-mic-one-hour/06-quality-pause-review.png`，页面没有 `inline-error`，内部 blocker 文本未暴露。
+
+## 边界
+
+- 本决策只关闭失败原因表达，不改变 semantic-quality v3 阈值，不把重复短音频变成合格会议输入，也不恢复被门禁抑制的正式产物。
+- 当前仍是 L0 / Browser Vertical Alpha 功能候选；Phase 2、Mac Alpha、Production 和公开发布均未因此完成。
+
+# DEC-384: 长会输入资格、增量持久化和建议校正时序收口
+
+时间：2026-07-16
+
+状态：Accepted / Implemented / 46 秒本地完整链路 Go / 一小时 Phase 2 仍 No-Go
+
+## 背景
+
+- DEC-382 的一小时运行使用约 26.66 秒音频循环约 130 次，物理录音和 ASR 可用，但不能作为语义质量正向证据。
+- 一小时 SQLite 中 234 个成功 correction job 的累计输出约 `13.9MB`，末期单条约 `125.5KB`；legacy live record 约 `4.0MB`，其中累计 `source_snapshot_text` 约 `2002KB`。同一运行 backend RSS 从约 `75MB` 增至 `301MB`，snapshot median 从约 `8ms` 增至 `81ms`，存在累计状态重复持久化风险。
+- 新鲜远端运行发现首条 suggestion 已在约 15.5 秒流式生成，但同段 meaning-preserved correction 把旧 evidence job 正常取消并创建 replacement；旧长测 runner 把 `cancelled/evidence_superseded` 错算为 suggestion lane 失败。
+
+## 决策与实现
+
+1. 长测报告新增源音频时长、SHA-256、逐次播放 manifest、播放次数、重复率和 `semantic_acceptance_eligible`。一小时输入至少覆盖 300 秒唯一内容且重复率不高于 10%；关键元数据缺失或不一致一律 fail closed。物理一小时和语义一小时使用两个独立计数，不得互相冒充。
+2. correction job 结果只保存无正文的有界摘要，不再复制累计 status、gate、final events 或 batch audits；权威 revision 继续保存在 normalized transcript/event 表。
+3. legacy ASR event 只保留恢复 canonical projection 所需的最新 final、最新 partial 和最近一次 reconciliation source snapshot。按旧一小时数据估算，累计 snapshot 从约 `2002KB` 降为约 `30KB`。
+4. semantic quality 被阻断时，suggestion job 先等待同 segment correction。revision 若取消旧 evidence job，旧 handler 在调用 provider 前退出，由 replacement job 基于新 evidence 生成，避免建议草稿闪现后消失；原始质量可用时 correction/suggestion 仍保持独立 lane。
+5. suggestion lane 与 correction lane 使用一致终态：至少一个 succeeded replacement，其他 job 只能是 succeeded 或 `cancelled/evidence_superseded`；普通 failed/cancelled/retry_wait 继续阻断严格门禁。
+
+## 主链路证据
+
+- 多场景中文输入 `engineering-loop.wav` 为 82.898 秒、单次播放、重复率 0、输入资格通过。真实 browser microphone + 本地 FunASR + 远端非 mock `gpt-5.5` 运行得到首字 `9.006s`、首 final `18.009s`、首可见 correction `21.008s`、1 张 committed suggestion、minutes、3 张 approach cards、index、84.388 秒录音和历史重开；formal quality blocker 最终清除，LLM 9 次/7173 tokens，RSS 增长 `9.81MB`，console/runtime/HTTP 5xx 为 0。原始 `report.json` 只因旧 runner 将一个 `cancelled/evidence_superseded` suggestion job 误判为失败而为 No-Go，证据未篡改；当前 snapshot 显示 9 个 succeeded replacement、1 个正常 superseded job和完整正式产物。
+- 修复后的免费回归 `artifacts/tmp/varied-mainline-20260716/local-fake-rerun/real-mic-46s/report.json` 为 `go`：输入 46.853 秒、单次播放、重复率 0；首字 `8.007s`、首 final/建议 `16.011s`；3 段文字、1 张建议、minutes、1 张 approach card、index、46.005 秒录音和历史重开全部通过；RSS 增长 `4.56MB`，snapshot late median `4.86ms`，浏览器错误和 5xx 为 0。该 lane 只证明本地 OpenAI-compatible 协议和调度，不计生产 LLM 价值证据。
+- 最终回归：backend `886 passed, 1 warning`；frontend `37 passed`，lint/typecheck/build 通过；long/real-mic runner contracts `12 passed, 1 warning`；Ruff、Node syntax 和 `git diff --check` 通过。
+
+## 未关闭边界
+
+- 本轮没有重新跑一小时；上述持久化优化尚缺语义合格的一小时 fresh resource 曲线，因此 Phase 2/M2 仍为 No-Go。
+- 82 秒输入只证明短时多样中文场景，不代表自然多人、重叠语音、系统音频或一小时真实会议代表性。
+- suggestion 等待 correction 的竞态由 TDD 和免费完整链路覆盖，未为该单点再次产生远端付费运行；远端旧证据仍保留原始判定。
+- Phase 0 的 clean release commit、LICENSE/NOTICE/SBOM、模型与 FFmpeg provenance、packaged native capture、separate clean Mac，以及 Phase 1B 的 `20 warm + 5 cold` 仍未完成。
+
+# DEC-385: FunASR 采用进程级常驻 worker，会议会话显式 reset 且单并发 fail-closed
+
+时间：2026-07-16
+
+状态：Accepted / Implemented / Local real-worker proof passed / Phase 1B fixed-environment gate pending
+
+## 背景
+
+- 旧 `FunasrSidecarRecognizer` 每次会议都启动 `funasr_stream_worker.py`，模型在每场会议重新加载。此前真实 packaged/browser 主链路的首段文字约为 7-9 秒，其中包含本地模型冷启动。
+- 直接把模型对象放进 Web backend 不可行：backend 与 FunASR 运行时是不同 Python 环境，且推理阻塞不能进入 async 事件循环。
+- 常驻进程如果没有显式会话边界，会把上一场的 cache、合并文本、音频尾帧和 telemetry 带入下一场，页面会重新出现重复/串稿问题。
+
+## 决策与实现
+
+1. 新增 `funasr_resident.py` 管理层。模型进程由 manager 持有，单场会议由 `FunasrResidentSession` 持有；Mac MVP 只允许一个活动 session，第二个请求返回不可用状态，不静默降级为 fake 或另一个本地会话。
+2. worker 增加兼容的 `--resident` JSONL 协议：`start_session`、`audio`、`end_session`、`abort_session`、`shutdown`。音频为严格 base64 的 16 kHz mono `pcm_f32le`；每条会话事件带 `session_id`。
+3. `end_session` 只清空本场 `cache/audio_buffer/merged_text/counters` 并发出 final、telemetry、`session_ended`，不退出模型进程；`abort_session` 丢弃未完成尾帧并允许下一场复用。
+4. worker EOF、协议错误、推理异常和活动会话崩溃均 fail-closed；manager 回收旧 generation，最多自动重建一次。应用 shutdown 在关闭 SQLite/LLM 资源前后都不遗留 FunASR 子进程。
+5. packaged/raw PCM 兼容模式保留；通过 `MEETING_COPILOT_FUNASR_RESIDENT=0` 可回退到旧的单场进程模式。runtime app 启动时异步预热常驻 worker，测试 app 默认不预热，避免单测隐式加载模型。
+
+## 证据
+
+- worker 协议与默认 raw PCM 兼容回归：`code/asr_runtime/tests` 为 `98 passed, 1 warning`；Ruff、py_compile 和 `git diff --check` 通过。
+- manager 假进程 TDD：`code/web_mvp/backend/tests/test_funasr_resident.py` 为 `5 passed`，覆盖连续两场同进程、session isolation、finalize 不退出、abort 后复用、并发拒绝、单次崩溃重建和 shutdown reap。
+- 真实本地 worker：`artifacts/tmp/funasr-resident-warm-proof-20260716/report.json`。14.842 秒中文技术音频连续三场，模型进程只启动 `1` 次；process cold ready `3.110s`；三场 session ready `0.13/0.28/0.16ms`，首个非空文字 `2.155/2.154/2.162s`，realtime factor 约 `0.23`，最终文本无串稿。
+- backend 聚焦回归：FunASR sidecar、resident manager、ASR stream、app 共 `190 passed, 1 warning`。前端与其他完整回归需以当前工作树最新结果为准。
+- 免费真实浏览器链路：`artifacts/tmp/funasr-resident-browser-mainline-20260716-release-incident/report.json`。真实 browser microphone + 本地真实 FunASR + 本地 OpenAI-compatible gateway；实时文字、实时 suggestion、录音、minutes、approach、index、history reopen 和浏览器/网络/5xx 诊断通过。该 artifact 为 `no_go`，因为本地 gateway 不是 production relay，且输入未产生可接受的 correction revision；不得改写为 production correction Go。
+
+## 边界与未关闭事项
+
+- 本决策关闭的是模型进程冷启动与 session 生命周期问题，不等于中文 ASR 术语准确率已经达到生产标准，也不等于实时建议/校正的自然多人一小时质量门禁通过。
+- `2 warm + 1 cold` 的本次证据是本地 worker 层的 1 cold process + 3 sequential sessions，不是 Phase 1B 要求的固定环境完整 `20 warm + 5 cold` 分布；该门禁仍未完成。
+- 实时 correction 必须以真实错误术语、LLM 返回 meaning-preserving revision 和 UI 可见 revision 为完整证据。已存在的真实 relay 82 秒链路和确定性 correction fixture 保留为对应证据，不能用“correction job succeeded 但文本未改变”冒充校正成功。
+- Phase 2 语义合格一小时、Phase 0 clean release/许可证/SBOM/provenance、packaged native capture、Keychain、separate clean Mac、签名公证和 Windows 真机仍未完成。
+
+# DEC-386: 活动会议 WebSocket 的服务退出采用有界 graceful shutdown，并先取消采集再回收运行时
+
+时间：2026-07-16
+
+状态：Accepted / Implemented / CLI process verified / Phase 2 仍未整体完成
+
+## 背景
+
+1. 初次对 8767 运行中的活动会议 WebSocket 发送 `SIGTERM` 时，ASR 路由已经记录 `asr.stream.aborted`，但 Uvicorn 仍停在 `Waiting for connections to close`。
+2. 原因是 Uvicorn 未配置 `timeout-graceful-shutdown`，服务会在 WebSocket 任务或连接无法自行完成时无限等待；FastAPI 的应用级 shutdown handler 在此之前没有机会执行。
+3. 该行为会把长会录音、ASR worker、后台任务和 SQLite 资源的回收变成不确定状态，不能作为生产级运行时接受。
+
+## 决策与实现
+
+1. `tools/workbench_server.py` 启动 Uvicorn 时固定使用 `--timeout-graceful-shutdown 8`，活动 WebSocket 超时后由 Uvicorn 取消连接任务，随后进入应用 shutdown 生命周期。
+2. `workbench_server stop` 默认等待 `12s`，即 graceful 上限之外保留 `4s` 的 worker、录音封存和资源回收余量，避免在进程即将退出时错误报告 `blocked_stop_timeout`。
+3. 应用 shutdown 仍按既定顺序执行：取消活动 V2 capture task，触发 `asr_stream` 的 abort/finally，封存已写入的录音 journal，停止 durable executor、recording export executor、streaming LLM client、FunASR resident worker，最后关闭 SQLite repositories。
+4. `asr_stream` 使用直接导入的 `AsyncCancelledError`，避免测试或运行时注入的 `asyncio` 替身缺少 `CancelledError` 属性而破坏清理路径。
+5. 该策略对活动会议采用“保留已落盘内容、标记会议 interrupted、丢弃未提交尾部”的安全边界，不把强制退出伪装成正常结束，也不等待会后 AI 任务完成。
+
+## 证据
+
+- focused TDD：`tests/test_asr_stream.py` 与 `tests/test_funasr_resident.py` `50 passed, 1 warning`；`tests/test_app.py -k 'shutdown or resident_funasr'` `4 passed`；`tests/test_workbench_server_tool.py` `8 passed`。
+- 静态检查：Ruff、`uv run python -m py_compile`、`git diff --check` 通过。
+- 真实进程验证：活动 WebSocket 保持打开并发送 PCM 后执行 `workbench_server stop --port 8767`，CLI 返回码 `0`、`status=stopped`，耗时约 `8.805s`；对应 recording session 为 `ready`、1 个 chunk/3200 bytes 已保存，meeting state 为 `interrupted`；FunASR resident worker 无残留进程。
+- 失败证据也保留在本轮操作上下文：未配置 Uvicorn graceful timeout 的旧进程持续处于 `Waiting for connections to close`，因此本决策不是静态推断，而是由实际进程行为驱动。
+
+## 边界
+
+- 本决策关闭的是服务退出和活动采集清理的生命周期缺口，不等于一小时语义合格会议、native Tauri capture、Mac Keychain、clean Mac、许可证/SBOM/provenance 或公开发布门禁完成。
+- 8 秒是服务退出上限，不是正常结束会议的处理时限；用户点击“结束会议”仍走正常 `END -> final -> seal -> durable jobs` 主流程。
+- 自包含 runtime 的 launcher 生成器和 bundle probe 已同步传入同一 `--timeout-graceful-shutdown 8`；但已有 r9 安装包 artifact 尚未因本决策重新打包，实际 DMG/签名/clean Mac 退出验收仍留在 Phase 3。
+
+# DEC-387: 本地模型与 FFmpeg provenance 先做事实快照，不把缓存事实伪装成发布授权
+
+时间：2026-07-16
+
+状态：Accepted / Implemented / Evidence captured / Phase 0 release gate remains No-Go
+
+## 背景
+
+- Phase 0 发布门禁需要模型逐文件制品摘要、不可变 revision、FFmpeg 制品摘要和再分发结论；当前 policy 只有 unresolved 占位，不能靠“本机模型能运行”或 Python 包 lock 推断发布资格。
+- 直接读取网络或重新下载模型会增加不可控副作用和费用，也不能自动产生上游授权；本轮目标是先固定当前机器上已经存在的事实。
+
+## 决策与实现
+
+1. 新增 `tools/local_supply_chain_snapshot.py`，只读取 caller-supplied 本地模型根目录和本机 FFmpeg executable；不访问网络、不下载模型、不读取 `configs/local/`、不读取 secrets、不修改 `configs/release-provenance.json`。
+2. 每个模型记录完整递归文件清单 `path/size_bytes/sha256`、确定性目录 manifest hash、`.mv/.msc` 文件 hash 和解析出的 revision 状态。`Revision:master`（含 `CreatedAt` 后缀）固定解释为 `mutable_or_unresolved`，不得填入 `immutable_revision`。
+3. FFmpeg 记录 executable SHA-256、`-version`、`-buildconf` 和 `-L` 输出，但 `immutable_revision` 和 `redistribution_status` 保持 unresolved，直到取得固定构建来源、许可证/source offer 与再分发批准。
+4. 发布验收文档与 runner contract 统一：`file_lane`、`simulated_realtime`、`browser_live_mic` 是 required；`real_mic_recorded_realtime` 是显式 blocked/可选补充 lane，不能被隐式省略，也不能替代 browser live mic。
+
+## 证据
+
+- TDD：`python3 -m pytest -q tests/test_local_supply_chain_snapshot.py` 为 `4 passed, 1 warning`；`python3 -m py_compile tools/local_supply_chain_snapshot.py` 通过；`git diff --check` 通过。
+- 当前快照：`artifacts/tmp/release_provenance/local-supply-chain-snapshot-20260716.json`。四个模型均存在，逐文件 manifest hash 分别为：`95204e09dbbfbcce68a8bf61009c4cbe832e78fd69747efadbf9e4e276e6931d`、`c405c0a237551f8eda89063e305c08adc47d331cbc2415034c07bdfaba104890`、`4c4ffbf9bed42f230992d73a72fd98c2b35b391ece4e5b8e80fb89c91b73063d`、`5367251ea7af0d5ac706c5930cb3bce2af0df11e01b07be99a2d8662e56ab64a`。
+- 本机 FFmpeg executable SHA-256 为 `00d01197255300c02122c783dd0126a9e7f47d6c6a19faafae2e6610efd071d3`；实际 version/buildconf/license 输出已保存到快照。没有产生远程调用或新增费用。
+
+## 未关闭边界
+
+- `.mv` 的四个 revision 均为 `master`，不是 immutable commit；本机 file hash 不能替代 ModelScope commit/revision 或模型卡授权。
+- 当前工作树仍 dirty/untracked，根级 LICENSE/NOTICE/SBOM 尚未进入 clean release commit；FFmpeg 当前为本机环境可执行文件，不是已批准的产品 bundle binary。
+- 因此本决策只关闭“当前机器有哪些 bytes”这一事实缺口，不关闭 Phase 0 发布门禁、Mac 签名公证、separate clean Mac 或公开/商业分发资格。
+
+# DEC-388: 长会证据的 input_mode 必须由真实播放清单推导
+
+时间：2026-07-16
+
+状态：Accepted / Implemented / TDD passed / Does not change Phase 2 gate
+
+## 背景
+
+- 一小时纯中文主流程使用一份时长超过目标的一次性音频，`playback_count=1`、`repetition_ratio=0`，但 runner 把所有报告的 `input_mode` 硬编码为 `real_browser_microphone_with_repeated_acoustic_fixture`。
+- 该字段虽然不直接决定 gate，但会让读者把合格输入误读为重复短音频，破坏证据可审计性，也可能掩盖真正的输入资格结果。
+
+## 决策与实现
+
+1. `workbench_v2_long_mic_soak.mjs` 根据已验证的 `playback_count` 和 `repetition_ratio` 生成 input mode：单次、零重复使用 `real_browser_microphone_with_unique_source_audio`；其他情况保留 `real_browser_microphone_with_repeated_acoustic_fixture`。
+2. 最终判定仍以 `source_audio_duration_seconds`、SHA-256、playlist、重复率和 `semantic_acceptance_eligible` 为准，不能只看 `input_mode`。
+
+## 证据
+
+- `tests/test_workbench_v2_long_mic_soak_contract.py`：`7 passed, 1 warning`。
+- `node --check code/web_mvp/e2e/workbench_v2_long_mic_soak.mjs` 和 `git diff --check` 通过。
+
+## 边界
+
+- 当前已经启动的一小时进程加载的是修复前的 Node 代码，因此本次最终报告仍需结合其实际 playlist 字段判断，不能假设它已使用新标签。
+- 该修复只纠正证据标签，不把当前一小时运行提前判为 Go，也不改变语义质量门禁。
+
+# DEC-389: V2 实时文字投影去重，并让 resident worker 关闭遵守 abort-before-shutdown
+
+时间：2026-07-16
+
+状态：Accepted / Implemented / TDD passed / 当前一小时会话不受修改影响
+
+## 背景
+
+- 前端审查发现：浏览器麦克风 final 到达后，local `activePartial` 可能在服务端确认 segment 已进入 reducer 前继续渲染；如果两者使用相同 `segmentId`，用户会看到同一段文字短暂双显。
+- 同一审查发现，同 revision、同 `updatedAtMs` 的旧 snapshot 可能覆盖已经显示的新文字；这会让“追加展示”看起来像回退或重复。
+- resident worker 协议明确禁止活动 session 直接 `shutdown`，但 manager 之前在应用退出时先清除 active session，再直接发送 shutdown；真实 worker 会返回 `shutdown_during_session` 并退出错误状态，fake worker 没有模拟这个边界。
+
+## 决策与实现
+
+1. V2 `LiveMeetingWorkbench` 在渲染 local/server partial 前，过滤已经存在于当前 segments 或 full transcript 的 `segmentId`；partial 只代表尚未确认的新段。
+2. `mergeTranscriptSegments` 对同 revision 采用严格 `updatedAtMs > current.updatedAtMs`，同毫秒不覆盖已有内容；未来若需要同毫秒多次更新，必须增加事件序号或稳定 tie-break，而不是恢复 `>=`。
+3. `FunasrResidentWorkerManager.shutdown()` 对活动 session 先发送 `abort_session` 并等待确认，再将 session 标记为关闭并发送 `shutdown`；超时则 fail-closed 回收 worker，不把协议错误当作正常退出。
+4. fake worker 测试同步真实状态机，明确断言 `abort_session -> shutdown` 顺序。
+
+## 证据
+
+- V2 frontend：`39 passed`；`npm run typecheck`、`npm run lint`、`npm run build` 通过。
+- Backend resident focused：`5 passed, 1 warning`；Python compile 和 `git diff --check` 通过。
+- 新增回归覆盖：final/partial 同 segment 不双显、同 timestamp 旧 snapshot 不回退、活动 worker shutdown 的 abort-before-shutdown 顺序。
+
+## 边界
+
+- 已经运行的一小时 browser session 使用修改前加载的代码，不把这次修复倒灌到它的报告；修复会在下一次服务重启后的 browser V2 主链路生效。
+- 该决策修复显示一致性和退出协议，不代表当前一小时语义门禁已经通过，也不替代 native Tauri capture 或 clean release 验证。
+
+# DEC-390: 纯中文低重复一小时主链路通过 Phase 2 物理与语义门禁
+
+时间：2026-07-16
+
+状态：Accepted / Phase 2 functional gate passed / Internal evidence only
+
+## 输入与成本边界
+
+1. 输入为本地生成的纯中文技术会议音频 `chinese-technical-meeting-16k.wav`，16 kHz mono，源时长 `6723.820687s`，SHA-256=`ab6de955843b6156cf1ad9012c04f45653a3acd2d7d4d86c48bcc2c7fdf9a45b`。
+2. 目标一小时只播放一次，`playback_count=1`、`repetition_ratio=0`、`semantic_acceptance_eligible=true`；没有读取用户私密录音。
+3. ASR 为真实本地 `funasr_realtime`；LLM 走本地 OpenAI-compatible fake gateway，协议/job/streaming 路径真实执行但不调用中转站，新增费用为 0。该 run 不替代远端 gpt-5.5 价值证据；Phase 1C 已有独立 20 条远端价值门禁。
+
+## 结果
+
+- artifact：`artifacts/tmp/phase2-pure-chinese-fixture-20260716/one-hour-run/`；主报告 SHA-256=`f1f44af9d093262459108a5da965aedf22a7e1db71a7341d200bb315a4aaf332`。
+- `verdict=go`，`blockers=[]`，`counts_as_phase2_one_hour_gate=true`，`counts_as_phase2_semantic_gate=true`。
+- 录音 wall clock `3600.491s`，会后处理 `1.602s`，最终音频 `3628.066s`，726 chunks，文件约 116 MB。
+- 首文字约 `5.002s`，首 final/建议约 `20.004s`；224 段 canonical transcript、1857 events、6 条 committed suggestions。
+- correction jobs `225`、suggestion jobs `224`，两个 lane 均完整；minutes、approach、index 三个 review job 全部 succeeded，纪要非空，方案卡 1 张，formal derivation 未被抑制。
+- 完整文字尾部可滚动到，历史重开通过；runtime exception、console error、network failure、HTTP 5xx 均为 0。
+- backend RSS 从约 `86.44MB` 到 `112.42MB`，增长 `25.98MB`；早期 snapshot median `6.93ms`、晚期 `21.02ms`、最大 `161.44ms`，未触发退化阈值。
+
+## 证据审计
+
+1. `post-run-audit.json` 保留源报告与截图 hash，并明确本次 source report 生成于 DEC-388 修复前，所以 `input_mode` 仍是旧硬编码标签；实际 playlist 字段证明它是单次零重复输入，衍生正确标签为 `real_browser_microphone_with_unique_source_audio`。不修改原始 report。
+2. 8768 backend 复用了先前 short run 的数据根，但当前 report/samples/screens 绑定明确 meeting ID，artifact 文件不包含另一 meeting ID；因此可作为内部功能证据，不作为 clean release evidence。
+3. 当前报告只采样 backend PID，不包含 FunASR resident worker 进程树；不能用该 RSS 字段宣称完整产品进程树 P95/SLO。
+4. 本地 gateway 未配置 token pricing，日志有 467 条 `rates_not_configured` warning，但当前 meeting error-level 日志为 0，所有 job 均成功。发布前仍需为远端 provider 配置真实费率或为本地零成本 provider 配置显式 profile。
+
+## 决策
+
+- Phase 2 Browser Vertical 的一小时物理、语义、review、录音、恢复和历史功能出口通过，项目可以称为 `M2 Recoverable Local Runtime` 功能候选。
+- 该结论不改变 Phase 0 clean release No-Go，也不完成 native Tauri capture、Keychain、separate clean Mac、签名公证、Windows 真机、远端 provider exactly-once 或 `20 warm + 5 cold` 延迟分布。
+
+# DEC-391: DEC-389 修复后的短主链路回归通过，干净输入不强行制造 correction
+
+时间：2026-07-16
+
+状态：Accepted / Browser V2 regression passed / No-cost local gateway
+
+## 证据
+
+- 服务使用独立 `post-fix-data` 重启，加载 DEC-389 后端和前端代码；本地 fake OpenAI-compatible gateway 使用 `rewrite_technical_terms` 模式，未调用远端 provider。
+- artifact：`artifacts/tmp/phase2-pure-chinese-fixture-20260716/post-fix-short-run/report.json`，`verdict=go`。
+- 60 秒录音 wall clock `60.013s`，最终音频 `59.001s`、12 chunks；首文字 `5004ms`、首 final `20006ms`、首建议 `20006ms`；4 段文字、1 条 committed suggestion、minutes/approach/index 全部 succeeded、历史重开通过。
+- `runtime_exceptions=[]`、`console_errors=[]`、`network_failures=[]`、`http_5xx=[]`；snapshot late median `5.50ms`，backend RSS 增长 `11.02MB`。
+- V2 frontend `39 passed`，typecheck/lint/build 通过；后端 shutdown/resident/finalization focused `9 passed`。
+
+## 解释边界
+
+- 本次纯中文输入没有产生需要改写的 ASR 术语，因此 `first_correction_latency_ms=null`；correction job lane 仍完整 succeeded，但没有把“任务执行”升级为“可见语义变化”。
+- 可见 AI 修正仍需要带有真实错误术语且 meaning-preserved 的输入；已有确定性 correction 和远端 gpt-5.5 evidence 继续作为该能力的专门证据。
+- 本次回归关闭的是 DEC-389 修复后的主链路回归风险，不改变 Phase 2 一小时证据和 Phase 0/3/4 发布边界。
+
+# DEC-392: release provenance 正确区分环境模板与真实敏感配置
+
+时间：2026-07-16
+
+状态：Accepted / Implemented / TDD passed / Release remains No-Go
+
+## 背景
+
+- Phase 0 gate 将仓库中已跟踪的 `.env.example` 误判为 tracked sensitive path，导致模板文件产生不应有的 blocker。
+- 直接删除敏感路径检查会放宽安全边界，不能接受；需要只允许明确的模板文件名，真实运行配置继续 fail closed。
+
+## 决策与实现
+
+1. `tools/release_provenance_manifest.py` 允许 `.env.example`、`.env.sample` 和 `.env.template` 作为不含真实值的模板路径。
+2. `.env`、`.env.production`、`.env.local`、`configs/local/**`、`*.local.json` 和 `*.secret.json` 继续视为敏感路径；模板是否包含占位符不改变路径安全判定之外的其他发布审查。
+3. 重新生成当前 worktree provenance manifest，使用新的 run id，保留旧 manifest，不覆盖历史证据。
+
+## 证据
+
+- TDD：`tests/test_release_provenance_manifest.py` 为 `12 passed, 1 warning`；`py_compile` 与 `git diff --check` 通过。
+- 新 manifest：`artifacts/tmp/release_provenance/phase0-current-worktree-20260715-r2/manifest.json`。
+- 新结果：`tracked_sensitive_count=0`；剩余 blocker 是 dirty/untracked source、evidence 明确不可公开发布、四个模型 revision/制品 hash/再分发授权未解决、FFmpeg revision/hash/再分发未解决。
+
+## 边界
+
+- 该修复只消除模板误报，不将 `.env.example` 内容作为 secret 审批，也不改变 `configs/local` 和真实 `.env` 的 fail-closed 规则。
+- Phase 0 clean release 仍 No-Go，不能因为敏感路径计数归零而宣称可发布。
+
+# DEC-393: Phase 2 功能通过后，生产化 backlog 固定为五项，不再继续泛化评测
+
+时间：2026-07-16
+
+状态：Accepted / Backlog triaged / Does not reopen Phase 2 functional gate
+
+## 复审结论
+
+多 Agent 对当前工作树做了只读工程化复审。长会实测没有发现当前会话的崩溃、5xx 或明显 backend RSS 退化，但以下结构性问题仍不足以支持 production release：
+
+1. WebSocket 音频热路径内仍有同步 fsync、文件 replace、SQLite transaction 和 ASR 调用；磁盘/锁抖动可能阻塞 event loop、SSE heartbeat 和 lease。
+2. legacy live projection 仍可能累计保留全场 finals/partials 并重复序列化；本轮一小时结果未触发门禁，但需要长期线性增长证据与投影清理。
+3. V2 SSE/backlog 与 snapshot 查询需要固定 batch/page 上限；断线重连、多个客户端和长 jobs 列表不能一次 materialize 全部历史。
+4. streaming suggestion provider 断线重试需要 checkpoint-aware resume 或显式 generation reset；不得把已有 draft checkpoint 的 retry 误判为不可重试 stale evidence。
+5. `asyncio.to_thread` 取消不会停止底层同步线程；shutdown、lease reclaim、SQLite close 后必须有 cooperative cancellation 或隔离进程边界。
+
+## 后续顺序
+
+1. 先为实时音频路径加入有界队列、写盘/SQLite worker 和 event-loop lag trace，补并发 WebSocket/SSE/health TDD。
+2. 再修 live projection 增量化、SSE pagination/`Last-Event-ID` 和进程树资源采样。
+3. 随后修 streaming checkpoint retry 与同步 worker 的 cancellation fencing。
+4. 每一项都必须有具体失败测试和短主链路回归；不再为了“覆盖更多边界”启动新的 provider 横评或长会循环。
+
+## 边界
+
+- DEC-390 的 Phase 2 Browser Vertical 功能门禁保持 `go`；DEC-393 是 production readiness backlog，不把已通过功能重新标成失败。
+- Phase 0 clean release、native capture/Keychain、separate clean Mac、签名公证、Windows 真机和 provider exactly-once 仍是独立发布阻塞项。
+
+# DEC-394: 实时 WebSocket 热路径采用 session-scoped 串行 executor，并修复跨线程录音导出唤醒
+
+时间：2026-07-16
+
+状态：Accepted / Implemented / TDD passed / Does not change Phase 2 gate
+
+## 背景
+
+- `handle_stream()` 原先在 async WebSocket handler 内直接执行音频 float32 -> PCM16 转换、chunk fsync、实时 ASR、live session SQLite upsert 和最终提交回调。
+- 这些同步操作平均可能很快，但一次磁盘抖动、模型推理抖动或 SQLite 锁等待就会阻塞事件循环，影响 heartbeat、录音 lease、SSE 和其他 API；一小时 run 没有触发故障，不能据此关闭结构风险。
+- 录音 seal 回调现在可能在 session worker 线程中触发 `RecordingExportExecutor.wake()`；直接调用 `asyncio.Event.set()` 跨线程不安全。
+
+## 决策与实现
+
+1. 每个 WebSocket meeting 创建一个 `ThreadPoolExecutor(max_workers=1)`，所有音频写入、ASR `recognize_chunk`/`finalize`、live session persistence、final commit、abort 和录音 seal 按同一 executor 串行执行。事件循环只负责收包、状态投影和 WS 发送，因此 final 顺序、事务边界、lease fencing 和 job 顺序不改变。
+2. 不使用无限生产者队列：每次下一帧只有在上一帧的 session operation 完成后才继续读取，天然形成有界 backpressure；未来需要进一步吸收突发输入时，必须显式增加有界队列和丢帧指标，不能直接并发 recognizer。
+3. `RecordingExportExecutor.wake()` 保存所属 event loop，并使用 `call_soon_threadsafe()` 投递唤醒；worker 线程不再直接操作 asyncio primitive。
+4. 旧 `/live/asr/sessions/{id}/events` 在 V2 export ledger 已提交成功但 legacy live projection 尚未刷新时，合并 durable WAV metadata；V2 ledger 仍是事实源，历史接口不把短暂 projection lag 显示为“录音未完成”。
+
+## TDD 与证据
+
+- 新增慢 ASR/慢最终提交回调测试：事件循环 heartbeat 持续调度，回调线程名为该会议的 session executor。
+- 更新 abort/finalize worker-thread 契约测试；新增跨线程 recording export wake 路径由现有录音导出集成测试覆盖。
+- focused：`57 passed, 2 warnings`，覆盖 `test_asr_stream.py`、`test_recording_export.py`、`test_v2_streaming_app_integration.py`、`test_v2_streaming_suggestions.py` 和 `test_real_asr_to_cards.py`。
+- backend 全量从 backend pytest 根目录执行为 `895 passed, 2 warnings`；`py_compile`、Node syntax 和 `git diff --check` 通过。仓库根目录直接执行 pytest 会错误收集 `artifacts/tmp` 中打包 runtime 的第三方测试，因此该错误入口不作为产品失败；正式入口固定为 `code/web_mvp/backend`。
+
+## 边界与未关闭问题
+
+- `asyncio` 任务取消不能中断已经开始的底层同步函数；本决策只保证正常顺序和事件循环不被阻塞，cooperative cancellation / 进程隔离仍是 DEC-393 backlog 的独立项。
+- session executor 是每个实时会议一个线程，目标是单用户桌面应用；多会议服务化部署前必须增加并发上限和资源预算。
+- 本决策不完成 native Tauri 采音、Keychain、Mac 签名公证、Windows 真机、模型不可变 revision 或 Phase 0 clean release。
+
+# DEC-395: 热路径修复后的 60 秒中文主链路回归通过，但不升级为 correction 或发布证据
+
+时间：2026-07-16
+
+状态：Accepted / Browser V2 short regression passed / Internal no-cost evidence
+
+## 运行条件
+
+1. 使用修复后的 8768 服务；浏览器通过真实 `getUserMedia` 路径接收扬声器播放的本地纯中文技术会议音频，不使用 Chrome fake media device。
+2. ASR 使用本地常驻 `funasr_realtime`，`provider_mode=real`、`is_mock=false`；LLM 使用本机 OpenAI-compatible fake gateway，协议和 durable job/streaming lane 真实执行但不调用远端中转站，新增费用为 0。
+3. 输入为一次性长中文音频，SHA-256=`ab6de955843b6156cf1ad9012c04f45653a3acd2d7d4d86c48bcc2c7fdf9a45b`，播放一次、重复率 0，输入资格通过。
+
+## 结果
+
+- artifact：`artifacts/tmp/phase2-pure-chinese-fixture-20260716/post-hotpath-soak-60s/report.json`
+- `verdict=go`，但 `counts_as_phase2_one_hour_gate=false`、`counts_as_phase2_semantic_gate=false`，因为本次只运行 60 秒。
+- 录音 wall clock `60.015s`，实际录音 `60.227s`，13 chunks，WAV 已组装；首文字 `5004ms`，首 final/首正式建议 `20005ms`。
+- canonical transcript 4 段，correction jobs 5 个且 lane 完成，suggestion jobs 4 个且 lane 完成，正式建议 1 条；minutes、approach、index 全部 succeeded；历史重开成功。
+- backend RSS 增长 `2.671875MB`；snapshot early median `9.285ms`、late median `6.385ms`、max `11.657ms`。
+- runtime exception、console error、network failure、HTTP 5xx 均为 0；首屏完整文字尾部可达。
+
+## 诚实边界
+
+- 纯净输入没有可见语义错误，因此 `first_correction_latency_ms=null` 是正确结果；correction job 成功不等于出现了 revision。可见 correction 必须单独使用带真实、可安全改写术语错误的输入验证。
+- 严格 `workbench_v2_real_mic_mainline.mjs` 在相同服务上的两次结果被分别保留：坏的短技术 fixture 因质量门阻断 suggestions，纯净 fixture 因没有语义变化而缺少 visible correction；这两类 No-Go 都不能被重写成 Go。
+- fake gateway 的 `gateway_base_url_kind=local` 不计生产远端 relay 证据；真实 gpt-5.5 中转站的 TTFT、费用、幂等和网络稳定性仍未在本轮重新验证。
+
+# DEC-396: 当前热路径修复不改变 Phase 0 clean release No-Go
+
+时间：2026-07-16
+
+状态：Accepted / Gate rerun / No-Go remains
+
+- 最新 manifest：`artifacts/tmp/release_provenance/phase0-current-worktree-20260716-r3/manifest.json`。
+- 当前 artifact hash 仍匹配，`tracked_sensitive_count=0`，根级 LICENSE/NOTICE/SBOM 能被读取；隐私/成本标志继续为 `secret_values_read=false`、`configs_local_read=false`、`remote_service_called=false`。
+- blocker 保持真实：58 个 dirty tracked files、277 个 untracked source files、evidence 本身不是 release Go、四个模型 immutable revision/artifact manifest/redistribution unresolved、FFmpeg revision/hash/redistribution unresolved。
+- 因此 DEC-394/395 只提高 Browser Vertical 的工程稳定性，不把开发 DMG、Mac Alpha 或公开发布状态升级为 Go。
+
+# DEC-397: V2 事件读取、live projection 和 streaming suggestion 副作用必须有界并受 lease fence
+
+时间：2026-07-16
+
+状态：Accepted / DEC-393 bounded-state backlog implemented
+
+## 问题
+
+1. `/v2/meetings/{id}/events` 与 SSE 原先一次读取 meeting 的全部历史事件，长会议会重复物化全量 outbox；前端 polling 也没有显式分页游标。
+2. legacy live projection 每次根据累计 partial/final 重建完整 record，source snapshot 虽已压缩，但 final、partial 和外部 revision 没有明确窗口上限。
+3. streaming suggestion 在 provider 失败后重试会从 `draft_seq=1` 重新开始；job lease 丢失后，进行中的 callback 仍可能写草稿或越过只校验证据的最终提交屏障。
+
+## 决策与实现
+
+1. V2 event API 默认每页 200、硬上限 1000，返回 `events/after_seq/last_seq/has_more/next_after_seq`；SSE 每轮只读取一页，有 backlog 时立即继续推进 cursor。前端 polling 在同一轮 drain 多页，并对不前进的 cursor fail-closed。
+2. legacy live projection 固定 `recent-canonical-window.v1`：最近 512 个 final、32 个 partial、128 个外部 revision；完整文字事实只由 V2 normalized tables 提供。record 保存策略、窗口和 dropped count，不把压缩伪装成完整历史。
+3. suggestion draft 与 commit 在同一 SQLite transaction 内校验 `job_id/status/lease_owner/lease_until_ms`。lease 失效后抛出 `JobLeaseLostError`，不能新增草稿或提交正式建议。
+4. retry 先读取同 generation 的持久化 draft，从现有 `draft_seq` 继续；不会覆盖旧 sequence，也不会把前次失败的草稿错误提交为新结果。
+
+## TDD
+
+- V2 persistence/app/streaming focused：`54 passed`；streaming lease/retry/pipeline focused：`44 passed`；ASR projection/repository focused：`59 passed`。
+- backend 全量正式入口：`901 passed, 2 warnings`。
+- frontend V2：`40 passed`，typecheck、lint 和 production build 通过。
+- Python compile、Node syntax、`git diff --check` 通过。
+
+# DEC-398: 修复后主链路通过短回归，但浏览器诊断和 Phase 0 必须继续 fail-closed
+
+时间：2026-07-16
+
+状态：Accepted / Browser short regression Go / Public release No-Go
+
+1. 修复后 8769 服务使用真实 browser `getUserMedia`、扬声器播放一次性纯中文技术会议音频、本地 `funasr_realtime` 和本地 OpenAI-compatible fake gateway。没有调用远端中转站，新增费用为 0。
+2. 60 秒功能回归完成 4 段文字、1 条正式建议、录音导出、minutes/approach/index 和历史重开；但 runner 报告包含一次空 URL `net::ERR_ABORTED`，旧 blocker 逻辑没有检查 `network_failures`。该报告只保留功能数据，不作为严格浏览器 clean evidence。
+3. runner 已改为：只有明确的 EventSource/events/audio unload `ERR_ABORTED` 可进入 `allowlisted_network_cancellations`，其余 network failure 与 runtime/console/5xx 一样使 verdict No-Go。修正后的 25 秒报告 `post-pagination-fencing-diagnostic-25s/report.json` 为 `go`，浏览器四类错误均为 0；首文字 `5005ms`、首 final/建议 `20005ms`，2 段文字、1 条正式建议、录音、三类会后任务和历史重开通过。
+4. 干净输入没有可见语义修正，`first_correction_latency_ms=null` 仍是诚实结果；local fake gateway 不计真实 relay TTFT、费用或 exactly-once 证据。
+5. Phase 0 最新 manifest 为 `phase0-current-worktree-20260716-r4/manifest.json`，仍为 `no_go`：58 个 dirty tracked、277 个 untracked source、evidence 非 release Go、四个模型 revision/manifest/redistribution unresolved、FFmpeg revision/hash/redistribution unresolved。`tracked_sensitive_count=0`，且 `secret_values_read/configs_local_read/remote_service_called` 均为 false。

@@ -10,7 +10,6 @@ import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import pytest
 from fastapi.testclient import TestClient
 
 from meeting_copilot_web_mvp.app import create_app
@@ -18,8 +17,6 @@ from meeting_copilot_web_mvp.app import create_app
 
 def _start_mock_openai_server():
     """A tiny OpenAI-compatible /v1/chat/completions server returning canned JSON."""
-    queue = {"approach": False}
-
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
             length = int(self.headers.get("content-length", "0"))
@@ -69,7 +66,7 @@ def test_real_llm_code_path_suggestion_cards_via_local_server(monkeypatch):
             "streaming_events": [{"event_type": "final", "segment_id": "s1", "text": "先灰度 5%。谁负责回滚？", "start_ms": 0, "end_ms": 3200, "received_at_ms": 3500, "confidence": 0.9}]
         })
         assert create.status_code == 201
-        r = client.post("/live/asr/sessions/real_llm_1/llm-execution-runs", json={"mode": "enabled"})
+        r = client.post("/live/asr/demo/sessions/real_llm_1/llm-execution-runs", json={"mode": "enabled"})
         assert r.status_code == 200, r.text
         body = r.json()
         assert body["run_count"] >= 1
@@ -96,7 +93,7 @@ def test_real_llm_code_path_approach_cards_via_local_server(monkeypatch):
             "session_id": "real_llm_2", "provider": "local_mock_asr",
             "streaming_events": [{"event_type": "final", "segment_id": "s1", "text": "先灰度 5%。", "start_ms": 0, "end_ms": 3200, "received_at_ms": 3500, "confidence": 0.9}]
         })
-        r = client.post("/live/asr/sessions/real_llm_2/approach-cards", json={"mode": "enabled"})
+        r = client.post("/live/asr/demo/sessions/real_llm_2/approach-cards", json={"mode": "enabled"})
         assert r.status_code == 200, r.text
         body = r.json()
         assert body["degraded"] is False

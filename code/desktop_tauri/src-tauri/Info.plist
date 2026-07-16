@@ -6,5 +6,7 @@
     <string>Meeting Copilot 需要麦克风权限以实时转录会议音频。音频默认由本地 ASR 处理，不上传到远程服务器。</string>
     <key>NSAudioCaptureUsageDescription</key>
     <string>Meeting Copilot 需要系统音频采集权限以转录会议中其他参会者的语音。</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>Meeting Copilot 需要屏幕与系统音频录制权限以转录电脑中播放的会议声音；产品不会保存屏幕视频。</string>
 </dict>
 </plist>

@@ -34,6 +34,8 @@ data/local_runtime/
 
 # === Artifacts (tmp / generated) ===
 artifacts/tmp/
+code/artifacts/
+code/web_mvp/backend/artifacts/
 .superpowers/
 
 # === ASR runtime heavy / regenerable dirs ===

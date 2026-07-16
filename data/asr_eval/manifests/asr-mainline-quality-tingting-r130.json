@@ -1,0 +1,34 @@
+{
+  "schema_version": "asr_mainline_quality_batch_matrix.v1",
+  "description": "Targeted regenerated local TTS matrix for release/incident coverage repair. Audio is generated locally with macOS say voice Tingting at 130 WPM under artifacts/tmp/synthetic_audio/tingting_r130; ASR uses cached local FunASR streaming model with hotwords. No remote ASR or LLM calls.",
+  "samples": [
+    {
+      "sample_id": "release-review-001",
+      "source_script_path": "data/asr_eval/synthetic_meetings/scripts/release-review.json",
+      "reference_path": "data/asr_eval/references/generated/release-review-001.txt",
+      "annotation_path": "data/asr_eval/annotations/generated/release-review-001.annotation.json",
+      "providers": [
+        {
+          "provider": "funasr_tingting_r130_chunk20_hotword",
+          "file_slug": "funasr_tingting_r130_chunk20_hotword",
+          "events_path": "artifacts/tmp/asr_events/tingting_r130_chunk20_hotword/release-review-001.funasr.events.json",
+          "transcript_report_path": "artifacts/tmp/asr_reports/tingting_r130_chunk20_hotword/release-review-001.funasr.transcript-report.json"
+        }
+      ]
+    },
+    {
+      "sample_id": "incident-review-001",
+      "source_script_path": "data/asr_eval/synthetic_meetings/scripts/incident-review.json",
+      "reference_path": "data/asr_eval/references/generated/incident-review-001.txt",
+      "annotation_path": "data/asr_eval/annotations/generated/incident-review-001.annotation.json",
+      "providers": [
+        {
+          "provider": "funasr_tingting_r130_chunk20_hotword",
+          "file_slug": "funasr_tingting_r130_chunk20_hotword",
+          "events_path": "artifacts/tmp/asr_events/tingting_r130_chunk20_hotword/incident-review-001.funasr.events.json",
+          "transcript_report_path": "artifacts/tmp/asr_reports/tingting_r130_chunk20_hotword/incident-review-001.funasr.transcript-report.json"
+        }
+      ]
+    }
+  ]
+}

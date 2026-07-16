@@ -1,0 +1,24 @@
+{
+  "technical_entities": [
+    {
+      "normalized": "checkout-service",
+      "text": "checkout-service",
+      "type": "service"
+    },
+    {
+      "normalized": "error_rate",
+      "text": "error_rate",
+      "type": "metric"
+    },
+    {
+      "normalized": "P99",
+      "text": "P99",
+      "type": "metric"
+    },
+    {
+      "normalized": "staging",
+      "text": "staging",
+      "type": "environment"
+    }
+  ]
+}

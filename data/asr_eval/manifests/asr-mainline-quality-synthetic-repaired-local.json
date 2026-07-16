@@ -1,0 +1,62 @@
+{
+  "schema_version": "asr_mainline_quality_batch_matrix.v1",
+  "description": "Repaired local synthetic technical-meeting ASR quality matrix. API and architecture use existing best local FunASR chunk20 hotword artifacts; release and incident use regenerated complete local macOS Tingting 130 WPM audio plus local FunASR chunk20 hotword artifacts. No remote ASR or LLM calls.",
+  "samples": [
+    {
+      "sample_id": "api-review-001",
+      "source_script_path": "data/asr_eval/synthetic_meetings/scripts/api-review.json",
+      "reference_path": "data/asr_eval/references/generated/api-review-001.txt",
+      "annotation_path": "data/asr_eval/annotations/generated/api-review-001.annotation.json",
+      "providers": [
+        {
+          "provider": "funasr_batch_chunk20_hotword",
+          "file_slug": "funasr_batch_chunk20_hotword",
+          "events_path": "artifacts/tmp/asr_events/batch-runtime-chunk20_hotword/api-review-001.funasr.batch-events.json",
+          "transcript_report_path": "artifacts/tmp/asr_reports/api-review-001.funasr.batch-chunk20_hotword.transcript-report.json"
+        }
+      ]
+    },
+    {
+      "sample_id": "release-review-001",
+      "source_script_path": "data/asr_eval/synthetic_meetings/scripts/release-review.json",
+      "reference_path": "data/asr_eval/references/generated/release-review-001.txt",
+      "annotation_path": "data/asr_eval/annotations/generated/release-review-001.annotation.json",
+      "providers": [
+        {
+          "provider": "funasr_tingting_r130_chunk20_hotword",
+          "file_slug": "funasr_tingting_r130_chunk20_hotword",
+          "events_path": "artifacts/tmp/asr_events/tingting_r130_chunk20_hotword/release-review-001.funasr.events.json",
+          "transcript_report_path": "artifacts/tmp/asr_reports/tingting_r130_chunk20_hotword/release-review-001.funasr.transcript-report.json"
+        }
+      ]
+    },
+    {
+      "sample_id": "incident-review-001",
+      "source_script_path": "data/asr_eval/synthetic_meetings/scripts/incident-review.json",
+      "reference_path": "data/asr_eval/references/generated/incident-review-001.txt",
+      "annotation_path": "data/asr_eval/annotations/generated/incident-review-001.annotation.json",
+      "providers": [
+        {
+          "provider": "funasr_tingting_r130_chunk20_hotword",
+          "file_slug": "funasr_tingting_r130_chunk20_hotword",
+          "events_path": "artifacts/tmp/asr_events/tingting_r130_chunk20_hotword/incident-review-001.funasr.events.json",
+          "transcript_report_path": "artifacts/tmp/asr_reports/tingting_r130_chunk20_hotword/incident-review-001.funasr.transcript-report.json"
+        }
+      ]
+    },
+    {
+      "sample_id": "architecture-review-001",
+      "source_script_path": "data/asr_eval/synthetic_meetings/scripts/architecture-review.json",
+      "reference_path": "data/asr_eval/references/generated/architecture-review-001.txt",
+      "annotation_path": "data/asr_eval/annotations/generated/architecture-review-001.annotation.json",
+      "providers": [
+        {
+          "provider": "funasr_batch_chunk20_hotword",
+          "file_slug": "funasr_batch_chunk20_hotword",
+          "events_path": "artifacts/tmp/asr_events/batch-runtime-chunk20_hotword/architecture-review-001.funasr.batch-events.json",
+          "transcript_report_path": "artifacts/tmp/asr_reports/architecture-review-001.funasr.batch-chunk20_hotword.transcript-report.json"
+        }
+      ]
+    }
+  ]
+}

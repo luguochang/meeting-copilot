@@ -1,0 +1,93 @@
+{
+  "dataset_version": "partial_hint_eval.v1",
+  "description": "Small no-cost gate for Chinese realtime partial-hint precision, recall, and progressive duplicate suppression.",
+  "cases": [
+    {
+      "case_id": "casual_chat_should_not_hint",
+      "text": "我们晚上吃什么，要不要点奶茶",
+      "expected_hint_type": null,
+      "tags": ["control", "non_engineering"]
+    },
+    {
+      "case_id": "non_technical_interruption_should_not_hint",
+      "text": "不好意思我这边外卖到了，等我开一下门",
+      "expected_hint_type": null,
+      "tags": ["control", "interruption"]
+    },
+    {
+      "case_id": "benign_engineering_should_not_hint",
+      "text": "接口负责人已经确认没有风险，监控看板也正常",
+      "expected_hint_type": null,
+      "tags": ["control", "closed_risk"]
+    },
+    {
+      "case_id": "closed_action_should_not_hint",
+      "text": "李四今天已经确认缓存窗口和回滚负责人，监控看板也正常",
+      "expected_hint_type": null,
+      "tags": ["control", "closed_action", "engineering"]
+    },
+    {
+      "case_id": "action_missing_details",
+      "text": "请李四今天确认缓存窗口和回滚负责人",
+      "expected_hint_type": "action_confirmation",
+      "tags": ["action", "engineering"]
+    },
+    {
+      "case_id": "open_question_owner",
+      "text": "P99 延迟这个风险有没有 owner",
+      "expected_hint_type": "question_followup",
+      "tags": ["question", "engineering"]
+    },
+    {
+      "case_id": "risk_threshold",
+      "text": "如果 P99 延迟超过九百毫秒就要回滚",
+      "expected_hint_type": "risk_confirmation",
+      "tags": ["risk", "engineering"]
+    },
+    {
+      "case_id": "real_mic_asr_error_release_gray_percent",
+      "text": "是技术去有些第阶合性规度百分之五",
+      "expected_hint_type": "risk_confirmation",
+      "tags": ["real_mic_error", "release", "engineering"]
+    },
+    {
+      "case_id": "real_mic_asr_error_kafka_owner",
+      "text": "需要网母今天处理科消费堆积",
+      "expected_hint_type": "action_confirmation",
+      "tags": ["real_mic_error", "action", "engineering"]
+    },
+    {
+      "case_id": "real_mic_asr_error_rate_rollback",
+      "text": "零点一旧回滚 缓存穿透",
+      "expected_hint_type": "risk_confirmation",
+      "tags": ["real_mic_error", "risk", "engineering"]
+    },
+    {
+      "case_id": "real_mic_asr_error_idempotency",
+      "text": "要确认限流合密等",
+      "expected_hint_type": "action_confirmation",
+      "tags": ["real_mic_error", "action", "engineering"]
+    },
+    {
+      "case_id": "progressive_risk_duplicate_1",
+      "text": "如果 P99 延迟超过九百毫秒",
+      "expected_hint_type": "risk_confirmation",
+      "duplicate_group": "progressive_risk",
+      "tags": ["duplicate", "risk", "engineering"]
+    },
+    {
+      "case_id": "progressive_risk_duplicate_2",
+      "text": "如果 P99 延迟超过九百毫秒就要回滚",
+      "expected_hint_type": "risk_confirmation",
+      "duplicate_group": "progressive_risk",
+      "tags": ["duplicate", "risk", "engineering"]
+    },
+    {
+      "case_id": "progressive_risk_duplicate_3",
+      "text": "如果 P99 延迟超过九百毫秒就要回滚，owner 张三确认",
+      "expected_hint_type": "risk_confirmation",
+      "duplicate_group": "progressive_risk",
+      "tags": ["duplicate", "risk", "engineering"]
+    }
+  ]
+}
