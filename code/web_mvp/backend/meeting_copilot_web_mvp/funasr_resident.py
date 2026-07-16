@@ -43,6 +43,9 @@ class _WorkerGeneration:
     reader: threading.Thread | None = None
     stderr_reader: threading.Thread | None = None
     stderr_lines: list[str] = field(default_factory=list)
+    started_at_monotonic: float = field(default_factory=time.monotonic)
+    ready_at_monotonic: float | None = None
+    exit_code: int | None = None
 
 
 class FunasrResidentSession:
@@ -215,6 +218,8 @@ class FunasrResidentWorkerManager:
         self._active_session: FunasrResidentSession | None = None
         self._shutdown = False
         self._automatic_restart_used = False
+        self._last_exit_code: int | None = None
+        self._last_error: str | None = None
         self.process_start_count = 0
         self.completed_session_count = 0
 
@@ -230,7 +235,42 @@ class FunasrResidentWorkerManager:
             generation = self._generation
             if generation is None or generation.terminal:
                 return False
-        return generation.ready_event.wait(timeout)
+        if not generation.ready_event.wait(timeout):
+            return False
+        with self._lock:
+            return (
+                self._generation is generation
+                and not generation.terminal
+                and generation.process.poll() is None
+                and generation.ready_at_monotonic is not None
+            )
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            generation = self._generation
+            process_running = bool(
+                generation is not None
+                and not generation.terminal
+                and generation.process.poll() is None
+            )
+            process_ready = bool(
+                process_running
+                and generation is not None
+                and generation.ready_at_monotonic is not None
+            )
+            return {
+                "schema_version": "funasr_resident_status.v1",
+                "spawned": generation is not None,
+                "process_running": process_running,
+                "process_ready": process_ready,
+                "pid": int(getattr(generation.process, "pid", 0) or 0) if process_running and generation else None,
+                "generation": generation.number if generation is not None else None,
+                "active_session_id": self._active_session.session_id if self._active_session is not None else None,
+                "process_start_count": self.process_start_count,
+                "completed_session_count": self.completed_session_count,
+                "last_exit_code": self._last_exit_code,
+                "last_error": self._last_error,
+            }
 
     def create_session(self, session_id: str) -> FunasrResidentSession:
         if not session_id.strip():
@@ -467,6 +507,7 @@ class FunasrResidentWorkerManager:
             if self._generation is not generation or generation.terminal:
                 return
             if event_type == "ready" and not event.get("session_id"):
+                generation.ready_at_monotonic = time.monotonic()
                 generation.ready_event.set()
                 return
             session = self._active_session
@@ -480,6 +521,10 @@ class FunasrResidentWorkerManager:
             if self._generation is not generation or generation.terminal:
                 return
             generation.terminal = True
+            generation.exit_code = exit_code
+            generation.ready_event.set()
+            self._last_exit_code = exit_code
+            self._last_error = f"worker_exited_with_code_{exit_code}"
             try:
                 generation.write_queue.put_nowait(None)
             except queue.Full:

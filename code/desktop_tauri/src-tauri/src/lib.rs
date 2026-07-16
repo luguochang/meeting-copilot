@@ -221,18 +221,18 @@ pub fn run() {
                 &resource_dir,
                 runtime_override.as_deref(),
             );
-            let backend = if runtime_bundle.is_dir() {
+            if runtime_bundle.is_dir() {
                 supervisor
                     .start_packaged(
                         &runtime_bundle,
                         &app.path().app_data_dir()?.join("runtime-data"),
                         &app.path().app_log_dir()?,
                     )
-                    .map_err(std::io::Error::other)?
+                    .map_err(std::io::Error::other)?;
             } else if cfg!(debug_assertions) {
                 let base_url = env::var("MEETING_COPILOT_DESKTOP_API_BASE_URL")
                     .unwrap_or_else(|_| "http://127.0.0.1:8765".to_string());
-                supervisor.use_external(base_url)
+                supervisor.use_external(base_url);
             } else {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
@@ -242,16 +242,13 @@ pub fn run() {
                     ),
                 )
                 .into());
-            };
-            let base_url = backend
-                .base_url
-                .clone()
-                .ok_or_else(|| std::io::Error::other("backend did not publish a base URL"))?;
+            }
+            let workbench_url = supervisor.workbench_url().map_err(std::io::Error::other)?;
             app.manage(supervisor);
             let window = app
                 .get_webview_window("main")
                 .ok_or_else(|| std::io::Error::other("main webview window is missing"))?;
-            let url = tauri::Url::parse(&format!("{base_url}/workbench"))?;
+            let url = tauri::Url::parse(&workbench_url)?;
             window.navigate(url)?;
             window.show()?;
             Ok(())

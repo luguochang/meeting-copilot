@@ -31,6 +31,58 @@ DEFAULT_MODEL_DIR = (
     / ".cache/modelscope/hub/models/iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online"
 )
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+RUNTIME_MANIFEST_RELATIVE = Path("code/desktop_tauri/runtime-bundle-manifest.json")
+RUNTIME_MANIFEST_SCHEMA = "meeting_copilot.runtime_bundle.v1"
+
+
+def _safe_bundle_path(value: Any, *, field: str) -> str:
+    relative = str(value or "").strip()
+    path = Path(relative)
+    if not relative or path.is_absolute() or ".." in path.parts or "\\" in relative:
+        raise ValueError(f"{field} must be a safe bundle-relative path")
+    return path.as_posix()
+
+
+def validate_runtime_manifest(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict) or payload.get("schema_version") != RUNTIME_MANIFEST_SCHEMA:
+        raise ValueError("runtime bundle manifest schema is invalid")
+    runtimes = payload.get("runtimes")
+    if not isinstance(runtimes, dict):
+        raise ValueError("runtime bundle manifest runtimes are missing")
+    for name in ("backend", "funasr"):
+        runtime = runtimes.get(name)
+        if not isinstance(runtime, dict) or not re.fullmatch(r"\d+\.\d+", str(runtime.get("python_version") or "")):
+            raise ValueError(f"runtime bundle manifest {name} runtime is invalid")
+        for field in ("source_venv", "executable", "venv_executable", "site_packages"):
+            runtime[field] = _safe_bundle_path(runtime.get(field), field=f"runtimes.{name}.{field}")
+    required = payload.get("required_files")
+    if not isinstance(required, list) or not required:
+        raise ValueError("runtime bundle manifest required_files are missing")
+    payload["required_files"] = [
+        _safe_bundle_path(relative, field="required_files") for relative in required
+    ]
+    for name in ("backend", "funasr"):
+        runtime = runtimes[name]
+        if runtime["executable"] not in payload["required_files"]:
+            raise ValueError(f"runtime bundle manifest omits {name} executable from required_files")
+    return payload
+
+
+def load_runtime_manifest(repo_root: Path) -> dict[str, Any]:
+    path = repo_root / RUNTIME_MANIFEST_RELATIVE
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot load runtime bundle manifest: {exc}") from exc
+    return validate_runtime_manifest(payload)
+
+
+def load_embedded_runtime_manifest(bundle: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads((bundle / "runtime-bundle-manifest.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot load embedded runtime bundle manifest: {exc}") from exc
+    return validate_runtime_manifest(payload)
 
 
 def build_and_probe(
@@ -44,19 +96,22 @@ def build_and_probe(
     repo_root = repo_root.resolve()
     output_root = resolve_output_root(repo_root, output_root)
     validate_run_id(run_id)
+    manifest = load_runtime_manifest(repo_root)
     run_root = output_root / run_id
     bundle = run_root / "MeetingCopilotRuntime.bundle"
     if run_root.exists():
         shutil.rmtree(run_root)
     bundle.mkdir(parents=True)
 
-    backend_venv = repo_root / "code/web_mvp/backend/.venv"
-    funasr_venv = repo_root / "code/asr_runtime/.venv-funasr"
-    backend_info = python_runtime_info(backend_venv / "bin/python")
-    funasr_info = python_runtime_info(funasr_venv / "bin/python")
+    backend_runtime = manifest["runtimes"]["backend"]
+    funasr_runtime = manifest["runtimes"]["funasr"]
+    backend_venv = repo_root / backend_runtime["source_venv"]
+    funasr_venv = repo_root / funasr_runtime["source_venv"]
     preconditions = {
         "backend_venv": backend_venv.is_dir(),
+        "backend_python": (backend_venv / "bin/python").is_file(),
         "funasr_venv": funasr_venv.is_dir(),
+        "funasr_python": (funasr_venv / "bin/python").is_file(),
         "model_dir": model_dir.is_dir(),
         "model_pt": (model_dir / "model.pt").is_file(),
         "model_config": (model_dir / "config.yaml").is_file(),
@@ -64,6 +119,20 @@ def build_and_probe(
     }
     if not all(preconditions.values()):
         raise RuntimeError(f"bundle preconditions failed: {preconditions}")
+    backend_info = python_runtime_info(backend_venv / "bin/python")
+    funasr_info = python_runtime_info(funasr_venv / "bin/python")
+    actual_versions = {
+        "backend": backend_info["version"],
+        "funasr": funasr_info["version"],
+    }
+    expected_versions = {
+        "backend": backend_runtime["python_version"],
+        "funasr": funasr_runtime["python_version"],
+    }
+    if actual_versions != expected_versions:
+        raise RuntimeError(
+            f"runtime Python version mismatch: expected={expected_versions}, actual={actual_versions}"
+        )
 
     clone_tree(Path(backend_info["base_prefix"]), bundle / "runtime/backend-python")
     clone_tree(backend_venv, bundle / "runtime/backend-venv")
@@ -81,11 +150,8 @@ def build_and_probe(
     )
     clone_tree(model_dir, bundle / "models/funasr-online")
     copy_application_sources(repo_root, bundle)
-    write_launchers(
-        bundle,
-        backend_version=backend_info["version"],
-        funasr_version=funasr_info["version"],
-    )
+    shutil.copy2(repo_root / RUNTIME_MANIFEST_RELATIVE, bundle / "runtime-bundle-manifest.json")
+    write_launchers(bundle, manifest=manifest)
 
     links = external_symlinks(bundle)
     probe_parent = Path(tempfile.mkdtemp(prefix=f"meeting-copilot-{run_id}-", dir="/tmp"))
@@ -117,6 +183,7 @@ def build_and_probe(
             "backend_python": backend_info["version"],
             "funasr_python": funasr_info["version"],
         },
+        "runtime_manifest": manifest,
         "key_artifacts": key_artifacts(bundle),
         "external_symlinks": links,
         "relocated_external_symlinks": relocated_links,
@@ -242,9 +309,11 @@ def copy_application_sources(repo_root: Path, bundle: Path) -> None:
 def write_launchers(
     bundle: Path,
     *,
-    backend_version: str = "3.12",
-    funasr_version: str = "3.11",
+    manifest: dict[str, Any],
 ) -> None:
+    manifest = validate_runtime_manifest(manifest)
+    backend_version = manifest["runtimes"]["backend"]["python_version"]
+    funasr_version = manifest["runtimes"]["funasr"]["python_version"]
     bin_dir = bundle / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
     backend = bin_dir / "meeting-copilot-backend"
@@ -288,6 +357,9 @@ exec "$ROOT/runtime/funasr-python/bin/python{funasr_version}" "$ROOT/app/code/as
 
 
 def clean_probe_environment(bundle: Path, probe_root: Path) -> dict[str, str]:
+    manifest = load_embedded_runtime_manifest(bundle)
+    backend_runtime = manifest["runtimes"]["backend"]
+    funasr_runtime = manifest["runtimes"]["funasr"]
     home = probe_root / "home"
     data_dir = probe_root / "data"
     cache = probe_root / "model-cache"
@@ -303,17 +375,17 @@ def clean_probe_environment(bundle: Path, probe_root: Path) -> dict[str, str]:
         "PYTHONHOME": str(bundle / "runtime/backend-python"),
         "PYTHONPATH": os.pathsep.join(
             [
-                str(bundle / "runtime/backend-venv/lib/python3.12/site-packages"),
+                str(bundle / backend_runtime["site_packages"]),
                 str(bundle / "app/code/web_mvp/backend"),
                 str(bundle / "app/code/core"),
             ]
         ),
         "MEETING_COPILOT_DATA_DIR": str(data_dir),
-        "MEETING_COPILOT_FUNASR_PYTHON": str(bundle / "runtime/funasr-python/bin/python3.11"),
+        "MEETING_COPILOT_FUNASR_PYTHON": str(bundle / funasr_runtime["executable"]),
         "MEETING_COPILOT_FUNASR_PYTHON_HOME": str(bundle / "runtime/funasr-python"),
         "MEETING_COPILOT_FUNASR_PYTHONPATH": os.pathsep.join(
             [
-                str(bundle / "runtime/funasr-venv/lib/python3.11/site-packages"),
+                str(bundle / funasr_runtime["site_packages"]),
                 str(bundle / "app/code/asr_runtime/scripts"),
             ]
         ),
@@ -329,8 +401,9 @@ def clean_probe_environment(bundle: Path, probe_root: Path) -> dict[str, str]:
 
 
 def probe_backend(bundle: Path, probe_root: Path, *, repo_root: Path) -> dict[str, Any]:
+    manifest = load_embedded_runtime_manifest(bundle)
     environment = clean_probe_environment(bundle, probe_root)
-    python = bundle / "runtime/backend-python/bin/python3.12"
+    python = bundle / manifest["runtimes"]["backend"]["executable"]
     backend_root = bundle / "app/code/web_mvp/backend"
     path_probe = subprocess.run(
         [str(python), "-c", "import json,sys; print(json.dumps(sys.path))"],
@@ -407,20 +480,22 @@ def probe_backend(bundle: Path, probe_root: Path, *, repo_root: Path) -> dict[st
 
 
 def probe_funasr(bundle: Path, probe_root: Path, *, timeout_seconds: float) -> dict[str, Any]:
+    manifest = load_embedded_runtime_manifest(bundle)
+    funasr_runtime = manifest["runtimes"]["funasr"]
     environment = clean_probe_environment(bundle, probe_root)
     environment.update(
         {
             "PYTHONHOME": str(bundle / "runtime/funasr-python"),
             "PYTHONPATH": os.pathsep.join(
                 [
-                    str(bundle / "runtime/funasr-venv/lib/python3.11/site-packages"),
+                    str(bundle / funasr_runtime["site_packages"]),
                     str(bundle / "app/code/asr_runtime/scripts"),
                 ]
             ),
         }
     )
     command = [
-        str(bundle / "runtime/funasr-python/bin/python3.11"),
+        str(bundle / funasr_runtime["executable"]),
         str(bundle / "app/code/asr_runtime/scripts/funasr_stream_worker.py"),
         "--model",
         str(bundle / "models/funasr-online"),
@@ -498,16 +573,7 @@ def external_symlinks(root: Path) -> list[str]:
 
 
 def key_artifacts(bundle: Path) -> list[dict[str, Any]]:
-    paths = (
-        "runtime/backend-python/bin/python3.12",
-        "runtime/funasr-python/bin/python3.11",
-        "app/code/web_mvp/backend/meeting_copilot_web_mvp/app.py",
-        "app/code/asr_runtime/scripts/funasr_stream_worker.py",
-        "models/funasr-online/model.pt",
-        "models/funasr-online/config.yaml",
-        "bin/meeting-copilot-backend",
-        "bin/meeting-copilot-asr-worker",
-    )
+    paths = load_embedded_runtime_manifest(bundle)["required_files"]
     artifacts: list[dict[str, Any]] = []
     for relative in paths:
         path = bundle / relative
@@ -593,13 +659,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    result = build_and_probe(
-        repo_root=args.repo_root,
-        output_root=args.output_root,
-        run_id=args.run_id,
-        model_dir=args.model_dir,
-        asr_timeout_seconds=args.asr_timeout_seconds,
-    )
+    try:
+        result = build_and_probe(
+            repo_root=args.repo_root,
+            output_root=args.output_root,
+            run_id=args.run_id,
+            model_dir=args.model_dir,
+            asr_timeout_seconds=args.asr_timeout_seconds,
+        )
+    except Exception as exc:
+        result = {
+            "schema_version": "meeting_copilot.macos_bundled_runtime_spike.v1",
+            "run_id": args.run_id,
+            "decision": {
+                "status": "no_go_local_relocatable_runtime_spike",
+                "counts_as_local_relocation_evidence": False,
+                "counts_as_clean_mac_evidence": False,
+                "counts_as_public_release_package": False,
+            },
+            "error": {
+                "class": type(exc).__name__,
+                "message": str(exc),
+            },
+        }
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0 if result["decision"]["counts_as_local_relocation_evidence"] else 2
 

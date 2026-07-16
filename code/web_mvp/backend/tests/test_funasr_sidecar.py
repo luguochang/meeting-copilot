@@ -355,11 +355,15 @@ def test_funasr_child_environment_switches_python_home_and_path(monkeypatch):
     monkeypatch.setenv("PYTHONPATH", "/bundle/backend")
     monkeypatch.setenv("MEETING_COPILOT_FUNASR_PYTHON_HOME", "/bundle/runtime/funasr-python")
     monkeypatch.setenv("MEETING_COPILOT_FUNASR_PYTHONPATH", "/bundle/runtime/funasr-site:/bundle/asr")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-must-not-reach-asr")
+    monkeypatch.setenv("MEETING_COPILOT_LOCAL_API_TOKEN", "a" * 64)
 
     environment = asr_stream._funasr_process_environment()
 
     assert environment["PYTHONHOME"] == "/bundle/runtime/funasr-python"
     assert environment["PYTHONPATH"] == "/bundle/runtime/funasr-site:/bundle/asr"
+    assert "LLM_GATEWAY_API_KEY" not in environment
+    assert "MEETING_COPILOT_LOCAL_API_TOKEN" not in environment
 
 
 def test_funasr_sidecar_uses_local_model_and_exposes_worker_ready(monkeypatch, tmp_path):

@@ -1,0 +1,49 @@
+{
+  "schema_version": "meeting_copilot.runtime_bundle.v1",
+  "platform": "macos",
+  "architectures": [
+    "arm64"
+  ],
+  "runtimes": {
+    "backend": {
+      "python_version": "3.13",
+      "source_venv": "code/web_mvp/backend/.venv",
+      "executable": "runtime/backend-python/bin/python3.13",
+      "venv_executable": "runtime/backend-venv/bin/python",
+      "site_packages": "runtime/backend-venv/lib/python3.13/site-packages"
+    },
+    "funasr": {
+      "python_version": "3.11",
+      "source_venv": "code/asr_runtime/.venv-funasr",
+      "executable": "runtime/funasr-python/bin/python3.11",
+      "venv_executable": "runtime/funasr-venv/bin/python",
+      "site_packages": "runtime/funasr-venv/lib/python3.11/site-packages"
+    }
+  },
+  "launchers": {
+    "backend": "bin/meeting-copilot-backend",
+    "funasr": "bin/meeting-copilot-asr-worker"
+  },
+  "realtime_model": {
+    "root": "models/funasr-online",
+    "required_files": [
+      "model.pt",
+      "config.yaml"
+    ]
+  },
+  "required_files": [
+    "runtime-bundle-manifest.json",
+    "bin/meeting-copilot-backend",
+    "bin/meeting-copilot-asr-worker",
+    "runtime/backend-python/bin/python3.13",
+    "runtime/backend-venv/bin/python",
+    "runtime/funasr-python/bin/python3.11",
+    "runtime/funasr-venv/bin/python",
+    "app/code/web_mvp/backend/meeting_copilot_web_mvp/app.py",
+    "app/code/web_mvp/frontend_v2/dist/index.html",
+    "app/code/core/meeting_copilot_core/__init__.py",
+    "app/code/asr_runtime/scripts/funasr_stream_worker.py",
+    "models/funasr-online/model.pt",
+    "models/funasr-online/config.yaml"
+  ]
+}

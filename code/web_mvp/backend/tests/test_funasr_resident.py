@@ -77,6 +77,8 @@ class _ProtocolStdin:
 
 
 class _FakePopen:
+    _next_pid = 20_000
+
     def __init__(self, command: list[str]) -> None:
         self.command = command
         self.stdout = _QueueLineStream()
@@ -90,6 +92,8 @@ class _FakePopen:
         self._exit_lock = threading.Lock()
         self.wait_calls = 0
         self.kill_calls = 0
+        self.pid = self.__class__._next_pid
+        self.__class__._next_pid += 1
 
     def handle_command(self, command: dict[str, Any]) -> None:
         self.commands.append(command)
@@ -243,6 +247,28 @@ def test_sequential_sessions_reuse_process_finalize_keeps_worker_and_text_is_iso
         "stderr": subprocess.PIPE,
         "env": {"FUNASR_OFFLINE": "1"},
     }
+
+
+def test_manager_status_requires_global_worker_ready_and_records_exit(manager_and_factory):
+    manager, factory = manager_and_factory
+
+    manager.start()
+    process = factory.processes[0]
+    before = manager.status()
+    assert before["spawned"] is True
+    assert before["process_running"] is True
+    assert before["process_ready"] is False
+    assert before["pid"] == process.pid
+
+    process.emit_event({"event_type": "ready", "provider": "funasr_realtime"})
+    assert manager.wait_process_ready(1.0) is True
+    assert manager.status()["process_ready"] is True
+
+    process.crash(19)
+    _wait_until(lambda: manager.status()["last_exit_code"] == 19)
+    status = manager.status()
+    assert status["last_error"] == "worker_exited_with_code_19"
+    assert status["process_ready"] is False
 
 
 def test_abort_releases_session_and_next_session_reuses_worker(manager_and_factory):

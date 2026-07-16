@@ -19,6 +19,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DESKTOP_ROOT = REPO_ROOT / "code" / "desktop_tauri"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "artifacts" / "tmp" / "tauri_runtime_package"
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+RUNTIME_MANIFEST_SCHEMA = "meeting_copilot.runtime_bundle.v1"
 
 
 def resolve_output_root(repo_root: Path, output_root: Path) -> Path:
@@ -36,18 +37,34 @@ def validate_run_id(run_id: str) -> None:
         raise ValueError("run_id contains unsafe characters")
 
 
-def validate_runtime_bundle(bundle: Path) -> None:
-    required = (
-        "bin/meeting-copilot-backend",
-        "runtime/backend-python/bin/python3.12",
-        "runtime/funasr-python/bin/python3.11",
-        "app/code/web_mvp/backend/meeting_copilot_web_mvp/app.py",
-        "app/code/web_mvp/frontend_v2/dist/index.html",
-        "app/code/core/meeting_copilot_core/__init__.py",
-        "app/code/asr_runtime/scripts/funasr_stream_worker.py",
-        "models/funasr-online/model.pt",
-        "models/funasr-online/config.yaml",
-    )
+def _safe_bundle_path(value: Any) -> str:
+    relative = str(value or "").strip()
+    path = Path(relative)
+    if not relative or path.is_absolute() or ".." in path.parts or "\\" in relative:
+        raise ValueError("runtime bundle manifest contains unsafe required path")
+    return path.as_posix()
+
+
+def load_runtime_bundle_manifest(bundle: Path) -> dict[str, Any]:
+    manifest_path = bundle / "runtime-bundle-manifest.json"
+    if not manifest_path.is_file():
+        raise ValueError("runtime bundle missing required files: runtime-bundle-manifest.json")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError("runtime bundle manifest is invalid JSON") from exc
+    if not isinstance(manifest, dict) or manifest.get("schema_version") != RUNTIME_MANIFEST_SCHEMA:
+        raise ValueError("runtime bundle manifest schema is invalid")
+    required = manifest.get("required_files")
+    if not isinstance(required, list) or not required:
+        raise ValueError("runtime bundle manifest required_files are missing")
+    manifest["required_files"] = [_safe_bundle_path(relative) for relative in required]
+    return manifest
+
+
+def validate_runtime_bundle(bundle: Path) -> dict[str, Any]:
+    manifest = load_runtime_bundle_manifest(bundle)
+    required = manifest["required_files"]
     missing = [relative for relative in required if not (bundle / relative).is_file()]
     if missing:
         raise ValueError(f"runtime bundle missing required files: {', '.join(missing)}")
@@ -60,6 +77,7 @@ def validate_runtime_bundle(bundle: Path) -> None:
                 external_links.append(candidate.relative_to(bundle).as_posix())
     if external_links:
         raise ValueError(f"runtime bundle contains external symlinks: {', '.join(external_links)}")
+    return manifest
 
 
 def build_overlay(bundle: Path, overlay_path: Path) -> dict[str, Any]:
@@ -130,7 +148,7 @@ def package_runtime_app(
     runtime_bundle = runtime_bundle.resolve()
     output_root = resolve_output_root(repo_root, output_root)
     validate_run_id(run_id)
-    validate_runtime_bundle(runtime_bundle)
+    runtime_manifest = validate_runtime_bundle(runtime_bundle)
 
     run_root = output_root / run_id
     if run_root.exists():
@@ -174,19 +192,20 @@ def package_runtime_app(
     packaged_app = run_root / "Meeting Copilot.app"
     clone_tree(built_app, packaged_app)
     resource_root = packaged_app / "Contents/Resources/MeetingCopilotRuntime.bundle"
-    required_packaged = [
-        resource_root / "bin/meeting-copilot-backend",
-        resource_root / "runtime/backend-python/bin/python3.12",
-        resource_root / "runtime/funasr-python/bin/python3.11",
-        resource_root / "models/funasr-online/model.pt",
-    ]
-    missing_packaged = [str(path.relative_to(packaged_app)) for path in required_packaged if not path.is_file()]
+    try:
+        packaged_manifest = validate_runtime_bundle(resource_root)
+        missing_packaged: list[str] = []
+    except ValueError as exc:
+        packaged_manifest = None
+        missing_packaged = [str(exc)]
     evidence = {
         "schema_version": "meeting_copilot.tauri_runtime_package.v1",
         "run_id": run_id,
         "host_platform": platform.platform(),
         "architecture": platform.machine(),
         "runtime_bundle_source": str(runtime_bundle),
+        "runtime_manifest": runtime_manifest,
+        "packaged_runtime_manifest": packaged_manifest,
         "overlay": overlay,
         "build_command": command,
         "build_return_code": completed.returncode,

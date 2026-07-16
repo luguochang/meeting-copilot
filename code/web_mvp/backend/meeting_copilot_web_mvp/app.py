@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import asyncio
+import hmac
 import json
 import os
 import structlog
@@ -20,7 +21,7 @@ from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request, Response, UploadFile, File, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -72,6 +73,15 @@ from meeting_copilot_web_mvp import metrics as _metrics
 from meeting_copilot_web_mvp.storage_governance import (
     UnsafeManagedPathError,
     preflight_meeting_storage,
+)
+from meeting_copilot_web_mvp.local_api_auth import (
+    BOOTSTRAP_PATH,
+    LOCAL_API_TOKEN_ENV,
+    SESSION_COOKIE_NAME,
+    LocalApiAuthMiddleware,
+    health_proof,
+    session_cookie_value,
+    token_status,
 )
 
 configure_logging()
@@ -495,6 +505,8 @@ def create_app(
     if degradation.reason.startswith(("asr_sidecar_crashed:", "asr_sidecar_restart_failed:")):
         degradation.reset()
     app = FastAPI(title="Meeting Copilot Local Web MVP")
+    local_api_token = os.environ.get(LOCAL_API_TOKEN_ENV, "").strip()
+    app.state.local_api_auth = token_status(local_api_token)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[
@@ -505,6 +517,7 @@ def create_app(
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["*"],
     )
+    app.add_middleware(LocalApiAuthMiddleware, token=local_api_token)
     if repository is not None and data_dir is not None:
         raise ValueError("repository and data_dir cannot both be provided")
     data_dir_path = Path(data_dir) if data_dir is not None else None
@@ -1144,9 +1157,31 @@ def create_app(
         response.headers["x-request-id"] = request_id
         return response
 
+    @app.get(BOOTSTRAP_PATH)
+    def desktop_bootstrap(token: str, next: str = "/workbench") -> Response:
+        if not local_api_token:
+            raise HTTPException(status_code=404, detail="desktop bootstrap is disabled")
+        if next not in {"/workbench", "/workbench-v2"}:
+            raise HTTPException(status_code=422, detail="desktop bootstrap target is invalid")
+        if not hmac.compare_digest(token, local_api_token):
+            raise HTTPException(status_code=403, detail="desktop bootstrap token is invalid")
+        response = RedirectResponse(next, status_code=303)
+        response.set_cookie(
+            SESSION_COOKIE_NAME,
+            session_cookie_value(local_api_token),
+            httponly=True,
+            secure=False,
+            samesite="strict",
+            path="/",
+        )
+        return response
+
     @app.get("/health")
     def health() -> dict[str, str]:
-        return {"status": "ok", "service": "meeting-copilot-web-mvp"}
+        result = {"status": "ok", "service": "meeting-copilot-web-mvp"}
+        if local_api_token:
+            result["instance_proof"] = health_proof(local_api_token)
+        return result
 
     def _require_v2_persistence() -> V2Persistence:
         if v2_persistence is None:
@@ -1609,6 +1644,15 @@ def create_app(
                 "raw_audio_uploaded_by_default": False,
             },
             "degradation": get_degradation_controller().to_status_dict(),
+        }
+
+    @app.get("/providers/asr/runtime")
+    def asr_runtime_status() -> dict[str, Any]:
+        return {
+            "schema_version": "asr_runtime_status.v1",
+            "realtime_available": asr_stream.funasr_realtime_available(),
+            "resident_enabled": asr_stream._funasr_resident_enabled(),
+            "resident": asr_stream.funasr_resident_status(),
         }
 
     @app.get("/degradation/status")
@@ -5652,7 +5696,10 @@ def create_app(
 
     async def _start_funasr_resident_worker() -> None:
         if prewarm_funasr:
-            await asyncio.to_thread(asr_stream.prewarm_funasr_resident_manager)
+            ready = await asyncio.to_thread(asr_stream.prewarm_funasr_resident_manager)
+            app.state.funasr_resident_prewarm_ready = ready
+            if os.environ.get("MEETING_COPILOT_DESKTOP_RUNTIME") == "1" and not ready:
+                raise RuntimeError("packaged desktop FunASR resident worker failed to become ready")
 
     async def _stop_desktop_parent_watchdog() -> None:
         task = app.state.desktop_parent_watchdog_task
