@@ -6,16 +6,23 @@ def test_correct_transcript_fixes_misrecognitions():
     config = llm_service.LlmConfig(base_url="https://gw.example", api_key="sk-x", model="m1")
 
     class FakeClient:
+        def __init__(self):
+            self.calls = []
+
         def post_json(self, url, headers, body, timeout):
+            self.calls.append({"url": url, "headers": headers, "body": body, "timeout": timeout})
             return {"choices": [{"message": {"content": "这次讨论 P99 延迟和 checkout-service 的灰度。"}}], "usage": {"total_tokens": 50}}
 
+    client = FakeClient()
     corrected, usage, degraded = asr_correct.correct_transcript(
-        "这次讨论 t九九 延迟和 payment gate 的灰度。", config, client=FakeClient()
+        "这次讨论 t九九 延迟和 payment gate 的灰度。", config, client=client
     )
     assert degraded is False
     assert "P99" in corrected
     assert "checkout-service" in corrected
     assert usage["total_tokens"] == 50
+    assert client.calls[0]["body"]["reasoning_effort"] == "low"
+    assert client.calls[0]["body"]["max_completion_tokens"] == 4096
 
 
 def test_correct_transcript_degrades_to_raw_on_failure(monkeypatch):

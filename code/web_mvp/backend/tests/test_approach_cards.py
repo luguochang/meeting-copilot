@@ -1,8 +1,11 @@
 """Tests for approach-consideration cards (Phase 2.5)."""
+from concurrent.futures import ThreadPoolExecutor
 import json
+from threading import Event
 from fastapi.testclient import TestClient
 from meeting_copilot_web_mvp import llm_service
 from meeting_copilot_web_mvp.app import create_app
+from meeting_copilot_web_mvp.sqlite_repository import SqliteAsrLiveSessionRepository
 
 
 class FakeClient:
@@ -57,7 +60,7 @@ def test_approach_cards_endpoint_returns_cards(monkeypatch):
         "streaming_events": [{"event_type": "final", "segment_id": "s1", "text": "先灰度 5%。", "start_ms": 0, "end_ms": 3200, "received_at_ms": 3500, "confidence": 0.9}]
     })
     assert create.status_code == 201
-    r = client.post("/live/asr/sessions/approach_test/approach-cards", json={"mode": "enabled"})
+    r = client.post("/live/asr/demo/sessions/approach_test/approach-cards", json={"mode": "enabled"})
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["count"] == 1
@@ -68,15 +71,42 @@ def test_approach_cards_endpoint_returns_cards(monkeypatch):
     assert body["llm_usage"]["total_tokens"] == 250
 
 
+def test_approach_cards_endpoint_persists_cards_for_history(monkeypatch):
+    resp = {"choices": [{"message": {"content": json.dumps([
+        {"card_type": "approach.risk", "suggestion_text": "补充回滚阈值", "confidence": 0.9, "trigger_reason": "灰度方案", "evidence_quote": "先灰度 5%"}
+    ])}}], "usage": {"total_tokens": 90}}
+    monkeypatch.setattr(llm_service, "HttpxLlmClient", lambda: FakeClient(resp))
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_GATEWAY_MODEL", "m1")
+    client = TestClient(create_app())
+    create = client.post("/live/asr/mock/sessions", json={
+        "session_id": "approach_persist", "provider": "local_mock_asr",
+        "streaming_events": [{"event_type": "final", "segment_id": "s1", "text": "先灰度 5%。", "start_ms": 0, "end_ms": 3200, "received_at_ms": 3500, "confidence": 0.9}]
+    })
+
+    response = client.post("/live/asr/demo/sessions/approach_persist/approach-cards", json={"mode": "enabled"})
+    fetched = client.get("/live/asr/sessions/approach_persist/events")
+    history = client.get("/live/asr/sessions?include_demo=true")
+
+    assert create.status_code == 201
+    assert response.status_code == 200
+    assert fetched.status_code == 200
+    assert fetched.json()["approach_cards"][0]["suggestion_text"] == "补充回滚阈值"
+    indexed = {item["session_id"]: item for item in history.json()["sessions"]}
+    assert indexed["approach_persist"]["approach_card_count"] == 1
+
+
 def test_approach_cards_endpoint_without_config_returns_422(monkeypatch):
     monkeypatch.delenv("LLM_GATEWAY_BASE_URL", raising=False)
     monkeypatch.delenv("LLM_GATEWAY_API_KEY", raising=False)
+    monkeypatch.setattr(llm_service, "REPO_ENV_FILE", "missing.env")
     client = TestClient(create_app())
     client.post("/live/asr/mock/sessions", json={
         "session_id": "approach_nocfg", "provider": "local_mock_asr",
         "streaming_events": [{"event_type": "final", "segment_id": "s1", "text": "x", "start_ms": 0, "end_ms": 100, "received_at_ms": 110, "confidence": 0.9}]
     })
-    r = client.post("/live/asr/sessions/approach_nocfg/approach-cards", json={"mode": "enabled"})
+    r = client.post("/live/asr/demo/sessions/approach_nocfg/approach-cards", json={"mode": "enabled"})
     assert r.status_code == 422
 
 
@@ -130,8 +160,49 @@ def test_approach_cards_endpoint_returns_degraded_flag_when_llm_fails(monkeypatc
         "session_id": "approach_deg", "provider": "local_mock_asr",
         "streaming_events": [{"event_type": "final", "segment_id": "s1", "text": "x", "start_ms": 0, "end_ms": 100, "received_at_ms": 110, "confidence": 0.9}]
     })
-    r = client.post("/live/asr/sessions/approach_deg/approach-cards", json={"mode": "enabled"})
+    r = client.post("/live/asr/demo/sessions/approach_deg/approach-cards", json={"mode": "enabled"})
     assert r.status_code == 200  # degraded, not 500
     body = r.json()
     assert body["degraded"] is True
     assert body["count"] == 0
+
+
+def test_approach_persistence_keeps_event_appended_while_llm_is_blocked(monkeypatch, tmp_path):
+    provider_entered = Event()
+    release_provider = Event()
+    response = {"choices": [{"message": {"content": json.dumps([
+        {"card_type": "approach.consideration", "suggestion_text": "确认回滚阈值", "confidence": 0.9, "trigger_reason": "灰度", "evidence_quote": "先灰度 5%"}
+    ])}}], "usage": {"total_tokens": 9}}
+
+    class BlockingClient:
+        def post_json(self, url, headers, body, timeout):
+            provider_entered.set()
+            assert release_provider.wait(timeout=3)
+            return response
+
+    monkeypatch.setattr(llm_service, "HttpxLlmClient", lambda: BlockingClient())
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_GATEWAY_MODEL", "m1")
+    client = TestClient(create_app(data_dir=tmp_path))
+    client.post("/live/asr/mock/sessions", json={
+        "session_id": "approach_concurrent_event", "provider": "local_mock_asr",
+        "streaming_events": [{"event_type": "final", "segment_id": "s1", "text": "先灰度 5%。", "start_ms": 0, "end_ms": 3200, "received_at_ms": 3500, "confidence": 0.9}]
+    })
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            client.post,
+            "/live/asr/demo/sessions/approach_concurrent_event/approach-cards",
+            json={"mode": "enabled"},
+        )
+        assert provider_entered.wait(timeout=2)
+        SqliteAsrLiveSessionRepository(tmp_path).update(
+            "approach_concurrent_event",
+            lambda latest: {**latest, "events": [*latest["events"], {"id": "concurrent_event", "event_type": "state_event", "at_ms": 9_999, "payload": {}}]},
+        )
+        release_provider.set()
+        assert future.result(timeout=5).status_code == 200
+
+    persisted = SqliteAsrLiveSessionRepository(tmp_path).get("approach_concurrent_event")
+    assert any(event.get("id") == "concurrent_event" for event in persisted["events"])

@@ -2,16 +2,25 @@
 name = "meeting-copilot-web-mvp"
 version = "0.1.0"
 description = "Local PC Web MVP backend for Meeting Copilot"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 dependencies = [
-  "fastapi",
-  "uvicorn[standard]",
-  "pydantic>=2",
-  "httpx",
-  "python-dotenv",
-  "structlog",
-  "websockets",
-  "python-multipart",
+  "fastapi>=0.116,<1",
+  "httpx>=0.28,<1",
+  "imageio-ffmpeg>=0.6,<1",
+  "pydantic>=2.11,<3",
+  "python-dotenv>=1.1,<2",
+  "python-multipart>=0.0.20,<1",
+  "sounddevice>=0.5,<1",
+  "structlog>=25.4,<27",
+  "uvicorn[standard]>=0.35,<1",
+  "websocket-client>=1.8,<2",
+  "websockets>=15,<17",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.4,<10",
+  "ruff>=0.12,<1",
 ]
 
 [tool.ruff]

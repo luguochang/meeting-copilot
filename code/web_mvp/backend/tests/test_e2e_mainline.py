@@ -4,7 +4,6 @@ Proves the real mainline: ASR events -> state -> suggestion candidate -> real LL
 call -> real suggestion card that references an ACTIVE EvidenceSpan, with LLM
 usage recorded. Uses a fake LLM client (no network, no real gateway).
 """
-import pytest
 from fastapi.testclient import TestClient
 
 from meeting_copilot_web_mvp import llm_service
@@ -67,7 +66,7 @@ def test_e2e_mainline_real_card_references_active_evidence_with_llm_usage(monkey
 
     # 3. execute real LLM -> real suggestion cards
     resp = client.post(
-        "/live/asr/sessions/e2e_mainline/llm-execution-runs",
+        "/live/asr/demo/sessions/e2e_mainline/llm-execution-runs",
         json={"mode": "enabled"},
     )
     assert resp.status_code == 200, resp.text

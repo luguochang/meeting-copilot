@@ -234,6 +234,7 @@ def test_build_asr_live_events_maps_streaming_contract_to_live_envelope():
             "status": "active",
         }
     ]
+
     assert revision["payload"]["superseded_evidence_spans"] == [
         {
             "id": "asr_ev_asr_seg_001",
@@ -258,6 +259,243 @@ def test_build_asr_live_events_maps_streaming_contract_to_live_envelope():
     assert evaluation["payload"]["revision_event_count"] == 1
     assert evaluation["payload"]["error_event_count"] == 1
     assert evaluation["payload"]["end_of_stream_event_count"] == 1
+
+
+def test_build_asr_live_events_emits_no_cost_partial_hint_for_risk_partial():
+    events = build_asr_live_events(
+        session_id="partial_hint_session",
+        provider="sherpa_onnx_realtime",
+        is_mock=False,
+        streaming_events=[
+            {
+                "event_type": "partial",
+                "segment_id": "asr_seg_partial_risk",
+                "text": "如果错误率超过零点一就回滚，接口负责人需要确认",
+                "start_ms": 0,
+                "end_ms": 1800,
+                "received_at_ms": 1900,
+                "confidence": 0.76,
+            }
+        ],
+    )
+
+    event_types = [event["event_type"] for event in events]
+    assert event_types == ["transcript_partial", "partial_hint_event"]
+    hint = events[1]
+    assert hint["source"] == "live_asr_stream"
+    assert hint["trace_kind"] == "live_event"
+    assert hint["payload"]["hint_policy_version"] == "partial-hint-policy.v1"
+    assert hint["payload"]["hint_origin"] == "local_deterministic_partial"
+    assert hint["payload"]["llm_call_status"] == "not_called"
+    assert hint["payload"]["card_status"] == "not_created"
+    assert hint["payload"]["segment_batch"] == ["asr_seg_partial_risk"]
+    assert hint["payload"]["source_event_ids"] == ["transcript_partial:asr_seg_partial_risk"]
+    assert "确认" in hint["payload"]["suggested_prompt"]
+    assert "partial_not_final" in hint["payload"]["degradation_reasons"]
+
+
+def test_build_asr_live_events_partial_hint_balances_precision_and_recall():
+    cases = [
+        (
+            "casual_chat",
+            "我们晚上吃什么，要不要点奶茶",
+            None,
+        ),
+        (
+            "benign_engineering",
+            "接口负责人已经确认没有风险，监控看板也正常",
+            None,
+        ),
+        (
+            "action_missing_details",
+            "请李四今天确认缓存窗口和回滚负责人",
+            "action_confirmation",
+        ),
+        (
+            "open_question",
+            "P99 延迟这个风险有没有 owner",
+            "question_followup",
+        ),
+        (
+            "risk_threshold",
+            "如果 P99 延迟超过九百毫秒就要回滚",
+            "risk_confirmation",
+        ),
+    ]
+
+    for segment_id, text, expected_hint_type in cases:
+        events = build_asr_live_events(
+            session_id=f"partial_hint_eval_{segment_id}",
+            provider="sherpa_onnx_realtime",
+            is_mock=False,
+            streaming_events=[
+                {
+                    "event_type": "partial",
+                    "segment_id": segment_id,
+                    "text": text,
+                    "start_ms": 0,
+                    "end_ms": 1500,
+                    "received_at_ms": 1600,
+                    "confidence": 0.8,
+                }
+            ],
+        )
+        hints = [event for event in events if event["event_type"] == "partial_hint_event"]
+        if expected_hint_type is None:
+            assert hints == [], segment_id
+        else:
+            assert len(hints) == 1, segment_id
+            assert hints[0]["payload"]["hint_type"] == expected_hint_type
+
+
+def test_build_asr_live_events_prioritizes_explicit_action_over_incidental_risk_wording():
+    action_events = build_asr_live_events(
+        session_id="partial_hint_action_with_backlog",
+        provider="sherpa_onnx_realtime",
+        is_mock=False,
+        streaming_events=[
+            {
+                "event_type": "partial",
+                "segment_id": "action_backlog_001",
+                "text": "需要网母今天处理科消费堆积",
+                "start_ms": 0,
+                "end_ms": 1600,
+                "received_at_ms": 1700,
+                "confidence": 0.78,
+            }
+        ],
+    )
+    action_hints = [
+        event for event in action_events if event["event_type"] == "partial_hint_event"
+    ]
+
+    risk_events = build_asr_live_events(
+        session_id="partial_hint_risk_backlog",
+        provider="sherpa_onnx_realtime",
+        is_mock=False,
+        streaming_events=[
+            {
+                "event_type": "partial",
+                "segment_id": "risk_backlog_001",
+                "text": "如果 Kafka 消费堆积导致积压，就需要回滚",
+                "start_ms": 0,
+                "end_ms": 1800,
+                "received_at_ms": 1900,
+                "confidence": 0.78,
+            }
+        ],
+    )
+    risk_hints = [
+        event for event in risk_events if event["event_type"] == "partial_hint_event"
+    ]
+
+    assert len(action_hints) == 1
+    assert action_hints[0]["payload"]["hint_type"] == "action_confirmation"
+    assert len(risk_hints) == 1
+    assert risk_hints[0]["payload"]["hint_type"] == "risk_confirmation"
+
+
+def test_build_asr_live_events_deduplicates_progressive_partial_hints_by_semantic_key():
+    events = build_asr_live_events(
+        session_id="partial_hint_dedupe_session",
+        provider="sherpa_onnx_realtime",
+        is_mock=False,
+        streaming_events=[
+            {
+                "event_type": "partial",
+                "segment_id": "risk_partial_001",
+                "text": "如果 P99 延迟超过九百毫秒",
+                "start_ms": 0,
+                "end_ms": 900,
+                "received_at_ms": 950,
+                "confidence": 0.78,
+            },
+            {
+                "event_type": "partial",
+                "segment_id": "risk_partial_002",
+                "text": "如果 P99 延迟超过九百毫秒就要回滚",
+                "start_ms": 0,
+                "end_ms": 1500,
+                "received_at_ms": 1550,
+                "confidence": 0.8,
+            },
+            {
+                "event_type": "partial",
+                "segment_id": "risk_partial_003",
+                "text": "如果 P99 延迟超过九百毫秒就要回滚，owner 张三确认",
+                "start_ms": 0,
+                "end_ms": 2100,
+                "received_at_ms": 2150,
+                "confidence": 0.82,
+            },
+        ],
+    )
+
+    assert [event["event_type"] for event in events].count("transcript_partial") == 3
+    hints = [event for event in events if event["event_type"] == "partial_hint_event"]
+    assert len(hints) == 1
+    assert hints[0]["payload"]["hint_type"] == "risk_confirmation"
+    assert hints[0]["payload"]["dedupe_key"] == "risk_confirmation:p99:latency_threshold"
+
+
+def test_build_asr_live_events_suppresses_already_closed_partial_action_hint():
+    events = build_asr_live_events(
+        session_id="partial_hint_closed_action_session",
+        provider="sherpa_onnx_realtime",
+        is_mock=False,
+        streaming_events=[
+            {
+                "event_type": "partial",
+                "segment_id": "closed_action_partial",
+                "text": "李四今天已经确认缓存窗口和回滚负责人，监控看板也正常",
+                "start_ms": 0,
+                "end_ms": 1800,
+                "received_at_ms": 1900,
+                "confidence": 0.86,
+            }
+        ],
+    )
+
+    assert [event["event_type"] for event in events] == ["transcript_partial"]
+
+
+def test_build_asr_live_events_extracts_state_candidates_from_normalized_final_text():
+    events = build_asr_live_events(
+        session_id="normalized_final_candidate_session",
+        provider="sherpa_onnx_realtime",
+        is_mock=False,
+        streaming_events=[
+            {
+                "event_type": "final",
+                "segment_id": "normalized_final_001",
+                "text": "接口先恢度百分之五，如果 P 九九延迟超过九百毫秒就回滚",
+                "start_ms": 0,
+                "end_ms": 2400,
+                "received_at_ms": 2500,
+                "confidence": 0.86,
+            }
+        ],
+    )
+
+    final = next(event for event in events if event["event_type"] == "transcript_final")
+    assert final["payload"]["text"] == "接口先恢度百分之五，如果 P 九九延迟超过九百毫秒就回滚"
+    assert final["payload"]["normalized_text"] == "接口先灰度百分之五，如果 P99延迟超过九百毫秒就回滚"
+    assert final["payload"]["evidence_spans"][0]["quote"] == final["payload"]["text"]
+
+    state_types = [
+        event["payload"]["target_type"]
+        for event in events
+        if event["event_type"] == "state_event"
+    ]
+    assert "DecisionCandidate" in state_types
+    assert "Risk" in state_types
+    decision = next(
+        event
+        for event in events
+        if event["event_type"] == "state_event"
+        and event["payload"]["target_type"] == "DecisionCandidate"
+    )
+    assert "先灰度" in decision["payload"]["state_item"]["statement"]
 
 
 def test_build_asr_live_events_emits_local_state_and_scheduler_skeleton():
@@ -461,6 +699,41 @@ def test_build_asr_live_events_suppresses_non_engineering_open_question_candidat
     assert "llm_request_draft_event" not in [event["event_type"] for event in events]
 
 
+def test_build_asr_live_events_extracts_general_software_architecture_question():
+    streaming_events = [
+        {
+            "event_type": "final",
+            "segment_id": "asr_seg_architecture_question_001",
+            "text": "公司里的工具是封装成 SDK，还是提供一个 toolkit？",
+            "start_ms": 0,
+            "end_ms": 4200,
+            "received_at_ms": 4400,
+            "confidence": 0.9,
+        },
+        {
+            "event_type": "end_of_stream",
+            "segment_id": "asr_eos",
+            "text": "",
+            "start_ms": 4500,
+            "end_ms": 4500,
+            "received_at_ms": 4500,
+        },
+    ]
+
+    events = build_asr_live_events(
+        session_id="general_architecture_question",
+        provider="local_mock_asr",
+        streaming_events=streaming_events,
+    )
+
+    state = next(event for event in events if event["event_type"] == "state_event")
+    candidate = next(event for event in events if event["event_type"] == "suggestion_candidate_event")
+    assert state["payload"]["target_type"] == "OpenQuestion"
+    assert state["payload"]["state_item"]["question"] == streaming_events[0]["text"]
+    assert candidate["payload"]["target_type"] == "OpenQuestion"
+    assert candidate["payload"]["scheduler_event_type"] == "llm_candidate_queued"
+
+
 def test_build_asr_live_events_extracts_action_item_state_candidate():
     streaming_events = [
         {
@@ -573,6 +846,164 @@ def test_build_asr_live_events_emits_suggestion_candidate_after_action_scheduler
     assert scheduler_event["payload"]["source_event_ids"] == [
         state_event["payload"]["event_id"]
     ]
+
+
+def test_build_asr_live_events_can_queue_candidate_from_stable_partial_before_final():
+    streaming_events = [
+        {
+            "event_type": "partial",
+            "segment_id": "asr_seg_live_partial_001",
+            "text": "发布评审 payment-gateway 先灰度百分之五，如果 P99 延迟超过九百毫秒就回滚，张三今天补 SLO 看板。",
+            "start_ms": 0,
+            "end_ms": 7200,
+            "received_at_ms": 7200,
+            "confidence": 0.88,
+            "candidate_eligible": True,
+            "candidate_source": "stable_partial",
+        },
+        {
+            "event_type": "end_of_stream",
+            "segment_id": "asr_eos",
+            "text": "",
+            "start_ms": 7500,
+            "end_ms": 7500,
+            "received_at_ms": 7500,
+        },
+    ]
+
+    events = build_asr_live_events(
+        session_id="stable_partial_candidate_contract",
+        provider="local_mock_asr",
+        streaming_events=streaming_events,
+    )
+
+    event_types = [event["event_type"] for event in events]
+    assert event_types == [
+        "transcript_partial",
+        "partial_hint_event",
+        "state_event",
+        "scheduler_event",
+        "suggestion_candidate_event",
+        "llm_request_draft_event",
+        "state_event",
+        "scheduler_event",
+        "suggestion_candidate_event",
+        "llm_request_draft_event",
+        "evaluation_summary",
+    ]
+    candidates = [
+        event for event in events if event["event_type"] == "suggestion_candidate_event"
+    ]
+    assert candidates[0]["payload"]["scheduler_event_type"] == "llm_candidate_deferred"
+    assert candidates[0]["payload"]["decision_reason"] == "partial_not_final"
+    assert candidates[0]["payload"]["llm_call_status"] == "not_called"
+    assert candidates[0]["payload"]["candidate_origin"] == "local_deterministic_asr_stable_partial_skeleton"
+    assert candidates[0]["payload"]["confidence"] == 0.85
+    assert candidates[0]["payload"]["confidence_level"] == "high"
+    assert candidates[0]["payload"]["degradation_reasons"] == ["partial_not_final"]
+    assert candidates[0]["payload"]["evidence_span_ids"] == [
+        "asr_partial_ev_asr_seg_live_partial_001"
+    ]
+
+
+def test_stable_partial_does_not_consume_scheduler_cooldown_before_final():
+    streaming_events = [
+        {
+            "event_type": "partial",
+            "segment_id": "partial_seg",
+            "text": "发布评审先灰度百分之五，如果错误率超过百分之零点一就回滚。",
+            "start_ms": 0,
+            "end_ms": 30_000,
+            "received_at_ms": 30_000,
+            "confidence": 0.88,
+            "candidate_eligible": True,
+            "candidate_source": "stable_partial",
+        },
+        {
+            "event_type": "final",
+            "segment_id": "final_seg",
+            "text": "发布评审先灰度百分之五，如果错误率超过百分之零点一就回滚。",
+            "start_ms": 0,
+            "end_ms": 31_000,
+            "received_at_ms": 31_000,
+            "confidence": 0.9,
+        },
+    ]
+
+    events = build_asr_live_events(
+        session_id="partial_then_final_scheduler",
+        provider="local_mock_asr",
+        streaming_events=streaming_events,
+    )
+    candidates = [event for event in events if event["event_type"] == "suggestion_candidate_event"]
+    partial_candidates = [
+        event for event in candidates
+        if event["payload"].get("candidate_origin") == "local_deterministic_asr_stable_partial_skeleton"
+    ]
+    final_candidates = [
+        event for event in candidates
+        if event["payload"].get("candidate_origin") == "local_deterministic_asr_skeleton"
+    ]
+
+    assert partial_candidates
+    assert all(event["payload"]["scheduler_event_type"] == "llm_candidate_deferred" for event in partial_candidates)
+    assert final_candidates
+    assert final_candidates[0]["payload"]["scheduler_event_type"] == "llm_candidate_queued"
+    final_scheduler = next(
+        event for event in events
+        if event["event_type"] == "scheduler_event"
+        and event["payload"].get("source_event_ids") == ["asr_state_event_final_seg"]
+    )
+    assert final_scheduler["payload"]["call_count_last_hour"] == 1
+
+
+def test_same_segment_final_requeues_candidate_deferred_from_stable_partial():
+    streaming_events = [
+        {
+            "event_type": "partial",
+            "segment_id": "same_segment",
+            "text": "发布评审先灰度百分之五，如果错误率超过百分之零点一就回滚。",
+            "start_ms": 0,
+            "end_ms": 30_000,
+            "received_at_ms": 30_000,
+            "confidence": 0.88,
+            "candidate_eligible": True,
+            "candidate_source": "stable_partial",
+        },
+        {
+            "event_type": "final",
+            "segment_id": "same_segment",
+            "text": "发布评审先灰度百分之五，如果错误率超过百分之零点一就回滚。",
+            "start_ms": 0,
+            "end_ms": 31_000,
+            "received_at_ms": 31_000,
+            "confidence": 0.9,
+        },
+    ]
+
+    events = build_asr_live_events(
+        session_id="same_segment_partial_final",
+        provider="funasr_realtime",
+        is_mock=False,
+        streaming_events=streaming_events,
+    )
+
+    candidates = [
+        event for event in events if event["event_type"] == "suggestion_candidate_event"
+    ]
+    partial_candidates = [
+        event for event in candidates
+        if event["payload"].get("candidate_origin") == "local_deterministic_asr_stable_partial_skeleton"
+    ]
+    final_candidates = [
+        event for event in candidates
+        if event["payload"].get("candidate_origin") == "local_deterministic_asr_skeleton"
+    ]
+
+    assert partial_candidates
+    assert final_candidates
+    assert final_candidates[0]["payload"]["scheduler_event_type"] == "llm_candidate_queued"
+    assert final_candidates[0]["payload"]["candidate_id"].endswith("_final")
 
 
 def test_build_asr_live_events_emits_llm_request_draft_after_suggestion_candidate():
@@ -1047,6 +1478,115 @@ def test_build_asr_live_events_extracts_risk_state_candidate():
         "asr_risk_event_asr_seg_risk_001"
     ]
     assert scheduler["payload"]["llm_call_status"] == "not_called"
+
+
+def test_build_asr_live_events_extracts_runtime_incident_risk_from_backlog_final():
+    events = build_asr_live_events(
+        session_id="local_asr_incident_risk_contract",
+        provider="local_mock_asr",
+        streaming_events=[
+            {
+                "event_type": "final",
+                "segment_id": "asr_seg_incident_001",
+                "text": "a凌晨autoker消费堆积lag最高到了八万，告警延迟六分钟。",
+                "start_ms": 0,
+                "end_ms": 5200,
+                "received_at_ms": 5400,
+                "confidence": 0.91,
+            },
+            {
+                "event_type": "end_of_stream",
+                "segment_id": "asr_eos",
+                "text": "",
+                "start_ms": 5400,
+                "end_ms": 5400,
+                "received_at_ms": 5400,
+            },
+        ],
+    )
+
+    state = next(event for event in events if event["event_type"] == "state_event")
+    candidate = next(event for event in events if event["event_type"] == "suggestion_candidate_event")
+    final = next(event for event in events if event["event_type"] == "transcript_final")
+
+    assert final["payload"]["text"] == "a凌晨autoker消费堆积lag最高到了八万，告警延迟六分钟。"
+    assert final["payload"]["normalized_text"] == "a凌晨order-worker消费堆积lag最高到了八万，告警延迟六分钟。"
+    assert state["payload"]["target_type"] == "Risk"
+    assert state["payload"]["state_item"]["description"] == "a凌晨order-worker消费堆积lag最高到了八万，告警延迟六分钟。"
+    assert state["payload"]["state_item"]["impact"] == "runtime_issue"
+    assert candidate["payload"]["gap_rule_id"] == "risk.rollback.validation"
+    assert candidate["payload"]["llm_call_status"] == "not_called"
+
+
+def test_build_asr_live_events_uses_adjacent_final_context_for_split_release_risk():
+    events = build_asr_live_events(
+        session_id="local_asr_split_release_context",
+        provider="local_mock_asr",
+        streaming_events=[
+            {
+                "event_type": "final",
+                "segment_id": "funasr_001",
+                "text": "a这次trcoutservice service周晚上灰",
+                "start_ms": 0,
+                "end_ms": 3600,
+                "received_at_ms": 1221,
+                "confidence": 0.91,
+            },
+            {
+                "event_type": "final",
+                "segment_id": "funasr_002",
+                "text": "度百分之十先看errorate和p九九",
+                "start_ms": 3600,
+                "end_ms": 7200,
+                "received_at_ms": 2411,
+                "confidence": 0.91,
+            },
+            {
+                "event_type": "final",
+                "segment_id": "funasr_003",
+                "text": "b如果指标异常我们暂停扩量但回滚",
+                "start_ms": 7200,
+                "end_ms": 10800,
+                "received_at_ms": 3663,
+                "confidence": 0.91,
+            },
+            {
+                "event_type": "final",
+                "segment_id": "funasr_004",
+                "text": "脚本还没有在",
+                "start_ms": 10800,
+                "end_ms": 11297,
+                "received_at_ms": 4063,
+                "confidence": 0.91,
+            },
+            {
+                "event_type": "end_of_stream",
+                "segment_id": "asr_eos",
+                "text": "",
+                "start_ms": 11297,
+                "end_ms": 11297,
+                "received_at_ms": 4063,
+            },
+        ],
+    )
+
+    candidates = [event for event in events if event["event_type"] == "suggestion_candidate_event"]
+    split_candidate = next(
+        event
+        for event in candidates
+        if event["payload"]["target_id"].endswith("funasr_004")
+    )
+
+    assert split_candidate["payload"]["gap_rule_id"] in {
+        "open.question.followup",
+        "risk.rollback.validation",
+    }
+    assert split_candidate["payload"]["evidence_span_ids"] == [
+        "asr_ev_funasr_003",
+        "asr_ev_funasr_004",
+    ]
+    assert split_candidate["payload"]["segment_batch"] == ["funasr_003", "funasr_004"]
+    assert split_candidate["payload"]["llm_call_status"] == "not_called"
 
 
 def test_build_asr_live_events_extracts_architecture_review_gap_candidates():

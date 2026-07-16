@@ -1,4 +1,5 @@
 import json
+import io
 import sys
 import types
 from pathlib import Path
@@ -6,6 +7,7 @@ from pathlib import Path
 import numpy as np
 
 from scripts import transcribe_funasr
+from scripts import funasr_stream_worker
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -33,6 +35,25 @@ class FakeAutoModel:
             {
                 "text": "灰度百分之十",
                 "timestamp": [[100, 260], [260, 520], [520, 760]],
+            }
+        ]
+
+
+class FakeOfflineBatchAutoModel:
+    calls = []
+
+    def __init__(self, **kwargs):
+        print("offline batch provider boot log")
+        self.calls.append(("init", kwargs))
+
+    def generate(self, **kwargs):
+        print("offline batch provider generate log")
+        self.calls.append(("generate", kwargs))
+        audio_name = Path(str(kwargs["input"])).stem
+        return [
+            {
+                "text": f"{audio_name}，已加标点。",
+                "timestamp": [[0, 100], [100, 200]],
             }
         ]
 
@@ -140,6 +161,20 @@ class FakeCorrectionStreamingAutoModel:
         return [{"text": text}]
 
 
+class FakeWorkerNonCumulativeStreamingAutoModel:
+    def __init__(self, **kwargs):
+        self.outputs = ["发布评审", "P99延迟超过九百毫秒", "张三补SLO看板"]
+
+    def generate(self, **kwargs):
+        text = self.outputs.pop(0) if self.outputs else ""
+        return [{"text": text}]
+
+
+class FakeWorkerStdin:
+    def __init__(self, payload: bytes):
+        self.buffer = io.BytesIO(payload)
+
+
 def test_stream_events_emits_partial_multiple_finals_and_eos(monkeypatch, tmp_path):
     FakeStreamingAutoModel.calls = []
     monkeypatch.setitem(
@@ -192,6 +227,64 @@ def test_stream_events_emits_partial_multiple_finals_and_eos(monkeypatch, tmp_pa
     assert generate_kwargs[0]["encoder_chunk_look_back"] == 4
     assert generate_kwargs[0]["decoder_chunk_look_back"] == 1
     assert [kwargs["is_final"] for kwargs in generate_kwargs] == [False, False, False, True]
+
+
+def test_stream_worker_accepts_balanced_chinese_meeting_chunk_profile():
+    args = funasr_stream_worker.parse_args(["--chunk-size", "0,30,15"])
+
+    assert args.chunk_size == [0, 30, 15]
+    assert funasr_stream_worker.chunk_stride_samples(args.chunk_size) == 28_800
+
+
+def test_stream_worker_merges_non_cumulative_partials_for_final_transcript():
+    merged = ""
+
+    for partial in ["院子门口不远处", "就是一个地铁站", "邮局门前的人行道上有一个蓝色的邮箱"]:
+        merged = funasr_stream_worker.merge_partial_hypothesis(merged, partial)
+
+    assert merged == "院子门口不远处就是一个地铁站邮局门前的人行道上有一个蓝色的邮箱"
+
+    corrected = funasr_stream_worker.merge_partial_hypothesis("先挥", "先灰度百分之十")
+    assert corrected == "先灰度百分之十"
+
+
+def test_stream_worker_emits_accumulated_partial_text_for_live_transcript(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "funasr",
+        types.SimpleNamespace(AutoModel=FakeWorkerNonCumulativeStreamingAutoModel),
+    )
+    chunk = np.ones(funasr_stream_worker.chunk_stride_samples([0, 10, 5]), dtype=np.float32)
+    monkeypatch.setattr(sys, "stdin", FakeWorkerStdin(chunk.tobytes() * 3))
+    stdout = io.StringIO()
+    monkeypatch.setattr(funasr_stream_worker, "_REAL_STDOUT", stdout)
+
+    funasr_stream_worker.main(["--chunk-size", "0,10,5"])
+
+    events = [json.loads(line) for line in stdout.getvalue().splitlines()]
+    partial_texts = [event["text"] for event in events if event["event_type"] == "partial"]
+    assert partial_texts == [
+        "发布评审",
+        "发布评审P99延迟超过九百毫秒",
+        "发布评审P99延迟超过九百毫秒张三补SLO看板",
+    ]
+
+
+def test_stream_worker_emits_ready_control_event_before_audio_events(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "funasr",
+        types.SimpleNamespace(AutoModel=FakeStreamingAutoModel),
+    )
+    monkeypatch.setattr(sys, "stdin", FakeWorkerStdin(b""))
+    stdout = io.StringIO()
+    monkeypatch.setattr(funasr_stream_worker, "_REAL_STDOUT", stdout)
+
+    funasr_stream_worker.main([])
+
+    events = [json.loads(line) for line in stdout.getvalue().splitlines()]
+    assert events[0]["event_type"] == "ready"
+    assert events[0]["provider"] == "funasr_realtime"
 
 
 def test_stream_events_merges_cumulative_partial_hypotheses(monkeypatch, tmp_path):
@@ -512,6 +605,141 @@ def test_streaming_batch_loads_hotword_manifest_and_passes_terms_to_generate(mon
     assert "funasr-hotwords.zh.json" not in item_json
     assert str(REPO_ROOT) not in item_json
     assert batch["items"][0]["raw"]["hotword_status"] == "enabled"
+
+
+def test_transcribe_offline_batch_reuses_one_model_and_reports_rtf_without_path_leaks(monkeypatch, tmp_path):
+    FakeOfflineBatchAutoModel.calls = []
+    monkeypatch.setitem(
+        sys.modules,
+        "funasr",
+        types.SimpleNamespace(AutoModel=FakeOfflineBatchAutoModel),
+    )
+
+    class FakeInfo:
+        frames = 32000
+        samplerate = 16000
+
+    monkeypatch.setitem(
+        sys.modules,
+        "soundfile",
+        types.SimpleNamespace(info=lambda *_args, **_kwargs: FakeInfo()),
+    )
+    audio_paths = [tmp_path / "meeting-a.16k.wav", tmp_path / "meeting-b.wav"]
+    for audio_path in audio_paths:
+        audio_path.write_bytes(b"fake")
+
+    batch = transcribe_funasr.transcribe_offline_batch(
+        audio_paths=audio_paths,
+        model_name="/private/cache/offline-model",
+        vad_model="/private/cache/vad-model",
+        punc_model="/private/cache/punc-model",
+        device="cpu",
+    )
+
+    init_calls = [call for call in FakeOfflineBatchAutoModel.calls if call[0] == "init"]
+    generate_calls = [call for call in FakeOfflineBatchAutoModel.calls if call[0] == "generate"]
+    assert len(init_calls) == 1
+    assert len(generate_calls) == 2
+    assert init_calls[0][1]["model"] == "/private/cache/offline-model"
+    assert init_calls[0][1]["vad_model"] == "/private/cache/vad-model"
+    assert init_calls[0][1]["punc_model"] == "/private/cache/punc-model"
+    assert batch["status"] == "ok"
+    assert batch["batch_mode"] == "single_process_reused_funasr_offline_model"
+    assert batch["item_count"] == 2
+    assert batch["total_audio_duration_seconds"] == 4.0
+    assert batch["transcribe_only_rtf"] >= 0
+    assert [item["audio_id"] for item in batch["items"]] == ["meeting-a", "meeting-b"]
+    assert [item["text"] for item in batch["items"]] == [
+        "meeting-a.16k，已加标点。",
+        "meeting-b，已加标点。",
+    ]
+    assert all(item["raw"]["mode"] == "file_batch_offline_transcript" for item in batch["items"])
+    assert all(item["audio_duration_seconds"] == 2.0 for item in batch["items"])
+    assert batch["safe_to_call_remote_asr"] is False
+    assert batch["safe_to_call_llm"] is False
+    batch_json = json.dumps(batch, ensure_ascii=False)
+    assert str(tmp_path) not in batch_json
+    assert "/private/cache" not in batch_json
+
+
+def test_transcribe_offline_batch_omits_punctuation_model_when_disabled(monkeypatch, tmp_path):
+    FakeOfflineBatchAutoModel.calls = []
+    monkeypatch.setitem(
+        sys.modules,
+        "funasr",
+        types.SimpleNamespace(AutoModel=FakeOfflineBatchAutoModel),
+    )
+
+    class FakeInfo:
+        frames = 16000
+        samplerate = 16000
+
+    monkeypatch.setitem(
+        sys.modules,
+        "soundfile",
+        types.SimpleNamespace(info=lambda *_args, **_kwargs: FakeInfo()),
+    )
+    audio = tmp_path / "meeting.wav"
+    audio.write_bytes(b"fake")
+
+    batch = transcribe_funasr.transcribe_offline_batch(
+        audio_paths=[audio],
+        model_name="offline-model",
+        vad_model="fsmn-vad",
+        punc_model=None,
+        device="cpu",
+    )
+
+    init_kwargs = [call[1] for call in FakeOfflineBatchAutoModel.calls if call[0] == "init"][0]
+    assert "punc_model" not in init_kwargs
+    assert batch["punc_model_status"] == "disabled"
+    assert batch["items"][0]["raw"]["punc_model_status"] == "disabled"
+
+
+def test_offline_batch_main_outputs_json_and_keeps_provider_noise_out_of_stdout(monkeypatch, tmp_path, capsys):
+    FakeOfflineBatchAutoModel.calls = []
+    monkeypatch.setitem(
+        sys.modules,
+        "funasr",
+        types.SimpleNamespace(AutoModel=FakeOfflineBatchAutoModel),
+    )
+
+    class FakeInfo:
+        frames = 16000
+        samplerate = 16000
+
+    monkeypatch.setitem(
+        sys.modules,
+        "soundfile",
+        types.SimpleNamespace(info=lambda *_args, **_kwargs: FakeInfo()),
+    )
+    audio_a = tmp_path / "meeting-a.16k.wav"
+    audio_b = tmp_path / "meeting-b.wav"
+    audio_a.write_bytes(b"fake")
+    audio_b.write_bytes(b"fake")
+
+    transcribe_funasr.main(
+        [
+            str(audio_a),
+            str(audio_b),
+            "--offline-batch",
+            "--model",
+            "/private/cache/offline-model",
+            "--vad-model",
+            "/private/cache/vad-model",
+            "--punc-model",
+            "/private/cache/punc-model",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["batch_mode"] == "single_process_reused_funasr_offline_model"
+    assert [item["audio_id"] for item in payload["items"]] == ["meeting-a", "meeting-b"]
+    assert "offline batch provider boot log" in captured.err
+    assert "offline batch provider generate log" in captured.err
+    assert "/private/cache" not in captured.out
+    assert str(tmp_path) not in captured.out
 
 
 def test_streaming_batch_blocks_forbidden_hotword_manifest_before_model_load(monkeypatch, tmp_path):

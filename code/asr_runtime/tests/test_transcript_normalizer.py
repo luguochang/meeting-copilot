@@ -178,6 +178,23 @@ def test_normalize_transcript_text_recovers_chunk20_hotword_visible_near_misses_
     }
 
 
+def test_normalize_transcript_text_recovers_tingting_release_visible_near_misses_without_staging_backfill():
+    result = normalize_transcript_text(
+        "诶这次 check outservice 周五晚上灰度 10% 先看 error r ate 和 P99 "
+        "回滚脚本还没有在 ing 跑过",
+        glossary_terms=load_glossary(TECHNICAL_GLOSSARY),
+    )
+
+    assert "checkout-service" in result.text
+    assert "error_rate" in result.text
+    assert "P99" in result.text
+    assert "staging" not in result.text
+    assert {change["canonical"] for change in result.changes} >= {
+        "checkout-service",
+        "error_rate",
+    }
+
+
 def test_normalize_transcript_text_does_not_convert_unscoped_quest_to_request_id():
     result = normalize_transcript_text(
         "普通英文 quest 只是在讨论任务名称，不是接口字段。",

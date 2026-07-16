@@ -24,7 +24,6 @@ def test_metrics_observe_latency():
 
 
 def test_metrics_endpoint_exposed():
-    client = create_app().__call__  # sanity
     from fastapi.testclient import TestClient
     c = TestClient(create_app())
     r = c.get("/metrics")
@@ -36,6 +35,7 @@ def test_metrics_endpoint_exposed():
 def test_validate_config_detects_missing_llm_env(monkeypatch):
     monkeypatch.delenv("LLM_GATEWAY_BASE_URL", raising=False)
     monkeypatch.delenv("LLM_GATEWAY_API_KEY", raising=False)
+    monkeypatch.setattr(metrics_mod, "REPO_ENV_FILE", "missing.env")
     issues = metrics_mod.validate_config()
     assert any("LLM_GATEWAY_BASE_URL" in i for i in issues)
     assert any("LLM_GATEWAY_API_KEY" in i for i in issues)
@@ -59,6 +59,6 @@ def test_metrics_incremented_on_llm_execution(monkeypatch):
         "session_id": "metrics_test", "provider": "local_mock_asr",
         "streaming_events": [{"event_type": "final", "segment_id": "s1", "text": "先灰度 5%。谁负责回滚？", "start_ms": 0, "end_ms": 3200, "received_at_ms": 3500, "confidence": 0.9}]
     })
-    c.post("/live/asr/sessions/metrics_test/llm-execution-runs", json={"mode": "enabled"})
+    c.post("/live/asr/demo/sessions/metrics_test/llm-execution-runs", json={"mode": "enabled"})
     after = metrics_mod.metrics.snapshot().get("llm_calls", 0)
     assert after > before

@@ -15,9 +15,11 @@ DEFAULT_MIN_FINAL_INTERVAL_MS = 30_000
 DEFAULT_MIN_STATE_CHANGE_INTERVAL_MS = 10_000
 DEFAULT_MAX_CALLS_PER_HOUR = 80
 CANDIDATE_POLICY_VERSION = "asr-candidate-policy.v1"
+PARTIAL_HINT_POLICY_VERSION = "partial-hint-policy.v1"
 LOW_ASR_CONFIDENCE_THRESHOLD = 0.80
 SHORT_EVIDENCE_TEXT_LENGTH = 6
-QUESTION_MARKERS = ("谁", "吗", "怎么", "是否", "有没有", "还没有确认", "?", "？")
+ADJACENT_FINAL_CONTEXT_GAP_MS = 1_000
+QUESTION_MARKERS = ("谁", "吗", "怎么", "如何", "是否", "有没有", "还是", "哪种", "哪个", "还没有确认", "?", "？")
 ENGINEERING_CONTEXT_MARKERS = (
     "API",
     "api",
@@ -36,6 +38,9 @@ ENGINEERING_CONTEXT_MARKERS = (
     "故障",
     "扩容",
     "降级",
+    "限流",
+    "幂等",
+    "合密等",
     "监控",
     "测试",
     "兼容",
@@ -55,10 +60,45 @@ ENGINEERING_CONTEXT_MARKERS = (
     "recommendation-service",
     "request_id",
     "trace_id",
+    "消费堆积",
+    "堆积",
+    "SDK",
+    "sdk",
+    "toolkit",
+    "tool",
+    "工具",
+    "封装",
+    "组件",
+    "模块",
+    "架构",
+    "插件",
+    "依赖",
+    "框架",
+    "客户端",
+    "页面",
+    "交互",
+    "代码",
+    "配置",
+    "权限",
+    "登录",
 )
 ACTION_MARKERS = ("负责", "补充", "推进", "跟进", "处理", "确认", "整理")
 RISK_MARKERS = ("风险", "如果", "超过", "异常", "失败", "故障")
 UNRESOLVED_QUESTION_MARKERS = ("还没", "还没有", "没定", "未定", "未安排", "待定")
+COMPLETED_CONTEXT_MARKERS = (
+    "已经确认",
+    "已确认",
+    "已经处理",
+    "已处理",
+    "处理完成",
+    "已经完成",
+    "已完成",
+    "已经闭环",
+    "已闭环",
+    "已经解决",
+    "已解决",
+    "看板也正常",
+)
 ARCHITECTURE_RISK_MARKERS = (
     "缓存穿透",
     "打到 mysql",
@@ -70,7 +110,8 @@ ARCHITECTURE_RISK_MARKERS = (
     "告警延迟",
 )
 ARCHITECTURE_RISK_UNCERTAINTY_MARKERS = ("可能", "如果", "会", "增多", "峰值")
-ACTION_ASSIGNMENT_CUES = ("由", "请", "让", "麻烦", "安排")
+RUNTIME_INCIDENT_MARKERS = ("消费堆积", "告警延迟", "扩容已经止血", "临时扩容", "根因")
+ACTION_ASSIGNMENT_CUES = ("由", "请", "让", "麻烦", "安排", "要")
 ACTION_OWNER_REJECT_MARKERS = ("我们", "大家", "团队", "这边", "这个", "那个")
 ASSIGNMENT_CUE_ACTION_MARKERS = ("负责", "补充", "推进", "跟进", "处理", "整理")
 NEGATED_RISK_MARKERS = (
@@ -101,6 +142,7 @@ OWNER_AT_END_PATTERN = re.compile(r"([\u4e00-\u9fff]{2,3})$")
 
 EVENT_ORDER = {
     "transcript_partial": 5,
+    "partial_hint_event": 7,
     "transcript_final": 10,
     "transcript_revision": 15,
     "state_event": 20,
@@ -133,6 +175,9 @@ def build_asr_live_events(
     events: list[dict[str, Any]] = []
     evidence_by_segment_id: dict[str, dict[str, Any]] = {}
     scheduler_state = _SchedulerState()
+    emitted_partial_hint_keys: set[str] = set()
+    recent_final_context: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    emitted_state_event_ids: set[str] = set()
     counts = {
         "partial_event_count": 0,
         "final_event_count": 0,
@@ -146,6 +191,30 @@ def build_asr_live_events(
         if event_type == "partial":
             counts["partial_event_count"] += 1
             events.append(_with_sort_group(_partial_event(raw_event), group_index))
+            partial_hint = build_partial_hint_event(raw_event)
+            if partial_hint:
+                dedupe_key = str(
+                    partial_hint.get("payload", {}).get("dedupe_key")
+                    or partial_hint["id"]
+                )
+                if dedupe_key in emitted_partial_hint_keys:
+                    continue
+                emitted_partial_hint_keys.add(dedupe_key)
+                events.append(_with_sort_group(partial_hint, group_index))
+            if _should_queue_stable_partial_candidate(raw_event):
+                partial_evidence = _partial_evidence(raw_event)
+                derived_events, scheduler_state = _local_state_scheduler_events(
+                    raw_event,
+                    partial_evidence,
+                    int(raw_event.get("received_at_ms", raw_event.get("end_ms", 0))),
+                    scheduler_state,
+                    recent_final_context=recent_final_context,
+                    emitted_state_event_ids=emitted_state_event_ids,
+                )
+                events.extend(
+                    _with_sort_group(derived_event, group_index)
+                    for derived_event in derived_events
+                )
             continue
         if event_type == "final":
             counts["final_event_count"] += 1
@@ -157,11 +226,14 @@ def build_asr_live_events(
                 evidence,
                 event["at_ms"],
                 scheduler_state,
+                recent_final_context=recent_final_context,
+                emitted_state_event_ids=emitted_state_event_ids,
             )
             events.extend(
                 _with_sort_group(derived_event, group_index)
                 for derived_event in derived_events
             )
+            recent_final_context = _updated_recent_final_context(recent_final_context, raw_event, evidence)
             continue
         if event_type == "revision":
             counts["revision_event_count"] += 1
@@ -173,11 +245,14 @@ def build_asr_live_events(
                 evidence,
                 event["at_ms"],
                 scheduler_state,
+                recent_final_context=recent_final_context,
+                emitted_state_event_ids=emitted_state_event_ids,
             )
             events.extend(
                 _with_sort_group(derived_event, group_index)
                 for derived_event in derived_events
             )
+            recent_final_context = _updated_recent_final_context(recent_final_context, raw_event, evidence)
             continue
         if event_type == "error":
             counts["error_event_count"] += 1
@@ -211,6 +286,7 @@ def render_asr_sse_events(events: list[dict[str, Any]]) -> str:
 
 def _partial_event(raw_event: dict[str, Any]) -> dict[str, Any]:
     segment_id = str(raw_event["segment_id"])
+    text = str(raw_event.get("text", ""))
     return {
         "id": f"transcript_partial:{segment_id}",
         "event_type": "transcript_partial",
@@ -219,11 +295,129 @@ def _partial_event(raw_event: dict[str, Any]) -> dict[str, Any]:
             "segment_id": segment_id,
             "start_ms": int(raw_event.get("start_ms", 0)),
             "end_ms": int(raw_event.get("end_ms", 0)),
-            "text": str(raw_event.get("text", "")),
+            "text": text,
+            "normalized_text": str(raw_event.get("normalized_text") or _normalize_text(text)),
+            **(
+                {"source_snapshot_text": str(raw_event["source_snapshot_text"])}
+                if raw_event.get("source_snapshot_text")
+                else {}
+            ),
+            **({"projection_reconciled": True} if raw_event.get("projection_reconciled") else {}),
             "confidence": raw_event.get("confidence"),
             "is_final": False,
         },
     }
+
+
+def build_partial_hint_event(raw_event: dict[str, Any]) -> dict[str, Any] | None:
+    if raw_event.get("event_type") not in {"partial", "transcript_partial"}:
+        return None
+    segment_id = str(raw_event.get("segment_id") or "")
+    if not segment_id:
+        return None
+    text = str(raw_event.get("normalized_text") or _normalize_text(str(raw_event.get("text") or ""))).strip()
+    if not _should_emit_partial_hint(text):
+        return None
+    prompt = _partial_hint_prompt(text)
+    at_ms = int(raw_event.get("received_at_ms", raw_event.get("end_ms", 0)) or 0)
+    return {
+        "id": f"partial_hint:{segment_id}",
+        "event_type": "partial_hint_event",
+        "at_ms": at_ms,
+        "payload": {
+            "hint_id": f"asr_partial_hint_{segment_id}",
+            "hint_type": _partial_hint_type(text),
+            "dedupe_key": _partial_hint_dedupe_key(text),
+            "hint_policy_version": PARTIAL_HINT_POLICY_VERSION,
+            "hint_origin": "local_deterministic_partial",
+            "segment_batch": [segment_id],
+            "source_event_ids": [f"transcript_partial:{segment_id}"],
+            "evidence_quote": text,
+            "suggested_prompt": prompt,
+            "trigger_reason": "实时识别到可能需要马上确认的上下文，先给本地提醒；最终建议仍以完整文字为准。",
+            "llm_call_status": "not_called",
+            "card_status": "not_created",
+            "confidence": 0.55,
+            "confidence_level": "medium",
+            "degradation_reasons": ["partial_not_final", "needs_confirmation"],
+            "source": ASR_LIVE_SOURCE,
+        },
+    }
+
+
+def _should_emit_partial_hint(text: str) -> bool:
+    if len("".join(text.split())) < 8:
+        return False
+    if not _is_engineering_meeting(text):
+        return False
+    if _looks_like_already_closed_context(text):
+        return False
+    return (
+        _looks_like_risk(text)
+        or _looks_like_release_rollout_partial(text)
+        or _looks_like_action_item(text)
+        or _looks_like_open_question(text)
+    )
+
+
+def _partial_hint_type(text: str) -> str:
+    if _looks_like_open_question(text):
+        return "question_followup"
+    if _looks_like_explicit_action_item(text):
+        return "action_confirmation"
+    if _looks_like_risk(text) or _looks_like_release_rollout_partial(text):
+        return "risk_confirmation"
+    if _looks_like_action_item(text):
+        return "action_confirmation"
+    return "context_confirmation"
+
+
+def _partial_hint_prompt(text: str) -> str:
+    if _looks_like_open_question(text):
+        return "实时识别到未闭环问题，建议现场追问 owner、下一步和截止时间。"
+    if _looks_like_explicit_action_item(text):
+        return "实时识别到行动项，建议确认 owner、deadline 和验收口径。"
+    if _looks_like_risk(text):
+        return "实时识别到风险条件，建议确认触发阈值、回滚动作、监控口径和负责人。"
+    if _looks_like_action_item(text):
+        return "实时识别到行动项，建议确认 owner、deadline 和验收口径。"
+    return "实时识别到需要确认的技术上下文，建议补齐 owner、风险和验收口径。"
+
+
+def _partial_hint_dedupe_key(text: str) -> str:
+    hint_type = _partial_hint_type(text)
+    lower = text.lower()
+    if hint_type == "risk_confirmation":
+        if "p99" in lower and "延迟" in text and "超过" in text:
+            return "risk_confirmation:p99:latency_threshold"
+        if "错误率" in text and "超过" in text:
+            return "risk_confirmation:error_rate_threshold"
+        if "缓存穿透" in text:
+            return "risk_confirmation:cache_penetration"
+        if "堆积" in text and ("kafka" in lower or "消费" in text):
+            return "risk_confirmation:kafka_backlog"
+        if "回滚" in text:
+            return "risk_confirmation:rollback"
+        return "risk_confirmation:general"
+    if hint_type == "action_confirmation":
+        if "缓存" in text and "回滚" in text:
+            return "action_confirmation:cache_rollback_owner"
+        if "监控" in text or "看板" in text:
+            return "action_confirmation:monitoring_owner"
+        return "action_confirmation:general"
+    if hint_type == "question_followup":
+        if "owner" in lower or "负责人" in text or "谁" in text:
+            return "question_followup:owner"
+        return "question_followup:general"
+    return f"{hint_type}:general"
+
+
+def _looks_like_already_closed_context(text: str) -> bool:
+    if any(marker in text for marker in UNRESOLVED_QUESTION_MARKERS):
+        return False
+    if _looks_like_open_question(text):
+        return False
+    return any(marker in text for marker in COMPLETED_CONTEXT_MARKERS)
 
 
 def _final_event(raw_event: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -320,7 +514,16 @@ def _final_payload(
         "start_ms": int(raw_event.get("start_ms", 0)),
         "end_ms": int(raw_event.get("end_ms", 0)),
         "text": str(raw_event.get("text", "")),
-        "normalized_text": _normalize_text(str(raw_event.get("text", ""))),
+        "normalized_text": str(
+            raw_event.get("normalized_text")
+            or _normalize_text(str(raw_event.get("text", "")))
+        ),
+        **(
+            {"source_snapshot_text": str(raw_event["source_snapshot_text"])}
+            if raw_event.get("source_snapshot_text")
+            else {}
+        ),
+        **({"projection_reconciled": True} if raw_event.get("projection_reconciled") else {}),
         "confidence": raw_event.get("confidence"),
         "is_final": True,
         "evidence_spans": evidence_spans,
@@ -339,16 +542,41 @@ def _active_evidence(raw_event: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _partial_evidence(raw_event: dict[str, Any]) -> dict[str, Any]:
+    segment_id = str(raw_event["segment_id"])
+    return {
+        "id": f"asr_partial_ev_{segment_id}",
+        "segment_id": segment_id,
+        "start_ms": int(raw_event.get("start_ms", 0)),
+        "end_ms": int(raw_event.get("end_ms", 0)),
+        "quote": str(raw_event.get("text", "")),
+        "status": "partial",
+    }
+
+
+def _should_queue_stable_partial_candidate(raw_event: dict[str, Any]) -> bool:
+    return bool(
+        raw_event.get("candidate_eligible")
+        and str(raw_event.get("candidate_source") or "") == "stable_partial"
+    )
+
+
 def _local_state_scheduler_events(
     raw_event: dict[str, Any],
     evidence: dict[str, Any],
     transcript_event_at_ms: int,
     scheduler_state: "_SchedulerState",
+    *,
+    recent_final_context: list[tuple[dict[str, Any], dict[str, Any]]] | None = None,
+    emitted_state_event_ids: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], "_SchedulerState"]:
-    text = str(raw_event.get("text", ""))
+    text, evidence_ids, segment_batch = _state_extraction_context(
+        raw_event=raw_event,
+        evidence=evidence,
+        recent_final_context=recent_final_context or [],
+    )
     segment_id = str(raw_event["segment_id"])
-    evidence_id = str(evidence["id"])
-    state_specs = _extract_local_state_specs(text, segment_id, evidence_id)
+    state_specs = _extract_local_state_specs(text, segment_id, evidence_ids, segment_batch)
     if not state_specs:
         return [], scheduler_state
 
@@ -356,11 +584,41 @@ def _local_state_scheduler_events(
     current_scheduler_state = scheduler_state
     for state_index, state_spec in enumerate(state_specs):
         state_event_id = str(state_spec["state_event_id"])
-        scheduler_decision = _decide_scheduler_event(
-            received_at_ms=transcript_event_at_ms,
-            has_state_change=True,
-            state=current_scheduler_state,
-        )
+        if raw_event.get("event_type") == "final" and state_event_id in (emitted_state_event_ids or set()):
+            base_state_event_id = state_event_id
+            suffix_index = 1
+            state_event_id = f"{base_state_event_id}_final"
+            while state_event_id in (emitted_state_event_ids or set()):
+                suffix_index += 1
+                state_event_id = f"{base_state_event_id}_final{suffix_index}"
+            state_item = dict(state_spec.get("state_item") or {})
+            state_spec = {
+                **state_spec,
+                "state_event_id": state_event_id,
+                "target_id": f"{state_spec['target_id']}_final",
+                "state_item": {
+                    **state_item,
+                    "id": f"{state_item.get('id') or state_spec['target_id']}_final",
+                },
+            }
+        if emitted_state_event_ids is not None and state_event_id in emitted_state_event_ids:
+            continue
+        if raw_event.get("event_type") == "partial":
+            state_spec = {
+                **state_spec,
+                "candidate_origin": "local_deterministic_asr_stable_partial_skeleton",
+            }
+        if raw_event.get("event_type") == "partial":
+            scheduler_decision = _defer_partial_scheduler_event(
+                received_at_ms=transcript_event_at_ms,
+                state=current_scheduler_state,
+            )
+        else:
+            scheduler_decision = _decide_scheduler_event(
+                received_at_ms=transcript_event_at_ms,
+                has_state_change=True,
+                state=current_scheduler_state,
+            )
         state_event = {
             "id": f"state:{state_event_id}",
             "event_type": "state_event",
@@ -371,7 +629,7 @@ def _local_state_scheduler_events(
                 "target_type": state_spec["target_type"],
                 "target_id": state_spec["target_id"],
                 "state_event_type": "created",
-                "evidence_span_ids": [evidence_id],
+                "evidence_span_ids": list(state_spec["evidence_span_ids"]),
                 "state_item": state_spec["state_item"],
             },
         }
@@ -392,7 +650,7 @@ def _local_state_scheduler_events(
                 "cooldown_remaining_ms": scheduler_decision.cooldown_remaining_ms,
                 "call_count_last_hour": scheduler_decision.call_count_last_hour,
                 "budget_remaining": scheduler_decision.budget_remaining,
-                "segment_batch": [segment_id],
+                "segment_batch": list(state_spec["segment_batch"]),
                 "source_event_ids": [state_event_id],
                 "prompt_version": "not-called",
                 "model": "not-called",
@@ -401,12 +659,14 @@ def _local_state_scheduler_events(
         # G4: engineering-context gate — non-engineering meetings produce no
         # engineering suggestion cards (state events still generated for summary).
         engineering = _is_engineering_meeting(text)
+        if emitted_state_event_ids is not None:
+            emitted_state_event_ids.add(state_event_id)
         if engineering:
             candidate_payload = _suggestion_candidate_payload(
                 state_spec=state_spec,
                 scheduler_decision=scheduler_decision,
-                segment_id=segment_id,
-                evidence_id=evidence_id,
+                segment_batch=list(state_spec["segment_batch"]),
+                evidence_ids=list(state_spec["evidence_span_ids"]),
                 evidence_quote=str(evidence.get("quote", "")),
                 asr_confidence=raw_event.get("confidence"),
             )
@@ -431,6 +691,95 @@ def _local_state_scheduler_events(
     return events, current_scheduler_state
 
 
+def _updated_recent_final_context(
+    recent_final_context: list[tuple[dict[str, Any], dict[str, Any]]],
+    raw_event: dict[str, Any],
+    evidence: dict[str, Any],
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    return [*recent_final_context[-1:], (raw_event, evidence)]
+
+
+def _state_extraction_context(
+    *,
+    raw_event: dict[str, Any],
+    evidence: dict[str, Any],
+    recent_final_context: list[tuple[dict[str, Any], dict[str, Any]]],
+) -> tuple[str, list[str], list[str]]:
+    raw_text = str(raw_event.get("text", ""))
+    current_text = str(raw_event.get("normalized_text") or _normalize_text(raw_text))
+    current_evidence_ids = [str(evidence["id"])]
+    current_segment_batch = [str(raw_event["segment_id"])]
+    if not recent_final_context:
+        return current_text, current_evidence_ids, current_segment_batch
+
+    previous_raw_event, previous_evidence = recent_final_context[-1]
+    if not _is_adjacent_final_context(previous_raw_event, raw_event):
+        return current_text, current_evidence_ids, current_segment_batch
+
+    previous_text = str(
+        previous_raw_event.get("normalized_text")
+        or _normalize_text(str(previous_raw_event.get("text", "")))
+    )
+    combined_text = _join_adjacent_transcript_text(previous_text, current_text)
+    if not _should_use_adjacent_final_context(current_text=current_text, combined_text=combined_text):
+        return current_text, current_evidence_ids, current_segment_batch
+    return (
+        combined_text,
+        [str(previous_evidence["id"]), str(evidence["id"])],
+        [str(previous_raw_event["segment_id"]), str(raw_event["segment_id"])],
+    )
+
+
+def _is_adjacent_final_context(previous_raw_event: dict[str, Any], raw_event: dict[str, Any]) -> bool:
+    try:
+        previous_end = int(previous_raw_event.get("end_ms", 0))
+        current_start = int(raw_event.get("start_ms", 0))
+    except (TypeError, ValueError):
+        return False
+    return 0 <= current_start - previous_end <= ADJACENT_FINAL_CONTEXT_GAP_MS
+
+
+def _join_adjacent_transcript_text(previous_text: str, current_text: str) -> str:
+    if not previous_text:
+        return current_text
+    if not current_text:
+        return previous_text
+    if _ends_with_cjk(previous_text) and _starts_with_cjk(current_text):
+        return f"{previous_text}{current_text}"
+    return f"{previous_text} {current_text}"
+
+
+def _starts_with_cjk(text: str) -> bool:
+    return bool(text) and "\u4e00" <= text[0] <= "\u9fff"
+
+
+def _ends_with_cjk(text: str) -> bool:
+    return bool(text) and "\u4e00" <= text[-1] <= "\u9fff"
+
+
+def _should_use_adjacent_final_context(*, current_text: str, combined_text: str) -> bool:
+    if current_text == combined_text:
+        return False
+    if _current_text_already_has_usable_state(current_text):
+        return False
+    if "灰度" in combined_text and "灰度" not in current_text:
+        return True
+    if "回滚脚本" in combined_text and "回滚脚本" not in current_text:
+        return True
+    if len("".join(current_text.split())) <= 8 and _has_engineering_context(combined_text):
+        return True
+    if not _is_engineering_meeting(current_text) and _is_engineering_meeting(combined_text):
+        return True
+    return False
+
+
+def _current_text_already_has_usable_state(current_text: str) -> bool:
+    return bool(
+        _is_engineering_meeting(current_text)
+        and _extract_local_state_specs(current_text, "probe", ["probe_evidence"], ["probe_segment"])
+    )
+
+
 _ENGINEERING_KEYWORDS = (
     "灰度", "发布", "上线", "部署", "回滚", "监控", "接口", "事故", "bug", "测试",
     "架构", "服务", "需求", "deadline", "owner", "staging", "生产", "线上",
@@ -440,6 +789,9 @@ _ENGINEERING_KEYWORDS = (
     "容量", "性能", "并发", "api", "系统", "模块", "代码", "编译", "迭代",
     "版本", "schema", "迁移", "设计", "文档", "排期", "进度", "故障", "告警",
     "日志", "链路", "调用", "依赖", "框架", "组件", "压测", "降级方案",
+    "技术", "规度", "恢度", "百分之", "消费堆积", "堆积", "限流", "幂等", "合密等",
+    "sdk", "toolkit", "tool", "工具", "封装", "插件", "客户端", "页面", "交互",
+    "配置", "权限", "登录",
 )
 
 
@@ -456,13 +808,16 @@ def _suggestion_candidate_payload(
     *,
     state_spec: dict[str, Any],
     scheduler_decision: "_SchedulerDecision",
-    segment_id: str,
-    evidence_id: str,
+    segment_batch: list[str],
+    evidence_ids: list[str],
     evidence_quote: str,
     asr_confidence: Any,
 ) -> dict[str, Any]:
     rule = _suggestion_candidate_rule(str(state_spec["target_type"]))
     state_event_id = str(state_spec["state_event_id"])
+    candidate_origin = str(
+        state_spec.get("candidate_origin") or "local_deterministic_asr_skeleton"
+    )
     quality = _suggestion_candidate_quality(
         state_spec=state_spec,
         scheduler_decision=scheduler_decision,
@@ -482,15 +837,15 @@ def _suggestion_candidate_payload(
         "decision_reason": scheduler_decision.reason,
         "source_event_ids": [state_event_id],
         "scheduler_event_type": scheduler_decision.event_type,
-        "evidence_span_ids": [evidence_id],
-        "segment_batch": [segment_id],
+        "evidence_span_ids": evidence_ids,
+        "segment_batch": segment_batch,
         "llm_call_status": "not_called",
         "card_status": "not_created",
         "confidence": quality["confidence"],
         "confidence_level": quality["confidence_level"],
         "degradation_reasons": quality["degradation_reasons"],
         "source": ASR_LIVE_SOURCE,
-        "candidate_origin": "local_deterministic_asr_skeleton",
+        "candidate_origin": candidate_origin,
     }
 
 
@@ -515,6 +870,7 @@ def _suggestion_candidate_quality(
         "action_owner_missing": 0.10,
         "action_deadline_missing": 0.10,
         "risk_mitigation_missing": 0.10,
+        "partial_not_final": 0.05,
     }
     for reason in degradation_reasons:
         score -= penalties[reason]
@@ -578,6 +934,8 @@ def _candidate_degradation_reasons(
         reasons.append("low_asr_confidence")
     if len("".join(evidence_quote.split())) < SHORT_EVIDENCE_TEXT_LENGTH:
         reasons.append("evidence_text_short")
+    if state_spec.get("candidate_origin") == "local_deterministic_asr_stable_partial_skeleton":
+        reasons.append("partial_not_final")
 
     target_type = str(state_spec["target_type"])
     state_item = state_spec.get("state_item", {})
@@ -643,7 +1001,8 @@ def _suggestion_candidate_rule(target_type: str) -> dict[str, str]:
 def _extract_local_state_specs(
     text: str,
     segment_id: str,
-    evidence_id: str,
+    evidence_ids: list[str],
+    segment_batch: list[str],
 ) -> list[dict[str, Any]]:
     state_specs: list[dict[str, Any]] = []
     if "灰度" in text:
@@ -655,10 +1014,12 @@ def _extract_local_state_specs(
                 "state_item": {
                     "id": f"asr_decision_{segment_id}",
                     "statement": text,
-                    "evidence_span_ids": [evidence_id],
+                    "evidence_span_ids": evidence_ids,
                     "source": ASR_LIVE_SOURCE,
                     "state_origin": "local_deterministic_asr_skeleton",
                 },
+                "evidence_span_ids": evidence_ids,
+                "segment_batch": segment_batch,
             }
         )
     if _looks_like_open_question(text):
@@ -670,10 +1031,12 @@ def _extract_local_state_specs(
                 "state_item": {
                     "id": f"asr_question_{segment_id}",
                     "question": text,
-                    "evidence_span_ids": [evidence_id],
+                    "evidence_span_ids": evidence_ids,
                     "source": ASR_LIVE_SOURCE,
                     "state_origin": "local_deterministic_asr_skeleton",
                 },
+                "evidence_span_ids": evidence_ids,
+                "segment_batch": segment_batch,
             }
         )
     if _looks_like_action_item(text):
@@ -688,10 +1051,12 @@ def _extract_local_state_specs(
                     "owner": _extract_action_owner(text),
                     "deadline": _extract_action_deadline(text),
                     "status": "candidate",
-                    "evidence_span_ids": [evidence_id],
+                    "evidence_span_ids": evidence_ids,
                     "source": ASR_LIVE_SOURCE,
                     "state_origin": "local_deterministic_asr_skeleton",
                 },
+                "evidence_span_ids": evidence_ids,
+                "segment_batch": segment_batch,
             }
         )
     if _looks_like_risk(text):
@@ -706,10 +1071,12 @@ def _extract_local_state_specs(
                     "impact": _extract_risk_impact(text),
                     "mitigation": _extract_risk_mitigation(text),
                     "status": "open",
-                    "evidence_span_ids": [evidence_id],
+                    "evidence_span_ids": evidence_ids,
                     "source": ASR_LIVE_SOURCE,
                     "state_origin": "local_deterministic_asr_skeleton",
                 },
+                "evidence_span_ids": evidence_ids,
+                "segment_batch": segment_batch,
             }
         )
     return state_specs
@@ -739,9 +1106,22 @@ def _looks_like_action_item(text: str) -> bool:
         marker in text for marker in ASSIGNMENT_CUE_ACTION_MARKERS
     ):
         return True
+    if "要确认" in text and any(marker in text for marker in ("限流", "幂等", "合密等", "监控", "看板")):
+        return True
     return any(cue in text for cue in ACTION_ASSIGNMENT_CUES) and any(
         marker in text for marker in ASSIGNMENT_CUE_ACTION_MARKERS
     )
+
+
+def _looks_like_explicit_action_item(text: str) -> bool:
+    """Prefer a concrete assignment verb when a sentence also mentions a risk."""
+    if not _looks_like_action_item(text):
+        return False
+    if any(marker in text for marker in ("处理", "补充", "推进", "跟进", "整理")):
+        return True
+    if "请" in text or any(marker in text for marker in ("由", "让", "麻烦", "安排")):
+        return True
+    return "要确认" in text and "需要确认" not in text
 
 
 def _has_action_marker(text: str) -> bool:
@@ -788,11 +1168,21 @@ def _extract_action_deadline(text: str) -> str | None:
 def _looks_like_risk(text: str) -> bool:
     if any(marker in text for marker in NEGATED_RISK_MARKERS):
         return False
+    if _looks_like_runtime_incident(text):
+        return True
     if _looks_like_architecture_risk(text):
+        return True
+    if "零点一" in text and "回滚" in text:
+        return True
+    if "缓存穿透" in text and "回滚" in text:
         return True
     if "如果" in text and "超过" in text:
         return True
     return "风险" in text or ("超过" in text and any(marker in text for marker in ("错误率", "P99", "延迟", "失败")))
+
+
+def _looks_like_release_rollout_partial(text: str) -> bool:
+    return "百分之" in text and any(marker in text for marker in ("灰度", "规度", "恢度", "合性规度", "一度外分"))
 
 
 def _looks_like_architecture_risk(text: str) -> bool:
@@ -803,11 +1193,17 @@ def _looks_like_architecture_risk(text: str) -> bool:
     )
 
 
+def _looks_like_runtime_incident(text: str) -> bool:
+    return _has_engineering_context(text) and any(marker in text for marker in RUNTIME_INCIDENT_MARKERS)
+
+
 def _extract_risk_impact(text: str) -> str:
     if "超过" in text:
         return "condition_exceeded"
     if "风险" in text:
         return "risk_detected"
+    if _looks_like_runtime_incident(text):
+        return "runtime_issue"
     if _looks_like_architecture_risk(text):
         return "runtime_issue"
     if any(marker in text for marker in RISK_MARKERS):
@@ -883,6 +1279,24 @@ def _decide_scheduler_event(
         cooldown_remaining_ms=0,
         call_count_last_hour=len(updated_calls),
         budget_remaining=DEFAULT_MAX_CALLS_PER_HOUR - len(updated_calls),
+    )
+
+
+def _defer_partial_scheduler_event(
+    *,
+    received_at_ms: int,
+    state: _SchedulerState,
+) -> _SchedulerDecision:
+    active_calls = _calls_in_last_hour(state.call_timestamps_ms, received_at_ms)
+    preserved_state = _SchedulerState(call_timestamps_ms=active_calls)
+    return _SchedulerDecision(
+        event_type="llm_candidate_deferred",
+        reason="partial_not_final",
+        would_call_llm=False,
+        state_after=preserved_state,
+        cooldown_remaining_ms=0,
+        call_count_last_hour=len(active_calls),
+        budget_remaining=max(0, DEFAULT_MAX_CALLS_PER_HOUR - len(active_calls)),
     )
 
 

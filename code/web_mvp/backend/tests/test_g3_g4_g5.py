@@ -40,7 +40,7 @@ def test_g4_engineering_text_produces_suggestion_candidates():
     assert candidates, "engineering meeting should produce suggestion candidates"
 
 
-def test_g5_minutes_json_returns_structured_json(monkeypatch):
+def test_g5_minutes_json_returns_structured_json_and_persists_across_restart(monkeypatch, tmp_path):
     class FakeClient:
         def post_json(self, url, headers, body, timeout):
             return {"choices": [{"message": {"content": json.dumps({
@@ -54,12 +54,12 @@ def test_g5_minutes_json_returns_structured_json(monkeypatch):
     monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
     monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-test")
     monkeypatch.setenv("LLM_GATEWAY_MODEL", "m1")
-    client = TestClient(create_app())
+    client = TestClient(create_app(data_dir=tmp_path))
     client.post("/live/asr/mock/sessions", json={
         "session_id": "g5_json", "provider": "local_mock_asr",
         "streaming_events": [{"event_type": "final", "segment_id": "s1", "text": "先灰度 5%。谁负责回滚？", "start_ms": 0, "end_ms": 3200, "received_at_ms": 3500, "confidence": 0.9}]
     })
-    r = client.post("/live/asr/sessions/g5_json/minutes.json", json={"mode": "enabled"})
+    r = client.post("/live/asr/demo/sessions/g5_json/minutes.json", json={"mode": "enabled"})
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["degraded"] is False
@@ -69,3 +69,11 @@ def test_g5_minutes_json_returns_structured_json(monkeypatch):
     assert minutes["action_items"][0]["owner"] == "张三"
     assert "rollback" in minutes["risks"][0]
     assert body["llm_usage"]["total_tokens"] == 100
+
+    reopened = TestClient(create_app(data_dir=tmp_path))
+    restored = reopened.get("/live/asr/sessions/g5_json/events")
+    assert restored.status_code == 200
+    restored_minutes = restored.json()["minutes"]
+    assert restored_minutes["minutes_json"]["background"] == "灰度发布评审"
+    assert restored_minutes["minutes_json_llm_usage"]["total_tokens"] == 100
+    assert restored.json()["formal_derivation_status"] == "available"
