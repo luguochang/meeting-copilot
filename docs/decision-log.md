@@ -25635,10 +25635,10 @@ verdict=no_go
 
 - runtime：`artifacts/tmp/macos_bundled_runtime/phase3-native-mic-runtime-20260717-r4/evidence.json`，native helper SHA-256=`771d8ba0...`，backend/FunASR/helper relocation probes 通过，external symlink `0`。
 - Tauri app：`artifacts/tmp/tauri_runtime_package/phase3-native-mic-tauri-20260717-r3/evidence.json`，required packaged files missing `0`，decision=`go_packaged_runtime_resource_app_not_public_release`。
-- real native mic：`artifacts/tmp/packaged_native_mic_smoke/phase3-real-native-mic-speaker-20260717-r2/evidence.json`。
+- real native mic：`artifacts/tmp/packaged_native_mic_smoke/phase3-real-native-mic-speaker-20260717-r3/evidence.json`。证据顶层声明 app binary path/SHA、status 和 public-release=false，可被 release provenance 直接校验。
 - helper 由 AVAudioEngine 获取真实 microphone，ready payload 明确 `frame_samples=4800`；受控合成中文技术会议音频由 `/usr/bin/afplay` 经扬声器和空气进入真实麦克风，没有直接注入 WebSocket。
-- helper 运行 `30.798s`，stream timeline 最大约 `30,000ms`，修复前 3x 漂移已消失；backend 保存 `30.297s`、7 chunks、`969,548B` WAV，SHA-256=`b09de6f2...`。
-- 本地 `funasr_realtime` 产生 2 个 transcript final；helper stderr 为空，credential 不在 process command；app/backend/端口清理全部通过。
+- helper 运行 `30.753s`，stream timeline 最大约 `30,300ms`，修复前 3x 漂移已消失；backend 保存 `30.382s`、7 chunks、`972,278B` WAV，SHA-256=`75da8f94...`。
+- 本地 `funasr_realtime` 产生 2 个 transcript final，可辨识 recommendation service、feature store、QPS、缓存穿透、降级方案和 owner；同时产生 state/scheduler/suggestion candidate/LLM request draft 事件。helper stderr 为空，credential 不在 process command；app/backend/端口清理全部通过。
 - runner decision=`go_packaged_real_native_mic_helper_not_ui_not_public_release`，`counts_as_real_native_microphone_evidence=true`。
 
 ## 诚实边界
