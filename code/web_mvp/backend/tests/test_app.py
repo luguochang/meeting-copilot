@@ -71,6 +71,44 @@ def test_runtime_app_prewarms_resident_funasr_during_startup(monkeypatch, tmp_pa
     assert lifecycle_calls == ["prewarm", "shutdown"]
 
 
+def test_packaged_runtime_fails_startup_when_resident_funasr_is_not_ready(monkeypatch, tmp_path):
+    monkeypatch.setenv("MEETING_COPILOT_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("MEETING_COPILOT_DESKTOP_RUNTIME", "1")
+    monkeypatch.setattr(app_module.asr_stream, "prewarm_funasr_resident_manager", lambda: False)
+
+    with pytest.raises(RuntimeError, match="failed to become ready"):
+        with TestClient(app_module.create_runtime_app()):
+            pass
+
+
+def test_asr_runtime_status_reports_real_resident_readiness(monkeypatch):
+    monkeypatch.setattr(app_module.asr_stream, "funasr_realtime_available", lambda: True)
+    monkeypatch.setattr(app_module.asr_stream, "_funasr_resident_enabled", lambda: True)
+    monkeypatch.setattr(
+        app_module.asr_stream,
+        "funasr_resident_status",
+        lambda: {
+            "schema_version": "funasr_resident_status.v1",
+            "spawned": True,
+            "process_running": True,
+            "process_ready": True,
+            "pid": 123,
+            "generation": 1,
+            "active_session_id": None,
+            "process_start_count": 1,
+            "completed_session_count": 0,
+            "last_exit_code": None,
+            "last_error": None,
+        },
+    )
+
+    response = TestClient(create_app()).get("/providers/asr/runtime")
+
+    assert response.status_code == 200
+    assert response.json()["resident"]["process_ready"] is True
+    assert response.json()["resident"]["pid"] == 123
+
+
 def test_execution_preview_uses_locally_normalized_final_as_llm_evidence():
     record = {
         "session_id": "normalized_preview",

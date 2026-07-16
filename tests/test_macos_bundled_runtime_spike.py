@@ -28,6 +28,42 @@ def test_output_root_and_run_id_are_bounded(tmp_path):
         tool.validate_run_id("../escape")
 
 
+def test_runtime_manifest_is_the_single_source_of_python_and_inventory_paths():
+    tool = load_tool_module()
+
+    manifest = tool.load_runtime_manifest(REPO_ROOT)
+
+    assert manifest["schema_version"] == "meeting_copilot.runtime_bundle.v1"
+    assert manifest["runtimes"]["backend"]["python_version"] == "3.13"
+    assert manifest["runtimes"]["funasr"]["python_version"] == "3.11"
+    assert manifest["runtimes"]["backend"]["executable"] in manifest["required_files"]
+    assert manifest["runtimes"]["funasr"]["executable"] in manifest["required_files"]
+    assert "models/funasr-online/model.pt" in manifest["required_files"]
+
+
+def test_missing_runtime_preconditions_fail_before_python_execution(tmp_path, monkeypatch):
+    tool = load_tool_module()
+    repo = tmp_path / "repo"
+    (repo / "artifacts/tmp").mkdir(parents=True)
+    (repo / "code/desktop_tauri").mkdir(parents=True)
+    (repo / "code/desktop_tauri/runtime-bundle-manifest.json").write_text(
+        (REPO_ROOT / "code/desktop_tauri/runtime-bundle-manifest.json").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    calls = []
+    monkeypatch.setattr(tool, "python_runtime_info", lambda path: calls.append(path))
+
+    with pytest.raises(RuntimeError, match="bundle preconditions failed"):
+        tool.build_and_probe(
+            repo_root=repo,
+            output_root=repo / "artifacts/tmp/runtime",
+            run_id="missing-runtime",
+            model_dir=repo / "missing-model",
+        )
+
+    assert calls == []
+
+
 def test_rewrite_venv_uses_only_relative_bundle_python_links(tmp_path):
     tool = load_tool_module()
     venv = tmp_path / "runtime" / "backend-venv"
@@ -53,6 +89,11 @@ def test_clean_probe_environment_drops_parent_secrets_and_binds_bundle_paths(tmp
     monkeypatch.setenv("PYTHONPATH", "/private/source-tree")
     bundle = tmp_path / "MeetingCopilotRuntime.bundle"
     probe_root = tmp_path / "probe"
+    bundle.mkdir()
+    (bundle / "runtime-bundle-manifest.json").write_text(
+        (REPO_ROOT / "code/desktop_tauri/runtime-bundle-manifest.json").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
 
     environment = tool.clean_probe_environment(bundle, probe_root)
 
@@ -61,7 +102,7 @@ def test_clean_probe_environment_drops_parent_secrets_and_binds_bundle_paths(tmp
     assert "/private/source-tree" not in serialized
     assert environment["PYTHONHOME"] == str(bundle / "runtime/backend-python")
     assert environment["PYTHONPATH"].split(":") == [
-        str(bundle / "runtime/backend-venv/lib/python3.12/site-packages"),
+        str(bundle / "runtime/backend-venv/lib/python3.13/site-packages"),
         str(bundle / "app/code/web_mvp/backend"),
         str(bundle / "app/code/core"),
     ]
@@ -87,7 +128,7 @@ def test_launchers_are_relocatable_and_do_not_embed_repository_path(tmp_path):
     tool = load_tool_module()
     bundle = tmp_path / "bundle"
 
-    tool.write_launchers(bundle)
+    tool.write_launchers(bundle, manifest=tool.load_runtime_manifest(REPO_ROOT))
 
     backend = (bundle / "bin" / "meeting-copilot-backend").read_text(encoding="utf-8")
     worker = (bundle / "bin" / "meeting-copilot-asr-worker").read_text(encoding="utf-8")
@@ -95,6 +136,7 @@ def test_launchers_are_relocatable_and_do_not_embed_repository_path(tmp_path):
     assert "Documents/面试" not in backend + worker
     assert "MEETING_COPILOT_FUNASR_MODEL_DIR" in backend
     assert "--timeout-graceful-shutdown 8" in backend
+    assert 'exec "$ROOT/runtime/backend-python/bin/python3.13"' in backend
     assert 'exec "$ROOT/runtime/funasr-python/bin/python3.11"' in worker
     assert 'export PYTHONHOME="$ROOT/runtime/funasr-python"' in worker
 

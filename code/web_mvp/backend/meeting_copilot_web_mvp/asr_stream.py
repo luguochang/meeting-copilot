@@ -712,6 +712,13 @@ def _configured_local_path(env_name: str, default: Path) -> Path:
 def _funasr_process_environment() -> dict[str, str]:
     """Use the bundled FunASR runtime instead of the backend's Python home."""
     environment = os.environ.copy()
+    for key in list(environment):
+        upper = key.upper()
+        if upper.endswith("_API_KEY") or upper in {
+            "AUTHORIZATION",
+            "MEETING_COPILOT_LOCAL_API_TOKEN",
+        }:
+            environment.pop(key, None)
     python_home = os.environ.get("MEETING_COPILOT_FUNASR_PYTHON_HOME", "").strip()
     python_path = os.environ.get("MEETING_COPILOT_FUNASR_PYTHONPATH", "").strip()
     if python_home:
@@ -1073,11 +1080,44 @@ def prewarm_funasr_resident_manager() -> bool:
     if not _funasr_resident_enabled() or not funasr_realtime_available():
         return False
     try:
-        _get_funasr_resident_manager().start()
+        manager = _get_funasr_resident_manager()
+        manager.start()
+        timeout_seconds = max(
+            1.0,
+            min(55.0, float(os.environ.get("MEETING_COPILOT_FUNASR_PREWARM_TIMEOUT_SECONDS") or 45.0)),
+        )
+        if not manager.wait_process_ready(timeout_seconds):
+            status = manager.status()
+            _log.warning(
+                "asr.sidecar.funasr.resident_prewarm_not_ready",
+                timeout_seconds=timeout_seconds,
+                status=status,
+            )
+            return False
     except Exception as exc:
         _log.warning("asr.sidecar.funasr.resident_prewarm_failed", error=str(exc))
         return False
     return True
+
+
+def funasr_resident_status() -> dict[str, Any]:
+    with _FUNASR_RESIDENT_MANAGER_LOCK:
+        manager = _FUNASR_RESIDENT_MANAGER
+    if manager is None:
+        return {
+            "schema_version": "funasr_resident_status.v1",
+            "spawned": False,
+            "process_running": False,
+            "process_ready": False,
+            "pid": None,
+            "generation": None,
+            "active_session_id": None,
+            "process_start_count": 0,
+            "completed_session_count": 0,
+            "last_exit_code": None,
+            "last_error": None,
+        }
+    return manager.status()
 
 
 def _maybe_funasr_sidecar(

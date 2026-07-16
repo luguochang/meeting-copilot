@@ -34,6 +34,33 @@ def test_validate_runtime_bundle_fails_closed_for_missing_inventory(tmp_path):
         tool.validate_runtime_bundle(tmp_path / "missing")
 
 
+def test_validate_runtime_bundle_uses_embedded_manifest_instead_of_hardcoded_versions(tmp_path):
+    tool = load_tool_module()
+    bundle = tmp_path / "MeetingCopilotRuntime.bundle"
+    bundle.mkdir()
+    manifest = {
+        "schema_version": "meeting_copilot.runtime_bundle.v1",
+        "runtimes": {
+            "backend": {"python_version": "9.8", "executable": "runtime/backend/bin/python9.8"},
+            "funasr": {"python_version": "7.6", "executable": "runtime/funasr/bin/python7.6"},
+        },
+        "required_files": [
+            "runtime/backend/bin/python9.8",
+            "runtime/funasr/bin/python7.6",
+            "models/realtime/model.pt",
+        ],
+    }
+    (bundle / "runtime-bundle-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    for relative in manifest["required_files"]:
+        path = bundle / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"fixture")
+
+    loaded = tool.validate_runtime_bundle(bundle)
+
+    assert loaded == manifest
+
+
 def test_build_command_uses_app_bundle_and_explicit_target_dir(tmp_path):
     tool = load_tool_module()
     command = tool.build_command(overlay_path=tmp_path / "overlay.json", rust_target_dir=tmp_path / "target")

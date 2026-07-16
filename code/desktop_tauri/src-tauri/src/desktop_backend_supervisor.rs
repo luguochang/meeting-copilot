@@ -1,4 +1,6 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -10,6 +12,17 @@ use std::time::{Duration, Instant};
 
 const BACKEND_START_TIMEOUT: Duration = Duration::from_secs(60);
 const BACKEND_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+const RUNTIME_MANIFEST_SCHEMA: &str = "meeting_copilot.runtime_bundle.v1";
+const LOCAL_API_TOKEN_ENV: &str = "MEETING_COPILOT_LOCAL_API_TOKEN";
+const TEST_TOKEN_OVERRIDE_ENV: &str = "MEETING_COPILOT_LOCAL_API_TOKEN_OVERRIDE";
+const ALLOW_TEST_TOKEN_OVERRIDE_ENV: &str = "MEETING_COPILOT_ALLOW_TEST_TOKEN_OVERRIDE";
+const HEALTH_PROOF_CONTEXT: &[u8] = b"meeting-copilot-health-v1";
+
+#[derive(Debug, Clone, Deserialize)]
+struct RuntimeBundleManifest {
+    schema_version: String,
+    required_files: Vec<String>,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BackendRuntimeSnapshot {
@@ -21,6 +34,8 @@ pub struct BackendRuntimeSnapshot {
     pub health_ready: bool,
     pub spawns_process: bool,
     pub resource_bundle_present: bool,
+    pub authenticated_loopback: bool,
+    pub health_identity_verified: bool,
     pub errors: Vec<String>,
 }
 
@@ -35,6 +50,8 @@ impl Default for BackendRuntimeSnapshot {
             health_ready: false,
             spawns_process: false,
             resource_bundle_present: false,
+            authenticated_loopback: false,
+            health_identity_verified: false,
             errors: Vec::new(),
         }
     }
@@ -44,6 +61,7 @@ impl Default for BackendRuntimeSnapshot {
 struct BackendRuntimeState {
     child: Option<Child>,
     snapshot: BackendRuntimeSnapshot,
+    api_token: Option<String>,
 }
 
 #[derive(Default)]
@@ -59,6 +77,7 @@ impl BackendSupervisor {
         log_dir: &Path,
     ) -> Result<BackendRuntimeSnapshot, String> {
         validate_runtime_bundle(runtime_bundle)?;
+        let api_token = generate_local_api_token()?;
         fs::create_dir_all(data_dir)
             .map_err(|error| format!("failed to create backend data directory: {error}"))?;
         fs::create_dir_all(log_dir)
@@ -86,6 +105,7 @@ impl BackendSupervisor {
             .env("MEETING_COPILOT_DATA_DIR", data_dir)
             .env("MEETING_COPILOT_DESKTOP_RUNTIME", "1")
             .env("MEETING_COPILOT_PARENT_PID", std::process::id().to_string())
+            .env(LOCAL_API_TOKEN_ENV, &api_token)
             .env_remove("PYTHONPATH")
             .env_remove("VIRTUAL_ENV")
             .env_remove("UV_PROJECT_ENVIRONMENT")
@@ -102,7 +122,7 @@ impl BackendSupervisor {
             .spawn()
             .map_err(|error| format!("failed to spawn bundled backend: {error}"))?;
         let pid = child.id();
-        if let Err(error) = wait_for_health(&mut child, port, BACKEND_START_TIMEOUT) {
+        if let Err(error) = wait_for_health(&mut child, port, &api_token, BACKEND_START_TIMEOUT) {
             stop_child_process_group(&mut child, BACKEND_STOP_TIMEOUT);
             return Err(error);
         }
@@ -116,6 +136,8 @@ impl BackendSupervisor {
             health_ready: true,
             spawns_process: true,
             resource_bundle_present: true,
+            authenticated_loopback: true,
+            health_identity_verified: true,
             errors: Vec::new(),
         };
         let mut state = self
@@ -126,6 +148,7 @@ impl BackendSupervisor {
             stop_child_process_group(&mut previous, BACKEND_STOP_TIMEOUT);
         }
         state.child = Some(child);
+        state.api_token = Some(api_token);
         state.snapshot = snapshot.clone();
         Ok(snapshot)
     }
@@ -140,9 +163,12 @@ impl BackendSupervisor {
             health_ready: false,
             spawns_process: false,
             resource_bundle_present: false,
+            authenticated_loopback: false,
+            health_identity_verified: false,
             errors: Vec::new(),
         };
         if let Ok(mut state) = self.inner.lock() {
+            state.api_token = None;
             state.snapshot = snapshot.clone();
         }
         snapshot
@@ -159,6 +185,22 @@ impl BackendSupervisor {
             })
     }
 
+    pub fn workbench_url(&self) -> Result<String, String> {
+        let state = self
+            .inner
+            .lock()
+            .map_err(|_| "backend supervisor lock poisoned")?;
+        let base_url = state
+            .snapshot
+            .base_url
+            .as_deref()
+            .ok_or_else(|| "backend base URL is unavailable".to_string())?;
+        Ok(match state.api_token.as_deref() {
+            Some(token) => format!("{base_url}/desktop/bootstrap?token={token}"),
+            None => format!("{base_url}/workbench"),
+        })
+    }
+
     pub fn stop(&self) -> BackendRuntimeSnapshot {
         let mut state = match self.inner.lock() {
             Ok(state) => state,
@@ -173,6 +215,7 @@ impl BackendSupervisor {
         if let Some(mut child) = state.child.take() {
             stop_child_process_group(&mut child, BACKEND_STOP_TIMEOUT);
         }
+        state.api_token = None;
         state.snapshot.status = "stopped".to_string();
         state.snapshot.health_ready = false;
         state.snapshot.pid = None;
@@ -187,20 +230,28 @@ pub fn resolve_runtime_bundle(resource_dir: &Path, override_path: Option<&Path>)
 }
 
 pub fn validate_runtime_bundle(runtime_bundle: &Path) -> Result<(), String> {
-    let required = [
-        "bin/meeting-copilot-backend",
-        "runtime/backend-python/bin/python3.12",
-        "runtime/funasr-python/bin/python3.11",
-        "app/code/web_mvp/backend/meeting_copilot_web_mvp/app.py",
-        "app/code/web_mvp/frontend_v2/dist/index.html",
-        "app/code/core/meeting_copilot_core/__init__.py",
-        "app/code/asr_runtime/scripts/funasr_stream_worker.py",
-        "models/funasr-online/model.pt",
-        "models/funasr-online/config.yaml",
-    ];
-    let missing: Vec<&str> = required
+    let manifest_path = runtime_bundle.join("runtime-bundle-manifest.json");
+    let manifest_text = fs::read_to_string(&manifest_path).map_err(|error| {
+        format!("bundled runtime is incomplete: runtime-bundle-manifest.json ({error})")
+    })?;
+    let manifest: RuntimeBundleManifest = serde_json::from_str(&manifest_text)
+        .map_err(|error| format!("bundled runtime manifest is invalid: {error}"))?;
+    if manifest.schema_version != RUNTIME_MANIFEST_SCHEMA {
+        return Err(format!(
+            "bundled runtime manifest schema is invalid: {}",
+            manifest.schema_version
+        ));
+    }
+    if manifest.required_files.is_empty() {
+        return Err("bundled runtime manifest required_files are empty".to_string());
+    }
+    for relative in &manifest.required_files {
+        validate_bundle_relative_path(relative)?;
+    }
+    let missing: Vec<&str> = manifest
+        .required_files
         .iter()
-        .copied()
+        .map(String::as_str)
         .filter(|relative| !runtime_bundle.join(relative).is_file())
         .collect();
     if missing.is_empty() {
@@ -213,6 +264,27 @@ pub fn validate_runtime_bundle(runtime_bundle: &Path) -> Result<(), String> {
     }
 }
 
+fn validate_bundle_relative_path(relative: &str) -> Result<(), String> {
+    use std::path::Component;
+
+    if relative.is_empty() || relative.contains('\\') {
+        return Err(format!(
+            "bundled runtime manifest contains unsafe path: {relative}"
+        ));
+    }
+    let path = Path::new(relative);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(format!(
+            "bundled runtime manifest contains unsafe path: {relative}"
+        ));
+    }
+    Ok(())
+}
+
 fn reserve_loopback_port() -> Result<u16, String> {
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .map_err(|error| format!("failed to reserve loopback port: {error}"))?;
@@ -222,7 +294,12 @@ fn reserve_loopback_port() -> Result<u16, String> {
         .map_err(|error| format!("failed to read loopback port: {error}"))
 }
 
-fn wait_for_health(child: &mut Child, port: u16, timeout: Duration) -> Result<(), String> {
+fn wait_for_health(
+    child: &mut Child,
+    port: u16,
+    api_token: &str,
+    timeout: Duration,
+) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if let Some(status) = child
@@ -231,7 +308,7 @@ fn wait_for_health(child: &mut Child, port: u16, timeout: Duration) -> Result<()
         {
             return Err(format!("bundled backend exited before health: {status}"));
         }
-        if health_request(port) {
+        if health_request(port, api_token) {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(100));
@@ -242,7 +319,7 @@ fn wait_for_health(child: &mut Child, port: u16, timeout: Duration) -> Result<()
     ))
 }
 
-fn health_request(port: u16) -> bool {
+fn health_request(port: u16, api_token: &str) -> bool {
     let address = SocketAddr::from(([127, 0, 0, 1], port));
     let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(250)) else {
         return false;
@@ -255,11 +332,67 @@ fn health_request(port: u16) -> bool {
     {
         return false;
     }
-    let mut response = [0_u8; 256];
-    let Ok(size) = stream.read(&mut response) else {
+    let mut response = Vec::with_capacity(4096);
+    let Ok(_) = stream.read_to_end(&mut response) else {
         return false;
     };
-    response[..size].starts_with(b"HTTP/1.1 200") || response[..size].starts_with(b"HTTP/1.0 200")
+    let status_ok = response.starts_with(b"HTTP/1.1 200") || response.starts_with(b"HTTP/1.0 200");
+    if !status_ok {
+        return false;
+    }
+    let expected = health_proof(api_token);
+    response
+        .windows(expected.len())
+        .any(|window| window == expected.as_bytes())
+}
+
+fn generate_local_api_token() -> Result<String, String> {
+    let allow_override = env::var(ALLOW_TEST_TOKEN_OVERRIDE_ENV)
+        .map(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    if allow_override {
+        if let Ok(value) = env::var(TEST_TOKEN_OVERRIDE_ENV) {
+            let token = value.trim();
+            if token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Ok(token.to_ascii_lowercase());
+            }
+            return Err(
+                "test local API token override must be 64 hexadecimal characters".to_string(),
+            );
+        }
+    }
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| format!("failed to generate local API token: {error}"))?;
+    Ok(hex::encode(bytes))
+}
+
+fn health_proof(api_token: &str) -> String {
+    hmac_sha256_hex(api_token.as_bytes(), HEALTH_PROOF_CONTEXT)
+}
+
+fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
+    const BLOCK_SIZE: usize = 64;
+    let mut normalized = [0_u8; BLOCK_SIZE];
+    if key.len() > BLOCK_SIZE {
+        normalized[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        normalized[..key.len()].copy_from_slice(key);
+    }
+    let mut inner_pad = [0x36_u8; BLOCK_SIZE];
+    let mut outer_pad = [0x5c_u8; BLOCK_SIZE];
+    for index in 0..BLOCK_SIZE {
+        inner_pad[index] ^= normalized[index];
+        outer_pad[index] ^= normalized[index];
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(message);
+    let inner_digest = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner_digest);
+    hex::encode(outer.finalize())
 }
 
 fn stop_child_process_group(child: &mut Child, timeout: Duration) {
@@ -316,13 +449,96 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let error = validate_runtime_bundle(&root).unwrap_err();
-        assert!(error.contains("bin/meeting-copilot-backend"));
-        assert!(error.contains("models/funasr-online/model.pt"));
+        assert!(error.contains("runtime-bundle-manifest.json"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn runtime_inventory_uses_manifest_paths_without_python_version_hardcoding() {
+        let root = std::env::temp_dir().join(format!(
+            "meeting-copilot-runtime-manifest-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("runtime/backend/bin")).unwrap();
+        fs::write(root.join("runtime/backend/bin/python9.8"), b"fixture").unwrap();
+        fs::write(
+            root.join("runtime-bundle-manifest.json"),
+            br#"{
+              "schema_version": "meeting_copilot.runtime_bundle.v1",
+              "required_files": [
+                "runtime-bundle-manifest.json",
+                "runtime/backend/bin/python9.8"
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        assert!(validate_runtime_bundle(&root).is_ok());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn runtime_inventory_rejects_manifest_path_escape() {
+        let root = std::env::temp_dir().join(format!(
+            "meeting-copilot-runtime-escape-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("runtime-bundle-manifest.json"),
+            br#"{
+              "schema_version": "meeting_copilot.runtime_bundle.v1",
+              "required_files": ["../outside"]
+            }"#,
+        )
+        .unwrap();
+
+        assert!(validate_runtime_bundle(&root)
+            .unwrap_err()
+            .contains("unsafe path"));
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn loopback_port_reservation_returns_nonzero_local_port() {
         assert!(reserve_loopback_port().unwrap() > 0);
+    }
+
+    #[test]
+    fn generated_local_api_token_is_high_entropy_hex() {
+        let token = generate_local_api_token().unwrap();
+        assert_eq!(token.len(), 64);
+        assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn health_proof_matches_backend_contract() {
+        assert_eq!(
+            health_proof(&"a".repeat(64)),
+            "cbf9aaeaeb5cad9d6c602451cd8d10734b2a52461c8cfe72acd97e088fdf9783"
+        );
+    }
+
+    #[test]
+    fn workbench_url_uses_bootstrap_without_exposing_token_in_snapshot() {
+        let supervisor = BackendSupervisor::default();
+        {
+            let mut state = supervisor.inner.lock().unwrap();
+            state.snapshot.base_url = Some("http://127.0.0.1:54321".to_string());
+            state.api_token = Some("a".repeat(64));
+        }
+
+        assert_eq!(
+            supervisor.workbench_url().unwrap(),
+            format!(
+                "http://127.0.0.1:54321/desktop/bootstrap?token={}",
+                "a".repeat(64)
+            )
+        );
+        assert!(!serde_json::to_string(&supervisor.snapshot())
+            .unwrap()
+            .contains(&"a".repeat(64)));
     }
 }
