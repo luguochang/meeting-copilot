@@ -25577,3 +25577,74 @@ verdict=no_go
 - Phase 3 下一个实现切片固定为 `Tauri native microphone -> existing backend WebSocket`；暂不同时开发 system audio，不重启 Provider bake-off。
 - Keychain、packaged CSP/HTTPS-only、FFmpeg 与模型供应链、entitlements、签名公证和 separate clean Mac 仍为 No-Go。
 - 本轮远程 ASR/LLM 调用均为 0，新增费用为 0。
+
+# DEC-402: native microphone 已完成 Tauri 主链实现，真实麦克风 UI 证据等待解锁屏幕
+
+时间：2026-07-16
+
+状态：Accepted / Implementation and synthetic packaged chain Go / Real microphone UI No-Go pending unlock
+
+## 决策
+
+1. Mac-first 原生采音采用单轨切片：Swift `AVAudioEngine` + `AVAudioConverter` 采集系统麦克风，统一输出 `16 kHz / mono / Float32 PCM`，通过 `URLSessionWebSocketTask` 连接现有 `/live/asr/stream/ws/{session_id}`；不在这一切片同时接入 ScreenCaptureKit system audio。
+2. Rust `NativeMicCaptureSupervisor` 由 Tauri 管理，负责 helper 路径、ready 协议、单活动会话、进程组启动/回收、SIGUSR1 暂停、SIGUSR2 恢复、SIGTERM 结束和 backend WebSocket URL/cookie 派生。Tauri Exit 先停止 native mic，再停止 backend。
+3. session Cookie 不再放入 helper 命令行参数，改为仅注入 helper 子进程环境；Rust IPC response 不序列化 token/Cookie。该方案仍不是最终 Keychain 方案，不能关闭凭据管理发布门禁。
+4. V2 前端新增 adaptive capture controller：Tauri 且 bundle helper 存在时使用 native IPC；普通浏览器或 debug external backend 自动使用已有 `getUserMedia -> AudioWorklet -> WebSocket`，两者共享同一后端 transcript/SSE/suggestion projection，不建立第二套业务链。
+5. backend 继续负责录音 chunk journal、ASR final、durable correction/suggestion jobs 和会后复盘；native helper 只负责采音与传输，不写 raw audio 文件、不调用远程 ASR/LLM。新增费用为 0。
+
+## TDD 与构建证据
+
+- Swift helper 编译、`--help` 探针通过；探针修复为同时检查 stdout/stderr，因为 CLI help 正常写入 stderr。
+- Rust `cargo test --locked`：`20 passed`，覆盖 session ID、ready schema/session 匹配、helper 缺失 fail-closed、单会话冲突、暂停/恢复、session mismatch stop、进程组清理和鉴权 WS URL。
+- V2 frontend：`42 passed`，`npm run typecheck`、`npm run lint`、`npm run build` 通过；覆盖 native 选择、browser fallback、native lifecycle 和没有伪造输入音量。
+- relocatable runtime：`artifacts/tmp/macos_bundled_runtime/phase3-native-mic-runtime-20260716-r3/evidence.json`；backend、FunASR、V2 dist、native helper 均通过，external symlink `0`，runtime 逻辑大小约 `2.106 GB`，decision=`go_local_relocatable_runtime_spike_not_public_release`。
+- Tauri app resource：`artifacts/tmp/tauri_runtime_package/phase3-native-mic-tauri-20260716-r2/evidence.json`；`.app` arm64 构建成功，runtime required files missing `0`，逻辑大小约 `2.288 GB`，decision=`go_packaged_runtime_resource_app_not_public_release`。
+- packaged supervisor synthetic ASR：`artifacts/tmp/packaged_runtime_supervisor_smoke/phase3-native-mic-packaged-smoke-20260716-r2/evidence.json`；bootstrap/HMAC/resident FunASR/认证 WebSocket/非空 final/录音与进程回收均通过，remote ASR/LLM `false`。
+
+## 未关闭边界
+
+- 真实麦克风 UI 尚未形成证据：打包 Tauri 窗口启动后，Computer Use 检测到 macOS 锁屏，无法安全点击开始会议或处理麦克风权限提示。本项不能用 helper `--help`、Swift WAV spike 或 synthetic WebSocket 替代。
+- 当前未关闭的下一步只有一项：解锁 Mac 后启动最新 `phase3-native-mic-tauri-20260716-r2/Meeting Copilot.app`，点击一次“开始会议”，在获得权限后让真实环境声音运行至少 30 秒，再点击“结束并整理”，核对 UI 实时文字、backend recording/audio metadata、FunASR final、建议候选和 app/backend/端口清理。
+- 该证据通过后才把 Phase 3 的 native microphone implementation 标记为功能 Go；system audio、Keychain、CSP/HTTPS-only、模型/FFmpeg 供应链、entitlements、签名、公证、separate clean Mac 仍分别保持 No-Go。
+
+## 成本与隐私
+
+- 本决策执行期间没有调用远程 ASR/LLM，没有使用用户提供的 API key，没有读取 `configs/local`、Voice Memos 或用户私有录音；输入 ASR smoke 使用仓库外已生成的公开/合成 WAV。
+- 临时恢复的 FunASR venv/source runtime 已在构建完成后从源码目录删除；大型 runtime、`.app` 和 evidence 仅保留在 `artifacts/tmp`，不进入源码提交。
+
+# DEC-403: packaged native helper 真实麦克风主链通过，Tauri IPC/UI 仍单独待验
+
+时间：2026-07-17
+
+状态：Accepted / Real packaged native helper Go / Tauri IPC and UI pending / Public release No-Go
+
+## 首次真实运行暴露的问题
+
+1. `phase3-real-native-mic-20260717-r1` 首次使用包内 Swift helper 真实采音 30 秒。权限、WebSocket、录音与清理实际成功：helper ready/exit code `0`，录音 `30.297s`、7 chunks、`969,548B` WAV、SHA-256 `1ab56e6e...`，app/backend/端口全部回收。
+2. 该次输入 RMS 仅 `0.005524`，没有可识别语音，因此 transcript 为 0；不能把它归因成 FunASR 链路失败。
+3. 更重要的真实缺陷是 Swift helper 按 CoreAudio tap 回调大小直接发送 payload，而 backend 按每个 payload `300ms` 维护 VAD/timeline，导致约 30 秒录音投影到约 `90s`。这是 native/browser 帧协议不一致，不是评测噪声。
+
+## 修复
+
+1. Swift helper 与 browser `StreamingPcmFramer` 统一为每帧 `4,800` samples，即 `16 kHz` 下 `300ms`；只在 stop 时发送一个不足 300ms 的尾帧。
+2. stop 生命周期增加 `stopping`，先停止 tap/engine，再在串行 send queue 排空完整帧和尾帧，最后发送 `END`；不再因提前设置 `stopped=true` 而丢弃队列尾部音频。
+3. binary WebSocket send 在串行 queue 上等待 completion 或 5 秒 timeout，使音频帧和 `END` 顺序明确，避免长会产生无界 in-flight send callbacks。
+4. 新增 `tools/packaged_native_mic_smoke.py`。它使用测试 token 启动真实 packaged app/backend，以最小 helper 环境传递 session cookie，创建 V2 meeting，运行包内 helper，读取 transcript/audio/events，结束会议并验证 app/backend/端口清理。runner 不读取 `configs/local`、用户私有录音或 API key。
+
+## 真实麦克风 Go 证据
+
+- runtime：`artifacts/tmp/macos_bundled_runtime/phase3-native-mic-runtime-20260717-r4/evidence.json`，native helper SHA-256=`771d8ba0...`，backend/FunASR/helper relocation probes 通过，external symlink `0`。
+- Tauri app：`artifacts/tmp/tauri_runtime_package/phase3-native-mic-tauri-20260717-r3/evidence.json`，required packaged files missing `0`，decision=`go_packaged_runtime_resource_app_not_public_release`。
+- real native mic：`artifacts/tmp/packaged_native_mic_smoke/phase3-real-native-mic-speaker-20260717-r2/evidence.json`。
+- helper 由 AVAudioEngine 获取真实 microphone，ready payload 明确 `frame_samples=4800`；受控合成中文技术会议音频由 `/usr/bin/afplay` 经扬声器和空气进入真实麦克风，没有直接注入 WebSocket。
+- helper 运行 `30.798s`，stream timeline 最大约 `30,000ms`，修复前 3x 漂移已消失；backend 保存 `30.297s`、7 chunks、`969,548B` WAV，SHA-256=`b09de6f2...`。
+- 本地 `funasr_realtime` 产生 2 个 transcript final；helper stderr 为空，credential 不在 process command；app/backend/端口清理全部通过。
+- runner decision=`go_packaged_real_native_mic_helper_not_ui_not_public_release`，`counts_as_real_native_microphone_evidence=true`。
+
+## 诚实边界
+
+- 扬声器回采同时受环境声和房间声学影响，文字为明显错误的中文片段；本证据证明 native capture execution contract，不升级中文 ASR 质量门禁。自然多人会议质量仍需独立验收，后续 system audio 可避免远端会议声音经过空气二次劣化。
+- 本 runner 直接启动同一个 packaged Swift helper，未通过 React 按钮和 Tauri IPC command，因此 `counts_as_tauri_ipc_evidence=false`、`counts_as_ui_evidence=false`。Rust supervisor fake-helper lifecycle 与前端 invoke selection 已分别通过单元测试，但不能拼接冒充单次 UI E2E。
+- packaged runtime 本次未配置远程 LLM，`suggestion_count=0`，所以该运行不证明实时 AI 正式建议；Phase 1C/2 的真实 relay/browser vertical 证据仍有效，但 packaged native mic + relay 同场仍待 Keychain/provider config 和 UI E2E。
+- Computer Use 对当前 Tauri/WebKit 窗口持续返回 timeout/`AXError.cannotComplete`；当前下一项固定为 opt-in Tauri IPC/UI probe 或可操作的真实桌面窗口，不再重复 native helper/Provider 横评。
+- system audio、Keychain、CSP/HTTPS-only、模型/FFmpeg 供应链、签名公证和 separate clean Mac 继续保持 No-Go。本轮远程 ASR/LLM调用为 0，新增费用为 0。

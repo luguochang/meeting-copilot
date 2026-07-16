@@ -59,23 +59,19 @@ def test_audio_chunk_runtime_module_exists_with_session_scoped_safe_root_contrac
         assert snippet not in source
 
 
-def test_tauri_mic_adapter_commands_delegate_to_audio_chunk_runtime_instead_of_noop():
+def test_tauri_mic_adapter_start_stop_use_native_supervisor_and_delete_stays_scoped_cleanup():
     lib_source = _read(LIB_RS)
 
     assert "pub mod desktop_audio_chunk_runtime;" in lib_source
 
-    for fn_name, runtime_call, command_id in [
-        ("mic_adapter_start", "desktop_audio_chunk_runtime::start_recording", "mic_adapter.start"),
-        ("mic_adapter_stop", "desktop_audio_chunk_runtime::stop_recording", "mic_adapter.stop"),
-        (
-            "mic_adapter_delete_audio_chunks",
-            "desktop_audio_chunk_runtime::delete_audio_chunks",
-            "mic_adapter.delete_audio_chunks",
-        ),
-    ]:
-        body = _command_body(lib_source, fn_name)
-        assert runtime_call in body
-        assert f'NoopBridgeResponse::for_command("{command_id}")' not in body
+    assert "microphone.start(session_id, &backend)" in _command_body(lib_source, "mic_adapter_start")
+    assert "microphone.stop_for_session(session_id.as_deref())" in _command_body(
+        lib_source, "mic_adapter_stop"
+    )
+    delete_body = _command_body(lib_source, "mic_adapter_delete_audio_chunks")
+    assert "desktop_audio_chunk_runtime::delete_audio_chunks" in delete_body
+    assert 'NoopBridgeResponse::for_command("mic_adapter.start")' not in lib_source
+    assert 'NoopBridgeResponse::for_command("mic_adapter.stop")' not in lib_source
 
 
 def test_desktop_runtime_response_contract_distinguishes_executable_local_lifecycle():

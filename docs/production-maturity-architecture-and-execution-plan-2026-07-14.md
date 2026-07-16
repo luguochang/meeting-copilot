@@ -818,9 +818,12 @@ DEC-382 已完成 90 秒真实 browser microphone 稳定性 smoke，并证明录
 
 ### Phase 3：自包含 Mac Internal Alpha（8-12 工程日）
 
-- [ ] 先实现 native microphone -> 现有 backend WebSocket 的单轨 adapter；完成真实主链路后再加 ScreenCaptureKit system audio，不在一个切片中同时开发双轨协议。
+- [x] 完成 native microphone -> 现有 backend WebSocket 的单轨 adapter 实现：Swift AVAudioEngine/Converter、Rust Tauri supervisor、authenticated WS、pause/resume/stop 和 V2 native/browser fallback 已通过 TDD；真实麦克风 UI 主链路证据仍待解锁 Mac 后执行。完成真实主链路后再加 ScreenCaptureKit system audio，不在一个切片中同时开发双轨协议。
 - [x] Tauri supervisor 启动 backend 与 warm ASR sidecar：启动、token、HMAC proof、resident-ready、受控 WAV -> backend WebSocket -> non-empty real final 和进程回收已有当前 packaged 证据。
 - [x] backend/FunASR Python runtime/online model 进入 app bundle，不依赖仓库或用户 venv；当前仅计本机 internal runtime 证据。
+- [ ] 运行最新打包 `.app` 的真实 microphone permission -> native PCM -> backend WS -> FunASR final -> recording/suggestion/review 全链路，并保留 UI screenshot、event trace 和 cleanup evidence；synthetic WAV packaged smoke 不替代本项。
+- [x] 包内 Swift native helper 的真实 microphone permission -> 4,800-sample PCM -> authenticated backend WS -> FunASR final -> recording export 与 cleanup 已通过；详见 DEC-403。该项不冒充 React/Tauri IPC 或正式建议证据。
+- [ ] 通过 React “开始会议/暂停/继续/结束并整理”实际触发 Tauri IPC，验证同一 session 的实时文字、正式建议、录音、会后复盘和 UI screenshot；当前 Computer Use 对 Tauri WebKit 返回 `AXError.cannotComplete`，须使用 opt-in packaged IPC probe 或可操作桌面宿主完成。
 - [ ] FFmpeg 制品、不可变 revision/hash 与再分发授权闭环；实时 PCM 主链路当前使用 torchaudio，不把“可以不用 FFmpeg 跑 smoke”等同于供应链已完成。
 - [x] 每次启动的 256-bit local API token、HttpOnly/SameSite=Strict bootstrap、Origin 校验和 backend instance HMAC proof。
 - [ ] Keychain 凭据存储、packaged CSP 和 HTTPS-only 策略。

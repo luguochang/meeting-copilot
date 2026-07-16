@@ -34,6 +34,10 @@ DEFAULT_MODEL_DIR = (
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 RUNTIME_MANIFEST_RELATIVE = Path("code/desktop_tauri/runtime-bundle-manifest.json")
 RUNTIME_MANIFEST_SCHEMA = "meeting_copilot.runtime_bundle.v1"
+NATIVE_MIC_SOURCE_RELATIVE = Path(
+    "code/desktop_tauri/native_mic/Sources/MeetingCopilotNativeMic/main.swift"
+)
+NATIVE_MIC_INFO_PLIST_RELATIVE = Path("code/desktop_tauri/native_mic/Info.plist")
 
 
 def _safe_bundle_path(value: Any, *, field: str) -> str:
@@ -117,6 +121,9 @@ def build_and_probe(
         "model_pt": (model_dir / "model.pt").is_file(),
         "model_config": (model_dir / "config.yaml").is_file(),
         "frontend_dist": (repo_root / "code/web_mvp/frontend_v2/dist/index.html").is_file(),
+        "native_mic_source": (repo_root / NATIVE_MIC_SOURCE_RELATIVE).is_file(),
+        "native_mic_info_plist": (repo_root / NATIVE_MIC_INFO_PLIST_RELATIVE).is_file(),
+        "xcrun": shutil.which("xcrun") is not None,
     }
     if not all(preconditions.values()):
         raise RuntimeError(f"bundle preconditions failed: {preconditions}")
@@ -153,6 +160,7 @@ def build_and_probe(
     copy_application_sources(repo_root, bundle)
     shutil.copy2(repo_root / RUNTIME_MANIFEST_RELATIVE, bundle / "runtime-bundle-manifest.json")
     write_launchers(bundle, manifest=manifest)
+    build_native_mic_helper(repo_root, bundle)
 
     links = external_symlinks(bundle)
     probe_parent = Path(tempfile.mkdtemp(prefix=f"meeting-copilot-{run_id}-", dir="/tmp"))
@@ -162,12 +170,14 @@ def build_and_probe(
         relocated_links = external_symlinks(relocated_bundle)
         backend_probe = probe_backend(relocated_bundle, probe_parent, repo_root=repo_root)
         asr_probe = probe_funasr(relocated_bundle, probe_parent, timeout_seconds=asr_timeout_seconds)
+        native_mic_probe = probe_native_mic(relocated_bundle)
     finally:
         shutil.rmtree(probe_parent, ignore_errors=True)
 
     decision = spike_decision(
         backend_probe=backend_probe,
         asr_probe=asr_probe,
+        native_mic_probe=native_mic_probe,
         external_link_count=len(links) + len(relocated_links),
     )
     evidence = {
@@ -190,6 +200,7 @@ def build_and_probe(
         "relocated_external_symlinks": relocated_links,
         "backend_probe": backend_probe,
         "asr_probe": asr_probe,
+        "native_mic_probe": native_mic_probe,
         "decision": decision,
         "privacy_cost_flags": {
             "parent_environment_secrets_inherited": False,
@@ -202,7 +213,7 @@ def build_and_probe(
         "remaining_blockers": [
             "not_verified_on_a_separate_clean_mac",
             "model_and_binary_redistribution_not_approved",
-            "not_integrated_into_tauri_process_supervision",
+            "native_microphone_tauri_ipc_and_ui_not_yet_proven",
             "not_signed_or_notarized",
         ],
     }
@@ -355,6 +366,55 @@ exec "$ROOT/runtime/funasr-python/bin/python{funasr_version}" "$ROOT/app/code/as
     )
     backend.chmod(0o755)
     worker.chmod(0o755)
+
+
+def native_mic_build_command(repo_root: Path, bundle: Path) -> list[str]:
+    architecture = platform.machine()
+    if architecture not in {"arm64", "x86_64"}:
+        raise RuntimeError(f"unsupported macOS architecture: {architecture}")
+    output = bundle / "bin/meeting-copilot-native-mic"
+    return [
+        "xcrun",
+        "swiftc",
+        "-swift-version",
+        "5",
+        "-parse-as-library",
+        "-O",
+        "-target",
+        f"{architecture}-apple-macos13.0",
+        "-framework",
+        "AVFoundation",
+        "-framework",
+        "Foundation",
+        "-Xlinker",
+        "-sectcreate",
+        "-Xlinker",
+        "__TEXT",
+        "-Xlinker",
+        "__info_plist",
+        "-Xlinker",
+        str(repo_root / NATIVE_MIC_INFO_PLIST_RELATIVE),
+        str(repo_root / NATIVE_MIC_SOURCE_RELATIVE),
+        "-o",
+        str(output),
+    ]
+
+
+def build_native_mic_helper(repo_root: Path, bundle: Path) -> None:
+    output = bundle / "bin/meeting-copilot-native-mic"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    completed = subprocess.run(
+        native_mic_build_command(repo_root, bundle),
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"native microphone helper build failed: {completed.stderr[-2000:]}"
+        )
+    output.chmod(0o755)
 
 
 def clean_probe_environment(bundle: Path, probe_root: Path) -> dict[str, str]:
@@ -542,11 +602,13 @@ def spike_decision(
     *,
     backend_probe: dict[str, Any],
     asr_probe: dict[str, Any],
+    native_mic_probe: dict[str, Any] | None = None,
     external_link_count: int,
 ) -> dict[str, Any]:
     ready = (
         backend_probe.get("status") == "passed"
         and asr_probe.get("status") == "passed"
+        and (native_mic_probe is None or native_mic_probe.get("status") == "passed")
         and external_link_count == 0
     )
     return {
@@ -558,6 +620,36 @@ def spike_decision(
         "counts_as_local_relocation_evidence": ready,
         "counts_as_clean_mac_evidence": False,
         "counts_as_public_release_package": False,
+    }
+
+
+def probe_native_mic(bundle: Path) -> dict[str, Any]:
+    started = time.monotonic()
+    try:
+        completed = subprocess.run(
+            [str(bundle / "bin/meeting-copilot-native-mic"), "--help"],
+            cwd=bundle,
+            env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {
+            "status": "failed",
+            "duration_seconds": round(time.monotonic() - started, 3),
+            "return_code": None,
+            "stderr_tail": str(exc),
+        }
+    help_text = f"{completed.stdout}\n{completed.stderr}"
+    passed = completed.returncode == 0 and "meeting-copilot-native-mic" in help_text
+    return {
+        "status": "passed" if passed else "failed",
+        "duration_seconds": round(time.monotonic() - started, 3),
+        "return_code": completed.returncode,
+        "stdout_tail": completed.stdout[-1000:],
+        "stderr_tail": completed.stderr[-1000:],
     }
 
 

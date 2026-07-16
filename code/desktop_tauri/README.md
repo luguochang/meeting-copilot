@@ -1,35 +1,32 @@
-# Meeting Copilot Desktop Tauri Scaffold
+# Meeting Copilot Desktop Tauri Shell
 
-PCWEB-082 creates the first desktop shell scaffold against the PCWEB-081 native bridge contract.
+## Current Status: 2026-07-16
 
-This scaffold is intentionally narrow:
+The historical PCWEB scaffold notes below are retained for traceability. The current
+implementation has moved beyond the original no-op boundary:
 
 - Tauri v2 Rust source lives under `src-tauri/`.
-- The shell points at the existing local Web MVP backend during development: `http://127.0.0.1:8765/`.
-- The shell points at the existing static Web MVP assets for build-time frontend distribution.
-- Only three no-op bridge commands are bound:
-  - `runtime_get_status` maps to `runtime.get_status`.
-  - `session_prepare` maps to `session.prepare`.
-  - `asr_worker_health` maps to `asr_worker.health`.
+- Packaged builds include `MeetingCopilotRuntime.bundle`, resident local FunASR and the
+  arm64 macOS helper `bin/meeting-copilot-native-mic`.
+- `NativeMicCaptureSupervisor` owns one native microphone session, helper process-group
+  lifecycle, ready-file validation, pause/resume/stop and authenticated backend WS setup.
+- The Swift helper uses `AVAudioEngine` and `AVAudioConverter` to send 16 kHz mono Float32
+  PCM to the existing `/live/asr/stream/ws/{session_id}` endpoint. It does not write raw
+  audio files or call remote ASR/LLM.
+- V2 uses native capture when the Tauri helper is present and keeps the browser
+  `getUserMedia` path for ordinary browser/debug external-backend runs.
+- Backend recording, transcript projection, correction/suggestion jobs and review remain
+  the single business pipeline; the native helper is only an input adapter.
 
-Each command returns a no-op response envelope with no audio capture, no process spawn, no remote provider call, and no local file write.
+The implementation evidence is recorded in `docs/decision-log.md` under `DEC-402` and the
+real packaged helper result under `DEC-403`. The latest helper captures 4,800-sample frames
+from a real microphone, produces local FunASR finals and persists a WAV, but React/Tauri IPC
+and UI evidence are still pending because Computer Use cannot inspect the Tauri WebKit window.
+This is `M3 Mac Internal Alpha` implementation work, not a public release.
 
-## Explicit Boundaries
-
-PCWEB-082 does not run Tauri, Cargo, npm, or any package manager. It also does not create dependency lock files, installers, signing assets, notarization assets, bundles, model files, audio files, or runtime output artifacts.
-
-The following remain unimplemented until later dedicated increments:
-
-- microphone capture
-- system audio capture
-- permission requests
-- audio device enumeration
-- ASR worker startup
-- provider config loading
-- secret storage
-- local runtime persistence
-- remote ASR calls
-- remote LLM calls
+The remaining release boundaries are Keychain, packaged CSP/HTTPS policy, app data/log
+retention, model/FFmpeg redistribution, signing/notarization, a separate clean Mac, and
+the real microphone UI run. System audio remains a separate later slice.
 
 Start the existing Web MVP backend manually before a future desktop dev run:
 

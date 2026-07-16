@@ -17,6 +17,7 @@ export interface BrowserMicrophoneState {
   phase: MicrophonePhase;
   asrReady: boolean;
   inputLevel: number;
+  inputLevelAvailable?: boolean;
   elapsedMs: number | null;
   activePartial: ActivePartial | null;
   error: string | null;
@@ -72,6 +73,7 @@ const initialState: BrowserMicrophoneState = {
   phase: "idle",
   asrReady: false,
   inputLevel: 0,
+  inputLevelAvailable: true,
   elapsedMs: null,
   activePartial: null,
   error: null,
