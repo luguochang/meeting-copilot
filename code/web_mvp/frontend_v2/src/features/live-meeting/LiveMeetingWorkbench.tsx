@@ -124,13 +124,26 @@ export function LiveMeetingWorkbench({
       setMessage("无法创建会议");
       return;
     }
+    let meetingCreated = false;
     try {
       await api.createMeeting(activeMeetingId);
+      meetingCreated = true;
       await microphone.start(activeMeetingId);
       setMessage("会议已开始");
     } catch (error) {
+      const captureError = error instanceof Error ? error.message : "麦克风启动失败";
+      if (createdFromList && meetingCreated) {
+        try {
+          await api.deleteMeeting(activeMeetingId);
+        } catch (rollbackError) {
+          const rollbackMessage = rollbackError instanceof Error ? rollbackError.message : "会议回滚失败";
+          setMessage(`${captureError}；新会议清理失败：${rollbackMessage}`);
+          onBackToMeetings?.();
+          return;
+        }
+      }
       if (createdFromList) onBackToMeetings?.();
-      setMessage(error instanceof Error ? error.message : "麦克风启动失败");
+      setMessage(captureError);
     }
   };
 
