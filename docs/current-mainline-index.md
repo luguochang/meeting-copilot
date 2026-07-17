@@ -10,7 +10,7 @@
 >
 > 文档真相与历史归档索引：`docs/archive/readiness-index.md`
 >
-> 当前代码候选基线：`7e696e0` (`feat: close packaged desktop mainline blockers`) 加上本轮 V2 导入录音改动；本轮改动提交前不得把旧 provenance 误认为当前代码证据
+> 当前代码候选基线：`72fbae9` (`feat: close v2 recording import mainline`)，工作树 clean；旧 packaged provenance 仍只代表它绑定的旧候选，不能覆盖本轮 V2 导入改动
 >
 > 最新 clean provenance：`artifacts/tmp/release_provenance/phase0-clean-commit-20260717-r6/manifest.json`
 >

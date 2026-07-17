@@ -2,7 +2,7 @@
 
 日期：2026-07-17
 
-代码候选：`7e696e0` (`codex/phase0-clean-baseline`)，文档绑定提交为 `fe71c5f`，工作树 clean。
+代码候选：`72fbae9` (`codex/phase0-clean-baseline`)，包含本轮 V2 导入录音闭环，工作树 clean。
 
 ## 总结结论
 
