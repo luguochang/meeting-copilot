@@ -1,17 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { resolveTauriInvoke } from "../../desktop/tauri";
 import type {
   BrowserMicrophoneController,
   BrowserMicrophoneState,
 } from "./useBrowserMicrophone";
-
-type TauriInvoke = <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
-
-declare global {
-  interface Window {
-    __TAURI__?: { core?: { invoke?: TauriInvoke } };
-    __TAURI_INTERNALS__?: { invoke?: TauriInvoke };
-  }
-}
 
 interface NativeMicCommandResponse {
   command_status: string;
@@ -47,13 +39,6 @@ const initialState: BrowserMicrophoneState = {
   droppedFrames: 0,
 };
 
-function resolveInvoke(): TauriInvoke | null {
-  const globalInvoke = window.__TAURI__?.core?.invoke;
-  if (typeof globalInvoke === "function") return globalInvoke;
-  const internalInvoke = window.__TAURI_INTERNALS__?.invoke;
-  return typeof internalInvoke === "function" ? internalInvoke : null;
-}
-
 function responseError(response: NativeMicCommandResponse, fallback: string): Error {
   return new Error(response.errors.filter(Boolean).join("；") || fallback);
 }
@@ -72,7 +57,7 @@ export function useNativeMicrophone(): NativeMicrophoneController {
   }, []);
 
   const probe = useCallback(async () => {
-    const invoke = resolveInvoke();
+    const invoke = resolveTauriInvoke();
     if (!invoke) return false;
     try {
       const response = await invoke<NativeMicCommandResponse>("mic_adapter_prepare");
@@ -85,7 +70,7 @@ export function useNativeMicrophone(): NativeMicrophoneController {
   const start = useCallback(async (meetingId: string) => {
     const normalizedMeetingId = meetingId.trim();
     if (!SESSION_ID_PATTERN.test(normalizedMeetingId)) throw new Error("会议 ID 格式无效");
-    const invoke = resolveInvoke();
+    const invoke = resolveTauriInvoke();
     if (!invoke) throw new Error("桌面原生麦克风不可用");
 
     updateState({
@@ -125,7 +110,7 @@ export function useNativeMicrophone(): NativeMicrophoneController {
 
   const togglePause = useCallback(() => {
     const runtime = runtimeRef.current;
-    const invoke = resolveInvoke();
+    const invoke = resolveTauriInvoke();
     if (!runtime || runtime.stopping || !invoke) return;
     const nowMs = Date.now();
     const resuming = runtime.pausedAtMs !== null;
@@ -154,7 +139,7 @@ export function useNativeMicrophone(): NativeMicrophoneController {
 
   const end = useCallback(async () => {
     const runtime = runtimeRef.current;
-    const invoke = resolveInvoke();
+    const invoke = resolveTauriInvoke();
     if (!runtime || runtime.stopping || !invoke) return;
     runtime.stopping = true;
     updateState({
@@ -198,7 +183,7 @@ export function useNativeMicrophone(): NativeMicrophoneController {
 
   useEffect(() => () => {
     const runtime = runtimeRef.current;
-    const invoke = resolveInvoke();
+    const invoke = resolveTauriInvoke();
     if (!runtime || !invoke) return;
     void invoke("mic_adapter_stop", { sessionId: runtime.meetingId });
     runtimeRef.current = null;

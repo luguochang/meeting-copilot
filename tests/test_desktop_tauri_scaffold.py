@@ -70,6 +70,9 @@ EXPECTED_BRIDGE_COMMANDS = {
     "mic_adapter_resume": "mic_adapter.resume",
     "mic_adapter_stop": "mic_adapter.stop",
     "mic_adapter_delete_audio_chunks": "mic_adapter.delete_audio_chunks",
+    "provider_config_status": "provider_config.status",
+    "provider_config_save": "provider_config.save",
+    "provider_config_clear": "provider_config.clear",
 }
 
 EXPECTED_NATIVE_MIC_COMMANDS = {
@@ -213,7 +216,7 @@ def test_cargo_manifest_is_tauri_v2_scaffold_without_dependency_lockfiles():
     assert not (DESKTOP_ROOT / "package.json").exists()
 
 
-def test_tauri_capability_stays_minimal_for_noop_shell():
+def test_static_tauri_capability_stays_local_and_minimal():
     capability = json.loads(
         (TAURI_ROOT / "capabilities" / "default.json").read_text(encoding="utf-8")
     )
@@ -224,6 +227,24 @@ def test_tauri_capability_stays_minimal_for_noop_shell():
     permission_text = "\n".join(capability["permissions"]).lower()
     for permission in forbidden_permissions:
         assert permission not in permission_text
+
+
+def test_packaged_workbench_gets_exact_runtime_origin_and_command_permissions():
+    build_rs = _read("src-tauri/build.rs")
+    manifest_rs = _read("src-tauri/src/app_command_manifest.rs")
+    lib_rs = _read("src-tauri/src/lib.rs")
+
+    assert "AppManifest::new().commands(app_command_manifest::APP_COMMAND_NAMES)" in build_rs
+    assert "CapabilityBuilder::new(\"packaged-loopback-workbench\")" in lib_rs
+    assert ".local(false)" in lib_rs
+    assert '.window("main")' in lib_rs
+    assert ".remote(remote_pattern)" in lib_rs
+    assert 'parsed.host_str() != Some("127.0.0.1")' in lib_rs
+    assert 'format!("http://127.0.0.1:{port}/*")' in lib_rs
+    assert "app.add_capability(packaged_remote_capability(remote_pattern))" in lib_rs
+    assert 'format!("allow-{}", command.replace(\'_\', "-"))' in manifest_rs
+    for command in EXPECTED_BRIDGE_COMMANDS:
+        assert f'"{command}"' in manifest_rs
 
 
 def test_tauri_lib_binds_bridge_and_mic_adapter_commands():
@@ -338,7 +359,7 @@ def test_desktop_frontend_probe_records_packaged_page_load_from_rust_side():
     assert "desktop_frontend_probe_runtime::write_frontend_probe" in lib_rs
 
 
-def test_scaffold_binds_local_backend_supervisor_without_remote_client_or_secret_reads():
+def test_scaffold_binds_local_backend_supervisor_without_general_remote_client_dependencies():
     checked_paths = [
         "src-tauri/Cargo.toml",
         "src-tauri/build.rs",
@@ -373,14 +394,11 @@ def test_scaffold_binds_local_backend_supervisor_without_remote_client_or_secret
         "cpal",
         "rodio",
         "keychain",
-        "api_key",
         "OPENAI_API_KEY",
-        "Authorization",
         "configs/local",
         "reqwest",
         "ureq",
         "hyper",
-        "openai",
     ]
     for snippet in forbidden_snippets:
         assert snippet not in scaffold_text

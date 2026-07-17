@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-asr-worker-collect-events"
+description = "Enables the asr_worker_collect_events command without any pre-configured scope."
+commands.allow = ["asr_worker_collect_events"]
+
+[[permission]]
+identifier = "deny-asr-worker-collect-events"
+description = "Denies the asr_worker_collect_events command without any pre-configured scope."
+commands.deny = ["asr_worker_collect_events"]

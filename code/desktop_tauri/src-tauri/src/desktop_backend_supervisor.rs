@@ -46,6 +46,14 @@ pub struct BackendWebSocketConnection {
     pub cookie: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct RuntimeProviderConfig {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    pub provider_label: String,
+}
+
 impl Default for BackendRuntimeSnapshot {
     fn default() -> Self {
         Self {
@@ -113,6 +121,12 @@ impl BackendSupervisor {
             .env("MEETING_COPILOT_DESKTOP_RUNTIME", "1")
             .env("MEETING_COPILOT_PARENT_PID", std::process::id().to_string())
             .env(LOCAL_API_TOKEN_ENV, &api_token)
+            .env_remove("LLM_GATEWAY_BASE_URL")
+            .env_remove("LLM_GATEWAY_API_KEY")
+            .env_remove("LLM_GATEWAY_MODEL")
+            .env_remove("LLM_GATEWAY_TIMEOUT_SECONDS")
+            .env_remove("LLM_GATEWAY_PROVIDER_LABEL")
+            .env_remove("LLM_GATEWAY_IS_MOCK")
             .env_remove("PYTHONPATH")
             .env_remove("VIRTUAL_ENV")
             .env_remove("UV_PROJECT_ENVIRONMENT")
@@ -251,6 +265,82 @@ impl BackendSupervisor {
             url: format!("{ws_base}/live/asr/stream/ws/{session_id}?audio_source=tauri_native_mic"),
             cookie,
         })
+    }
+
+    pub fn configure_provider(&self, config: &RuntimeProviderConfig) -> Result<(), String> {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "base_url": config.base_url,
+            "api_key": config.api_key,
+            "model": config.model,
+            "provider_label": config.provider_label,
+        }))
+        .map_err(|error| format!("failed to encode provider config: {error}"))?;
+        self.send_authenticated_request("PUT", "/desktop/provider/config", Some(&body))
+    }
+
+    pub fn clear_provider(&self) -> Result<(), String> {
+        self.send_authenticated_request("DELETE", "/desktop/provider/config", None)
+    }
+
+    fn send_authenticated_request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+    ) -> Result<(), String> {
+        let (port, api_token) = {
+            let state = self
+                .inner
+                .lock()
+                .map_err(|_| "backend supervisor lock poisoned".to_string())?;
+            let port = state
+                .snapshot
+                .port
+                .ok_or_else(|| "packaged backend port is unavailable".to_string())?;
+            let api_token = state
+                .api_token
+                .clone()
+                .ok_or_else(|| "packaged backend token is unavailable".to_string())?;
+            (port, api_token)
+        };
+        let body = body.unwrap_or_default();
+        let mut stream = TcpStream::connect_timeout(
+            &SocketAddr::from(([127, 0, 0, 1], port)),
+            Duration::from_secs(2),
+        )
+        .map_err(|error| format!("failed to connect to packaged backend: {error}"))?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .map_err(|error| format!("failed to configure backend read timeout: {error}"))?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .map_err(|error| format!("failed to configure backend write timeout: {error}"))?;
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-Meeting-Copilot-Token: {api_token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len(),
+        );
+        stream
+            .write_all(request.as_bytes())
+            .and_then(|_| stream.write_all(body))
+            .map_err(|error| format!("failed to send provider config to backend: {error}"))?;
+        let mut response = Vec::with_capacity(4096);
+        stream
+            .read_to_end(&mut response)
+            .map_err(|error| format!("failed to read provider config response: {error}"))?;
+        if response.starts_with(b"HTTP/1.1 200") || response.starts_with(b"HTTP/1.0 200") {
+            Ok(())
+        } else {
+            let status = String::from_utf8_lossy(
+                response
+                    .split(|byte| *byte == b'\n')
+                    .next()
+                    .unwrap_or_default(),
+            );
+            Err(format!(
+                "packaged backend rejected provider config: {}",
+                status.trim()
+            ))
+        }
     }
 
     pub fn stop(&self) -> BackendRuntimeSnapshot {
@@ -622,5 +712,67 @@ mod tests {
         assert!(supervisor
             .native_microphone_connection("../private")
             .is_err());
+    }
+
+    #[test]
+    fn provider_config_is_sent_only_to_authenticated_packaged_backend() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let receiver = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 1024];
+                let count = stream.read(&mut chunk).unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..count]);
+                let Some(header_end) = request.windows(4).position(|value| value == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("Content-Length: ")
+                            .and_then(|value| value.parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let supervisor = BackendSupervisor::default();
+        {
+            let mut state = supervisor.inner.lock().unwrap();
+            state.snapshot.port = Some(port);
+            state.snapshot.base_url = Some(format!("http://127.0.0.1:{port}"));
+            state.api_token = Some("b".repeat(64));
+        }
+        supervisor
+            .configure_provider(&RuntimeProviderConfig {
+                base_url: "https://relay.example".to_string(),
+                api_key: "sk-test-only-secret".to_string(),
+                model: "test-model".to_string(),
+                provider_label: "openai_compatible_gateway".to_string(),
+            })
+            .unwrap();
+        let request = receiver.join().unwrap();
+        assert!(request.starts_with("PUT /desktop/provider/config HTTP/1.1"));
+        assert!(request.contains(&format!("X-Meeting-Copilot-Token: {}", "b".repeat(64))));
+        assert!(request.contains("sk-test-only-secret"));
+        assert!(!serde_json::to_string(&supervisor.snapshot())
+            .unwrap()
+            .contains("sk-test-only-secret"));
     }
 }

@@ -177,6 +177,234 @@
       "description": "Permission identifier",
       "oneOf": [
         {
+          "description": "Enables the asr_worker_cleanup command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-asr-worker-cleanup",
+          "markdownDescription": "Enables the asr_worker_cleanup command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the asr_worker_collect_events command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-asr-worker-collect-events",
+          "markdownDescription": "Enables the asr_worker_collect_events command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the asr_worker_health command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-asr-worker-health",
+          "markdownDescription": "Enables the asr_worker_health command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the asr_worker_prepare command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-asr-worker-prepare",
+          "markdownDescription": "Enables the asr_worker_prepare command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the asr_worker_start command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-asr-worker-start",
+          "markdownDescription": "Enables the asr_worker_start command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the asr_worker_stop command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-asr-worker-stop",
+          "markdownDescription": "Enables the asr_worker_stop command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the mic_adapter_delete_audio_chunks command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-mic-adapter-delete-audio-chunks",
+          "markdownDescription": "Enables the mic_adapter_delete_audio_chunks command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the mic_adapter_pause command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-mic-adapter-pause",
+          "markdownDescription": "Enables the mic_adapter_pause command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the mic_adapter_prepare command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-mic-adapter-prepare",
+          "markdownDescription": "Enables the mic_adapter_prepare command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the mic_adapter_resume command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-mic-adapter-resume",
+          "markdownDescription": "Enables the mic_adapter_resume command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the mic_adapter_start command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-mic-adapter-start",
+          "markdownDescription": "Enables the mic_adapter_start command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the mic_adapter_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-mic-adapter-status",
+          "markdownDescription": "Enables the mic_adapter_status command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the mic_adapter_stop command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-mic-adapter-stop",
+          "markdownDescription": "Enables the mic_adapter_stop command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the provider_config_clear command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-provider-config-clear",
+          "markdownDescription": "Enables the provider_config_clear command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the provider_config_save command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-provider-config-save",
+          "markdownDescription": "Enables the provider_config_save command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the provider_config_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-provider-config-status",
+          "markdownDescription": "Enables the provider_config_status command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the runtime_get_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-runtime-get-status",
+          "markdownDescription": "Enables the runtime_get_status command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the runtime_write_frontend_probe command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-runtime-write-frontend-probe",
+          "markdownDescription": "Enables the runtime_write_frontend_probe command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the session_prepare command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-session-prepare",
+          "markdownDescription": "Enables the session_prepare command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the asr_worker_cleanup command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-asr-worker-cleanup",
+          "markdownDescription": "Denies the asr_worker_cleanup command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the asr_worker_collect_events command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-asr-worker-collect-events",
+          "markdownDescription": "Denies the asr_worker_collect_events command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the asr_worker_health command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-asr-worker-health",
+          "markdownDescription": "Denies the asr_worker_health command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the asr_worker_prepare command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-asr-worker-prepare",
+          "markdownDescription": "Denies the asr_worker_prepare command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the asr_worker_start command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-asr-worker-start",
+          "markdownDescription": "Denies the asr_worker_start command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the asr_worker_stop command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-asr-worker-stop",
+          "markdownDescription": "Denies the asr_worker_stop command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the mic_adapter_delete_audio_chunks command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-mic-adapter-delete-audio-chunks",
+          "markdownDescription": "Denies the mic_adapter_delete_audio_chunks command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the mic_adapter_pause command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-mic-adapter-pause",
+          "markdownDescription": "Denies the mic_adapter_pause command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the mic_adapter_prepare command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-mic-adapter-prepare",
+          "markdownDescription": "Denies the mic_adapter_prepare command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the mic_adapter_resume command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-mic-adapter-resume",
+          "markdownDescription": "Denies the mic_adapter_resume command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the mic_adapter_start command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-mic-adapter-start",
+          "markdownDescription": "Denies the mic_adapter_start command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the mic_adapter_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-mic-adapter-status",
+          "markdownDescription": "Denies the mic_adapter_status command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the mic_adapter_stop command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-mic-adapter-stop",
+          "markdownDescription": "Denies the mic_adapter_stop command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the provider_config_clear command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-provider-config-clear",
+          "markdownDescription": "Denies the provider_config_clear command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the provider_config_save command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-provider-config-save",
+          "markdownDescription": "Denies the provider_config_save command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the provider_config_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-provider-config-status",
+          "markdownDescription": "Denies the provider_config_status command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the runtime_get_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-runtime-get-status",
+          "markdownDescription": "Denies the runtime_get_status command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the runtime_write_frontend_probe command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-runtime-write-frontend-probe",
+          "markdownDescription": "Denies the runtime_write_frontend_probe command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the session_prepare command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-session-prepare",
+          "markdownDescription": "Denies the session_prepare command without any pre-configured scope."
+        },
+        {
           "description": "Default core plugins set.\n#### This default permission set includes:\n\n- `core:path:default`\n- `core:event:default`\n- `core:window:default`\n- `core:webview:default`\n- `core:app:default`\n- `core:image:default`\n- `core:resources:default`\n- `core:menu:default`\n- `core:tray:default`",
           "type": "string",
           "const": "core:default",

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-mic-adapter-prepare"
+description = "Enables the mic_adapter_prepare command without any pre-configured scope."
+commands.allow = ["mic_adapter_prepare"]
+
+[[permission]]
+identifier = "deny-mic-adapter-prepare"
+description = "Denies the mic_adapter_prepare command without any pre-configured scope."
+commands.deny = ["mic_adapter_prepare"]

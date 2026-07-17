@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-runtime-write-frontend-probe"
+description = "Enables the runtime_write_frontend_probe command without any pre-configured scope."
+commands.allow = ["runtime_write_frontend_probe"]
+
+[[permission]]
+identifier = "deny-runtime-write-frontend-probe"
+description = "Denies the runtime_write_frontend_probe command without any pre-configured scope."
+commands.deny = ["runtime_write_frontend_probe"]

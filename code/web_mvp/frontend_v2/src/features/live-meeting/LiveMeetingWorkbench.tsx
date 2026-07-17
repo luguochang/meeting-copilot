@@ -1,4 +1,4 @@
-import { Gauge, LoaderCircle, Mic, Pause, Play, Radio, Square } from "lucide-react";
+import { ArrowLeft, Gauge, LoaderCircle, Mic, Pause, Play, Radio, Square } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { MeetingApi } from "../../api/client";
 import type { MeetingEventTransport } from "../../api/eventTransport";
@@ -11,6 +11,7 @@ import { NowRail } from "./NowRail";
 import { TranscriptPane } from "./TranscriptPane";
 import { MeetingHistory } from "../history/MeetingHistory";
 import { ReviewWorkspace } from "../review/ReviewWorkspace";
+import { ProviderSettingsControl } from "../settings/ProviderSettingsControl";
 import {
   type BrowserMicrophoneController,
   type BrowserMicrophoneState,
@@ -24,6 +25,7 @@ interface LiveMeetingWorkbenchProps {
   asrBaseUrl?: string;
   onCreateMeeting?: () => string;
   onOpenMeeting?: (meetingId: string) => void;
+  onBackToMeetings?: () => void;
   microphoneController?: BrowserMicrophoneController;
 }
 
@@ -82,6 +84,7 @@ export function LiveMeetingWorkbench({
   asrBaseUrl = "",
   onCreateMeeting,
   onOpenMeeting,
+  onBackToMeetings,
   microphoneController,
 }: LiveMeetingWorkbenchProps) {
   const { state, actions, transportKind } = useMeetingProjection(meetingId, api, transport);
@@ -147,14 +150,42 @@ export function LiveMeetingWorkbench({
             <span className="brand-name">Meeting Copilot</span>
             <h1>开始一场会议</h1>
           </div>
-          <button className="start-meeting-button" type="button" onClick={() => void startMeeting()}>
-            {microphone.state.phase === "requesting" ? <LoaderCircle className="spin" size={17} /> : <Mic size={17} />}
-            {microphone.state.phase === "requesting" ? "正在请求权限" : "开始会议"}
-          </button>
+          <div className="start-command-actions">
+            <ProviderSettingsControl />
+            <button className="start-meeting-button" type="button" onClick={() => void startMeeting()}>
+              {microphone.state.phase === "requesting" ? <LoaderCircle className="spin" size={17} /> : <Mic size={17} />}
+              {microphone.state.phase === "requesting" ? "正在请求权限" : "开始会议"}
+            </button>
+          </div>
           {microphone.state.error ? <p className="unbound-error">{microphone.state.error}</p> : null}
         </section>
         <MeetingHistory api={api} onOpenMeeting={onOpenMeeting ?? (() => undefined)} />
       </main>
+    );
+  }
+
+  const normalizedMeetingId = meetingId.trim();
+  const snapshotLoading = state.meetingId !== normalizedMeetingId || state.lastSyncedAtMs === null;
+  if (snapshotLoading) {
+    return (
+      <div className="workbench-shell">
+        <header className="app-header">
+          <div className="meeting-identity">
+            <span className="brand-mark" aria-hidden="true"><Radio size={18} /></span>
+            <div>
+              <span className="brand-name">Meeting Copilot</span>
+              <h1>会议状态加载中</h1>
+            </div>
+          </div>
+          <div className="header-actions">
+            <ProviderSettingsControl />
+          </div>
+        </header>
+        <main className="meeting-loading-state" role="status" aria-live="polite">
+          <LoaderCircle className="spin" size={22} />
+          <span>正在加载会议状态</span>
+        </main>
+      </div>
     );
   }
 
@@ -197,6 +228,13 @@ export function LiveMeetingWorkbench({
         </div>
 
         <div className="header-actions">
+          {meetingEnded && onBackToMeetings ? (
+            <button className="secondary-button" type="button" onClick={onBackToMeetings}>
+              <ArrowLeft size={16} />
+              返回会议列表
+            </button>
+          ) : null}
+          <ProviderSettingsControl />
           {canStartCapture ? (
             <button className="start-recording-button" type="button" onClick={() => void startMeeting()}>
               <Mic size={16} />

@@ -247,6 +247,41 @@ button:focus-visible,
   gap: 8px;
 }
 
+.provider-settings-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-width: 36px;
+  height: 36px;
+  padding: 0 10px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 650;
+  white-space: nowrap;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.provider-settings-trigger:hover {
+  color: var(--text);
+  background: var(--surface-subtle);
+  border-color: var(--border-strong);
+}
+
+.provider-settings-trigger--configured {
+  color: var(--accent-strong);
+  background: var(--accent-soft);
+  border-color: #b8dcd1;
+}
+
+.provider-settings-trigger--error {
+  color: var(--danger-strong);
+  background: var(--danger-soft);
+  border-color: #efcaca;
+}
+
 .icon-button {
   display: inline-grid;
   width: 36px;
@@ -329,6 +364,16 @@ button:focus-visible,
   min-width: 0;
   min-height: 0;
   background: var(--surface);
+}
+
+.meeting-loading-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: var(--text-muted);
+  font-size: 13px;
+  background: var(--surface-subtle);
 }
 
 .transcript-pane {
@@ -749,6 +794,125 @@ button:focus-visible,
   box-shadow: var(--shadow-drawer);
 }
 
+.provider-settings-dialog {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: min(520px, calc(100vw - 32px));
+  max-height: calc(100dvh - 40px);
+  padding: 20px;
+  overflow-y: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 18px 50px rgb(23 32 29 / 22%);
+  transform: translate(-50%, -50%);
+}
+
+.provider-settings-form {
+  display: grid;
+  gap: 15px;
+  padding-top: 18px;
+}
+
+.provider-settings-form label {
+  display: grid;
+  gap: 6px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.provider-settings-form input {
+  width: 100%;
+  height: 40px;
+  padding: 0 11px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+}
+
+.provider-settings-form input:focus {
+  border-color: var(--accent);
+  outline: 3px solid rgb(20 125 104 / 12%);
+}
+
+.credential-status,
+.provider-desktop-only,
+.provider-settings-actions,
+.provider-settings-actions > div,
+.primary-button,
+.danger-text-button {
+  display: flex;
+  align-items: center;
+}
+
+.credential-status {
+  gap: 7px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.provider-desktop-only {
+  gap: 10px;
+  min-height: 120px;
+  justify-content: center;
+  color: var(--text-muted);
+}
+
+.provider-desktop-only p {
+  margin: 0;
+  font-size: 13px;
+}
+
+.provider-settings-actions {
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 4px;
+}
+
+.provider-settings-actions > div {
+  gap: 8px;
+}
+
+.primary-button,
+.danger-text-button {
+  justify-content: center;
+  gap: 7px;
+  height: 36px;
+  padding: 0 13px;
+  font-size: 12px;
+  font-weight: 650;
+  border-radius: 6px;
+}
+
+.primary-button {
+  color: #ffffff;
+  background: var(--accent);
+  border: 1px solid var(--accent);
+}
+
+.primary-button:hover:not(:disabled) {
+  background: var(--accent-strong);
+}
+
+.danger-text-button {
+  color: var(--danger-strong);
+  background: transparent;
+  border: 1px solid transparent;
+}
+
+.danger-text-button:hover:not(:disabled) {
+  background: var(--danger-soft);
+}
+
+.inline-success {
+  margin: 0;
+  color: var(--accent-strong);
+  font-size: 12px;
+}
+
 .drawer-header {
   justify-content: space-between;
   gap: 16px;
@@ -942,6 +1106,13 @@ button:focus-visible,
 .start-command .start-meeting-button {
   min-width: 148px;
   margin: 0;
+}
+
+.start-command-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 .start-command .unbound-error {
@@ -1481,6 +1652,10 @@ button:focus-visible,
     gap: 3px;
   }
 
+  .header-actions .provider-settings-trigger span {
+    display: none;
+  }
+
   .end-meeting-button {
     min-width: 102px;
     height: 36px;
@@ -1551,8 +1726,13 @@ button:focus-visible,
   }
 
   .start-command .start-meeting-button {
-    grid-column: 1 / -1;
     width: 100%;
+  }
+
+  .start-command-actions {
+    grid-column: 1 / -1;
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
   }
 
   .history-row {
