@@ -1684,6 +1684,154 @@ class V2Persistence:
                 )
         return recording
 
+    def register_imported_recording(
+        self,
+        *,
+        meeting_id: str,
+        source_type: str,
+        relative_path: str,
+        sha256: str,
+        sample_rate_hz: int,
+        sample_count: int,
+        duration_ms: int,
+        file_size_bytes: int,
+        started_at_ms: int,
+        now_ms: int,
+    ) -> dict[str, Any]:
+        """Register an already assembled file as a durable V2 recording."""
+
+        meeting_id = _required(meeting_id, "meeting_id")
+        source_type = _required(source_type, "source_type")
+        relative_path = _required(relative_path, "relative_path")
+        sha256 = _required(sha256, "sha256")
+        sample_rate_hz = int(sample_rate_hz)
+        sample_count = int(sample_count)
+        duration_ms = int(duration_ms)
+        file_size_bytes = int(file_size_bytes)
+        started_at_ms = max(0, int(started_at_ms))
+        now_ms = max(0, int(now_ms))
+        if min(sample_rate_hz, sample_count, duration_ms, file_size_bytes) <= 0:
+            raise ValueError("imported recording dimensions must be positive")
+
+        chunk = {
+            "chunk_seq": 0,
+            "name": Path(relative_path).name,
+            "sample_count": sample_count,
+            "file_size_bytes": file_size_bytes,
+            "sha256": sha256,
+        }
+        journal_sha256 = audio_chunk_journal_sha256([chunk])
+        with self._write_transaction():
+            self._raise_if_tombstoned_locked(meeting_id)
+            meeting = self._conn.execute(
+                "SELECT * FROM meetings WHERE id = ?",
+                (meeting_id,),
+            ).fetchone()
+            if meeting is None:
+                raise KeyError(f"meeting not found: {meeting_id}")
+            existing_chunk = self._conn.execute(
+                "SELECT * FROM audio_chunks WHERE meeting_id = ? AND track = 'microphone' "
+                "AND epoch = 0 AND chunk_seq = 0",
+                (meeting_id,),
+            ).fetchone()
+            if existing_chunk is None:
+                self._conn.execute(
+                    "INSERT INTO audio_chunks ("
+                    "meeting_id, track, epoch, chunk_seq, relative_path, sha256, "
+                    "sample_rate_hz, sample_count, duration_ms, file_size_bytes, status, created_at_ms"
+                    ") VALUES (?, 'microphone', 0, 0, ?, ?, ?, ?, ?, ?, 'committed', ?)",
+                    (
+                        meeting_id,
+                        relative_path,
+                        sha256,
+                        sample_rate_hz,
+                        sample_count,
+                        duration_ms,
+                        file_size_bytes,
+                        now_ms,
+                    ),
+                )
+            else:
+                expected = {
+                    "relative_path": relative_path,
+                    "sha256": sha256,
+                    "sample_rate_hz": sample_rate_hz,
+                    "sample_count": sample_count,
+                    "duration_ms": duration_ms,
+                    "file_size_bytes": file_size_bytes,
+                    "status": "committed",
+                }
+                conflicts = {
+                    key: (existing_chunk[key], value)
+                    for key, value in expected.items()
+                    if existing_chunk[key] != value
+                }
+                if conflicts:
+                    raise ValueError(f"imported recording was retried with conflicting content: {conflicts}")
+
+            existing_recording = self._conn.execute(
+                "SELECT * FROM recording_sessions WHERE meeting_id = ? AND track = 'microphone' AND epoch = 0",
+                (meeting_id,),
+            ).fetchone()
+            if existing_recording is None:
+                self._conn.execute(
+                    "INSERT INTO recording_sessions ("
+                    "meeting_id, track, epoch, source_type, capture_generation, status, sample_rate_hz, "
+                    "chunk_count, sample_count, duration_ms, file_size_bytes, lease_owner, lease_until_ms, "
+                    "journal_sha256, output_relative_path, output_sha256, output_file_size_bytes, "
+                    "started_at_ms, sealed_at_ms, completed_at_ms, updated_at_ms"
+                    ") VALUES (?, 'microphone', 0, ?, 1, 'ready', ?, 1, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        meeting_id,
+                        source_type,
+                        sample_rate_hz,
+                        sample_count,
+                        duration_ms,
+                        file_size_bytes,
+                        journal_sha256,
+                        relative_path,
+                        sha256,
+                        file_size_bytes,
+                        started_at_ms,
+                        now_ms,
+                        now_ms,
+                        now_ms,
+                    ),
+                )
+            else:
+                if existing_recording["status"] != "ready" or existing_recording["output_sha256"] != sha256:
+                    raise ValueError("imported recording was retried with conflicting recording state")
+
+            event_key = f"recording.imported:{sha256}"
+            if self._conn.execute(
+                "SELECT 1 FROM meeting_events WHERE meeting_id = ? AND idempotency_key = ?",
+                (meeting_id, event_key),
+            ).fetchone() is None:
+                self._append_event_locked(
+                    meeting_id=meeting_id,
+                    event_type="recording.imported",
+                    aggregate_type="recording_session",
+                    aggregate_id="microphone:0",
+                    occurred_at_ms=now_ms,
+                    idempotency_key=event_key,
+                    payload={
+                        "meeting_id": meeting_id,
+                        "track": "microphone",
+                        "epoch": 0,
+                        "source_type": source_type,
+                        "status": "ready",
+                        "relative_path": relative_path,
+                        "sha256": sha256,
+                        "duration_ms": duration_ms,
+                    },
+                    correlation_id=meeting_id,
+                )
+            row = self._conn.execute(
+                "SELECT * FROM recording_sessions WHERE meeting_id = ? AND track = 'microphone' AND epoch = 0",
+                (meeting_id,),
+            ).fetchone()
+        return self._recording_session_dict(row)
+
     def heartbeat_recording(
         self,
         *,

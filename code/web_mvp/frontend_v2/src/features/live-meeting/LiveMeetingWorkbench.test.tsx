@@ -83,6 +83,7 @@ function realSnapshot(): MeetingSnapshot {
 function dependencies() {
   const api: MeetingApi = {
     createMeeting: vi.fn().mockResolvedValue(undefined),
+    importRecording: vi.fn().mockResolvedValue({ meetingId: "imported-meeting" }),
     deleteMeeting: vi.fn().mockResolvedValue(undefined),
     listMeetings: vi.fn().mockResolvedValue({ meetings: [] }),
     getSnapshot: vi.fn().mockResolvedValue(realSnapshot()),
@@ -144,6 +145,51 @@ function microphoneController(
 }
 
 describe("LiveMeetingWorkbench", () => {
+  it("exposes recording import from the meeting list and opens the imported review", async () => {
+    const user = userEvent.setup();
+    const { api, transport } = dependencies();
+    const onOpenMeeting = vi.fn();
+    render(
+      <LiveMeetingWorkbench
+        meetingId={null}
+        api={api}
+        transport={transport}
+        onOpenMeeting={onOpenMeeting}
+      />,
+    );
+
+    const input = screen.getByLabelText("选择要导入的录音文件") as HTMLInputElement;
+    const file = new File(["audio"], "review.wav", { type: "audio/wav" });
+    await user.upload(input, file);
+
+    expect(api.importRecording).toHaveBeenCalledWith(file);
+    expect(onOpenMeeting).toHaveBeenCalledWith("imported-meeting");
+  });
+
+  it("shows an import failure on the meeting list instead of hiding it in a toast", async () => {
+    const user = userEvent.setup();
+    const { api, transport } = dependencies();
+    vi.mocked(api.importRecording).mockRejectedValue(new Error("本地转写不可用"));
+    render(<LiveMeetingWorkbench meetingId={null} api={api} transport={transport} />);
+
+    const input = screen.getByLabelText("选择要导入的录音文件") as HTMLInputElement;
+    await user.upload(input, new File(["audio"], "broken.wav", { type: "audio/wav" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("本地转写不可用");
+  });
+
+  it("rejects an empty import before making a network request", async () => {
+    const user = userEvent.setup();
+    const { api, transport } = dependencies();
+    render(<LiveMeetingWorkbench meetingId={null} api={api} transport={transport} />);
+
+    const input = screen.getByLabelText("选择要导入的录音文件") as HTMLInputElement;
+    await user.upload(input, new File([], "empty.wav", { type: "audio/wav" }));
+
+    expect(screen.getByRole("alert")).toHaveTextContent("录音文件为空");
+    expect(api.importRecording).not.toHaveBeenCalled();
+  });
+
   it("creates a meeting and starts the real microphone from the empty state", async () => {
     const user = userEvent.setup();
     const { api, transport } = dependencies();
@@ -173,6 +219,26 @@ describe("LiveMeetingWorkbench", () => {
     expect(api.createMeeting).toHaveBeenCalledWith("rec_new_meeting");
     expect(microphone.start).toHaveBeenCalledWith("rec_new_meeting");
     expect(order).toEqual(["meeting-created", "microphone-started"]);
+  });
+
+  it("returns to the meeting list when creating a new meeting fails", async () => {
+    const user = userEvent.setup();
+    const { api, transport } = dependencies();
+    const onBackToMeetings = vi.fn();
+    vi.mocked(api.createMeeting).mockRejectedValue(new Error("会议存储不可用"));
+    render(
+      <LiveMeetingWorkbench
+        meetingId={null}
+        api={api}
+        transport={transport}
+        onCreateMeeting={() => "failed-meeting"}
+        onBackToMeetings={onBackToMeetings}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "开始会议" }));
+
+    await waitFor(() => expect(onBackToMeetings).toHaveBeenCalledOnce());
   });
 
   it("keeps capture controls hidden until the initial meeting snapshot arrives", async () => {

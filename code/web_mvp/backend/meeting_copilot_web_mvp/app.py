@@ -1238,6 +1238,190 @@ def create_app(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {"meeting": meeting, "storage_preflight": preflight.to_dict()}
 
+    @app.post("/v2/meetings/import-audio", status_code=201)
+    async def import_v2_meeting_audio(file: UploadFile = File(...)) -> dict[str, Any]:
+        """Import one local recording into the canonical V2 meeting pipeline."""
+
+        persistence = _require_v2_persistence()
+        if data_dir_path is None:
+            raise HTTPException(status_code=503, detail="persistent data directory is unavailable")
+        if not batch_transcribe.is_available():
+            raise HTTPException(status_code=422, detail="FunASR offline batch path is not ready")
+
+        import os as _os
+        import tempfile
+
+        suffix = Path(file.filename or "").suffix.lower() or ".wav"
+        fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+        _os.close(fd)
+        tmp = Path(tmp_path)
+        meeting_id = "import_" + uuid.uuid4().hex[:20]
+        created_meeting = False
+
+        async def rollback_meeting() -> None:
+            if not created_meeting:
+                return
+            deletion_job = await _begin_deletion_fence(meeting_id)
+            await _complete_deletion_facts(deletion_job)
+
+        try:
+            uploaded_bytes = 0
+            with tmp.open("wb") as uploaded_file:
+                while chunk := await file.read(1024 * 1024):
+                    uploaded_bytes += len(chunk)
+                    if uploaded_bytes > 500 * 1024 * 1024:
+                        raise HTTPException(
+                            status_code=413,
+                            detail="文件超过 500MB 限制，请缩短录音或分段导入",
+                        )
+                    uploaded_file.write(chunk)
+                uploaded_file.flush()
+                _os.fsync(uploaded_file.fileno())
+
+            asr_report = await asyncio.to_thread(
+                batch_transcribe.transcribe_file_report,
+                tmp,
+                preserve_preprocessed=True,
+            )
+            raw_text = str(asr_report.get("text") or "").strip()
+            normalized_text = _normalize_text(raw_text)
+            canonical_path = Path(str(asr_report.get("normalized_audio_path") or tmp))
+            if not canonical_path.exists():
+                canonical_path = await asyncio.to_thread(batch_transcribe.ensure_wav_16k_mono, tmp)
+            if canonical_path.suffix.lower() != ".wav":
+                raise ValueError("导入音频无法转换为标准 WAV")
+
+            created = persistence.create_meeting(
+                meeting_id=meeting_id,
+                title=Path(file.filename or "录音导入").stem[:200] or "录音导入",
+                now_ms=time.time_ns() // 1_000_000,
+            )
+            created_meeting = True
+            source_audio_asset = await asyncio.to_thread(
+                audio_assets.persist_uploaded_audio_asset_from_path,
+                data_dir=data_dir_path,
+                session_id=meeting_id,
+                source_type="imported_original",
+                filename=file.filename or "recording",
+                source_path=tmp,
+            )
+            audio_asset = await asyncio.to_thread(
+                audio_assets.persist_imported_wav_asset_from_path,
+                data_dir=data_dir_path,
+                session_id=meeting_id,
+                source_path=canonical_path,
+                original_filename=file.filename or "recording",
+            )
+            persistence.register_imported_recording(
+                meeting_id=meeting_id,
+                source_type="imported_file",
+                relative_path=str(audio_asset["relative_path"]),
+                sha256=str(audio_asset["sha256"]),
+                sample_rate_hz=int(audio_asset["sample_rate_hz"] or 0),
+                sample_count=int(
+                    round(
+                        int(audio_asset["duration_ms"] or 0)
+                        * int(audio_asset["sample_rate_hz"] or 0)
+                        / 1_000
+                    )
+                ),
+                duration_ms=int(audio_asset["duration_ms"] or 0),
+                file_size_bytes=int(audio_asset["file_size_bytes"] or 0),
+                started_at_ms=int(created["started_at_ms"] or time.time_ns() // 1_000_000),
+                now_ms=time.time_ns() // 1_000_000,
+            )
+
+            streaming_events = [
+                {
+                    "event_type": "final",
+                    "segment_id": "import_seg_0001",
+                    "text": normalized_text,
+                    "start_ms": 0,
+                    "end_ms": int(audio_asset["duration_ms"] or 0),
+                    "received_at_ms": 0,
+                    "confidence": 0.9,
+                }
+            ] if normalized_text else []
+            live_events = build_asr_live_events(
+                session_id=meeting_id,
+                provider="local_funasr_batch",
+                streaming_events=streaming_events,
+                is_mock=False,
+            )
+            semantic_quality = evaluate_semantic_quality(normalized_text) if normalized_text else {
+                "status": "not_evaluated",
+                "blocker": None,
+                "quality_failure_reasons": ["transcript_empty"],
+            }
+            asr_live_repo.create(
+                {
+                    "session_id": meeting_id,
+                    "provider": "local_funasr_batch",
+                    "provider_mode": "real",
+                    "is_mock": False,
+                    "asr_fallback_used": False,
+                    "degradation_reasons": (
+                        [ASR_SEMANTIC_QUALITY_BLOCKER]
+                        if semantic_quality.get("blocker") == ASR_SEMANTIC_QUALITY_BLOCKER
+                        else []
+                    ),
+                    "asr_semantic_quality": semantic_quality,
+                    "post_meeting_asr_profile": _post_meeting_asr_profile(asr_report),
+                    "audio_source": "uploaded_file",
+                    "input_source": "uploaded_file",
+                    "audio": audio_asset,
+                    "source": ASR_LIVE_SOURCE,
+                    "trace_kind": ASR_LIVE_TRACE_KIND,
+                    "events": live_events,
+                }
+            )
+            if normalized_text:
+                _commit_v2_final(
+                    meeting_id,
+                    {
+                        "segment_id": "import_seg_0001",
+                        "text": raw_text,
+                        "normalized_text": normalized_text,
+                        "start_ms": 0,
+                        "end_ms": int(audio_asset["duration_ms"] or 0),
+                        "received_at_ms": time.time_ns() // 1_000_000,
+                    },
+                )
+            ended = persistence.end_meeting(
+                meeting_id=meeting_id,
+                now_ms=time.time_ns() // 1_000_000,
+                correlation_id=meeting_id,
+            )
+            executor = getattr(app.state, "v2_executor", None)
+            if executor is not None:
+                executor.wake()
+            return {
+                "meeting": ended,
+                "meeting_id": meeting_id,
+                "source": "uploaded_file",
+                "provider": "local_funasr_batch",
+                "raw_transcript": raw_text,
+                "transcript": normalized_text,
+                "audio": audio_asset,
+                "source_audio": source_audio_asset,
+                "snapshot": persistence.get_snapshot(meeting_id),
+                "jobs": persistence.list_jobs(meeting_id=meeting_id),
+            }
+        except HTTPException:
+            await rollback_meeting()
+            raise
+        except subprocess.TimeoutExpired as exc:
+            await rollback_meeting()
+            raise HTTPException(status_code=408, detail="录音文件识别超时，请尝试较短的录音") from exc
+        except (RuntimeError, ValueError, OSError) as exc:
+            await rollback_meeting()
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        finally:
+            tmp.unlink(missing_ok=True)
+            normalized_path = tmp.with_suffix(".16k.wav")
+            if normalized_path != tmp:
+                normalized_path.unlink(missing_ok=True)
+
     @app.get("/v2/meetings")
     def list_v2_meetings(limit: int = 100) -> dict[str, Any]:
         try:
