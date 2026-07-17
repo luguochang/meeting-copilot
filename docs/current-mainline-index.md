@@ -38,6 +38,7 @@
 - 桌面 AI 配置已采用 Mac Keychain / Windows Credential Manager；磁盘只保存 base URL、model 和 provider label。packaged backend 运行时配置不继承 `LLM_GATEWAY_*`，远端只允许 HTTPS，保存/清除带回滚，API Key 不回显。UI 保存后只显示“AI 已配置”，仅 probe 成功后显示“AI 已连接”。
 - 同一新包的 no-cost AI 主链已产生 FunASR final、流式建议 draft/delta/commit、transcript correction、14.842 秒录音导出、会议结束以及 minutes/approach/index。受控样本原始文字仍有中英混杂和错字，因此该证据只证明工程链路，不证明中文 ASR 生产质量。
 - V2 已增加首次 snapshot 中性加载态、复盘返回会议列表/popstate 同步，并修复 `_dedupe_strings` 只返回第一个原因的问题。当前尚未把“用户在真实打包页面点击开始录音 -> 真实 mic -> relay -> UI 建议/修正 -> 结束复盘”压成同一次自动化证据，不能把独立通过的 IPC prepare、native helper 和 backend AI smoke 拼接成 UI E2E。
+- DEC-405 修复 V2 开始会议失败的一致性缺陷：新 meeting 创建成功但麦克风/native helper 启动失败时，前端先调用 V2 delete 完成 tombstone/资产回滚，再返回列表；create 本身失败不误删，已存在会议启动失败不删除既有资产。当前 clean browser failure-path 复测为历史 0 行、API meeting 列表为空、console warn/error 0；frontend 全量 `55 passed`。该项不替代 packaged 真实麦克风 UI 证据。
 - 新 `.app` 的 UI 点击运行已经准备并启动，但 macOS 自动化接口返回 Mac locked；测试 app/backend/local provider 已全部清理。下一次只在用户解锁后继续该单一门禁，不重复 runtime、provider 或 ASR 基础横评。
 - `/workbench` 已切换为 React/TypeScript V2 权威入口；`/workbench-v2` 是别名，`/workbench-legacy` 只保留旧页面。
 - 正式 correction/suggestion 由后台 durable executor 在 final 同一 SQLite 事务入队；浏览器不触发付费 AI。建议通过 SSE 流式展示草稿并使用 commit barrier，只有显式 `VITE_EVENT_TRANSPORT=poll` 才回退轮询。

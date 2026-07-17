@@ -93,3 +93,19 @@ P2 用户点击后的 native mic + UI 完整同场会议：No-Go，等待解锁 
 本轮测试结果：后端 V2 app/persistence/recording `56 passed`（含新增导入和 durable post-job 集成）；前端完整 `54 passed`，API/workbench focused `23 passed`；typecheck/build/Ruff 通过。
 
 本轮仍不改变总体发布结论：导入闭环已实现，但真实 packaged UI 麦克风点击链路仍待 Mac 解锁，Windows、签名、公证和中文自然多人质量仍不是本轮假装完成的内容。
+
+## 2026-07-17 后续主线修复：麦克风启动失败回滚
+
+当前 clean worktree 在独立端口 `8770` 的页面自测发现：V2 首页点击开始会议后，如果麦克风权限请求超时，后端已经创建的 meeting 会残留为“进行中 / 0 段文字”。这不是边界测试，而是开始会议主流程的数据一致性缺陷。
+
+已修复为：
+
+- 新会议只有在 meeting 创建成功后才标记为可回滚。
+- 采集启动失败时调用 V2 delete 完成 tombstone/资产清理，再返回会议列表。
+- meeting 创建本身失败时不调用无意义的 delete。
+- 回滚失败时同时展示原始采集错误和清理错误。
+- 已存在会议重新开始录音失败时不自动删除既有会议资产。
+
+验证结果：frontend focused `18 passed`、frontend 全量 `55 passed`、typecheck、ESLint、production build、`git diff --check` 通过。浏览器真实失败路径复测中，权限超时后 URL 返回 `/workbench`、历史行数为 0、`GET /v2/meetings` 为空、console warn/error 为 0。
+
+该修复关闭“启动失败留下幽灵会议”的缺陷；它不代表真实麦克风成功，也不改变 packaged UI 仍等待 Mac 解锁的 No-Go 结论。

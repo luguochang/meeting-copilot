@@ -25683,3 +25683,35 @@ Tauri 启动 bundled backend 后会把主 WebView 导航到随机 `http://127.0.
 - packaged IPC probe 只执行 `mic_adapter_prepare`。先前真实 native helper 证据证明实际采音，但二者不能拼接冒充“用户点击 UI 后同一场完整 E2E”。
 - 本轮已启动新 `.app` 和本地 fake provider 准备执行真实 UI 点击，但 Computer Use 明确返回 Mac locked；测试 app、backend 和 provider 随即全部清理，无残留进程。不得绕过锁屏，解锁后的下一次运行继续此门禁。
 - system audio、packaged CSP、签名/公证/staple、separate clean Mac、模型与二进制再分发授权仍未完成。当前是 Mac Internal Alpha candidate，不是公开发布包。
+
+# DEC-405: 麦克风启动失败必须回滚新建会议，禁止留下进行中的空会话
+
+时间：2026-07-17
+
+状态：Accepted / Implemented / Browser failure-path E2E Go / Packaged real mic UI still No-Go
+
+## 问题与真实复现
+
+1. 使用当前 clean worktree 的独立 backend `http://127.0.0.1:8770` 打开 V2 首页，点击“开始会议”。
+2. 页面先执行 `POST /v2/meetings`，随后请求麦克风权限；in-app browser 的权限请求在 15 秒后超时。
+3. 旧行为只把路由切回会议列表，没有删除已创建的 meeting，历史中残留“进行中 / 0 段文字”的空会话。这会污染历史、误导用户，并使一次失败的启动看起来像仍在录音。
+
+## 决策与实现
+
+1. `startMeeting()` 显式区分“会议是否已持久化”和“采集是否已启动”。
+2. 从会议列表发起的新会议，如果 `createMeeting` 成功但麦克风/native helper 启动失败，前端必须先调用 V2 `deleteMeeting` 完成 tombstone 与本地资产清理，再返回会议列表并保留原始启动错误提示。
+3. 如果 `createMeeting` 本身失败，只返回列表，不调用删除不存在的 meeting。
+4. 如果回滚删除失败，必须同时展示采集错误和清理错误，不得隐藏残留风险。
+5. 已存在会议中的“开始录音”失败不自动删除会议，因为它可能包含此前已保存的文字、录音或复盘资产。
+
+## TDD 与页面证据
+
+- 新增 `rolls back a newly created meeting when microphone startup fails`，锁定 `create -> microphone failure -> delete -> back to list` 顺序和用户可见错误。
+- frontend focused：`18 passed`；frontend 全量：`55 passed`；typecheck、ESLint、production build 和 `git diff --check` 通过。
+- 页面复测：权限超时后 URL 为 `/workbench`，`.history-row=0`，`GET /v2/meetings` 返回空列表，horizontal overflow=false，浏览器 warn/error 为 0。
+- 该证据验证 browser failure path 和数据回滚，不等于真实麦克风成功，不关闭 packaged native mic UI 门禁。
+
+## 成本与隐私
+
+- backend 使用 `provider_mode=safe`，没有读取历史中转站密钥、`configs/local` 或用户私有录音；远程 ASR/LLM 调用为 0，新增费用为 0。
+- 测试使用独立 `artifacts/tmp/current-clean-8770-data`，没有修改 8767/8768/8769 的既有用户进程或数据。

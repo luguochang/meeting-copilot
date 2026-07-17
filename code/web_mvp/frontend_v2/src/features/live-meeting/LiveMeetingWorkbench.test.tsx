@@ -241,6 +241,33 @@ describe("LiveMeetingWorkbench", () => {
     await waitFor(() => expect(onBackToMeetings).toHaveBeenCalledOnce());
   });
 
+  it("rolls back a newly created meeting when microphone startup fails", async () => {
+    const user = userEvent.setup();
+    const { api, transport } = dependencies();
+    const microphone = microphoneController();
+    const onBackToMeetings = vi.fn();
+    vi.mocked(microphone.start).mockRejectedValue(new Error("麦克风权限请求超时"));
+
+    render(
+      <LiveMeetingWorkbench
+        meetingId={null}
+        api={api}
+        transport={transport}
+        microphoneController={microphone}
+        onCreateMeeting={() => "rec_mic_timeout"}
+        onBackToMeetings={onBackToMeetings}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "开始会议" }));
+
+    await waitFor(() => {
+      expect(api.deleteMeeting).toHaveBeenCalledWith("rec_mic_timeout");
+      expect(onBackToMeetings).toHaveBeenCalledOnce();
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent("麦克风权限请求超时");
+  });
+
   it("keeps capture controls hidden until the initial meeting snapshot arrives", async () => {
     const { api, transport } = dependencies();
     let resolveSnapshot: ((snapshot: MeetingSnapshot) => void) | undefined;
