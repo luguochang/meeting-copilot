@@ -1,6 +1,6 @@
 # Meeting Copilot Desktop Tauri Shell
 
-## Current Status: 2026-07-16
+## Current Status: 2026-07-17
 
 The historical PCWEB scaffold notes below are retained for traceability. The current
 implementation has moved beyond the original no-op boundary:
@@ -17,6 +17,20 @@ implementation has moved beyond the original no-op boundary:
   `getUserMedia` path for ordinary browser/debug external-backend runs.
 - Backend recording, transcript projection, correction/suggestion jobs and review remain
   the single business pipeline; the native helper is only an input adapter.
+- `ProviderConfigSupervisor` stores API Keys in Mac Keychain or Windows Credential
+  Manager. Disk metadata contains only the relay URL, model and provider label.
+- `AppManifest` generates command-level permissions. At runtime, Tauri grants them only
+  to `main` at the exact random `http://127.0.0.1:<port>/*` origin before navigation.
+- The actual packaged React WebView has invoked runtime status, provider status and native
+  microphone prepare through Tauri IPC. The probe does not capture audio or bypass consent.
+
+Latest internal evidence:
+
+- app: `artifacts/tmp/tauri_runtime_package/phase3-ipc-tauri-20260717-r1/evidence.json`
+- packaged React IPC: `artifacts/tmp/packaged_tauri_ipc_smoke/phase3-packaged-tauri-ipc-20260717-r1/evidence.json`
+- packaged local AI mainline: `artifacts/tmp/packaged_ai_mainline_smoke/phase3-packaged-ai-mainline-20260717-r2/evidence.json`
+
+These artifacts are unsigned and unnotarized. They are not public-release packages.
 
 The implementation evidence is recorded in `docs/decision-log.md` under `DEC-402` and the
 real packaged helper result under `DEC-403`. The latest helper captures 4,800-sample frames

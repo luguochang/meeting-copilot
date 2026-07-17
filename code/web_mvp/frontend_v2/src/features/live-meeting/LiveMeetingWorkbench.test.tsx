@@ -175,6 +175,32 @@ describe("LiveMeetingWorkbench", () => {
     expect(order).toEqual(["meeting-created", "microphone-started"]);
   });
 
+  it("keeps capture controls hidden until the initial meeting snapshot arrives", async () => {
+    const { api, transport } = dependencies();
+    let resolveSnapshot: ((snapshot: MeetingSnapshot) => void) | undefined;
+    vi.mocked(api.getSnapshot).mockImplementation(
+      () => new Promise((resolve) => {
+        resolveSnapshot = resolve;
+      }),
+    );
+    render(
+      <LiveMeetingWorkbench
+        meetingId="meeting-1"
+        api={api}
+        transport={transport}
+        microphoneController={microphoneController({ phase: "recording" })}
+      />,
+    );
+
+    expect(screen.getByRole("status")).toHaveTextContent("正在加载会议状态");
+    expect(screen.queryByRole("button", { name: "开始录音" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "暂停录音" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "结束并整理" })).not.toBeInTheDocument();
+
+    resolveSnapshot?.(realSnapshot());
+    expect(await screen.findByText("支付服务上线安排")).toBeVisible();
+  });
+
   it("shows the complete live projection and exactly one end-meeting command", async () => {
     const { api, transport } = dependencies();
     render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} />);
@@ -382,6 +408,7 @@ describe("LiveMeetingWorkbench", () => {
   it("shows the four-tab review and saved recording after meeting end", async () => {
     const user = userEvent.setup();
     const { api, transport } = dependencies();
+    const onBackToMeetings = vi.fn();
     vi.mocked(api.getSnapshot).mockResolvedValue({
       ...realSnapshot(),
       activePartial: null,
@@ -403,7 +430,14 @@ describe("LiveMeetingWorkbench", () => {
       },
     });
 
-    render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} />);
+    render(
+      <LiveMeetingWorkbench
+        meetingId="meeting-1"
+        api={api}
+        transport={transport}
+        onBackToMeetings={onBackToMeetings}
+      />,
+    );
 
     expect(await screen.findByRole("tab", { name: "复盘" })).toBeVisible();
     expect(screen.getByRole("heading", { level: 1, name: "会议复盘" })).toBeVisible();
@@ -416,6 +450,10 @@ describe("LiveMeetingWorkbench", () => {
     expect(screen.getByText(/确认灰度发布/)).toBeVisible();
     expect(screen.getByRole("list")).toHaveTextContent("张三跟进");
     expect(screen.queryByRole("button", { name: "结束并整理" })).not.toBeInTheDocument();
+
+    await screen.findByRole("button", { name: "返回会议列表" });
+    await user.click(screen.getByRole("button", { name: "返回会议列表" }));
+    expect(onBackToMeetings).toHaveBeenCalledOnce();
 
     await user.click(screen.getByRole("tab", { name: "会议文字" }));
     await user.click(screen.getByRole("button", { name: /在录音中定位到/ }));

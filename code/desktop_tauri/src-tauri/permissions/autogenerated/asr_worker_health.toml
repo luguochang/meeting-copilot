@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-asr-worker-health"
+description = "Enables the asr_worker_health command without any pre-configured scope."
+commands.allow = ["asr_worker_health"]
+
+[[permission]]
+identifier = "deny-asr-worker-health"
+description = "Denies the asr_worker_health command without any pre-configured scope."
+commands.deny = ["asr_worker_health"]

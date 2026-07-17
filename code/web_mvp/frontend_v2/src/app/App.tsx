@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { HttpMeetingApi } from "../api/client";
 import { PollingEventTransport, SseEventTransport } from "../api/eventTransport";
 import { LiveMeetingWorkbench } from "../features/live-meeting/LiveMeetingWorkbench";
@@ -14,6 +14,12 @@ export function App() {
         : new SseEventTransport(import.meta.env.VITE_API_BASE_URL ?? ""),
     [api],
   );
+
+  useEffect(() => {
+    const handlePopState = () => setMeetingId(resolveMeetingId(window.location.search));
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, []);
 
   const createMeeting = useCallback(() => {
     const nextMeetingId = createMeetingId();
@@ -33,6 +39,13 @@ export function App() {
     setMeetingId(nextMeetingId);
   }, []);
 
+  const returnToMeetingList = useCallback(() => {
+    const url = new URL(window.location.href);
+    for (const alias of ["meeting_id", "meeting", "session_id", "session"]) url.searchParams.delete(alias);
+    window.history.replaceState(window.history.state, "", url);
+    setMeetingId(null);
+  }, []);
+
   return (
     <LiveMeetingWorkbench
       meetingId={meetingId}
@@ -41,6 +54,7 @@ export function App() {
       asrBaseUrl={import.meta.env.VITE_API_BASE_URL ?? ""}
       onCreateMeeting={createMeeting}
       onOpenMeeting={openMeeting}
+      onBackToMeetings={returnToMeetingList}
     />
   );
 }

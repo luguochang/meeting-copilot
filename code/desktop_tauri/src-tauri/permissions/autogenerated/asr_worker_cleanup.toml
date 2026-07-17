@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-asr-worker-cleanup"
+description = "Enables the asr_worker_cleanup command without any pre-configured scope."
+commands.allow = ["asr_worker_cleanup"]
+
+[[permission]]
+identifier = "deny-asr-worker-cleanup"
+description = "Denies the asr_worker_cleanup command without any pre-configured scope."
+commands.deny = ["asr_worker_cleanup"]

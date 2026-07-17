@@ -23,7 +23,7 @@ from fastapi import FastAPI, HTTPException, Request, Response, UploadFile, File,
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 
 from meeting_copilot_web_mvp.logging_config import (
     ManagedRotatingLogStream,
@@ -471,6 +471,19 @@ class SettingsPayload(BaseModel):
     asr: AsrSettings = Field(default_factory=AsrSettings)
     suggestions: SuggestionSettings = Field(default_factory=SuggestionSettings)
     budget: BudgetSettings = Field(default_factory=BudgetSettings)
+
+
+class DesktopProviderConfigRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    base_url: str = Field(min_length=8, max_length=2_048)
+    api_key: SecretStr
+    model: str = Field(min_length=1, max_length=128)
+    provider_label: str = Field(
+        default="openai_compatible_gateway",
+        min_length=1,
+        max_length=128,
+    )
 
 
 class ShadowReportFeedbackIngestionRequest(BaseModel):
@@ -1694,7 +1707,12 @@ def create_app(
                     "message": "Mock LLM不被接受，请使用真实LLM配置",
                 },
             )
-        cache_key = (config.base_url, config.model, llm_service.provider_identifier(config))
+        cache_key = (
+            config.base_url,
+            config.model,
+            llm_service.provider_identifier(config),
+            llm_service.runtime_config_generation(),
+        )
         lane_lease = llm_lane_locks.try_acquire("provider_probe", "probe")
         if lane_lease is None:
             raise HTTPException(
@@ -1750,6 +1768,62 @@ def create_app(
             ) from None
         finally:
             lane_lease.release()
+
+    def _require_authenticated_desktop_runtime() -> None:
+        if not bool(app.state.local_api_auth.get("enabled")) or os.environ.get(
+            "MEETING_COPILOT_DESKTOP_RUNTIME"
+        ) != "1":
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error": "desktop_runtime_required",
+                    "message": "AI 配置只能由已认证的桌面客户端修改",
+                },
+            )
+
+    @app.get("/desktop/provider/config")
+    def get_desktop_provider_config() -> dict[str, Any]:
+        _require_authenticated_desktop_runtime()
+        config = llm_service.LlmConfig.from_env()
+        return {
+            "configured": config is not None,
+            "runtime_override": llm_service.runtime_configured(),
+            **llm_service.provider_metadata(config),
+        }
+
+    @app.put("/desktop/provider/config")
+    def put_desktop_provider_config(
+        payload: DesktopProviderConfigRequest,
+    ) -> dict[str, Any]:
+        _require_authenticated_desktop_runtime()
+        try:
+            metadata = llm_service.configure_runtime(
+                base_url=payload.base_url,
+                api_key=payload.api_key.get_secret_value(),
+                model=payload.model,
+                provider_label=payload.provider_label,
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "invalid_provider_config", "message": str(exc)},
+            ) from None
+        return {
+            "configured": True,
+            "runtime_override": True,
+            **metadata,
+        }
+
+    @app.delete("/desktop/provider/config")
+    def delete_desktop_provider_config() -> dict[str, Any]:
+        _require_authenticated_desktop_runtime()
+        llm_service.clear_runtime_config()
+        config = llm_service.LlmConfig.from_env()
+        return {
+            "configured": config is not None,
+            "runtime_override": False,
+            **llm_service.provider_metadata(config),
+        }
 
     @app.post("/degradation/reset")
     def degradation_reset() -> dict[str, Any]:

@@ -182,11 +182,14 @@ def stream_packaged_funasr(
     meeting_id: str,
     cookie: str,
     audio_path: Path,
+    audio_source: str = "packaged_synthetic_fixture",
     timeout_seconds: float = 90.0,
 ) -> dict[str, Any]:
     import websocket
 
-    ws_url = f"ws://127.0.0.1:{port}/live/asr/stream/ws/{meeting_id}?audio_source=packaged_synthetic_fixture"
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", audio_source):
+        raise ValueError("audio_source contains unsafe characters")
+    ws_url = f"ws://127.0.0.1:{port}/live/asr/stream/ws/{meeting_id}?audio_source={audio_source}"
     ws = websocket.create_connection(
         ws_url,
         cookie=cookie,

@@ -23,6 +23,16 @@ from meeting_copilot_web_mvp.sqlite_repository import SqliteAsrLiveSessionReposi
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
 
+def test_dedupe_strings_handles_empty_values_and_preserves_order():
+    assert app_module._dedupe_strings([]) == []
+    assert app_module._dedupe_strings(["first", "second"]) == ["first", "second"]
+    assert app_module._dedupe_strings(["first", "second", "first", "third", "second"]) == [
+        "first",
+        "second",
+        "third",
+    ]
+
+
 def test_create_app_rejects_multi_worker_llm_runtime(monkeypatch):
     monkeypatch.setenv("WEB_CONCURRENCY", "2")
 

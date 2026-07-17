@@ -1,6 +1,6 @@
 # Current Mainline Index
 
-## 2026-07-16 V2 纵向主链路状态（当前唯一状态）
+## 2026-07-17 V2 纵向主链路状态（当前唯一状态）
 
 > 当前等级：`L0 功能原型`；功能里程碑 `M2 Recoverable Local Runtime` 已达成，桌面交付里程碑尚未达成
 >
@@ -10,24 +10,31 @@
 >
 > 文档真相与历史归档索引：`docs/archive/readiness-index.md`
 >
-> 当前代码候选基线：`6e39a19660bb75a9d35ed599dc42064f1cc09a47`；后续审计文档提交不改变该候选源码绑定
+> 当前实施分支：`codex/phase0-clean-baseline`；本轮 provider/IPC/UX 改动完成验证后再生成新的 clean commit provenance
 >
 > 最新 clean provenance：`artifacts/tmp/release_provenance/phase0-clean-commit-20260717-r6/manifest.json`
 >
 > 最新 clean packaged runtime 证据：`artifacts/tmp/packaged_runtime_supervisor_smoke/phase3-native-mic-packaged-smoke-20260716-r2/evidence.json`
 
-> 最新 relocatable runtime：`artifacts/tmp/macos_bundled_runtime/phase3-native-mic-runtime-20260717-r4/evidence.json`
+> 最新 relocatable runtime：`artifacts/tmp/macos_bundled_runtime/phase3-ipc-runtime-20260717-r1/evidence.json`
 
-> 最新 Tauri resource app：`artifacts/tmp/tauri_runtime_package/phase3-native-mic-tauri-20260717-r3/evidence.json`
+> 最新 Tauri resource app：`artifacts/tmp/tauri_runtime_package/phase3-ipc-tauri-20260717-r1/evidence.json`；binary SHA-256=`18368babca86b6656ab56e9089fcb5ca933377a45415bade22bbeaf634af1d3d`
 
-> 最新 native microphone implementation 证据：`docs/decision-log.md` 的 DEC-402；真实麦克风 UI 证据仍待解锁 Mac 后完成
+> 最新 packaged WebView IPC 证据：`artifacts/tmp/packaged_tauri_ipc_smoke/phase3-packaged-tauri-ipc-20260717-r1/evidence.json`；真实 React 页面已调用 runtime/provider/mic prepare，未启动录音或绕过授权
 
-> 最新真实 native helper 证据：`artifacts/tmp/packaged_native_mic_smoke/phase3-real-native-mic-speaker-20260717-r3/evidence.json`；Tauri IPC/UI 与 packaged relay 同场仍待验
+> 最新 packaged AI 主链证据：`artifacts/tmp/packaged_ai_mainline_smoke/phase3-packaged-ai-mainline-20260717-r2/evidence.json`；本地 fake OpenAI-compatible provider，不计远端 relay 或 UI 证据
+
+> 最新真实 native helper 证据：`artifacts/tmp/packaged_native_mic_smoke/phase3-real-native-mic-speaker-20260717-r3/evidence.json`；用户点击 UI 后 native mic + relay 同场仍待验
 >
 > 历史 packaged 业务证据：`artifacts/tmp/packaged_mainline/packaged-r9-final-real-mic-20260716/report.json`；它不绑定当前 clean 候选代码
 
 当前事实：
 
+- DEC-404 已关闭 packaged localhost WebView 的 Tauri ACL 阻塞：构建时为 19 个应用 command 生成 permission manifest，运行时只给 `main` 窗口和本次 `http://127.0.0.1:<random-port>/*` 授权，拒绝 `localhost`、隐式端口和远端 origin。新 `.app` 的真实 React WebView 已成功调用 `runtime_get_status`、`provider_config_status`、`mic_adapter_prepare` 并通过 Rust command 写出 IPC evidence；app/backend/端口全部回收。
+- 桌面 AI 配置已采用 Mac Keychain / Windows Credential Manager；磁盘只保存 base URL、model 和 provider label。packaged backend 运行时配置不继承 `LLM_GATEWAY_*`，远端只允许 HTTPS，保存/清除带回滚，API Key 不回显。UI 保存后只显示“AI 已配置”，仅 probe 成功后显示“AI 已连接”。
+- 同一新包的 no-cost AI 主链已产生 FunASR final、流式建议 draft/delta/commit、transcript correction、14.842 秒录音导出、会议结束以及 minutes/approach/index。受控样本原始文字仍有中英混杂和错字，因此该证据只证明工程链路，不证明中文 ASR 生产质量。
+- V2 已增加首次 snapshot 中性加载态、复盘返回会议列表/popstate 同步，并修复 `_dedupe_strings` 只返回第一个原因的问题。当前尚未把“用户在真实打包页面点击开始录音 -> 真实 mic -> relay -> UI 建议/修正 -> 结束复盘”压成同一次自动化证据，不能把独立通过的 IPC prepare、native helper 和 backend AI smoke 拼接成 UI E2E。
+- 新 `.app` 的 UI 点击运行已经准备并启动，但 macOS 自动化接口返回 Mac locked；测试 app/backend/local provider 已全部清理。下一次只在用户解锁后继续该单一门禁，不重复 runtime、provider 或 ASR 基础横评。
 - `/workbench` 已切换为 React/TypeScript V2 权威入口；`/workbench-v2` 是别名，`/workbench-legacy` 只保留旧页面。
 - 正式 correction/suggestion 由后台 durable executor 在 final 同一 SQLite 事务入队；浏览器不触发付费 AI。建议通过 SSE 流式展示草稿并使用 commit barrier，只有显式 `VITE_EVENT_TRANSPORT=poll` 才回退轮询。
 - Phase 1A 远程幂等提示已接入：suggestion durable job 与 correction preview 的稳定 key 先做 SHA-256 脱敏，再作为 `Idempotency-Key` 发送；stream -> non-stream fallback、429/5xx retry 和 backend lease 恢复沿用同一值。原始 meeting/job ID 不进入 header；本地提交仍由 SQLite CAS 保证，中转站不支持该 header 时仍只能提供 at-least-once provider 执行。

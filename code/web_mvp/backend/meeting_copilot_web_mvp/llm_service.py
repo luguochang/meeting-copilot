@@ -8,8 +8,10 @@ records usage, and creates a real suggestion card (card_status='new').
 from __future__ import annotations
 
 import json
+import ipaddress
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +29,9 @@ _log = get_logger("meeting_copilot_web_mvp.llm_service")
 PROMPT_VERSION = "web_mvp.suggestion_card.v2"
 REPO_ENV_FILE = Path(__file__).resolve().parents[4] / ".env"
 _PROVIDER_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_RUNTIME_CONFIG_LOCK = threading.RLock()
+_RUNTIME_CONFIG_PAYLOAD: dict[str, Any] | None = None
+_RUNTIME_CONFIG_GENERATION = 0
 _AUDIT_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$")
 
 
@@ -79,7 +84,13 @@ class LlmConfig:
 
     @classmethod
     def from_env(cls) -> "LlmConfig | None":
-        """Return config from env, or None if not configured."""
+        """Return the desktop runtime override, process env config, or None."""
+        with _RUNTIME_CONFIG_LOCK:
+            runtime_payload = dict(_RUNTIME_CONFIG_PAYLOAD) if _RUNTIME_CONFIG_PAYLOAD else None
+        if runtime_payload is not None:
+            return cls(**runtime_payload)
+        if _env_bool(os.environ.get("MEETING_COPILOT_DESKTOP_RUNTIME"), default=False):
+            return None
         base = os.environ.get("LLM_GATEWAY_BASE_URL")
         key = os.environ.get("LLM_GATEWAY_API_KEY")
         if not base or not key:
@@ -96,6 +107,55 @@ class LlmConfig:
             provider_label=os.environ.get("LLM_GATEWAY_PROVIDER_LABEL", "openai_compatible_gateway"),
             is_mock=_env_bool(os.environ.get("LLM_GATEWAY_IS_MOCK"), default=False),
         )
+
+
+def configure_runtime(
+    *,
+    base_url: str,
+    api_key: str,
+    model: str,
+    provider_label: str = "openai_compatible_gateway",
+) -> dict[str, Any]:
+    """Install a process-local provider config without persisting its secret."""
+    config = LlmConfig(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        provider_label=provider_label,
+        is_mock=False,
+    )
+    payload = {
+        "base_url": config.base_url,
+        "api_key": config.api_key,
+        "model": config.model,
+        "timeout_seconds": config.timeout_seconds,
+        "provider_label": config.provider_label,
+        "is_mock": False,
+        "max_retries": config.max_retries,
+    }
+    with _RUNTIME_CONFIG_LOCK:
+        global _RUNTIME_CONFIG_GENERATION, _RUNTIME_CONFIG_PAYLOAD
+        _RUNTIME_CONFIG_PAYLOAD = payload
+        _RUNTIME_CONFIG_GENERATION += 1
+    return provider_metadata(config)
+
+
+def clear_runtime_config() -> None:
+    """Remove only the process-local override; environment config remains intact."""
+    with _RUNTIME_CONFIG_LOCK:
+        global _RUNTIME_CONFIG_GENERATION, _RUNTIME_CONFIG_PAYLOAD
+        _RUNTIME_CONFIG_PAYLOAD = None
+        _RUNTIME_CONFIG_GENERATION += 1
+
+
+def runtime_configured() -> bool:
+    with _RUNTIME_CONFIG_LOCK:
+        return _RUNTIME_CONFIG_PAYLOAD is not None
+
+
+def runtime_config_generation() -> int:
+    with _RUNTIME_CONFIG_LOCK:
+        return _RUNTIME_CONFIG_GENERATION
 
 
 def _env_bool(value: str | None, *, default: bool = False) -> bool:
@@ -232,6 +292,13 @@ def _validated_base_url(value: str) -> str:
     parsed = urlsplit(raw)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ValueError("LLM gateway base_url must be an absolute http(s) URL")
+    if parsed.scheme == "http":
+        try:
+            is_loopback = ipaddress.ip_address(parsed.hostname).is_loopback
+        except ValueError:
+            is_loopback = False
+        if not is_loopback:
+            raise ValueError("remote LLM gateway base_url must use HTTPS")
     if parsed.username is not None or parsed.password is not None:
         raise ValueError("LLM gateway base_url must not contain userinfo")
     if parsed.query:

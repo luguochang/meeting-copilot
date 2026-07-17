@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-asr-worker-prepare"
+description = "Enables the asr_worker_prepare command without any pre-configured scope."
+commands.allow = ["asr_worker_prepare"]
+
+[[permission]]
+identifier = "deny-asr-worker-prepare"
+description = "Denies the asr_worker_prepare command without any pre-configured scope."
+commands.deny = ["asr_worker_prepare"]

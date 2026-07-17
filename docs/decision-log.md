@@ -25649,3 +25649,37 @@ verdict=no_go
 - packaged runtime 本次未配置远程 LLM，`suggestion_count=0`，所以该运行不证明实时 AI 正式建议；Phase 1C/2 的真实 relay/browser vertical 证据仍有效，但 packaged native mic + relay 同场仍待 Keychain/provider config 和 UI E2E。
 - Computer Use 对当前 Tauri/WebKit 窗口持续返回 timeout/`AXError.cannotComplete`；当前下一项固定为 opt-in Tauri IPC/UI probe 或可操作的真实桌面窗口，不再重复 native helper/Provider 横评。
 - system audio、Keychain、CSP/HTTPS-only、模型/FFmpeg 供应链、签名公证和 separate clean Mac 继续保持 No-Go。本轮远程 ASR/LLM调用为 0，新增费用为 0。
+
+# DEC-404: 系统凭据库与精确端口 Tauri ACL 已落地，真实 packaged WebView IPC 和本地 AI 主链通过
+
+时间：2026-07-17
+
+状态：Accepted / Packaged IPC Go / Packaged local AI mainline Go / Public release No-Go
+
+## 问题与根因
+
+Tauri 启动 bundled backend 后会把主 WebView 导航到随机 `http://127.0.0.1:<port>/desktop/bootstrap`。Tauri 2.11.5 将它视为 remote origin；原 `capabilities/default.json` 只有 local `core:default`，应用自定义 command 也没有 app permission manifest。因此 Rust handler 虽存在，React 调用 `provider_config_status`、`mic_adapter_prepare` 等 command 仍会被 ACL 拒绝。这解释了此前“后端功能存在但打包页面按钮不可用”的主流程断点。
+
+## 决策与实现
+
+1. `build.rs` 通过 `tauri_build::AppManifest::commands` 为 19 个应用 command 生成显式 allow/deny permission；命令清单集中在 `src/app_command_manifest.rs`。
+2. packaged backend 随机端口确定后，`lib.rs` 只接受显式 `http://127.0.0.1:<port>`，构造 `local(false) + window("main") + remote("http://127.0.0.1:<port>/*")` capability，在 `window.navigate` 前注册。拒绝 `localhost`、非 loopback host、隐式端口和全端口通配。
+3. Provider API Key 保存到 Mac Keychain / Windows Credential Manager；磁盘 metadata 不包含 secret。packaged backend 不继承 `LLM_GATEWAY_*`，配置只通过本机认证 token 进入进程 runtime override；远端只允许 HTTPS，保存/清除失败会恢复此前凭据、metadata 与 runtime config。
+4. React provider UI 将“已配置”和“已连接”分开；只有 `/providers/llm/probe` 成功才显示连接。首次 snapshot 未到达时不显示录音/结束操作；复盘页可以返回会议列表并同步 `popstate`。
+5. opt-in `DesktopIpcBootProbe` 只执行 runtime status、provider status 和 mic prepare，不启动采音、不绕过授权。`tools/packaged_tauri_ipc_smoke.py` 验证 evidence provenance、命令结果和 app/backend/端口清理。
+
+## 真实证据
+
+- relocatable runtime：`artifacts/tmp/macos_bundled_runtime/phase3-ipc-runtime-20260717-r1/evidence.json`，backend/FunASR/native helper 通过，external symlink 为 0。
+- unsigned Tauri app：`artifacts/tmp/tauri_runtime_package/phase3-ipc-tauri-20260717-r1/evidence.json`，binary SHA-256=`18368babca86b6656ab56e9089fcb5ca933377a45415bade22bbeaf634af1d3d`。
+- actual packaged WebView IPC：`artifacts/tmp/packaged_tauri_ipc_smoke/phase3-packaged-tauri-ipc-20260717-r1/evidence.json`。runtime real、provider status、mic prepare、native helper、no capture/no consent bypass、no errors 共 8 项检查全为 true；app/backend/随机端口全部回收。
+- packaged local AI mainline：`artifacts/tmp/packaged_ai_mainline_smoke/phase3-packaged-ai-mainline-20260717-r2/evidence.json`。FunASR final 1 个，录音 3 chunks/14.842 秒，suggestion draft/delta/commit，correction/minutes/approach 各一次本地 OpenAI-compatible 请求，index/minutes/approach 全部 succeeded。
+- 本轮 frontend `49 passed`，typecheck/lint/build 通过；Rust normal suite `28 passed, 1 ignored`，显式 Mac Keychain round-trip integration `1 passed`；provider/LLM/correction/streaming focused `81 passed`；Tauri/smoke 合同 `23 passed`；Ruff、Python compile 和 `git diff --check` 通过。
+
+## 诚实边界
+
+- packaged AI smoke 使用本地 fake OpenAI-compatible provider，不调用用户中转站、不产生费用，也不计远端 relay evidence。
+- 受控中文样本原始 final 仍有明显中英混杂和错字；本决策证明工程链路，不升级中文 ASR 质量。
+- packaged IPC probe 只执行 `mic_adapter_prepare`。先前真实 native helper 证据证明实际采音，但二者不能拼接冒充“用户点击 UI 后同一场完整 E2E”。
+- 本轮已启动新 `.app` 和本地 fake provider 准备执行真实 UI 点击，但 Computer Use 明确返回 Mac locked；测试 app、backend 和 provider 随即全部清理，无残留进程。不得绕过锁屏，解锁后的下一次运行继续此门禁。
+- system audio、packaged CSP、签名/公证/staple、separate clean Mac、模型与二进制再分发授权仍未完成。当前是 Mac Internal Alpha candidate，不是公开发布包。

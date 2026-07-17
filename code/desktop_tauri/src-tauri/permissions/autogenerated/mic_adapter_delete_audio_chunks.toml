@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-mic-adapter-delete-audio-chunks"
+description = "Enables the mic_adapter_delete_audio_chunks command without any pre-configured scope."
+commands.allow = ["mic_adapter_delete_audio_chunks"]
+
+[[permission]]
+identifier = "deny-mic-adapter-delete-audio-chunks"
+description = "Denies the mic_adapter_delete_audio_chunks command without any pre-configured scope."
+commands.deny = ["mic_adapter_delete_audio_chunks"]

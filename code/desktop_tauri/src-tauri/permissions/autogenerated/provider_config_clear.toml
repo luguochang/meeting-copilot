@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-provider-config-clear"
+description = "Enables the provider_config_clear command without any pre-configured scope."
+commands.allow = ["provider_config_clear"]
+
+[[permission]]
+identifier = "deny-provider-config-clear"
+description = "Denies the provider_config_clear command without any pre-configured scope."
+commands.deny = ["provider_config_clear"]

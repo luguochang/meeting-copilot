@@ -96,6 +96,12 @@ fn category_probe_file_name(payload: &Value) -> &'static str {
     {
         "latest-backend-api.json"
     } else if payload
+        .get("packaged_ipc_probe")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        "latest-ipc.json"
+    } else if payload
         .get("packaged_same_chain_probe")
         .and_then(Value::as_bool)
         .unwrap_or(false)
@@ -214,6 +220,26 @@ mod tests {
 
         assert_eq!(response.command_status, "ok");
         assert!(root.join("latest-backend-api.json").is_file());
+    }
+
+    #[test]
+    fn write_frontend_probe_preserves_packaged_ipc_evidence() {
+        let _guard = FRONTEND_PROBE_TEST_LOCK.lock().unwrap();
+        let root = repo_root().join(FRONTEND_PROBE_ROOT);
+        let _ = fs::remove_dir_all(&root);
+
+        let response = write_frontend_probe(json!({
+            "packaged_ipc_probe": true,
+            "runtime_command_status": "ok",
+            "provider_command_status": "ok",
+            "microphone_command_status": "ok",
+            "microphone_captures_audio": false,
+            "consent_bypassed": false,
+            "errors": []
+        }));
+
+        assert_eq!(response.command_status, "ok");
+        assert!(root.join("latest-ipc.json").is_file());
     }
 
     #[test]

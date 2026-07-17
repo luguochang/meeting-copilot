@@ -2,9 +2,11 @@ use serde::Serialize;
 use serde_json::json;
 use std::env;
 use std::path::PathBuf;
+use tauri::ipc::CapabilityBuilder;
 use tauri::webview::PageLoadEvent;
 use tauri::Manager;
 
+pub mod app_command_manifest;
 pub mod asr_worker_mic_source_runtime;
 pub mod desktop_asr_worker_lifecycle_runtime;
 pub mod desktop_audio_chunk_runtime;
@@ -12,6 +14,7 @@ pub mod desktop_backend_supervisor;
 pub mod desktop_frontend_probe_runtime;
 pub mod mic_adapter_runtime;
 pub mod native_mic_capture_runtime;
+pub mod provider_config_runtime;
 
 pub const BRIDGE_COMMAND_IDS: &[&str] = &[
     "runtime.get_status",
@@ -30,7 +33,32 @@ pub const BRIDGE_COMMAND_IDS: &[&str] = &[
     "mic_adapter.resume",
     "mic_adapter.stop",
     "mic_adapter.delete_audio_chunks",
+    "provider_config.status",
+    "provider_config.save",
+    "provider_config.clear",
 ];
+
+fn packaged_remote_pattern(workbench_url: &str) -> Result<String, String> {
+    let parsed = tauri::Url::parse(workbench_url)
+        .map_err(|error| format!("invalid packaged workbench URL: {error}"))?;
+    if parsed.scheme() != "http" || parsed.host_str() != Some("127.0.0.1") {
+        return Err("packaged workbench must use an explicit 127.0.0.1 HTTP origin".to_string());
+    }
+    let port = parsed.port().ok_or_else(|| {
+        "packaged workbench URL must include its random loopback port".to_string()
+    })?;
+    Ok(format!("http://127.0.0.1:{port}/*"))
+}
+
+fn packaged_remote_capability(remote_pattern: String) -> CapabilityBuilder {
+    app_command_manifest::APP_COMMAND_NAMES.iter().fold(
+        CapabilityBuilder::new("packaged-loopback-workbench")
+            .local(false)
+            .window("main")
+            .remote(remote_pattern),
+        |capability, command| capability.permission(app_command_manifest::permission_name(command)),
+    )
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct NoopBridgeResponse {
@@ -214,11 +242,41 @@ fn mic_adapter_delete_audio_chunks(
     desktop_audio_chunk_runtime::delete_audio_chunks(session_id)
 }
 
+#[tauri::command]
+fn provider_config_status(
+    provider: tauri::State<'_, provider_config_runtime::ProviderConfigSupervisor>,
+) -> provider_config_runtime::ProviderConfigResponse {
+    provider.status()
+}
+
+#[tauri::command]
+fn provider_config_save(
+    base_url: String,
+    api_key: String,
+    model: String,
+    provider: tauri::State<'_, provider_config_runtime::ProviderConfigSupervisor>,
+    backend: tauri::State<'_, desktop_backend_supervisor::BackendSupervisor>,
+) -> provider_config_runtime::ProviderConfigResponse {
+    provider.save(base_url, api_key, model, &backend)
+}
+
+#[tauri::command]
+fn provider_config_clear(
+    provider: tauri::State<'_, provider_config_runtime::ProviderConfigSupervisor>,
+    backend: tauri::State<'_, desktop_backend_supervisor::BackendSupervisor>,
+) -> provider_config_runtime::ProviderConfigResponse {
+    provider.clear(&backend)
+}
+
 pub fn run() {
     let app = tauri::Builder::default()
         .setup(|app| {
             let supervisor = desktop_backend_supervisor::BackendSupervisor::default();
             let resource_dir = app.path().resource_dir()?;
+            let app_data_dir = app.path().app_data_dir()?;
+            let app_log_dir = app.path().app_log_dir()?;
+            let provider_config =
+                provider_config_runtime::ProviderConfigSupervisor::new(app_data_dir.clone());
             let runtime_override = env::var_os("MEETING_COPILOT_RUNTIME_BUNDLE").map(PathBuf::from);
             let runtime_bundle = desktop_backend_supervisor::resolve_runtime_bundle(
                 &resource_dir,
@@ -228,8 +286,8 @@ pub fn run() {
                 supervisor
                     .start_packaged(
                         &runtime_bundle,
-                        &app.path().app_data_dir()?.join("runtime-data"),
-                        &app.path().app_log_dir()?,
+                        &app_data_dir.join("runtime-data"),
+                        &app_log_dir,
                     )
                     .map_err(std::io::Error::other)?;
             } else if cfg!(debug_assertions) {
@@ -246,16 +304,19 @@ pub fn run() {
                 )
                 .into());
             }
-            let app_data_dir = app.path().app_data_dir()?;
-            let app_log_dir = app.path().app_log_dir()?;
             let native_mic = native_mic_capture_runtime::NativeMicCaptureSupervisor::new(
                 runtime_bundle.join("bin/meeting-copilot-native-mic"),
                 app_data_dir.join("native-mic"),
                 app_log_dir,
             );
+            let _ = provider_config.sync(&supervisor);
             let workbench_url = supervisor.workbench_url().map_err(std::io::Error::other)?;
+            let remote_pattern =
+                packaged_remote_pattern(&workbench_url).map_err(std::io::Error::other)?;
+            app.add_capability(packaged_remote_capability(remote_pattern))?;
             app.manage(supervisor);
             app.manage(native_mic);
+            app.manage(provider_config);
             let window = app
                 .get_webview_window("main")
                 .ok_or_else(|| std::io::Error::other("main webview window is missing"))?;
@@ -296,7 +357,10 @@ pub fn run() {
             mic_adapter_pause,
             mic_adapter_resume,
             mic_adapter_stop,
-            mic_adapter_delete_audio_chunks
+            mic_adapter_delete_audio_chunks,
+            provider_config_status,
+            provider_config_save,
+            provider_config_clear
         ])
         .build(tauri::generate_context!())
         .expect("error while building Meeting Copilot desktop shell");
@@ -314,4 +378,25 @@ pub fn run() {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packaged_capability_is_scoped_to_the_runtime_loopback_port() {
+        assert_eq!(
+            packaged_remote_pattern("http://127.0.0.1:54321/desktop/bootstrap?token=not-recorded")
+                .unwrap(),
+            "http://127.0.0.1:54321/*"
+        );
+    }
+
+    #[test]
+    fn packaged_capability_rejects_non_loopback_or_implicit_ports() {
+        assert!(packaged_remote_pattern("https://example.com/workbench").is_err());
+        assert!(packaged_remote_pattern("http://localhost:54321/workbench").is_err());
+        assert!(packaged_remote_pattern("http://127.0.0.1/workbench").is_err());
+    }
 }
