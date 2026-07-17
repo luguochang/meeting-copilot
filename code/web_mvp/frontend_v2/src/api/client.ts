@@ -17,6 +17,7 @@ import {
 
 export interface MeetingApi {
   createMeeting(meetingId: string, signal?: AbortSignal): Promise<void>;
+  importRecording(file: File, signal?: AbortSignal): Promise<{ meetingId: string }>;
   deleteMeeting(meetingId: string, signal?: AbortSignal): Promise<void>;
   listMeetings(signal?: AbortSignal): Promise<MeetingHistory>;
   getSnapshot(meetingId: string, signal?: AbortSignal): Promise<MeetingSnapshot>;
@@ -85,11 +86,12 @@ export class HttpMeetingApi implements MeetingApi {
   }
 
   private async request(path: string, init: RequestInit = {}): Promise<unknown> {
+    const isMultipart = typeof FormData !== "undefined" && init.body instanceof FormData;
     const response = await fetch(endpoint(this.baseUrl, path), {
       ...init,
       headers: {
         Accept: "application/json",
-        ...(init.body ? { "Content-Type": "application/json" } : {}),
+        ...(init.body && !isMultipart ? { "Content-Type": "application/json" } : {}),
         ...init.headers,
       },
     });
@@ -108,6 +110,23 @@ export class HttpMeetingApi implements MeetingApi {
       }),
       signal,
     });
+  }
+
+  async importRecording(file: File, signal?: AbortSignal): Promise<{ meetingId: string }> {
+    const form = new FormData();
+    form.append("file", file, file.name);
+    const body = await this.request("/v2/meetings/import-audio", {
+      method: "POST",
+      body: form,
+      signal,
+    });
+    if (!body || typeof body !== "object") throw new ContractError("import response must be an object");
+    const rawMeetingId = (body as { meeting_id?: unknown; meeting?: { id?: unknown } }).meeting_id
+      ?? (body as { meeting?: { id?: unknown } }).meeting?.id;
+    if (typeof rawMeetingId !== "string" || !rawMeetingId.trim()) {
+      throw new ContractError("import response is missing meeting_id");
+    }
+    return { meetingId: rawMeetingId.trim() };
   }
 
   async deleteMeeting(meetingId: string, signal?: AbortSignal): Promise<void> {

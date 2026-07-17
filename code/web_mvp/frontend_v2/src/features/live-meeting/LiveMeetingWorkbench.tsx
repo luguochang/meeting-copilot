@@ -1,5 +1,5 @@
-import { ArrowLeft, Gauge, LoaderCircle, Mic, Pause, Play, Radio, Square } from "lucide-react";
-import { useEffect, useState } from "react";
+import { ArrowLeft, FileAudio, Gauge, LoaderCircle, Mic, Pause, Play, Radio, Square } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import type { MeetingApi } from "../../api/client";
 import type { MeetingEventTransport } from "../../api/eventTransport";
 import { useMeetingProjection } from "../../app/useMeetingProjection";
@@ -92,6 +92,8 @@ export function LiveMeetingWorkbench({
   const microphone = microphoneController ?? liveMicrophone;
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
   const [message, setMessage] = useState("");
+  const [importing, setImporting] = useState(false);
+  const importInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (!message) return;
@@ -117,6 +119,7 @@ export function LiveMeetingWorkbench({
 
   const startMeeting = async () => {
     const activeMeetingId = meetingId ?? onCreateMeeting?.();
+    const createdFromList = meetingId === null && Boolean(activeMeetingId);
     if (!activeMeetingId) {
       setMessage("无法创建会议");
       return;
@@ -126,7 +129,31 @@ export function LiveMeetingWorkbench({
       await microphone.start(activeMeetingId);
       setMessage("会议已开始");
     } catch (error) {
+      if (createdFromList) onBackToMeetings?.();
       setMessage(error instanceof Error ? error.message : "麦克风启动失败");
+    }
+  };
+
+  const importRecording = async (file: File | undefined) => {
+    if (!file || importing) return;
+    if (file.size <= 0) {
+      setMessage("录音文件为空");
+      return;
+    }
+    if (file.size > 500 * 1024 * 1024) {
+      setMessage("文件超过 500MB 限制，请缩短录音或分段导入");
+      return;
+    }
+    setImporting(true);
+    setMessage("正在导入并转写录音");
+    try {
+      const imported = await api.importRecording(file);
+      onOpenMeeting?.(imported.meetingId);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "录音导入失败");
+    } finally {
+      setImporting(false);
+      if (importInputRef.current) importInputRef.current.value = "";
     }
   };
 
@@ -152,12 +179,43 @@ export function LiveMeetingWorkbench({
           </div>
           <div className="start-command-actions">
             <ProviderSettingsControl />
-            <button className="start-meeting-button" type="button" onClick={() => void startMeeting()}>
+            <button
+              className="secondary-button"
+              type="button"
+              onClick={() => importInputRef.current?.click()}
+              disabled={importing || microphone.state.phase === "requesting"}
+            >
+              {importing ? <LoaderCircle className="spin" size={17} /> : <FileAudio size={17} />}
+              {importing ? "正在导入" : "导入录音"}
+            </button>
+            <button
+              className="start-meeting-button"
+              type="button"
+              onClick={() => void startMeeting()}
+              disabled={importing}
+            >
               {microphone.state.phase === "requesting" ? <LoaderCircle className="spin" size={17} /> : <Mic size={17} />}
               {microphone.state.phase === "requesting" ? "正在请求权限" : "开始会议"}
             </button>
+            <input
+              ref={importInputRef}
+              className="sr-only"
+              type="file"
+              accept="audio/*,video/*"
+              onChange={(event) => void importRecording(event.target.files?.[0])}
+              aria-label="选择要导入的录音文件"
+            />
           </div>
           {microphone.state.error ? <p className="unbound-error">{microphone.state.error}</p> : null}
+          {message ? (
+            <p
+              className="start-command-message"
+              role={importing ? "status" : "alert"}
+              aria-live="polite"
+            >
+              {message}
+            </p>
+          ) : null}
         </section>
         <MeetingHistory api={api} onOpenMeeting={onOpenMeeting ?? (() => undefined)} />
       </main>

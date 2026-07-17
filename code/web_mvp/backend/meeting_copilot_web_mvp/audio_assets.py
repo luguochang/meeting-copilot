@@ -593,6 +593,56 @@ def persist_uploaded_audio_asset_from_path(
     )
 
 
+def persist_imported_wav_asset_from_path(
+    *,
+    data_dir: str | Path,
+    session_id: str,
+    source_path: str | Path,
+    original_filename: str,
+) -> dict[str, Any]:
+    """Persist a normalized 16 kHz mono WAV at the V2 playback path."""
+
+    if not SESSION_ID_PATTERN.fullmatch(session_id):
+        raise ValueError(f"unsafe session_id: {session_id}")
+    source = Path(source_path)
+    try:
+        with wave.open(str(source), "rb") as wav_file:
+            sample_rate_hz = int(wav_file.getframerate())
+            channel_count = int(wav_file.getnchannels())
+            sample_width_bytes = int(wav_file.getsampwidth())
+            sample_count = int(wav_file.getnframes())
+    except (OSError, wave.Error) as exc:
+        raise ValueError("normalized import audio is not a readable WAV file") from exc
+    if sample_rate_hz <= 0 or sample_count <= 0:
+        raise ValueError("normalized import audio must contain samples")
+    if channel_count != CHANNEL_COUNT or sample_width_bytes != PCM_SAMPLE_WIDTH_BYTES:
+        raise ValueError("normalized import audio must be mono PCM16")
+
+    relative_path = Path("audio_assets") / session_id / "audio.wav"
+    destination = safe_audio_path(data_dir, relative_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = destination.with_suffix(".wav.tmp")
+    try:
+        with source.open("rb") as source_file, temp_path.open("wb") as target_file:
+            shutil.copyfileobj(source_file, target_file, length=_HASH_BUFFER_BYTES)
+            target_file.flush()
+            os.fsync(target_file.fileno())
+        os.replace(temp_path, destination)
+        _fsync_directory(destination.parent)
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
+    return audio_metadata_for_file(
+        data_dir=data_dir,
+        session_id=session_id,
+        relative_path=relative_path,
+        source_type="imported_file",
+        sample_rate_hz=sample_rate_hz,
+        sample_count=sample_count,
+        original_filename=Path(original_filename or "recording").name,
+    )
+
+
 def audio_metadata_for_file(
     *,
     data_dir: str | Path,

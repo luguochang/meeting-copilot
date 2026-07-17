@@ -1,9 +1,9 @@
 # P0-P2 Full Completion Execution Plan
 
-> 日期：2026-07-09
-> 状态：active execution plan
+> 日期：2026-07-17 更新
+> 状态：active execution plan / current implementation audited
 > 目标：完成所有已经定好的 P0-P2 内容，不再把 no-op、计划或边界证明误称为生产完成。
-> 当前结论：P0/P1 Web 主链路已完成到文档边界；P2 仍缺真实 Mac native desktop execution。真正的完成目标是把 Mac 桌面主链路补齐，并刷新 release evidence。
+> 当前结论：P0/P1 Web 主链路和 P2 桌面实现已大幅完成；P2 的真实 packaged React 页面完整会议操作仍待解锁 Mac 后执行，不能把 IPC prepare 或 backend smoke 拼接成完整 UI E2E。
 
 ## 1. 当前基线
 
@@ -63,6 +63,16 @@ Mac-first desktop must move beyond no-op boundary:
 
 Windows P2 remains compatibility implementation planning unless the goal is expanded to Windows machine execution. It must stay clearly labeled as plan-only.
 
+### 2.1 2026-07-17 current audit override
+
+本节优先于本文件早期的历史基线和旧命令输出：
+
+- 原来写作“no-op IPC”的 P2 代码已经被替换为真实 native mic supervisor、Keychain/Credential Manager provider 配置、bundled backend/FunASR runtime、随机 loopback token 和 exact-port Tauri capability。
+- `build.rs` 已生成 19 个 application command permissions；新的 packaged React WebView 已真实调用 `runtime_get_status`、`provider_config_status`、`mic_adapter_prepare`，证据为 `artifacts/tmp/packaged_tauri_ipc_smoke/phase3-packaged-tauri-ipc-20260717-r1/evidence.json`。
+- 新 `.app` 的 local AI backend mainline 已通过 FunASR final、流式建议、correction、recording、end、minutes/approach/index，证据为 `artifacts/tmp/packaged_ai_mainline_smoke/phase3-packaged-ai-mainline-20260717-r2/evidence.json`。
+- 当前剩余的 W5 不是“Rust command 不存在”，而是“用户在真实 packaged 页面显式开始录音后，同一场会议的 UI 文字、建议、录音、结束和复盘”尚未取得一次性证据。2026-07-17 尝试时 macOS 处于锁屏，自动化接口返回 `Mac is locked`；没有绕过锁屏。
+- P2 的签名、公证、Gatekeeper、Windows 真机和模型/FFmpeg 再分发授权仍是发布门禁，不因本地 `.app` 能构建而自动通过。
+
 ## 3. Required Work Items
 
 ### W1. Evidence Drift Fix
@@ -71,7 +81,7 @@ Windows P2 remains compatibility implementation planning unless the goal is expa
 - [x] Restore missing desktop worker policy files:
   - `code/desktop_tauri/asr-worker-command-protocol.policy.json`
   - `code/desktop_tauri/asr-worker-command-runner-binding.policy.json`
-- [ ] Run P1/P2 focused regression after all changes.
+- [x] Run P1/P2 focused regression after all changes. Current focused result: backend provider/LLM/correction/streaming `81 passed`, frontend `49 passed`, Rust normal `28 passed` plus Keychain integration `1 passed`, Tauri/smoke `23 passed`.
 
 ### W2. P2 Mac Desktop Executable Dev Path
 
@@ -183,6 +193,8 @@ W4 boundary:
 - A true Tauri dev WebView run is still not complete because the controlled toolchain does not include `cargo-tauri`.
 - This is a documented blocker, not production desktop completion.
 
+补充：当前受控工具链仍没有 `cargo-tauri` dev subcommand，但已经用新的 packaged `.app` 完成真实 WebView IPC smoke。该补充关闭了远程 origin ACL 和 command binding 阻塞，不等同于 `cargo tauri dev` 证据。
+
 ### W5. Same Chain Desktop Evidence
 
 - [x] Verify the W3 desktop worker event output reaches the existing Web ASR live session handoff path as non-production evidence:
@@ -230,11 +242,13 @@ W5 boundary:
 - The remaining W5 gap is the full desktop realtime chain:
   `desktop mic/dev audio input -> realtime ASR -> auto suggestions -> cards -> approach -> minutes -> history -> delete`.
 
+2026-07-17 当前状态：`partial_packaged_ipc_go_ui_mainline_pending_unlock`。后端和录音链路已经有 packaged local smoke，实际页面安全 IPC 已通过，但锁屏使本轮无法点击“开始会议”并触发系统麦克风授权；该项保持未完成。
+
 ### W6. Release Refresh
 
 - [x] Refresh browser live mic or equivalent current evidence so semantic quality fields are present.
 - [x] Re-run release acceptance.
-- [ ] Write final P0-P2 completion report with Go/No-Go per item.
+- [x] Write final P0-P2 completion report with Go/No-Go per item. See `docs/p0-p2-completion-report-2026-07-17.md`.
 
 Current W6 evidence:
 
@@ -629,3 +643,27 @@ Continue P2 release hardening and external blocker closure:
 3. If Developer ID material becomes available, rerun app/DMG signing, notarization, staple, Gatekeeper acceptance, and the release external preflight.
 4. Keep Windows as plan-only until a Windows machine is available for real Tauri/WebView/audio/installer smoke.
 5. Do not refresh paid release acceptance unless explicit budget is approved.
+
+## 7. 2026-07-17 V2 文件导入主线决策
+
+审计发现旧版 `/live/asr/transcribe-file/sessions` 没有接入 V2 React 首页、V2 history 或 canonical transcript，因此早期 P1-1 勾选不能视为 V2 产品功能完成。本轮不继续做横向 ASR 评测，直接补齐真实业务闭环：
+
+```text
+V2 首页导入录音
+-> 本地 FunASR batch
+-> 原始音频 + 标准化 WAV 本地保存
+-> V2 canonical transcript / audio persistence
+-> durable correction + suggestion + minutes + approach + index
+-> V2 review / history / audio playback
+```
+
+实现约束：
+
+- 不新增远程 ASR 费用，默认使用本地 FunASR；LLM 仍只在用户配置的 OpenAI-compatible Provider 下执行。
+- 阻塞性文件转写在线程池执行，不能占用 async event loop。
+- 导入结果必须落 V2 persistence，不能只返回 legacy session ID。
+- 失败时执行 deletion fence，不能留下只存在文件系统或只存在旧仓库的半套会话。
+- 导入是会后文件链路，不替代实时 microphone/partial 目标。
+- 当前 batch wrapper 仍以 whole-file segment 兼容；timestamped segments 作为后续明确 backlog，不在本轮扩展为新的评测循环。
+
+详细接口与证据见 `docs/v2-import-audio-contract-2026-07-17.md`。

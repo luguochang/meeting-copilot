@@ -1,6 +1,7 @@
 import asyncio
 from fastapi.testclient import TestClient
 import httpx
+from io import BytesIO
 import json
 import pytest
 import re
@@ -8,6 +9,7 @@ import sqlite3
 import struct
 import threading
 import time
+import wave
 
 from meeting_copilot_web_mvp.app import (
     _commit_v2_transcript_revisions,
@@ -1147,6 +1149,98 @@ def test_v2_create_history_and_audio_playback_endpoints(tmp_path):
     assert content.status_code == 200
     assert content.headers["content-type"] == "audio/wav"
     assert content.content == b"RIFF-test-audio"
+
+
+def test_v2_import_audio_creates_ended_meeting_transcript_history_and_playback(
+    tmp_path,
+    monkeypatch,
+):
+    audio_buffer = BytesIO()
+    with wave.open(audio_buffer, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(16_000)
+        wav_file.writeframes(b"\x00\x00" * 16_000)
+
+    monkeypatch.setattr(app_module.batch_transcribe, "is_available", lambda: True)
+    monkeypatch.setattr(
+        app_module.batch_transcribe,
+        "transcribe_file_report",
+        lambda path, **_kwargs: {
+            "text": "接口先恢度百分之五，确认负责人。",
+            "raw": {"provider": "funasr"},
+            "audio_duration_seconds": 1.0,
+            "rtf": 0.05,
+        },
+    )
+    monkeypatch.setattr(app_module.batch_transcribe, "ensure_wav_16k_mono", lambda path: path)
+
+    app = create_app(data_dir=tmp_path)
+    persistence = app.state.v2_persistence
+    app.state.v2_correction_job_handler_impl = lambda job: {"job_id": job["id"], "called": True}
+    app.state.v2_suggestion_job_handler_impl = lambda job: {"job_id": job["id"], "generated_card_count": 0}
+    app.state.v2_post_job_handler_impls = {
+        "minutes": lambda job: persistence.save_minutes(
+            meeting_id=job["meeting_id"],
+            job_id=job["id"],
+            markdown="# 导入会议复盘\n\n已生成。",
+            structured=None,
+            degraded=False,
+            now_ms=time.time_ns() // 1_000_000,
+        ),
+        "approach": lambda job: persistence.save_approach_cards(
+            meeting_id=job["meeting_id"],
+            job_id=job["id"],
+            cards=[{"suggestion_text": "确认负责人和回滚条件"}],
+            degraded=False,
+            now_ms=time.time_ns() // 1_000_000,
+        ),
+        "index": lambda job: persistence.rebuild_search_document(
+            meeting_id=job["meeting_id"],
+            job_id=job["id"],
+            now_ms=time.time_ns() // 1_000_000,
+        ),
+    }
+    with TestClient(app) as client:
+        imported = client.post(
+            "/v2/meetings/import-audio",
+            files={"file": ("review.wav", audio_buffer.getvalue(), "audio/wav")},
+        )
+        assert imported.status_code == 201, imported.text
+        body = imported.json()
+        meeting_id = body["meeting_id"]
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            jobs = persistence.list_jobs(meeting_id=meeting_id)
+            if jobs and all(job["status"] == "succeeded" for job in jobs):
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError(f"imported meeting jobs did not complete: {jobs}")
+        snapshot = client.get(f"/v2/meetings/{meeting_id}/snapshot")
+        history = client.get("/v2/meetings")
+        audio = client.get(f"/v2/meetings/{meeting_id}/audio")
+        content = client.get(f"/v2/meetings/{meeting_id}/audio/content")
+
+    assert body["source"] == "uploaded_file"
+    assert body["provider"] == "local_funasr_batch"
+    assert body["source_audio"]["source_type"] == "imported_original"
+    assert (tmp_path / body["source_audio"]["relative_path"]).read_bytes() == audio_buffer.getvalue()
+    assert snapshot.status_code == 200
+    assert snapshot.json()["segments"][0]["text"] == "接口先恢度百分之五，确认负责人。"
+    assert snapshot.json()["runtime"]["phase"] == "ended"
+    assert snapshot.json()["minutes"]["markdown"].startswith("# 导入会议复盘")
+    assert snapshot.json()["approach_cards"][0]["suggestion_text"] == "确认负责人和回滚条件"
+    assert snapshot.json()["review"]["indexed"] is True
+    assert {job["status"] for job in jobs} == {"succeeded"}
+    assert history.status_code == 200
+    assert history.json()["meetings"][0]["id"] == meeting_id
+    assert history.json()["meetings"][0]["has_minutes"] is True
+    assert audio.status_code == 200
+    assert audio.json()["assembled"] is True
+    assert audio.json()["status"] == "saved"
+    assert content.status_code == 200
+    assert content.content.startswith(b"RIFF")
 
 
 def test_app_lifecycle_exports_a_sealed_recording_without_blocking_websocket_path(tmp_path):

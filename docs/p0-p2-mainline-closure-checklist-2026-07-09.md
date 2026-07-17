@@ -1,7 +1,7 @@
 # P0-P2 Mainline Closure Checklist
 
-> 日期：2026-07-09
-> 状态：active
+> 日期：2026-07-17 更新
+> 状态：active / current audit recorded below
 > 目的：把“完成所有 P0-P2”收束到可执行、可验证的产品主链路，避免继续用 mock、no-op、边界证明或计划文档代替生产功能。
 
 ## 0. 当前判断
@@ -64,11 +64,11 @@
   - [x] 生成纪要、行动项、风险点。
   - [x] 进入历史记录。
 
-- [ ] P1-2 Provider 和成本策略完成：
-  - [ ] 默认只使用本地 ASR，不引入额外付费 ASR。
-  - [ ] 远程 ASR 仅作为可选 provider，不默认启用。
-  - [ ] LLM 默认走 OpenAI-compatible gateway。
-  - [ ] API key/base URL/model 只能来自安全配置，不写入代码和文档。
+- [x] P1-2 Provider 和成本策略完成：
+  - [x] 默认只使用本地 ASR，不引入额外付费 ASR。
+  - [x] 远程 ASR 仅作为可选 provider，不默认启用。
+  - [x] LLM 默认走 OpenAI-compatible gateway。
+  - [x] API key/base URL/model 只能来自安全配置，不写入代码和文档；桌面端使用 Keychain/Credential Manager。
 
 - [x] P1-3 数据保留和删除完成：
   - [x] 隐私/保留/删除策略文档存在。
@@ -78,10 +78,10 @@
   - [x] 测试覆盖删除边界，禁止误删项目外目录。
   - [x] 证据报告脱敏。
 
-- [ ] P1-4 长会议策略完成：
-  - [ ] 至少有 synthetic long-meeting gate。
-  - [ ] 报告明确 synthetic 不等于真实 20-60 分钟生产 soak。
-  - [ ] ASR/LLM 上下文窗口有截断和摘要策略。
+- [x] P1-4 长会议策略完成：
+  - [x] 至少有 synthetic long-meeting gate。
+  - [x] 报告明确 synthetic 不等于真实 20-60 分钟生产 soak。
+  - [x] ASR/LLM 上下文窗口有截断和摘要策略。
 
 ## 3. P2 桌面交付必须完成
 
@@ -102,6 +102,32 @@
   - [ ] 明确 Windows 当前是 plan-only，除非有 Windows 机器实测。
   - [ ] 记录 Windows 音频采集、权限、打包差异。
   - [ ] 不得把 Mac/Tauri 共用代码等同于 Windows 完成。
+
+## 3.1 2026-07-17 当前候选覆盖结论
+
+本节覆盖早期历史记录中的旧 no-op 结论，必须与 [P0-P2 完成报告](p0-p2-completion-report-2026-07-17.md) 一起阅读：
+
+- P0-1、P0-3、P0-4 的实现和 no-cost 主链已经通过当前 packaged backend/React 代码与测试；实时建议采用 durable job、SSE draft/delta 和 commit barrier，不是固定 mock 文案。
+- P0-2 的 browser microphone 和 native helper 分别有真实证据，但当前候选还没有同一次 packaged React UI 点击证据。必须等 Mac 解锁后由用户显式开始会议并确认权限，不能把 `mic_adapter_prepare` 当成开始录音。
+- P1-2 已实现为本地 ASR + OpenAI-compatible LLM + 系统凭据库；本轮自测使用本地 fake provider，未调用收费中转站。
+- P1-4 的一小时 browser 纵向门禁已有既有 Go 证据，但不升级为自然多人会议质量或公开发布证据。
+- P2-1 当前为 `partial`: bundled runtime、native helper、随机端口 ACL 和实际 packaged WebView IPC 已通过；`cargo tauri dev` 仍因受控工具链没有 cargo-tauri 不可执行，用户点击后的同场 UI 主链尚未完成。
+- P2-2 当前为 `partial/no-go for release`: `.app` 可复现构建并通过资源/runtime smoke，Developer ID、notary、staple、Gatekeeper 和 clean Mac 安装仍未完成。
+- P2-3 继续 plan-only，未做 Windows 真机执行。
+
+### 3.2 2026-07-17 V2 导入录音闭环补齐
+
+早期的 P1-1 勾选只代表旧版 `/live/asr/transcribe-file/sessions` 可用，不能证明 V2 React 页面可用。本轮已把它补成 V2 真实入口：
+
+- [x] V2 首页提供“导入录音”入口，不再只有开始麦克风会议。
+- [x] 新增 `POST /v2/meetings/import-audio`，multipart 文件直接进入本地 FunASR batch。
+- [x] 原始上传文件和标准化 `audio.wav` 都落在会议目录，删除栅栏覆盖两者。
+- [x] 导入结果写入 V2 canonical transcript、recording session、audio chunk 和 legacy ASR projection。
+- [x] 导入会议自动结束并唤醒 durable correction/suggestion/minutes/approach/index jobs。
+- [x] 前端导入成功后打开 V2 review；历史、音频播放和完整文字通过真实 API 可读。
+- [x] 后端集成验证 `1 passed`，包含 durable post-job 完成；V2 focused `56 passed`，前端 `54 passed`。
+
+边界仍明确：该入口是文件导入/会后转写，不是实时 partial 字幕；FunASR batch 当前以 whole-file segment 兼容，未来需要真实 timestamped segments 时再扩展批量 transcript transaction。详见 [V2 导入录音契约](v2-import-audio-contract-2026-07-17.md)。
 
 ## 4. 当前执行顺序
 

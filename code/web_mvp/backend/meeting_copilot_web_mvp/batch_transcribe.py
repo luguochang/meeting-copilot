@@ -98,7 +98,12 @@ def is_available() -> bool:
     )
 
 
-def transcribe_file_report(audio_path: Path, timeout: int = 180) -> dict[str, Any]:
+def transcribe_file_report(
+    audio_path: Path,
+    timeout: int = 180,
+    *,
+    preserve_preprocessed: bool = False,
+) -> dict[str, Any]:
     if not is_available():
         raise RuntimeError("FunASR offline batch path not ready - file conversion unavailable")
     wav_path = ensure_wav_16k_mono(audio_path)
@@ -120,8 +125,10 @@ def transcribe_file_report(audio_path: Path, timeout: int = 180) -> dict[str, An
     item = dict(items[0])
     batch = {key: value for key, value in payload.items() if key not in {"items"}}
     item["batch"] = batch
+    if preserve_preprocessed:
+        item["normalized_audio_path"] = str(wav_path)
     _log.info("batch.transcribe.end", chars=len(str(item.get("text") or "")))
-    if wav_path != audio_path:
+    if wav_path != audio_path and not preserve_preprocessed:
         wav_path.unlink(missing_ok=True)
     return item
 

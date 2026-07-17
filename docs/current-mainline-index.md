@@ -10,7 +10,7 @@
 >
 > 文档真相与历史归档索引：`docs/archive/readiness-index.md`
 >
-> 当前代码候选基线：`7e696e0` (`feat: close packaged desktop mainline blockers`)，工作树已 clean；完整 commit 为 `7e696e0`，后续 artifact provenance 应绑定该候选
+> 当前代码候选基线：`7e696e0` (`feat: close packaged desktop mainline blockers`) 加上本轮 V2 导入录音改动；本轮改动提交前不得把旧 provenance 误认为当前代码证据
 >
 > 最新 clean provenance：`artifacts/tmp/release_provenance/phase0-clean-commit-20260717-r6/manifest.json`
 >
@@ -23,6 +23,10 @@
 > 最新 packaged WebView IPC 证据：`artifacts/tmp/packaged_tauri_ipc_smoke/phase3-packaged-tauri-ipc-20260717-r1/evidence.json`；真实 React 页面已调用 runtime/provider/mic prepare，未启动录音或绕过授权
 
 > 最新 packaged AI 主链证据：`artifacts/tmp/packaged_ai_mainline_smoke/phase3-packaged-ai-mainline-20260717-r2/evidence.json`；本地 fake OpenAI-compatible provider，不计远端 relay 或 UI 证据
+
+> 最新 P0-P2 逐项完成报告：`docs/p0-p2-completion-report-2026-07-17.md`
+
+> 最新 V2 导入录音契约：`docs/v2-import-audio-contract-2026-07-17.md`；该链路已有后端 focused `56 passed` 和前端完整 `54 passed`，但不替代 packaged UI 真实麦克风证据
 
 > 最新真实 native helper 证据：`artifacts/tmp/packaged_native_mic_smoke/phase3-real-native-mic-speaker-20260717-r3/evidence.json`；用户点击 UI 后 native mic + relay 同场仍待验
 >

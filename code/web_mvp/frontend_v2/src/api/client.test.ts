@@ -29,6 +29,21 @@ describe("HttpMeetingApi", () => {
     );
   });
 
+  it("uploads a recording as multipart without overriding the browser boundary", async () => {
+    const fetchSpy = vi.fn().mockResolvedValue(response({ meeting_id: "imported-meeting" }));
+    vi.stubGlobal("fetch", fetchSpy);
+    const api = new HttpMeetingApi();
+    const file = new File(["audio"], "meeting.m4a", { type: "audio/mp4" });
+
+    await expect(api.importRecording(file)).resolves.toEqual({ meetingId: "imported-meeting" });
+
+    const request = fetchSpy.mock.calls[0][1] as RequestInit;
+    expect(fetchSpy.mock.calls[0][0]).toBe("/v2/meetings/import-audio");
+    expect(request.method).toBe("POST");
+    expect(request.headers).toEqual({ Accept: "application/json" });
+    expect(request.body).toBeInstanceOf(FormData);
+  });
+
   it("deletes a meeting through the durable cleanup endpoint", async () => {
     const fetchSpy = vi.fn().mockResolvedValue(response({ deleted: true }));
     vi.stubGlobal("fetch", fetchSpy);
