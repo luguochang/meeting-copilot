@@ -115,6 +115,8 @@
 - P2-2 当前为 `partial/no-go for release`: `.app` 可复现构建并通过资源/runtime smoke，Developer ID、notary、staple、Gatekeeper 和 clean Mac 安装仍未完成。
 - P2-3 继续 plan-only，未做 Windows 真机执行。
 
+2026-07-17 DEC-406 最新 P2 证据：隔离 Rust `1.97.1` 与 `cargo-tauri 2.11.4` 已可用；当前提交 `.app` 已重新构建，资源完整；packaged React WebView IPC、bundled runtime supervisor 和 local AI 主链均通过。P2-1 仍未完全勾选的唯一主线是用户点击 packaged 页面后的真实 native microphone/UI 同场会议，Mac 锁屏解除后执行；P2-2 的签名、公证、Gatekeeper、clean Mac 和再分发授权仍保持发布门禁 No-Go。
+
 ### 3.2 2026-07-17 V2 导入录音闭环补齐
 
 早期的 P1-1 勾选只代表旧版 `/live/asr/transcribe-file/sessions` 可用，不能证明 V2 React 页面可用。本轮已把它补成 V2 真实入口：

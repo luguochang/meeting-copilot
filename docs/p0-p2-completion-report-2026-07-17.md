@@ -2,7 +2,7 @@
 
 日期：2026-07-17
 
-代码候选：`72fbae9` (`codex/phase0-clean-baseline`)，包含本轮 V2 导入录音闭环，工作树 clean。
+代码候选：`3bcc852` (`codex/phase0-clean-baseline`)，包含 V2 导入录音闭环和启动失败回滚，工作树 clean。
 
 ## 总结结论
 
@@ -53,7 +53,7 @@ P2 用户点击后的 native mic + UI 完整同场会议：No-Go，等待解锁 
 - [packaged app package](/Users/chase/Documents/面试/meeting-copilot-phase0-clean/artifacts/tmp/tauri_runtime_package/phase3-ipc-tauri-20260717-r1/evidence.json)
 - [provider/IPC/AI 设计状态](/Users/chase/Documents/面试/meeting-copilot-phase0-clean/docs/phase3-provider-tauri-ipc-and-packaged-ai-status-2026-07-17.md)
 
-验证汇总：frontend `49 passed`；provider/LLM/correction/streaming backend `81 passed`；Rust `28 passed`，Mac Keychain integration `1 passed`；Tauri/smoke `23 passed`；typecheck/lint/build/Ruff/Python compile/diff check 全部通过。
+验证汇总：frontend `55 passed`；provider/LLM/correction/streaming backend `81 passed`；Rust `28 passed`，Mac Keychain integration `1 passed`；Tauri/smoke `23 passed`；typecheck/lint/build/Ruff/Python compile/diff check 全部通过。
 
 ## 剩余主线
 
@@ -109,3 +109,32 @@ P2 用户点击后的 native mic + UI 完整同场会议：No-Go，等待解锁 
 验证结果：frontend focused `18 passed`、frontend 全量 `55 passed`、typecheck、ESLint、production build、`git diff --check` 通过。浏览器真实失败路径复测中，权限超时后 URL 返回 `/workbench`、历史行数为 0、`GET /v2/meetings` 为空、console warn/error 为 0。
 
 该修复关闭“启动失败留下幽灵会议”的缺陷；它不代表真实麦克风成功，也不改变 packaged UI 仍等待 Mac 解锁的 No-Go 结论。
+
+## 2026-07-17 当前提交 packaged 运行时收口
+
+为避免继续依赖旧 `.app` 证据，本轮在隔离工具链中完成了当前提交的重新构建：
+
+- Rust `1.97.1`、`cargo-tauri 2.11.4` 安装在 `artifacts/tmp/controlled_rust_toolchain`。
+- 当前 runtime bundle：`artifacts/tmp/macos_bundled_runtime/phase0-2-current-runtime-bundle-20260717-r2/evidence.json`。
+- 当前 packaged app：`artifacts/tmp/tauri_runtime_package/phase0-2-current-tauri-20260717-r1/evidence.json`。
+- 当前 packaged IPC：`artifacts/tmp/packaged_tauri_ipc_smoke/phase0-2-current-packaged-ipc-20260717-r1/evidence.json`。
+- 当前 packaged supervisor：`artifacts/tmp/packaged_runtime_supervisor_smoke/phase0-2-current-packaged-runtime-20260717-r1/evidence.json`。
+- 当前 packaged local AI：`artifacts/tmp/packaged_ai_mainline_smoke/phase0-2-current-packaged-ai-20260717-r1/evidence.json`。
+
+当前隔离 Rust/Tauri 工具链下 Rust 测试为 `28 passed, 1 ignored`，说明当前提交的 Tauri native/runtime 代码在新建工具链中仍可编译和通过行为测试。
+
+当前 packaged local AI 主链实际通过：
+
+```text
+本地中文 TTS WAV
+-> bundled FunASR final
+-> V2 transcript projection
+-> suggestion draft/delta/commit
+-> correction request
+-> recording chunks + WAV export
+-> end meeting
+-> minutes/approach/index
+-> app/backend/port cleanup
+```
+
+该证据将 P2 的“当前提交可打包、运行时可启动、后端 AI 主链可闭合”从旧制品重新绑定到 `3bcc852`；它仍不能替代真实 packaged UI 麦克风同场证据。

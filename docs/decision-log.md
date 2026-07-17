@@ -25715,3 +25715,34 @@ Tauri 启动 bundled backend 后会把主 WebView 导航到随机 `http://127.0.
 
 - backend 使用 `provider_mode=safe`，没有读取历史中转站密钥、`configs/local` 或用户私有录音；远程 ASR/LLM 调用为 0，新增费用为 0。
 - 测试使用独立 `artifacts/tmp/current-clean-8770-data`，没有修改 8767/8768/8769 的既有用户进程或数据。
+
+# DEC-406: 为当前提交补齐隔离 Tauri 工具链和 packaged 本地 AI 主链证据
+
+时间：2026-07-17
+
+状态：Accepted / Current commit packaged runtime and local AI chain Go / Packaged UI native mic No-Go pending unlock
+
+## 执行内容
+
+1. 在 `artifacts/tmp/controlled_rust_toolchain` 安装隔离 Rust `1.97.1` 和 `cargo-tauri 2.11.4`，不修改系统 PATH，不写入项目源码，不读取密钥。
+2. 用当前提交 `3bcc852` 的 frontend dist、backend、FunASR venv、Paraformer 模型和 native helper 重新生成 runtime bundle：
+   `artifacts/tmp/macos_bundled_runtime/phase0-2-current-runtime-bundle-20260717-r2/`。
+3. 用该 runtime bundle 重新构建 `.app`：
+   `artifacts/tmp/tauri_runtime_package/phase0-2-current-tauri-20260717-r1/Meeting Copilot.app`。
+4. 使用项目本地 TTS 生成的非私密中文技术会议 WAV 做 packaged runtime smoke；不使用之前的中转站配置，不调用远端服务。
+
+## 证据结果
+
+- runtime relocation：`go_local_relocatable_runtime_spike_not_public_release`；backend、FunASR、native helper、V2 dist 通过，external symlink `0`。
+- packaged app resource：`go_packaged_runtime_resource_app_not_public_release`；`build_return_code=0`，required packaged files missing `0`，app 逻辑大小约 `2.292 GB`。
+- packaged React WebView IPC：`go_packaged_tauri_ipc_page_smoke_not_public_release`；runtime/provider/mic prepare 命令可调用，未启动麦克风、未绕过授权。
+- packaged runtime supervisor：`go_packaged_runtime_supervisor_smoke_not_public_release`；bootstrap `303`、health/providers/workbench/ASR runtime `200`，FunASR ready，app/backend/端口均回收。
+- packaged local AI mainline：`go_packaged_local_ai_mainline_not_ui_not_public_release`；`FunASR final=1`，V2 segments `2`，suggestion committed `2`，录音 `6` chunks/30 秒/WAV assembled，minutes/approach/index 全部 `succeeded`，本地 OpenAI-compatible provider 请求 `5` 次且全部带测试授权。
+- 当前隔离工具链下 `cargo test --locked --quiet`：`28 passed, 1 ignored`。
+
+## 严格边界
+
+- 以上 packaged AI 证据不是用户点击 UI 证据；它证明的是当前 `.app` 内的 backend、FunASR、durable AI jobs、录音和复盘链路。
+- Computer Use 仍返回 Mac locked，因此尚未执行“打包页面点击开始会议 -> 系统权限 -> native mic -> 页面文字/建议/修正 -> 结束复盘”的同场操作。
+- 公开发布仍 No-Go：未完成 Developer ID、notary/staple、Gatekeeper、separate clean Mac 和模型/FFmpeg 再分发授权。
+- 运行期间 remote ASR/LLM、paid service 和用户私有音频读取均为 `0`。

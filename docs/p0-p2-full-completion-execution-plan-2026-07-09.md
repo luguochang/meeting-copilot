@@ -244,6 +244,8 @@ W5 boundary:
 
 2026-07-17 当前状态：`partial_packaged_ipc_go_ui_mainline_pending_unlock`。后端和录音链路已经有 packaged local smoke，实际页面安全 IPC 已通过，但锁屏使本轮无法点击“开始会议”并触发系统麦克风授权；该项保持未完成。
 
+2026-07-17 DEC-406 follow-up：已在 `artifacts/tmp/controlled_rust_toolchain` 安装隔离 Rust `1.97.1` 与 `cargo-tauri 2.11.4`，并用当前提交重新生成 runtime bundle 和 `.app`。当前 packaged IPC、supervisor 和 local AI mainline 均有当前候选证据；W5 剩余范围收敛为真实打包页面点击后的 native microphone/UI 同场验证，不再把缺失 cargo-tauri 当作当前 blocker。
+
 ### W6. Release Refresh
 
 - [x] Refresh browser live mic or equivalent current evidence so semantic quality fields are present.
