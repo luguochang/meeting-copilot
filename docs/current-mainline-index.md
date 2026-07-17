@@ -10,7 +10,7 @@
 >
 > 文档真相与历史归档索引：`docs/archive/readiness-index.md`
 >
-> 当前实施分支：`codex/phase0-clean-baseline`；本轮 provider/IPC/UX 改动完成验证后再生成新的 clean commit provenance
+> 当前代码候选基线：`7e696e0` (`feat: close packaged desktop mainline blockers`)，工作树已 clean；完整 commit 为 `7e696e0`，后续 artifact provenance 应绑定该候选
 >
 > 最新 clean provenance：`artifacts/tmp/release_provenance/phase0-clean-commit-20260717-r6/manifest.json`
 >

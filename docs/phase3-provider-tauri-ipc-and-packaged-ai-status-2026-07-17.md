@@ -2,6 +2,8 @@
 
 日期：2026-07-17
 
+代码候选：`7e696e0` (`codex/phase0-clean-baseline`)，工作树已 clean。
+
 结论：桌面工程主链从“Rust handler 已实现但 packaged 页面不可调用”推进到“真实 packaged React WebView IPC 已通过”；同一新包的本地 ASR、流式建议、修正、录音和会后任务也已通过。当前可以作为 Mac Internal Alpha 候选继续收口，但不是生产发布包。
 
 ## 已实现
