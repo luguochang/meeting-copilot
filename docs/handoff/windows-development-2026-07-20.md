@@ -303,7 +303,7 @@ Mac 打包必须在 macOS 上执行，因为 Swift/ScreenCaptureKit、Apple Deve
 
 ```text
 你正在接手 Meeting Copilot。先阅读：
-1. docs/repository-handoff-windows-development-2026-07-20.md
+1. docs/handoff/windows-development-2026-07-20.md
 2. docs/full-roadmap-execution-checklist-2026-07-18.md
 3. docs/post-phase0-2-product-gap-and-roadmap-discussion-2026-07-18.md
 4. docs/runtime-operating-constraints.md
