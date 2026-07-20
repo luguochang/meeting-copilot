@@ -2,7 +2,7 @@
 
 > 日期：2026-07-06  
 > 决策者：项目维护者 + Claude Code 复盘  
-> 参照：`docs/project-release-readiness-reset-2026-07-05.md`（DEC-217）、`优化方案与计划书-2026-07-06.md`
+> 参照：`docs/project-release-readiness-reset-2026-07-05.md`（DEC-217）、`docs/archive/legacy/2026-07/优化方案与计划书-2026-07-06.md`
 
 ## 1. 当前状态定性
 
@@ -36,7 +36,7 @@
 
 ## 3. 已采纳的优化路线（5 阶段）
 
-见 `优化方案与计划书-2026-07-06.md`。摘要：
+见 `docs/archive/legacy/2026-07/优化方案与计划书-2026-07-06.md`。摘要：
 
 - **Phase 0**（止血）：git 基线、密钥迁 .env、structlog 日志、归档脚手架 ← 进行中
 - **Phase 1**（ASR 决断，命门）：干净音频重测 FunASR/sherpa/远程，决断路线

@@ -8,7 +8,8 @@
 
 ```text
 meeting-copilot/
-  docs/                    产品、需求、架构、评测文档
+  docs/                    当前产品、需求、架构、评测文档
+    archive/               历史方案、阶段计划和被替代报告
   code/                    可运行代码
     core/                  平台无关 Copilot core
     web_mvp/               本地 PC Web MVP
@@ -26,6 +27,8 @@ meeting-copilot/
       fixtures/            PC Local Web MVP demo/replay 样本，不包含密钥或真实本地录音路径
   configs/                 provider 配置、mock 输入
   results/                 bake-off 输出结果
+  design-system/           当前 UI 设计系统和页面规范
+  设计稿/                  历史视觉设计稿和说明素材
   artifacts/               临时产物、导出物、后续可清理文件
   tools/                   本地开发、验证和质量门禁脚本
   tests/                   跨模块工具脚本测试
@@ -34,10 +37,12 @@ meeting-copilot/
 ## 分类原则
 
 - `docs/` 只放设计、需求、评审和说明。
+- `docs/archive/` 只放历史文档，不作为当前状态依据。
 - `code/` 只放可执行代码和测试。
 - `data/` 放输入数据，真实音频不提交公共仓库。
 - `configs/` 放 provider 和运行配置，真实 API key 不提交。
 - `results/` 放可复现评测结果。
+- `design-system/` 放当前 UI 设计系统；`设计稿/` 保留历史视觉素材和设计说明。
 - `artifacts/` 放临时人工产物或导出物。
 - `tools/` 放不属于单一业务包的本地工程脚本，例如统一质量门禁。
 - `tests/` 放跨模块工程脚本测试；业务模块测试仍放在各自 `code/*/tests` 下。

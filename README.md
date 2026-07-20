@@ -7,7 +7,8 @@
 
 ```text
 meeting-copilot/
-  docs/                    产品、需求、架构、评测文档
+  docs/                    当前产品、需求、架构、评测和交接文档
+    archive/               历史方案、阶段计划和被替代报告
   code/                    可运行代码
     core/                  平台无关 Copilot core
     web_mvp/               本地 PC Web MVP
@@ -19,6 +20,8 @@ meeting-copilot/
   data/                    评测数据、样本、标注、reference
   configs/                 provider 配置、mock 输入
   results/                 bake-off 输出结果
+  design-system/           当前 UI 设计系统和页面规范
+  设计稿/                  历史视觉设计稿和说明素材
   artifacts/               临时产物和导出物
 ```
 
