@@ -244,6 +244,15 @@ def test_fact_changing_corrections_are_rejected_even_when_text_is_similar():
         ) is None
 
 
+def test_chinese_fraction_scales_match_equivalent_percentages_but_reject_changed_values():
+    original = "错误率超过千分之一时立即回滚，丢包率超过万分之五时报警。"
+    equivalent = "错误率超过 0.1% 时立即回滚，丢包率超过 0.05% 时报警。"
+    changed = "错误率超过 0.5% 时立即回滚，丢包率超过 0.05% 时报警。"
+
+    assert correction.correction_is_safe(original, equivalent) is True
+    assert correction.correction_is_safe(original, changed) is False
+
+
 def test_valid_revision_preserves_evidence_and_non_secret_usage():
     final = _final("s1", "我们先灰度百分之五，如果错误率超过百分之零点一就回滚。")
     revision = correction.build_revision_event(

@@ -23,6 +23,9 @@ PRODUCT_SOFT_LIMIT_BYTES = 10 * GIB
 AVAILABLE_SPACE_QUOTA_DIVISOR = 5
 LOG_MAX_BYTES = 10 * MIB
 LOG_BACKUP_COUNT = 5
+PRIVATE_DIRECTORY_MODE = 0o700
+PRIVATE_FILE_MODE = 0o600
+PRIVATE_STORAGE_PERMISSIONS_MARKER = ".storage-permissions-v1"
 
 _LOG_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.log$")
 _PROCESS_LOCKS_GUARD = threading.Lock()
@@ -85,6 +88,98 @@ class LogWriteResult:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def _chmod_private(path: Path, mode: int) -> None:
+    """Apply owner-only permissions where the host filesystem exposes them."""
+
+    if os.name == "nt":
+        # Windows app-data ACLs are inherited from the per-user app-data root.
+        # The POSIX mode bits are not an ACL boundary there.
+        return
+    try:
+        os.chmod(path, mode, follow_symlinks=False)
+    except TypeError:  # pragma: no cover - older Python/platform combination.
+        os.chmod(path, mode)
+
+
+def ensure_private_directory(path: str | Path) -> Path:
+    """Create or tighten a managed directory without following symlinks."""
+
+    requested = Path(path).expanduser()
+    if requested.is_symlink():
+        raise UnsafeManagedPathError("managed private directory must not be a symbolic link")
+    directory = requested.resolve(strict=False)
+    directory.mkdir(parents=True, exist_ok=True, mode=PRIVATE_DIRECTORY_MODE)
+    if directory.is_symlink() or not directory.is_dir():
+        raise UnsafeManagedPathError("managed private path must be a directory")
+    _chmod_private(directory, PRIVATE_DIRECTORY_MODE)
+    return directory
+
+
+def harden_private_file(path: str | Path) -> Path:
+    """Tighten an existing managed regular file and reject symlinks."""
+
+    file_path = Path(path).expanduser()
+    if file_path.is_symlink():
+        raise UnsafeManagedPathError("managed private file must not be a symbolic link")
+    if not file_path.exists() or not file_path.is_file():
+        raise UnsafeManagedPathError("managed private path must be a regular file")
+    _chmod_private(file_path, PRIVATE_FILE_MODE)
+    return file_path
+
+
+def harden_sqlite_files(database_path: str | Path) -> None:
+    """Tighten SQLite's database and any live journal sidecars."""
+
+    database = Path(database_path)
+    for candidate in (
+        database,
+        Path(f"{database}-wal"),
+        Path(f"{database}-shm"),
+        Path(f"{database}-journal"),
+    ):
+        if candidate.exists():
+            harden_private_file(candidate)
+
+
+def harden_managed_storage_permissions(data_dir: str | Path) -> dict[str, int]:
+    """Tighten an existing local data tree once, without following links."""
+
+    root = ensure_private_directory(data_dir)
+    marker = root / PRIVATE_STORAGE_PERMISSIONS_MARKER
+    if marker.exists():
+        harden_private_file(marker)
+        return {"directory_count": 0, "file_count": 0, "already_hardened": 1}
+    directory_count = 0
+    file_count = 0
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        for entry in os.scandir(directory):
+            candidate = Path(entry.path)
+            if entry.is_symlink():
+                raise UnsafeManagedPathError(
+                    f"managed storage contains a symbolic link: {candidate.name}"
+                )
+            if entry.is_dir(follow_symlinks=False):
+                _chmod_private(candidate, PRIVATE_DIRECTORY_MODE)
+                directory_count += 1
+                pending.append(candidate)
+            elif entry.is_file(follow_symlinks=False):
+                harden_private_file(candidate)
+                file_count += 1
+            else:
+                raise UnsafeManagedPathError(
+                    f"managed storage contains an unsupported entry: {candidate.name}"
+                )
+    marker.write_text("owner-only storage permissions enforced\n", encoding="ascii")
+    harden_private_file(marker)
+    return {
+        "directory_count": directory_count,
+        "file_count": file_count,
+        "already_hardened": 0,
+    }
 
 
 def estimate_pcm16_storage_bytes(

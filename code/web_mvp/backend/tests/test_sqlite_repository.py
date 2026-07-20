@@ -8,6 +8,7 @@ import time
 import pytest
 
 import meeting_copilot_web_mvp.sqlite_repository as sqlite_repository
+from meeting_copilot_web_mvp.application_schema import APPLICATION_SCHEMA_VERSION
 from meeting_copilot_web_mvp.sqlite_repository import (
     SqliteAsrLiveSessionRepository,
     SqlitePersistenceCoordinator,
@@ -254,7 +255,7 @@ def test_schema_version_zero_database_upgrades_to_minimal_tombstone_schema(tmp_p
     assert migrate_json_to_sqlite(tmp_path, db_path) == 0
 
     with sqlite3.connect(db_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == APPLICATION_SCHEMA_VERSION
         assert connection.execute(
             "SELECT COUNT(*) FROM sessions WHERE session_id = 'existing_version_zero'"
         ).fetchone()[0] == 1
@@ -267,9 +268,9 @@ def test_schema_version_zero_database_upgrades_to_minimal_tombstone_schema(tmp_p
 def test_unknown_higher_schema_version_is_rejected(tmp_path):
     db_path = tmp_path / "meeting_copilot.db"
     with sqlite3.connect(db_path) as connection:
-        connection.execute("PRAGMA user_version = 2")
+        connection.execute(f"PRAGMA user_version = {APPLICATION_SCHEMA_VERSION + 1}")
 
-    with pytest.raises(RuntimeError, match="unsupported SQLite schema version 2"):
+    with pytest.raises(RuntimeError, match=f"unsupported future SQLite schema version {APPLICATION_SCHEMA_VERSION + 1}"):
         migrate_json_to_sqlite(tmp_path, db_path)
 
 

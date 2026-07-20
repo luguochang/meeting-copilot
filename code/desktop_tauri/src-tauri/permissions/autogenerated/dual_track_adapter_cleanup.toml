@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-dual-track-adapter-cleanup"
+description = "Enables the dual_track_adapter_cleanup command without any pre-configured scope."
+commands.allow = ["dual_track_adapter_cleanup"]
+
+[[permission]]
+identifier = "deny-dual-track-adapter-cleanup"
+description = "Denies the dual_track_adapter_cleanup command without any pre-configured scope."
+commands.deny = ["dual_track_adapter_cleanup"]

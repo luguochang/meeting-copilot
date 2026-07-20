@@ -37,6 +37,7 @@ def test_llm_provider_probe_uses_running_service_configuration(monkeypatch):
     monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gateway.example")
     monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-probe-secret")
     monkeypatch.setenv("LLM_GATEWAY_MODEL", "probe-model")
+    monkeypatch.setenv("LLM_GATEWAY_REALTIME_MODEL", "probe-fast-model")
     monkeypatch.delenv("LLM_GATEWAY_IS_MOCK", raising=False)
     monkeypatch.setattr(llm_service, "HttpxLlmClient", lambda: Client())
 
@@ -48,10 +49,11 @@ def test_llm_provider_probe_uses_running_service_configuration(monkeypatch):
         "ok": True,
         "operational": True,
         "provider": "openai_compatible_gateway",
-        "model": "probe-model",
+        "model": "probe-fast-model",
         "usage": {"prompt_tokens": 7, "completion_tokens": 2, "total_tokens": 9},
     }
     assert calls[0][0] == "https://gateway.example/v1/chat/completions"
+    assert calls[0][2]["model"] == "probe-fast-model"
     assert calls[0][2]["reasoning_effort"] == "low"
     assert calls[0][2]["max_completion_tokens"] == 16
     assert "max_tokens" not in calls[0][2]

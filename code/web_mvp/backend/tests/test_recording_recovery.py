@@ -3,7 +3,10 @@ from __future__ import annotations
 import struct
 
 from meeting_copilot_web_mvp.audio_assets import SAMPLE_RATE_HZ, RealtimeWavAssetWriter
-from meeting_copilot_web_mvp.recording_recovery import reconcile_and_recover_expired_recordings
+from meeting_copilot_web_mvp.recording_recovery import (
+    reconcile_and_recover_abandoned_recordings,
+    reconcile_and_recover_expired_recordings,
+)
 from meeting_copilot_web_mvp.v2_persistence import V2Persistence
 
 
@@ -135,11 +138,149 @@ def test_partial_init_directory_does_not_block_other_expired_recordings(tmp_path
     )
 
     assert recovered == ["a-partial-init", "b-fsynced-audio"]
-    assert persistence.get_recording_session(
-        "a-partial-init", track="microphone", epoch=0
-    )["status"] == "interrupted"
+    assert persistence.get_recording_session("a-partial-init", track="microphone", epoch=0)["status"] == "interrupted"
     assert len(persistence.list_audio_chunks("b-fsynced-audio")) == 1
-    assert persistence.list_recording_exports(meeting_id="b-fsynced-audio")[0][
-        "status"
-    ] == "pending"
+    assert persistence.list_recording_exports(meeting_id="b-fsynced-audio")[0]["status"] == "pending"
+    persistence.close()
+
+
+def test_packaged_restart_recovers_unexpired_capture_and_fsynced_audio(tmp_path):
+    meeting_id = "runtime-restart-recording"
+    persistence = V2Persistence(tmp_path / "meeting_copilot.db")
+    persistence.create_meeting(meeting_id=meeting_id, title=None, now_ms=1_000)
+    persistence.begin_recording(
+        meeting_id=meeting_id,
+        track="microphone",
+        epoch=0,
+        source_type="browser_live_mic",
+        sample_rate_hz=SAMPLE_RATE_HZ,
+        lease_owner="dead-runtime-capture",
+        lease_ms=30_000,
+        now_ms=1_000,
+    )
+    writer = RealtimeWavAssetWriter(
+        data_dir=tmp_path,
+        session_id=meeting_id,
+        source_type="browser_live_mic",
+    )
+    writer.write_float32_pcm(struct.pack("<f", 0.1) * (SAMPLE_RATE_HZ * 5))
+
+    recovered = reconcile_and_recover_abandoned_recordings(
+        persistence,
+        data_dir=tmp_path,
+        now_ms=2_000,
+    )
+
+    assert recovered == [meeting_id]
+    recording = persistence.get_recording_session(
+        meeting_id,
+        track="microphone",
+        epoch=0,
+    )
+    assert recording["status"] == "interrupted"
+    assert recording["error_class"] == "runtime_restarted"
+    assert recording["chunk_count"] == 1
+    assert persistence.list_recording_exports(meeting_id=meeting_id)[0]["status"] == "pending"
+    persistence.close()
+
+
+def test_packaged_restart_scan_cannot_interrupt_new_capture_generation(tmp_path, monkeypatch):
+    meeting_id = "runtime-restart-fenced"
+    persistence = V2Persistence(tmp_path / "meeting_copilot.db")
+    persistence.create_meeting(meeting_id=meeting_id, title=None, now_ms=1_000)
+    persistence.begin_recording(
+        meeting_id=meeting_id,
+        track="microphone",
+        epoch=0,
+        source_type="browser_live_mic",
+        sample_rate_hz=SAMPLE_RATE_HZ,
+        lease_owner="dead-runtime-capture",
+        lease_ms=500,
+        now_ms=1_000,
+    )
+    stale_scan = persistence.list_active_recording_sessions()
+    persistence.recover_expired_recording_leases(now_ms=2_000)
+    resumed = persistence.begin_recording(
+        meeting_id=meeting_id,
+        track="microphone",
+        epoch=0,
+        source_type="browser_live_mic",
+        sample_rate_hz=SAMPLE_RATE_HZ,
+        lease_owner="new-runtime-capture",
+        lease_ms=30_000,
+        now_ms=2_000,
+    )
+    monkeypatch.setattr(
+        persistence,
+        "list_active_recording_sessions",
+        lambda: stale_scan,
+    )
+
+    recovered = reconcile_and_recover_abandoned_recordings(
+        persistence,
+        data_dir=tmp_path,
+        now_ms=2_100,
+    )
+
+    assert recovered == []
+    current = persistence.get_recording_session(
+        meeting_id,
+        track="microphone",
+        epoch=0,
+    )
+    assert current["status"] == "active"
+    assert current["capture_generation"] == resumed["capture_generation"] == 2
+    persistence.close()
+
+
+def test_writer_setup_abort_releases_only_its_exact_capture_generation(tmp_path):
+    meeting_id = "writer-setup-abort"
+    persistence = V2Persistence(tmp_path / "meeting_copilot.db")
+    persistence.create_meeting(meeting_id=meeting_id, title=None, now_ms=1_000)
+    first = persistence.begin_recording(
+        meeting_id=meeting_id,
+        track="microphone",
+        epoch=0,
+        source_type="browser_live_mic",
+        sample_rate_hz=SAMPLE_RATE_HZ,
+        lease_owner="failed-writer",
+        lease_ms=30_000,
+        now_ms=1_000,
+    )
+
+    aborted = persistence.abort_recording_setup(
+        meeting_id=meeting_id,
+        track="microphone",
+        epoch=0,
+        lease_owner="failed-writer",
+        capture_generation=first["capture_generation"],
+        now_ms=1_100,
+    )
+    resumed = persistence.begin_recording(
+        meeting_id=meeting_id,
+        track="microphone",
+        epoch=0,
+        source_type="browser_live_mic",
+        sample_rate_hz=SAMPLE_RATE_HZ,
+        lease_owner="healthy-writer",
+        lease_ms=30_000,
+        now_ms=1_200,
+    )
+    stale_abort = persistence.abort_recording_setup(
+        meeting_id=meeting_id,
+        track="microphone",
+        epoch=0,
+        lease_owner="failed-writer",
+        capture_generation=first["capture_generation"],
+        now_ms=1_300,
+    )
+
+    current = persistence.get_recording_session(meeting_id, track="microphone", epoch=0)
+    assert aborted is not None
+    assert aborted["status"] == "interrupted"
+    assert aborted["error_class"] == "recording_setup_failed"
+    assert resumed["capture_generation"] == first["capture_generation"] + 1
+    assert stale_abort is None
+    assert current["status"] == "active"
+    assert current["lease_owner"] == "healthy-writer"
     persistence.close()

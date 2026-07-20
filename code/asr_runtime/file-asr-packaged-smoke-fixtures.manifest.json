@@ -1,0 +1,28 @@
+{
+  "schema_version": "meeting_copilot.file_asr_smoke_fixtures.v1",
+  "fixture_set_id": "modelscope-asr-example-three-formats-20260719-v2",
+  "language": "zh-CN",
+  "fixtures": {
+    "wav": {
+      "sha256": "2ffa478de2cd570dd54e8762008cd6bbde9871fd79757f1cdbbec7d6b7b49274",
+      "duration_ms": 4523,
+      "provenance": "upstream_model_example"
+    },
+    "m4a": {
+      "sha256": "c894a72bb3c2db4e6d535c4b6ac9a008e911557f3a8e0a3263ed3e071fceb3de",
+      "duration_ms": 4523,
+      "provenance": "controlled_conversion_of_upstream_model_example"
+    },
+    "mp3": {
+      "sha256": "26a2be7457db1454e01f21fe7719dcae131524bbcb7f32a3ea042275e6ad5fa4",
+      "duration_ms": 4523,
+      "provenance": "controlled_conversion_of_upstream_model_example"
+    }
+  },
+  "quality_scope": {
+    "fake_asr_allowed": false,
+    "counts_as_worker_execution_smoke": true,
+    "counts_as_model_quality_benchmark": false,
+    "reason": "A single upstream example validates packaged plumbing and real model execution, not Chinese meeting quality."
+  }
+}

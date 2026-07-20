@@ -32,8 +32,8 @@ data/asr_eval/local_samples/
 data/asr_eval/public_raw/
 data/local_runtime/
 
-# === Artifacts (tmp / generated) ===
-artifacts/tmp/
+# === Artifacts (tmp / generated; never commit recordings, databases, reports, or screenshots) ===
+artifacts/
 code/artifacts/
 code/web_mvp/backend/artifacts/
 .superpowers/

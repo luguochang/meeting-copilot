@@ -10,7 +10,6 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
-import re
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -19,6 +18,13 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
+
+from meeting_copilot_web_mvp.openai_protocol import (
+    chat_body_to_responses,
+    responses_finish_reason,
+    responses_payload_to_chat,
+    responses_usage_to_chat,
+)
 
 
 class TransportMode(str, Enum):
@@ -115,7 +121,23 @@ DeltaCallback = Callable[[CompletionDelta], Awaitable[None] | None]
 Clock = Callable[[], float]
 
 _RESERVED_PARAMETERS = frozenset({"model", "messages", "stream", "stream_options"})
-_SAFE_PROVIDER_CODE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+_SAFE_PROVIDER_CODES = frozenset(
+    {
+        "API_KEY_REQUIRED",
+        "AUTHENTICATION_ERROR",
+        "ENDPOINT_NOT_FOUND",
+        "INSUFFICIENT_QUOTA",
+        "INVALID_API_KEY",
+        "INVALID_MODEL",
+        "INVALID_REQUEST_ERROR",
+        "MODEL_NOT_FOUND",
+        "NO_AVAILABLE_ACCOUNTS",
+        "PERMISSION_DENIED",
+        "RATE_LIMIT_EXCEEDED",
+        "UNSUPPORTED_ENDPOINT",
+        "UNSUPPORTED_PARAMETER",
+    }
+)
 
 
 def provider_idempotency_header_value(value: Any) -> str | None:
@@ -145,6 +167,7 @@ class OpenAICompatibleStreamingProvider:
         client: httpx.AsyncClient | None = None,
         timeout_seconds: float = 60.0,
         allow_non_streaming_fallback: bool = True,
+        api_style: str = "chat_completions",
         clock: Clock | None = None,
     ) -> None:
         self._base_url = _validated_base_url(base_url)
@@ -159,6 +182,10 @@ class OpenAICompatibleStreamingProvider:
 
         self._timeout_seconds = float(timeout_seconds)
         self._allow_non_streaming_fallback = bool(allow_non_streaming_fallback)
+        normalized_api_style = str(api_style or "").strip().lower()
+        if normalized_api_style not in {"chat_completions", "responses"}:
+            raise ValueError("api_style must be chat_completions or responses")
+        self._api_style = normalized_api_style
         self._clock = clock or time.perf_counter
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(
@@ -214,6 +241,14 @@ class OpenAICompatibleStreamingProvider:
         if request_identity is not None:
             headers["Idempotency-Key"] = request_identity
         started_at = self._clock()
+
+        if self._api_style == "responses":
+            return await self._complete_via_responses(
+                request_body,
+                headers=headers,
+                on_delta=on_delta,
+                started_at=started_at,
+            )
 
         try:
             async with self._client.stream(
@@ -293,6 +328,181 @@ class OpenAICompatibleStreamingProvider:
     @property
     def _completion_url(self) -> str:
         return f"{self._base_url}/v1/chat/completions"
+
+    @property
+    def _responses_url(self) -> str:
+        return f"{self._base_url}/v1/responses"
+
+    async def _complete_via_responses(
+        self,
+        chat_body: Mapping[str, Any],
+        *,
+        headers: Mapping[str, str],
+        on_delta: DeltaCallback | None,
+        started_at: float,
+    ) -> ChatCompletionResult:
+        responses_body = chat_body_to_responses(chat_body, stream=True)
+        try:
+            async with self._client.stream(
+                "POST",
+                self._responses_url,
+                headers=headers,
+                json=responses_body,
+                timeout=self._timeout_seconds,
+            ) as response:
+                connected_at = self._clock()
+                if response.status_code >= 400:
+                    raise _http_error(response.status_code, await _response_json(response))
+
+                content_type = response.headers.get("content-type", "").lower()
+                if "text/event-stream" in content_type:
+                    return await self._consume_responses_sse(
+                        response,
+                        on_delta=on_delta,
+                        started_at=started_at,
+                        connected_at=connected_at,
+                    )
+
+                payload = await _response_json(response)
+                if not isinstance(payload, dict):
+                    raise StreamingProviderError(
+                        ProviderErrorCategory.PROTOCOL,
+                        retryable=False,
+                        status_code=response.status_code,
+                        detail="Responses API returned invalid JSON",
+                    )
+                normalized = responses_payload_to_chat(payload)
+                return await self._consume_non_streaming(
+                    normalized,
+                    on_delta=on_delta,
+                    started_at=started_at,
+                    connected_at=connected_at,
+                    fallback_reason="responses_api_returned_non_streaming_response",
+                )
+        except StreamingProviderError:
+            raise
+        except httpx.TimeoutException as exc:
+            raise StreamingProviderError(
+                ProviderErrorCategory.TIMEOUT,
+                retryable=True,
+                detail="provider request timed out",
+            ) from exc
+        except httpx.RequestError as exc:
+            raise StreamingProviderError(
+                ProviderErrorCategory.TRANSPORT,
+                retryable=True,
+                detail="provider transport failed",
+            ) from exc
+        except ValueError as exc:
+            raise StreamingProviderError(
+                ProviderErrorCategory.PROTOCOL,
+                retryable=False,
+                detail="Responses API returned an invalid completion",
+            ) from exc
+
+    async def _consume_responses_sse(
+        self,
+        response: httpx.Response,
+        *,
+        on_delta: DeltaCallback | None,
+        started_at: float,
+        connected_at: float,
+    ) -> ChatCompletionResult:
+        parts: list[str] = []
+        sequence = 0
+        first_token_at: float | None = None
+        usage: TokenUsage | None = None
+        response_id: str | None = None
+        served_model: str | None = None
+        finish_reason: str | None = None
+        done_seen = False
+
+        async for raw_data in _iter_sse_data(response):
+            data = raw_data.strip()
+            if data == "[DONE]":
+                break
+            try:
+                payload = json.loads(data)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise StreamingProviderError(
+                    ProviderErrorCategory.PROTOCOL,
+                    retryable=False,
+                    detail="provider emitted malformed Responses SSE JSON",
+                ) from exc
+            if not isinstance(payload, dict):
+                raise StreamingProviderError(
+                    ProviderErrorCategory.PROTOCOL,
+                    retryable=False,
+                    detail="provider emitted a non-object Responses event",
+                )
+
+            event_type = str(payload.get("type") or "")
+            if event_type == "error" or event_type == "response.failed":
+                raise _stream_error(payload)
+            if event_type == "response.incomplete":
+                raise StreamingProviderError(
+                    ProviderErrorCategory.PROTOCOL,
+                    retryable=False,
+                    detail="provider Responses stream ended incomplete",
+                )
+            if event_type == "response.output_text.delta":
+                text = str(payload.get("delta") or "")
+                if not text:
+                    continue
+                if first_token_at is None:
+                    first_token_at = self._clock()
+                parts.append(text)
+                sequence += 1
+                await _emit_delta(
+                    on_delta,
+                    CompletionDelta(
+                        text=text,
+                        sequence=sequence,
+                        transport_mode=TransportMode.STREAMING,
+                    ),
+                )
+                continue
+            if event_type != "response.completed":
+                continue
+
+            completed = payload.get("response")
+            completed = completed if isinstance(completed, dict) else payload
+            response_id = _optional_string(completed.get("id"))
+            served_model = _optional_string(completed.get("model"))
+            finish_reason = responses_finish_reason(completed)
+            raw_usage = responses_usage_to_chat(completed.get("usage"))
+            if any(raw_usage.values()):
+                usage = _parse_usage(raw_usage)
+            done_seen = True
+            break
+
+        if not done_seen:
+            raise StreamingProviderError(
+                ProviderErrorCategory.PROTOCOL,
+                retryable=not parts,
+                detail="provider Responses stream ended before completion",
+            )
+        if first_token_at is None:
+            raise StreamingProviderError(
+                ProviderErrorCategory.EMPTY_RESPONSE,
+                retryable=True,
+                detail="provider Responses stream contained no assistant text",
+            )
+        completed_at = self._clock()
+        return ChatCompletionResult(
+            content="".join(parts),
+            transport_mode=TransportMode.STREAMING,
+            timings=ProviderTimings(
+                started_at=started_at,
+                connected_at=connected_at,
+                first_token_at=first_token_at,
+                completed_at=completed_at,
+            ),
+            usage=usage,
+            response_id=response_id,
+            model=served_model,
+            finish_reason=finish_reason,
+        )
 
     async def _consume_sse(
         self,
@@ -383,7 +593,7 @@ class OpenAICompatibleStreamingProvider:
         if not done_seen:
             raise StreamingProviderError(
                 ProviderErrorCategory.PROTOCOL,
-                retryable=True,
+                retryable=not parts,
                 detail="provider stream ended before [DONE]",
             )
         if first_token_at is None:
@@ -644,6 +854,9 @@ def _http_error(status_code: int, payload: Any) -> StreamingProviderError:
 
 def _stream_error(payload: Mapping[str, Any]) -> StreamingProviderError:
     error = payload.get("error")
+    if not isinstance(error, dict):
+        response = payload.get("response")
+        error = response.get("error") if isinstance(response, dict) else error
     error = error if isinstance(error, dict) else {}
     provider_code = _optional_string(error.get("code"))
     classifier = " ".join(
@@ -689,14 +902,14 @@ def _provider_code(payload: Any) -> str | None:
     if not isinstance(payload, dict):
         return None
     error = payload.get("error")
-    if not isinstance(error, dict):
-        return None
-    return _optional_string(error.get("code"))
+    if isinstance(error, dict):
+        return _optional_string(error.get("code") or error.get("type"))
+    return _optional_string(payload.get("code") or payload.get("type"))
 
 
 def _safe_provider_code(value: str | None) -> str | None:
-    normalized = str(value or "").strip()
-    return normalized if _SAFE_PROVIDER_CODE.fullmatch(normalized) else None
+    normalized = str(value or "").strip().upper()
+    return normalized if normalized in _SAFE_PROVIDER_CODES else None
 
 
 def _first_non_empty(current: str | None, candidate: Any) -> str | None:

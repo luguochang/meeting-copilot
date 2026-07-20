@@ -663,6 +663,108 @@ def test_build_asr_live_events_extracts_open_question_state_candidate():
     }
 
 
+def test_plain_technical_final_creates_candidate_only_suggestion_opportunity():
+    events = build_asr_live_events(
+        session_id="plain_technical_discussion",
+        provider="funasr_realtime",
+        streaming_events=[
+            {
+                "event_type": "final",
+                "segment_id": "technical_001",
+                "text": "数据库迁移方案分两步，先兼容旧 schema，再切换读流量。",
+                "start_ms": 0,
+                "end_ms": 5_000,
+                "received_at_ms": 5_100,
+                "confidence": 0.91,
+            },
+            {
+                "event_type": "end_of_stream",
+                "segment_id": "eos",
+                "text": "",
+                "start_ms": 5_100,
+                "end_ms": 5_100,
+                "received_at_ms": 5_200,
+            },
+        ],
+    )
+
+    event_types = [event["event_type"] for event in events]
+    assert "state_event" not in event_types
+    assert "suggestion_candidate_event" in event_types
+    assert "llm_request_draft_event" in event_types
+    scheduler = next(event for event in events if event["event_type"] == "scheduler_event")
+    candidate = next(event for event in events if event["event_type"] == "suggestion_candidate_event")
+    draft = next(event for event in events if event["event_type"] == "llm_request_draft_event")
+    assert scheduler["payload"]["scheduler_event_type"] == "llm_candidate_queued"
+    assert scheduler["payload"]["gap_rule_id"] == "technical.discussion.open_loop"
+    assert candidate["payload"]["target_type"] == "TechnicalDiscussion"
+    assert candidate["payload"]["source_event_ids"] == ["transcript_final:technical_001"]
+    assert draft["payload"]["segment_batch"] == ["technical_001"]
+
+
+def test_closed_technical_final_does_not_create_generic_suggestion_candidate():
+    events = build_asr_live_events(
+        session_id="closed_technical_discussion",
+        provider="funasr_realtime",
+        streaming_events=[
+            {
+                "event_type": "final",
+                "segment_id": "technical_closed_001",
+                "text": "数据库迁移已经完成，监控正常，风险已关闭。",
+                "start_ms": 0,
+                "end_ms": 4_000,
+                "received_at_ms": 4_100,
+                "confidence": 0.92,
+            },
+            {
+                "event_type": "end_of_stream",
+                "segment_id": "eos",
+                "text": "",
+                "start_ms": 4_100,
+                "end_ms": 4_100,
+                "received_at_ms": 4_200,
+            },
+        ],
+    )
+
+    assert "suggestion_candidate_event" not in [event["event_type"] for event in events]
+    assert "llm_request_draft_event" not in [event["event_type"] for event in events]
+
+
+def test_explicit_state_rule_takes_priority_over_generic_technical_candidate():
+    events = build_asr_live_events(
+        session_id="explicit_state_priority",
+        provider="funasr_realtime",
+        streaming_events=[
+            {
+                "event_type": "final",
+                "segment_id": "explicit_001",
+                "text": "接口先灰度百分之五，如果 P99 延迟超过九百毫秒就回滚。",
+                "start_ms": 0,
+                "end_ms": 5_000,
+                "received_at_ms": 5_100,
+                "confidence": 0.93,
+            },
+            {
+                "event_type": "end_of_stream",
+                "segment_id": "eos",
+                "text": "",
+                "start_ms": 5_100,
+                "end_ms": 5_100,
+                "received_at_ms": 5_200,
+            },
+        ],
+    )
+
+    target_types = [
+        event["payload"]["target_type"]
+        for event in events
+        if event["event_type"] == "suggestion_candidate_event"
+    ]
+    assert "DecisionCandidate" in target_types
+    assert "TechnicalDiscussion" not in target_types
+
+
 def test_build_asr_live_events_suppresses_non_engineering_open_question_candidate():
     streaming_events = [
         {

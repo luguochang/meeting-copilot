@@ -103,11 +103,11 @@ describe("useBrowserMicrophone", () => {
   });
 
   it("streams real Float32 microphone frames and projects one live partial", async () => {
-    const { result } = renderHook(() => useBrowserMicrophone({ asrBaseUrl: "https://api.example.test" }));
+    const { result } = renderHook(() => useBrowserMicrophone({ asrBaseUrl: "http://127.0.0.1:8765" }));
 
     await act(async () => result.current.start("rec_test"));
     const socket = FakeWebSocket.latest!;
-    expect(socket.url).toBe("wss://api.example.test/live/asr/stream/ws/rec_test?audio_source=browser_live_mic");
+    expect(socket.url).toBe("ws://127.0.0.1:8765/live/asr/stream/ws/rec_test?audio_source=browser_live_mic");
 
     act(() => socket.open());
     act(() => {
@@ -134,6 +134,17 @@ describe("useBrowserMicrophone", () => {
 
     act(() => result.current.acknowledgeCommitted(["segment-1"]));
     expect(result.current.state.activePartial).toBeNull();
+  });
+
+  it("rejects a remote ASR target before requesting microphone permission or opening a socket", async () => {
+    const { result } = renderHook(() => useBrowserMicrophone({ asrBaseUrl: "https://api.example.test" }));
+
+    await expect(act(async () => result.current.start("rec_private"))).rejects.toThrow(
+      "浏览器麦克风只能连接本机会议服务",
+    );
+
+    expect(navigator.mediaDevices.getUserMedia).not.toHaveBeenCalled();
+    expect(FakeWebSocket.latest).toBeNull();
   });
 
   it("pauses capture and ends with END before releasing browser audio resources", async () => {

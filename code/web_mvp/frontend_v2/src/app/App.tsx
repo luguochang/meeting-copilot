@@ -1,18 +1,23 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { HttpMeetingApi } from "../api/client";
 import { PollingEventTransport, SseEventTransport } from "../api/eventTransport";
+import { resolveLocalApiBase } from "../api/localApiBase";
 import { LiveMeetingWorkbench } from "../features/live-meeting/LiveMeetingWorkbench";
 import { createMeetingId, resolveMeetingId } from "./meetingId";
 
 export function App() {
   const [meetingId, setMeetingId] = useState(() => resolveMeetingId(window.location.search));
-  const api = useMemo(() => new HttpMeetingApi(), []);
+  const apiBase = useMemo(
+    () => resolveLocalApiBase(import.meta.env.VITE_API_BASE_URL ?? ""),
+    [],
+  );
+  const api = useMemo(() => new HttpMeetingApi(apiBase), [apiBase]);
   const transport = useMemo(
     () =>
       import.meta.env.VITE_EVENT_TRANSPORT === "poll"
         ? new PollingEventTransport(api)
-        : new SseEventTransport(import.meta.env.VITE_API_BASE_URL ?? ""),
-    [api],
+        : new SseEventTransport(apiBase),
+    [api, apiBase],
   );
 
   useEffect(() => {
@@ -51,7 +56,7 @@ export function App() {
       meetingId={meetingId}
       api={api}
       transport={transport}
-      asrBaseUrl={import.meta.env.VITE_API_BASE_URL ?? ""}
+      asrBaseUrl={apiBase}
       onCreateMeeting={createMeeting}
       onOpenMeeting={openMeeting}
       onBackToMeetings={returnToMeetingList}

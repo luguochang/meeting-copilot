@@ -22,8 +22,11 @@ from typing import Any
 from packaged_runtime_supervisor_smoke import (
     bootstrap_cookie,
     find_backend_process,
+    find_funasr_process,
     health_proof,
     http_response,
+    meeting_preparation_payload,
+    packaged_app_launch_command,
     pid_exists,
     port_is_listening,
     read_process_table,
@@ -65,12 +68,13 @@ class LocalOpenAIProvider:
                     }
                 )
                 if payload.get("stream"):
-                    self._stream_suggestion()
+                    self._stream_completion(_completion_for(purpose, user))
                     return
                 self._json_completion(_completion_for(purpose, user))
 
-            def _stream_suggestion(self) -> None:
-                parts = ["建议确认回滚负责人、", "监控指标和降级边界是否已经明确？"]
+            def _stream_completion(self, content: str) -> None:
+                midpoint = max(1, len(content) // 2)
+                parts = [content[:midpoint], content[midpoint:]]
                 events = [
                     {"id": "local-smoke", "choices": [{"delta": {"role": "assistant"}}]},
                     *[
@@ -128,8 +132,8 @@ class LocalOpenAIProvider:
 
 
 def _purpose(system: str, streaming: bool) -> str:
-    if streaming:
-        return "streaming_suggestion"
+    if "中文会议实时理解引擎" in system:
+        return "realtime_intelligence"
     if "ASR 转写修正器" in system:
         return "transcript_correction"
     if "会议纪要生成器" in system:
@@ -138,10 +142,43 @@ def _purpose(system: str, streaming: bool) -> str:
         return "approach"
     if "建议生成器" in system:
         return "legacy_suggestion"
+    if streaming:
+        return "streaming_suggestion"
     return "probe"
 
 
 def _completion_for(purpose: str, user: str) -> str:
+    if purpose == "realtime_intelligence":
+        payload = json.loads(user)
+        paragraph = dict((payload.get("new_paragraphs") or [{}])[0])
+        paragraph_id = str(paragraph.get("id") or "")
+        text = str(paragraph.get("text") or "").strip()
+        return json.dumps(
+            {
+                "paragraph_revisions": [
+                    {
+                        "target_id": paragraph_id,
+                        "expected_revision": int(paragraph.get("revision") or 1),
+                        "corrected_text": text,
+                        "change_count": 0,
+                    }
+                ],
+                "topic_update": {
+                    "operation": "add",
+                    "title": "体验说明",
+                    "summary": text,
+                },
+                "state_changes": [],
+                "follow_up": {
+                    "question": "建议确认本次体验的负责人和验收标准是否明确？",
+                    "reason": "当前原话只说明正在体验，尚未说明负责人和验收标准。",
+                    "evidence_segment_ids": [paragraph_id],
+                    "evidence_quote": text,
+                    "urgency": "medium",
+                },
+            },
+            ensure_ascii=False,
+        )
     if purpose == "transcript_correction":
         return user
     if purpose == "minutes":
@@ -254,7 +291,7 @@ def run_smoke(
         }
     )
     app = subprocess.Popen(
-        [str(binary)],
+        packaged_app_launch_command(binary),
         cwd=app_path.parent,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
@@ -270,6 +307,9 @@ def run_smoke(
     audio: dict[str, Any] = {}
     events: list[dict[str, Any]] = []
     app_exited = backend_exited = port_closed = False
+    funasr_process: dict[str, Any] | None = None
+    funasr_exited = False
+    funasr_forced_cleanup = False
     started = time.monotonic()
     try:
         deadline = time.monotonic() + 60
@@ -282,6 +322,11 @@ def run_smoke(
             time.sleep(0.1)
         if backend is None:
             raise RuntimeError("packaged backend did not become ready")
+        funasr_process = find_funasr_process(
+            read_process_table(),
+            backend_pid=int(backend["pid"]),
+            app_path=app_path,
+        )
         port = int(backend["port"])
         bootstrap_status, cookie = bootstrap_cookie(port, token)
         if bootstrap_status != 303 or not cookie:
@@ -323,19 +368,28 @@ def run_smoke(
             },
         )
         responses["create_meeting"] = created_status
-        asr_result = stream_packaged_funasr(
+        preparation_status, _ = _request_json(
             port,
-            meeting_id=meeting_id,
+            "PUT",
+            f"/v2/meetings/{meeting_id}/preparation",
             cookie=cookie,
-            audio_path=audio_path,
-            audio_source="simulated_realtime_wav",
+            payload=meeting_preparation_payload(),
         )
+        responses["preparation"] = preparation_status
+        if preparation_status == 200:
+            asr_result = stream_packaged_funasr(
+                port,
+                meeting_id=meeting_id,
+                cookie=cookie,
+                audio_path=audio_path,
+                audio_source="simulated_realtime_wav",
+            )
         deadline = time.monotonic() + 45
         while time.monotonic() < deadline:
             _, snapshot = _request_json(
                 port, "GET", f"/v2/meetings/{meeting_id}/snapshot", cookie=cookie
             )
-            if any(item.get("status") == "committed" for item in snapshot.get("suggestions") or []):
+            if isinstance(snapshot.get("follow_up"), dict):
                 break
             time.sleep(0.25)
         end_status, _ = _request_json(
@@ -387,31 +441,54 @@ def run_smoke(
         while backend is not None and time.monotonic() < deadline:
             backend_exited = not pid_exists(int(backend["pid"]))
             port_closed = not port_is_listening(int(backend["port"]))
-            if backend_exited and port_closed:
+            funasr_exited = bool(
+                funasr_process is not None
+                and not pid_exists(int(funasr_process["pid"]))
+            )
+            if backend_exited and port_closed and funasr_exited:
                 break
             time.sleep(0.1)
+        if funasr_process is not None and pid_exists(int(funasr_process["pid"])):
+            funasr_forced_cleanup = True
+            os.kill(int(funasr_process["pid"]), signal.SIGTERM)
+            cleanup_deadline = time.monotonic() + 3
+            while pid_exists(int(funasr_process["pid"])) and time.monotonic() < cleanup_deadline:
+                time.sleep(0.05)
+            if pid_exists(int(funasr_process["pid"])):
+                os.kill(int(funasr_process["pid"]), signal.SIGKILL)
+            funasr_exited = not pid_exists(int(funasr_process["pid"]))
 
     suggestions = list(snapshot.get("suggestions") or [])
     segments = list(transcript.get("segments") or [])
+    follow_up = dict(snapshot.get("follow_up") or {})
     event_types = [str(event.get("type") or "") for event in events]
     provider_purposes = Counter(str(item["purpose"]) for item in provider.requests)
     passed = (
         responses.get("provider_config") == 200
         and responses.get("create_meeting") == 201
+        and responses.get("preparation") == 200
         and responses.get("end_meeting") in {200, 202}
         and asr_result.get("ready") is True
         and int(asr_result.get("non_empty_final_count") or 0) > 0
         and bool(segments)
-        and any(item.get("status") == "committed" for item in suggestions)
-        and "suggestion.draft.started" in event_types
-        and "suggestion.committed" in event_types
+        and bool(str(follow_up.get("question") or "").strip())
+        and bool(follow_up.get("evidence_segment_ids"))
+        and bool(str(follow_up.get("evidence_quote") or "").strip())
+        and "meeting.intelligence.applied" in event_types
+        and all(
+            str(item.get("correction_status") or "") in {"changed", "no_change"}
+            for item in segments
+        )
         and bool(audio.get("assembled"))
         and bool(snapshot.get("minutes"))
-        and provider_purposes["streaming_suggestion"] > 0
+        and provider_purposes["realtime_intelligence"] > 0
         and all(item.get("authorization_present") for item in provider.requests)
         and app_exited
         and backend_exited
         and port_closed
+        and funasr_process is not None
+        and funasr_exited
+        and not funasr_forced_cleanup
     )
     evidence = {
         "schema_version": "meeting_copilot.packaged_ai_mainline_smoke.v1",
@@ -432,7 +509,14 @@ def run_smoke(
         },
         "projection": {
             "segment_count": len(segments),
-            "segments": [str(item.get("normalized_text") or item.get("text") or "") for item in segments],
+            "segments": [
+                {
+                    "text": str(item.get("normalized_text") or item.get("text") or ""),
+                    "correction_status": item.get("correction_status"),
+                }
+                for item in segments
+            ],
+            "follow_up": follow_up,
             "suggestions": [
                 {"status": item.get("status"), "text": item.get("text") or item.get("draft_text")}
                 for item in suggestions
@@ -453,6 +537,9 @@ def run_smoke(
             "app_exited": app_exited,
             "backend_exited": backend_exited,
             "backend_port_closed": port_closed,
+            "funasr_worker_pid": funasr_process.get("pid") if funasr_process else None,
+            "funasr_worker_exited": funasr_exited,
+            "funasr_worker_forced_cleanup": funasr_forced_cleanup,
         },
         "duration_seconds": round(time.monotonic() - started, 3),
         "host": {"platform": platform.platform(), "architecture": platform.machine()},

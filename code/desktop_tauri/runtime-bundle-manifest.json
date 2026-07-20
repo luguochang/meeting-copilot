@@ -4,38 +4,232 @@
   "architectures": [
     "arm64"
   ],
+  "app_identity": {
+    "product_name": "Meeting Copilot",
+    "bundle_identifier": "com.meetingcopilot.desktop",
+    "app_bundle_name": "Meeting Copilot.app",
+    "executable_name": "meeting-copilot-desktop"
+  },
   "runtimes": {
     "backend": {
       "python_version": "3.13",
-      "source_venv": "code/web_mvp/backend/.venv",
       "executable": "runtime/backend-python/bin/python3.13",
       "venv_executable": "runtime/backend-venv/bin/python",
       "site_packages": "runtime/backend-venv/lib/python3.13/site-packages"
     },
     "funasr": {
       "python_version": "3.11",
-      "source_venv": "code/asr_runtime/.venv-funasr",
+      "component_version": "funasr-1.3.10",
       "executable": "runtime/funasr-python/bin/python3.11",
-      "venv_executable": "runtime/funasr-venv/bin/python",
-      "site_packages": "runtime/funasr-venv/lib/python3.11/site-packages"
+      "venv_executable": "runtime/funasr-python/bin/python3.11",
+      "site_packages": "runtime/funasr-venv/lib/python3.11/site-packages",
+      "root": "runtime/funasr-venv",
+      "size_bytes": null,
+      "sha256": null
     }
   },
   "launchers": {
     "backend": "bin/meeting-copilot-backend",
     "funasr": "bin/meeting-copilot-asr-worker"
   },
+  "workers": {
+    "realtime": "app/code/asr_runtime/scripts/funasr_stream_worker.py",
+    "file_asr": "app/code/asr_runtime/scripts/transcribe_funasr.py",
+    "diarization": "app/code/asr_runtime/scripts/funasr_diarization_worker.py"
+  },
+  "worker_inventory": {
+    "realtime": {
+      "version": "funasr-stream-worker-v1",
+      "path": "app/code/asr_runtime/scripts/funasr_stream_worker.py",
+      "size_bytes": null,
+      "sha256": null
+    },
+    "file_asr": {
+      "version": "funasr-file-worker-v1",
+      "path": "app/code/asr_runtime/scripts/transcribe_funasr.py",
+      "size_bytes": null,
+      "sha256": null
+    },
+    "diarization": {
+      "version": "funasr-diarization-jsonl-v1",
+      "path": "app/code/asr_runtime/scripts/funasr_diarization_worker.py",
+      "size_bytes": null,
+      "sha256": null,
+      "implementation_status": "local_funasr_vad_camplus_supported",
+      "model_download_status": "not_performed"
+    }
+  },
+  "diarization": {
+    "optional": true,
+    "requires_network": false,
+    "missing_user_message": "说话人识别模型未安装，录音与转写仍可继续",
+    "worker": {
+      "version": "funasr-diarization-jsonl-v1",
+      "path": "app/code/asr_runtime/scripts/funasr_diarization_worker.py"
+    },
+    "package": {
+      "pack_id": "diarization-zh-cn",
+      "install_status": "not_bundled",
+      "verification_status": "absent_optional_fail_open",
+      "version": null,
+      "size_bytes": null,
+      "sha256": null,
+      "control_manifest_sha256": null,
+      "redistribution_status": "public_redistribution_unresolved",
+      "counts_as_public_release": false
+    },
+    "model_pack": {
+      "model_id": "damo/speech_campplus_sv_zh-cn_16k-common",
+      "version": null,
+      "install_status": "not_bundled",
+      "root": "models/diarization-camplus",
+      "size_bytes": null,
+      "sha256": null,
+      "source_inventory_sha256": null,
+      "provenance": null,
+      "required_files": [
+        "campplus_cn_common.bin",
+        "config.yaml"
+      ],
+      "cosine_similarity_threshold": 0.35,
+      "model_download_status": "not_performed",
+      "public_release_approved": false
+    },
+    "vad_model": {
+      "model_id": "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+      "version": null,
+      "root": "models/diarization-vad",
+      "required_files": [
+        "model.pt",
+        "config.yaml"
+      ],
+      "install_status": "not_bundled",
+      "model_download_status": "not_performed",
+      "size_bytes": null,
+      "sha256": null,
+      "source_inventory_sha256": null,
+      "provenance": null,
+      "public_release_approved": false
+    },
+    "redistribution": {
+      "status": "public_redistribution_unresolved",
+      "public_redistribution_approved": false,
+      "license_ids": [],
+      "notices_path": null,
+      "control_manifest_sha256": null
+    }
+  },
   "realtime_model": {
+    "model_id": "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online",
+    "version": "modelscope-master-2026-06-19",
     "root": "models/funasr-online",
     "required_files": [
       "model.pt",
       "config.yaml"
-    ]
+    ],
+    "size_bytes": null,
+    "sha256": null
+  },
+  "file_asr": {
+    "optional": true,
+    "requires_network": false,
+    "missing_user_message": "文件导入组件未安装",
+    "runtime": {
+      "runtime_id": "funasr",
+      "version": "funasr-1.3.10",
+      "root": "runtime/funasr-venv",
+      "executable": "runtime/funasr-python/bin/python3.11",
+      "size_bytes": null,
+      "sha256": null
+    },
+    "worker": {
+      "version": "funasr-file-worker-v1",
+      "path": "app/code/asr_runtime/scripts/transcribe_funasr.py",
+      "size_bytes": null,
+      "sha256": null
+    },
+    "converter": {
+      "component_id": "imageio-ffmpeg",
+      "version": "0.6.0-ffmpeg-7.1",
+      "path": "runtime/backend-venv/lib/python3.13/site-packages/imageio_ffmpeg/binaries/ffmpeg-macos-aarch64-v7.1",
+      "license_path": "runtime/backend-venv/lib/python3.13/site-packages/imageio_ffmpeg-0.6.0.dist-info/LICENSE",
+      "required_for_formats": [
+        "m4a",
+        "mp3"
+      ],
+      "provenance": {
+        "status": "public_redistribution_unresolved",
+        "evidence_scope": "imageio_ffmpeg_package_license_only",
+        "public_redistribution_approved": false
+      },
+      "size_bytes": null,
+      "sha256": null
+    },
+    "package": {
+      "install_status": "not_bundled",
+      "version": null,
+      "size_bytes": null,
+      "sha256": null,
+      "control_manifest_sha256": null,
+      "redistribution_status": "public_redistribution_unresolved",
+      "internal_controlled_smoke_status": "not_ready",
+      "counts_as_public_release": false
+    },
+    "models": {
+      "offline": {
+        "model_id": "iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
+        "version": "modelscope-master-2026-06-19",
+        "root": "models/funasr-file/offline-paraformer",
+        "required_files": [
+          "model.pt",
+          "config.yaml"
+        ],
+        "size_bytes": null,
+        "sha256": null
+      },
+      "vad": {
+        "model_id": "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+        "version": "modelscope-master-2026-06-19",
+        "root": "models/funasr-file/vad",
+        "required_files": [
+          "model.pt",
+          "config.yaml"
+        ],
+        "size_bytes": null,
+        "sha256": null
+      },
+      "punc": {
+        "model_id": "iic/punc_ct-transformer_cn-en-common-vocab471067-large",
+        "version": "modelscope-master-2026-06-19",
+        "root": "models/funasr-file/punc",
+        "required_files": [
+          "model.pt",
+          "config.yaml"
+        ],
+        "size_bytes": null,
+        "sha256": null
+      }
+    },
+    "redistribution": {
+      "status": "public_redistribution_unresolved",
+      "public_redistribution_approved": false,
+      "license_id": null,
+      "license_path": null,
+      "notices_path": null,
+      "control_manifest_sha256": null
+    }
+  },
+  "component_inventory": {
+    "schema_version": "meeting_copilot.runtime_component_inventory.v1",
+    "status": "unsealed",
+    "components": {}
   },
   "required_files": [
     "runtime-bundle-manifest.json",
     "bin/meeting-copilot-backend",
     "bin/meeting-copilot-asr-worker",
     "bin/meeting-copilot-native-mic",
+    "bin/meeting-copilot-native-system-audio",
     "runtime/backend-python/bin/python3.13",
     "runtime/backend-venv/bin/python",
     "runtime/funasr-python/bin/python3.11",
@@ -44,6 +238,8 @@
     "app/code/web_mvp/frontend_v2/dist/index.html",
     "app/code/core/meeting_copilot_core/__init__.py",
     "app/code/asr_runtime/scripts/funasr_stream_worker.py",
+    "app/code/asr_runtime/scripts/transcribe_funasr.py",
+    "app/code/asr_runtime/scripts/funasr_diarization_worker.py",
     "models/funasr-online/model.pt",
     "models/funasr-online/config.yaml"
   ]

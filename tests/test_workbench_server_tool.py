@@ -39,7 +39,9 @@ def test_stop_timeout_includes_cleanup_margin_after_uvicorn_grace_period():
     assert tool.STOP_TIMEOUT_SECONDS > tool.GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS
 
 
-def test_build_child_env_uses_data_dir_and_strips_paid_provider_secrets(monkeypatch, tmp_path):
+def test_build_child_env_uses_data_dir_and_strips_paid_provider_secrets(
+    monkeypatch, tmp_path
+):
     tool = _load_tool()
     monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://paid.example")
     monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-secret")
@@ -53,7 +55,12 @@ def test_build_child_env_uses_data_dir_and_strips_paid_provider_secrets(monkeypa
     assert str(tool.WEB_BACKEND_ROOT) in env["PYTHONPATH"]
     assert str(tool.CORE_ROOT) in env["PYTHONPATH"]
     assert "existing" in env["PYTHONPATH"]
-    for key in ("LLM_GATEWAY_BASE_URL", "LLM_GATEWAY_API_KEY", "LLM_GATEWAY_MODEL", "OPENAI_API_KEY"):
+    for key in (
+        "LLM_GATEWAY_BASE_URL",
+        "LLM_GATEWAY_API_KEY",
+        "LLM_GATEWAY_MODEL",
+        "OPENAI_API_KEY",
+    ):
         assert key not in env
 
 
@@ -83,23 +90,36 @@ def test_build_child_env_can_explicitly_inherit_provider_env(monkeypatch, tmp_pa
     assert env["LLM_GATEWAY_MODEL"] == "m1"
 
 
-def test_status_report_prefers_health_when_server_reachable(monkeypatch, tmp_path):
+def test_status_report_rejects_health_without_runtime_identity(monkeypatch, tmp_path):
     tool = _load_tool()
 
     monkeypatch.setattr(tool, "read_pid", lambda pid_file: None)
-    monkeypatch.setattr(tool, "check_health", lambda port, timeout_seconds=1.0: {"ok": True, "body": {"status": "ok"}})
+    monkeypatch.setattr(
+        tool,
+        "check_health",
+        lambda port, timeout_seconds=1.0: {"ok": True, "body": {"status": "ok"}},
+    )
 
     report = tool.status_report(port=8765, pid_file=tmp_path / "server.pid")
 
-    assert report["status"] == "running"
-    assert report["health_ok"] is True
+    assert report["status"] == "not_running"
+    assert report["health_ok"] is False
+    assert report["runtime_identity_verified"] is False
+    assert (
+        report["health"]["runtime_identity"]["reason"]
+        == "runtime_identity_contract_missing"
+    )
     assert report["workbench_url"] == "http://127.0.0.1:8765/workbench"
 
 
 def test_start_blocks_when_port_is_used_by_unknown_process(monkeypatch, tmp_path):
     tool = _load_tool()
 
-    monkeypatch.setattr(tool, "check_health", lambda port, timeout_seconds=1.0: {"ok": False, "error": "connection refused"})
+    monkeypatch.setattr(
+        tool,
+        "check_health",
+        lambda port, timeout_seconds=1.0: {"ok": False, "error": "connection refused"},
+    )
     monkeypatch.setattr(tool, "is_port_open", lambda port: True)
 
     report = tool.start_server(

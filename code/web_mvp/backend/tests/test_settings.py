@@ -446,6 +446,9 @@ def test_real_enabled_provider_usage_is_persisted_and_missing_rates_are_unavaila
     assert stats.json()["currentSession"] is None
     assert stats.json()["today"] is None
     assert stats.json()["month"] is None
+    assert stats.json()["currentSessionTokens"] == 30
+    assert stats.json()["todayTokens"] == 30
+    assert stats.json()["monthTokens"] == 30
     assert stats.json()["costStatus"] == "unavailable"
     assert stats.json()["breakdown"] == [
         {
@@ -523,6 +526,9 @@ def test_cost_stats_are_estimated_from_explicit_rates_and_budget_gate_blocks_bef
     assert stats["currentSession"] == pytest.approx(3.0)
     assert stats["today"] == pytest.approx(3.0)
     assert stats["month"] == pytest.approx(3.0)
+    assert stats["currentSessionTokens"] == 30
+    assert stats["todayTokens"] == 30
+    assert stats["monthTokens"] == 30
     assert stats["costStatus"] == "estimated"
     assert stats["estimated"] is True
     assert stats["breakdown"][0]["estimated_cost_cny"] == pytest.approx(3.0)

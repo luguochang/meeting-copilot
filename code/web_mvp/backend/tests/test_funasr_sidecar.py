@@ -249,6 +249,19 @@ class _DegradationSpy:
         self.called.set()
 
 
+def _wait_for_generation_switch(recognizer, previous_generation, timeout=1.0):
+    deadline = time.monotonic() + timeout
+    while True:
+        with recognizer._state_lock:
+            generation = recognizer._generation
+            if generation is not previous_generation:
+                return generation
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AssertionError("sidecar restart did not publish a new generation")
+        time.sleep(min(0.001, remaining))
+
+
 def test_funasr_sidecar_feeds_chunks_and_reads_final(monkeypatch):
     fake = _FakeProc()
     popen_calls = []
@@ -581,39 +594,53 @@ def test_funasr_restart_retires_old_writer_and_routes_future_pcm_to_new_generati
     first_proc = _ControlledProc(block_first_write=True)
     second_proc = _ControlledProc()
     processes = iter([first_proc, second_proc])
-    second_spawned = threading.Event()
     degradation = _DegradationSpy()
 
     def popen(*args, **kwargs):
-        proc = next(processes)
-        if proc is second_proc:
-            second_spawned.set()
-        return proc
+        return next(processes)
 
     monkeypatch.setattr(asr_stream.subprocess, "Popen", popen)
     monkeypatch.setattr(asr_stream, "get_degradation_controller", lambda: degradation)
 
     rec = asr_stream.FunasrSidecarRecognizer("sess_generation")
+    old_generation = rec._generation
     old_write_q = rec._write_q
     old_writer = rec._writer
     rec.recognize_chunk(b"old-generation-pcm")
     assert first_proc.stdin.write_started.wait(1)
 
-    first_proc.exit(7)
-    assert second_spawned.wait(1), "non-zero exit did not trigger the single restart"
+    try:
+        first_proc.exit(7)
+        new_generation = _wait_for_generation_switch(rec, old_generation)
 
-    assert rec._write_q is not old_write_q
-    first_proc.stdin.release_write()
-    old_writer.join(timeout=1)
-    assert not old_writer.is_alive(), "old generation writer was not retired"
+        assert new_generation.number == old_generation.number + 1
+        assert new_generation.proc is second_proc
+        with rec._state_lock:
+            assert rec._generation is new_generation
+            assert rec._write_q is new_generation.write_q
+            assert rec._writer is new_generation.writer
+            assert old_generation.terminal is True
+            assert old_generation.accepting_audio is False
+            assert old_generation.accepting_events is False
+            assert rec._write_q is not old_write_q
 
-    rec.recognize_chunk(b"new-generation-pcm")
-    assert second_proc.stdin.write_seen.wait(1)
-    rec.finalize()
+        first_proc.stdin.release_write()
+        old_writer.join(timeout=1)
+        assert not old_writer.is_alive(), "old generation writer was not retired"
 
-    assert [payload for _, payload in second_proc.stdin.writes] == [b"new-generation-pcm"]
-    assert degradation.called.wait(1)
-    assert len(degradation.calls) == 1
+        rec.recognize_chunk(b"new-generation-pcm")
+        assert second_proc.stdin.write_seen.wait(1)
+        rec.finalize()
+
+        assert [payload for _, payload in second_proc.stdin.writes] == [b"new-generation-pcm"]
+        assert degradation.called.wait(1)
+        assert len(degradation.calls) == 1
+    finally:
+        # Keep a failed assertion from leaking the blocked old writer into the
+        # next test, where its delayed crash report would use a new spy.
+        first_proc.stdin.release_write()
+        old_writer.join(timeout=1)
+        rec.abort()
 
 
 def test_funasr_finalize_exit_zero_does_not_degrade_or_restart(monkeypatch):

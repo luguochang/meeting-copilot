@@ -1,4 +1,6 @@
 """Tests for L2 LLM correction (asr_correct)."""
+import pytest
+
 from meeting_copilot_web_mvp import asr_correct, llm_service
 
 
@@ -37,6 +39,39 @@ def test_correct_transcript_degrades_to_raw_on_failure(monkeypatch):
     corrected, _usage, degraded = asr_correct.correct_transcript(raw, config, client=FailingClient())
     assert degraded is True
     assert corrected == raw  # degrade to raw on failure
+
+
+def test_correct_transcript_strict_mode_raises_provider_failure(monkeypatch):
+    monkeypatch.setattr(llm_service.time, "sleep", lambda *a: None)
+    config = llm_service.LlmConfig(base_url="https://gw.example", api_key="sk-x", model="m1")
+
+    class FailingClient:
+        def post_json(self, url, headers, body, timeout):
+            raise RuntimeError("502 Bad Gateway")
+
+    with pytest.raises(RuntimeError, match="502 Bad Gateway"):
+        asr_correct.correct_transcript(
+            "原始转写 t九九",
+            config,
+            client=FailingClient(),
+            raise_on_failure=True,
+        )
+
+
+def test_correct_transcript_strict_mode_raises_response_parse_failure():
+    config = llm_service.LlmConfig(base_url="https://gw.example", api_key="sk-x", model="m1")
+
+    class MalformedClient:
+        def post_json(self, url, headers, body, timeout):
+            return {"choices": []}
+
+    with pytest.raises(IndexError):
+        asr_correct.correct_transcript(
+            "原始转写 t九九",
+            config,
+            client=MalformedClient(),
+            raise_on_failure=True,
+        )
 
 
 def test_correct_transcript_empty_input():

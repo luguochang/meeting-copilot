@@ -11,6 +11,136 @@ from meeting_copilot_web_mvp import asr_correct, batch_transcribe, llm_service
 from meeting_copilot_web_mvp.app import create_app
 
 
+RUNTIME_MANIFEST_TEMPLATE = (
+    Path(__file__).resolve().parents[3] / "desktop_tauri" / "runtime-bundle-manifest.json"
+)
+
+
+def _component_record(bundle: Path, relative: str, *, kind: str) -> dict:
+    path = bundle / relative
+    if kind == "file":
+        payload = path.read_bytes()
+        return {
+            "path": relative,
+            "kind": kind,
+            "version": "fixture-v1",
+            "size_bytes": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+    entries = []
+    for candidate in sorted(path.rglob("*")):
+        if candidate.is_file():
+            payload = candidate.read_bytes()
+            entries.append({
+                "path": candidate.relative_to(path).as_posix(),
+                "kind": "file",
+                "size_bytes": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            })
+    digest_payload = json.dumps(
+        entries,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    return {
+        "path": relative,
+        "kind": kind,
+        "version": "fixture-v1",
+        "size_bytes": sum(item["size_bytes"] for item in entries),
+        "sha256": hashlib.sha256(digest_payload).hexdigest(),
+        "file_count": len(entries),
+        "symlink_count": 0,
+    }
+
+
+def _file_asr_bundle(tmp_path: Path, *, include_models: bool) -> tuple[Path, dict]:
+    bundle = tmp_path / "MeetingCopilotRuntime.bundle"
+    manifest = json.loads(RUNTIME_MANIFEST_TEMPLATE.read_text(encoding="utf-8"))
+    manifest_path = bundle / "runtime-bundle-manifest.json"
+    manifest_path.parent.mkdir(parents=True)
+    launcher_relative = "bin/meeting-copilot-file-asr-python"
+    manifest["runtimes"]["funasr"]["venv_executable"] = launcher_relative
+    manifest["file_asr"]["runtime"]["executable"] = launcher_relative
+    for relative in (
+        manifest["runtimes"]["funasr"]["executable"],
+        manifest["runtimes"]["funasr"]["venv_executable"],
+        manifest["workers"]["file_asr"],
+    ):
+        path = bundle / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("fixture", encoding="utf-8")
+    runtime_root = bundle / manifest["runtimes"]["funasr"]["root"]
+    runtime_root.mkdir(parents=True, exist_ok=True)
+    (runtime_root / "fixture-runtime.py").write_text("fixture", encoding="utf-8")
+    converter = manifest["file_asr"]["converter"]
+    converter_path = bundle / converter["path"]
+    converter_path.parent.mkdir(parents=True, exist_ok=True)
+    converter_path.write_text("fixture-ffmpeg", encoding="utf-8")
+    converter_license = bundle / converter["license_path"]
+    converter_license.parent.mkdir(parents=True, exist_ok=True)
+    converter_license.write_text("fixture-license", encoding="utf-8")
+    if include_models:
+        for model in manifest["file_asr"]["models"].values():
+            for relative in model["required_files"]:
+                path = bundle / model["root"] / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("fixture", encoding="utf-8")
+
+    runtime_record = _component_record(
+        bundle,
+        manifest["runtimes"]["funasr"]["root"],
+        kind="directory",
+    )
+    launcher_record = _component_record(bundle, launcher_relative, kind="file")
+    worker_relative = manifest["workers"]["file_asr"]
+    worker_record = _component_record(bundle, worker_relative, kind="file")
+    converter_record = _component_record(bundle, converter["path"], kind="file")
+    manifest["runtimes"]["funasr"].update({
+        "size_bytes": runtime_record["size_bytes"],
+        "sha256": runtime_record["sha256"],
+    })
+    manifest["file_asr"]["runtime"].update({
+        "size_bytes": runtime_record["size_bytes"],
+        "sha256": runtime_record["sha256"],
+    })
+    manifest["worker_inventory"]["file_asr"].update({
+        "path": worker_relative,
+        "size_bytes": worker_record["size_bytes"],
+        "sha256": worker_record["sha256"],
+    })
+    manifest["file_asr"]["worker"].update({
+        "path": worker_relative,
+        "size_bytes": worker_record["size_bytes"],
+        "sha256": worker_record["sha256"],
+    })
+    converter.update({
+        "size_bytes": converter_record["size_bytes"],
+        "sha256": converter_record["sha256"],
+    })
+    components = {
+        "shared_asr.runtime": runtime_record,
+        "file_asr.python_launcher": launcher_record,
+        "file_asr.worker": worker_record,
+        "file_asr.converter": converter_record,
+    }
+    if include_models:
+        for name, model in manifest["file_asr"]["models"].items():
+            record = _component_record(bundle, model["root"], kind="directory")
+            model.update({
+                "size_bytes": record["size_bytes"],
+                "sha256": record["sha256"],
+            })
+            components[f"file_asr.model.{name}"] = record | {"model_id": model["model_id"]}
+    manifest["component_inventory"] = {
+        "schema_version": "meeting_copilot.runtime_component_inventory.v1",
+        "status": "sealed",
+        "components": components,
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    return manifest_path, manifest
+
+
 def _offline_asr_report(text: str) -> dict:
     return {
         "text": text,
@@ -30,6 +160,7 @@ def _offline_asr_report(text: str) -> dict:
 
 def test_get_ffmpeg_falls_back_to_system_binary_when_imageio_is_unavailable(monkeypatch):
     monkeypatch.setattr(batch_transcribe, "_ffmpeg_path", None)
+    monkeypatch.setattr(batch_transcribe, "_ffmpeg_packaged_mode", None)
     monkeypatch.setitem(sys.modules, "imageio_ffmpeg", None)
     monkeypatch.setattr(batch_transcribe, "shutil", shutil, raising=False)
     monkeypatch.setattr(
@@ -39,6 +170,40 @@ def test_get_ffmpeg_falls_back_to_system_binary_when_imageio_is_unavailable(monk
     )
 
     assert batch_transcribe._get_ffmpeg() == "/opt/homebrew/bin/ffmpeg"
+
+
+def test_get_ffmpeg_falls_back_to_system_when_development_imageio_path_is_forbidden(monkeypatch):
+    import imageio_ffmpeg
+
+    monkeypatch.setattr(batch_transcribe, "_ffmpeg_path", None)
+    monkeypatch.setattr(batch_transcribe, "_ffmpeg_packaged_mode", None)
+    monkeypatch.setattr(
+        imageio_ffmpeg,
+        "get_ffmpeg_exe",
+        lambda: "/tmp/meeting-copilot/.venv/site-packages/imageio_ffmpeg/ffmpeg",
+    )
+    monkeypatch.setattr(
+        batch_transcribe.shutil,
+        "which",
+        lambda name: "/opt/homebrew/bin/ffmpeg" if name == "ffmpeg" else None,
+    )
+
+    assert batch_transcribe._get_ffmpeg(packaged_mode=False) == "/opt/homebrew/bin/ffmpeg"
+
+
+def test_get_ffmpeg_never_falls_back_to_a_system_binary_in_packaged_mode(monkeypatch, tmp_path):
+    import imageio_ffmpeg
+
+    monkeypatch.setattr(batch_transcribe, "_ffmpeg_path", None)
+    monkeypatch.setattr(batch_transcribe, "_ffmpeg_packaged_mode", None)
+    monkeypatch.setattr(
+        imageio_ffmpeg,
+        "get_ffmpeg_exe",
+        lambda: "/opt/homebrew/bin/ffmpeg",
+    )
+    monkeypatch.setattr(batch_transcribe.shutil, "which", lambda _name: "/opt/homebrew/bin/ffmpeg")
+
+    assert batch_transcribe._get_ffmpeg(packaged_mode=True, bundle_root=tmp_path) is None
 
 
 def test_transcribe_file_session_creates_session_from_audio(monkeypatch):
@@ -98,8 +263,20 @@ def test_file_converted_session_exports_transcript_and_minutes(monkeypatch):
     )
     monkeypatch.setattr(
         llm_service,
-        "build_minutes",
-        lambda transcript, config: ("# 会议纪要\n\n- 先灰度 5%\n", {"total_tokens": 12}, False),
+        "build_minutes_artifact",
+        lambda transcript, config: (
+            "# 会议纪要\n\n- 先灰度 5%\n",
+            {
+                "background": "接口灰度发布",
+                "decisions": ["先灰度 5%"],
+                "action_items": [],
+                "risks": [],
+                "open_questions": [],
+                "evidence_quotes": ["接口先灰度 5%"],
+            },
+            {"total_tokens": 12},
+            False,
+        ),
     )
 
     client = TestClient(create_app())
@@ -255,25 +432,34 @@ def test_transcribe_file_session_unavailable_when_funasr_missing(monkeypatch):
 def test_batch_transcribe_file_report_runs_offline_batch_cli(monkeypatch, tmp_path):
     audio = tmp_path / "meeting.wav"
     audio.write_bytes(b"fake")
-    fake_python = tmp_path / "python"
-    fake_worker = tmp_path / "transcribe_funasr.py"
-    fake_model = tmp_path / "offline-model"
-    fake_vad = tmp_path / "vad-model"
-    fake_punc = tmp_path / "punc-model"
-    for path in [fake_python, fake_worker]:
-        path.write_text("", encoding="utf-8")
-    for path in [fake_model, fake_vad, fake_punc]:
-        path.mkdir()
-
-    monkeypatch.setattr(batch_transcribe, "_FUNASR_PY", fake_python)
-    monkeypatch.setattr(batch_transcribe, "_TRANSCRIBE_WORKER", fake_worker)
-    monkeypatch.setattr(batch_transcribe, "_resolve_offline_model_arg", lambda: str(fake_model))
-    monkeypatch.setattr(batch_transcribe, "_resolve_vad_model_arg", lambda: str(fake_vad))
-    monkeypatch.setattr(batch_transcribe, "_resolve_punc_model_arg", lambda: str(fake_punc))
+    manifest_path, manifest = _file_asr_bundle(tmp_path, include_models=True)
+    bundle = manifest_path.parent
+    fake_python = bundle / manifest["runtimes"]["funasr"]["venv_executable"]
+    fake_worker = bundle / manifest["workers"]["file_asr"]
+    fake_model = bundle / manifest["file_asr"]["models"]["offline"]["root"]
+    fake_vad = bundle / manifest["file_asr"]["models"]["vad"]["root"]
+    fake_punc = bundle / manifest["file_asr"]["models"]["punc"]["root"]
+    monkeypatch.setenv("MEETING_COPILOT_RUNTIME_MANIFEST", str(manifest_path))
+    packaged_override_names = [
+        "MEETING_COPILOT_BATCH_FUNASR_PYTHON",
+        "MEETING_COPILOT_BATCH_TRANSCRIBE_WORKER",
+        "MEETING_COPILOT_FILE_ASR_MODEL_DIR",
+        "MEETING_COPILOT_FILE_ASR_VAD_MODEL_DIR",
+        "MEETING_COPILOT_FILE_ASR_PUNC_MODEL_DIR",
+        "MEETING_COPILOT_FFMPEG",
+        "IMAGEIO_FFMPEG_EXE",
+    ]
+    for name in packaged_override_names:
+        monkeypatch.setenv(name, f"/external/{name.lower()}")
+    monkeypatch.setattr(batch_transcribe, "ensure_wav_16k_mono", lambda path: path)
     calls = []
+    child_environments = []
+    monkeypatch.setenv("PYTHONHOME", "/backend/python")
+    monkeypatch.setenv("PYTHONPATH", "/backend/site-packages")
 
-    def fake_run(cmd, capture_output, text, timeout):
+    def fake_run(cmd, capture_output, text, timeout, env):
         calls.append(cmd)
+        child_environments.append(env)
         return subprocess.CompletedProcess(
             cmd,
             0,
@@ -303,8 +489,199 @@ def test_batch_transcribe_file_report_runs_offline_batch_cli(monkeypatch, tmp_pa
     assert report["batch"]["batch_mode"] == "single_process_reused_funasr_offline_model"
     cmd = next(call for call in calls if call and call[0] == str(fake_python))
     assert cmd[:2] == [str(fake_python), str(fake_worker)]
-    assert cmd[2] == str(audio.with_name("meeting.16k.wav"))
+    assert cmd[2] == str(audio)
     assert "--offline-batch" in cmd
     assert cmd[cmd.index("--model") + 1] == str(fake_model)
     assert cmd[cmd.index("--vad-model") + 1] == str(fake_vad)
     assert cmd[cmd.index("--punc-model") + 1] == str(fake_punc)
+    assert "PYTHONHOME" not in child_environments[0]
+    assert "PYTHONPATH" not in child_environments[0]
+    assert all(name not in child_environments[0] for name in packaged_override_names)
+    assert child_environments[0]["HF_HUB_OFFLINE"] == "1"
+    assert child_environments[0]["TRANSFORMERS_OFFLINE"] == "1"
+
+
+def test_packaged_runtime_ignores_external_component_and_converter_overrides(tmp_path):
+    manifest_path, manifest = _file_asr_bundle(tmp_path, include_models=True)
+    external = tmp_path / "external-runtime"
+    external_paths = {
+        "MEETING_COPILOT_BATCH_FUNASR_PYTHON": external / "python",
+        "MEETING_COPILOT_BATCH_TRANSCRIBE_WORKER": external / "worker.py",
+        "MEETING_COPILOT_FILE_ASR_MODEL_DIR": external / "offline",
+        "MEETING_COPILOT_FILE_ASR_VAD_MODEL_DIR": external / "vad",
+        "MEETING_COPILOT_FILE_ASR_PUNC_MODEL_DIR": external / "punc",
+        "MEETING_COPILOT_FFMPEG": external / "ffmpeg",
+        "IMAGEIO_FFMPEG_EXE": external / "imageio-ffmpeg",
+    }
+    for name, path in external_paths.items():
+        if "MODEL_DIR" in name:
+            path.mkdir(parents=True)
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("hijacked", encoding="utf-8")
+    environ = {
+        "MEETING_COPILOT_RUNTIME_MANIFEST": str(manifest_path),
+        **{name: str(path) for name, path in external_paths.items()},
+    }
+
+    runtime = batch_transcribe._resolve_runtime_components(environ)
+
+    inventory = manifest["component_inventory"]["components"]
+    expected_inventory_names = {
+        "funasr_python": "file_asr.python_launcher",
+        "worker": "file_asr.worker",
+        "offline_model": "file_asr.model.offline",
+        "vad_model": "file_asr.model.vad",
+        "punc_model": "file_asr.model.punc",
+        "converter": "file_asr.converter",
+    }
+    for name, inventory_name in expected_inventory_names.items():
+        component = runtime["components"][name]
+        assert component["source"] == "sealed_manifest"
+        assert component["path"] == manifest_path.parent / inventory[inventory_name]["path"]
+        assert external not in component["path"].parents
+
+    capability = batch_transcribe.capability_status(environ)
+    assert capability["status"] == "ready"
+    assert capability["components"]["ffmpeg"]["status"] == "ready"
+    assert capability["components"]["ffmpeg"]["source"] == "bundled"
+
+
+def test_packaged_runtime_rejects_unsealed_component_inventory(tmp_path):
+    manifest_path, manifest = _file_asr_bundle(tmp_path, include_models=True)
+    manifest["component_inventory"]["status"] = "unsealed"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    capability = batch_transcribe.capability_status(
+        {"MEETING_COPILOT_RUNTIME_MANIFEST": str(manifest_path)}
+    )
+
+    assert capability["status"] == "invalid_runtime_configuration"
+    assert capability["available"] is False
+    assert capability["manifest_errors"] == ["runtime_component_inventory_not_sealed"]
+
+
+def test_packaged_runtime_rejects_manifest_component_path_mismatch(tmp_path):
+    manifest_path, manifest = _file_asr_bundle(tmp_path, include_models=True)
+    manifest["workers"]["file_asr"] = manifest["runtimes"]["funasr"]["venv_executable"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    capability = batch_transcribe.capability_status(
+        {"MEETING_COPILOT_RUNTIME_MANIFEST": str(manifest_path)}
+    )
+
+    assert capability["status"] == "invalid_runtime_configuration"
+    assert capability["components"]["worker"]["status"] == "invalid"
+    assert capability["components"]["worker"]["reason"] == "manifest_component_path_mismatch"
+
+
+def test_packaged_runtime_rejects_manifest_component_hash_mismatch(tmp_path):
+    manifest_path, manifest = _file_asr_bundle(tmp_path, include_models=True)
+    manifest["file_asr"]["worker"]["sha256"] = "0" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    capability = batch_transcribe.capability_status(
+        {"MEETING_COPILOT_RUNTIME_MANIFEST": str(manifest_path)}
+    )
+
+    assert capability["status"] == "invalid_runtime_configuration"
+    assert capability["components"]["worker"]["status"] == "invalid"
+    assert capability["components"]["worker"]["reason"] == "manifest_component_hash_mismatch"
+
+
+def test_batch_runtime_preserves_the_funasr_venv_symlink_for_execution(tmp_path):
+    manifest_path, manifest = _file_asr_bundle(tmp_path, include_models=True)
+    bundle = manifest_path.parent
+    base_python = bundle / manifest["runtimes"]["funasr"]["executable"]
+    venv_python = bundle / manifest["runtimes"]["funasr"]["venv_executable"]
+    venv_python.unlink()
+    venv_python.symlink_to(Path("..") / base_python.relative_to(bundle))
+
+    runtime = batch_transcribe._resolve_runtime_components(
+        {"MEETING_COPILOT_RUNTIME_MANIFEST": str(manifest_path)}
+    )
+
+    assert runtime["components"]["funasr_python"]["path"] == venv_python
+    assert runtime["components"]["funasr_python"]["configuration_errors"] == []
+    assert runtime["components"]["funasr_python"]["path"].resolve() == base_python.resolve()
+
+
+def test_batch_runtime_manifest_reports_concrete_missing_model_components(tmp_path):
+    manifest_path, _manifest = _file_asr_bundle(tmp_path, include_models=False)
+
+    capability = batch_transcribe.capability_status(
+        {"MEETING_COPILOT_RUNTIME_MANIFEST": str(manifest_path)}
+    )
+
+    assert capability["status"] == "file_asr_models_not_installed"
+    assert capability["available"] is False
+    assert capability["missing_components"] == [
+        "offline_model",
+        "vad_model",
+        "punc_model",
+    ]
+    assert capability["components"]["funasr_python"]["status"] == "ready"
+    assert capability["components"]["worker"]["status"] == "ready"
+    assert capability["network_offline"] is None
+    assert capability["remote_asr_used"] is False
+
+
+def test_batch_runtime_env_resolves_all_components_and_supported_formats(tmp_path):
+    paths = {
+        "MEETING_COPILOT_BATCH_FUNASR_PYTHON": tmp_path / "python",
+        "MEETING_COPILOT_BATCH_TRANSCRIBE_WORKER": tmp_path / "transcribe_funasr.py",
+        "MEETING_COPILOT_FILE_ASR_MODEL_DIR": tmp_path / "offline",
+        "MEETING_COPILOT_FILE_ASR_VAD_MODEL_DIR": tmp_path / "vad",
+        "MEETING_COPILOT_FILE_ASR_PUNC_MODEL_DIR": tmp_path / "punc",
+        "MEETING_COPILOT_FFMPEG": tmp_path / "ffmpeg",
+    }
+    for key, path in paths.items():
+        if "MODEL_DIR" in key:
+            path.mkdir()
+        else:
+            path.write_text("fixture", encoding="utf-8")
+    capability = batch_transcribe.capability_status(
+        {key: str(path) for key, path in paths.items()}
+    )
+
+    assert capability["status"] == "ready"
+    assert capability["available"] is True
+    assert capability["supported_import_formats"] == [
+        ".wav",
+        ".mp3",
+        ".m4a",
+        ".aac",
+        ".flac",
+        ".mp4",
+        ".mov",
+    ]
+    assert all(item["available"] for item in capability["formats"].values())
+    assert batch_transcribe.import_format_capability("meeting.mkv", {
+        key: str(path) for key, path in paths.items()
+    })["status"] == "unsupported_import_format"
+
+
+def test_batch_runtime_rejects_user_model_cache_paths(tmp_path):
+    python = tmp_path / "python"
+    worker = tmp_path / "worker.py"
+    python.write_text("fixture", encoding="utf-8")
+    worker.write_text("fixture", encoding="utf-8")
+    cache_root = tmp_path / ".cache" / "modelscope" / "models"
+    for name in ("offline", "vad", "punc"):
+        (cache_root / name).mkdir(parents=True)
+    capability = batch_transcribe.capability_status(
+        {
+            "MEETING_COPILOT_BATCH_FUNASR_PYTHON": str(python),
+            "MEETING_COPILOT_BATCH_TRANSCRIBE_WORKER": str(worker),
+            "MEETING_COPILOT_FILE_ASR_MODEL_DIR": str(cache_root / "offline"),
+            "MEETING_COPILOT_FILE_ASR_VAD_MODEL_DIR": str(cache_root / "vad"),
+            "MEETING_COPILOT_FILE_ASR_PUNC_MODEL_DIR": str(cache_root / "punc"),
+        }
+    )
+
+    assert capability["status"] == "invalid_runtime_configuration"
+    assert capability["invalid_components"] == ["offline_model", "vad_model", "punc_model"]
+    assert all(
+        capability["components"][name]["reason"] == "development_or_user_cache_path_forbidden"
+        for name in capability["invalid_components"]
+    )

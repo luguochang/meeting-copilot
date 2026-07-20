@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>com.meetingcopilot.desktop.native-system-audio</string>
+  <key>CFBundleName</key>
+  <string>Meeting Copilot Native System Audio</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.1.0</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>13.0</string>
+  <key>NSAudioCaptureUsageDescription</key>
+  <string>Meeting Copilot needs system audio access to transcribe the other participants in a meeting.</string>
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>Meeting Copilot needs screen and system audio recording access to capture meeting audio. It does not capture or save screen video.</string>
+</dict>
+</plist>

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-system-audio-adapter-stop"
+description = "Enables the system_audio_adapter_stop command without any pre-configured scope."
+commands.allow = ["system_audio_adapter_stop"]
+
+[[permission]]
+identifier = "deny-system-audio-adapter-stop"
+description = "Denies the system_audio_adapter_stop command without any pre-configured scope."
+commands.deny = ["system_audio_adapter_stop"]

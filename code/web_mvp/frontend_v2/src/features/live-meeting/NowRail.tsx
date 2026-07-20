@@ -1,7 +1,14 @@
-import { Bookmark, Check, Copy, EyeOff, Flag, MessageCircleQuestion, MoreHorizontal, Quote, TimerOff } from "lucide-react";
+import { Bookmark, Check, CircleAlert, Copy, EyeOff, Flag, ListChecks, MessageCircleQuestion, MoreHorizontal, Quote, ShieldAlert, TimerOff, CircleHelp } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import { useMemo, useState } from "react";
 import type {
+  ActionItemProjection,
+  DecisionCandidate,
+  FollowUpProjection,
+  MeetingFactKind,
+  MeetingFactStatus,
   OpenQuestionProjection,
+  RiskProjection,
   Suggestion,
   SuggestionFeedback,
   TopicProjection,
@@ -9,10 +16,15 @@ import type {
 
 interface NowRailProps {
   currentTopic: TopicProjection | null;
+  followUp: FollowUpProjection | null | undefined;
   openQuestions: OpenQuestionProjection[];
   suggestions: Suggestion[];
+  decisionCandidates: DecisionCandidate[];
+  actionItems: ActionItemProjection[];
+  risks: RiskProjection[];
   onEvidence(segmentId: string): void;
   onFeedback(suggestionId: string, feedback: SuggestionFeedback): Promise<void>;
+  onFactStatus(factType: MeetingFactKind, factId: string, status: Extract<MeetingFactStatus, "confirmed" | "dismissed">): Promise<void>;
   onMessage(message: string): void;
 }
 
@@ -36,12 +48,204 @@ function questionIsOpen(question: OpenQuestionProjection): boolean {
   return question.status === "open" || question.status === "carried_over" || question.status === "unknown";
 }
 
-export function NowRail({ currentTopic, openQuestions, suggestions, onEvidence, onFeedback, onMessage }: NowRailProps) {
-  const suggestion = useMemo(() => currentSuggestion(suggestions), [suggestions]);
-  const questions = openQuestions.filter(questionIsOpen).slice(0, 3);
+type RailFact = DecisionCandidate | ActionItemProjection | RiskProjection;
+
+function isFormalAi(value: { formalAi?: { source: "llm_first"; llmCalled: true } | null }): boolean {
+  return value.formalAi?.source === "llm_first" && value.formalAi.llmCalled === true;
+}
+
+function factStatusLabel(status: MeetingFactStatus): string {
+  if (status === "candidate") return "候选";
+  if (status === "confirmed") return "已确认";
+  if (status === "dismissed") return "已忽略";
+  if (status === "in_progress") return "进行中";
+  if (status === "done") return "已完成";
+  return "待确认";
+}
+
+function factKindLabel(kind: MeetingFactKind, status: MeetingFactStatus): string {
+  const state = factStatusLabel(status);
+  if (kind === "decision") return state === "已确认" ? "已确认决策" : state === "候选" ? "候选决策" : `${state}决策`;
+  if (kind === "action_item") return state === "候选" ? "候选待办" : state === "已确认" ? "已确认待办" : `${state}待办`;
+  return state === "候选" ? "候选风险" : state === "已确认" ? "已确认风险" : `${state}风险`;
+}
+
+function factEvidenceId(fact: RailFact): string | null {
+  return fact.evidenceSpans[0]?.segmentId ?? fact.evidenceSegmentIds[0] ?? null;
+}
+
+function factEvidenceQuote(fact: RailFact): string {
+  return fact.evidenceSpans[0]?.quote || "查看依据";
+}
+
+function FactRow({
+  fact,
+  factType,
+  onEvidence,
+  onStatus,
+}: {
+  fact: RailFact;
+  factType: MeetingFactKind;
+  onEvidence(segmentId: string): void;
+  onStatus(factType: MeetingFactKind, factId: string, status: Extract<MeetingFactStatus, "confirmed" | "dismissed">): Promise<void>;
+}) {
+  const [saving, setSaving] = useState<Extract<MeetingFactStatus, "confirmed" | "dismissed"> | null>(null);
+  const evidenceId = factEvidenceId(fact);
+  const save = async (status: Extract<MeetingFactStatus, "confirmed" | "dismissed">) => {
+    if (saving) return;
+    setSaving(status);
+    try {
+      await onStatus(factType, fact.id, status);
+    } finally {
+      setSaving(null);
+    }
+  };
+
+  return (
+    <li className={`fact-row fact-row--${fact.status}`}>
+      <div className="fact-row-main">
+        <span className="fact-status-label">{factKindLabel(factType, fact.status)}</span>
+        <p>{fact.text}</p>
+        {factType === "action_item" ? (
+          <span className="fact-detail">
+            负责人：{(fact as ActionItemProjection).owner ?? "待定"} · 截止：{(fact as ActionItemProjection).deadline ?? "待定"}
+          </span>
+        ) : null}
+        {factType === "risk" && (fact as RiskProjection).mitigation ? <span className="fact-detail">应对：{(fact as RiskProjection).mitigation}</span> : null}
+      </div>
+      <div className="fact-row-footer">
+        <button
+          className="fact-evidence-link"
+          type="button"
+          onClick={() => evidenceId && onEvidence(evidenceId)}
+          disabled={!evidenceId}
+          aria-label={`查看“${fact.text}”的依据`}
+        >
+          <Quote size={12} />
+          <span>{factEvidenceQuote(fact)}</span>
+        </button>
+        <div className="fact-actions" aria-label={`${fact.text}操作`}>
+          {fact.status !== "confirmed" ? (
+            <button
+              className="icon-button icon-button--small"
+              type="button"
+              onClick={() => void save("confirmed")}
+              disabled={Boolean(saving)}
+              title="确认事实"
+              aria-label={`确认${factKindLabel(factType, fact.status)}“${fact.text}”`}
+            >
+              <Check size={14} />
+            </button>
+          ) : null}
+          <button
+            className="icon-button icon-button--small"
+            type="button"
+            onClick={() => void save("dismissed")}
+            disabled={Boolean(saving)}
+            title="忽略事实"
+            aria-label={`忽略${factKindLabel(factType, fact.status)}“${fact.text}”`}
+          >
+            <EyeOff size={14} />
+          </button>
+        </div>
+      </div>
+    </li>
+  );
+}
+
+function FactGroup({
+  icon,
+  label,
+  facts,
+  factType,
+  dismissedFactIds,
+  onEvidence,
+  onStatus,
+}: {
+  icon: LucideIcon;
+  label: string;
+  facts: RailFact[];
+  factType: MeetingFactKind;
+  dismissedFactIds: Set<string>;
+  onEvidence(segmentId: string): void;
+  onStatus(factType: MeetingFactKind, factId: string, status: Extract<MeetingFactStatus, "confirmed" | "dismissed">): Promise<void>;
+}) {
+  const Icon = icon;
+  const visible = facts
+    .filter((fact) => isFormalAi(fact))
+    .filter((fact) => fact.status !== "dismissed" && !dismissedFactIds.has(`${factType}:${fact.id}`))
+    .slice(0, 4);
+  return (
+    <div className="fact-group">
+      <div className="fact-group-heading">
+        <span className="fact-group-label"><Icon size={13} />{label}</span>
+        {visible.length ? <span className="fact-group-count">{visible.length}</span> : null}
+      </div>
+      {visible.length ? (
+        <ul className="fact-list">
+          {visible.map((fact) => (
+            <FactRow
+              key={fact.id}
+              fact={fact}
+              factType={factType}
+              onEvidence={onEvidence}
+              onStatus={onStatus}
+            />
+          ))}
+        </ul>
+      ) : <p className="fact-empty">暂无记录</p>}
+    </div>
+  );
+}
+
+export function NowRail({
+  currentTopic,
+  followUp,
+  openQuestions,
+  suggestions,
+  decisionCandidates,
+  actionItems,
+  risks,
+  onEvidence,
+  onFeedback,
+  onFactStatus,
+  onMessage,
+}: NowRailProps) {
+  const suggestion = useMemo(
+    () => currentSuggestion(suggestions.filter((item) => isFormalAi(item))),
+    [suggestions],
+  );
+  const questions = openQuestions.filter((question) => isFormalAi(question) && questionIsOpen(question)).slice(0, 3);
+  const formalTopic = currentTopic && isFormalAi(currentTopic) ? currentTopic : null;
+  const formalFollowUp = followUp && isFormalAi(followUp) ? followUp : null;
   const [menuOpen, setMenuOpen] = useState(false);
   const [saving, setSaving] = useState<SuggestionFeedback | null>(null);
+  const [dismissedFactIds, setDismissedFactIds] = useState<Set<string>>(new Set());
+  const [factStatusOverrides, setFactStatusOverrides] = useState<Record<string, MeetingFactStatus>>({});
   const text = suggestion ? suggestionText(suggestion) : "";
+
+  const withFactStatusOverrides = <T extends RailFact>(factType: MeetingFactKind, facts: T[]): T[] => facts.map((fact) => {
+    const status = factStatusOverrides[`${factType}:${fact.id}`];
+    return status ? { ...fact, status } : fact;
+  });
+
+  const saveFactStatus = async (
+    factType: MeetingFactKind,
+    factId: string,
+    status: Extract<MeetingFactStatus, "confirmed" | "dismissed">,
+  ) => {
+    try {
+      await onFactStatus(factType, factId, status);
+      setFactStatusOverrides((current) => ({ ...current, [`${factType}:${factId}`]: status }));
+      if (status === "dismissed") {
+        setDismissedFactIds((current) => new Set(current).add(`${factType}:${factId}`));
+      }
+      onMessage(status === "confirmed" ? "事实已确认" : "事实已忽略");
+    } catch (error) {
+      onMessage(error instanceof Error ? error.message : "事实状态保存失败");
+      throw error;
+    }
+  };
 
   const saveFeedback = async (feedback: SuggestionFeedback) => {
     if (!suggestion || saving) return;
@@ -80,14 +284,14 @@ export function NowRail({ currentTopic, openQuestions, suggestions, onEvidence, 
           <Flag size={15} />
           <h2 id="topic-title">当前议题</h2>
         </header>
-        {currentTopic ? (
+        {formalTopic ? (
           <button
             className="topic-content evidence-content"
             type="button"
-            onClick={() => currentTopic.evidenceSegmentIds[0] && onEvidence(currentTopic.evidenceSegmentIds[0])}
-            disabled={!currentTopic.evidenceSegmentIds.length}
+            onClick={() => formalTopic.evidenceSegmentIds[0] && onEvidence(formalTopic.evidenceSegmentIds[0])}
+            disabled={!formalTopic.evidenceSegmentIds.length}
           >
-            {currentTopic.text}
+            {formalTopic.text}
           </button>
         ) : (
           <p className="rail-empty">等待讨论形成清晰议题</p>
@@ -97,13 +301,40 @@ export function NowRail({ currentTopic, openQuestions, suggestions, onEvidence, 
       <section className="rail-section suggestion-section" aria-labelledby="suggestion-title">
         <header className="rail-heading">
           <MessageCircleQuestion size={16} />
-          <h2 id="suggestion-title">现在最值得追问</h2>
+          <h2 id="suggestion-title">AI 实时建议</h2>
           {suggestion?.status === "draft" || suggestion?.status === "validating" ? (
             <span className="draft-badge">生成中</span>
           ) : null}
         </header>
 
-        {suggestion && text ? (
+        {formalFollowUp ? (
+          <div className="follow-up-card" data-testid="follow-up-card">
+            <div className="follow-up-heading">
+              <strong>建议追问</strong>
+              <span
+                className="follow-up-reason"
+                title={`为什么现在提示：${formalFollowUp.reason}${formalFollowUp.evidenceQuote ? `；依据：${formalFollowUp.evidenceQuote}` : ""}`}
+              >
+                <CircleHelp size={15} aria-hidden="true" />
+                <span className="sr-only">{formalFollowUp.reason}</span>
+              </span>
+            </div>
+            <blockquote>{formalFollowUp.question}</blockquote>
+            <p className="follow-up-reason-text">{formalFollowUp.reason}</p>
+            <div className="suggestion-footer">
+              {formalFollowUp.evidenceSegmentIds[0] ? (
+                <button
+                  className="evidence-link"
+                  type="button"
+                  onClick={() => onEvidence(formalFollowUp.evidenceSegmentIds[0])}
+                >
+                  <Quote size={13} />查看依据
+                </button>
+              ) : <span className="evidence-link evidence-link--disabled">暂无可定位依据</span>}
+              <span className="follow-up-urgency">{formalFollowUp.urgency === "high" ? "紧急" : formalFollowUp.urgency === "low" ? "低优先" : "适时确认"}</span>
+            </div>
+          </div>
+        ) : suggestion && text ? (
           <div className={`suggestion-card suggestion-card--${suggestion.status}`}>
             <blockquote>{text}</blockquote>
             <div className="suggestion-footer">
@@ -146,7 +377,7 @@ export function NowRail({ currentTopic, openQuestions, suggestions, onEvidence, 
             </div>
           </div>
         ) : (
-          <p className="rail-empty">暂无需要立即追问的建议</p>
+          <p className="rail-empty">AI 正在结合最新会议文字分析</p>
         )}
       </section>
 
@@ -173,6 +404,42 @@ export function NowRail({ currentTopic, openQuestions, suggestions, onEvidence, 
         ) : (
           <p className="rail-empty">暂无已识别的未闭环问题</p>
         )}
+      </section>
+
+      <section className="rail-section facts-section" aria-labelledby="facts-title" aria-label="会议事实">
+        <header className="rail-heading">
+          <CircleAlert size={15} />
+          <h2 id="facts-title">会议事实</h2>
+        </header>
+        <div className="fact-groups">
+          <FactGroup
+            icon={ListChecks}
+            label="决策"
+            facts={withFactStatusOverrides("decision", decisionCandidates)}
+            factType="decision"
+            dismissedFactIds={dismissedFactIds}
+            onEvidence={onEvidence}
+            onStatus={saveFactStatus}
+          />
+          <FactGroup
+            icon={ListChecks}
+            label="待办"
+            facts={withFactStatusOverrides("action_item", actionItems)}
+            factType="action_item"
+            dismissedFactIds={dismissedFactIds}
+            onEvidence={onEvidence}
+            onStatus={saveFactStatus}
+          />
+          <FactGroup
+            icon={ShieldAlert}
+            label="风险"
+            facts={withFactStatusOverrides("risk", risks)}
+            factType="risk"
+            dismissedFactIds={dismissedFactIds}
+            onEvidence={onEvidence}
+            onStatus={saveFactStatus}
+          />
+        </div>
       </section>
     </aside>
   );

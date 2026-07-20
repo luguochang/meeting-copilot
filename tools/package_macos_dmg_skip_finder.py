@@ -11,7 +11,6 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
-import sys
 from typing import Any
 
 
@@ -48,6 +47,27 @@ def build_bundle_command(
         "--no-internet-enable",
         str(output_dmg),
         str(source_dir),
+    ]
+
+
+def build_direct_hdiutil_command(
+    *,
+    output_dmg: Path,
+    source_dir: Path,
+    volume_name: str,
+) -> list[str]:
+    """Build the no-Finder DMG command used by local installation smoke."""
+    return [
+        "hdiutil",
+        "create",
+        "-volname",
+        volume_name,
+        "-srcfolder",
+        str(source_dir),
+        "-format",
+        "UDZO",
+        "-ov",
+        str(output_dmg),
     ]
 
 

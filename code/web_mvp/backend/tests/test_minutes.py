@@ -41,6 +41,79 @@ def test_build_minutes_to_markdown_with_evidence():
     assert usage["total_tokens"] == 210
 
 
+def test_build_minutes_artifact_keeps_structured_data_and_markdown_in_one_call():
+    config = llm_service.LlmConfig(base_url="https://gw.example", api_key="sk-x", model="m1")
+
+    class FakeClient:
+        def post_json(self, url, headers, body, timeout):
+            return _minutes_response()
+
+    markdown, structured, usage, degraded = llm_service.build_minutes_artifact(
+        "转写",
+        config,
+        client=FakeClient(),
+    )
+
+    assert degraded is False
+    assert structured["decisions"] == ["灰度 5% 起步"]
+    assert structured["action_items"][0]["owner"] == "张三"
+    assert "灰度 5% 起步" in markdown
+    assert usage["total_tokens"] == 210
+
+
+def test_build_minutes_artifact_degrades_for_valid_json_with_invalid_schema(monkeypatch):
+    monkeypatch.setattr(llm_service.time, "sleep", lambda *args: None)
+    config = llm_service.LlmConfig(base_url="https://gw.example", api_key="sk-x", model="m1")
+
+    class FakeClient:
+        def __init__(self, content):
+            self.content = content
+
+        def post_json(self, url, headers, body, timeout):
+            return {
+                "choices": [{"message": {"content": json.dumps(self.content)}}],
+                "usage": {},
+            }
+
+    for content in (
+        [],
+        {},
+        {"background": "背景", "decisions": "不是数组"},
+        {"background": "背景", "action_items": ["不是对象"]},
+    ):
+        markdown, structured, _usage, degraded = llm_service.build_minutes_artifact(
+            "转写",
+            config,
+            client=FakeClient(content),
+        )
+        assert degraded is True
+        assert markdown == ""
+        assert structured == {}
+
+
+def test_build_minutes_artifact_normalizes_multiline_fields_before_markdown_projection():
+    config = llm_service.LlmConfig(base_url="https://gw.example", api_key="sk-x", model="m1")
+    response = _minutes_response()
+    payload = json.loads(response["choices"][0]["message"]["content"])
+    payload["decisions"] = ["确认发布\n## 伪造章节\n[外链](https://example.test)"]
+    response["choices"][0]["message"]["content"] = json.dumps(payload, ensure_ascii=False)
+
+    class FakeClient:
+        def post_json(self, url, headers, body, timeout):
+            return response
+
+    markdown, structured, _usage, degraded = llm_service.build_minutes_artifact(
+        "转写",
+        config,
+        client=FakeClient(),
+    )
+
+    assert degraded is False
+    assert structured["decisions"] == ["确认发布 ## 伪造章节 [外链](https://example.test)"]
+    assert "\n## 伪造章节\n" not in markdown
+    assert r"\#\# 伪造章节 \[外链\](https://example.test)" in markdown
+
+
 def test_minutes_endpoint_returns_markdown(monkeypatch):
     class FakeClient:
         def post_json(self, url, headers, body, timeout):
@@ -61,6 +134,8 @@ def test_minutes_endpoint_returns_markdown(monkeypatch):
     assert body["degraded"] is False
     assert "# 会议纪要" in body["minutes_md"]
     assert "证据片段" in body["minutes_md"]
+    assert body["minutes"]["decisions"] == ["灰度 5% 起步"]
+    assert body["minutes"]["action_items"][0]["owner"] == "张三"
     assert body["llm_usage"]["total_tokens"] == 210
 
 

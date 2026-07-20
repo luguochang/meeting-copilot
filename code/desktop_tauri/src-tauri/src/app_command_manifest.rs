@@ -9,13 +9,27 @@ pub const APP_COMMAND_NAMES: &[&str] = &[
     "asr_worker_stop",
     "asr_worker_cleanup",
     "mic_adapter_prepare",
+    "mic_adapter_probe",
     "mic_adapter_status",
+    "mic_adapter_collect_events",
     "mic_adapter_start",
     "mic_adapter_pause",
     "mic_adapter_resume",
     "mic_adapter_stop",
-    "mic_adapter_delete_audio_chunks",
+    "mic_adapter_cleanup",
+    "system_audio_adapter_prepare",
+    "system_audio_adapter_status",
+    "system_audio_adapter_collect_events",
+    "system_audio_adapter_start",
+    "system_audio_adapter_stop",
+    "system_audio_adapter_cleanup",
+    "dual_track_adapter_start",
+    "dual_track_adapter_status",
+    "dual_track_adapter_collect_events",
+    "dual_track_adapter_stop",
+    "dual_track_adapter_cleanup",
     "provider_config_status",
+    "provider_config_sync",
     "provider_config_save",
     "provider_config_clear",
 ];
@@ -34,6 +48,10 @@ mod tests {
         assert_eq!(
             permission_name("mic_adapter_prepare"),
             "allow-mic-adapter-prepare"
+        );
+        assert_eq!(
+            permission_name("mic_adapter_probe"),
+            "allow-mic-adapter-probe"
         );
         assert_eq!(
             permission_name("provider_config_status"),

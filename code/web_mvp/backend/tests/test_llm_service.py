@@ -70,7 +70,7 @@ def test_execute_candidate_reuses_redacted_idempotency_header_across_retry(monke
         def post_json(self, url, headers, body, timeout):
             self.calls.append({"url": url, "headers": dict(headers), "body": body})
             if len(self.calls) == 1:
-                raise RuntimeError("transient gateway failure")
+                raise llm_service.LlmProviderTransportError("transport")
             return self.response
 
     monkeypatch.setattr(llm_service.time, "sleep", lambda _seconds: None)
@@ -313,3 +313,112 @@ def test_httpx_llm_client_does_not_inherit_system_proxy(monkeypatch):
     assert body == {"ok": True}
     assert created["timeout"] == 5
     assert created["trust_env"] is False
+
+
+def test_httpx_llm_client_uses_explicit_responses_style_and_normalizes_result(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "id": "resp_1",
+                "model": "gpt-5.5",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "OK"}],
+                    }
+                ],
+                "usage": {"input_tokens": 4, "output_tokens": 1, "total_tokens": 5},
+            }
+
+    class FakeHttpxClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, url, headers, json):
+            calls.append((url, headers, json))
+            return FakeResponse()
+
+    monkeypatch.setattr(llm_service.httpx, "Client", FakeHttpxClient)
+    result = llm_service.HttpxLlmClient(api_style="responses").post_json(
+        "https://gateway.example/v1/chat/completions",
+        headers={"Authorization": "Bearer redacted"},
+        body={
+            "model": "gpt-5.5",
+            "messages": [{"role": "user", "content": "只回复 OK"}],
+            "reasoning_effort": "low",
+            "max_completion_tokens": 16,
+        },
+        timeout=5,
+    )
+
+    assert calls[0][0] == "https://gateway.example/v1/responses"
+    assert calls[0][2]["input"] == [{"role": "user", "content": "只回复 OK"}]
+    assert result["choices"][0]["message"]["content"] == "OK"
+    assert result["usage"]["total_tokens"] == 5
+
+
+def test_httpx_llm_client_reports_redacted_authentication_error(monkeypatch):
+    class FakeResponse:
+        status_code = 401
+
+        def json(self):
+            return {
+                "code": "INVALID_API_KEY",
+                "message": "credential sk-should-never-escape is invalid",
+            }
+
+    class FakeHttpxClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, _url, headers, json):
+            return FakeResponse()
+
+    monkeypatch.setattr(llm_service.httpx, "Client", FakeHttpxClient)
+
+    with pytest.raises(llm_service.LlmProviderHttpError) as caught:
+        llm_service.HttpxLlmClient(api_style="responses").post_json(
+            "https://gateway.example/v1/chat/completions",
+            headers={"Authorization": "Bearer redacted"},
+            body={"model": "gpt-5.5", "messages": [{"role": "user", "content": "x"}]},
+            timeout=5,
+        )
+
+    assert caught.value.status_code == 401
+    assert caught.value.category == "authentication"
+    assert caught.value.retryable is False
+    assert caught.value.provider_code == "INVALID_API_KEY"
+    assert caught.value.api_style == "responses"
+    message = llm_service.provider_failure_message(caught.value)
+    assert "HTTP 401" in message
+    assert "INVALID_API_KEY" in message
+    assert "Responses" in message
+    assert "Chat Completions" in message
+    assert "sk-should-never-escape" not in message
+
+
+def test_call_with_retry_does_not_retry_permanent_provider_error(monkeypatch):
+    fake = FakeClient(error=llm_service.LlmProviderHttpError(400, provider_code="INVALID_MODEL"))
+    monkeypatch.setattr(llm_service.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(llm_service.LlmProviderHttpError):
+        llm_service._call_with_retry(fake, "https://gateway.example", {}, {}, 5, retries=2)
+
+    assert len(fake.calls) == 1

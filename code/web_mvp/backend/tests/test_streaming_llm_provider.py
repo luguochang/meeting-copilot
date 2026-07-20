@@ -38,14 +38,17 @@ def _provider(
     *,
     allow_non_streaming_fallback: bool = True,
     clock=None,
+    model: str = "test-model",
+    api_style: str = "chat_completions",
 ) -> OpenAICompatibleStreamingProvider:
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler), trust_env=False)
     return OpenAICompatibleStreamingProvider(
         base_url="https://gateway.example/openai",
         api_key="sk-test-secret",
-        model="test-model",
+        model=model,
         client=client,
         allow_non_streaming_fallback=allow_non_streaming_fallback,
+        api_style=api_style,
         clock=clock,
     )
 
@@ -111,6 +114,73 @@ async def test_streams_real_sse_deltas_usage_and_timings() -> None:
             "max_completion_tokens": 64,
         }
     ]
+    await provider.aclose()
+
+
+@_async_test
+async def test_gpt5_streams_through_responses_api_and_normalizes_usage() -> None:
+    request_bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_bodies.append(json.loads(request.content))
+        assert request.url == "https://gateway.example/openai/v1/responses"
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=(
+                'data: {"type":"response.output_text.delta","delta":"建议"}\n\n'
+                'data: {"type":"response.output_text.delta","delta":"确认"}\n\n'
+                'data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.5","status":"completed","usage":{"input_tokens":9,"output_tokens":2,"total_tokens":11}}}\n\n'
+            ),
+        )
+
+    provider = _provider(handler, model="gpt-5.5", api_style="responses")
+    deltas = []
+    result = await provider.complete(
+        [
+            {"role": "system", "content": "生成低打扰建议"},
+            {"role": "user", "content": "P99 超过阈值"},
+        ],
+        on_delta=deltas.append,
+        reasoning_effort="low",
+        max_completion_tokens=64,
+    )
+
+    assert [delta.text for delta in deltas] == ["建议", "确认"]
+    assert result.content == "建议确认"
+    assert result.response_id == "resp_1"
+    assert result.model == "gpt-5.5"
+    assert result.usage is not None
+    assert result.usage.total_tokens == 11
+    assert request_bodies == [
+        {
+            "model": "gpt-5.5",
+            "input": [{"role": "user", "content": "P99 超过阈值"}],
+            "instructions": "生成低打扰建议",
+            "store": False,
+            "stream": True,
+            "max_output_tokens": 64,
+            "reasoning": {"effort": "low"},
+        }
+    ]
+    await provider.aclose()
+
+
+@_async_test
+async def test_explicit_responses_404_does_not_dual_submit_to_chat_completions() -> None:
+    urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        urls.append(str(request.url))
+        return httpx.Response(404, json={"code": "ENDPOINT_NOT_FOUND"})
+
+    provider = _provider(handler, model="gpt-5.5", api_style="responses")
+    with pytest.raises(StreamingProviderError) as caught:
+        await provider.complete([{"role": "user", "content": "x"}])
+
+    assert urls == ["https://gateway.example/openai/v1/responses"]
+    assert caught.value.status_code == 404
+    assert caught.value.retryable is False
     await provider.aclose()
 
 
@@ -294,7 +364,7 @@ async def test_classifies_http_errors(status, category, retryable) -> None:
     assert caught.value.category is category
     assert caught.value.status_code == status
     assert caught.value.retryable is retryable
-    assert caught.value.provider_code == "test"
+    assert caught.value.provider_code is None
     assert "sk-test-secret" not in str(caught.value)
     await provider.aclose()
 
@@ -358,7 +428,7 @@ async def test_sse_error_payload_is_classified() -> None:
         await provider.complete([{"role": "user", "content": "x"}])
 
     assert caught.value.category is ProviderErrorCategory.RATE_LIMIT
-    assert caught.value.provider_code == "rate_limit_exceeded"
+    assert caught.value.provider_code == "RATE_LIMIT_EXCEEDED"
     assert caught.value.retryable is True
     await provider.aclose()
 

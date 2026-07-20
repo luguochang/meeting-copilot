@@ -64,30 +64,40 @@ EXPECTED_BRIDGE_COMMANDS = {
     "asr_worker_stop": "worker.stop",
     "asr_worker_cleanup": "worker.cleanup",
     "mic_adapter_prepare": "mic_adapter.prepare",
+    "mic_adapter_probe": "mic_adapter.probe",
     "mic_adapter_status": "mic_adapter.status",
     "mic_adapter_start": "mic_adapter.start",
     "mic_adapter_pause": "mic_adapter.pause",
     "mic_adapter_resume": "mic_adapter.resume",
     "mic_adapter_stop": "mic_adapter.stop",
-    "mic_adapter_delete_audio_chunks": "mic_adapter.delete_audio_chunks",
+    "mic_adapter_collect_events": "mic_adapter.collect_events",
+    "mic_adapter_cleanup": "mic_adapter.cleanup",
+    "system_audio_adapter_prepare": "system_audio_adapter.prepare",
+    "system_audio_adapter_status": "system_audio_adapter.status",
+    "system_audio_adapter_collect_events": "system_audio_adapter.collect_events",
+    "system_audio_adapter_start": "system_audio_adapter.start",
+    "system_audio_adapter_stop": "system_audio_adapter.stop",
+    "system_audio_adapter_cleanup": "system_audio_adapter.cleanup",
+    "dual_track_adapter_start": "dual_track_adapter.start",
+    "dual_track_adapter_status": "dual_track_adapter.status",
+    "dual_track_adapter_collect_events": "dual_track_adapter.collect_events",
+    "dual_track_adapter_stop": "dual_track_adapter.stop",
+    "dual_track_adapter_cleanup": "dual_track_adapter.cleanup",
     "provider_config_status": "provider_config.status",
+    "provider_config_sync": "provider_config.sync",
     "provider_config_save": "provider_config.save",
     "provider_config_clear": "provider_config.clear",
 }
 
 EXPECTED_NATIVE_MIC_COMMANDS = {
     "mic_adapter_prepare": "native_mic_capture_runtime::NativeMicCaptureSupervisor",
+    "mic_adapter_probe": "native_mic_capture_runtime::NativeMicCaptureSupervisor",
     "mic_adapter_status": "native_mic_capture_runtime::NativeMicCaptureSupervisor",
     "mic_adapter_start": "native_mic_capture_runtime::NativeMicCaptureSupervisor",
     "mic_adapter_pause": "native_mic_capture_runtime::NativeMicCaptureSupervisor",
     "mic_adapter_resume": "native_mic_capture_runtime::NativeMicCaptureSupervisor",
     "mic_adapter_stop": "native_mic_capture_runtime::NativeMicCaptureSupervisor",
-}
-
-EXPECTED_AUDIO_CHUNK_RUNTIME_COMMANDS = {
-    "mic_adapter_start": "desktop_audio_chunk_runtime::start_recording",
-    "mic_adapter_stop": "desktop_audio_chunk_runtime::stop_recording",
-    "mic_adapter_delete_audio_chunks": "desktop_audio_chunk_runtime::delete_audio_chunks",
+    "mic_adapter_cleanup": "native_mic_capture_runtime::NativeMicCaptureSupervisor",
 }
 
 EXPECTED_ASR_WORKER_LIFECYCLE_RUNTIME_COMMANDS = {
@@ -253,7 +263,10 @@ def test_tauri_lib_binds_bridge_and_mic_adapter_commands():
     public_command_functions = re.findall(r"#\[tauri::command\]\s*pub fn ([a-z0-9_]+)\(", lib_rs)
     assert public_command_functions == []
 
-    command_functions = re.findall(r"#\[tauri::command\]\s*fn ([a-z0-9_]+)\(", lib_rs)
+    command_functions = re.findall(
+        r"#\[tauri::command\]\s*(?:async\s+)?fn ([a-z0-9_]+)\(",
+        lib_rs,
+    )
     assert set(command_functions) == set(EXPECTED_BRIDGE_COMMANDS)
 
     handler_match = re.search(r"generate_handler!\s*\\?\[\s*(.*?)\s*\]", lib_rs, re.S)
@@ -274,10 +287,11 @@ def test_tauri_lib_binds_bridge_and_mic_adapter_commands():
 
     assert "microphone.prepare()" in lib_rs
     assert "microphone.status()" in lib_rs
-    assert "microphone.start(session_id, &backend)" in lib_rs
+    assert "microphone.start_with_epoch(" in lib_rs
     assert "microphone.pause()" in lib_rs
     assert "microphone.resume()" in lib_rs
-    assert "microphone.stop()" in lib_rs
+    assert "microphone.stop_for_session(session_id.as_deref())" in lib_rs
+    assert "microphone.cleanup_for_session(session_id.as_deref())" in lib_rs
 
     for worker_function, runtime_call in EXPECTED_ASR_WORKER_LIFECYCLE_RUNTIME_COMMANDS.items():
         assert re.search(
@@ -420,5 +434,6 @@ def test_scaffold_binds_local_backend_supervisor_without_general_remote_client_d
     env_reads = set(re.findall(r'env::var\("([^"]+)"\)', scaffold_text))
     assert env_reads == {
         "MEETING_COPILOT_DESKTOP_API_BASE_URL",
+        "MEETING_COPILOT_AUTO_SYNC_PROVIDER",
         "MEETING_COPILOT_PACKAGED_SAME_CHAIN_PROBE",
     }

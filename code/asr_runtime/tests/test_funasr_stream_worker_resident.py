@@ -19,6 +19,8 @@ class FakeResidentAutoModel:
     init_count = 0
     cache_ids = []
     cache_call_numbers = []
+    is_final_flags = []
+    hotword_values = []
 
     def __init__(self, **_kwargs):
         type(self).init_count += 1
@@ -28,6 +30,8 @@ class FakeResidentAutoModel:
         cache["call_number"] = cache.get("call_number", 0) + 1
         type(self).cache_ids.append(id(cache))
         type(self).cache_call_numbers.append(cache["call_number"])
+        type(self).is_final_flags.append(bool(kwargs["is_final"]))
+        type(self).hotword_values.append(tuple(kwargs.get("hotword") or ()))
         marker = int(round(float(kwargs["input"][0])))
         return [{"text": {1: "第一场内容", 2: "第二场内容"}.get(marker, "其他内容")}]
 
@@ -44,6 +48,8 @@ def _install_fake_model(monkeypatch):
     FakeResidentAutoModel.init_count = 0
     FakeResidentAutoModel.cache_ids = []
     FakeResidentAutoModel.cache_call_numbers = []
+    FakeResidentAutoModel.is_final_flags = []
+    FakeResidentAutoModel.hotword_values = []
     monkeypatch.setitem(
         sys.modules,
         "funasr",
@@ -90,6 +96,14 @@ def test_resident_command_header_encode_and_decode_helpers_round_trip():
     assert decoded.session_id == "session-1"
     assert decoded.pcm_bytes == pcm_bytes
 
+    start_encoded = funasr_stream_worker.encode_resident_command(
+        "start_session",
+        session_id="session-1",
+        hotwords=["P99", "订单中台", "p99"],
+    )
+    start_decoded = funasr_stream_worker.decode_resident_command(start_encoded)
+    assert start_decoded.hotwords == ("P99", "订单中台")
+
 
 def test_resident_command_decoder_rejects_bad_base64_and_extra_fields():
     with pytest.raises(funasr_stream_worker.ResidentProtocolError) as bad_base64:
@@ -109,6 +123,12 @@ def test_resident_command_decoder_rejects_bad_base64_and_extra_fields():
             b'{"command":"start_session","session_id":"first","session_id":"second"}\n'
         )
     assert duplicate_field.value.code == "duplicate_json_field"
+
+    with pytest.raises(funasr_stream_worker.ResidentProtocolError) as invalid_hotwords:
+        funasr_stream_worker.decode_resident_command(
+            b'{"command":"start_session","session_id":"session-1","hotwords":["bad\\nword"]}\n'
+        )
+    assert invalid_hotwords.value.code == "invalid_hotwords"
 
 
 def test_resident_mode_loads_model_once_and_resets_every_session(monkeypatch):
@@ -171,6 +191,86 @@ def test_resident_mode_loads_model_once_and_resets_every_session(monkeypatch):
     assert all(event["status"] == "completed" for event in ended)
     assert all(event["reason"] == "end_session" for event in ended)
     assert all(event["final_emitted"] is True for event in ended)
+
+
+def test_resident_mode_marks_the_short_tail_as_final_for_funasr(monkeypatch):
+    commands = b"".join(
+        [
+            funasr_stream_worker.encode_resident_command(
+                "start_session", session_id="tail-session"
+            ),
+            funasr_stream_worker.encode_resident_command(
+                "audio",
+                session_id="tail-session",
+                pcm_bytes=_audio_payload(1, sample_count=480),
+            ),
+            funasr_stream_worker.encode_resident_command(
+                "end_session", session_id="tail-session"
+            ),
+            funasr_stream_worker.encode_resident_command("shutdown"),
+        ]
+    )
+
+    events = _run_worker(
+        monkeypatch,
+        commands,
+        ["--resident", "--chunk-size", "0,1,0"],
+    )
+
+    assert FakeResidentAutoModel.is_final_flags == [True]
+    assert any(event["event_type"] == "final" for event in events)
+
+
+def test_resident_mode_keeps_an_exact_stride_for_final_inference(monkeypatch):
+    commands = b"".join(
+        [
+            funasr_stream_worker.encode_resident_command(
+                "start_session", session_id="exact-stride"
+            ),
+            funasr_stream_worker.encode_resident_command(
+                "audio",
+                session_id="exact-stride",
+                pcm_bytes=_audio_payload(1, sample_count=960),
+            ),
+            funasr_stream_worker.encode_resident_command(
+                "end_session", session_id="exact-stride"
+            ),
+            funasr_stream_worker.encode_resident_command("shutdown"),
+        ]
+    )
+
+    _run_worker(monkeypatch, commands, ["--resident", "--chunk-size", "0,1,0"])
+
+    assert FakeResidentAutoModel.is_final_flags == [True]
+
+
+def test_resident_mode_applies_and_isolates_session_hotwords(monkeypatch):
+    commands = b"".join(
+        [
+            funasr_stream_worker.encode_resident_command(
+                "start_session", session_id="hotword-one", hotwords=["订单中台"]
+            ),
+            funasr_stream_worker.encode_resident_command(
+                "audio", session_id="hotword-one", pcm_bytes=_audio_payload(1, 480)
+            ),
+            funasr_stream_worker.encode_resident_command("end_session", session_id="hotword-one"),
+            funasr_stream_worker.encode_resident_command(
+                "start_session", session_id="hotword-two", hotwords=["缓存穿透"]
+            ),
+            funasr_stream_worker.encode_resident_command(
+                "audio", session_id="hotword-two", pcm_bytes=_audio_payload(2, 480)
+            ),
+            funasr_stream_worker.encode_resident_command("end_session", session_id="hotword-two"),
+            funasr_stream_worker.encode_resident_command("shutdown"),
+        ]
+    )
+
+    _run_worker(monkeypatch, commands, ["--resident", "--chunk-size", "0,1,0", "--hotwords", "P99"])
+
+    assert FakeResidentAutoModel.hotword_values == [
+        ("P99", "订单中台"),
+        ("P99", "缓存穿透"),
+    ]
 
 
 def test_abort_discards_buffer_and_next_session_starts_clean(monkeypatch):
@@ -319,7 +419,7 @@ def test_resident_mode_emits_redacted_session_error_and_failed_end(monkeypatch):
             funasr_stream_worker.encode_resident_command(
                 "audio",
                 session_id="session-1",
-                pcm_bytes=_audio_payload(1),
+                pcm_bytes=_audio_payload(1, sample_count=1_920),
             ),
         ]
     )

@@ -26,6 +26,20 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "artifacts/tmp/packaged_runtime_supervisor_smoke"
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 PORT_PATTERN = re.compile(r"(?:^|\s)--port\s+(\d+)(?:\s|$)")
+PACKAGED_APP_PROCESS_PATTERN = re.compile(
+    r"^(?P<binary>.+?Meeting Copilot\.app/Contents/MacOS/meeting-copilot-desktop)(?:\s|$)"
+)
+
+
+def packaged_app_launch_command(binary: Path) -> list[str]:
+    """Prevent AppKit crash-history restoration prompts from blocking setup."""
+    return [
+        str(binary),
+        "-ApplePersistenceIgnoreState",
+        "YES",
+        "-NSQuitAlwaysKeepsWindows",
+        "NO",
+    ]
 
 
 def validate_run_id(run_id: str) -> None:
@@ -57,6 +71,27 @@ def parse_process_table(output: str) -> list[dict[str, Any]]:
     return processes
 
 
+def find_conflicting_app_instances(
+    processes: list[dict[str, Any]], *, app_path: Path
+) -> list[dict[str, Any]]:
+    candidate_binary = (
+        app_path / "Contents/MacOS/meeting-copilot-desktop"
+    ).expanduser().resolve(strict=False)
+    conflicts: list[dict[str, Any]] = []
+    for process in processes:
+        match = PACKAGED_APP_PROCESS_PATTERN.match(str(process.get("command") or ""))
+        if match is None:
+            continue
+        observed_binary = Path(match.group("binary")).expanduser().resolve(strict=False)
+        conflicts.append(
+            {
+                "pid": int(process["pid"]),
+                "same_candidate": observed_binary == candidate_binary,
+            }
+        )
+    return conflicts
+
+
 def backend_executable_from_manifest(app_path: Path) -> str:
     manifest_path = app_path / "Contents/Resources/MeetingCopilotRuntime.bundle/runtime-bundle-manifest.json"
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -83,6 +118,25 @@ def find_backend_process(processes: list[dict[str, Any]], *, app_pid: int, app_p
             and port_match is not None
         ):
             return {**process, "port": int(port_match.group(1))}
+    return None
+
+
+def find_funasr_process(
+    processes: list[dict[str, Any]],
+    *,
+    backend_pid: int,
+    app_path: Path,
+) -> dict[str, Any] | None:
+    runtime_marker = str(app_path / "Contents/Resources/MeetingCopilotRuntime.bundle")
+    for process in processes:
+        command = str(process["command"])
+        if (
+            int(process["ppid"]) == backend_pid
+            and runtime_marker in command
+            and "funasr_stream_worker.py" in command
+            and "--resident" in command
+        ):
+            return process
     return None
 
 
@@ -135,12 +189,19 @@ def bootstrap_cookie(port: int, token: str) -> tuple[int | None, str | None]:
     return response["status"], cookie
 
 
-def post_json(port: int, path: str, cookie: str, payload: dict[str, Any]) -> dict[str, Any]:
+def request_json(
+    port: int,
+    path: str,
+    cookie: str,
+    payload: dict[str, Any],
+    *,
+    method: str = "POST",
+) -> dict[str, Any]:
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
     try:
         body = json.dumps(payload).encode("utf-8")
         connection.request(
-            "POST",
+            method,
             path,
             body=body,
             headers={
@@ -162,6 +223,20 @@ def post_json(port: int, path: str, cookie: str, payload: dict[str, Any]) -> dic
         connection.close()
 
 
+def post_json(port: int, path: str, cookie: str, payload: dict[str, Any]) -> dict[str, Any]:
+    return request_json(port, path, cookie, payload)
+
+
+def meeting_preparation_payload() -> dict[str, Any]:
+    return {
+        "hotwords": ["P99", "SLO", "灰度", "回滚"],
+        "input_source": "microphone",
+        "input_device_id": "packaged-smoke-fixture",
+        "input_device_name": "Packaged synthetic acceptance fixture",
+        "notice_acknowledged": True,
+    }
+
+
 def pcm_float32_chunks(wav_path: Path, *, chunk_samples: int = 4_800, max_seconds: float = 30.0):
     with wave.open(str(wav_path), "rb") as handle:
         if handle.getsampwidth() != 2 or handle.getnchannels() != 1 or handle.getframerate() != 16_000:
@@ -174,6 +249,12 @@ def pcm_float32_chunks(wav_path: Path, *, chunk_samples: int = 4_800, max_second
             values = struct.unpack("<" + "h" * (len(raw) // 2), raw)
             yield b"".join(struct.pack("<f", value / 32768.0) for value in values)
             remaining -= len(values)
+
+
+def pcm_float32_duration_seconds(chunk: bytes, *, sample_rate_hz: int = 16_000) -> float:
+    if len(chunk) % 4 != 0:
+        raise ValueError("float32 PCM chunk size must be divisible by four")
+    return (len(chunk) // 4) / sample_rate_hz
 
 
 def stream_packaged_funasr(
@@ -199,9 +280,14 @@ def stream_packaged_funasr(
     events: list[dict[str, Any]] = []
     ready = False
     finals: list[dict[str, Any]] = []
+    rejected = False
+    transport_error: str | None = None
+    post_end_quiet_seconds = 2.0
+    ready_wait_started = time.monotonic()
+    ready_wait_ms: float | None = None
 
     def drain(timeout: float) -> None:
-        nonlocal ready
+        nonlocal ready, rejected
         ws.settimeout(timeout)
         while True:
             try:
@@ -218,27 +304,57 @@ def stream_packaged_funasr(
             event_type = str(event.get("event_type") or "")
             if event_type == "asr_ready" and event.get("ready") is True:
                 ready = True
+                return
             if event_type == "final" and str(event.get("text") or event.get("normalized_text") or "").strip():
                 finals.append(event)
-            if event_type in {"provider_error", "error"}:
+            if event_type in {"provider_error", "recording_rejected", "error"}:
+                rejected = True
                 return
 
     try:
-        drain(0.2)
+        ready_deadline = time.monotonic() + min(45.0, timeout_seconds)
+        while not ready and not rejected and time.monotonic() < ready_deadline:
+            drain(min(0.5, max(0.01, ready_deadline - time.monotonic())))
+        ready_wait_ms = round((time.monotonic() - ready_wait_started) * 1_000, 2)
         for chunk in pcm_float32_chunks(audio_path):
-            ws.send_binary(chunk)
-            drain(0.02)
-        ws.send("END")
+            if not ready or rejected:
+                break
+            chunk_started = time.monotonic()
+            try:
+                ws.send_binary(chunk)
+            except OSError as exc:
+                transport_error = type(exc).__name__
+                break
+            drain(0.05)
+            remaining_pacing = pcm_float32_duration_seconds(chunk) - (
+                time.monotonic() - chunk_started
+            )
+            if remaining_pacing > 0:
+                time.sleep(remaining_pacing)
+        if not rejected and transport_error is None:
+            try:
+                ws.send("END")
+            except OSError as exc:
+                transport_error = type(exc).__name__
         deadline = time.monotonic() + timeout_seconds
-        while time.monotonic() < deadline and not finals:
+        last_event_at = time.monotonic()
+        while time.monotonic() < deadline and not rejected and transport_error is None:
+            event_count = len(events)
             drain(min(0.5, max(0.01, deadline - time.monotonic())))
+            if len(events) != event_count:
+                last_event_at = time.monotonic()
+            if finals and time.monotonic() - last_event_at >= post_end_quiet_seconds:
+                break
     finally:
         ws.close()
     return {
         "ready": ready,
+        "ready_wait_ms": ready_wait_ms,
         "events": events,
         "non_empty_final_count": len(finals),
         "non_empty_final_texts": [str(event.get("normalized_text") or event.get("text") or "") for event in finals],
+        "rejected": rejected,
+        "transport_error": transport_error,
     }
 
 
@@ -271,6 +387,43 @@ def smoke_packaged_app(
     run_root = output_root / run_id
     run_root.mkdir(parents=True, exist_ok=True)
     started_at = time.monotonic()
+    conflicting_instances = find_conflicting_app_instances(
+        read_process_table(), app_path=app_path
+    )
+    if conflicting_instances:
+        evidence = {
+            "schema_version": "meeting_copilot.packaged_runtime_supervisor_smoke.v1",
+            "run_id": run_id,
+            "host_platform": platform.platform(),
+            "architecture": platform.machine(),
+            "app_path": str(app_path.relative_to(repo_root)),
+            "app_pid": None,
+            "backend_pid": None,
+            "backend_port": None,
+            "funasr_worker_pid": None,
+            "preflight": {
+                "conflicting_app_instance_count": len(conflicting_instances),
+                "conflicting_app_instances": conflicting_instances,
+            },
+            "duration_seconds": round(time.monotonic() - started_at, 3),
+            "decision": {
+                "status": "no_go_conflicting_app_instance",
+                "counts_as_packaged_runtime_supervisor_evidence": False,
+                "counts_as_packaged_mainline_evidence": False,
+                "counts_as_public_release_package": False,
+            },
+            "privacy_cost_flags": {
+                "remote_service_called": False,
+                "remote_asr_called": False,
+                "llm_called": False,
+                "user_audio_read": False,
+            },
+        }
+        evidence_path = run_root / "evidence.json"
+        evidence_path.write_text(
+            json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        return evidence | {"evidence_path": str(evidence_path.relative_to(repo_root))}
     smoke_token = secrets.token_hex(32)
     environment = dict(os.environ)
     environment.update({
@@ -278,7 +431,7 @@ def smoke_packaged_app(
         "MEETING_COPILOT_LOCAL_API_TOKEN_OVERRIDE": smoke_token,
     })
     app_process = subprocess.Popen(
-        [str(binary)],
+        packaged_app_launch_command(binary),
         cwd=app_path.parent,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
@@ -295,6 +448,9 @@ def smoke_packaged_app(
     app_exited = False
     backend_exited = False
     port_closed = False
+    funasr_process: dict[str, Any] | None = None
+    funasr_exited = False
+    funasr_forced_cleanup = False
     try:
         deadline = time.monotonic() + startup_timeout_seconds
         while time.monotonic() < deadline:
@@ -325,6 +481,11 @@ def smoke_packaged_app(
                     runtime_payload = {}
                 resident = dict(runtime_payload.get("resident") or {})
                 resident_ready = resident.get("process_ready") is True
+                funasr_process = find_funasr_process(
+                    read_process_table(),
+                    backend_pid=int(backend["pid"]),
+                    app_path=app_path,
+                )
             responses = {
                 "health": health["status"],
                 "bootstrap": bootstrap_status,
@@ -341,12 +502,21 @@ def smoke_packaged_app(
                     {"meeting_id": meeting_id, "expected_duration_seconds": 60, "track_count": 1},
                 )
                 if created["status"] == 201:
-                    asr_stream = stream_packaged_funasr(
+                    prepared = request_json(
                         port,
-                        meeting_id=meeting_id,
-                        cookie=cookie or "",
-                        audio_path=audio_path,
+                        f"/v2/meetings/{meeting_id}/preparation",
+                        cookie or "",
+                        meeting_preparation_payload(),
+                        method="PUT",
                     )
+                    responses["preparation"] = prepared["status"]
+                    if prepared["status"] == 200:
+                        asr_stream = stream_packaged_funasr(
+                            port,
+                            meeting_id=meeting_id,
+                            cookie=cookie or "",
+                            audio_path=audio_path,
+                        )
                     record = http_response(port, f"/live/asr/sessions/{meeting_id}/events", request_headers)
                     if record["status"] == 200:
                         try:
@@ -365,7 +535,11 @@ def smoke_packaged_app(
         while time.monotonic() < cleanup_deadline and backend is not None:
             backend_exited = not pid_exists(int(backend["pid"]))
             port_closed = not port_is_listening(int(backend["port"]))
-            if backend_exited and port_closed:
+            funasr_exited = bool(
+                funasr_process is not None
+                and not pid_exists(int(funasr_process["pid"]))
+            )
+            if backend_exited and port_closed and funasr_exited:
                 break
             time.sleep(0.1)
     finally:
@@ -374,6 +548,15 @@ def smoke_packaged_app(
             app_process.wait(timeout=5)
         if backend is not None and pid_exists(int(backend["pid"])):
             os.kill(int(backend["pid"]), signal.SIGTERM)
+        if funasr_process is not None and pid_exists(int(funasr_process["pid"])):
+            funasr_forced_cleanup = True
+            os.kill(int(funasr_process["pid"]), signal.SIGTERM)
+            cleanup_deadline = time.monotonic() + 3
+            while pid_exists(int(funasr_process["pid"])) and time.monotonic() < cleanup_deadline:
+                time.sleep(0.05)
+            if pid_exists(int(funasr_process["pid"])):
+                os.kill(int(funasr_process["pid"]), signal.SIGKILL)
+            funasr_exited = not pid_exists(int(funasr_process["pid"]))
 
     passed = (
         backend is not None
@@ -383,6 +566,7 @@ def smoke_packaged_app(
             "workbench": 200,
             "providers": 200,
             "asr_runtime": 200,
+            **({"preparation": 200} if audio_path is not None else {}),
         }
         and health_identity_verified
         and bootstrap_authenticated
@@ -394,6 +578,9 @@ def smoke_packaged_app(
         and app_exited
         and backend_exited
         and port_closed
+        and funasr_process is not None
+        and funasr_exited
+        and not funasr_forced_cleanup
     )
     evidence = {
         "schema_version": "meeting_copilot.packaged_runtime_supervisor_smoke.v1",
@@ -404,6 +591,7 @@ def smoke_packaged_app(
         "app_pid": app_process.pid,
         "backend_pid": backend.get("pid") if backend else None,
         "backend_port": backend.get("port") if backend else None,
+        "funasr_worker_pid": funasr_process.get("pid") if funasr_process else None,
         "responses": responses,
         "health_identity_verified": health_identity_verified,
         "bootstrap_authenticated": bootstrap_authenticated,
@@ -414,6 +602,8 @@ def smoke_packaged_app(
         "app_exited_after_sigterm": app_exited,
         "backend_exited_after_parent": backend_exited,
         "backend_port_closed": port_closed,
+        "funasr_worker_exited_after_parent": funasr_exited,
+        "funasr_worker_forced_cleanup": funasr_forced_cleanup,
         "duration_seconds": round(time.monotonic() - started_at, 3),
         "decision": {
             "status": (

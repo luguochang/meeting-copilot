@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { ActivePartial } from "../../domain/events";
+import type { ActivePartial, MeetingInputSource } from "../../domain/events";
+import type { NativeCaptureHealth } from "../../desktop/nativeCaptureHealth";
+import { resolveLocalWebSocketUrl } from "../../api/localApiBase";
 import { pcmLevel, StreamingPcmFramer } from "./audioPcm";
 
 export type MicrophonePhase =
@@ -23,6 +25,7 @@ export interface BrowserMicrophoneState {
   error: string | null;
   statusMessage: string;
   droppedFrames: number;
+  systemAudioHealth?: NativeCaptureHealth | null;
 }
 
 interface UseBrowserMicrophoneOptions {
@@ -33,10 +36,17 @@ interface UseBrowserMicrophoneOptions {
 
 export interface BrowserMicrophoneController {
   state: BrowserMicrophoneState;
-  start(meetingId: string): Promise<void>;
+  inputSource?: MeetingInputSource;
+  supportsPause?: boolean;
+  start(meetingId: string, options?: MeetingCaptureStartOptions): Promise<void>;
   togglePause(): void;
   end(): Promise<void>;
   acknowledgeCommitted(segmentIds: Iterable<string>): void;
+}
+
+export interface MeetingCaptureStartOptions {
+  inputDeviceId?: string | null;
+  inputSource?: MeetingInputSource;
 }
 
 interface MicrophoneRuntime {
@@ -101,17 +111,18 @@ function errorMessage(error: unknown): string {
 }
 
 function buildWebSocketUrl(meetingId: string, baseUrl = ""): string {
-  const base = baseUrl.trim()
-    ? new URL(baseUrl, window.location.href)
-    : new URL(window.location.href);
-  base.protocol = base.protocol === "https:" ? "wss:" : "ws:";
-  base.pathname = `/live/asr/stream/ws/${encodeURIComponent(meetingId)}`;
-  base.search = new URLSearchParams({ audio_source: "browser_live_mic" }).toString();
-  base.hash = "";
-  return base.toString();
+  const url = new URL(resolveLocalWebSocketUrl(
+    `/live/asr/stream/ws/${encodeURIComponent(meetingId)}`,
+    baseUrl,
+  ));
+  url.search = new URLSearchParams({ audio_source: "browser_live_mic" }).toString();
+  return url.toString();
 }
 
-function requestMicrophone(timeoutMs: number): Promise<MediaStream> {
+function requestMicrophone(
+  timeoutMs: number,
+  inputDeviceId: string | null = null,
+): Promise<MediaStream> {
   if (!navigator.mediaDevices?.getUserMedia) {
     return Promise.reject(new Error("当前浏览器不支持麦克风访问"));
   }
@@ -126,6 +137,7 @@ function requestMicrophone(timeoutMs: number): Promise<MediaStream> {
       audio: {
         channelCount: 1,
         sampleRate: 16_000,
+        ...(inputDeviceId ? { deviceId: { exact: inputDeviceId } } : {}),
         echoCancellation: false,
         noiseSuppression: true,
         autoGainControl: true,
@@ -227,9 +239,13 @@ export function useBrowserMicrophone(
     for (const frame of runtime.framer.push(samples)) queueOrSend(runtime, frame);
   }, [queueOrSend, updateState]);
 
-  const start = useCallback(async (meetingId: string) => {
+  const start = useCallback(async (
+    meetingId: string,
+    startOptions: MeetingCaptureStartOptions = {},
+  ) => {
     const normalizedMeetingId = meetingId.trim();
     if (!SESSION_ID_PATTERN.test(normalizedMeetingId)) throw new Error("会议 ID 格式无效");
+    const socketUrl = buildWebSocketUrl(normalizedMeetingId, optionsRef.current.asrBaseUrl);
     if (runtimeRef.current && !runtimeRef.current.disposed) dispose(runtimeRef.current);
 
     updateState({
@@ -268,6 +284,7 @@ export function useBrowserMicrophone(
     try {
       runtime.stream = await requestMicrophone(
         optionsRef.current.permissionTimeoutMs ?? DEFAULT_PERMISSION_TIMEOUT_MS,
+        startOptions.inputDeviceId?.trim() || null,
       );
       if (runtimeRef.current !== runtime || runtime.disposed) {
         runtime.stream.getTracks().forEach((track) => track.stop());
@@ -314,10 +331,7 @@ export function useBrowserMicrophone(
       processor.connect(runtime.monitor);
       runtime.monitor.connect(runtime.context.destination);
 
-      const socket = new WebSocket(buildWebSocketUrl(
-        normalizedMeetingId,
-        optionsRef.current.asrBaseUrl,
-      ));
+      const socket = new WebSocket(socketUrl);
       runtime.socket = socket;
       socket.binaryType = "arraybuffer";
       socket.onopen = () => {
@@ -362,7 +376,7 @@ export function useBrowserMicrophone(
                 startedAtMs: typeof event.start_ms === "number" ? event.start_ms : null,
                 updatedAtMs: Date.now(),
               },
-              statusMessage: eventType === "final" ? "文字已确认，正在同步" : "正在实时识别",
+              statusMessage: eventType === "final" ? "文字已确认，正在整理" : "正在实时识别",
             });
           }
           return;

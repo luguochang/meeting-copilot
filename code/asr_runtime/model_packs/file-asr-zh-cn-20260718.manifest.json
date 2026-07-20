@@ -1,0 +1,83 @@
+{
+  "schema_version": "meeting_copilot.controlled_model_pack.v1",
+  "pack_id": "file-asr-zh-cn",
+  "version": "file-asr-zh-cn-20260718-v1",
+  "internal_controlled_smoke": {
+    "status": "internal_controlled_smoke",
+    "counts_as_public_release": false
+  },
+  "redistribution": {
+    "status": "public_redistribution_unresolved",
+    "license_id": "Apache-2.0",
+    "license_text": "../licenses/Apache-2.0.txt",
+    "license_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+    "notice_destination": "licenses/models/file-asr-zh-cn-20260718",
+    "public_redistribution_approved": false
+  },
+  "models": {
+    "offline": {
+      "model_id": "iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
+      "version": "modelscope-master-2026-06-19",
+      "source_url": "https://www.modelscope.cn/models/iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
+      "source_directory": "offline",
+      "license_evidence": {
+        "path": "README.md",
+        "sha256": "c92fa06ad63cc9962b9515eb23872f8ed8052fecb4f2df90ec7d0cdbaf916b9f",
+        "required_text": "license: Apache License 2.0",
+        "scope": "model_readme_metadata_only"
+      },
+      "files": {
+        "model.pt": "3d491689244ec5dfbf9170ef3827c358aa10f1f20e42a7c59e15e688647946d1",
+        "config.yaml": "6602efa95e4c7248e1d1030f7ff454a3c9af0f57c335ed87f35260cd7faec35d",
+        "configuration.json": "1acac324430b5a4680ef5ee2947575443ab2039a92c8a0551665f6bc9a606b41",
+        "am.mvn": "29b3c740a2c0cfc6b308126d31d7f265fa2be74f3bb095cd2f143ea970896ae5",
+        "tokens.json": "2b20c2b12572d682afff84ce1c8d560f67b8b32a4c1f21567411d141ed352127",
+        "seg_dict": "59a2ef803a3f1648ad03a2e1480db1c1ee0c0d7dc4ef4dbd16cea33944329022"
+      },
+      "size_bytes": 998159713,
+      "sha256": "ded4e3295bfc0d912169d4435f97781f305d73106bcdcf524f6aae20e5fcc7d0"
+    },
+    "vad": {
+      "model_id": "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+      "version": "modelscope-master-2026-06-19",
+      "source_url": "https://www.modelscope.cn/models/iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+      "source_directory": "vad",
+      "license_evidence": {
+        "path": "README.md",
+        "sha256": "42377011603a186fc2bae41a5cc5e548ebf98d8ec307bbae9dd405f82567f543",
+        "required_text": "license: Apache License 2.0",
+        "scope": "model_readme_metadata_only"
+      },
+      "files": {
+        "model.pt": "b3be75be477f0780277f3bae0fe489f48718f585f3a6e45d7dd1fbb1a4255fc5",
+        "config.yaml": "486861ca26ddb79081663b6179cb204c6bfae71c52f04aafc48a9e9d8dde1e93",
+        "configuration.json": "7bce8867e37d55c3dd8f672695ced18077a2be199ea529a5d432d5350fc0acba",
+        "am.mvn": "6820fef9687708c4fc3fab2530179c8fcea6262daa25514380056cd8f6eb1754"
+      },
+      "size_bytes": 1730986,
+      "sha256": "0379fd29f166a9a543fb90dc9e7fe5c1555e71197793bd5afa393959cc16a048"
+    },
+    "punc": {
+      "model_id": "iic/punc_ct-transformer_cn-en-common-vocab471067-large",
+      "version": "modelscope-master-2026-06-19",
+      "source_url": "https://www.modelscope.cn/models/iic/punc_ct-transformer_cn-en-common-vocab471067-large",
+      "source_directory": "punc",
+      "license_evidence": {
+        "path": "README.md",
+        "sha256": "d1f2f3c30db716fb995208608d4305b045f6ef7b7b46a84e7e2d200160df50e0",
+        "required_text": "license: Apache License 2.0",
+        "scope": "model_readme_metadata_only"
+      },
+      "files": {
+        "model.pt": "7176cae922a872e130e6b88aef9a1153581711baf79c9124c7c95be383cd6f81",
+        "config.yaml": "c5ffb25cd063ed366cb26283908dca05a08ecfef8e90bef1d498ef9ffacd7552",
+        "configuration.json": "7043245e6264cea789404e498a6f55a330a18585a4690d35dfe71741e6982237",
+        "tokens.json": "89951fe0669380ed33298ee048c4a2b0ebcaaf6ee8f332d85c281c41d0f38392",
+        "jieba_usr_dict": "059aa2af152734d5fd011a4d69cbab171f62347074db0db5157c17b5649010f5",
+        "jieba.c.dict": "eb0a68f8bfa65e6956d59e8f9652b49f5c91952273e24737bc9a8c5e23055221"
+      },
+      "size_bytes": 1186607304,
+      "sha256": "d81ee3350cbd5f40273aee5c29e814d7659119d57c04078bcfa40c86aa8849ef"
+    }
+  }
+}

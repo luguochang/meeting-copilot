@@ -12,6 +12,7 @@ Accepts binary PCM audio chunks, runs a streaming recognizer, emits ASR events
 Protocol: client sends binary PCM chunks; sends text "END" to finalize. Server
 responds with one JSON ASR event per chunk (partial) and one final event.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -19,6 +20,7 @@ from asyncio import CancelledError as AsyncCancelledError
 from asyncio import get_running_loop as _get_running_loop
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 import functools
 import json
 import os
@@ -27,11 +29,16 @@ import struct
 import subprocess
 import threading
 import time
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from meeting_copilot_web_mvp.logging_config import get_logger
+from meeting_copilot_web_mvp.meeting_preparation import (
+    normalize_hotwords,
+    normalize_meeting_id,
+)
 from meeting_copilot_web_mvp.asr_live_events import (
     ASR_LIVE_SOURCE,
     ASR_LIVE_TRACE_KIND,
@@ -40,21 +47,33 @@ from meeting_copilot_web_mvp.asr_live_events import (
 )
 from meeting_copilot_web_mvp.transcript_normalizer import hotwords as _hotwords
 from meeting_copilot_web_mvp.transcript_normalizer import normalize as _normalize_text
+
 # Retained as a test injection point; realtime LLM correction is route-controlled.
 from meeting_copilot_web_mvp.asr_correct import correct_transcript as _correct_transcript  # noqa: F401
 from meeting_copilot_web_mvp.asr_semantic_quality import (
     BLOCKER as ASR_SEMANTIC_QUALITY_BLOCKER,
     evaluate_semantic_quality,
 )
-from meeting_copilot_web_mvp.audio_assets import RealtimeWavAssetWriter
+from meeting_copilot_web_mvp.audio_assets import (
+    Float32PcmPayloadError,
+    RealtimeWavAssetWriter,
+    validate_float32_pcm_payload,
+)
 from meeting_copilot_web_mvp.funasr_resident import (
     FunasrResidentBusyError,
     FunasrResidentSession,
     FunasrResidentUnavailableError,
     FunasrResidentWorkerManager,
 )
+from meeting_copilot_web_mvp.native_pcm_protocol import (
+    NativePcmFrame,
+    NativePcmProtocolError,
+    NativePcmV2Decoder,
+    PROTOCOL_NAME as NATIVE_PCM_PROTOCOL_NAME,
+)
 from meeting_copilot_web_mvp.realtime_transcript_correction import POLICY_VERSION as REALTIME_CORRECTION_POLICY_VERSION
 from meeting_copilot_web_mvp.degradation_controller import get_degradation_controller, LEVEL_HEAVY
+from meeting_copilot_web_mvp.diarization_runtime import DiarizationRuntime
 
 _log = get_logger("meeting_copilot_web_mvp.asr_stream")
 VAD_SILENCE_RMS_THRESHOLD = 0.003
@@ -78,6 +97,127 @@ ASR_READY_BUFFER_MAX_CHUNKS = 240
 SIDECAR_GRACEFUL_DRAIN_MARGIN_S = 5.0
 SIDECAR_GRACEFUL_DRAIN_MAX_S = 30.0
 SIDECAR_GRACEFUL_DRAIN_AUDIO_FACTOR = 2.0
+MAX_SESSION_HOTWORD_REGISTRATIONS = 128
+
+_SESSION_HOTWORDS: dict[str, tuple[str, ...]] = {}
+_SESSION_HOTWORDS_LOCK = threading.RLock()
+
+
+def _exception_origin(error: BaseException) -> str:
+    frames = traceback.extract_tb(error.__traceback__)
+    if not frames:
+        return "unknown"
+    frame = frames[-1]
+    return f"{Path(frame.filename).stem}.{frame.name}"
+
+
+def _source_segment_namespace(audio_source: str | None) -> str | None:
+    normalized = str(audio_source or "").strip().lower()
+    if normalized in {"tauri_native_mic", "native_microphone_streaming"}:
+        return "microphone"
+    if normalized in {"tauri_system_audio", "macos_system_audio"}:
+        return "system_audio"
+    return None
+
+
+def _native_pcm_decoder(
+    *,
+    pcm_protocol: str | None,
+    native_track_id: str | None,
+    native_capture_epoch: int | None,
+) -> NativePcmV2Decoder | None:
+    normalized_protocol = str(pcm_protocol or "").strip().lower()
+    if not normalized_protocol:
+        return None
+    if normalized_protocol != NATIVE_PCM_PROTOCOL_NAME:
+        raise NativePcmProtocolError(
+            "native_pcm_version_invalid",
+            "本地音频协议版本不受支持，请更新客户端。",
+        )
+    try:
+        return NativePcmV2Decoder(
+            expected_track_id=str(native_track_id or ""),
+            expected_capture_epoch=int(native_capture_epoch or 0),
+        )
+    except (TypeError, ValueError) as exc:
+        raise NativePcmProtocolError(
+            "native_pcm_identity_invalid",
+            "本地音频轨道或采集批次无效，请重新开始会议。",
+        ) from exc
+
+
+def _decode_native_pcm_payload(
+    payload: bytes,
+    *,
+    decoder: NativePcmV2Decoder | None,
+) -> tuple[bytes, NativePcmFrame | None]:
+    if decoder is None:
+        return payload, None
+    frame = decoder.decode(payload)
+    return frame.payload, frame
+
+
+def _native_pcm_event_identity(frame: NativePcmFrame | None) -> dict[str, Any]:
+    if frame is None:
+        return {}
+    return {
+        "pcm_protocol": NATIVE_PCM_PROTOCOL_NAME,
+        "source_track": frame.track_id,
+        "capture_epoch": frame.capture_epoch,
+        "track_sequence": frame.sequence,
+        "source_timestamp_ms": frame.timestamp_ms,
+    }
+
+
+def _source_qualified_streaming_events(
+    events: list[dict[str, Any]],
+    *,
+    audio_source: str | None,
+) -> list[dict[str, Any]]:
+    namespace = _source_segment_namespace(audio_source)
+    if namespace is None:
+        return events
+    qualified: list[dict[str, Any]] = []
+    for event in events:
+        copied = dict(event)
+        segment_id = str(copied.get("segment_id") or "").strip()
+        if segment_id and not segment_id.startswith(f"{namespace}:"):
+            copied["source_segment_id"] = str(copied.get("source_segment_id") or segment_id)
+            copied["segment_id"] = f"{namespace}:{segment_id}"
+        qualified.append(copied)
+    return qualified
+
+
+def set_session_hotwords(session_id: str, hotwords: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+    """Bind validated local ASR hotwords to one meeting before recognizer start."""
+
+    normalized_session_id = normalize_meeting_id(session_id)
+    normalized_hotwords = normalize_hotwords(hotwords)
+    with _SESSION_HOTWORDS_LOCK:
+        if not normalized_hotwords:
+            _SESSION_HOTWORDS.pop(normalized_session_id, None)
+            return ()
+        _SESSION_HOTWORDS[normalized_session_id] = normalized_hotwords
+        while len(_SESSION_HOTWORDS) > MAX_SESSION_HOTWORD_REGISTRATIONS:
+            oldest_session_id = next(iter(_SESSION_HOTWORDS))
+            if oldest_session_id == normalized_session_id and len(_SESSION_HOTWORDS) > 1:
+                oldest_session_id = next(key for key in _SESSION_HOTWORDS if key != normalized_session_id)
+            _SESSION_HOTWORDS.pop(oldest_session_id, None)
+    return normalized_hotwords
+
+
+def session_hotwords(session_id: str) -> tuple[str, ...]:
+    normalized_session_id = normalize_meeting_id(session_id)
+    with _SESSION_HOTWORDS_LOCK:
+        return tuple(_SESSION_HOTWORDS.get(normalized_session_id, ()))
+
+
+def clear_session_hotwords(session_id: str) -> None:
+    normalized_session_id = normalize_meeting_id(session_id)
+    with _SESSION_HOTWORDS_LOCK:
+        _SESSION_HOTWORDS.pop(normalized_session_id, None)
+
+
 STABLE_PARTIAL_CANDIDATE_MARKERS = (
     "灰度",
     "发布",
@@ -119,24 +259,28 @@ class FakeStreamRecognizer:
 
     def recognize_chunk(self, pcm: bytes) -> list[dict[str, Any]]:
         self._seq += 1
-        return [{
-            "event_type": "partial",
-            "segment_id": f"stream_seg_{self.session_id}",
-            "text": f"partial {self._seq} ({len(pcm)} bytes)",
-            "start_ms": (self._seq - 1) * 300,
-            "end_ms": self._seq * 300,
-            "confidence": 0.7,
-        }]
+        return [
+            {
+                "event_type": "partial",
+                "segment_id": f"stream_seg_{self.session_id}",
+                "text": f"partial {self._seq} ({len(pcm)} bytes)",
+                "start_ms": (self._seq - 1) * 300,
+                "end_ms": self._seq * 300,
+                "confidence": 0.7,
+            }
+        ]
 
     def finalize(self) -> list[dict[str, Any]]:
-        return [{
-            "event_type": "final",
-            "segment_id": f"stream_seg_{self.session_id}",
-            "text": f"final transcript for {self.session_id}",
-            "start_ms": 0,
-            "end_ms": self._seq * 300,
-            "confidence": 0.9,
-        }]
+        return [
+            {
+                "event_type": "final",
+                "segment_id": f"stream_seg_{self.session_id}",
+                "text": f"final transcript for {self.session_id}",
+                "start_ms": 0,
+                "end_ms": self._seq * 300,
+                "confidence": 0.9,
+            }
+        ]
 
     def abort(self) -> None:
         return None
@@ -261,6 +405,12 @@ def _close_sidecar_pipe(pipe: Any) -> None:
 
 def _kill_sidecar_process(proc: Any) -> None:
     try:
+        if proc.poll() is not None:
+            return
+    except Exception:
+        # Test doubles and unusual process wrappers may not expose poll().
+        pass
+    try:
         proc.kill()
     except Exception:
         pass
@@ -296,8 +446,7 @@ def _sidecar_graceful_drain_timeout_s(recognizer: Any) -> float:
         SIDECAR_GRACEFUL_DRAIN_MAX_S,
         max(
             SIDECAR_PROCESS_WAIT_TIMEOUT_S,
-            SIDECAR_GRACEFUL_DRAIN_MARGIN_S
-            + estimated_audio_s * SIDECAR_GRACEFUL_DRAIN_AUDIO_FACTOR,
+            SIDECAR_GRACEFUL_DRAIN_MARGIN_S + estimated_audio_s * SIDECAR_GRACEFUL_DRAIN_AUDIO_FACTOR,
         ),
     )
 
@@ -365,11 +514,7 @@ def _shutdown_sidecar_generation(recognizer: Any, generation: _SidecarGeneration
     proc = generation.proc
     writer = generation.writer
     started_at = time.monotonic()
-    total_timeout_s = (
-        SIDECAR_PROCESS_WAIT_TIMEOUT_S
-        if abort
-        else _sidecar_graceful_drain_timeout_s(recognizer)
-    )
+    total_timeout_s = SIDECAR_PROCESS_WAIT_TIMEOUT_S if abort else _sidecar_graceful_drain_timeout_s(recognizer)
     deadline = started_at + total_timeout_s
     write_queue_depth_at_end = generation.write_q.qsize()
     sentinel_started_at = time.monotonic()
@@ -576,7 +721,9 @@ class SherpaSidecarRecognizer:
                 if became_ready and generation.ready_time is not None:
                     elapsed = generation.ready_time - generation.start_time
                     if elapsed > 15.0:
-                        _log.warning("asr.sidecar.cold_start_slow", session_id=self.session_id, elapsed_s=round(elapsed, 1))
+                        _log.warning(
+                            "asr.sidecar.cold_start_slow", session_id=self.session_id, elapsed_s=round(elapsed, 1)
+                        )
         except Exception as exc:
             _log.warning("asr.sidecar.read_loop_error", session_id=self.session_id, error=str(exc))
         rc = proc.poll()
@@ -599,11 +746,7 @@ class SherpaSidecarRecognizer:
     def _cold_start_watchdog(self, generation: _SidecarGeneration) -> None:
         time.sleep(15.0)
         with self._state_lock:
-            timed_out = (
-                self._generation is generation
-                and not self._finalizing
-                and generation.ready_time is None
-            )
+            timed_out = self._generation is generation and not self._finalizing and generation.ready_time is None
         if timed_out:
             _log.warning("asr.sidecar.cold_start_timeout", session_id=self.session_id, timeout_s=15.0)
 
@@ -666,14 +809,16 @@ class SherpaSidecarRecognizer:
             ev.setdefault("confidence", 0.8)
             events.append(ev)
         if not events:
-            events.append({
-                "event_type": "partial",
-                "segment_id": f"stream_seg_{self.session_id}",
-                "text": "",
-                "start_ms": (self._seq - 1) * 300,
-                "end_ms": self._seq * 300,
-                "confidence": 0.7,
-            })
+            events.append(
+                {
+                    "event_type": "partial",
+                    "segment_id": f"stream_seg_{self.session_id}",
+                    "text": "",
+                    "start_ms": (self._seq - 1) * 300,
+                    "end_ms": self._seq * 300,
+                    "confidence": 0.7,
+                }
+            )
         return events
 
     def finalize(self) -> list[dict[str, Any]]:
@@ -693,7 +838,9 @@ class SherpaSidecarRecognizer:
             ev.setdefault("confidence", 0.9)
             events.append(ev)
         if not events:
-            events.append({"event_type": "final", "segment_id": f"stream_seg_{self.session_id}", "text": "", "confidence": 0.9})
+            events.append(
+                {"event_type": "final", "segment_id": f"stream_seg_{self.session_id}", "text": "", "confidence": 0.9}
+            )
         _log.info("asr.sidecar.end", session_id=self.session_id, events=len(events))
         return events
 
@@ -752,7 +899,11 @@ FUNASR_REALTIME_ENCODER_CHUNK_LOOK_BACK = 4
 FUNASR_REALTIME_DECODER_CHUNK_LOOK_BACK = 1
 
 
-def _funasr_worker_command(venv_python: Path | None = None) -> list[str]:
+def _funasr_worker_command(
+    venv_python: Path | None = None,
+    *,
+    session_hotword_values: tuple[str, ...] = (),
+) -> list[str]:
     command = [
         str(venv_python or _FUNASR_VENV_PY),
         str(_FUNASR_WORKER),
@@ -766,7 +917,14 @@ def _funasr_worker_command(venv_python: Path | None = None) -> list[str]:
         str(FUNASR_REALTIME_DECODER_CHUNK_LOOK_BACK),
     ]
     try:
-        hotwords = _hotwords()
+        hotwords = list(
+            dict.fromkeys(
+                [
+                    *[str(value).strip() for value in _hotwords() if str(value).strip()],
+                    *session_hotword_values,
+                ]
+            )
+        )
         if hotwords:
             command += ["--hotwords", " ".join(hotwords)]
     except Exception:
@@ -787,11 +945,20 @@ class FunasrSidecarRecognizer:
     asr_profile = FUNASR_REALTIME_PROFILE
     chunk_size = FUNASR_REALTIME_CHUNK_SIZE
 
-    def __init__(self, session_id: str, venv_python: Path | None = None):
+    def __init__(
+        self,
+        session_id: str,
+        venv_python: Path | None = None,
+        *,
+        session_hotword_values: tuple[str, ...] = (),
+    ):
         self.session_id = session_id
         self.asr_profile = FUNASR_REALTIME_PROFILE
         self.chunk_size = list(FUNASR_REALTIME_CHUNK_SIZE)
-        self._cmd = _funasr_worker_command(venv_python)
+        self._cmd = _funasr_worker_command(
+            venv_python,
+            session_hotword_values=session_hotword_values,
+        )
         self._q: "queue.Queue[dict[str, Any]]" = queue.Queue()
         self._seq = 0
         self._state_lock = threading.Lock()
@@ -914,7 +1081,11 @@ class FunasrSidecarRecognizer:
                 if became_ready and generation.ready_time is not None:
                     elapsed = generation.ready_time - generation.start_time
                     if elapsed > 15.0:
-                        _log.warning("asr.sidecar.funasr.cold_start_slow", session_id=self.session_id, elapsed_s=round(elapsed, 1))
+                        _log.warning(
+                            "asr.sidecar.funasr.cold_start_slow",
+                            session_id=self.session_id,
+                            elapsed_s=round(elapsed, 1),
+                        )
         except Exception as exc:
             _log.warning("asr.sidecar.funasr.read_loop_error", session_id=self.session_id, error=str(exc))
         rc = proc.poll()
@@ -937,11 +1108,7 @@ class FunasrSidecarRecognizer:
     def _cold_start_watchdog(self, generation: _SidecarGeneration) -> None:
         time.sleep(15.0)
         with self._state_lock:
-            timed_out = (
-                self._generation is generation
-                and not self._finalizing
-                and generation.ready_time is None
-            )
+            timed_out = self._generation is generation and not self._finalizing and generation.ready_time is None
         if timed_out:
             _log.warning("asr.sidecar.funasr.cold_start_timeout", session_id=self.session_id, timeout_s=15.0)
 
@@ -984,7 +1151,16 @@ class FunasrSidecarRecognizer:
             ev.setdefault("confidence", 0.8)
             events.append(ev)
         if not events:
-            events.append({"event_type": "partial", "segment_id": f"stream_seg_{self.session_id}", "text": "", "start_ms": (self._seq - 1) * 300, "end_ms": self._seq * 300, "confidence": 0.7})
+            events.append(
+                {
+                    "event_type": "partial",
+                    "segment_id": f"stream_seg_{self.session_id}",
+                    "text": "",
+                    "start_ms": (self._seq - 1) * 300,
+                    "end_ms": self._seq * 300,
+                    "confidence": 0.7,
+                }
+            )
         return events
 
     def wait_ready(self, timeout: float | None = None) -> bool:
@@ -1011,7 +1187,9 @@ class FunasrSidecarRecognizer:
             ev.setdefault("confidence", 0.9)
             events.append(ev)
         if not events:
-            events.append({"event_type": "final", "segment_id": f"stream_seg_{self.session_id}", "text": "", "confidence": 0.9})
+            events.append(
+                {"event_type": "final", "segment_id": f"stream_seg_{self.session_id}", "text": "", "confidence": 0.9}
+            )
         _log.info("asr.sidecar.funasr.end", session_id=self.session_id, events=len(events))
         return events
 
@@ -1126,9 +1304,13 @@ def _maybe_funasr_sidecar(
     """Return a FunasrSidecarRecognizer if the funasr venv + worker exist, else None."""
     if not funasr_realtime_available():
         return None
+    meeting_hotwords = session_hotwords(session_id)
     if _funasr_resident_enabled():
         try:
-            recognizer = _get_funasr_resident_manager().create_session(session_id)
+            recognizer = _get_funasr_resident_manager().create_session(
+                session_id,
+                hotwords=meeting_hotwords,
+            )
             recognizer.asr_profile = FUNASR_REALTIME_PROFILE
             recognizer.chunk_size = list(FUNASR_REALTIME_CHUNK_SIZE)
             _log.info("asr.sidecar.funasr.resident_session_start", session_id=session_id)
@@ -1139,7 +1321,10 @@ def _maybe_funasr_sidecar(
         except Exception as exc:
             _log.warning("asr.sidecar.funasr.resident_spawn_failed", error=str(exc))
     try:
-        return FunasrSidecarRecognizer(session_id)
+        return FunasrSidecarRecognizer(
+            session_id,
+            session_hotword_values=meeting_hotwords,
+        )
     except Exception as exc:
         _log.warning("asr.sidecar.funasr.spawn_failed", error=str(exc))
         return None
@@ -1205,13 +1390,18 @@ async def reject_recording_stream(
     reason: str,
 ) -> None:
     await websocket.accept()
-    await websocket.send_text(json.dumps({
-        "event_type": "provider_error",
-        "error_code": "recording_unavailable",
-        "message": "录音当前不可用，请检查麦克风权限、音频设备或本地服务后重试。",
-        "degradation_level": degradation_level,
-        "reason": reason,
-    }, ensure_ascii=False))
+    await websocket.send_text(
+        json.dumps(
+            {
+                "event_type": "provider_error",
+                "error_code": "recording_unavailable",
+                "message": "录音当前不可用，请检查麦克风权限、音频设备或本地服务后重试。",
+                "degradation_level": degradation_level,
+                "reason": reason,
+            },
+            ensure_ascii=False,
+        )
+    )
     await websocket.close()
 
 
@@ -1227,47 +1417,137 @@ async def handle_recording_only_stream(
     authorize_audio_chunk_commit: Callable[[dict[str, Any]], bool] | None = None,
     on_audio_recording_started: Callable[[dict[str, Any]], Any] | None = None,
     on_audio_recording_sealed: Callable[[dict[str, Any]], Any] | None = None,
+    on_audio_recording_setup_failed: Callable[[], Any] | None = None,
+    audio_asset_lock: Any | None = None,
+    pcm_protocol: str | None = None,
+    native_track_id: str | None = None,
+    native_capture_epoch: int | None = None,
 ) -> None:
     await websocket.accept()
     if audio_asset_data_dir is None:
-        await websocket.send_text(json.dumps({
-            "event_type": "provider_error",
-            "error_code": "recording_storage_unavailable",
-            "message": "录音存储目录未配置，当前不能进入仅录音模式。",
-            "degradation_level": 3,
-        }, ensure_ascii=False))
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "event_type": "provider_error",
+                    "error_code": "recording_storage_unavailable",
+                    "message": "录音存储目录未配置，当前不能进入仅录音模式。",
+                    "degradation_level": 3,
+                },
+                ensure_ascii=False,
+            )
+        )
         await websocket.close()
         return
 
     source_type = audio_source or "live_asr_stream"
-    if on_audio_recording_started is not None:
-        on_audio_recording_started({
-            "session_id": session_id,
-            "source_type": source_type,
-            "sample_rate_hz": 16_000,
-        })
-    writer = RealtimeWavAssetWriter(
-        data_dir=audio_asset_data_dir,
-        session_id=session_id,
-        source_type=source_type,
-        on_chunk_committed=on_audio_chunk_committed,
-        authorize_chunk_commit=authorize_audio_chunk_commit,
-    )
-    await websocket.send_text(json.dumps({
-        "event_type": "recording_only",
-        "message": "实时识别暂不可用，本次会议将继续保留录音。",
-        "degradation_level": 3,
-    }, ensure_ascii=False))
+    try:
+        native_decoder = _native_pcm_decoder(
+            pcm_protocol=pcm_protocol,
+            native_track_id=native_track_id,
+            native_capture_epoch=native_capture_epoch,
+        )
+    except NativePcmProtocolError as exc:
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "event_type": "provider_error",
+                    "error_code": exc.code,
+                    "message": exc.user_message,
+                    "recording_saved": False,
+                    "recoverable": True,
+                },
+                ensure_ascii=False,
+            )
+        )
+        await websocket.close()
+        return
 
-    def persist(audio_asset: dict[str, Any], *, interrupted: bool) -> None:
-        reasons = [degradation_reason]
+    def _setup_writer() -> RealtimeWavAssetWriter:
+        with audio_asset_lock if audio_asset_lock is not None else nullcontext():
+            if on_audio_recording_started is not None:
+                on_audio_recording_started(
+                    {
+                        "session_id": session_id,
+                        "source_type": source_type,
+                        "sample_rate_hz": 16_000,
+                        "track_id": native_track_id,
+                        "epoch": int(native_capture_epoch or 0),
+                    }
+                )
+            return RealtimeWavAssetWriter(
+                data_dir=audio_asset_data_dir,
+                session_id=session_id,
+                source_type=source_type,
+                track_id=native_track_id,
+                epoch=int(native_capture_epoch or 0),
+                on_chunk_committed=on_audio_chunk_committed,
+                authorize_chunk_commit=authorize_audio_chunk_commit,
+            )
+
+    try:
+        writer = await asyncio.to_thread(_setup_writer)
+    except Exception as exc:
+        if on_audio_recording_setup_failed is not None:
+            try:
+                await asyncio.to_thread(on_audio_recording_setup_failed)
+            except Exception as rollback_exc:
+                _log.error(
+                    "asr.recording_only.setup_rollback_failed",
+                    session_id=session_id,
+                    error_class=type(rollback_exc).__name__,
+                    error_origin=_exception_origin(rollback_exc),
+                )
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "event_type": "provider_error",
+                    "error_code": "recording_resume_failed",
+                    "message": "录音恢复失败，请稍后重试。",
+                    "recording_saved": False,
+                    "recoverable": True,
+                },
+                ensure_ascii=False,
+            )
+        )
+        _log.error(
+            "asr.recording_only.recording_setup_failed",
+            session_id=session_id,
+            error_class=type(exc).__name__,
+            error_origin=_exception_origin(exc),
+        )
+        await websocket.close()
+        return
+    await websocket.send_text(
+        json.dumps(
+            {
+                "event_type": "recording_only",
+                "message": "实时识别暂不可用，本次会议将继续保留录音。",
+                "degradation_level": 3,
+            },
+            ensure_ascii=False,
+        )
+    )
+
+    def persist(
+        audio_asset: dict[str, Any],
+        *,
+        interrupted: bool,
+        extra_reasons: tuple[str, ...] = (),
+    ) -> None:
+        reasons = [degradation_reason, *extra_reasons]
         if interrupted:
             reasons.append("stream_interrupted")
-        streaming_events = [] if interrupted else [{
-            "event_type": "end_of_stream",
-            "end_ms": int(audio_asset.get("duration_ms") or 0),
-            "received_at_ms": int(audio_asset.get("duration_ms") or 0),
-        }]
+        streaming_events = (
+            []
+            if interrupted
+            else [
+                {
+                    "event_type": "end_of_stream",
+                    "end_ms": int(audio_asset.get("duration_ms") or 0),
+                    "received_at_ms": int(audio_asset.get("duration_ms") or 0),
+                }
+            ]
+        )
         live_events = build_asr_live_events(
             session_id=session_id,
             provider="recording_only_local_audio",
@@ -1299,10 +1579,12 @@ async def handle_recording_only_stream(
                 lambda existing: {
                     **existing,
                     **base_record,
-                    "degradation_reasons": _dedupe_values([
-                        *list(existing.get("degradation_reasons") or []),
-                        *reasons,
-                    ]),
+                    "degradation_reasons": _dedupe_values(
+                        [
+                            *list(existing.get("degradation_reasons") or []),
+                            *reasons,
+                        ]
+                    ),
                     "suggestion_cards": list(existing.get("suggestion_cards") or []),
                     "approach_cards": list(existing.get("approach_cards") or []),
                     "minutes": dict(existing.get("minutes") or {}),
@@ -1316,16 +1598,55 @@ async def handle_recording_only_stream(
         on_audio_recording_sealed({**audio_asset, "interrupted": interrupted})
         return audio_asset
 
+    audio_asset: dict[str, Any] | None = None
     try:
         while True:
             message = await websocket.receive()
             if message.get("bytes") is not None:
-                writer.write_float32_pcm(message["bytes"])
+                pcm_payload, _native_frame = _decode_native_pcm_payload(
+                    message["bytes"],
+                    decoder=native_decoder,
+                )
+                writer.write_float32_pcm(pcm_payload)
             elif message.get("text") == "END":
                 audio_asset = seal_audio(interrupted=False)
                 persist(audio_asset, interrupted=False)
                 await websocket.close()
                 return
+    except Float32PcmPayloadError as exc:
+        try:
+            audio_asset = seal_audio(interrupted=True)
+            persist(audio_asset, interrupted=True, extra_reasons=(exc.code,))
+        except Exception as persist_exc:
+            writer.discard()
+            _log.warning(
+                "asr.recording_only.persist_failed",
+                session_id=session_id,
+                error=str(persist_exc),
+            )
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "event_type": "provider_error",
+                    "error_code": exc.code,
+                    "message": exc.user_message,
+                    "provider": "recording_only_local_audio",
+                    "provider_mode": "recording_only",
+                    "recording_saved": bool(audio_asset and audio_asset.get("saved")),
+                    "recoverable": True,
+                },
+                ensure_ascii=False,
+            )
+        )
+        _log.warning(
+            "asr.recording_only.invalid_audio_payload",
+            session_id=session_id,
+            error_code=exc.code,
+        )
+        try:
+            await websocket.close()
+        except Exception:
+            pass
     except Exception as exc:
         try:
             audio_asset = seal_audio(interrupted=True)
@@ -1386,18 +1707,9 @@ def _bound_streaming_projection_events(
 ) -> tuple[list[dict[str, Any]], int]:
     """Keep a recent live projection window; V2 tables retain complete facts."""
 
-    final_indexes = [
-        index for index, event in enumerate(events)
-        if event.get("event_type") == "final"
-    ]
-    partial_indexes = [
-        index for index, event in enumerate(events)
-        if event.get("event_type") == "partial"
-    ]
-    other_indexes = [
-        index for index, event in enumerate(events)
-        if event.get("event_type") not in {"final", "partial"}
-    ]
+    final_indexes = [index for index, event in enumerate(events) if event.get("event_type") == "final"]
+    partial_indexes = [index for index, event in enumerate(events) if event.get("event_type") == "partial"]
+    other_indexes = [index for index, event in enumerate(events) if event.get("event_type") not in {"final", "partial"}]
     retained_indexes = {
         *final_indexes[-LIVE_PROJECTION_MAX_FINALS:],
         *partial_indexes[-LIVE_PROJECTION_MAX_PARTIALS:],
@@ -1423,6 +1735,14 @@ async def handle_stream(
     on_audio_active: Callable[[dict[str, Any]], Any] | None = None,
     on_audio_recording_started: Callable[[dict[str, Any]], Any] | None = None,
     on_audio_recording_sealed: Callable[[dict[str, Any]], Any] | None = None,
+    on_audio_recording_setup_failed: Callable[[], Any] | None = None,
+    audio_asset_lock: Any | None = None,
+    diarization_persistence: Any | None = None,
+    diarization_enabled: bool = False,
+    diarization_sidecar_factory: Callable[..., Any] | None = None,
+    pcm_protocol: str | None = None,
+    native_track_id: str | None = None,
+    native_capture_epoch: int | None = None,
 ) -> None:
     """Handle one WS audio stream: read chunks, emit ASR events back over the WS.
 
@@ -1432,6 +1752,27 @@ async def handle_stream(
     minutes can then run on the real ASR session).
     """
     await websocket.accept()
+    try:
+        native_decoder = _native_pcm_decoder(
+            pcm_protocol=pcm_protocol,
+            native_track_id=native_track_id,
+            native_capture_epoch=native_capture_epoch,
+        )
+    except NativePcmProtocolError as exc:
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "event_type": "provider_error",
+                    "error_code": exc.code,
+                    "message": exc.user_message,
+                    "recording_saved": False,
+                    "recoverable": True,
+                },
+                ensure_ascii=False,
+            )
+        )
+        await websocket.close()
+        return
     recognizer = get_recognizer(session_id)
     provider_metadata = _recognizer_provider_metadata(recognizer, configured_provider=provider)
     if _should_block_recognizer(provider_metadata, allow_fake_fallback=allow_fake_fallback):
@@ -1451,7 +1792,9 @@ async def handle_stream(
         max_workers=1,
         thread_name_prefix=f"meeting-stream-{session_id[:24]}",
     )
+    session_executor_shutdown = False
     event_loop = _get_running_loop()
+    diarization_runtime: DiarizationRuntime | None = None
 
     async def _run_blocking(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         operation = functools.partial(fn, *args, **kwargs)
@@ -1459,6 +1802,9 @@ async def handle_stream(
         return await future
 
     async def _shutdown_session_executor() -> None:
+        nonlocal session_executor_shutdown
+        if session_executor_shutdown:
+            return
         # All stream operations are awaited in sequence. The shutdown itself
         # is still moved off the event loop so an interrupted stream cannot
         # accidentally block the server while joining a worker thread.
@@ -1467,6 +1813,8 @@ async def handle_stream(
             wait=True,
             cancel_futures=True,
         )
+        session_executor_shutdown = True
+
     _log.info("asr.stream.start", session_id=session_id)
     existing_record: dict[str, Any] = {}
     if asr_live_repo is not None:
@@ -1484,9 +1832,16 @@ async def handle_stream(
         return str(existing_normalized_text or _normalize_text(text))
 
     def _commit_normalized_final(event: dict[str, Any]) -> None:
-        if on_final_committed is None:
-            return
-        on_final_committed(dict(event))
+        committed: Any = None
+        if on_final_committed is not None:
+            committed = on_final_committed(dict(event))
+        if diarization_runtime is not None:
+            observed = dict(event)
+            # The application may namespace microphone/system-audio segment IDs
+            # during the durable commit. Use that returned ID for attribution.
+            if isinstance(committed, dict) and committed.get("segment_id"):
+                observed["segment_id"] = committed["segment_id"]
+            diarization_runtime.observe_final(observed)
 
     def _persisted_raw_transcript_events() -> list[dict[str, Any]]:
         restored: list[dict[str, Any]] = []
@@ -1496,41 +1851,32 @@ async def handle_stream(
                 continue
             payload = dict(event.get("payload") or {})
             raw_source_text = str(
-                payload.get("source_snapshot_text")
-                or payload.get("text")
-                or payload.get("normalized_text")
-                or ""
+                payload.get("source_snapshot_text") or payload.get("text") or payload.get("normalized_text") or ""
             ).strip()
             text = raw_source_text
             segment_id = str(payload.get("segment_id") or "").strip()
             if not text or not segment_id:
                 continue
-            normalized_text = (
-                _normalize_text(raw_source_text)
-                if l3_normalize_enabled
-                else raw_source_text
+            normalized_text = _normalize_text(raw_source_text) if l3_normalize_enabled else raw_source_text
+            restored.append(
+                {
+                    "event_type": "final" if event_type == "transcript_final" else "partial",
+                    "segment_id": segment_id,
+                    "text": text,
+                    "normalized_text": normalized_text,
+                    "start_ms": int(payload.get("start_ms") or 0),
+                    "end_ms": int(payload.get("end_ms") or 0),
+                    "received_at_ms": int(event.get("at_ms") or payload.get("end_ms") or 0),
+                    "confidence": payload.get("confidence"),
+                    **(
+                        {"source_segment_id": str(payload["source_segment_id"])}
+                        if payload.get("source_segment_id")
+                        else {}
+                    ),
+                    **({"source_snapshot_text": raw_source_text} if raw_source_text else {}),
+                    **({"projection_reconciled": True} if payload.get("projection_reconciled") else {}),
+                }
             )
-            restored.append({
-                "event_type": "final" if event_type == "transcript_final" else "partial",
-                "segment_id": segment_id,
-                "text": text,
-                "normalized_text": normalized_text,
-                "start_ms": int(payload.get("start_ms") or 0),
-                "end_ms": int(payload.get("end_ms") or 0),
-                "received_at_ms": int(event.get("at_ms") or payload.get("end_ms") or 0),
-                "confidence": payload.get("confidence"),
-                **(
-                    {"source_segment_id": str(payload["source_segment_id"])}
-                    if payload.get("source_segment_id")
-                    else {}
-                ),
-                **(
-                    {"source_snapshot_text": raw_source_text}
-                    if raw_source_text
-                    else {}
-                ),
-                **({"projection_reconciled": True} if payload.get("projection_reconciled") else {}),
-            })
         return restored
 
     restored_transcript_events = _persisted_raw_transcript_events()
@@ -1538,9 +1884,7 @@ async def handle_stream(
         event for event in restored_transcript_events if event["event_type"] == "final"
     ]
     latest_partials: dict[str, dict[str, Any]] = {
-        str(event["segment_id"]): event
-        for event in restored_transcript_events
-        if event["event_type"] == "partial"
+        str(event["segment_id"]): event for event in restored_transcript_events if event["event_type"] == "partial"
     }
     sent_partial_hint_keys: set[str] = set()
     sent_live_candidate_event_ids: set[str] = {
@@ -1570,15 +1914,14 @@ async def handle_stream(
             "monotonic_ns": time.monotonic_ns(),
             "active_streak_ms": audio_active_streak_ms,
         }
+
     endpoint_final_count = max(
         len(accumulated_finals),
         int((existing_record.get("live_projection") or {}).get("total_final_count") or 0),
     )
     endpoint_candidate: dict[str, Any] = {}
     endpoint_committed_source_text = str(
-        accumulated_finals[-1].get("source_snapshot_text")
-        if accumulated_finals
-        else ""
+        accumulated_finals[-1].get("source_snapshot_text") if accumulated_finals else ""
     )
     endpoint_committed_end_ms = max(
         [int(event.get("end_ms") or 0) for event in accumulated_finals],
@@ -1588,19 +1931,100 @@ async def handle_stream(
     audio_writer: RealtimeWavAssetWriter | None = None
     if audio_asset_data_dir is not None:
         source_type = audio_source or "live_asr_stream"
-        if on_audio_recording_started is not None:
-            on_audio_recording_started({
-                "session_id": session_id,
-                "source_type": source_type,
-                "sample_rate_hz": 16_000,
-            })
-        audio_writer = RealtimeWavAssetWriter(
-            data_dir=audio_asset_data_dir,
-            session_id=session_id,
-            source_type=source_type,
-            on_chunk_committed=on_audio_chunk_committed,
-            authorize_chunk_commit=authorize_audio_chunk_commit,
+
+        def _setup_audio_writer() -> RealtimeWavAssetWriter:
+            with audio_asset_lock if audio_asset_lock is not None else nullcontext():
+                if on_audio_recording_started is not None:
+                    on_audio_recording_started(
+                        {
+                            "session_id": session_id,
+                            "source_type": source_type,
+                            "sample_rate_hz": 16_000,
+                            "track_id": native_track_id,
+                            "epoch": int(native_capture_epoch or 0),
+                        }
+                    )
+                return RealtimeWavAssetWriter(
+                    data_dir=audio_asset_data_dir,
+                    session_id=session_id,
+                    source_type=source_type,
+                    track_id=native_track_id,
+                    epoch=int(native_capture_epoch or 0),
+                    on_chunk_committed=on_audio_chunk_committed,
+                    authorize_chunk_commit=authorize_audio_chunk_commit,
+                )
+
+        try:
+            audio_writer = await _run_blocking(_setup_audio_writer)
+        except Exception as exc:
+            if on_audio_recording_setup_failed is not None:
+                try:
+                    await _run_blocking(on_audio_recording_setup_failed)
+                except Exception as rollback_exc:
+                    _log.error(
+                        "asr.stream.recording_setup_rollback_failed",
+                        session_id=session_id,
+                        error_class=type(rollback_exc).__name__,
+                        error_origin=_exception_origin(rollback_exc),
+                    )
+            abort = getattr(recognizer, "abort", None)
+            if callable(abort):
+                try:
+                    await _run_blocking(abort)
+                except Exception as abort_exc:
+                    _log.warning(
+                        "asr.stream.setup_abort_failed",
+                        session_id=session_id,
+                        error_class=type(abort_exc).__name__,
+                    )
+            try:
+                await websocket.send_text(
+                    json.dumps(
+                        {
+                            "event_type": "provider_error",
+                            "error_code": "recording_resume_failed",
+                            "message": "录音恢复失败，实时识别已安全停止，请稍后重试。",
+                            "provider": provider_metadata["provider"],
+                            "provider_mode": provider_metadata["provider_mode"],
+                            "recording_saved": bool(audio_asset and audio_asset.get("saved")),
+                            "recoverable": True,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            except Exception:
+                pass
+            _log.error(
+                "asr.stream.recording_setup_failed",
+                session_id=session_id,
+                error_class=type(exc).__name__,
+                error_origin=_exception_origin(exc),
+            )
+            try:
+                await websocket.close()
+            except Exception:
+                pass
+            await _shutdown_session_executor()
+            return
+
+    if diarization_enabled and (
+        not provider_metadata["is_mock"] or diarization_sidecar_factory is not None
+    ):
+        diarization_runtime = DiarizationRuntime(
+            session_id,
+            persistence=diarization_persistence,
+            sidecar_factory=diarization_sidecar_factory,
         )
+        try:
+            await _run_blocking(diarization_runtime.start)
+        except Exception as exc:
+            # Diarization is deliberately fail-open. ASR and recording remain
+            # usable even if the local speaker sidecar cannot start.
+            _log.warning(
+                "asr.stream.diarization_start_failed",
+                session_id=session_id,
+                error_class=type(exc).__name__,
+            )
 
     def _to_streaming_final(ev: dict[str, Any], idx: int) -> dict[str, Any]:
         text = str(ev.get("text") or "")
@@ -1612,16 +2036,8 @@ async def handle_stream(
                 text,
                 ev.get("normalized_text"),
             ),
-            **(
-                {"source_segment_id": str(ev["source_segment_id"])}
-                if ev.get("source_segment_id")
-                else {}
-            ),
-            **(
-                {"source_snapshot_text": str(ev["source_snapshot_text"])}
-                if ev.get("source_snapshot_text")
-                else {}
-            ),
+            **({"source_segment_id": str(ev["source_segment_id"])} if ev.get("source_segment_id") else {}),
+            **({"source_snapshot_text": str(ev["source_snapshot_text"])} if ev.get("source_snapshot_text") else {}),
             **({"projection_reconciled": True} if ev.get("projection_reconciled") else {}),
             "start_ms": int(ev.get("start_ms") if ev.get("start_ms") is not None else idx * chunk_ms),
             "end_ms": int(ev.get("end_ms") if ev.get("end_ms") is not None else (idx + 1) * chunk_ms),
@@ -1666,7 +2082,7 @@ async def handle_stream(
         if source == previous or previous.startswith(source):
             return "", False
         if source.startswith(previous):
-            return source[len(previous):].strip(), False
+            return source[len(previous) :].strip(), False
         common_prefix = 0
         for previous_char, source_char in zip(previous, source):
             if previous_char != source_char:
@@ -1752,9 +2168,7 @@ async def handle_stream(
         return True
 
     def _current_session_streaming_events() -> list[dict[str, Any]]:
-        events, _dropped = _bound_streaming_projection_events(
-            [*latest_partials.values(), *accumulated_finals]
-        )
+        events, _dropped = _bound_streaming_projection_events([*latest_partials.values(), *accumulated_finals])
         return events
 
     def _track_endpoint_candidate(source_ev: dict[str, Any], display_ev: dict[str, Any]) -> None:
@@ -1775,11 +2189,7 @@ async def handle_stream(
             "start_ms": int(display_ev.get("start_ms") or endpoint_committed_end_ms),
             "end_ms": int(display_ev.get("end_ms") or getattr(recognizer, "_seq", 0) * chunk_ms),
             "confidence": display_ev.get("confidence", 0.8),
-            **(
-                {"source_segment_id": display_ev["source_segment_id"]}
-                if display_ev.get("source_segment_id")
-                else {}
-            ),
+            **({"source_segment_id": display_ev["source_segment_id"]} if display_ev.get("source_segment_id") else {}),
             "projection_reconciled": bool(display_ev.get("projection_reconciled")),
         }
 
@@ -1791,17 +2201,11 @@ async def handle_stream(
     def _maybe_vad_endpoint_final() -> dict[str, Any] | None:
         nonlocal endpoint_final_count, endpoint_committed_source_text, endpoint_committed_end_ms
         text = str(endpoint_candidate.get("text") or "").strip()
-        candidate_end_ms = int(
-            endpoint_candidate.get("end_ms")
-            or getattr(recognizer, "_seq", 0) * chunk_ms
-        )
+        candidate_end_ms = int(endpoint_candidate.get("end_ms") or getattr(recognizer, "_seq", 0) * chunk_ms)
         candidate_duration_ms = max(0, candidate_end_ms - endpoint_committed_end_ms)
         reached_natural_endpoint = endpoint_silence_ms >= VAD_ENDPOINT_SILENCE_MS
         reached_bounded_endpoint = candidate_duration_ms >= VAD_MAX_SEGMENT_MS
-        if (
-            not (reached_natural_endpoint or reached_bounded_endpoint)
-            or len(text) < VAD_MIN_FINAL_TEXT_CHARS
-        ):
+        if not (reached_natural_endpoint or reached_bounded_endpoint) or len(text) < VAD_MIN_FINAL_TEXT_CHARS:
             return None
         endpoint_final_count += 1
         end_ms = candidate_end_ms
@@ -1817,11 +2221,7 @@ async def handle_stream(
             "end_ms": end_ms,
             "received_at_ms": end_ms,
             "confidence": endpoint_candidate.get("confidence", 0.8),
-            "endpoint_source": (
-                "server_vad_stable_partial"
-                if reached_natural_endpoint
-                else "server_vad_max_segment"
-            ),
+            "endpoint_source": ("server_vad_stable_partial" if reached_natural_endpoint else "server_vad_max_segment"),
             "source_snapshot_text": endpoint_committed_source_text,
             **(
                 {"source_segment_id": endpoint_candidate["source_segment_id"]}
@@ -1832,25 +2232,29 @@ async def handle_stream(
             "projection_reconciled": bool(endpoint_candidate.get("projection_reconciled")),
         }
 
-    def _upsert_live_session(streaming_events: list[dict[str, Any]], degradation_reasons: list[str]) -> list[dict[str, Any]]:
+    def _upsert_live_session(
+        streaming_events: list[dict[str, Any]], degradation_reasons: list[str]
+    ) -> list[dict[str, Any]]:
         if asr_live_repo is None:
             return []
-        bounded_streaming_events, dropped_streaming_events = _bound_streaming_projection_events(
-            streaming_events
+        bounded_streaming_events, dropped_streaming_events = _bound_streaming_projection_events(streaming_events)
+        projection_streaming_events = _source_qualified_streaming_events(
+            bounded_streaming_events,
+            audio_source=audio_source,
         )
-        semantic_quality = _semantic_quality_for_streaming_events(bounded_streaming_events)
+        semantic_quality = _semantic_quality_for_streaming_events(projection_streaming_events)
         effective_degradation_reasons = list(degradation_reasons)
         if semantic_quality.get("blocker") == ASR_SEMANTIC_QUALITY_BLOCKER:
             effective_degradation_reasons.append(ASR_SEMANTIC_QUALITY_BLOCKER)
         live_events = build_asr_live_events(
             session_id=session_id,
             provider=provider_metadata["provider"],
-            streaming_events=bounded_streaming_events,
+            streaming_events=projection_streaming_events,
             is_mock=provider_metadata["is_mock"],
         )
         source_segment_ids = {
             str(event.get("segment_id") or ""): str(event["source_segment_id"])
-            for event in bounded_streaming_events
+            for event in projection_streaming_events
             if event.get("segment_id") and event.get("source_segment_id")
         }
         for live_event in live_events:
@@ -1869,7 +2273,11 @@ async def handle_stream(
             "asr_fallback_used": provider_metadata["fallback_used"],
             "degradation_reasons": _dedupe(effective_degradation_reasons),
             "asr_semantic_quality": semantic_quality,
-            **({"asr_runtime_profile": dict(provider_metadata["asr_runtime_profile"])} if provider_metadata.get("asr_runtime_profile") else {}),
+            **(
+                {"asr_runtime_profile": dict(provider_metadata["asr_runtime_profile"])}
+                if provider_metadata.get("asr_runtime_profile")
+                else {}
+            ),
             "audio_source": audio_source,
             "input_source": audio_source,
             **({"audio": audio_asset} if audio_asset is not None else {}),
@@ -1897,6 +2305,7 @@ async def handle_stream(
         except KeyError:
             asr_live_repo.create(base_record)
         else:
+
             def merge_latest(existing: dict[str, Any]) -> dict[str, Any]:
                 live_event_ids = {str(event.get("id") or "") for event in live_events}
                 all_external_revisions = [
@@ -1919,10 +2328,12 @@ async def handle_stream(
                 return {
                     **existing,
                     **base_record,
-                    "degradation_reasons": _dedupe([
-                        *retained_degradation_reasons,
-                        *list(base_record.get("degradation_reasons") or []),
-                    ]),
+                    "degradation_reasons": _dedupe(
+                        [
+                            *retained_degradation_reasons,
+                            *list(base_record.get("degradation_reasons") or []),
+                        ]
+                    ),
                     "events": merged_events,
                     "live_projection": {
                         **dict(base_record["live_projection"]),
@@ -2004,12 +2415,33 @@ async def handle_stream(
     pending_asr_audio_dropped = False
     readiness_degradation_reasons: list[str] = []
     finalization_started = False
+    last_native_frame: NativePcmFrame | None = None
+
+    def _decode_stream_message(message: dict[str, Any]) -> dict[str, Any]:
+        nonlocal last_native_frame
+        pcm_envelope = message.get("bytes")
+        if pcm_envelope is None or message.get("_native_pcm_decoded"):
+            return message
+        pcm_payload, native_frame = _decode_native_pcm_payload(
+            pcm_envelope,
+            decoder=native_decoder,
+        )
+        if native_frame is not None:
+            last_native_frame = native_frame
+        return {
+            **message,
+            "bytes": pcm_payload,
+            "_native_pcm_decoded": True,
+            "_native_pcm_frame": native_frame,
+        }
 
     def _current_degradation_reasons() -> list[str]:
-        return _dedupe([
-            *list(provider_metadata["degradation_reasons"]),
-            *readiness_degradation_reasons,
-        ])
+        return _dedupe(
+            [
+                *list(provider_metadata["degradation_reasons"]),
+                *readiness_degradation_reasons,
+            ]
+        )
 
     def _close_audio_writer(*, interrupted: bool = False) -> None:
         nonlocal audio_asset, audio_writer
@@ -2020,27 +2452,42 @@ async def handle_stream(
                 audio_asset = audio_writer.close()
             else:
                 audio_asset = audio_writer.seal()
-                on_audio_recording_sealed({
-                    **audio_asset,
-                    "interrupted": interrupted,
-                })
+                on_audio_recording_sealed(
+                    {
+                        **audio_asset,
+                        "interrupted": interrupted,
+                    }
+                )
         except Exception:
             audio_writer.discard()
             raise
         finally:
             audio_writer = None
 
-    def _record_audio_payload(payload: bytes) -> None:
+    def _record_audio_payload(
+        payload: bytes,
+        *,
+        native_frame: NativePcmFrame | None,
+    ) -> None:
         if audio_writer is not None:
-            audio_writer.write_float32_pcm(payload)
+            audio_writer.write_float32_pcm(
+                payload,
+                source_frame=_native_pcm_event_identity(native_frame) or None,
+            )
 
     def _record_and_recognize_audio_payload(
         payload: bytes,
         *,
         audio_already_recorded: bool,
+        native_frame: NativePcmFrame | None,
     ) -> list[dict[str, Any]]:
         if audio_writer is not None and not audio_already_recorded:
-            audio_writer.write_float32_pcm(payload)
+            audio_writer.write_float32_pcm(
+                payload,
+                source_frame=_native_pcm_event_identity(native_frame) or None,
+            )
+        if diarization_runtime is not None:
+            diarization_runtime.submit_pcm(payload)
         return recognizer.recognize_chunk(payload)
 
     def _upsert_and_commit_final(
@@ -2070,11 +2517,13 @@ async def handle_stream(
         try:
             await _run_blocking(
                 _upsert_live_session,
-                [{
-                    "event_type": "end_of_stream",
-                    "end_ms": end_ms,
-                    "received_at_ms": end_ms,
-                }],
+                [
+                    {
+                        "event_type": "end_of_stream",
+                        "end_ms": end_ms,
+                        "received_at_ms": end_ms,
+                    }
+                ],
                 reasons,
             )
         except Exception as exc:
@@ -2082,6 +2531,30 @@ async def handle_stream(
                 "asr.stream.readiness_terminal_persist_failed",
                 session_id=session_id,
                 error=str(exc),
+            )
+
+    async def _finish_diarization() -> None:
+        if diarization_runtime is None:
+            return
+        try:
+            await _run_blocking(diarization_runtime.finish)
+        except Exception as exc:
+            _log.warning(
+                "asr.stream.diarization_finish_failed",
+                session_id=session_id,
+                error_class=type(exc).__name__,
+            )
+
+    async def _abort_diarization() -> None:
+        if diarization_runtime is None:
+            return
+        try:
+            await _run_blocking(diarization_runtime.abort)
+        except Exception as exc:
+            _log.warning(
+                "asr.stream.diarization_abort_failed",
+                session_id=session_id,
+                error_class=type(exc).__name__,
             )
 
     async def _cancel_readiness_task(readiness_task: asyncio.Task[Any] | None) -> None:
@@ -2130,6 +2603,7 @@ async def handle_stream(
         reason: str,
     ) -> bool:
         await _abort_before_readiness_terminal(readiness_task)
+        await _abort_diarization()
         reasons = _current_degradation_reasons()
         reasons.append(reason)
         if pending_asr_audio_dropped:
@@ -2142,15 +2616,71 @@ async def handle_stream(
                 session_id=session_id,
                 error=str(exc),
             )
-        await websocket.send_text(json.dumps({
-            "event_type": "provider_error",
-            "error_code": error_code,
-            "message": message,
-            "provider": provider_metadata["provider"],
-            "provider_mode": provider_metadata["provider_mode"],
-            "degradation_reasons": _dedupe(reasons),
-            "recording_saved": bool(audio_asset and audio_asset.get("saved")),
-        }, ensure_ascii=False))
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "event_type": "provider_error",
+                    "error_code": error_code,
+                    "message": message,
+                    "provider": provider_metadata["provider"],
+                    "provider_mode": provider_metadata["provider_mode"],
+                    "degradation_reasons": _dedupe(reasons),
+                    "recording_saved": bool(audio_asset and audio_asset.get("saved")),
+                },
+                ensure_ascii=False,
+            )
+        )
+        await websocket.close()
+        return False
+
+    async def _finish_invalid_audio_payload(exc: Float32PcmPayloadError) -> bool:
+        reasons = _dedupe([*_current_degradation_reasons(), exc.code])
+        await _abort_diarization()
+        try:
+            await _run_blocking(_close_audio_writer, interrupted=True)
+        except Exception as persist_exc:
+            _log.warning(
+                "asr.stream.invalid_audio_payload_persist_failed",
+                session_id=session_id,
+                error=str(persist_exc),
+            )
+        if asr_live_repo is not None:
+            try:
+                await _run_blocking(
+                    _upsert_live_session,
+                    _current_session_streaming_events(),
+                    reasons,
+                )
+            except Exception as persist_exc:
+                _log.warning(
+                    "asr.stream.invalid_audio_payload_state_failed",
+                    session_id=session_id,
+                    error=str(persist_exc),
+                )
+        _log.warning(
+            "asr.stream.invalid_audio_payload",
+            session_id=session_id,
+            error_code=exc.code,
+        )
+        # Complete all ordered persistence/sidecar work before exposing the
+        # terminal frame. Otherwise a client that closes immediately after
+        # reading the error can cancel the ASGI task during executor teardown.
+        await _shutdown_session_executor()
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "event_type": "provider_error",
+                    "error_code": exc.code,
+                    "message": exc.user_message,
+                    "provider": provider_metadata["provider"],
+                    "provider_mode": provider_metadata["provider_mode"],
+                    "degradation_reasons": reasons,
+                    "recording_saved": bool(audio_asset and audio_asset.get("saved")),
+                    "recoverable": True,
+                },
+                ensure_ascii=False,
+            )
+        )
         await websocket.close()
         return False
 
@@ -2158,27 +2688,35 @@ async def handle_stream(
         nonlocal pending_asr_audio_dropped
         if not readiness_event_required:
             return True
-        await websocket.send_text(json.dumps({
-            "event_type": "asr_starting",
-            "provider": provider_metadata["provider"],
-            "ready": False,
-            "message": "正在准备实时识别，请稍候。",
-        }, ensure_ascii=False))
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "event_type": "asr_starting",
+                    "provider": provider_metadata["provider"],
+                    "ready": False,
+                    "message": "正在准备实时识别，请稍候。",
+                },
+                ensure_ascii=False,
+            )
+        )
         if not readiness_is_required:
-            await websocket.send_text(json.dumps({
-                "event_type": "asr_ready",
-                "provider": provider_metadata["provider"],
-                "ready": True,
-                "ready_latency_ms": 0.0,
-                "message": "实时识别已就绪。",
-            }, ensure_ascii=False))
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "event_type": "asr_ready",
+                        "provider": provider_metadata["provider"],
+                        "ready": True,
+                        "ready_latency_ms": 0.0,
+                        "message": "实时识别已就绪。",
+                    },
+                    ensure_ascii=False,
+                )
+            )
             _mark_real_asr_ready_healthy()
             return True
 
         ready_started_at = time.monotonic()
-        readiness_task = asyncio.create_task(
-            asyncio.to_thread(readiness_waiter, ASR_READY_TIMEOUT_S)
-        )
+        readiness_task = asyncio.create_task(asyncio.to_thread(readiness_waiter, ASR_READY_TIMEOUT_S))
         while True:
             receive_task = asyncio.create_task(websocket.receive())
             done, _pending = await asyncio.wait(
@@ -2187,7 +2725,10 @@ async def handle_stream(
             )
             if receive_task in done:
                 try:
-                    message = receive_task.result()
+                    message = _decode_stream_message(receive_task.result())
+                except NativePcmProtocolError as exc:
+                    await _cancel_readiness_task(readiness_task)
+                    return await _finish_invalid_audio_payload(exc)
                 except Exception as exc:
                     await _finish_before_readiness(
                         readiness_task,
@@ -2203,15 +2744,30 @@ async def handle_stream(
                     return False
                 pcm_payload = message.get("bytes")
                 if pcm_payload is not None:
-                    audio_activity = _observe_audio_activity(pcm_payload)
+                    try:
+                        audio_activity = _observe_audio_activity(pcm_payload)
+                    except Float32PcmPayloadError as exc:
+                        return await _finish_invalid_audio_payload(exc)
+                    if audio_activity is not None:
+                        audio_activity.update(
+                            _native_pcm_event_identity(message.get("_native_pcm_frame"))
+                        )
                     if audio_activity is not None and on_audio_active is not None:
                         await _run_blocking(on_audio_active, audio_activity)
-                    await _run_blocking(_record_audio_payload, pcm_payload)
+                    await _run_blocking(
+                        _record_audio_payload,
+                        pcm_payload,
+                        native_frame=message.get("_native_pcm_frame"),
+                    )
                     if len(pending_messages) < pending_message_limit:
-                        pending_messages.append({
-                            "bytes": pcm_payload,
-                            "_audio_recorded": True,
-                        })
+                        pending_messages.append(
+                            {
+                                "bytes": pcm_payload,
+                                "_audio_recorded": True,
+                                "_native_pcm_decoded": True,
+                                "_native_pcm_frame": message.get("_native_pcm_frame"),
+                            }
+                        )
                     else:
                         pending_asr_audio_dropped = True
                     if not readiness_task.done():
@@ -2262,20 +2818,25 @@ async def handle_stream(
                     reason="asr_ready_timeout",
                 )
             readiness_latency_ms = round((time.monotonic() - ready_started_at) * 1000, 1)
-            await websocket.send_text(json.dumps({
-                "event_type": "asr_ready",
-                "provider": provider_metadata["provider"],
-                "ready": True,
-                "ready_latency_ms": readiness_latency_ms,
-                "message": "实时识别已就绪。",
-            }, ensure_ascii=False))
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "event_type": "asr_ready",
+                        "provider": provider_metadata["provider"],
+                        "ready": True,
+                        "ready_latency_ms": readiness_latency_ms,
+                        "message": "实时识别已就绪。",
+                    },
+                    ensure_ascii=False,
+                )
+            )
             _mark_real_asr_ready_healthy()
             return True
 
     async def _next_stream_message() -> dict[str, Any]:
         if pending_messages:
             return pending_messages.popleft()
-        return await websocket.receive()
+        return _decode_stream_message(await websocket.receive())
 
     try:
         ready_for_stream = await _prepare_before_asr_ready()
@@ -2288,33 +2849,47 @@ async def handle_stream(
 
     try:
         while True:
-            msg = await _next_stream_message()
+            try:
+                msg = await _next_stream_message()
+            except NativePcmProtocolError as exc:
+                await _finish_invalid_audio_payload(exc)
+                return
             if msg.get("bytes") is not None:
                 pcm_payload = msg["bytes"]
-                audio_activity = _observe_audio_activity(pcm_payload)
+                try:
+                    audio_activity = _observe_audio_activity(pcm_payload)
+                except Float32PcmPayloadError as exc:
+                    await _finish_invalid_audio_payload(exc)
+                    return
+                if audio_activity is not None:
+                    audio_activity.update(
+                        _native_pcm_event_identity(msg.get("_native_pcm_frame"))
+                    )
                 if audio_activity is not None and on_audio_active is not None:
                     await _run_blocking(on_audio_active, audio_activity)
                 events = await _run_blocking(
                     _record_and_recognize_audio_payload,
                     pcm_payload,
                     audio_already_recorded=bool(msg.get("_audio_recorded")),
+                    native_frame=msg.get("_native_pcm_frame"),
                 )
                 for ev in events:
                     source_ev = _normalize_client_stream_event(
                         ev,
                         l3_normalize_enabled=l3_normalize_enabled,
                     )
+                    source_ev.update(
+                        _native_pcm_event_identity(msg.get("_native_pcm_frame"))
+                    )
                     ev = (
                         _to_endpoint_partial(source_ev)
-                        if source_ev.get("event_type") == "partial" and provider_metadata["provider"] == "funasr_realtime"
+                        if source_ev.get("event_type") == "partial"
+                        and provider_metadata["provider"] == "funasr_realtime"
                         else source_ev
                     )
                     partial_hint = build_partial_hint_event(ev)
                     if partial_hint:
-                        partial_hint_key = str(
-                            partial_hint.get("payload", {}).get("dedupe_key")
-                            or partial_hint["id"]
-                        )
+                        partial_hint_key = str(partial_hint.get("payload", {}).get("dedupe_key") or partial_hint["id"])
                     outgoing_events = [ev]
                     if partial_hint and partial_hint_key not in sent_partial_hint_keys:
                         sent_partial_hint_keys.add(partial_hint_key)
@@ -2350,8 +2925,11 @@ async def handle_stream(
                         endpoint_final,
                         l3_normalize_enabled=l3_normalize_enabled,
                     )
+                    endpoint_final.update(_native_pcm_event_identity(last_native_frame))
                     endpoint_outgoing_events = [endpoint_final]
-                    if _append_accumulated_final(endpoint_final, getattr(recognizer, "_seq", len(accumulated_finals) + 1)):
+                    if _append_accumulated_final(
+                        endpoint_final, getattr(recognizer, "_seq", len(accumulated_finals) + 1)
+                    ):
                         live_events = await _run_blocking(
                             _upsert_and_commit_final,
                             _current_session_streaming_events(),
@@ -2373,6 +2951,7 @@ async def handle_stream(
                         ev,
                         l3_normalize_enabled=l3_normalize_enabled,
                     )
+                    ev.update(_native_pcm_event_identity(last_native_frame))
                     if ev.get("event_type") == "final" and provider_metadata["provider"] == "funasr_realtime":
                         source_text = str(ev.get("text") or "").strip()
                         source_segment_id = _funasr_source_segment_id(session_id, ev)
@@ -2414,7 +2993,9 @@ async def handle_stream(
                         )
                         finalize_candidate_events = _unsent_realtime_candidate_events(live_events)
                     except Exception as exc:
-                        _log.warning("asr.stream.persist_before_finalize_send_failed", session_id=session_id, error=str(exc))
+                        _log.warning(
+                            "asr.stream.persist_before_finalize_send_failed", session_id=session_id, error=str(exc)
+                        )
                 for outgoing_event in [*normalized_final_events, *finalize_candidate_events]:
                     await websocket.send_text(json.dumps(outgoing_event, ensure_ascii=False))
                 if asr_live_repo is not None:
@@ -2428,6 +3009,7 @@ async def handle_stream(
                         "event_type": "end_of_stream",
                         "end_ms": getattr(recognizer, "_seq", 0) * chunk_ms,
                         "received_at_ms": getattr(recognizer, "_seq", 0) * chunk_ms,
+                        **_native_pcm_event_identity(last_native_frame),
                     }
                     streaming_events = [*_current_session_streaming_events(), end_of_stream]
                     try:
@@ -2440,10 +3022,15 @@ async def handle_stream(
                             await websocket.send_text(json.dumps(outgoing_event, ensure_ascii=False))
                     except Exception as exc:
                         _log.warning("asr.stream.persist_failed", session_id=session_id, error=str(exc))
+                await _finish_diarization()
+                await _shutdown_session_executor()
                 await websocket.close()
-                _log.info("asr.stream.end", session_id=session_id, chunks=recognizer._seq, finals=len(accumulated_finals))
+                _log.info(
+                    "asr.stream.end", session_id=session_id, chunks=recognizer._seq, finals=len(accumulated_finals)
+                )
                 return
     except (Exception, AsyncCancelledError) as exc:
+        await _abort_diarization()
         abort = getattr(recognizer, "abort", None)
         if callable(abort):
             try:
@@ -2484,7 +3071,12 @@ async def handle_stream(
                     session_id=session_id,
                     error=str(persist_exc),
                 )
-        _log.warning("asr.stream.aborted", session_id=session_id, error=str(exc))
+        _log.warning(
+            "asr.stream.aborted",
+            session_id=session_id,
+            error_class=type(exc).__name__,
+            error_origin=_exception_origin(exc),
+        )
         try:
             await websocket.close()
         except Exception:
@@ -2503,9 +3095,7 @@ def _normalize_client_stream_event(
         text = str(event.get("text") or "")
         if text:
             event["normalized_text"] = (
-                str(event.get("normalized_text") or _normalize_text(text))
-                if l3_normalize_enabled
-                else text
+                str(event.get("normalized_text") or _normalize_text(text)) if l3_normalize_enabled else text
             )
     return event
 
@@ -2549,7 +3139,7 @@ def _recognizer_provider_metadata(recognizer: StreamRecognizer, *, configured_pr
 
 
 def _float32_pcm_rms(payload: bytes) -> float:
-    usable = payload[: len(payload) - (len(payload) % 4)]
+    usable = validate_float32_pcm_payload(payload)
     if not usable:
         return 0.0
     total = 0.0

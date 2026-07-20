@@ -13,6 +13,21 @@ from .v2_persistence import V2Persistence
 
 JobOutput: TypeAlias = Mapping[str, Any] | list[Any] | str | int | float | bool | None
 JobHandler: TypeAlias = Callable[[dict[str, Any]], JobOutput | Awaitable[JobOutput]]
+JobTelemetryObserver: TypeAlias = Callable[[str], Any]
+_PUBLIC_INTELLIGENCE_VALIDATION_CATEGORIES = frozenset(
+    {"structural", "truncated", "evidence", "stale", "semantic_safety"}
+)
+
+
+def _handler_error_class(error: Exception) -> str:
+    error_class = type(error).__name__ or "handler_error"
+    category = str(getattr(error, "category", "") or "").strip()
+    if (
+        error_class == "IntelligenceResponseValidationError"
+        and category in _PUBLIC_INTELLIGENCE_VALIDATION_CATEGORIES
+    ):
+        return f"intelligence_validation_{category}"
+    return error_class
 
 
 class DurableJobExecutor:
@@ -39,6 +54,8 @@ class DurableJobExecutor:
         shutdown_timeout_s: float = 30.0,
         now_ms: Callable[[], int] | None = None,
         additional_handlers: Mapping[str, JobHandler] | None = None,
+        retry_observer: JobTelemetryObserver | None = None,
+        cancellation_observer: JobTelemetryObserver | None = None,
     ) -> None:
         if lease_ms < 2:
             raise ValueError("lease_ms must be at least 2")
@@ -79,6 +96,8 @@ class DurableJobExecutor:
         self._retry_max_ms = int(retry_max_ms)
         self._shutdown_timeout_s = float(shutdown_timeout_s)
         self._now_ms = now_ms or (lambda: int(time.time() * 1_000))
+        self._retry_observer = retry_observer
+        self._cancellation_observer = cancellation_observer
 
         self._stop_event = asyncio.Event()
         self._wake_events = {lane: asyncio.Event() for lane in self._lanes}
@@ -289,8 +308,17 @@ class DurableJobExecutor:
                 self._retry_max_ms,
                 max(0, int(requested_delay_ms)),
             )
-        error_class = type(error).__name__ or "handler_error"
-        if getattr(error, "retryable", True) is False:
+        error_class = _handler_error_class(error)
+        if getattr(error, "preserve_attempt", False):
+            retried = await asyncio.to_thread(
+                self._persistence.defer_job,
+                job_id=job["id"],
+                worker_id=worker_id,
+                now_ms=now_ms,
+                next_attempt_at_ms=now_ms + delay_ms,
+                error_class=error_class,
+            )
+        elif getattr(error, "retryable", True) is False:
             retried = await asyncio.to_thread(
                 self._persistence.fail_job,
                 job_id=job["id"],
@@ -310,14 +338,34 @@ class DurableJobExecutor:
         if retried is None:
             self._logger.warning("Lost lease before retrying V2 job %s", job["id"])
             return
-        self._logger.warning(
-            "V2 %s job %s failed on attempt %s with %s; status=%s",
+        if retried["status"] == "cancelled":
+            self._notify_telemetry(self._cancellation_observer, str(job["id"]), "cancelled")
+        elif retried["status"] == "retry_wait":
+            self._notify_telemetry(self._retry_observer, str(job["id"]), "retry")
+        log = self._logger.info if getattr(error, "preserve_attempt", False) else self._logger.warning
+        log(
+            "V2 %s job %s deferred on attempt %s with %s; status=%s"
+            if getattr(error, "preserve_attempt", False)
+            else "V2 %s job %s failed on attempt %s with %s; status=%s",
             job["kind"],
             job["id"],
             attempt,
             error_class,
             retried["status"],
         )
+
+    def _notify_telemetry(
+        self,
+        observer: JobTelemetryObserver | None,
+        job_id: str,
+        event: str,
+    ) -> None:
+        if observer is None:
+            return
+        try:
+            observer(job_id)
+        except (KeyError, TypeError, ValueError):
+            self._logger.debug("Skipped missing V2 %s telemetry for job %s", event, job_id)
 
     async def _invoke_handler(self, handler: JobHandler, job: dict[str, Any]) -> JobOutput:
         if inspect.iscoroutinefunction(handler):

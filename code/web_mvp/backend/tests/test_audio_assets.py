@@ -1,12 +1,16 @@
 import hashlib
 import json
+import math
+import os
 from pathlib import Path
+import stat
 import struct
 import wave
 
 import pytest
 
 from meeting_copilot_web_mvp.audio_assets import (
+    Float32PcmPayloadError,
     RealtimeWavAssetWriter,
     assemble_realtime_wav_asset,
     audio_metadata_for_file,
@@ -29,6 +33,30 @@ def _read_wav_samples(path: Path) -> tuple[wave._wave_params, tuple[int, ...]]:
         params = wav_file.getparams()
         frames = wav_file.readframes(wav_file.getnframes())
     return params, tuple(sample[0] for sample in struct.iter_unpack("<h", frames))
+
+
+@pytest.mark.parametrize(
+    ("payload", "code"),
+    [
+        (b"\x00" * 2, "audio_payload_alignment"),
+        (struct.pack("<f", math.nan), "audio_payload_non_finite"),
+        (struct.pack("<f", math.inf), "audio_payload_non_finite"),
+    ],
+)
+def test_realtime_wav_writer_rejects_invalid_float32_frames(tmp_path, payload, code):
+    writer = RealtimeWavAssetWriter(
+        data_dir=tmp_path,
+        session_id="invalid_audio_frame",
+        source_type="browser_live_mic",
+        sample_rate_hz=100,
+        chunk_duration_seconds=0.1,
+    )
+
+    with pytest.raises(Float32PcmPayloadError) as raised:
+        writer.write_float32_pcm(payload)
+
+    assert raised.value.code == code
+    assert list((tmp_path / "audio_assets" / "invalid_audio_frame" / "chunks").glob("*.pcm")) == []
 
 
 def test_realtime_wav_writer_commits_chunks_and_assembles_partial_tail(tmp_path):
@@ -68,6 +96,26 @@ def test_realtime_wav_writer_commits_chunks_and_assembles_partial_tail(tmp_path)
     assert committed_chunks[0]["relative_path"].endswith("chunk-00000000.pcm")
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows uses inherited per-user ACLs")
+def test_realtime_recording_assets_are_owner_only(tmp_path):
+    writer = RealtimeWavAssetWriter(
+        data_dir=tmp_path,
+        session_id="private_audio_1",
+        source_type="browser_live_mic",
+        sample_rate_hz=100,
+        chunk_duration_seconds=0.1,
+    )
+    writer.write_float32_pcm(_float32_payload(10))
+    writer.close()
+
+    session_dir = tmp_path / "audio_assets" / "private_audio_1"
+    assert stat.S_IMODE(session_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE((session_dir / "chunks").stat().st_mode) == 0o700
+    assert stat.S_IMODE((session_dir / "audio.manifest.json").stat().st_mode) == 0o600
+    assert stat.S_IMODE((session_dir / "audio.wav").stat().st_mode) == 0o600
+    assert stat.S_IMODE(next((session_dir / "chunks").glob("*.pcm")).stat().st_mode) == 0o600
+
+
 def test_realtime_wav_writer_seals_journal_without_blocking_on_wav_export(tmp_path):
     writer = RealtimeWavAssetWriter(
         data_dir=tmp_path,
@@ -98,6 +146,44 @@ def test_realtime_wav_writer_seals_journal_without_blocking_on_wav_export(tmp_pa
     assert exported["chunk_count"] == 3
     assert exported["sha256"]
     assert _read_wav_samples(audio_path)[0].nframes == 23
+
+
+def test_realtime_wav_export_preserves_existing_journal_timeline(tmp_path):
+    writer = RealtimeWavAssetWriter(
+        data_dir=tmp_path,
+        session_id="preserve_journal_timeline",
+        source_type="browser_live_mic",
+        sample_rate_hz=100,
+        chunk_duration_seconds=0.1,
+        started_at_ms=1_001,
+    )
+    writer.write_float32_pcm(_float32_payload(10))
+    sealed = writer.seal()
+
+    exported = assemble_realtime_wav_asset(
+        data_dir=tmp_path,
+        session_id="preserve_journal_timeline",
+        source_type="browser_live_mic",
+        sample_rate_hz=100,
+        expected_chunk_count=sealed["chunk_count"],
+        expected_sample_count=sealed["sample_count"],
+        expected_journal_sha256=sealed["journal_sha256"],
+        started_at_ms=1_000,
+    )
+    replayed = []
+    RealtimeWavAssetWriter(
+        data_dir=tmp_path,
+        session_id="preserve_journal_timeline",
+        source_type="browser_live_mic",
+        sample_rate_hz=100,
+        chunk_duration_seconds=0.1,
+        on_chunk_committed=replayed.append,
+    )
+
+    manifest = json.loads((tmp_path / "audio_assets" / "preserve_journal_timeline" / "audio.manifest.json").read_text())
+    assert manifest["started_at_ms"] == 1_001
+    assert exported["started_at_ms"] == 1_001
+    assert replayed[0]["timestamp_ms"] == 1_001
 
 
 def test_realtime_wav_export_rejects_a_stale_journal_digest(tmp_path):
@@ -140,9 +226,7 @@ def test_realtime_writer_fences_chunk_before_touching_filesystem(tmp_path):
 
     chunks_dir = tmp_path / "audio_assets" / "fenced_writer_1" / "chunks"
     assert list(chunks_dir.glob("*.pcm")) == []
-    manifest = json.loads(
-        (tmp_path / "audio_assets" / "fenced_writer_1" / "audio.manifest.json").read_text()
-    )
+    manifest = json.loads((tmp_path / "audio_assets" / "fenced_writer_1" / "audio.manifest.json").read_text())
     assert manifest["chunks"] == []
 
 
@@ -232,9 +316,7 @@ def test_realtime_wav_writer_resumes_existing_session_audio_without_overwrite(tm
     assert second_metadata["duration_ms"] == 600
     assert second_metadata["file_size_bytes"] > first_metadata["file_size_bytes"]
     assert second_metadata["sha256"] != first_metadata["sha256"]
-    manifest = json.loads(
-        (audio_path.parent / "audio.manifest.json").read_text(encoding="utf-8")
-    )
+    manifest = json.loads((audio_path.parent / "audio.manifest.json").read_text(encoding="utf-8"))
     assert manifest["chunk_duration_ms"] == 5_000
 
 
@@ -324,6 +406,62 @@ def test_uploaded_audio_is_streamed_from_path_into_managed_storage(tmp_path):
     assert not stored.with_suffix(".m4a.tmp").exists()
 
 
+def test_realtime_writer_persists_native_pcm_sequence_and_timestamp_ranges(tmp_path):
+    committed: list[dict] = []
+    writer = RealtimeWavAssetWriter(
+        data_dir=tmp_path,
+        session_id="native-range",
+        source_type="tauri_system_audio",
+        track_id="system_audio",
+        epoch=7,
+        chunk_duration_seconds=0.6,
+        on_chunk_committed=committed.append,
+    )
+    frame = struct.pack("<f", 0.125) * 4_800
+
+    writer.write_float32_pcm(
+        frame,
+        source_frame={
+            "source_track": "system_audio",
+            "capture_epoch": 7,
+            "track_sequence": 1,
+            "source_timestamp_ms": 12_000,
+        },
+    )
+    writer.write_float32_pcm(
+        frame,
+        source_frame={
+            "source_track": "system_audio",
+            "capture_epoch": 7,
+            "track_sequence": 2,
+            "source_timestamp_ms": 12_300,
+        },
+    )
+    sealed = writer.seal()
+
+    assert sealed["chunk_count"] == 1
+    assert committed[0]["source_sequence_start"] == 1
+    assert committed[0]["source_sequence_end"] == 2
+    assert committed[0]["source_timestamp_start_ms"] == 12_000
+    assert committed[0]["source_timestamp_end_ms"] == 12_300
+    manifest_path = tmp_path / "audio_assets/native-range/tracks/system_audio/epoch-7/audio.manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["chunks"][0]["source_sequence_start"] == 1
+    assert manifest["chunks"][0]["source_sequence_end"] == 2
+    assert manifest["chunks"][0]["source_timestamp_start_ms"] == 12_000
+    assert manifest["chunks"][0]["source_timestamp_end_ms"] == 12_300
+
+    reopened = RealtimeWavAssetWriter(
+        data_dir=tmp_path,
+        session_id="native-range",
+        source_type="tauri_system_audio",
+        track_id="system_audio",
+        epoch=7,
+        chunk_duration_seconds=0.6,
+    )
+    assert reopened.seal()["journal_sha256"] == sealed["journal_sha256"]
+
+
 @pytest.mark.parametrize(
     "relative_path",
     ["../outside.wav", "audio_assets/../../outside.wav", "/tmp/outside.wav"],
@@ -357,7 +495,10 @@ def test_delete_audio_asset_removes_entire_controlled_session_directory(tmp_path
 
     assert result == "deleted"
     assert not session_dir.exists()
-    assert delete_audio_asset(
-        tmp_path,
-        {"relative_path": "audio_assets/delete_audio_1/audio.wav"},
-    ) == "already_missing"
+    assert (
+        delete_audio_asset(
+            tmp_path,
+            {"relative_path": "audio_assets/delete_audio_1/audio.wav"},
+        )
+        == "already_missing"
+    )

@@ -1,6 +1,7 @@
 import type { EventsPage, MeetingEvent } from "../domain/events";
 import { parseMeetingEvent } from "./schema";
 import type { MeetingApi } from "./client";
+import { resolveLocalApiBase, resolveLocalApiUrl } from "./localApiBase";
 
 export interface EventSubscription {
   meetingId: string;
@@ -41,12 +42,10 @@ const V2_NAMED_EVENT_TYPES = [
 ] as const;
 
 function sseUrl(baseUrl: string, meetingId: string, afterSeq: number): string {
-  const origin = window.location.origin;
-  const normalizedBase = baseUrl.trim();
-  const base = normalizedBase
-    ? new URL(`${normalizedBase.replace(/\/+$/, "")}/`, origin)
-    : new URL("/", origin);
-  const url = new URL(`v2/meetings/${encodeURIComponent(meetingId)}/events`, base);
+  const url = new URL(resolveLocalApiUrl(
+    `/v2/meetings/${encodeURIComponent(meetingId)}/events`,
+    baseUrl,
+  ));
   url.searchParams.set("after_seq", String(Math.max(0, Math.trunc(afterSeq))));
   return url.toString();
 }
@@ -111,8 +110,11 @@ export class PollingEventTransport implements MeetingEventTransport {
 /** Retained adapter for the continuous SSE endpoint introduced by Phase 1B. */
 export class SseEventTransport implements MeetingEventTransport {
   readonly kind = "sse" as const;
+  private readonly baseUrl: string;
 
-  constructor(private readonly baseUrl = import.meta.env.VITE_API_BASE_URL ?? "") {}
+  constructor(baseUrl = import.meta.env.VITE_API_BASE_URL ?? "") {
+    this.baseUrl = resolveLocalApiBase(baseUrl);
+  }
 
   subscribe(subscription: EventSubscription): () => void {
     let stopped = false;
