@@ -104,10 +104,13 @@ http://127.0.0.1:8795/workbench
 远程仓库配置完成后，在 Windows PowerShell：
 
 ```powershell
-git clone <REPOSITORY_URL> meeting-copilot
+git clone https://github.com/luguochang/meeting-copilot.git meeting-copilot
 Set-Location .\meeting-copilot
 git fetch --all --prune
 git checkout codex/phase0-clean-baseline
+git config --local user.name "luguochang"
+git config --local user.email "38338551+luguochang@users.noreply.github.com"
+git config --local user.useConfigOnly true
 ```
 
 如果远程分支名称不同，以实际推送分支为准。不要直接 checkout 一个旧的 `main` 再声称已经复刻当前主线。
@@ -314,6 +317,9 @@ git checkout main
 git log -1 --oneline
 git status --short --branch
 git remote -v
+git config --local user.name "luguochang"
+git config --local user.email "38338551+luguochang@users.noreply.github.com"
+git config --local user.useConfigOnly true
 ```
 
 确认 `git status` 为 clean，并以远程 `main` 的最新提交为唯一交付基线。然后阅读：
