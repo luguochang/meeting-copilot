@@ -15,18 +15,21 @@
 
 ## 1. 仓库和提交状态
 
-本轮审计时：
+当前已交付基线：
 
 ```text
-仓库：/Users/chase/Documents/面试/meeting-copilot-phase0-clean
-分支：codex/phase0-clean-baseline
-HEAD：8eafc92 docs: bind phase0-2 evidence to current packaged app
-远程 origin：未配置
-upstream：未配置
-工作树：115 个已跟踪文件修改、3 个删除、144 个未跟踪源文件/文档
+仓库：https://github.com/luguochang/meeting-copilot
+本地 macOS 工作树：/Users/chase/Documents/面试/meeting-copilot-phase0-clean
+交付分支：main
+开发分支：codex/phase0-clean-baseline
+基线内容提交：cb58e07 docs: archive legacy plans and reports
+HEAD：以远程 main 最新提交为准；交接文档更新位于该基线之后
+远程 origin：https://github.com/luguochang/meeting-copilot.git
+远程 main 和开发分支：均指向同一最新交付提交，至少包含 cb58e07
+工作树：clean
 ```
 
-这意味着历史功能已经有一部分提交记录，但当前最新代码仍有大量工作树改动。完成本次交接前，必须把代码、测试和文档作为一个可复现提交处理；不得只推送一个旧 HEAD，然后告诉 Windows 开发环境已经拿到最新实现。
+这个提交包含当前最新源码、测试、文档、评测素材、设计系统和 Windows 交接资料。Windows 环境必须从远程 `main` 克隆，不要使用其他旧目录，也不要把旧本地工作树覆盖到新环境。任何新的实现必须先在新分支完成测试，再合并或推送。
 
 本仓库不会提交以下内容：
 
@@ -280,7 +283,7 @@ Mac 打包必须在 macOS 上执行，因为 Swift/ScreenCaptureKit、Apple Deve
 - `NEXT-010`：Windows native audio、Credential Manager、Tauri WebView、安装/签名/升级/真机。
 - `NEXT-012/017/019/020/021/022/023`：部分 UI/API 已有代码和内部证据，但 packaged/UI/失败恢复/供应链边界仍未全部关闭。
 - 公共模型和 FFmpeg 的固定 revision、许可证和再分发审计。
-- 远程仓库 origin 配置和本次工作树的正式远程推送。
+- Windows 原生实现和异平台发布验收仍未完成；当前远程仓库已经完成推送，但后续提交必须继续保持密钥和用户数据隔离。
 
 权威跟踪文档：
 
@@ -291,7 +294,7 @@ Mac 打包必须在 macOS 上执行，因为 Swift/ScreenCaptureKit、Apple Deve
 
 ## 7. 接手后的第一轮执行顺序
 
-1. 确认 `git status`、分支、提交 hash 和远程地址，禁止覆盖其他工作树改动。
+1. 从远程 `main` 克隆并确认 `git status`、分支、提交 hash 和远程地址，禁止使用旧工作树冒充最新代码。
 2. 在 Windows 按本手册建立 Python 3.13 和 Node LTS 环境。
 3. 运行 backend/frontend focused tests、typecheck、lint、build，再运行完整回归。
 4. 启动 loopback Workbench，使用页面 Provider 配置；先用 fake gateway 验证共享业务链，不把它写成真实验收。
@@ -301,19 +304,32 @@ Mac 打包必须在 macOS 上执行，因为 Swift/ScreenCaptureKit、Apple Deve
 
 ## 8. 可复制给下一位 AI 的接手指令
 
-```text
-你正在接手 Meeting Copilot。先阅读：
+````text
+你正在接手 Meeting Copilot。不要从零重新评估项目，也不要先新增评测/边界文档。先从远程仓库获取最新代码：
+
+```powershell
+git clone https://github.com/luguochang/meeting-copilot.git
+Set-Location .\meeting-copilot
+git checkout main
+git log -1 --oneline
+git status --short --branch
+git remote -v
+```
+
+`git log -5 --oneline` 必须能看到 `cb58e07 docs: archive legacy plans and reports`，且当前 `main` 可能还有其后的交接文档更新。然后阅读：
+
 1. docs/handoff/windows-development-2026-07-20.md
 2. docs/full-roadmap-execution-checklist-2026-07-18.md
 3. docs/post-phase0-2-product-gap-and-roadmap-discussion-2026-07-18.md
 4. docs/runtime-operating-constraints.md
 5. docs/decision-log.md
 
-先执行 git status、git log -1、git remote -v，不要回滚现有工作树改动。
 当前产品是 local-first：Web/backend 用于 Windows 开发和共享业务验证；当前不是 Docker 运行，也不能用 Docker 替代桌面音频验收。
 先在 Windows 建立 Python 3.13、Node LTS、npm 环境，运行 backend/frontend 全量回归和 build，再启动 loopback Workbench。
 Provider 只能通过页面配置或本次进程临时环境变量注入；绝不把真实 API Key 写入 Git、日志、截图、evidence 或文档。
 Windows 原生 WASAPI、Credential Manager、Tauri WebView、安装包、签名和升级仍未实现，按 NEXT-010 建立 SDD/TDD，不要声称 Windows 客户端已完成。
 共享业务代码/UI 不要复制成两套；Mac 最终打包必须回 macOS 完成 Swift/ScreenCaptureKit、Developer ID、notarization 和 Gatekeeper 验收。
+先完成环境复刻和当前代码回归，再进入 `NEXT-010`；不要重复旧的 ASR 泛化评测循环，也不要把 fake audio、fake LLM、旧 artifact 或 Web 页面通过写成 packaged client/Windows/公开发布完成。
+当前未完成项以 `full-roadmap-execution-checklist-2026-07-18.md` 的 `NEXT-001` 至 `NEXT-023` 表格为准，任何 `Partial`、`Blocked`、`Not started` 都不能改写为 Go。
 每次重要决策、测试结果和未完成项都要更新 docs/current-mainline-index.md 与 docs/decision-log.md。
-```
+````
