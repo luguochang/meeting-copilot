@@ -22,10 +22,10 @@
 本地 macOS 工作树：/Users/chase/Documents/面试/meeting-copilot-phase0-clean
 交付分支：main
 开发分支：codex/phase0-clean-baseline
-基线内容提交：cb58e07 docs: archive legacy plans and reports
-HEAD：以远程 main 最新提交为准；交接文档更新位于该基线之后
+基线内容：包含完整源码、分类文档、素材和 Windows 交接资料
+HEAD：以远程 main 最新提交为准
 远程 origin：https://github.com/luguochang/meeting-copilot.git
-远程 main 和开发分支：均指向同一最新交付提交，至少包含 cb58e07
+远程 main 和开发分支：均指向同一最新交付提交
 工作树：clean
 ```
 
@@ -316,7 +316,7 @@ git status --short --branch
 git remote -v
 ```
 
-`git log -5 --oneline` 必须能看到 `cb58e07 docs: archive legacy plans and reports`，且当前 `main` 可能还有其后的交接文档更新。然后阅读：
+确认 `git status` 为 clean，并以远程 `main` 的最新提交为唯一交付基线。然后阅读：
 
 1. docs/handoff/windows-development-2026-07-20.md
 2. docs/full-roadmap-execution-checklist-2026-07-18.md
