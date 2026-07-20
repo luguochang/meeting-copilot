@@ -12,11 +12,13 @@ import time
 import wave
 
 from meeting_copilot_web_mvp.app import (
+    ProviderRuntimeNotConfiguredDeferred,
     _commit_v2_transcript_revisions,
     _live_asr_record_is_finalized,
     create_app,
 )
 from meeting_copilot_web_mvp import app as app_module
+from meeting_copilot_web_mvp import llm_service
 from meeting_copilot_web_mvp import realtime_transcript_correction
 from meeting_copilot_web_mvp.audio_assets import RealtimeWavAssetWriter
 
@@ -73,6 +75,78 @@ def test_final_commit_creates_normalized_snapshot_and_two_durable_jobs(tmp_path)
         "correction",
         "suggestion",
     ]
+    app.state.v2_persistence.close()
+
+
+def test_ai_job_handlers_wait_without_consuming_work_before_provider_sync(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        llm_service.LlmConfig,
+        "from_env",
+        classmethod(lambda _cls: None),
+    )
+    app = create_app(data_dir=tmp_path)
+    committed = app.state.commit_v2_final("meeting-1", _final_event())
+    app.state.asr_live_repository.create(
+        {
+            "session_id": "meeting-1",
+            "source": "live_asr_stream",
+            "trace_kind": "live_event",
+            "provider": "funasr_realtime",
+            "provider_mode": "real",
+            "is_mock": False,
+            "input_source": "browser_live_mic",
+            "events": [
+                {
+                    "id": "transcript_final:segment-1",
+                    "event_type": "transcript_final",
+                    "payload": {
+                        "segment_id": "segment-1",
+                        "text": "需要确认发布负责人。",
+                        "normalized_text": "需要确认发布负责人。",
+                    },
+                }
+            ],
+        }
+    )
+    jobs = {
+        job["kind"]: job
+        for job in app.state.v2_persistence.list_jobs(meeting_id="meeting-1")
+    }
+
+    with pytest.raises(ProviderRuntimeNotConfiguredDeferred) as correction_error:
+        app.state.v2_correction_job_handler_impl(jobs["correction"])
+    with pytest.raises(ProviderRuntimeNotConfiguredDeferred) as suggestion_error:
+        asyncio.run(app.state.v2_suggestion_job_handler_impl(jobs["suggestion"]))
+    now_ms = time.time_ns() // 1_000_000
+    claimed_correction = app.state.v2_persistence.claim_next_job(
+        worker_id="provider-wait-test",
+        lane="correction",
+        now_ms=now_ms,
+        lease_ms=1_000,
+    )
+    assert claimed_correction is not None
+    app.state.v2_persistence.defer_job(
+        job_id=claimed_correction["id"],
+        worker_id="provider-wait-test",
+        now_ms=now_ms + 1,
+        next_attempt_at_ms=now_ms + 10_000,
+        error_class="ProviderRuntimeNotConfiguredDeferred",
+    )
+    with pytest.raises(ProviderRuntimeNotConfiguredDeferred):
+        app.state.v2_post_job_handler_impls["minutes"](
+            {"id": "minutes-job", "meeting_id": "meeting-1"}
+        )
+    with pytest.raises(ProviderRuntimeNotConfiguredDeferred):
+        app.state.v2_post_job_handler_impls["approach"](
+            {"id": "approach-job", "meeting_id": "meeting-1"}
+        )
+
+    assert committed["created"] is True
+    assert correction_error.value.preserve_attempt is True
+    assert suggestion_error.value.retry_after_ms == 10_000
     app.state.v2_persistence.close()
 
 
@@ -279,6 +353,9 @@ def test_correction_job_output_is_bounded_and_omits_cumulative_transcript_state(
     tmp_path,
     monkeypatch,
 ):
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_GATEWAY_MODEL", "gpt-5.5")
     app = create_app(data_dir=tmp_path)
     committed = app.state.commit_v2_final("meeting-1", _final_event())
     app.state.asr_live_repository.create(
@@ -425,6 +502,9 @@ def test_correction_batch_deferral_uses_typed_retry_instead_of_invalid_trace_sta
     tmp_path,
     monkeypatch,
 ):
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_GATEWAY_MODEL", "gpt-5.5")
     app = create_app(data_dir=tmp_path)
     committed = app.state.commit_v2_final("meeting-1", _final_event())
     app.state.asr_live_repository.create(
@@ -500,6 +580,44 @@ def test_v2_snapshot_and_event_endpoints_use_normalized_tables(tmp_path):
     assert "id: 1\n" in stream.text
     assert "event: transcript.segment.finalized\n" in stream.text
     assert '"segment_id":"segment-1"' in stream.text
+
+
+def test_v2_entity_confirmation_endpoint_persists_candidate_status(tmp_path):
+    app = create_app(data_dir=tmp_path)
+    app.state.commit_v2_final(
+        "meeting-1",
+        _final_event(
+            text="由李明负责在周五前完成数据库迁移。",
+        ),
+    )
+    action = app.state.v2_persistence.get_snapshot("meeting-1")["action_items"][0]
+
+    with TestClient(app) as client:
+        response = client.post(
+            f"/v2/meetings/meeting-1/entities/{action['id']}/confirm"
+        )
+
+    assert response.status_code == 200
+    assert response.json()["entity"]["status"] == "confirmed"
+
+
+def test_v2_json_export_carries_formal_meeting_facts(tmp_path):
+    app = create_app(data_dir=tmp_path)
+    app.state.commit_v2_final(
+        "meeting-1",
+        _final_event(
+            text="结论是采用蓝绿发布方案。由李明负责在周五前完成数据库迁移。风险是双写数据不一致，需要先做校验。",
+        ),
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/v2/meetings/meeting-1/export", params={"format": "json"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["decision_candidates"][0]["evidence"]["segment_id"] == "segment-1"
+    assert payload["action_items"][0]["owner"] == "李明"
+    assert payload["risks"][0]["mitigation"] == "先做校验"
 
 
 def test_v2_event_endpoint_returns_a_bounded_page_contract(tmp_path):
@@ -681,9 +799,9 @@ def test_app_lifecycle_runs_durable_jobs_without_browser_trigger(tmp_path):
             assert "job_claimed" in trace["stages"]
 
 
-def test_post_meeting_jobs_fail_closed_when_correction_is_terminally_failed(tmp_path):
+def test_post_meeting_jobs_degrade_without_blocking_when_correction_is_terminally_failed(tmp_path):
     app = create_app(data_dir=tmp_path)
-    committed = app.state.commit_v2_final("meeting-1", _final_event())
+    app.state.commit_v2_final("meeting-1", _final_event())
     persistence = app.state.v2_persistence
     now_ms = time.time_ns() // 1_000_000
     correction = persistence.claim_next_job(
@@ -700,19 +818,111 @@ def test_post_meeting_jobs_fail_closed_when_correction_is_terminally_failed(tmp_
         error_class="CorrectionProjectionFailed",
     )
 
-    with pytest.raises(RuntimeError, match="blocked by transcript correction"):
-        app.state.v2_post_job_handler_impls["minutes"](
-            {
-                "id": "minutes-job",
-                "meeting_id": "meeting-1",
-                "evidence_segment_id": committed["segment_id"],
-            }
-        )
+    quality = app.state.wait_for_v2_correction_jobs("meeting-1", timeout_seconds=0.1)
+
+    assert quality["correction_degraded"] is True
+    assert quality["reason"] == "correction_has_no_successful_job"
 
     persistence.close()
 
 
-def test_post_meeting_jobs_fail_closed_when_correction_is_cancelled(tmp_path):
+def test_correction_failure_does_not_block_review_outputs_and_marks_degraded(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_GATEWAY_MODEL", "gpt-test")
+    monkeypatch.delenv("LLM_GATEWAY_IS_MOCK", raising=False)
+    monkeypatch.setattr(
+        llm_service,
+        "build_minutes_artifact",
+        lambda *_args, **_kwargs: (
+            "# 会议复盘\n\n已从原始文字生成。",
+            {"background": "保留原始文字", "decisions": [], "action_items": [], "risks": [], "open_questions": [], "evidence_quotes": []},
+            {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            False,
+        ),
+    )
+    monkeypatch.setattr(
+        llm_service,
+        "build_approach_cards",
+        lambda *_args, **_kwargs: (
+            [],
+            {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            False,
+        ),
+    )
+    app = create_app(data_dir=tmp_path)
+    app.state.commit_v2_final("meeting-1", _final_event())
+    app.state.asr_live_repository.create(
+        {
+            "session_id": "meeting-1",
+            "source": "live_asr_stream",
+            "trace_kind": "live_event",
+            "provider": "funasr_realtime",
+            "provider_mode": "real",
+            "is_mock": False,
+            "input_source": "browser_live_mic",
+            "ingest_mode": "live_asr_stream",
+            "asr_fallback_used": False,
+            "degradation_reasons": [],
+            "events": [
+                {
+                    "id": "transcript_final:segment-1",
+                    "event_type": "transcript_final",
+                    "payload": {
+                        "segment_id": "segment-1",
+                        "text": "需要确认发布负责人。",
+                        "normalized_text": "需要确认发布负责人。",
+                    },
+                }
+            ],
+        }
+    )
+    persistence = app.state.v2_persistence
+    now_ms = time.time_ns() // 1_000_000
+    persistence.end_meeting(meeting_id="meeting-1", now_ms=now_ms)
+    while True:
+        correction = persistence.claim_next_job(
+            worker_id="failed-review-correction",
+            lane="correction",
+            now_ms=now_ms + 1,
+            lease_ms=30_000,
+        )
+        if correction is None:
+            break
+        persistence.fail_job(
+            job_id=correction["id"],
+            worker_id="failed-review-correction",
+            now_ms=now_ms + 2,
+            error_class="TimeoutError",
+        )
+
+    review_jobs = {
+        job["kind"]: job
+        for job in persistence.list_jobs(meeting_id="meeting-1")
+        if job["kind"] in {"minutes", "approach", "index"}
+    }
+
+    outputs = {
+        kind: app.state.v2_post_job_handler_impls[kind](review_jobs[kind])
+        for kind in ("minutes", "approach", "index")
+    }
+
+    assert set(outputs) == {"minutes", "approach", "index"}
+    assert all(output["correction_degraded"] is True for output in outputs.values())
+    assert {
+        output["correction_degraded_reason"]
+        for output in outputs.values()
+    } == {"correction_has_no_successful_job"}
+    assert persistence.get_transcript_segment("meeting-1", "segment-1")["normalized_text"] == (
+        "需要确认发布负责人。"
+    )
+    persistence.close()
+
+
+def test_post_meeting_jobs_degrade_without_blocking_when_correction_is_cancelled(tmp_path):
     app = create_app(data_dir=tmp_path)
     committed = app.state.commit_v2_final("meeting-1", _final_event())
     persistence = app.state.v2_persistence
@@ -724,14 +934,10 @@ def test_post_meeting_jobs_fail_closed_when_correction_is_cancelled(tmp_path):
     )
     assert cancelled == 1
 
-    with pytest.raises(RuntimeError, match="no successful replacement"):
-        app.state.v2_post_job_handler_impls["minutes"](
-            {
-                "id": "minutes-job",
-                "meeting_id": "meeting-1",
-                "evidence_segment_id": committed["segment_id"],
-            }
-        )
+    quality = app.state.wait_for_v2_correction_jobs("meeting-1", timeout_seconds=0.1)
+
+    assert quality["correction_degraded"] is True
+    assert quality["reason"] == "correction_has_no_successful_job"
 
     persistence.close()
 
@@ -776,25 +982,116 @@ def test_post_meeting_wait_accepts_superseded_correction_with_successful_replace
     persistence.close()
 
 
-def test_post_meeting_jobs_fail_closed_when_transcript_has_no_correction_job(
+def test_v2_minutes_job_persists_structured_minutes_for_review_actions(
+    tmp_path,
+    monkeypatch,
+):
+    class FakeClient:
+        def post_json(self, url, headers, body, timeout):
+            return {
+                "choices": [{"message": {"content": json.dumps({
+                    "background": "发布评审",
+                    "decisions": ["先灰度 5%"],
+                    "action_items": [{
+                        "item": "确认回滚负责人",
+                        "owner": "张三",
+                        "deadline": "上线前",
+                    }],
+                    "risks": ["P99 延迟超标"],
+                    "open_questions": ["监控 owner 是谁"],
+                    "evidence_quotes": ["先灰度 5%"],
+                }, ensure_ascii=False)}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
+            }
+
+    monkeypatch.setattr(llm_service, "HttpxLlmClient", lambda: FakeClient())
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_GATEWAY_MODEL", "gpt-test")
+    monkeypatch.delenv("LLM_GATEWAY_IS_MOCK", raising=False)
+    app = create_app(data_dir=tmp_path)
+    meeting_id = "meeting-structured-minutes"
+    transcript = "我们确认先灰度百分之五，P99 延迟超标就回滚，上线前由张三确认负责人和监控方案。"
+    committed = app.state.commit_v2_final(
+        meeting_id,
+        _final_event(segment_id="segment-1", text=transcript),
+    )
+    app.state.asr_live_repository.create({
+        "session_id": meeting_id,
+        "source": "live_asr_stream",
+        "trace_kind": "live_event",
+        "provider": "funasr_realtime",
+        "provider_mode": "real",
+        "is_mock": False,
+        "input_source": "browser_live_mic",
+        "ingest_mode": "live_asr_stream",
+        "asr_fallback_used": False,
+        "degradation_reasons": [],
+        "events": [{
+            "id": "transcript_final:segment-1",
+            "event_type": "transcript_final",
+            "at_ms": 1_000,
+            "payload": {
+                "segment_id": "segment-1",
+                "text": transcript,
+                "normalized_text": transcript,
+                "start_ms": 100,
+                "end_ms": 900,
+            },
+        }],
+    })
+    persistence = app.state.v2_persistence
+    now_ms = time.time_ns() // 1_000_000
+    persistence.end_meeting(meeting_id=meeting_id, now_ms=now_ms)
+    while True:
+        correction = persistence.claim_next_job(
+            worker_id="structured-minutes-correction",
+            lane="correction",
+            now_ms=now_ms + 1,
+            lease_ms=30_000,
+        )
+        if correction is None:
+            break
+        persistence.complete_job(
+            job_id=correction["id"],
+            worker_id="structured-minutes-correction",
+            now_ms=now_ms + 2,
+            output={"no_revision_needed": True},
+        )
+    minutes_job = next(
+        job
+        for job in persistence.list_jobs(meeting_id=meeting_id)
+        if job["kind"] == "minutes"
+    )
+
+    result = app.state.v2_post_job_handler_impls["minutes"]({
+        "id": minutes_job["id"],
+        "meeting_id": meeting_id,
+        "evidence_segment_id": committed["segment_id"],
+    })
+    snapshot = persistence.get_snapshot(meeting_id)
+
+    assert result["v2_minutes"]["structured"]["decisions"] == ["先灰度 5%"]
+    assert snapshot["minutes"]["structured"]["action_items"][0]["owner"] == "张三"
+    assert "确认回滚负责人" in snapshot["minutes"]["markdown"]
+    persistence.close()
+
+
+def test_post_meeting_jobs_degrade_when_transcript_has_no_correction_job(
     tmp_path,
 ):
     app = create_app(data_dir=tmp_path)
-    committed = app.state.commit_v2_final("meeting-1", _final_event())
+    app.state.commit_v2_final("meeting-1", _final_event())
     with sqlite3.connect(tmp_path / "meeting_copilot.db") as connection:
         connection.execute(
             "DELETE FROM jobs WHERE meeting_id = ? AND kind = 'correction'",
             ("meeting-1",),
         )
 
-    with pytest.raises(RuntimeError, match="correction jobs are missing"):
-        app.state.v2_post_job_handler_impls["minutes"](
-            {
-                "id": "minutes-job",
-                "meeting_id": "meeting-1",
-                "evidence_segment_id": committed["segment_id"],
-            }
-        )
+    quality = app.state.wait_for_v2_correction_jobs("meeting-1", timeout_seconds=0.1)
+
+    assert quality["correction_degraded"] is True
+    assert quality["reason"] == "correction_jobs_missing"
 
     app.state.v2_persistence.close()
 
@@ -1148,6 +1445,7 @@ def test_v2_create_history_and_audio_playback_endpoints(tmp_path):
     assert audio.json()["chunk_count"] == 1
     assert content.status_code == 200
     assert content.headers["content-type"] == "audio/wav"
+    assert content.headers["content-disposition"].startswith("inline;")
     assert content.content == b"RIFF-test-audio"
 
 
@@ -1206,17 +1504,19 @@ def test_v2_import_audio_creates_ended_meeting_transcript_history_and_playback(
             "/v2/meetings/import-audio",
             files={"file": ("review.wav", audio_buffer.getvalue(), "audio/wav")},
         )
-        assert imported.status_code == 201, imported.text
+        assert imported.status_code == 202, imported.text
         body = imported.json()
         meeting_id = body["meeting_id"]
         deadline = time.monotonic() + 3
+        import_job = None
         while time.monotonic() < deadline:
+            import_job = persistence.list_import_jobs(meeting_id=meeting_id)[0]
             jobs = persistence.list_jobs(meeting_id=meeting_id)
-            if jobs and all(job["status"] == "succeeded" for job in jobs):
+            if import_job["status"] == "succeeded" and jobs and all(job["status"] == "succeeded" for job in jobs):
                 break
             time.sleep(0.01)
         else:
-            raise AssertionError(f"imported meeting jobs did not complete: {jobs}")
+            raise AssertionError(f"import job/jobs did not complete: {import_job}, {jobs}")
         snapshot = client.get(f"/v2/meetings/{meeting_id}/snapshot")
         history = client.get("/v2/meetings")
         audio = client.get(f"/v2/meetings/{meeting_id}/audio")
@@ -1224,6 +1524,7 @@ def test_v2_import_audio_creates_ended_meeting_transcript_history_and_playback(
 
     assert body["source"] == "uploaded_file"
     assert body["provider"] == "local_funasr_batch"
+    assert body["import_job"]["status"] == "pending"
     assert body["source_audio"]["source_type"] == "imported_original"
     assert (tmp_path / body["source_audio"]["relative_path"]).read_bytes() == audio_buffer.getvalue()
     assert snapshot.status_code == 200
@@ -1232,6 +1533,7 @@ def test_v2_import_audio_creates_ended_meeting_transcript_history_and_playback(
     assert snapshot.json()["minutes"]["markdown"].startswith("# 导入会议复盘")
     assert snapshot.json()["approach_cards"][0]["suggestion_text"] == "确认负责人和回滚条件"
     assert snapshot.json()["review"]["indexed"] is True
+    assert import_job["status"] == "succeeded"
     assert {job["status"] for job in jobs} == {"succeeded"}
     assert history.status_code == 200
     assert history.json()["meetings"][0]["id"] == meeting_id
@@ -1240,6 +1542,7 @@ def test_v2_import_audio_creates_ended_meeting_transcript_history_and_playback(
     assert audio.json()["assembled"] is True
     assert audio.json()["status"] == "saved"
     assert content.status_code == 200
+    assert content.headers["content-disposition"].startswith("inline;")
     assert content.content.startswith(b"RIFF")
 
 
@@ -1294,4 +1597,36 @@ def test_app_lifecycle_exports_a_sealed_recording_without_blocking_websocket_pat
     assert audio.json()["assembled"] is True
     assert audio.json()["exports"][0]["status"] == "succeeded"
     assert content.status_code == 200
+    assert content.headers["content-disposition"].startswith("inline;")
     assert content.content.startswith(b"RIFF")
+
+
+def test_app_audio_chunk_callback_persists_native_pcm_source_range(tmp_path):
+    app = create_app(data_dir=tmp_path)
+    chunk = {
+        "source_type": "tauri_system_audio",
+        "track_id": "system_audio",
+        "epoch": 9,
+        "sequence": 0,
+        "relative_path": "audio_assets/native-callback/chunks/chunk-00000000.pcm",
+        "sha256": "e" * 64,
+        "sample_rate_hz": 16_000,
+        "sample_count": 80_000,
+        "duration_ms": 5_000,
+        "file_size_bytes": 320_000,
+        "timestamp_ms": 50_000,
+        "source_sequence_start": 101,
+        "source_sequence_end": 117,
+        "source_timestamp_start_ms": 50_000,
+        "source_timestamp_end_ms": 54_800,
+    }
+
+    persisted = app.state.record_v2_audio_chunk("native-callback", chunk)
+
+    assert persisted["track"] == "system_audio"
+    assert persisted["epoch"] == 9
+    assert persisted["source_sequence_start"] == 101
+    assert persisted["source_sequence_end"] == 117
+    assert persisted["source_timestamp_start_ms"] == 50_000
+    assert persisted["source_timestamp_end_ms"] == 54_800
+    assert app.state.v2_persistence.list_audio_chunks("native-callback") == [persisted]

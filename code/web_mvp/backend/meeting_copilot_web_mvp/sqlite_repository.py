@@ -15,14 +15,23 @@ from meeting_copilot_web_mvp.asr_live_repository import (
     _stamp_created_record,
     _stamp_updated_record,
 )
+from meeting_copilot_web_mvp.application_schema import (
+    APPLICATION_SCHEMA_VERSION,
+    bootstrap_application_schema,
+)
 from meeting_copilot_web_mvp.repository import (
     SESSION_ID_PATTERN,
     SessionRecord,
     _validate_card_status_transition,
 )
+from meeting_copilot_web_mvp.storage_governance import (
+    ensure_private_directory,
+    harden_private_file,
+    harden_sqlite_files,
+)
 
 
-SQLITE_SCHEMA_VERSION = 1
+SQLITE_SCHEMA_VERSION = APPLICATION_SCHEMA_VERSION
 
 
 # ---------------------------------------------------------------------------
@@ -82,9 +91,10 @@ def _validate_session_id(session_id: str) -> str:
 
 class _SqliteRepositoryBase:
     def _open_database(self, data_dir: str | Path) -> None:
-        self._data_dir = Path(data_dir)
-        self._data_dir.mkdir(parents=True, exist_ok=True)
+        self._data_dir = ensure_private_directory(data_dir)
         self._db_path = self._data_dir / "meeting_copilot.db"
+        bootstrap_application_schema(self._db_path)
+        harden_private_file(self._db_path)
         self._lock = RLock()
         self._closed = False
         self._conn = sqlite3.connect(
@@ -97,7 +107,7 @@ class _SqliteRepositoryBase:
             self._conn.execute("PRAGMA busy_timeout=30000")
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
-            _ensure_schema(self._conn)
+            harden_sqlite_files(self._db_path)
         except BaseException:
             self._conn.close()
             self._closed = True
@@ -913,55 +923,6 @@ def _usage_record(
     }
 
 
-def _sqlite_schema_version(connection: sqlite3.Connection) -> int:
-    return int(connection.execute("PRAGMA user_version").fetchone()[0])
-
-
-def _ensure_schema(connection: sqlite3.Connection) -> None:
-    version = _sqlite_schema_version(connection)
-    if version > SQLITE_SCHEMA_VERSION:
-        raise RuntimeError(
-            f"unsupported SQLite schema version {version}; "
-            f"maximum supported version is {SQLITE_SCHEMA_VERSION}"
-        )
-    if version == SQLITE_SCHEMA_VERSION:
-        return
-
-    connection.execute("BEGIN IMMEDIATE")
-    try:
-        version = _sqlite_schema_version(connection)
-        if version > SQLITE_SCHEMA_VERSION:
-            raise RuntimeError(
-                f"unsupported SQLite schema version {version}; "
-                f"maximum supported version is {SQLITE_SCHEMA_VERSION}"
-            )
-        if version == 0:
-            for statement in (
-                _ASR_LIVE_CREATE_TABLE_SQL,
-                _SESSION_CREATE_TABLE_SQL,
-                _PENDING_AUDIO_CLEANUP_CREATE_TABLE_SQL,
-                _DELETED_SESSIONS_CREATE_TABLE_SQL,
-                _SETTINGS_CREATE_TABLE_SQL,
-                _LLM_USAGE_CREATE_TABLE_SQL,
-                _LLM_USAGE_TIME_INDEX_SQL,
-                _LLM_USAGE_SESSION_TIME_INDEX_SQL,
-            ):
-                connection.execute(statement)
-            connection.execute(f"PRAGMA user_version = {SQLITE_SCHEMA_VERSION}")
-        elif version != SQLITE_SCHEMA_VERSION:
-            raise RuntimeError(f"unsupported SQLite schema version {version}")
-    except BaseException:
-        if connection.in_transaction:
-            connection.execute("ROLLBACK")
-        raise
-    try:
-        connection.execute("COMMIT")
-    except BaseException:
-        if connection.in_transaction:
-            connection.execute("ROLLBACK")
-        raise
-
-
 # ---------------------------------------------------------------------------
 # Migration
 # ---------------------------------------------------------------------------
@@ -1017,13 +978,12 @@ def migrate_json_to_sqlite(data_dir: str | Path, db_path: str | Path) -> int:
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
+    bootstrap_application_schema(db_path)
     conn = sqlite3.connect(str(db_path), isolation_level=None, timeout=30.0)
     try:
         conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
-        _ensure_schema(conn)
-
         prepared_live_records: list[tuple[str, dict[str, Any]]] = []
         asr_dir = data_dir / "live_asr_sessions"
         if asr_dir.exists():

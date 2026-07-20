@@ -1,0 +1,62 @@
+{
+  "schema_version": "meeting_copilot.controlled_diarization_model_pack.v1",
+  "pack_id": "diarization-zh-cn",
+  "version": "diarization-vad-v2.0.4-camplus-v1.0.0-20260719-v1",
+  "size_bytes": 29768439,
+  "sha256": "dd422a9249ef2800d440a9cd255c834b55d33a942798dadf1c90238935a794ad",
+  "offline_boundary": {
+    "requires_network": false,
+    "runtime_downloads_allowed": false,
+    "remote_asr_used": false
+  },
+  "verification": {
+    "status": "verified_for_internal_packaging",
+    "counts_as_public_release": false
+  },
+  "redistribution": {
+    "status": "public_redistribution_unresolved",
+    "notice_destination": "licenses/models/diarization-vad-v2.0.4-camplus-v1.0.0",
+    "public_redistribution_approved": false
+  },
+  "models": {
+    "vad": {
+      "model_id": "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+      "version": "v2.0.4",
+      "provenance": {
+        "provider": "modelscope",
+        "source_url": "https://modelscope.cn/models/iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+        "immutable_revision": "v2.0.4",
+        "license_id": "Apache-2.0",
+        "license_evidence_scope": "upstream_model_metadata_observed_not_public_redistribution_approval",
+        "public_redistribution_approved": false
+      },
+      "files": {
+        "am.mvn": "6820fef9687708c4fc3fab2530179c8fcea6262daa25514380056cd8f6eb1754",
+        "config.yaml": "486861ca26ddb79081663b6179cb204c6bfae71c52f04aafc48a9e9d8dde1e93",
+        "configuration.json": "7bce8867e37d55c3dd8f672695ced18077a2be199ea529a5d432d5350fc0acba",
+        "model.pt": "b3be75be477f0780277f3bae0fe489f48718f585f3a6e45d7dd1fbb1a4255fc5"
+      },
+      "size_bytes": 1730986,
+      "sha256": "36743ff7cb85b79c0b75051f355fadc769a0cb48f315eef60938113720a8a246"
+    },
+    "camplus": {
+      "model_id": "damo/speech_campplus_sv_zh-cn_16k-common",
+      "version": "v1.0.0",
+      "provenance": {
+        "provider": "modelscope",
+        "source_url": "https://modelscope.cn/models/damo/speech_campplus_sv_zh-cn_16k-common",
+        "immutable_revision": "v1.0.0",
+        "license_id": "Apache-2.0",
+        "license_evidence_scope": "upstream_model_metadata_observed_not_public_redistribution_approval",
+        "public_redistribution_approved": false
+      },
+      "files": {
+        "campplus_cn_common.bin": "3388cf5fd3493c9ac9c69851d8e7a8badcfb4f3dc631020c4961371646d5ada8",
+        "config.yaml": "17342041bd5b22f6fd7e32f6e7a267b0bf65f018c0a721bada6547e3d28fbfc9",
+        "configuration.json": "6f7acaf1e81ca121f4a3c71b6ddb66beec24350a3ef330e2c846f17829176a8f"
+      },
+      "size_bytes": 28037453,
+      "sha256": "ff3307df7691c998a98634a303aaad15d2b43456a6afb41c9666df086d058212"
+    }
+  }
+}

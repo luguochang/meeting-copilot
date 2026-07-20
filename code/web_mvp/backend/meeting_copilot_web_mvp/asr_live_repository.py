@@ -21,6 +21,10 @@ except ImportError:  # pragma: no cover - unavailable on non-Windows platforms.
     msvcrt = None  # type: ignore[assignment]
 
 from meeting_copilot_web_mvp.repository import SESSION_ID_PATTERN
+from meeting_copilot_web_mvp.storage_governance import (
+    ensure_private_directory,
+    harden_private_file,
+)
 
 
 _JSON_REPOSITORY_LOCKS: dict[Path, RLock] = {}
@@ -245,7 +249,7 @@ class JsonFileAsrLiveSessionRepository:
     @contextmanager
     def _locked(self):
         with self._lock:
-            self._records_dir.mkdir(parents=True, exist_ok=True)
+            ensure_private_directory(self._records_dir)
             capability = _repository_lock_capability()
             if capability == "process_only":
                 yield
@@ -271,7 +275,7 @@ class JsonFileAsrLiveSessionRepository:
                         msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
 
     def _write_record(self, path: Path, record: dict[str, Any]) -> None:
-        self._records_dir.mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(self._records_dir)
         payload = json.dumps(record, ensure_ascii=False, sort_keys=True, indent=2)
         temp_path: Path | None = None
         try:
@@ -287,7 +291,9 @@ class JsonFileAsrLiveSessionRepository:
                 temp_file.write(payload)
                 temp_file.flush()
                 os.fsync(temp_file.fileno())
+            harden_private_file(temp_path)
             os.replace(temp_path, path)
+            harden_private_file(path)
             temp_path = None
             directory_fd = os.open(self._records_dir, os.O_RDONLY)
             try:

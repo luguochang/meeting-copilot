@@ -23,7 +23,7 @@ def test_run_semantic_quality_report_scores_dataset_and_records_default_provider
                     {
                         "id": "negative",
                         "text": "今天天气不错，我们吃饭聊天，然后大家都很开心。",
-                        "expected_status": "blocked",
+                        "expected_status": "warning",
                         "expected_keywords": [],
                     },
                 ],
@@ -41,10 +41,13 @@ def test_run_semantic_quality_report_scores_dataset_and_records_default_provider
     assert report["summary"] == {
         "sample_count": 2,
         "expected_passed_count": 1,
-        "expected_blocked_count": 1,
+        "expected_blocked_count": 0,
+        "expected_warning_count": 1,
         "actual_passed_count": 1,
-        "actual_blocked_count": 1,
+        "actual_blocked_count": 0,
+        "actual_warning_count": 1,
         "expected_status_match_count": 2,
+        "unexpected_status_count": 0,
         "false_pass_count": 0,
         "false_block_count": 0,
         "keyword_recall_average": 1.0,
@@ -59,4 +62,4 @@ def test_run_semantic_quality_report_scores_dataset_and_records_default_provider
     assert report["cost_status"] == "no_paid_remote_service"
     assert report["samples"][0]["actual_status"] == "passed"
     assert report["samples"][0]["keyword_recall"] == 1.0
-    assert report["samples"][1]["actual_status"] == "blocked"
+    assert report["samples"][1]["actual_status"] == "warning"

@@ -1,0 +1,57 @@
+{
+  "schema_version": "meeting_copilot.diarization_model_pack.v1",
+  "pack_id": "diarization-camplus-zh-cn",
+  "version": "diarization-camplus-zh-cn-v1",
+  "status": "locally_verified_not_bundled",
+  "resolution": "immutable_upstream_tag_and_file_hashes",
+  "sha256": "3388cf5fd3493c9ac9c69851d8e7a8badcfb4f3dc631020c4961371646d5ada8",
+  "hash": "sha256:3388cf5fd3493c9ac9c69851d8e7a8badcfb4f3dc631020c4961371646d5ada8",
+  "implementation_status": "local_funasr_vad_camplus_supported",
+  "real_model_claim": true,
+  "evidence_scope": "local_internal_model_load_and_embedding_only",
+  "public_release_approved": false,
+  "clustering": {
+    "cosine_similarity_threshold": 0.35,
+    "upstream_verification_threshold": 0.31,
+    "local_same_speaker_cosine": 0.693603,
+    "local_different_speaker_cosine_range": [-0.084177, 0.007206],
+    "evidence_scope": "upstream_labeled_speaker_verification_examples_not_meeting_acceptance"
+  },
+  "license": {
+    "spdx": "Apache-2.0",
+    "path": "code/asr_runtime/licenses/Apache-2.0.txt"
+  },
+  "offline_policy": {
+    "absolute_local_directories_only": true,
+    "modelscope_offline": "1",
+    "hf_hub_offline": "1",
+    "remote_download": false
+  },
+  "models": {
+    "vad": {
+      "role": "voice_activity_detection",
+      "status": "unresolved",
+      "resolution": "unresolved",
+      "model_id": null,
+      "revision": "unresolved",
+      "sha256": null,
+      "hash": null,
+      "source_directory": null
+    },
+    "camplus": {
+      "role": "speaker_embedding",
+      "status": "locally_verified_not_bundled",
+      "resolution": "immutable_upstream_tag_and_file_hashes",
+      "model_id": "iic/speech_campplus_sv_zh-cn_16k-common",
+      "revision": "v2.0.2",
+      "sha256": "3388cf5fd3493c9ac9c69851d8e7a8badcfb4f3dc631020c4961371646d5ada8",
+      "hash": "sha256:3388cf5fd3493c9ac9c69851d8e7a8badcfb4f3dc631020c4961371646d5ada8",
+      "source_directory": "artifacts/tmp/diarization-camplus-zh-cn-v2.0.2",
+      "required_files": {
+        "campplus_cn_common.bin": "3388cf5fd3493c9ac9c69851d8e7a8badcfb4f3dc631020c4961371646d5ada8",
+        "config.yaml": "17342041bd5b22f6fd7e32f6e7a267b0bf65f018c0a721bada6547e3d28fbfc9",
+        "configuration.json": "6f7acaf1e81ca121f4a3c71b6ddb66beec24350a3ef330e2c846f17829176a8f"
+      }
+    }
+  }
+}

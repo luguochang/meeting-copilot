@@ -144,10 +144,10 @@ def test_main_can_write_streaming_events(monkeypatch, tmp_path, capsys):
     ]
 
 
-def test_cli_runs_as_direct_script_with_sherpa_python():
+def test_cli_runs_as_direct_script_with_current_python():
     result = subprocess.run(
         [
-            ".venv-sherpa/bin/python",
+            sys.executable,
             "scripts/transcribe_sherpa_onnx.py",
             "--help",
         ],

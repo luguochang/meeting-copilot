@@ -20,6 +20,7 @@ from packaged_runtime_supervisor_smoke import (
     find_backend_process,
     health_proof,
     http_response,
+    packaged_app_launch_command,
     pid_exists,
     port_is_listening,
     post_json,
@@ -228,7 +229,7 @@ def smoke_packaged_native_mic(
         }
     )
     app_process = subprocess.Popen(
-        [str(binary)],
+        packaged_app_launch_command(binary),
         cwd=app_path.parent,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,

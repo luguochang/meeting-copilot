@@ -1,17 +1,26 @@
 from __future__ import annotations
 
+from array import array
+from collections import deque
 import hashlib
 import json
+import math
 import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
 import struct
+import sys
 import time
 import wave
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from meeting_copilot_web_mvp.repository import SESSION_ID_PATTERN
+from meeting_copilot_web_mvp.next006_failpoints import storage_write_failpoint
+from meeting_copilot_web_mvp.storage_governance import (
+    ensure_private_directory,
+    harden_private_file,
+)
 
 
 SAMPLE_RATE_HZ = 16_000
@@ -21,19 +30,66 @@ DEFAULT_CHUNK_DURATION_SECONDS = 5.0
 _MANIFEST_VERSION = 1
 _HASH_BUFFER_BYTES = 1024 * 1024
 _CHUNK_NAME_PATTERN = re.compile(r"^chunk-(\d{8})\.pcm$")
+DUAL_TRACK_IDS = frozenset({"microphone", "system_audio"})
+
+
+class Float32PcmPayloadError(ValueError):
+    """Raised when a realtime audio frame violates the Float32 PCM contract."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.user_message = message
+
+
+def validate_float32_pcm_payload(payload: bytes | bytearray | memoryview) -> bytes:
+    """Validate one little-endian mono Float32 PCM frame and return its bytes.
+
+    Browser and native microphone adapters send raw Float32 samples. Silently
+    truncating an incomplete sample or passing NaN into RMS/WAV conversion can
+    corrupt both the live state and the saved recording, so malformed frames
+    are rejected at the protocol boundary.
+    """
+
+    if not isinstance(payload, (bytes, bytearray, memoryview)):
+        raise Float32PcmPayloadError(
+            "audio_payload_type",
+            "音频帧格式无效，请重新连接麦克风。",
+        )
+    raw = bytes(payload)
+    if len(raw) % 4:
+        raise Float32PcmPayloadError(
+            "audio_payload_alignment",
+            "音频帧不是完整的 Float32 PCM 数据，请重新开始会议。",
+        )
+    for (sample,) in struct.iter_unpack("<f", raw):
+        if not math.isfinite(sample):
+            raise Float32PcmPayloadError(
+                "audio_payload_non_finite",
+                "音频帧包含无效数值，请重新连接麦克风。",
+            )
+    return raw
 
 
 def audio_chunk_journal_sha256(chunks: list[dict[str, Any]]) -> str:
-    normalized = [
-        {
+    normalized = []
+    for index, chunk in enumerate(chunks):
+        item = {
             "chunk_seq": int(chunk.get("chunk_seq", index)),
             "name": str(chunk.get("name") or Path(str(chunk.get("relative_path") or "")).name),
             "sample_count": int(chunk["sample_count"]),
             "file_size_bytes": int(chunk["file_size_bytes"]),
             "sha256": str(chunk["sha256"]),
         }
-        for index, chunk in enumerate(chunks)
-    ]
+        for key in (
+            "source_sequence_start",
+            "source_sequence_end",
+            "source_timestamp_start_ms",
+            "source_timestamp_end_ms",
+        ):
+            if chunk.get(key) is not None:
+                item[key] = int(chunk[key])
+        normalized.append(item)
     encoded = json.dumps(
         normalized,
         ensure_ascii=True,
@@ -52,6 +108,9 @@ class RealtimeWavAssetWriter:
         source_type: str,
         sample_rate_hz: int = SAMPLE_RATE_HZ,
         chunk_duration_seconds: float = DEFAULT_CHUNK_DURATION_SECONDS,
+        track_id: str | None = None,
+        epoch: int = 0,
+        started_at_ms: int | None = None,
         on_chunk_committed: Callable[[dict[str, Any]], None] | None = None,
         authorize_chunk_commit: Callable[[dict[str, Any]], bool] | None = None,
     ) -> None:
@@ -61,10 +120,20 @@ class RealtimeWavAssetWriter:
             raise ValueError("sample_rate_hz must be positive")
         if chunk_duration_seconds <= 0:
             raise ValueError("chunk_duration_seconds must be positive")
+        normalized_track_id = str(track_id or "").strip() or None
+        if normalized_track_id is not None and normalized_track_id not in DUAL_TRACK_IDS:
+            raise ValueError(f"track_id must be one of {sorted(DUAL_TRACK_IDS)}")
+        epoch = int(epoch)
+        if epoch < 0:
+            raise ValueError("epoch must be non-negative")
 
         self._data_dir = Path(data_dir)
         self._session_id = session_id
         self._source_type = source_type
+        self._track_id = normalized_track_id or ("system_audio" if "system_audio" in source_type else None)
+        self._public_track_id = self._track_id or ("system_audio" if "system_audio" in source_type else "microphone")
+        self._epoch = epoch
+        self._started_at_ms = max(0, int(started_at_ms)) if started_at_ms is not None else int(time.time() * 1_000)
         self._sample_rate_hz = sample_rate_hz
         self._chunk_duration_seconds = chunk_duration_seconds
         self._chunk_sample_count = max(1, round(sample_rate_hz * chunk_duration_seconds))
@@ -74,7 +143,14 @@ class RealtimeWavAssetWriter:
         self._closed = False
         self._assembled = False
         self._buffer = bytearray()
-        self._relative_path = Path("audio_assets") / session_id / "audio.wav"
+        self._pending_source_spans: deque[dict[str, Any]] = deque()
+        if self._track_id is None:
+            self._relative_path = Path("audio_assets") / session_id / "audio.wav"
+        else:
+            self._relative_path = (
+                Path("audio_assets") / session_id / "tracks" / self._track_id / f"epoch-{epoch}" / "audio.wav"
+            )
+        self._relative_chunks_dir = self._relative_path.parent / "chunks"
         self._path = self._data_dir / self._relative_path
         self._session_dir = self._path.parent
         self._chunks_dir = self._session_dir / "chunks"
@@ -82,25 +158,33 @@ class RealtimeWavAssetWriter:
         self._assembly_temp_path = self._session_dir / "audio.wav.tmp"
         self._legacy_temp_path = self._session_dir / "audio.wav.inprogress"
         self._manifest_temp_path = self._session_dir / "audio.manifest.json.tmp"
-        self._session_dir.mkdir(parents=True, exist_ok=True)
-        self._chunks_dir.mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(self._session_dir)
+        ensure_private_directory(self._chunks_dir)
         self._remove_incomplete_files()
 
         manifest = self._load_manifest()
+        # An existing journal owns its timeline. Export/recovery callers may
+        # hold a millisecond-rounded database timestamp; rewriting the manifest
+        # with that value would make replayed chunks conflict with SQLite.
+        if manifest is not None and manifest.get("started_at_ms") is not None:
+            self._started_at_ms = max(0, int(manifest["started_at_ms"]))
         self._base_sample_count = self._load_base_sample_count(manifest)
         self._chunks = self._recover_chunks(manifest)
         self._next_chunk_index = len(self._chunks)
-        self._sample_count = self._base_sample_count + sum(
-            int(chunk["sample_count"]) for chunk in self._chunks
-        )
+        self._sample_count = self._base_sample_count + sum(int(chunk["sample_count"]) for chunk in self._chunks)
         self._write_manifest()
         for chunk_index, chunk in enumerate(self._chunks):
             self._notify_chunk_committed(chunk, chunk_index=chunk_index)
 
-    def write_float32_pcm(self, payload: bytes) -> None:
+    def write_float32_pcm(
+        self,
+        payload: bytes,
+        *,
+        source_frame: Mapping[str, Any] | None = None,
+    ) -> None:
         if self._closed:
             raise RuntimeError("audio asset writer is already closed")
-        usable = payload[: len(payload) - (len(payload) % 4)]
+        usable = validate_float32_pcm_payload(payload)
         if not usable:
             return
         pcm16 = bytearray()
@@ -110,6 +194,12 @@ class RealtimeWavAssetWriter:
             elif sample < -1.0:
                 sample = -1.0
             pcm16.extend(struct.pack("<h", int(sample * 32767)))
+        self._pending_source_spans.append(
+            self._normalize_source_span(
+                source_frame,
+                sample_count=len(usable) // 4,
+            )
+        )
         self._buffer.extend(pcm16)
         while len(self._buffer) >= self._chunk_size_bytes:
             chunk = bytes(self._buffer[: self._chunk_size_bytes])
@@ -128,7 +218,10 @@ class RealtimeWavAssetWriter:
         return {
             "saved": True,
             "assembled": False,
-            "audio_asset_id": f"audio_{self._session_id}",
+            "audio_asset_id": f"audio_{self._session_id}_{self._public_track_id}_{self._epoch}",
+            "track_id": self._public_track_id,
+            "epoch": self._epoch,
+            "started_at_ms": self._started_at_ms,
             "relative_path": str(self._relative_path),
             "format": "pcm_s16le_chunk_journal",
             "sample_rate_hz": self._sample_rate_hz,
@@ -158,12 +251,22 @@ class RealtimeWavAssetWriter:
             sample_rate_hz=self._sample_rate_hz,
             sample_count=self._sample_count,
         )
-        return {**metadata, "assembled": True, "chunk_count": len(self._chunks)}
+        return {
+            **metadata,
+            "assembled": True,
+            "audio_asset_id": f"audio_{self._session_id}_{self._public_track_id}_{self._epoch}",
+            "track_id": self._public_track_id,
+            "epoch": self._epoch,
+            "started_at_ms": self._started_at_ms,
+            "chunk_count": len(self._chunks),
+            "journal_sha256": audio_chunk_journal_sha256(self._chunks),
+        }
 
     def discard(self) -> None:
         if self._closed:
             return
         self._buffer.clear()
+        self._pending_source_spans.clear()
         self._closed = True
         self._remove_incomplete_files()
 
@@ -191,6 +294,10 @@ class RealtimeWavAssetWriter:
             or manifest.get("sample_width_bytes") != PCM_SAMPLE_WIDTH_BYTES
         ):
             raise ValueError("existing realtime audio format does not match writer")
+        if manifest.get("track_id") not in {None, self._public_track_id}:
+            raise ValueError("existing realtime audio track does not match writer")
+        if int(manifest.get("epoch", self._epoch)) != self._epoch:
+            raise ValueError("existing realtime audio epoch does not match writer")
         if not isinstance(manifest.get("chunks", []), list):
             raise ValueError("audio chunk manifest has invalid chunks")
         return manifest
@@ -241,12 +348,14 @@ class RealtimeWavAssetWriter:
             file_size_bytes, sha256 = _file_size_and_sha256(path)
             if file_size_bytes <= 0 or file_size_bytes % PCM_SAMPLE_WIDTH_BYTES:
                 raise ValueError(f"invalid PCM16 audio chunk: {path.name}")
-            recovered.append({
-                "name": path.name,
-                "sample_count": file_size_bytes // PCM_SAMPLE_WIDTH_BYTES,
-                "file_size_bytes": file_size_bytes,
-                "sha256": sha256,
-            })
+            recovered.append(
+                {
+                    "name": path.name,
+                    "sample_count": file_size_bytes // PCM_SAMPLE_WIDTH_BYTES,
+                    "file_size_bytes": file_size_bytes,
+                    "sha256": sha256,
+                }
+            )
 
         declared = list((manifest or {}).get("chunks") or [])
         if len(declared) > len(recovered):
@@ -254,38 +363,103 @@ class RealtimeWavAssetWriter:
         for index, expected in enumerate(declared):
             actual = recovered[index]
             if not isinstance(expected, dict) or any(
-                expected.get(key) != actual[key]
-                for key in ("name", "sample_count", "file_size_bytes", "sha256")
+                expected.get(key) != actual[key] for key in ("name", "sample_count", "file_size_bytes", "sha256")
             ):
                 raise ValueError("audio chunk does not match its manifest")
+            source_keys = (
+                "source_sequence_start",
+                "source_sequence_end",
+                "source_timestamp_start_ms",
+                "source_timestamp_end_ms",
+            )
+            present = [expected.get(key) is not None for key in source_keys]
+            if any(present):
+                if not all(present):
+                    raise ValueError("audio chunk has incomplete native PCM source metadata")
+                source_values = {key: int(expected[key]) for key in source_keys}
+                if (
+                    source_values["source_sequence_start"] <= 0
+                    or source_values["source_sequence_end"] < source_values["source_sequence_start"]
+                    or source_values["source_timestamp_start_ms"] < 0
+                    or source_values["source_timestamp_end_ms"]
+                    < source_values["source_timestamp_start_ms"]
+                ):
+                    raise ValueError("audio chunk has invalid native PCM source metadata")
+                actual.update(source_values)
         return recovered
+
+    def _normalize_source_span(
+        self,
+        source_frame: Mapping[str, Any] | None,
+        *,
+        sample_count: int,
+    ) -> dict[str, Any]:
+        span: dict[str, Any] = {
+            "remaining_samples": sample_count,
+            "sequence": None,
+            "timestamp_ms": None,
+        }
+        if source_frame is None:
+            return span
+        source_track = str(source_frame.get("source_track") or "").strip()
+        capture_epoch = int(source_frame.get("capture_epoch") or 0)
+        sequence = int(source_frame.get("track_sequence") or 0)
+        timestamp_ms = int(source_frame.get("source_timestamp_ms") or 0)
+        if source_track != self._public_track_id or capture_epoch != self._epoch:
+            raise ValueError("native PCM source identity does not match the recording writer")
+        if sequence <= 0 or timestamp_ms < 0:
+            raise ValueError("native PCM source sequence and timestamp must be valid")
+        span["sequence"] = sequence
+        span["timestamp_ms"] = timestamp_ms
+        return span
+
+    def _consume_source_range(self, sample_count: int) -> dict[str, int]:
+        remaining = sample_count
+        observed: list[tuple[int | None, int | None]] = []
+        while remaining > 0:
+            if not self._pending_source_spans:
+                raise RuntimeError("PCM source metadata is shorter than the audio buffer")
+            span = self._pending_source_spans[0]
+            take = min(remaining, int(span["remaining_samples"]))
+            observed.append((span["sequence"], span["timestamp_ms"]))
+            span["remaining_samples"] = int(span["remaining_samples"]) - take
+            remaining -= take
+            if int(span["remaining_samples"]) == 0:
+                self._pending_source_spans.popleft()
+        if not observed or any(sequence is None or timestamp is None for sequence, timestamp in observed):
+            return {}
+        return {
+            "source_sequence_start": int(observed[0][0]),
+            "source_sequence_end": int(observed[-1][0]),
+            "source_timestamp_start_ms": int(observed[0][1]),
+            "source_timestamp_end_ms": int(observed[-1][1]),
+        }
 
     def _commit_chunk(self, pcm16: bytes) -> None:
         if not pcm16 or len(pcm16) % PCM_SAMPLE_WIDTH_BYTES:
             raise ValueError("PCM16 chunk must contain complete samples")
+        storage_write_failpoint.maybe_raise("audio_chunk")
         name = f"chunk-{self._next_chunk_index:08d}.pcm"
         sample_count = len(pcm16) // PCM_SAMPLE_WIDTH_BYTES
+        source_range = self._consume_source_range(sample_count)
         proposed_chunk = {
             "name": name,
             "session_id": self._session_id,
             "source_type": self._source_type,
+            "track_id": self._public_track_id,
+            "epoch": self._epoch,
+            "sequence": self._next_chunk_index,
+            "timestamp_ms": self._timestamp_for_chunk(self._next_chunk_index),
             "sample_rate_hz": self._sample_rate_hz,
             "chunk_index": self._next_chunk_index,
             "sample_count": sample_count,
             "duration_ms": round(sample_count / self._sample_rate_hz * 1_000),
             "file_size_bytes": len(pcm16),
             "sha256": hashlib.sha256(pcm16).hexdigest(),
-            "relative_path": str(
-                Path("audio_assets")
-                / self._session_id
-                / "chunks"
-                / name
-            ),
+            "relative_path": str(self._relative_chunks_dir / name),
+            **source_range,
         }
-        if (
-            self._authorize_chunk_commit is not None
-            and not self._authorize_chunk_commit(dict(proposed_chunk))
-        ):
+        if self._authorize_chunk_commit is not None and not self._authorize_chunk_commit(dict(proposed_chunk)):
             raise RuntimeError("capture lease fence rejected audio chunk commit")
         path = self._chunks_dir / name
         temp_path = self._chunks_dir / f"{name}.tmp"
@@ -293,7 +467,9 @@ class RealtimeWavAssetWriter:
             chunk_file.write(pcm16)
             chunk_file.flush()
             os.fsync(chunk_file.fileno())
+        harden_private_file(temp_path)
         os.replace(temp_path, path)
+        harden_private_file(path)
         _fsync_directory(self._chunks_dir)
 
         committed_chunk = {
@@ -301,6 +477,7 @@ class RealtimeWavAssetWriter:
             "sample_count": sample_count,
             "file_size_bytes": len(pcm16),
             "sha256": proposed_chunk["sha256"],
+            **source_range,
         }
         self._chunks.append(committed_chunk)
         self._next_chunk_index += 1
@@ -319,22 +496,21 @@ class RealtimeWavAssetWriter:
     ) -> None:
         if self._on_chunk_committed is None:
             return
-        self._on_chunk_committed({
-            **chunk,
-            "session_id": self._session_id,
-            "source_type": self._source_type,
-            "sample_rate_hz": self._sample_rate_hz,
-            "chunk_index": chunk_index,
-            "duration_ms": round(
-                int(chunk["sample_count"]) / self._sample_rate_hz * 1_000
-            ),
-            "relative_path": str(
-                Path("audio_assets")
-                / self._session_id
-                / "chunks"
-                / str(chunk["name"])
-            ),
-        })
+        self._on_chunk_committed(
+            {
+                **chunk,
+                "session_id": self._session_id,
+                "source_type": self._source_type,
+                "track_id": self._public_track_id,
+                "epoch": self._epoch,
+                "sequence": chunk_index,
+                "timestamp_ms": self._timestamp_for_chunk(chunk_index),
+                "sample_rate_hz": self._sample_rate_hz,
+                "chunk_index": chunk_index,
+                "duration_ms": round(int(chunk["sample_count"]) / self._sample_rate_hz * 1_000),
+                "relative_path": str(self._relative_chunks_dir / str(chunk["name"])),
+            }
+        )
 
     def _write_manifest(self) -> None:
         manifest = {
@@ -343,6 +519,9 @@ class RealtimeWavAssetWriter:
             "sample_rate_hz": self._sample_rate_hz,
             "channel_count": CHANNEL_COUNT,
             "sample_width_bytes": PCM_SAMPLE_WIDTH_BYTES,
+            "track_id": self._public_track_id,
+            "epoch": self._epoch,
+            "started_at_ms": self._started_at_ms,
             "chunk_duration_ms": round(self._chunk_duration_seconds * 1000),
             "base_sample_count": self._base_sample_count,
             "chunks": self._chunks,
@@ -357,8 +536,16 @@ class RealtimeWavAssetWriter:
             manifest_file.write(encoded)
             manifest_file.flush()
             os.fsync(manifest_file.fileno())
+        harden_private_file(self._manifest_temp_path)
         os.replace(self._manifest_temp_path, self._manifest_path)
+        harden_private_file(self._manifest_path)
         _fsync_directory(self._session_dir)
+
+    def _timestamp_for_chunk(self, chunk_index: int) -> int:
+        preceding_samples = self._base_sample_count + sum(
+            int(chunk["sample_count"]) for chunk in self._chunks[:chunk_index]
+        )
+        return self._started_at_ms + round(preceding_samples / self._sample_rate_hz * 1_000)
 
     def _assemble_wav(self) -> None:
         try:
@@ -375,7 +562,9 @@ class RealtimeWavAssetWriter:
                             assembled.writeframesraw(data)
             with self._assembly_temp_path.open("rb") as assembled_file:
                 os.fsync(assembled_file.fileno())
+            harden_private_file(self._assembly_temp_path)
             os.replace(self._assembly_temp_path, self._path)
+            harden_private_file(self._path)
             _fsync_directory(self._session_dir)
         except Exception:
             self._assembly_temp_path.unlink(missing_ok=True)
@@ -402,6 +591,9 @@ def assemble_realtime_wav_asset(
     expected_chunk_count: int | None = None,
     expected_sample_count: int | None = None,
     expected_journal_sha256: str | None = None,
+    track_id: str | None = None,
+    epoch: int = 0,
+    started_at_ms: int | None = None,
 ) -> dict[str, Any]:
     """Assemble a sealed/recovered journal in a background-worker friendly call."""
 
@@ -410,6 +602,9 @@ def assemble_realtime_wav_asset(
         session_id=session_id,
         source_type=source_type,
         sample_rate_hz=sample_rate_hz,
+        track_id=track_id,
+        epoch=epoch,
+        started_at_ms=started_at_ms,
     )
     sealed = writer.seal()
     expected = {
@@ -425,6 +620,144 @@ def assemble_realtime_wav_asset(
     if mismatches:
         raise ValueError(f"recording journal changed before export: {mismatches}")
     return writer.close()
+
+
+def derive_local_mixed_wav_asset(
+    *,
+    data_dir: str | Path,
+    meeting_id: str,
+    asset_id: str,
+    sources: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Create an explicit local PCM16 mix without changing either source asset."""
+
+    if not SESSION_ID_PATTERN.fullmatch(meeting_id):
+        raise ValueError(f"unsafe session_id: {meeting_id}")
+    if not re.fullmatch(r"mixed_[a-f0-9]{24}", asset_id):
+        raise ValueError("unsafe mixed asset_id")
+    if len(sources) != 2 or {str(source.get("track_id")) for source in sources} != DUAL_TRACK_IDS:
+        raise ValueError("mixed audio requires microphone and system_audio sources")
+
+    opened: list[tuple[Mapping[str, Any], wave.Wave_read, int]] = []
+    output_relative_path = Path("audio_assets") / meeting_id / "derived" / "mixed" / f"{asset_id}.wav"
+    output_path = safe_audio_path(data_dir, output_relative_path)
+    ensure_private_directory(output_path.parent)
+    if output_path.parent.is_symlink():
+        raise ValueError("mixed audio output directory must not be a symlink")
+    temp_path = output_path.with_suffix(".wav.tmp")
+    try:
+        sample_rate_hz: int | None = None
+        timeline_start_ms = min(int(source["started_at_ms"]) for source in sources)
+        total_frames = 0
+        for source in sources:
+            relative_path = str(source["output_relative_path"])
+            _require_meeting_owned_audio_path(meeting_id, relative_path)
+            source_path = safe_audio_path(data_dir, relative_path)
+            if not source_path.is_file() or source_path.is_symlink():
+                raise ValueError(f"source track audio is unavailable: {source['track_id']}")
+            _size, sha256 = _file_size_and_sha256(source_path)
+            if sha256 != str(source["output_sha256"]):
+                raise ValueError(f"source track audio changed before mixing: {source['track_id']}")
+            try:
+                reader = wave.open(str(source_path), "rb")
+            except (OSError, wave.Error) as exc:
+                raise ValueError(f"source track is not a readable WAV: {source['track_id']}") from exc
+            if (
+                reader.getnchannels() != CHANNEL_COUNT
+                or reader.getsampwidth() != PCM_SAMPLE_WIDTH_BYTES
+                or reader.getcomptype() != "NONE"
+            ):
+                reader.close()
+                raise ValueError("mixed audio sources must be mono PCM16 WAV")
+            if sample_rate_hz is None:
+                sample_rate_hz = int(reader.getframerate())
+            elif reader.getframerate() != sample_rate_hz:
+                reader.close()
+                raise ValueError("mixed audio sources must use the same sample rate")
+            offset_frames = round((int(source["started_at_ms"]) - timeline_start_ms) * sample_rate_hz / 1_000)
+            total_frames = max(total_frames, offset_frames + reader.getnframes())
+            opened.append((source, reader, offset_frames))
+
+        assert sample_rate_hz is not None
+        with wave.open(str(temp_path), "wb") as output:
+            output.setnchannels(CHANNEL_COUNT)
+            output.setsampwidth(PCM_SAMPLE_WIDTH_BYTES)
+            output.setframerate(sample_rate_hz)
+            cursor = 0
+            block_frames = 4_096
+            while cursor < total_frames:
+                requested = min(block_frames, total_frames - cursor)
+                sums = [0] * requested
+                active = [0] * requested
+                for _source, reader, offset in opened:
+                    source_start = max(cursor, offset)
+                    source_end = min(cursor + requested, offset + reader.getnframes())
+                    if source_start >= source_end:
+                        continue
+                    relative_start = source_start - offset
+                    if reader.tell() != relative_start:
+                        reader.setpos(relative_start)
+                    samples = array("h")
+                    samples.frombytes(reader.readframes(source_end - source_start))
+                    if sys.byteorder != "little":
+                        samples.byteswap()
+                    destination_start = source_start - cursor
+                    for index, sample in enumerate(samples, start=destination_start):
+                        sums[index] += int(sample)
+                        active[index] += 1
+                mixed = array(
+                    "h",
+                    (
+                        max(-32_768, min(32_767, round(total / count))) if count else 0
+                        for total, count in zip(sums, active, strict=True)
+                    ),
+                )
+                if sys.byteorder != "little":
+                    mixed.byteswap()
+                output.writeframesraw(mixed.tobytes())
+                cursor += requested
+        with temp_path.open("rb") as output_file:
+            os.fsync(output_file.fileno())
+        harden_private_file(temp_path)
+        os.replace(temp_path, output_path)
+        harden_private_file(output_path)
+        _fsync_directory(output_path.parent)
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
+    finally:
+        for _source, reader, _offset in opened:
+            reader.close()
+
+    metadata = audio_metadata_for_file(
+        data_dir=data_dir,
+        session_id=meeting_id,
+        relative_path=output_relative_path,
+        source_type="local_derived_mix",
+        sample_rate_hz=sample_rate_hz,
+        sample_count=total_frames,
+    )
+    return {
+        **metadata,
+        "asset_id": asset_id,
+        "kind": "mixed",
+        "derivation": "local_pcm16_timeline_mix",
+        "timeline_start_ms": timeline_start_ms,
+        "remote_upload_used": False,
+    }
+
+
+def _require_meeting_owned_audio_path(meeting_id: str, relative_path: str) -> None:
+    if "\\" in relative_path:
+        raise ValueError("audio source path must use POSIX separators")
+    path = PurePosixPath(relative_path)
+    if (
+        path.is_absolute()
+        or ".." in path.parts
+        or len(path.parts) < 3
+        or path.parts[:2] != ("audio_assets", meeting_id)
+    ):
+        raise ValueError("audio source is outside the meeting-owned asset root")
 
 
 def inspect_realtime_audio_journal(
@@ -489,18 +822,18 @@ def inspect_realtime_audio_journal(
         if file_size_bytes <= 0 or file_size_bytes % PCM_SAMPLE_WIDTH_BYTES:
             raise ValueError(f"invalid PCM16 audio chunk: {path.name}")
         sample_count = file_size_bytes // PCM_SAMPLE_WIDTH_BYTES
-        chunks.append({
-            "chunk_seq": chunk_seq,
-            "name": path.name,
-            "relative_path": str(
-                Path("audio_assets") / session_id / "chunks" / path.name
-            ),
-            "sample_rate_hz": sample_rate_hz,
-            "sample_count": sample_count,
-            "duration_ms": round(sample_count / sample_rate_hz * 1_000),
-            "file_size_bytes": file_size_bytes,
-            "sha256": sha256,
-        })
+        chunks.append(
+            {
+                "chunk_seq": chunk_seq,
+                "name": path.name,
+                "relative_path": str(Path("audio_assets") / session_id / "chunks" / path.name),
+                "sample_rate_hz": sample_rate_hz,
+                "sample_count": sample_count,
+                "duration_ms": round(sample_count / sample_rate_hz * 1_000),
+                "file_size_bytes": file_size_bytes,
+                "sha256": sha256,
+            }
+        )
 
     declared = list((manifest or {}).get("chunks") or [])
     if len(declared) > len(chunks):
@@ -508,8 +841,7 @@ def inspect_realtime_audio_journal(
     for index, expected in enumerate(declared):
         actual = chunks[index]
         if not isinstance(expected, dict) or any(
-            expected.get(key) != actual[key]
-            for key in ("name", "sample_count", "file_size_bytes", "sha256")
+            expected.get(key) != actual[key] for key in ("name", "sample_count", "file_size_bytes", "sha256")
         ):
             raise ValueError("audio chunk does not match its manifest")
 
@@ -540,8 +872,9 @@ def persist_uploaded_audio_asset(
         suffix = ".audio"
     relative_path = Path("audio_assets") / session_id / f"source{suffix}"
     path = Path(data_dir) / relative_path
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_directory(path.parent)
     path.write_bytes(payload)
+    harden_private_file(path)
     return audio_metadata_for_file(
         data_dir=data_dir,
         session_id=session_id,
@@ -570,14 +903,16 @@ def persist_uploaded_audio_asset_from_path(
         suffix = ".audio"
     relative_path = Path("audio_assets") / session_id / f"source{suffix}"
     destination = Path(data_dir) / relative_path
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_directory(destination.parent)
     temp_path = destination.with_suffix(f"{destination.suffix}.tmp")
     try:
         with Path(source_path).open("rb") as source, temp_path.open("wb") as target:
             shutil.copyfileobj(source, target, length=_HASH_BUFFER_BYTES)
             target.flush()
             os.fsync(target.fileno())
+        harden_private_file(temp_path)
         os.replace(temp_path, destination)
+        harden_private_file(destination)
         _fsync_directory(destination.parent)
     except BaseException:
         temp_path.unlink(missing_ok=True)
@@ -620,14 +955,16 @@ def persist_imported_wav_asset_from_path(
 
     relative_path = Path("audio_assets") / session_id / "audio.wav"
     destination = safe_audio_path(data_dir, relative_path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_directory(destination.parent)
     temp_path = destination.with_suffix(".wav.tmp")
     try:
         with source.open("rb") as source_file, temp_path.open("wb") as target_file:
             shutil.copyfileobj(source_file, target_file, length=_HASH_BUFFER_BYTES)
             target_file.flush()
             os.fsync(target_file.fileno())
+        harden_private_file(temp_path)
         os.replace(temp_path, destination)
+        harden_private_file(destination)
         _fsync_directory(destination.parent)
     except BaseException:
         temp_path.unlink(missing_ok=True)
@@ -655,11 +992,7 @@ def audio_metadata_for_file(
 ) -> dict[str, Any]:
     path = safe_audio_path(data_dir, relative_path)
     file_size_bytes, sha256 = _file_size_and_sha256(path)
-    duration_ms = (
-        int((sample_count / sample_rate_hz) * 1000)
-        if sample_rate_hz and sample_count is not None
-        else 0
-    )
+    duration_ms = int((sample_count / sample_rate_hz) * 1000) if sample_rate_hz and sample_count is not None else 0
     return {
         "saved": True,
         "audio_asset_id": f"audio_{session_id}",
@@ -722,9 +1055,7 @@ def _controlled_session_audio_dir(data_dir: str | Path, relative_path: str) -> P
         raise ValueError("controlled session audio directory must not be a symlink")
     session_dir = unresolved_session_dir.resolve()
     target = safe_audio_path(root, Path(*parts))
-    if root not in session_dir.parents or (
-        target != session_dir and session_dir not in target.parents
-    ):
+    if root not in session_dir.parents or (target != session_dir and session_dir not in target.parents):
         raise ValueError("audio cleanup path escapes its controlled session")
     return session_dir
 

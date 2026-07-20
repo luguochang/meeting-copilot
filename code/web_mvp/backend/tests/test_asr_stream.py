@@ -1,7 +1,9 @@
 """Tests for the realtime ASR WebSocket stream."""
+
 import asyncio
 import hashlib
 import json
+import math
 from pathlib import Path
 import struct
 import threading
@@ -9,6 +11,7 @@ import time
 import wave
 import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 from meeting_copilot_web_mvp import asr_stream
 from meeting_copilot_web_mvp.app import create_app
 from meeting_copilot_web_mvp.asr_live_repository import InMemoryAsrLiveSessionRepository
@@ -50,6 +53,25 @@ def test_asr_stream_ws_sessions_are_independent():
         assert p["segment_id"] == "stream_seg_sess_a"
 
 
+def test_asr_stream_reports_invalid_float32_payload_and_preserves_recording(tmp_path):
+    client = TestClient(create_app(data_dir=tmp_path, allow_fake_asr_fallback=True))
+
+    with client.websocket_connect("/live/asr/stream/ws/invalid_float32_session?audio_source=browser_live_mic") as ws:
+        ws.send_bytes(struct.pack("<f", math.nan))
+        error = json.loads(ws.receive_text())
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_text()
+
+    assert error["event_type"] == "provider_error"
+    assert error["error_code"] == "audio_payload_non_finite"
+    assert error["recoverable"] is True
+    assert error["recording_saved"] is True
+    record = client.get("/live/asr/sessions/invalid_float32_session/events").json()
+    assert "audio_payload_non_finite" in record["degradation_reasons"]
+    assert record["audio"]["saved"] is True
+    assert record["audio"]["duration_ms"] == 0
+
+
 def test_asr_readiness_buffer_covers_the_cold_start_timeout_without_unbounded_memory():
     buffered_audio_seconds = asr_stream.ASR_READY_BUFFER_MAX_CHUNKS * 0.3
 
@@ -77,12 +99,14 @@ def test_asr_stream_waits_for_recognizer_ready_before_accepting_audio(monkeypatc
         def recognize_chunk(self, pcm):
             self.recognized = True
             self._seq += 1
-            return [{
-                "event_type": "partial",
-                "segment_id": "ready_gate_segment",
-                "text": "模型已就绪",
-                "confidence": 0.9,
-            }]
+            return [
+                {
+                    "event_type": "partial",
+                    "segment_id": "ready_gate_segment",
+                    "text": "模型已就绪",
+                    "confidence": 0.9,
+                }
+            ]
 
         def finalize(self):
             return []
@@ -297,13 +321,15 @@ def test_asr_stream_persists_audio_when_end_arrives_before_asr_ready(monkeypatch
     session_id = "asr_not_ready_audio_session"
     monkeypatch.setattr(asr_stream, "get_recognizer", lambda sid: recognizer)
 
-    asyncio.run(asr_stream.handle_stream(
-        ws,
-        session_id,
-        asr_live_repo=repo,
-        audio_source="browser_live_mic",
-        audio_asset_data_dir=tmp_path,
-    ))
+    asyncio.run(
+        asr_stream.handle_stream(
+            ws,
+            session_id,
+            asr_live_repo=repo,
+            audio_source="browser_live_mic",
+            audio_asset_data_dir=tmp_path,
+        )
+    )
 
     record = repo.get(session_id)
     audio = record["audio"]
@@ -314,10 +340,7 @@ def test_asr_stream_persists_audio_when_end_arrives_before_asr_ready(monkeypatch
     assert audio_path.is_file()
     assert hashlib.sha256(audio_path.read_bytes()).hexdigest() == audio["sha256"]
     assert "asr_not_ready_at_stop" in record["degradation_reasons"]
-    assert not any(
-        event["event_type"] == "transcript_final"
-        for event in record["events"]
-    )
+    assert not any(event["event_type"] == "transcript_final" for event in record["events"])
     assert recognizer.recognize_calls == 0
     assert recognizer.abort_calls == 1
     assert ws.closed is True
@@ -377,13 +400,15 @@ def test_asr_stream_persists_audio_when_asr_readiness_times_out(monkeypatch, tmp
     session_id = "asr_ready_timeout_audio_session"
     monkeypatch.setattr(asr_stream, "get_recognizer", lambda sid: recognizer)
 
-    asyncio.run(asr_stream.handle_stream(
-        ws,
-        session_id,
-        asr_live_repo=repo,
-        audio_source="browser_live_mic",
-        audio_asset_data_dir=tmp_path,
-    ))
+    asyncio.run(
+        asr_stream.handle_stream(
+            ws,
+            session_id,
+            asr_live_repo=repo,
+            audio_source="browser_live_mic",
+            audio_asset_data_dir=tmp_path,
+        )
+    )
 
     record = repo.get(session_id)
     audio = record["audio"]
@@ -394,10 +419,7 @@ def test_asr_stream_persists_audio_when_asr_readiness_times_out(monkeypatch, tmp
     assert audio_path.is_file()
     assert hashlib.sha256(audio_path.read_bytes()).hexdigest() == audio["sha256"]
     assert "asr_ready_timeout" in record["degradation_reasons"]
-    assert not any(
-        event["event_type"] == "transcript_final"
-        for event in record["events"]
-    )
+    assert not any(event["event_type"] == "transcript_final" for event in record["events"])
     assert recognizer.abort_calls == 1
     assert ws.sent[-1]["error_code"] == "asr_ready_timeout"
     assert ws.closed is True
@@ -518,25 +540,29 @@ def test_asr_stream_slow_audio_and_final_callbacks_do_not_block_event_loop(monke
         def recognize_chunk(self, pcm):
             time.sleep(0.08)
             self._seq += 1
-            return [{
-                "event_type": "partial",
-                "segment_id": "slow-segment",
-                "text": "实时识别中的一段技术讨论",
-                "start_ms": 0,
-                "end_ms": 300,
-                "confidence": 0.9,
-            }]
+            return [
+                {
+                    "event_type": "partial",
+                    "segment_id": "slow-segment",
+                    "text": "实时识别中的一段技术讨论",
+                    "start_ms": 0,
+                    "end_ms": 300,
+                    "confidence": 0.9,
+                }
+            ]
 
         def finalize(self):
             time.sleep(0.08)
-            return [{
-                "event_type": "final",
-                "segment_id": "slow-segment",
-                "text": "实时识别中的一段技术讨论已经确认。",
-                "start_ms": 0,
-                "end_ms": 300,
-                "confidence": 0.9,
-            }]
+            return [
+                {
+                    "event_type": "final",
+                    "segment_id": "slow-segment",
+                    "text": "实时识别中的一段技术讨论已经确认。",
+                    "start_ms": 0,
+                    "end_ms": 300,
+                    "confidence": 0.9,
+                }
+            ]
 
         def abort(self):
             return None
@@ -606,14 +632,16 @@ def test_asr_stream_reconnect_preserves_audio_and_prior_final_events(monkeypatch
 
         def recognize_chunk(self, pcm):
             self._seq += 1
-            return [{
-                "event_type": "final",
-                "segment_id": f"reconnect_{self.connection_id}",
-                "text": f"第{self.connection_id}段会议内容需要保留。",
-                "start_ms": (self.connection_id - 1) * 300,
-                "end_ms": self.connection_id * 300,
-                "confidence": 0.9,
-            }]
+            return [
+                {
+                    "event_type": "final",
+                    "segment_id": f"reconnect_{self.connection_id}",
+                    "text": f"第{self.connection_id}段会议内容需要保留。",
+                    "start_ms": (self.connection_id - 1) * 300,
+                    "end_ms": self.connection_id * 300,
+                    "confidence": 0.9,
+                }
+            ]
 
         def finalize(self):
             return []
@@ -650,24 +678,28 @@ def test_asr_stream_reconnect_preserves_audio_and_prior_final_events(monkeypatch
     repo = InMemoryAsrLiveSessionRepository()
     sid = "reconnect_audio_session"
 
-    asyncio.run(asr_stream.handle_stream(
-        ReconnectWebSocket(interrupted=True),
-        sid,
-        asr_live_repo=repo,
-        audio_source="browser_live_mic",
-        audio_asset_data_dir=tmp_path,
-    ))
+    asyncio.run(
+        asr_stream.handle_stream(
+            ReconnectWebSocket(interrupted=True),
+            sid,
+            asr_live_repo=repo,
+            audio_source="browser_live_mic",
+            audio_asset_data_dir=tmp_path,
+        )
+    )
     interrupted_record = repo.get(sid)
     assert interrupted_record["audio"]["saved"] is True
     assert "stream_interrupted" in interrupted_record["degradation_reasons"]
 
-    asyncio.run(asr_stream.handle_stream(
-        ReconnectWebSocket(interrupted=False),
-        sid,
-        asr_live_repo=repo,
-        audio_source="browser_live_mic",
-        audio_asset_data_dir=tmp_path,
-    ))
+    asyncio.run(
+        asr_stream.handle_stream(
+            ReconnectWebSocket(interrupted=False),
+            sid,
+            asr_live_repo=repo,
+            audio_source="browser_live_mic",
+            audio_asset_data_dir=tmp_path,
+        )
+    )
     completed_record = repo.get(sid)
     final_texts = [
         (event.get("payload") or {}).get("text")
@@ -682,6 +714,175 @@ def test_asr_stream_reconnect_preserves_audio_and_prior_final_events(monkeypatch
         assert wav_file.getnframes() == 9_600
 
 
+def test_asr_stream_recording_setup_failure_aborts_recognizer(monkeypatch, tmp_path):
+    class SetupRecognizer:
+        provider = "test_realtime_asr"
+        provider_mode = "real"
+        is_mock = False
+        fallback_used = False
+        degradation_reasons = []
+
+        def __init__(self):
+            self.aborted = False
+
+        def recognize_chunk(self, _pcm):
+            return []
+
+        def finalize(self):
+            return []
+
+        def abort(self):
+            self.aborted = True
+
+    class SetupWebSocket:
+        def __init__(self):
+            self.sent = []
+            self.closed = False
+
+        async def accept(self):
+            return None
+
+        async def receive(self):
+            raise AssertionError("setup failure must stop before receiving audio")
+
+        async def send_text(self, payload):
+            self.sent.append(json.loads(payload))
+
+        async def close(self):
+            self.closed = True
+
+    recognizer = SetupRecognizer()
+    websocket = SetupWebSocket()
+    rollback_calls = []
+    monkeypatch.setattr(asr_stream, "get_recognizer", lambda _sid: recognizer)
+
+    asyncio.run(
+        asr_stream.handle_stream(
+            websocket,
+            "recording-setup-failure",
+            audio_asset_data_dir=tmp_path,
+            on_audio_recording_started=lambda _metadata: (_ for _ in ()).throw(
+                RuntimeError("recording lease is already owned")
+            ),
+            on_audio_recording_setup_failed=lambda: rollback_calls.append("rolled_back"),
+        )
+    )
+
+    assert recognizer.aborted is True
+    assert websocket.closed is True
+    assert websocket.sent[-1]["error_code"] == "recording_resume_failed"
+    assert websocket.sent[-1]["recoverable"] is True
+    assert rollback_calls == ["rolled_back"]
+
+
+def test_app_recording_setup_failure_releases_capture_lease(monkeypatch, tmp_path):
+    class FailingWriter:
+        def __init__(self, **_kwargs):
+            raise ValueError("simulated writer replay conflict")
+
+    monkeypatch.setattr(asr_stream, "RealtimeWavAssetWriter", FailingWriter)
+    app = create_app(data_dir=tmp_path, allow_fake_asr_fallback=True)
+    persistence = app.state.v2_persistence
+    session_id = "recording-setup-lease-rollback"
+
+    with TestClient(app) as client:
+        with client.websocket_connect(f"/live/asr/stream/ws/{session_id}?audio_source=browser_live_mic") as websocket:
+            error = json.loads(websocket.receive_text())
+            with pytest.raises(WebSocketDisconnect):
+                websocket.receive_text()
+
+        recording = persistence.get_recording_session(
+            session_id,
+            track="microphone",
+            epoch=0,
+        )
+        resumed = persistence.begin_recording(
+            meeting_id=session_id,
+            track="microphone",
+            epoch=0,
+            source_type="browser_live_mic",
+            sample_rate_hz=16_000,
+            lease_owner="retry-after-setup-failure",
+            lease_ms=30_000,
+            now_ms=recording["updated_at_ms"] + 1,
+        )
+
+    assert error["error_code"] == "recording_resume_failed"
+    assert recording["status"] == "interrupted"
+    assert recording["lease_owner"] is None
+    assert recording["error_class"] == "recording_setup_failed"
+    assert resumed["status"] == "active"
+    assert resumed["capture_generation"] == recording["capture_generation"] + 1
+
+
+def test_asr_stream_claims_recording_before_replaying_existing_chunks(monkeypatch, tmp_path):
+    session_id = "recording-restart-order"
+    previous_writer = asr_stream.RealtimeWavAssetWriter(
+        data_dir=tmp_path,
+        session_id=session_id,
+        source_type="browser_live_mic",
+    )
+    previous_writer.write_float32_pcm(struct.pack("<f", 0.1) * (16_000 * 5))
+
+    class ResumeRecognizer:
+        provider = "test_realtime_asr"
+        provider_mode = "real"
+        is_mock = False
+        fallback_used = False
+        degradation_reasons = []
+        _seq = 0
+
+        def recognize_chunk(self, _pcm):
+            return []
+
+        def finalize(self):
+            return []
+
+        def abort(self):
+            raise AssertionError("successful resume must not abort")
+
+    class ResumeWebSocket:
+        def __init__(self):
+            self.messages = [{"text": "END"}]
+            self.sent = []
+
+        async def accept(self):
+            return None
+
+        async def receive(self):
+            return self.messages.pop(0)
+
+        async def send_text(self, payload):
+            self.sent.append(json.loads(payload))
+
+        async def close(self):
+            return None
+
+    setup_order = []
+
+    def recording_started(_metadata):
+        setup_order.append("lease_claimed")
+
+    def chunk_replayed(_chunk):
+        assert setup_order == ["lease_claimed"]
+        setup_order.append("chunk_replayed")
+
+    monkeypatch.setattr(asr_stream, "get_recognizer", lambda _sid: ResumeRecognizer())
+
+    asyncio.run(
+        asr_stream.handle_stream(
+            ResumeWebSocket(),
+            session_id,
+            audio_source="browser_live_mic",
+            audio_asset_data_dir=tmp_path,
+            on_audio_recording_started=recording_started,
+            on_audio_chunk_committed=chunk_replayed,
+        )
+    )
+
+    assert setup_order[:2] == ["lease_claimed", "chunk_replayed"]
+
+
 def test_asr_stream_ws_recognizer_is_pluggable(monkeypatch):
     from meeting_copilot_web_mvp import asr_stream
 
@@ -690,15 +891,33 @@ def test_asr_stream_ws_recognizer_is_pluggable(monkeypatch):
             self.session_id = session_id
 
         def recognize_chunk(self, pcm):
-            return [{"event_type": "partial", "segment_id": "custom", "text": "custom", "start_ms": 0, "end_ms": 100, "confidence": 0.5}]
+            return [
+                {
+                    "event_type": "partial",
+                    "segment_id": "custom",
+                    "text": "custom",
+                    "start_ms": 0,
+                    "end_ms": 100,
+                    "confidence": 0.5,
+                }
+            ]
 
         def finalize(self):
-            return [{"event_type": "final", "segment_id": "custom", "text": "custom-final", "start_ms": 0, "end_ms": 100, "confidence": 0.9}]
+            return [
+                {
+                    "event_type": "final",
+                    "segment_id": "custom",
+                    "text": "custom-final",
+                    "start_ms": 0,
+                    "end_ms": 100,
+                    "confidence": 0.9,
+                }
+            ]
 
     monkeypatch.setattr(asr_stream, "get_recognizer", lambda sid: CustomRecognizer(sid))
     client = TestClient(create_app(allow_fake_asr_fallback=True))
     with client.websocket_connect("/live/asr/stream/ws/sess_custom") as ws:
-        ws.send_bytes(b"\x00" * 10)
+        ws.send_bytes(b"\x00" * 12)
         p = json.loads(ws.receive_text())
         ws.send_text("END")
         fin = json.loads(ws.receive_text())
@@ -708,7 +927,7 @@ def test_asr_stream_ws_recognizer_is_pluggable(monkeypatch):
 
 def test_asr_stream_sends_no_cost_partial_hint_over_same_websocket():
     source = Path(asr_stream.__file__).read_text(encoding="utf-8")
-    partial_branch = source[source.index("for ev in events:"):]
+    partial_branch = source[source.index("for ev in events:") :]
     partial_branch = partial_branch[: partial_branch.index('elif msg.get("text") == "END"')]
 
     assert "build_partial_hint_event" in source
@@ -717,7 +936,9 @@ def test_asr_stream_sends_no_cost_partial_hint_over_same_websocket():
     assert "for outgoing_event in outgoing_events:" in partial_branch
     assert "await websocket.send_text(json.dumps(outgoing_event" in partial_branch
     assert partial_branch.index("outgoing_events = [ev]") < partial_branch.index("outgoing_events.append(partial_hint)")
-    assert partial_branch.index("outgoing_events.append(partial_hint)") < partial_branch.index("for outgoing_event in outgoing_events:")
+    assert partial_branch.index("outgoing_events.append(partial_hint)") < partial_branch.index(
+        "for outgoing_event in outgoing_events:"
+    )
 
 
 def test_asr_stream_deduplicates_progressive_partial_hint_over_websocket(monkeypatch, tmp_path):
@@ -739,14 +960,16 @@ def test_asr_stream_deduplicates_progressive_partial_hint_over_websocket(monkeyp
                 "如果 P99 延迟超过九百毫秒就要回滚",
                 "如果 P99 延迟超过九百毫秒就要回滚，owner 张三确认",
             ]
-            return [{
-                "event_type": "partial",
-                "segment_id": f"risk_partial_{self._seq:03d}",
-                "text": texts[self._seq - 1],
-                "start_ms": 0,
-                "end_ms": self._seq * 300,
-                "confidence": 0.8,
-            }]
+            return [
+                {
+                    "event_type": "partial",
+                    "segment_id": f"risk_partial_{self._seq:03d}",
+                    "text": texts[self._seq - 1],
+                    "start_ms": 0,
+                    "end_ms": self._seq * 300,
+                    "confidence": 0.8,
+                }
+            ]
 
         def finalize(self):
             return []
@@ -775,9 +998,7 @@ def test_asr_stream_deduplicates_progressive_partial_hint_over_websocket(monkeyp
     events_response = client.get(f"/live/asr/sessions/{sid}/events")
     assert events_response.status_code == 200
     body = events_response.json()
-    persisted_hints = [
-        event for event in body["events"] if event["event_type"] == "partial_hint_event"
-    ]
+    persisted_hints = [event for event in body["events"] if event["event_type"] == "partial_hint_event"]
     assert len(persisted_hints) == 1
 
 
@@ -789,24 +1010,28 @@ def test_asr_stream_recognizer_without_metadata_fails_closed_by_default(monkeypa
 
         def recognize_chunk(self, pcm):
             self._seq += 1
-            return [{
-                "event_type": "partial",
-                "segment_id": "custom",
-                "text": "custom",
-                "start_ms": 0,
-                "end_ms": 100,
-                "confidence": 0.5,
-            }]
+            return [
+                {
+                    "event_type": "partial",
+                    "segment_id": "custom",
+                    "text": "custom",
+                    "start_ms": 0,
+                    "end_ms": 100,
+                    "confidence": 0.5,
+                }
+            ]
 
         def finalize(self):
-            return [{
-                "event_type": "final",
-                "segment_id": "custom",
-                "text": "custom-final",
-                "start_ms": 0,
-                "end_ms": 100,
-                "confidence": 0.9,
-            }]
+            return [
+                {
+                    "event_type": "final",
+                    "segment_id": "custom",
+                    "text": "custom-final",
+                    "start_ms": 0,
+                    "end_ms": 100,
+                    "confidence": 0.9,
+                }
+            ]
 
     monkeypatch.setattr(asr_stream, "get_recognizer", lambda sid: CustomRecognizerWithoutMetadata(sid))
     client = TestClient(create_app(data_dir=tmp_path))
@@ -892,24 +1117,28 @@ def test_asr_stream_empty_real_final_is_persisted_as_degraded_session(monkeypatc
 
         def recognize_chunk(self, pcm):
             self._seq += 1
-            return [{
-                "event_type": "partial",
-                "segment_id": f"stream_seg_{self.session_id}",
-                "text": "",
-                "start_ms": 0,
-                "end_ms": 300,
-                "confidence": 0.7,
-            }]
+            return [
+                {
+                    "event_type": "partial",
+                    "segment_id": f"stream_seg_{self.session_id}",
+                    "text": "",
+                    "start_ms": 0,
+                    "end_ms": 300,
+                    "confidence": 0.7,
+                }
+            ]
 
         def finalize(self):
-            return [{
-                "event_type": "final",
-                "segment_id": f"stream_seg_{self.session_id}",
-                "text": "",
-                "start_ms": 0,
-                "end_ms": self._seq * 300,
-                "confidence": 0.9,
-            }]
+            return [
+                {
+                    "event_type": "final",
+                    "segment_id": f"stream_seg_{self.session_id}",
+                    "text": "",
+                    "start_ms": 0,
+                    "end_ms": self._seq * 300,
+                    "confidence": 0.9,
+                }
+            ]
 
     monkeypatch.setattr(asr_stream, "get_recognizer", lambda sid: EmptyRealRecognizer(sid))
     client = TestClient(create_app(data_dir=tmp_path))
@@ -972,14 +1201,16 @@ def test_asr_stream_persists_non_empty_partial_before_final_with_normalized_text
                 text = ""
             else:
                 text = "P 九九延迟和<unk>看板需要观察"
-            return [{
-                "event_type": "partial",
-                "segment_id": f"delayed_partial_{self.session_id}",
-                "text": text,
-                "start_ms": 0,
-                "end_ms": self._seq * 300,
-                "confidence": 0.82,
-            }]
+            return [
+                {
+                    "event_type": "partial",
+                    "segment_id": f"delayed_partial_{self.session_id}",
+                    "text": text,
+                    "start_ms": 0,
+                    "end_ms": self._seq * 300,
+                    "confidence": 0.82,
+                }
+            ]
 
         def finalize(self):
             return []
@@ -1002,11 +1233,7 @@ def test_asr_stream_persists_non_empty_partial_before_final_with_normalized_text
         events_response = client.get(f"/live/asr/sessions/{sid}/events")
         assert events_response.status_code == 200
         body = events_response.json()
-        partials = [
-            event
-            for event in body["events"]
-            if event["event_type"] == "transcript_partial"
-        ]
+        partials = [event for event in body["events"] if event["event_type"] == "transcript_partial"]
         assert len(partials) == 1
         assert partials[0]["payload"]["text"] == "P 九九延迟和<unk>看板需要观察"
         assert partials[0]["payload"]["normalized_text"] == "P99延迟和<unk>看板需要观察"
@@ -1030,14 +1257,16 @@ def test_asr_stream_promotes_stable_partial_to_candidate_before_final(monkeypatc
 
         def recognize_chunk(self, pcm):
             self._seq += 1
-            return [{
-                "event_type": "partial",
-                "segment_id": f"stable_partial_{self.session_id}",
-                "text": "发布评审 payment-gateway 先灰度百分之五，如果 P99 延迟超过九百毫秒就回滚，张三今天补 SLO 看板。",
-                "start_ms": 0,
-                "end_ms": self._seq * 300,
-                "confidence": 0.88,
-            }]
+            return [
+                {
+                    "event_type": "partial",
+                    "segment_id": f"stable_partial_{self.session_id}",
+                    "text": "发布评审 payment-gateway 先灰度百分之五，如果 P99 延迟超过九百毫秒就回滚，张三今天补 SLO 看板。",
+                    "start_ms": 0,
+                    "end_ms": self._seq * 300,
+                    "confidence": 0.88,
+                }
+            ]
 
         def finalize(self):
             return []
@@ -1057,11 +1286,7 @@ def test_asr_stream_promotes_stable_partial_to_candidate_before_final(monkeypatc
         events_response = client.get(f"/live/asr/sessions/{sid}/events")
         assert events_response.status_code == 200
         body = events_response.json()
-        candidates = [
-            event
-            for event in body["events"]
-            if event["event_type"] == "suggestion_candidate_event"
-        ]
+        candidates = [event for event in body["events"] if event["event_type"] == "suggestion_candidate_event"]
         assert candidates
         assert candidates[0]["payload"]["candidate_origin"] == "local_deterministic_asr_stable_partial_skeleton"
         assert candidates[0]["payload"]["degradation_reasons"] == ["partial_not_final"]
@@ -1085,14 +1310,16 @@ def test_asr_stream_sends_stable_partial_candidate_over_same_websocket(monkeypat
 
         def recognize_chunk(self, pcm):
             self._seq += 1
-            return [{
-                "event_type": "partial",
-                "segment_id": f"stable_partial_{self.session_id}",
-                "text": "发布评审 payment-gateway 先灰度百分之五，如果 P99 延迟超过九百毫秒就回滚，张三今天补 SLO 看板。",
-                "start_ms": 0,
-                "end_ms": self._seq * 300,
-                "confidence": 0.88,
-            }]
+            return [
+                {
+                    "event_type": "partial",
+                    "segment_id": f"stable_partial_{self.session_id}",
+                    "text": "发布评审 payment-gateway 先灰度百分之五，如果 P99 延迟超过九百毫秒就回滚，张三今天补 SLO 看板。",
+                    "start_ms": 0,
+                    "end_ms": self._seq * 300,
+                    "confidence": 0.88,
+                }
+            ]
 
         def finalize(self):
             return []
@@ -1129,9 +1356,7 @@ def test_asr_stream_sends_stable_partial_candidate_over_same_websocket(monkeypat
 
     event_types = [event["event_type"] for event in ws.sent]
     assert event_types[:2] == ["partial", "partial_hint_event"]
-    live_candidates = [
-        event for event in ws.sent if event["event_type"] == "suggestion_candidate_event"
-    ]
+    live_candidates = [event for event in ws.sent if event["event_type"] == "suggestion_candidate_event"]
     assert live_candidates
     assert live_candidates[0]["payload"]["candidate_origin"] == "local_deterministic_asr_stable_partial_skeleton"
     assert live_candidates[0]["payload"]["degradation_reasons"] == ["partial_not_final"]
@@ -1152,14 +1377,16 @@ def test_asr_stream_sends_live_final_candidate_over_same_websocket(monkeypatch):
 
         def recognize_chunk(self, pcm):
             self._seq += 1
-            return [{
-                "event_type": "final",
-                "segment_id": f"live_final_{self.session_id}",
-                "text": "支付网关先灰度百分之五，如果 P99 延迟超过九百毫秒就回滚，张三负责 SLO 看板。",
-                "start_ms": 0,
-                "end_ms": self._seq * 300,
-                "confidence": 0.91,
-            }]
+            return [
+                {
+                    "event_type": "final",
+                    "segment_id": f"live_final_{self.session_id}",
+                    "text": "支付网关先灰度百分之五，如果 P99 延迟超过九百毫秒就回滚，张三负责 SLO 看板。",
+                    "start_ms": 0,
+                    "end_ms": self._seq * 300,
+                    "confidence": 0.91,
+                }
+            ]
 
         def finalize(self):
             return []
@@ -1197,9 +1424,7 @@ def test_asr_stream_sends_live_final_candidate_over_same_websocket(monkeypatch):
 
     event_types = [event["event_type"] for event in ws.sent]
     assert event_types[0] == "final"
-    live_candidates = [
-        event for event in ws.sent if event["event_type"] == "suggestion_candidate_event"
-    ]
+    live_candidates = [event for event in ws.sent if event["event_type"] == "suggestion_candidate_event"]
     assert live_candidates
     assert live_candidates[0]["payload"]["candidate_origin"] == "local_deterministic_asr_skeleton"
 
@@ -1218,14 +1443,16 @@ def test_asr_stream_preserves_external_realtime_correction_during_later_upsert(m
 
         def recognize_chunk(self, pcm):
             self._seq += 1
-            return [{
-                "event_type": "final",
-                "segment_id": f"seg_{self._seq}",
-                "text": f"第{self._seq}段发布评审需要明确回滚负责人和监控阈值。",
-                "start_ms": (self._seq - 1) * 300,
-                "end_ms": self._seq * 300,
-                "confidence": 0.91,
-            }]
+            return [
+                {
+                    "event_type": "final",
+                    "segment_id": f"seg_{self._seq}",
+                    "text": f"第{self._seq}段发布评审需要明确回滚负责人和监控阈值。",
+                    "start_ms": (self._seq - 1) * 300,
+                    "end_ms": self._seq * 300,
+                    "confidence": 0.91,
+                }
+            ]
 
         def finalize(self):
             return []
@@ -1246,29 +1473,32 @@ def test_asr_stream_preserves_external_realtime_correction_during_later_upsert(m
             if self.receive_count == 1:
                 return {"bytes": b"\x00" * 3200}
             if self.receive_count == 2:
-                repo.update(session_id, lambda record: {
-                    **record,
-                    "events": [
-                        *record["events"],
-                        {
-                            "id": "transcript_revision:seg_1:rtc-v1",
-                            "event_type": "transcript_revision",
-                            "at_ms": 300,
-                            "payload": {
-                                "segment_id": "seg_1:rtc-v1",
-                                "revision_of": "seg_1",
-                                "supersedes_segment_id": "seg_1",
-                                "text": "第一段发布评审需要明确回滚负责人和监控阈值。",
-                                "normalized_text": "第一段发布评审需要明确回滚负责人和监控阈值。",
-                                "correction": {"policy_version": "realtime-transcript-correction.v1"},
+                repo.update(
+                    session_id,
+                    lambda record: {
+                        **record,
+                        "events": [
+                            *record["events"],
+                            {
+                                "id": "transcript_revision:seg_1:rtc-v1",
+                                "event_type": "transcript_revision",
+                                "at_ms": 300,
+                                "payload": {
+                                    "segment_id": "seg_1:rtc-v1",
+                                    "revision_of": "seg_1",
+                                    "supersedes_segment_id": "seg_1",
+                                    "text": "第一段发布评审需要明确回滚负责人和监控阈值。",
+                                    "normalized_text": "第一段发布评审需要明确回滚负责人和监控阈值。",
+                                    "correction": {"policy_version": "realtime-transcript-correction.v1"},
+                                },
                             },
+                        ],
+                        "realtime_transcript_correction": {
+                            "policy_version": "realtime-transcript-correction.v1",
+                            "revised_segment_ids": ["seg_1"],
                         },
-                    ],
-                    "realtime_transcript_correction": {
-                        "policy_version": "realtime-transcript-correction.v1",
-                        "revised_segment_ids": ["seg_1"],
                     },
-                })
+                )
                 return {"bytes": b"\x00" * 3200}
             return {"text": "END"}
 
@@ -1315,14 +1545,16 @@ def test_asr_stream_keeps_stable_partial_candidate_after_later_short_partial(mon
                 if self._seq == 1
                 else "看板"
             )
-            return [{
-                "event_type": "partial",
-                "segment_id": f"same_segment_{self.session_id}",
-                "text": text,
-                "start_ms": 0,
-                "end_ms": self._seq * 300,
-                "confidence": 0.88,
-            }]
+            return [
+                {
+                    "event_type": "partial",
+                    "segment_id": f"same_segment_{self.session_id}",
+                    "text": text,
+                    "start_ms": 0,
+                    "end_ms": self._seq * 300,
+                    "confidence": 0.88,
+                }
+            ]
 
         def finalize(self):
             return []
@@ -1348,16 +1580,8 @@ def test_asr_stream_keeps_stable_partial_candidate_after_later_short_partial(mon
             raise AssertionError("did not receive later short partial")
 
         body = client.get(f"/live/asr/sessions/{sid}/events").json()
-        candidates = [
-            event
-            for event in body["events"]
-            if event["event_type"] == "suggestion_candidate_event"
-        ]
-        partials = [
-            event
-            for event in body["events"]
-            if event["event_type"] == "transcript_partial"
-        ]
+        candidates = [event for event in body["events"] if event["event_type"] == "suggestion_candidate_event"]
+        partials = [event for event in body["events"] if event["event_type"] == "transcript_partial"]
         assert candidates
         assert candidates[0]["payload"]["candidate_origin"] == "local_deterministic_asr_stable_partial_skeleton"
         assert any("发布评审" in event["payload"]["normalized_text"] for event in partials)
@@ -1380,14 +1604,16 @@ def test_asr_stream_persists_live_final_before_sending_to_browser(monkeypatch):
 
         def recognize_chunk(self, pcm):
             self._seq += 1
-            return [{
-                "event_type": "final",
-                "segment_id": "live_final_before_send",
-                "text": "接口先灰度 5%，如果错误率超过 0.1% 就回滚，owner 张三今天补 SLO 看板。",
-                "start_ms": 0,
-                "end_ms": 900,
-                "confidence": 0.91,
-            }]
+            return [
+                {
+                    "event_type": "final",
+                    "segment_id": "live_final_before_send",
+                    "text": "接口先灰度 5%，如果错误率超过 0.1% 就回滚，owner 张三今天补 SLO 看板。",
+                    "start_ms": 0,
+                    "end_ms": 900,
+                    "confidence": 0.91,
+                }
+            ]
 
         def finalize(self):
             return []
@@ -1451,14 +1677,16 @@ def test_asr_stream_persists_finalize_final_before_sending_to_browser(monkeypatc
             return []
 
         def finalize(self):
-            return [{
-                "event_type": "final",
-                "segment_id": "finalize_final_before_send",
-                "text": "接口先灰度 5%，如果错误率超过 0.1% 就回滚，owner 张三今天补 SLO 看板。",
-                "start_ms": 0,
-                "end_ms": 900,
-                "confidence": 0.91,
-            }]
+            return [
+                {
+                    "event_type": "final",
+                    "segment_id": "finalize_final_before_send",
+                    "text": "接口先灰度 5%，如果错误率超过 0.1% 就回滚，owner 张三今天补 SLO 看板。",
+                    "start_ms": 0,
+                    "end_ms": 900,
+                    "confidence": 0.91,
+                }
+            ]
 
     class ObservingWebSocket:
         def __init__(self, repo):
@@ -1481,8 +1709,7 @@ def test_asr_stream_persists_finalize_final_before_sending_to_browser(monkeypatc
                     self.final_send_saw_persisted_session = False
                 else:
                     self.final_send_saw_persisted_session = any(
-                        event.get("event_type") == "transcript_final"
-                        for event in record.get("events") or []
+                        event.get("event_type") == "transcript_final" for event in record.get("events") or []
                     )
 
         async def close(self):
@@ -1522,14 +1749,16 @@ def test_asr_stream_persists_eos_after_browser_disconnect_during_finalize_send(m
             return []
 
         def finalize(self):
-            return [{
-                "event_type": "final",
-                "segment_id": "disconnect_finalize_segment",
-                "text": "需要确认回滚负责人。",
-                "start_ms": 0,
-                "end_ms": 900,
-                "confidence": 0.91,
-            }]
+            return [
+                {
+                    "event_type": "final",
+                    "segment_id": "disconnect_finalize_segment",
+                    "text": "需要确认回滚负责人。",
+                    "start_ms": 0,
+                    "end_ms": 900,
+                    "confidence": 0.91,
+                }
+            ]
 
         def abort(self):
             return None
@@ -1564,9 +1793,7 @@ def test_asr_stream_persists_eos_after_browser_disconnect_during_finalize_send(m
     )
 
     record = repo.get("disconnect_finalize_session")
-    evaluation = next(
-        event for event in record["events"] if event["event_type"] == "evaluation_summary"
-    )
+    evaluation = next(event for event in record["events"] if event["event_type"] == "evaluation_summary")
     assert evaluation["payload"]["end_of_stream_event_count"] == 1
     assert "stream_interrupted" not in record["degradation_reasons"]
 
@@ -1585,14 +1812,16 @@ def test_asr_stream_persists_partial_events_drained_during_finalize(monkeypatch,
 
         def recognize_chunk(self, pcm):
             self._seq += 1
-            return [{
-                "event_type": "partial",
-                "segment_id": f"empty_backlog_{self.session_id}",
-                "text": "",
-                "start_ms": 0,
-                "end_ms": self._seq * 300,
-                "confidence": 0.7,
-            }]
+            return [
+                {
+                    "event_type": "partial",
+                    "segment_id": f"empty_backlog_{self.session_id}",
+                    "text": "",
+                    "start_ms": 0,
+                    "end_ms": self._seq * 300,
+                    "confidence": 0.7,
+                }
+            ]
 
         def finalize(self):
             return [
@@ -1633,11 +1862,7 @@ def test_asr_stream_persists_partial_events_drained_during_finalize(monkeypatch,
     events_response = client.get(f"/live/asr/sessions/{sid}/events")
     assert events_response.status_code == 200
     body = events_response.json()
-    partials = [
-        event
-        for event in body["events"]
-        if event["event_type"] == "transcript_partial"
-    ]
+    partials = [event for event in body["events"] if event["event_type"] == "transcript_partial"]
     assert len(partials) == 1
     assert partials[0]["payload"]["normalized_text"] == "P99延迟和<unk>看板"
     assert body["event_source"]["partial_count"] == 1
@@ -1658,24 +1883,28 @@ def test_asr_stream_simulated_realtime_wav_source_is_persisted_without_claiming_
 
         def recognize_chunk(self, pcm):
             self._seq += 1
-            return [{
-                "event_type": "partial",
-                "segment_id": f"stream_seg_{self.session_id}",
-                "text": "先灰度",
-                "start_ms": 0,
-                "end_ms": self._seq * 300,
-                "confidence": 0.7,
-            }]
+            return [
+                {
+                    "event_type": "partial",
+                    "segment_id": f"stream_seg_{self.session_id}",
+                    "text": "先灰度",
+                    "start_ms": 0,
+                    "end_ms": self._seq * 300,
+                    "confidence": 0.7,
+                }
+            ]
 
         def finalize(self):
-            return [{
-                "event_type": "final",
-                "segment_id": f"stream_seg_{self.session_id}",
-                "text": "先灰度 5%。谁负责回滚？",
-                "start_ms": 0,
-                "end_ms": self._seq * 300,
-                "confidence": 0.9,
-            }]
+            return [
+                {
+                    "event_type": "final",
+                    "segment_id": f"stream_seg_{self.session_id}",
+                    "text": "先灰度 5%。谁负责回滚？",
+                    "start_ms": 0,
+                    "end_ms": self._seq * 300,
+                    "confidence": 0.9,
+                }
+            ]
 
     monkeypatch.setattr(asr_stream, "get_recognizer", lambda sid: SimulatedRealtimeRecognizer(sid))
     monkeypatch.setattr(asr_stream, "_correct_transcript", lambda raw, cfg: (raw, {"total_tokens": 0}, False))
@@ -1715,24 +1944,28 @@ def test_asr_stream_browser_live_mic_source_is_acceptance_lane(monkeypatch, tmp_
 
         def recognize_chunk(self, pcm):
             self._seq += 1
-            return [{
-                "event_type": "partial",
-                "segment_id": f"browser_seg_{self.session_id}",
-                "text": "先灰度",
-                "start_ms": 0,
-                "end_ms": self._seq * 300,
-                "confidence": 0.7,
-            }]
+            return [
+                {
+                    "event_type": "partial",
+                    "segment_id": f"browser_seg_{self.session_id}",
+                    "text": "先灰度",
+                    "start_ms": 0,
+                    "end_ms": self._seq * 300,
+                    "confidence": 0.7,
+                }
+            ]
 
         def finalize(self):
-            return [{
-                "event_type": "final",
-                "segment_id": f"browser_seg_{self.session_id}",
-                "text": "先灰度 5%。谁负责回滚？",
-                "start_ms": 0,
-                "end_ms": self._seq * 300,
-                "confidence": 0.9,
-            }]
+            return [
+                {
+                    "event_type": "final",
+                    "segment_id": f"browser_seg_{self.session_id}",
+                    "text": "先灰度 5%。谁负责回滚？",
+                    "start_ms": 0,
+                    "end_ms": self._seq * 300,
+                    "confidence": 0.9,
+                }
+            ]
 
     monkeypatch.setattr(asr_stream, "get_recognizer", lambda sid: BrowserLiveMicRecognizer(sid))
     monkeypatch.setattr(asr_stream, "_correct_transcript", lambda raw, cfg: (raw, {"total_tokens": 0}, False))
@@ -1750,20 +1983,23 @@ def test_asr_stream_browser_live_mic_source_is_acceptance_lane(monkeypatch, tmp_
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:
         events_response = client.get(f"/live/asr/sessions/{sid}/events")
-        if events_response.json().get("audio", {}).get("assembled"):
+        current = events_response.json()
+        evaluation_persisted = any(
+            event.get("event_type") == "evaluation_summary" for event in current.get("events", [])
+        )
+        if current.get("audio", {}).get("assembled") and evaluation_persisted:
             break
         time.sleep(0.01)
     else:
-        raise AssertionError(f"background audio export did not finish: {events_response.json()}")
+        raise AssertionError(
+            f"background audio export or session finalization did not finish: {events_response.json()}"
+        )
     assert events_response.status_code == 200
     body = events_response.json()
     assert body["event_source"]["input_source"] == "browser_live_mic"
     assert body["event_source"]["acceptance_eligible"] is True
     assert "input_source_not_acceptance_lane" not in body["event_source"]["acceptance_blockers"]
-    evaluation = next(
-        event for event in body["events"]
-        if event["event_type"] == "evaluation_summary"
-    )
+    evaluation = next(event for event in body["events"] if event["event_type"] == "evaluation_summary")
     assert evaluation["payload"]["end_of_stream_event_count"] == 1
     audio = body["audio"]
     assert audio["saved"] is True
@@ -1783,10 +2019,7 @@ def test_asr_stream_browser_live_mic_source_is_acceptance_lane(monkeypatch, tmp_
     assert download_response.content == audio_path.read_bytes()
     list_response = client.get("/live/asr/sessions")
     assert list_response.status_code == 200
-    listed = {
-        item["session_id"]: item
-        for item in list_response.json()["sessions"]
-    }
+    listed = {item["session_id"]: item for item in list_response.json()["sessions"]}
     assert listed[sid]["has_audio"] is True
 
     delete_response = client.delete(f"/live/asr/sessions/{sid}")
@@ -1810,24 +2043,28 @@ def test_asr_stream_warns_when_transcript_is_clear_but_not_technical(monkeypatch
 
         def recognize_chunk(self, pcm):
             self._seq += 1
-            return [{
-                "event_type": "partial",
-                "segment_id": f"bad_semantic_{self.session_id}",
-                "text": "今天天气不错",
-                "start_ms": 0,
-                "end_ms": self._seq * 300,
-                "confidence": 0.9,
-            }]
+            return [
+                {
+                    "event_type": "partial",
+                    "segment_id": f"bad_semantic_{self.session_id}",
+                    "text": "今天天气不错",
+                    "start_ms": 0,
+                    "end_ms": self._seq * 300,
+                    "confidence": 0.9,
+                }
+            ]
 
         def finalize(self):
-            return [{
-                "event_type": "final",
-                "segment_id": f"bad_semantic_{self.session_id}",
-                "text": "今天天气不错，我们吃饭聊天，然后大家都很开心，下午去散步。",
-                "start_ms": 0,
-                "end_ms": self._seq * 300,
-                "confidence": 0.9,
-            }]
+            return [
+                {
+                    "event_type": "final",
+                    "segment_id": f"bad_semantic_{self.session_id}",
+                    "text": "今天天气不错，我们吃饭聊天，然后大家都很开心，下午去散步。",
+                    "start_ms": 0,
+                    "end_ms": self._seq * 300,
+                    "confidence": 0.9,
+                }
+            ]
 
     monkeypatch.setattr(asr_stream, "get_recognizer", lambda sid: BadSemanticRecognizer(sid))
     monkeypatch.setattr(asr_stream, "_correct_transcript", lambda raw, cfg: (raw, {"total_tokens": 0}, False))
@@ -1865,24 +2102,28 @@ def test_asr_stream_marks_good_realtime_transcript_semantic_quality_passed(monke
 
         def recognize_chunk(self, pcm):
             self._seq += 1
-            return [{
-                "event_type": "partial",
-                "segment_id": f"good_semantic_{self.session_id}",
-                "text": "接口先灰度",
-                "start_ms": 0,
-                "end_ms": self._seq * 300,
-                "confidence": 0.9,
-            }]
+            return [
+                {
+                    "event_type": "partial",
+                    "segment_id": f"good_semantic_{self.session_id}",
+                    "text": "接口先灰度",
+                    "start_ms": 0,
+                    "end_ms": self._seq * 300,
+                    "confidence": 0.9,
+                }
+            ]
 
         def finalize(self):
-            return [{
-                "event_type": "final",
-                "segment_id": f"good_semantic_{self.session_id}",
-                "text": "接口先灰度 5%，如果错误率超过 0.1% 就回滚，owner 张三今天补 SLO 看板。",
-                "start_ms": 0,
-                "end_ms": self._seq * 300,
-                "confidence": 0.9,
-            }]
+            return [
+                {
+                    "event_type": "final",
+                    "segment_id": f"good_semantic_{self.session_id}",
+                    "text": "接口先灰度 5%，如果错误率超过 0.1% 就回滚，owner 张三今天补 SLO 看板。",
+                    "start_ms": 0,
+                    "end_ms": self._seq * 300,
+                    "confidence": 0.9,
+                }
+            ]
 
     monkeypatch.setattr(asr_stream, "get_recognizer", lambda sid: GoodSemanticRecognizer(sid))
     monkeypatch.setattr(asr_stream, "_correct_transcript", lambda raw, cfg: (raw, {"total_tokens": 0}, False))
@@ -1918,28 +2159,32 @@ def test_asr_stream_end_does_not_call_llm_or_guess_revision_boundaries(monkeypat
 
         def recognize_chunk(self, pcm):
             self._seq += 1
-            return [{
-                "event_type": "partial",
-                "segment_id": f"long_final_{self.session_id}",
-                "text": "接口灰度",
-                "start_ms": 0,
-                "end_ms": self._seq * 300,
-                "confidence": 0.8,
-            }]
+            return [
+                {
+                    "event_type": "partial",
+                    "segment_id": f"long_final_{self.session_id}",
+                    "text": "接口灰度",
+                    "start_ms": 0,
+                    "end_ms": self._seq * 300,
+                    "confidence": 0.8,
+                }
+            ]
 
         def finalize(self):
-            return [{
-                "event_type": "final",
-                "segment_id": f"long_final_{self.session_id}",
-                "text": (
-                    "接口先灰度 5% 如果错误率超过 0.1% 就回滚 "
-                    "Redis 缓存穿透风险需要王五今天处理 "
-                    "Kafka 消费堆积导致 P95 延迟升高 李四补监控看板"
-                ),
-                "start_ms": 0,
-                "end_ms": self._seq * 300,
-                "confidence": 0.92,
-            }]
+            return [
+                {
+                    "event_type": "final",
+                    "segment_id": f"long_final_{self.session_id}",
+                    "text": (
+                        "接口先灰度 5% 如果错误率超过 0.1% 就回滚 "
+                        "Redis 缓存穿透风险需要王五今天处理 "
+                        "Kafka 消费堆积导致 P95 延迟升高 李四补监控看板"
+                    ),
+                    "start_ms": 0,
+                    "end_ms": self._seq * 300,
+                    "confidence": 0.92,
+                }
+            ]
 
     monkeypatch.setattr(asr_stream, "get_recognizer", lambda sid: LongFinalRecognizer(sid))
     monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
@@ -1960,16 +2205,8 @@ def test_asr_stream_end_does_not_call_llm_or_guess_revision_boundaries(monkeypat
     events_response = client.get(f"/live/asr/sessions/{sid}/events")
     assert events_response.status_code == 200
     body = events_response.json()
-    transcript_finals = [
-        event
-        for event in body["events"]
-        if event["event_type"] == "transcript_final"
-    ]
-    transcript_revisions = [
-        event
-        for event in body["events"]
-        if event["event_type"] == "transcript_revision"
-    ]
+    transcript_finals = [event for event in body["events"] if event["event_type"] == "transcript_final"]
+    transcript_revisions = [event for event in body["events"] if event["event_type"] == "transcript_revision"]
     assert len(transcript_finals) == 1
     assert transcript_revisions == []
     assert correction_calls == []
@@ -1992,14 +2229,16 @@ def test_asr_stream_end_preserves_original_final_evidence_without_llm_correction
 
         def recognize_chunk(self, pcm):
             self._seq += 1
-            return [{
-                "event_type": "final",
-                "segment_id": f"raw_release_{self.session_id}",
-                "text": "接口先恢度百分之五，如果 P 九九延迟超过九百毫秒",
-                "start_ms": 0,
-                "end_ms": self._seq * 300,
-                "confidence": 0.82,
-            }]
+            return [
+                {
+                    "event_type": "final",
+                    "segment_id": f"raw_release_{self.session_id}",
+                    "text": "接口先恢度百分之五，如果 P 九九延迟超过九百毫秒",
+                    "start_ms": 0,
+                    "end_ms": self._seq * 300,
+                    "confidence": 0.82,
+                }
+            ]
 
         def finalize(self):
             return []
@@ -2028,8 +2267,7 @@ def test_asr_stream_end_preserves_original_final_evidence_without_llm_correction
     final = next(
         event
         for event in events
-        if event["event_type"] == "transcript_final"
-        and event["payload"]["segment_id"] == original_segment_id
+        if event["event_type"] == "transcript_final" and event["payload"]["segment_id"] == original_segment_id
     )
     assert final["payload"]["evidence_spans"][0]["id"] == original_evidence_id
     assert final["payload"]["evidence_spans"][0]["quote"] == "接口先恢度百分之五，如果 P 九九延迟超过九百毫秒"
@@ -2045,11 +2283,7 @@ def test_asr_stream_end_preserves_original_final_evidence_without_llm_correction
     previews_response = client.get(f"/live/asr/sessions/{sid}/llm-execution-previews")
     assert previews_response.status_code == 200
     previews = previews_response.json()["execution_previews"]
-    original_previews = [
-        preview
-        for preview in previews
-        if original_evidence_id in preview["evidence_span_ids"]
-    ]
+    original_previews = [preview for preview in previews if original_evidence_id in preview["evidence_span_ids"]]
     assert original_previews
     assert original_previews[0]["evidence_spans"][0]["id"] == original_evidence_id
     assert "先灰度" in original_previews[0]["evidence_context"]
@@ -2072,14 +2306,16 @@ def test_asr_stream_promotes_stable_partial_to_realtime_final_after_silence(monk
         def recognize_chunk(self, pcm):
             self._seq += 1
             text = "接口先灰度 5%，谁负责回滚？" if self._seq <= 2 else ""
-            return [{
-                "event_type": "partial",
-                "segment_id": f"stable_partial_{self.session_id}",
-                "text": text,
-                "start_ms": 0,
-                "end_ms": self._seq * 300,
-                "confidence": 0.88,
-            }]
+            return [
+                {
+                    "event_type": "partial",
+                    "segment_id": f"stable_partial_{self.session_id}",
+                    "text": text,
+                    "start_ms": 0,
+                    "end_ms": self._seq * 300,
+                    "confidence": 0.88,
+                }
+            ]
 
         def finalize(self):
             return []
@@ -2093,6 +2329,7 @@ def test_asr_stream_promotes_stable_partial_to_realtime_final_after_silence(monk
     sid = "sess_vad_endpoint_final"
 
     with client.websocket_connect(f"/live/asr/stream/ws/{sid}?audio_source=browser_live_mic") as ws:
+
         def receive_until_event(event_type: str):
             for _ in range(4):
                 event = json.loads(ws.receive_text())
@@ -2111,11 +2348,7 @@ def test_asr_stream_promotes_stable_partial_to_realtime_final_after_silence(monk
         events_response = client.get(f"/live/asr/sessions/{sid}/events")
         assert events_response.status_code == 200
         body = events_response.json()
-        transcript_finals = [
-            event
-            for event in body["events"]
-            if event["event_type"] == "transcript_final"
-        ]
+        transcript_finals = [event for event in body["events"] if event["event_type"] == "transcript_final"]
         assert len(transcript_finals) == 1
         assert transcript_finals[0]["payload"]["text"] == "接口先灰度 5%，谁负责回滚？"
         assert transcript_finals[0]["payload"]["segment_id"].startswith("vad_endpoint_")
@@ -2143,14 +2376,16 @@ def test_asr_stream_promotes_long_continuous_partial_to_realtime_final_before_st
 
         def recognize_chunk(self, pcm):
             self._seq += 1
-            return [{
-                "event_type": "partial",
-                "segment_id": f"continuous_partial_{self.session_id}",
-                "text": "接口先灰度 5%，谁负责回滚？持续讨论中。",
-                "start_ms": 0,
-                "end_ms": self._seq * 300,
-                "confidence": 0.88,
-            }]
+            return [
+                {
+                    "event_type": "partial",
+                    "segment_id": f"continuous_partial_{self.session_id}",
+                    "text": "接口先灰度 5%，谁负责回滚？持续讨论中。",
+                    "start_ms": 0,
+                    "end_ms": self._seq * 300,
+                    "confidence": 0.88,
+                }
+            ]
 
         def finalize(self):
             return []
@@ -2196,15 +2431,17 @@ def test_asr_stream_splits_cumulative_funasr_partials_into_non_repeating_endpoin
         def recognize_chunk(self, pcm):
             self._seq += 1
             text = first if self._seq == 1 else first + second if self._seq == 5 else ""
-            return [{
-                "event_type": "partial",
-                "segment_id": f"{self.session_id}_funasr_sc_001",
-                "source_segment_id": "worker_seg_1",
-                "text": text,
-                "start_ms": 0,
-                "end_ms": self._seq * 300,
-                "confidence": 0.88,
-            }]
+            return [
+                {
+                    "event_type": "partial",
+                    "segment_id": f"{self.session_id}_funasr_sc_001",
+                    "source_segment_id": "worker_seg_1",
+                    "text": text,
+                    "start_ms": 0,
+                    "end_ms": self._seq * 300,
+                    "confidence": 0.88,
+                }
+            ]
 
         def finalize(self):
             return []
@@ -2246,8 +2483,7 @@ def test_asr_stream_splits_cumulative_funasr_partials_into_non_repeating_endpoin
         events_response = client.get(f"/live/asr/sessions/{sid}/events")
         assert events_response.status_code == 200
         transcript_finals = [
-            event for event in events_response.json()["events"]
-            if event["event_type"] == "transcript_final"
+            event for event in events_response.json()["events"] if event["event_type"] == "transcript_final"
         ]
         assert [event["payload"]["text"] for event in transcript_finals] == [first, second]
 
@@ -2282,15 +2518,17 @@ def test_asr_stream_funasr_end_final_keeps_worker_source_segment_id(
             return []
 
         def finalize(self):
-            return [{
-                "event_type": "final",
-                "segment_id": f"{self.session_id}_funasr_sc_009",
-                "source_segment_id": source_segment_id,
-                "text": "最终确认灰度发布。",
-                "start_ms": 0,
-                "end_ms": 300,
-                "confidence": 0.91,
-            }]
+            return [
+                {
+                    "event_type": "final",
+                    "segment_id": f"{self.session_id}_funasr_sc_009",
+                    "source_segment_id": source_segment_id,
+                    "text": "最终确认灰度发布。",
+                    "start_ms": 0,
+                    "end_ms": 300,
+                    "confidence": 0.91,
+                }
+            ]
 
     monkeypatch.setattr(asr_stream, "get_recognizer", lambda sid: FinalOnlyFunasrRecognizer(sid))
     client = TestClient(create_app(data_dir=tmp_path))
@@ -2306,8 +2544,7 @@ def test_asr_stream_funasr_end_final_keeps_worker_source_segment_id(
     events_response = client.get(f"/live/asr/sessions/{sid}/events")
     assert events_response.status_code == 200
     transcript_final = next(
-        event for event in events_response.json()["events"]
-        if event["event_type"] == "transcript_final"
+        event for event in events_response.json()["events"] if event["event_type"] == "transcript_final"
     )
     assert transcript_final["payload"]["source_segment_id"] == f"{sid}_worker_seg_009"
 
@@ -2333,26 +2570,30 @@ def test_funasr_partial_final_and_canonical_share_l3_normalization_snapshot(
 
         def recognize_chunk(self, pcm):
             self._seq += 1
-            return [{
-                "event_type": "partial",
-                "segment_id": f"{self.session_id}_funasr_sc_042",
-                "source_segment_id": "worker_seg_42",
-                "text": raw_text,
-                "start_ms": 0,
-                "end_ms": 300,
-                "confidence": 0.92,
-            }]
+            return [
+                {
+                    "event_type": "partial",
+                    "segment_id": f"{self.session_id}_funasr_sc_042",
+                    "source_segment_id": "worker_seg_42",
+                    "text": raw_text,
+                    "start_ms": 0,
+                    "end_ms": 300,
+                    "confidence": 0.92,
+                }
+            ]
 
         def finalize(self):
-            return [{
-                "event_type": "final",
-                "segment_id": f"{self.session_id}_funasr_sc_042",
-                "source_segment_id": "worker_seg_42",
-                "text": raw_text,
-                "start_ms": 0,
-                "end_ms": 300,
-                "confidence": 0.92,
-            }]
+            return [
+                {
+                    "event_type": "final",
+                    "segment_id": f"{self.session_id}_funasr_sc_042",
+                    "source_segment_id": "worker_seg_42",
+                    "text": raw_text,
+                    "start_ms": 0,
+                    "end_ms": 300,
+                    "confidence": 0.92,
+                }
+            ]
 
     monkeypatch.setattr(
         asr_stream,
@@ -2388,11 +2629,7 @@ def test_funasr_partial_final_and_canonical_share_l3_normalization_snapshot(
     assert final["source_segment_id"] == expected_source_segment_id
 
     record = client.get(f"/live/asr/sessions/{sid}/events").json()
-    transcript_final = next(
-        event
-        for event in record["events"]
-        if event["event_type"] == "transcript_final"
-    )
+    transcript_final = next(event for event in record["events"] if event["event_type"] == "transcript_final")
     assert transcript_final["payload"]["text"] == raw_text
     assert transcript_final["payload"]["normalized_text"] == expected_text
     assert transcript_final["payload"]["source_snapshot_text"] == raw_text
@@ -2434,15 +2671,17 @@ def test_asr_stream_same_session_reconnect_reprojects_from_raw_source(
             self._seq += 1
             if self.connection_number != 1:
                 return []
-            return [{
-                "event_type": "final",
-                "segment_id": "reconnect_l3_seg",
-                "source_segment_id": "worker_l3_42",
-                "text": raw_text,
-                "start_ms": 0,
-                "end_ms": 300,
-                "confidence": 0.92,
-            }]
+            return [
+                {
+                    "event_type": "final",
+                    "segment_id": "reconnect_l3_seg",
+                    "source_segment_id": "worker_l3_42",
+                    "text": raw_text,
+                    "start_ms": 0,
+                    "end_ms": 300,
+                    "confidence": 0.92,
+                }
+            ]
 
         def finalize(self):
             return []
@@ -2481,23 +2720,25 @@ def test_asr_stream_same_session_reconnect_reprojects_from_raw_source(
     repo = InMemoryAsrLiveSessionRepository()
     sid = f"sess_l3_reconnect_{str(first_l3).lower()}_{str(second_l3).lower()}"
 
-    asyncio.run(asr_stream.handle_stream(
-        ReconnectWebSocket(interrupted=True),
-        sid,
-        asr_live_repo=repo,
-        l3_normalize_enabled=first_l3,
-    ))
-    asyncio.run(asr_stream.handle_stream(
-        ReconnectWebSocket(interrupted=False),
-        sid,
-        asr_live_repo=repo,
-        l3_normalize_enabled=second_l3,
-    ))
+    asyncio.run(
+        asr_stream.handle_stream(
+            ReconnectWebSocket(interrupted=True),
+            sid,
+            asr_live_repo=repo,
+            l3_normalize_enabled=first_l3,
+        )
+    )
+    asyncio.run(
+        asr_stream.handle_stream(
+            ReconnectWebSocket(interrupted=False),
+            sid,
+            asr_live_repo=repo,
+            l3_normalize_enabled=second_l3,
+        )
+    )
 
     record = repo.get(sid)
-    transcript_final = next(
-        event for event in record["events"] if event["event_type"] == "transcript_final"
-    )
+    transcript_final = next(event for event in record["events"] if event["event_type"] == "transcript_final")
     expected_projection = asr_stream._normalize_text(raw_text) if second_l3 else raw_text
     assert transcript_final["payload"]["text"] == raw_text
     assert transcript_final["payload"]["normalized_text"] == expected_projection
@@ -2529,14 +2770,16 @@ def test_asr_stream_marks_bounded_cumulative_rerecognition_without_dropping_sour
         def recognize_chunk(self, pcm):
             self._seq += 1
             text = first if self._seq == 1 else rerecognized if self._seq == 5 else ""
-            return [{
-                "event_type": "partial",
-                "segment_id": f"{self.session_id}_funasr_sc_001",
-                "text": text,
-                "start_ms": 0,
-                "end_ms": self._seq * 300,
-                "confidence": 0.88,
-            }]
+            return [
+                {
+                    "event_type": "partial",
+                    "segment_id": f"{self.session_id}_funasr_sc_001",
+                    "text": text,
+                    "start_ms": 0,
+                    "end_ms": self._seq * 300,
+                    "confidence": 0.88,
+                }
+            ]
 
         def finalize(self):
             return []
@@ -2632,9 +2875,7 @@ def test_bounds_legacy_live_projection_without_dropping_the_latest_window():
     ]
     end_of_stream = {"event_type": "end_of_stream", "segment_id": "eos"}
 
-    bounded, dropped = asr_stream._bound_streaming_projection_events(
-        [*finals, *partials, end_of_stream]
-    )
+    bounded, dropped = asr_stream._bound_streaming_projection_events([*finals, *partials, end_of_stream])
 
     retained_finals = [event for event in bounded if event["event_type"] == "final"]
     retained_partials = [event for event in bounded if event["event_type"] == "partial"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-system-audio-adapter-start"
+description = "Enables the system_audio_adapter_start command without any pre-configured scope."
+commands.allow = ["system_audio_adapter_start"]
+
+[[permission]]
+identifier = "deny-system-audio-adapter-start"
+description = "Denies the system_audio_adapter_start command without any pre-configured scope."
+commands.deny = ["system_audio_adapter_start"]

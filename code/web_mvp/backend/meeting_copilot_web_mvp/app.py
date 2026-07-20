@@ -5,6 +5,7 @@ import asyncio
 import hmac
 import json
 import os
+import platform
 import structlog
 import subprocess
 import threading
@@ -12,14 +13,15 @@ import time
 import uuid
 import httpx
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import re
 import sqlite3
 from typing import Any, Literal
-from urllib.parse import urlsplit
+import unicodedata
+from urllib.parse import quote, urlsplit
 
-from fastapi import FastAPI, HTTPException, Request, Response, UploadFile, File, WebSocket
+from fastapi import FastAPI, HTTPException, Request, Response, UploadFile, File, Form, Query, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -30,9 +32,18 @@ from meeting_copilot_web_mvp.logging_config import (
     configure_logging,
     get_logger,
 )
+from meeting_copilot_web_mvp.meeting_preparation import MeetingPreparationStore
 from meeting_copilot_web_mvp import llm_service
 from meeting_copilot_web_mvp import asr_stream
 from meeting_copilot_web_mvp import batch_transcribe
+from meeting_copilot_web_mvp import diagnostic_bundle
+from meeting_copilot_web_mvp import provider_config_runtime
+from meeting_copilot_web_mvp.provider_config_store import ProviderConfigStore
+from meeting_copilot_web_mvp.data_governance import (
+    DataGovernanceService,
+    normalize_deletion_scope,
+)
+from meeting_copilot_web_mvp.docx_export import render_docx
 from meeting_copilot_web_mvp import asr_correct
 from meeting_copilot_web_mvp import auto_suggestion_orchestrator
 from meeting_copilot_web_mvp import audio_assets
@@ -41,11 +52,30 @@ from meeting_copilot_web_mvp import realtime_transcript_correction
 from meeting_copilot_web_mvp.canonical_transcript import project_canonical_transcript
 from meeting_copilot_web_mvp.llm_lane_locks import LaneLockRegistry
 from meeting_copilot_web_mvp.pipeline_trace import PipelineTraceCollector
+from meeting_copilot_web_mvp.realtime_slo import RealtimeSLOStore
+from meeting_copilot_web_mvp.application_schema import (
+    bootstrap_application_schema,
+    safe_schema_migration_report,
+)
 from meeting_copilot_web_mvp.v2_persistence import (
     DEFAULT_EVENT_PAGE_LIMIT,
     MAX_EVENT_PAGE_LIMIT,
+    ReviewDocumentConflict,
+    REVIEW_DOCUMENT_KINDS,
+    SpeakerLabelConflict,
     V2Persistence,
     transcript_evidence_hash,
+)
+from meeting_copilot_web_mvp.review_export import (
+    build_transcript_versions,
+    export_fact_items,
+    export_minutes,
+    export_minutes_markdown,
+    export_transcript,
+    format_meeting_datetime,
+    format_meeting_duration,
+    transcript_display_line,
+    value_text,
 )
 from meeting_copilot_web_mvp.v2_migration import (
     MigrationPreflightError,
@@ -55,6 +85,7 @@ from meeting_copilot_web_mvp.v2_migration import (
 from meeting_copilot_web_mvp.v2_pipeline import DurableJobExecutor
 from meeting_copilot_web_mvp.recording_export import RecordingExportExecutor
 from meeting_copilot_web_mvp.recording_recovery import (
+    reconcile_and_recover_abandoned_recordings,
     reconcile_and_recover_expired_recordings,
 )
 from meeting_copilot_web_mvp.streaming_llm_provider import (
@@ -64,6 +95,12 @@ from meeting_copilot_web_mvp.v2_streaming_suggestions import (
     build_realtime_suggestion_messages,
     generate_streaming_suggestion,
 )
+from meeting_copilot_web_mvp.realtime_intelligence import (
+    RealtimeIntelligenceRequest,
+    build_llm_first_event_context,
+    realtime_intelligence_batch_id,
+    run_realtime_intelligence,
+)
 from meeting_copilot_web_mvp.asr_semantic_quality import (
     BLOCKER as ASR_SEMANTIC_QUALITY_BLOCKER,
     evaluate_semantic_quality,
@@ -72,6 +109,8 @@ from meeting_copilot_web_mvp.transcript_normalizer import normalize as _normaliz
 from meeting_copilot_web_mvp import metrics as _metrics
 from meeting_copilot_web_mvp.storage_governance import (
     UnsafeManagedPathError,
+    ensure_private_directory,
+    harden_managed_storage_permissions,
     preflight_meeting_storage,
 )
 from meeting_copilot_web_mvp.local_api_auth import (
@@ -82,6 +121,10 @@ from meeting_copilot_web_mvp.local_api_auth import (
     health_proof,
     session_cookie_value,
     token_status,
+)
+from meeting_copilot_web_mvp.next006_failpoints import (
+    InjectedStorageWriteError,
+    storage_write_failpoint,
 )
 
 configure_logging()
@@ -106,6 +149,7 @@ async def _cancel_active_capture_tasks(
         await asyncio.gather(*tasks, return_exceptions=True)
     active_capture_tasks.clear()
     return len(tasks)
+
 
 from meeting_copilot_core.session_snapshot import build_markdown_report
 from meeting_copilot_web_mvp.asr_live_events import (
@@ -228,6 +272,343 @@ LLM_EXECUTION_GAP_RULE_PRIORITY = {
     "action.owner.deadline.confirmation": 2,
     "open.question.followup": 3,
 }
+
+FORMAL_REALTIME_AI_EVENT_TYPES = frozenset(
+    {
+        "meeting.topic.updated",
+        "meeting.open_question.updated",
+        "meeting.decision.updated",
+        "meeting.action_item.updated",
+        "meeting.risk.updated",
+        "meeting.intelligence.applied",
+        "suggestion.draft.started",
+        "suggestion.draft.delta",
+        "suggestion.committed",
+        "suggestion.superseded",
+        "suggestion.evidence.remapped",
+    }
+)
+FORMAL_REALTIME_AI_PROJECTION_KEYS = {
+    "meeting.open_question.updated": "question",
+    "meeting.decision.updated": "decision",
+    "meeting.action_item.updated": "action_item",
+    "meeting.risk.updated": "risk",
+}
+
+V2_MEETING_TITLE_MAX_LENGTH = 200
+V2_MEETING_TITLE_FORBIDDEN_PATTERN = re.compile(r"[\x00-\x1f\x7f/\\]")
+V2_EXPORT_FILENAME_UNSAFE_PATTERN = re.compile(r"[\x00-\x1f\x7f<>:\"/\\|?*]+")
+V2_EXPORT_FILENAME_SEPARATOR_PATTERN = re.compile(r"[\s._-]+")
+V2_EXPORT_TIMEZONE = timezone(timedelta(hours=8))
+
+
+def _validated_v2_meeting_title(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("title must be a string")
+    if V2_MEETING_TITLE_FORBIDDEN_PATTERN.search(value):
+        raise ValueError("title contains path-unsafe or control characters")
+    normalized = " ".join(value.split())
+    if not normalized:
+        raise ValueError("title must not be empty")
+    if len(normalized) > V2_MEETING_TITLE_MAX_LENGTH:
+        raise ValueError(f"title must not exceed {V2_MEETING_TITLE_MAX_LENGTH} characters")
+    return normalized
+
+
+def _v2_snapshot_with_meeting_metadata(
+    persistence: V2Persistence,
+    meeting_id: str,
+    *,
+    segment_limit: int = 500,
+) -> dict[str, Any]:
+    snapshot = persistence.get_snapshot(meeting_id, segment_limit=segment_limit)
+    try:
+        meeting = persistence.get_meeting(meeting_id)
+    except KeyError:
+        return snapshot
+    return {
+        **snapshot,
+        "title": meeting["title"],
+        "title_source": meeting["title_source"],
+        "updated_at_ms": meeting["updated_at_ms"],
+    }
+
+
+def _v2_export_filename_component(value: Any) -> str:
+    normalized = unicodedata.normalize("NFKC", str(value or ""))
+    normalized = "".join(
+        "-" if unicodedata.category(character).startswith("C") else character for character in normalized
+    )
+    normalized = V2_EXPORT_FILENAME_UNSAFE_PATTERN.sub("-", normalized)
+    normalized = V2_EXPORT_FILENAME_SEPARATOR_PATTERN.sub("-", normalized).strip("-")
+    return normalized[:96].rstrip("-") or "meeting"
+
+
+def _v2_export_date(meeting: dict[str, Any]) -> str:
+    for field in ("started_at_ms", "created_at_ms"):
+        try:
+            milliseconds = max(0, int(meeting.get(field)))
+            return datetime.fromtimestamp(
+                milliseconds / 1_000,
+                tz=V2_EXPORT_TIMEZONE,
+            ).strftime("%Y-%m-%d")
+        except (OSError, OverflowError, TypeError, ValueError):
+            continue
+    return "1970-01-01"
+
+
+def _v2_export_content_disposition(
+    meeting: dict[str, Any],
+    *,
+    extension: str,
+) -> str:
+    title = _v2_export_filename_component(meeting.get("title"))
+    date = _v2_export_date(meeting)
+    filename = f"{title}-{date}.{extension}"
+    ascii_title = (
+        re.sub(
+            r"[^A-Za-z0-9_-]+",
+            "-",
+            title.encode("ascii", "ignore").decode("ascii"),
+        ).strip("-")
+        or "meeting"
+    )
+    ascii_filename = f"{ascii_title}-{date}.{extension}"
+    return f"attachment; filename=\"{ascii_filename}\"; filename*=UTF-8''{quote(filename, safe='')}"
+
+
+def _v2_export_problem(error: str, message: str, *, retryable: bool) -> dict[str, Any]:
+    return {
+        "error": error,
+        "message": message,
+        "retryable": retryable,
+    }
+
+
+def _v2_validate_export_download_contract(
+    content_disposition: str,
+    *,
+    extension: str,
+    content: str | bytes,
+) -> None:
+    if not isinstance(content, (str, bytes)) or not content:
+        raise ValueError("export content must be non-empty text or bytes")
+    if not isinstance(content_disposition, str) or "\r" in content_disposition or "\n" in content_disposition:
+        raise ValueError("invalid Content-Disposition header")
+    match = re.search(r"filename\*=UTF-8''([^;]+)", content_disposition)
+    if match is None:
+        raise ValueError("Content-Disposition is missing its UTF-8 filename")
+    from urllib.parse import unquote
+
+    filename = unquote(match.group(1))
+    if (
+        not filename
+        or filename.startswith(".")
+        or ".." in filename
+        or "/" in filename
+        or "\\" in filename
+        or V2_EXPORT_FILENAME_UNSAFE_PATTERN.search(filename)
+        or not filename.endswith(f".{extension}")
+    ):
+        raise ValueError("Content-Disposition filename is unsafe")
+
+
+def _v2_export_download_response(
+    content: str | bytes,
+    *,
+    media_type: str,
+    content_disposition: str,
+    extension: str,
+) -> Response:
+    _v2_validate_export_download_contract(
+        content_disposition,
+        extension=extension,
+        content=content,
+    )
+    return Response(
+        content,
+        media_type=media_type,
+        headers={"Content-Disposition": content_disposition},
+    )
+
+
+def _v2_complete_transcript(persistence: V2Persistence, meeting_id: str) -> list[dict[str, Any]]:
+    transcript: list[dict[str, Any]] = []
+    after_seq = 0
+    while True:
+        page = persistence.list_transcript_segments(
+            meeting_id,
+            after_transcript_seq=after_seq,
+            limit=1_000,
+        )
+        transcript.extend(page["segments"])
+        if not page["has_more"]:
+            return transcript
+        next_seq = int(page["next_after_transcript_seq"])
+        if next_seq <= after_seq:
+            raise RuntimeError("meeting export transcript cursor did not advance")
+        after_seq = next_seq
+
+
+def _v2_export_payload(persistence: V2Persistence, meeting_id: str) -> dict[str, Any]:
+    meeting = persistence.get_meeting(meeting_id)
+    snapshot = persistence.get_snapshot(meeting_id, segment_limit=1_000)
+    source_transcript = _v2_complete_transcript(persistence, meeting_id)
+    documents = snapshot.get("documents") or {}
+    suggestions = [
+        {
+            "suggestion_id": item["suggestion_id"],
+            "status": item["status"],
+            "text": item.get("text") or item.get("draft_text"),
+            "feedback": item.get("feedback"),
+            "evidence_segment_id": item.get("evidence_segment_id"),
+            "evidence_transcript_seq": item.get("evidence_transcript_seq"),
+            "committed_at_ms": item.get("committed_at_ms"),
+        }
+        for item in snapshot["suggestions"]
+        if item.get("status") == "committed"
+    ]
+    review_document_revisions = {
+        kind: persistence.list_review_document_revisions(meeting_id, kind, limit=500)
+        for kind in sorted(documents)
+        if kind in REVIEW_DOCUMENT_KINDS
+    }
+    payload = {
+        "schema_version": "meeting_copilot.meeting_export.v1",
+        "exported_at_ms": time.time_ns() // 1_000_000,
+        "meeting": meeting,
+        "transcript": source_transcript,
+        "source_transcript": source_transcript,
+        "current_topic": snapshot["current_topic"],
+        "open_questions": snapshot["open_questions"],
+        "decision_candidates": snapshot["decision_candidates"],
+        "action_items": snapshot["action_items"],
+        "risks": snapshot["risks"],
+        "suggestions": suggestions,
+        "minutes": snapshot["minutes"],
+        "approach_cards": snapshot["approach_cards"],
+        "review_jobs": snapshot["review_jobs"],
+        "documents": documents,
+        "audio": snapshot["audio"],
+        "audit": {
+            "meeting_revision": meeting["revision"],
+            "latest_event_seq": meeting["latest_seq"],
+            "review_document_revisions": review_document_revisions,
+        },
+    }
+    payload["minutes"] = export_minutes(payload)
+    payload["decision_candidates"] = export_fact_items(
+        payload,
+        kind="decisions",
+        key="decisions",
+        fallback=snapshot["decision_candidates"],
+    )
+    payload["action_items"] = export_fact_items(
+        payload,
+        kind="action_items",
+        key="action_items",
+        fallback=snapshot["action_items"],
+    )
+    payload["risks"] = export_fact_items(
+        payload,
+        kind="risks",
+        key="risks",
+        fallback=snapshot["risks"],
+    )
+    payload["transcript"] = export_transcript(payload)
+    payload["transcript_versions"] = build_transcript_versions(payload)
+    return payload
+
+
+def _single_line_export_text(value: Any) -> str:
+    return " ".join(str(value or "").split())
+
+
+def _export_offset(milliseconds: Any) -> str:
+    try:
+        total_seconds = max(0, int(milliseconds or 0) // 1_000)
+    except (TypeError, ValueError):
+        total_seconds = 0
+    hours, remainder = divmod(total_seconds, 3_600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:02d}:{seconds:02d}"
+
+
+def _render_v2_export_markdown(payload: dict[str, Any]) -> str:
+    meeting = dict(payload["meeting"])
+    meeting_id = str(meeting["id"])
+    title = _single_line_export_text(meeting.get("title")) or "会议复盘"
+    lines = [
+        f"# {title}",
+        "",
+        f"- 会议 ID：`{meeting_id}`",
+        f"- 状态：{_single_line_export_text(meeting.get('state')) or 'unknown'}",
+        f"- 会议日期：{format_meeting_datetime(meeting)}",
+        f"- 会议时长：{format_meeting_duration(meeting)}",
+        "",
+        "## 会议复盘",
+        "",
+    ]
+    markdown = export_minutes_markdown(payload).strip()
+    lines.append(markdown or "会议复盘尚未生成。")
+
+    formal_facts = (
+        (
+            "决策候选",
+            export_fact_items(
+                payload, kind="decisions", key="decisions", fallback=payload.get("decision_candidates") or []
+            ),
+        ),
+        (
+            "行动项",
+            export_fact_items(
+                payload, kind="action_items", key="action_items", fallback=payload.get("action_items") or []
+            ),
+        ),
+        ("风险", export_fact_items(payload, kind="risks", key="risks", fallback=payload.get("risks") or [])),
+    )
+    for heading, facts in formal_facts:
+        if not facts:
+            continue
+        lines.extend(["", f"## {heading}", ""])
+        for fact in facts:
+            evidence = fact.get("evidence") or {} if isinstance(fact, dict) else {}
+            evidence_id = _single_line_export_text(
+                evidence.get("segment_id") if isinstance(evidence, dict) else None
+            ) or _single_line_export_text(fact.get("evidence_segment_id") if isinstance(fact, dict) else None)
+            details = (
+                [f"状态：{_single_line_export_text(fact.get('status')) or 'candidate'}"]
+                if isinstance(fact, dict)
+                else ["状态：candidate"]
+            )
+            if isinstance(fact, dict) and fact.get("owner") is not None:
+                details.append(f"负责人：{_single_line_export_text(fact.get('owner'))}")
+            if isinstance(fact, dict) and fact.get("deadline") is not None:
+                details.append(f"截止：{_single_line_export_text(fact.get('deadline'))}")
+            if isinstance(fact, dict) and fact.get("mitigation") is not None:
+                details.append(f"缓解：{_single_line_export_text(fact.get('mitigation'))}")
+            if evidence_id:
+                details.append(f"依据：`{evidence_id}`")
+            lines.append(f"- {value_text(fact, 'text', 'item')}（{'；'.join(details)}）")
+
+    kept = [item for item in payload["suggestions"] if item.get("feedback") == "kept"]
+    if kept:
+        lines.extend(["", "## 保留的会中建议", ""])
+        for item in kept:
+            evidence = _single_line_export_text(item.get("evidence_segment_id"))
+            suffix = f"（依据：`{evidence}`）" if evidence else ""
+            lines.append(f"- {_single_line_export_text(item.get('text'))}{suffix}")
+
+    lines.extend(["", "## 完整会议文字", ""])
+    transcript = export_transcript(payload)
+    if transcript:
+        for segment in transcript:
+            lines.append(f"- {transcript_display_line(segment)}")
+    else:
+        lines.append("暂无会议文字。")
+    return "\n".join(lines).rstrip() + "\n"
+
+
 OPENAI_REQUEST_BODY_SENSITIVE_PATTERN = re.compile(
     r"sk-[A-Za-z0-9_-]{8,}|"
     r"Bearer\s+\S+|"
@@ -283,6 +664,26 @@ class CorrectionBatchDeferred(RuntimeError):
     def __init__(self, retry_after_ms: int) -> None:
         super().__init__("transcript correction batch is waiting for its realtime interval")
         self.retry_after_ms = max(250, int(retry_after_ms))
+
+
+class RealtimeCorrectionProviderError(HTTPException):
+    def __init__(self, *, retryable: bool) -> None:
+        super().__init__(
+            status_code=502,
+            detail=llm_service.provider_error_payload(
+                error_code="realtime_correction_provider_failed",
+                message="Realtime correction provider request failed",
+            ),
+        )
+        self.retryable = bool(retryable)
+
+
+class ProviderRuntimeNotConfiguredDeferred(RuntimeError):
+    preserve_attempt = True
+    retry_after_ms = 10_000
+
+    def __init__(self) -> None:
+        super().__init__("AI provider is waiting for explicit desktop connection")
 
 
 def _commit_v2_transcript_revisions(
@@ -479,11 +880,36 @@ class DesktopProviderConfigRequest(BaseModel):
     base_url: str = Field(min_length=8, max_length=2_048)
     api_key: SecretStr
     model: str = Field(min_length=1, max_length=128)
+    realtime_model: str | None = Field(default=None, min_length=1, max_length=128)
+    api_style: Literal["chat_completions", "responses"] = "chat_completions"
     provider_label: str = Field(
         default="openai_compatible_gateway",
         min_length=1,
         max_length=128,
     )
+
+
+class WebProviderConfigRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    base_url: str = Field(min_length=8, max_length=2_048)
+    api_key: SecretStr | None = None
+    model: str = Field(min_length=1, max_length=128)
+    realtime_model: str | None = Field(default=None, min_length=1, max_length=128)
+    api_style: Literal["chat_completions", "responses"] = "chat_completions"
+    provider_label: str = Field(
+        default="openai_compatible_gateway",
+        min_length=1,
+        max_length=128,
+    )
+
+
+class Next006StorageFailpointRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scope: Literal["sqlite_transaction", "meeting_title_transaction", "audio_chunk"]
+    failure: Literal["enospc", "eio", "erofs"]
+    count: int = Field(default=1, ge=1, le=10)
 
 
 class ShadowReportFeedbackIngestionRequest(BaseModel):
@@ -505,6 +931,7 @@ def create_app(
     data_dir: str | Path | None = None,
     allow_fake_asr_fallback: bool = False,
     prewarm_funasr: bool = False,
+    semantic_projection_mode: str = "legacy",
 ) -> FastAPI:
     configured_workers = max(
         int(os.environ.get("WEB_CONCURRENCY") or 1),
@@ -518,6 +945,24 @@ def create_app(
     if degradation.reason.startswith(("asr_sidecar_crashed:", "asr_sidecar_restart_failed:")):
         degradation.reset()
     app = FastAPI(title="Meeting Copilot Local Web MVP")
+
+    @app.exception_handler(InjectedStorageWriteError)
+    async def next006_storage_write_failure_handler(
+        _request: Request,
+        error: InjectedStorageWriteError,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=507,
+            content={
+                "detail": {
+                    "error": "storage_write_failed",
+                    "failure": error.failure,
+                    "scope": error.scope,
+                    "retryable": True,
+                }
+            },
+        )
+
     local_api_token = os.environ.get(LOCAL_API_TOKEN_ENV, "").strip()
     app.state.local_api_auth = token_status(local_api_token)
     app.add_middleware(
@@ -534,18 +979,35 @@ def create_app(
     if repository is not None and data_dir is not None:
         raise ValueError("repository and data_dir cannot both be provided")
     data_dir_path = Path(data_dir) if data_dir is not None else None
+    meeting_preparation_store: MeetingPreparationStore | None = None
     sqlite_repositories: list[Any] = []
     persistence_coordinator: SqlitePersistenceCoordinator | None = None
     v2_persistence: V2Persistence | None = None
     v2_migration_report: dict[str, Any] | None = None
+    application_schema_migration_report = safe_schema_migration_report(None)
     if repository is not None:
         repo = repository
         asr_live_repo = InMemoryAsrLiveSessionRepository()
     elif data_dir is not None:
-        data_dir_path.mkdir(parents=True, exist_ok=True)
+        data_dir_path = ensure_private_directory(data_dir_path)
+        harden_managed_storage_permissions(data_dir_path)
         db_path = data_dir_path / "meeting_copilot.db"
         if db_path.is_dir():
-            raise RuntimeError(f"SQLite migration failed: database path is a directory: {db_path}")
+            raise RuntimeError(
+                "Application SQLite schema bootstrap failed: database_path_is_directory"
+            )
+        try:
+            schema_result = bootstrap_application_schema(db_path)
+        except Exception as exc:
+            error_class = type(exc).__name__
+            _log.error(
+                "meeting.application_schema.bootstrap_failed",
+                error_class=error_class,
+            )
+            raise RuntimeError(
+                f"Application SQLite schema bootstrap failed: {error_class}"
+            ) from None
+        application_schema_migration_report = safe_schema_migration_report(schema_result)
         try:
             migrate_json_to_sqlite(data_dir, str(db_path))
         except Exception as exc:
@@ -561,10 +1023,14 @@ def create_app(
                 "meeting.v2.shadow_migration_failed",
                 error_class=type(exc).__name__,
             )
+        meeting_preparation_store = MeetingPreparationStore(data_dir_path / "meeting_preparation")
         repo = SqliteSessionRepository(data_dir_path)
         asr_live_repo = SqliteAsrLiveSessionRepository(data_dir_path)
         persistence_coordinator = SqlitePersistenceCoordinator(data_dir_path)
-        v2_persistence = V2Persistence(db_path)
+        v2_persistence = V2Persistence(
+            db_path,
+            semantic_projection_mode=semantic_projection_mode,
+        )
         sqlite_repositories.extend([repo, asr_live_repo, persistence_coordinator, v2_persistence])
     else:
         repo = InMemorySessionRepository()
@@ -575,6 +1041,36 @@ def create_app(
         sqlite_repositories.append(settings_usage_repo)
     else:
         settings_usage_repo = InMemorySettingsUsageRepository(default_settings)
+    web_provider_config_store = (
+        ProviderConfigStore(data_dir_path)
+        if data_dir_path is not None and os.environ.get("MEETING_COPILOT_DESKTOP_RUNTIME") != "1"
+        else None
+    )
+    web_provider_config_error: str | None = None
+    if web_provider_config_store is not None:
+        try:
+            stored_provider = web_provider_config_store.load()
+            if stored_provider is not None:
+                llm_service.configure_runtime(
+                    base_url=str(stored_provider["base_url"]),
+                    api_key=str(stored_provider["api_key"]),
+                    model=str(stored_provider["model"]),
+                    realtime_model=(
+                        str(stored_provider["realtime_model"])
+                        if stored_provider.get("realtime_model")
+                        else None
+                    ),
+                    provider_label=str(
+                        stored_provider.get("provider_label") or "openai_compatible_gateway"
+                    ),
+                    api_style=str(stored_provider.get("api_style") or "chat_completions"),
+                )
+        except (OSError, TypeError, ValueError) as exc:
+            web_provider_config_error = "本地 AI 配置无效，请重新保存"
+            _log.warning(
+                "provider.web_config.load_failed",
+                error_type=type(exc).__name__,
+            )
     app.state.asr_live_repository = asr_live_repo
     app.state.session_repository = repo
     app.state.settings_usage_repository = settings_usage_repo
@@ -582,8 +1078,362 @@ def create_app(
     app.state.persistence_coordinator = persistence_coordinator
     app.state.v2_persistence = v2_persistence
     app.state.v2_migration_report = v2_migration_report
-    pipeline_traces = PipelineTraceCollector()
+    app.state.application_schema_migration_report = application_schema_migration_report
+    app.state.meeting_preparation_store = meeting_preparation_store
+    app.state.web_provider_config_store = web_provider_config_store
+    app.state.web_provider_config_error = web_provider_config_error
+    app.state.llm_first_event_contexts = {}
+
+    def _valid_llm_first_event_context(value: Any) -> dict[str, Any] | None:
+        if not isinstance(value, dict):
+            return None
+        required_text_fields = ("job_id", "batch_id", "provider", "model")
+        if value.get("source") != "llm_first" or value.get("llm_called") is not True:
+            return None
+        if any(not str(value.get(field) or "").strip() for field in required_text_fields):
+            return None
+        evidence = value.get("evidence")
+        if not isinstance(evidence, dict) or not isinstance(evidence.get("segment_ids"), list):
+            return None
+        if not any(str(item).strip() for item in evidence["segment_ids"]):
+            return None
+        return dict(value)
+
+    def _llm_first_event_context_for_job(job_id: str) -> dict[str, Any] | None:
+        normalized_job_id = str(job_id or "").strip()
+        if not normalized_job_id:
+            return None
+        cached = _valid_llm_first_event_context(
+            app.state.llm_first_event_contexts.get(normalized_job_id)
+        )
+        if cached is not None:
+            return cached
+        if v2_persistence is None:
+            return None
+        try:
+            job = v2_persistence.get_job(normalized_job_id)
+        except KeyError:
+            return None
+        output = job.get("output") if isinstance(job, dict) else None
+        context = _valid_llm_first_event_context(
+            output.get("formal_event_context") if isinstance(output, dict) else None
+        )
+        if context is not None:
+            app.state.llm_first_event_contexts[normalized_job_id] = context
+        return context
+
+    def _evidence_from_value(value: Any, fallback: dict[str, Any]) -> dict[str, Any]:
+        source = value if isinstance(value, dict) else {}
+        raw_ids = source.get("segment_ids") or source.get("evidence_segment_ids") or []
+        segment_ids = [str(item).strip() for item in raw_ids if str(item).strip()]
+        if not segment_ids:
+            segment_ids = [str(item).strip() for item in fallback.get("segment_ids") or [] if str(item).strip()]
+        evidence = {
+            "segment_ids": segment_ids,
+            "quote": str(source.get("quote") or fallback.get("quote") or "").strip(),
+        }
+        for key in ("evidence_hash", "state_revision"):
+            if source.get(key) is not None:
+                evidence[key] = source[key]
+            elif fallback.get(key) is not None:
+                evidence[key] = fallback[key]
+        return evidence
+
+    def _formal_event_evidence(event: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        fallback = dict(context.get("evidence") or {})
+        event_type = str(event.get("type") or "")
+        if event_type == "meeting.topic.updated":
+            return _evidence_from_value(context.get("topic_evidence"), fallback)
+        if event_type == "meeting.intelligence.applied":
+            follow_up = payload.get("follow_up")
+            return _evidence_from_value(
+                context.get("follow_up_evidence") if isinstance(follow_up, dict) else None,
+                fallback,
+            )
+        entity = payload.get("entity")
+        if isinstance(entity, dict):
+            entity_evidence = entity.get("evidence") if isinstance(entity.get("evidence"), dict) else {}
+            return _evidence_from_value(
+                {
+                    "segment_ids": entity.get("evidence_segment_ids") or entity_evidence.get("segment_ids"),
+                    "quote": payload.get("evidence_quote") or entity_evidence.get("quote"),
+                },
+                fallback,
+            )
+        return _evidence_from_value(
+            {
+                "segment_ids": payload.get("evidence_segment_ids") or (
+                    [payload.get("evidence_segment_id")] if payload.get("evidence_segment_id") else []
+                ),
+                "quote": payload.get("evidence_quote"),
+            },
+            fallback,
+        )
+
+    def _decorate_v2_formal_event(event: dict[str, Any]) -> dict[str, Any]:
+        event_type = str(event.get("type") or "")
+        if event_type not in FORMAL_REALTIME_AI_EVENT_TYPES:
+            return event
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        if payload.get("source") != "llm_first":
+            return event
+        job_id = str(payload.get("job_id") or event.get("causation_id") or "").strip()
+        context = _llm_first_event_context_for_job(job_id)
+        if context is None:
+            return event
+        enriched_payload = {
+            **payload,
+            "source": "llm_first",
+            "job_id": context["job_id"],
+            "batch_id": context["batch_id"],
+            "provider": context["provider"],
+            "model": context["model"],
+            "llm_called": True,
+            "llm_call_status": "called",
+            "evidence": _formal_event_evidence(event, context),
+        }
+        projection_key = FORMAL_REALTIME_AI_PROJECTION_KEYS.get(event_type)
+        if projection_key and isinstance(payload.get("entity"), dict):
+            enriched_payload[projection_key] = payload["entity"]
+        return {**event, "payload": enriched_payload}
+
+    def _all_v2_formal_events(meeting_id: str) -> list[dict[str, Any]]:
+        if v2_persistence is None:
+            return []
+        cursor = 0
+        formal_events: list[dict[str, Any]] = []
+        while True:
+            page = v2_persistence.list_event_page(
+                meeting_id,
+                after_seq=cursor,
+                limit=MAX_EVENT_PAGE_LIMIT,
+            )
+            decorated = [_decorate_v2_formal_event(event) for event in page["events"]]
+            formal_events.extend(
+                event
+                for event in decorated
+                if event.get("type") in FORMAL_REALTIME_AI_EVENT_TYPES
+                and (event.get("payload") or {}).get("llm_called") is True
+                and (event.get("payload") or {}).get("source") == "llm_first"
+            )
+            if not page["has_more"]:
+                break
+            next_cursor = int(page["next_after_seq"])
+            if next_cursor <= cursor:
+                break
+            cursor = next_cursor
+        return formal_events
+
+    def _decorate_v2_snapshot(snapshot: dict[str, Any], meeting_id: str) -> dict[str, Any]:
+        if v2_persistence is None or v2_persistence.semantic_projection_mode != "llm_first":
+            return snapshot
+        formal_events = _all_v2_formal_events(meeting_id)
+        by_projection: dict[tuple[str, str], dict[str, Any]] = {}
+        intelligence_events: list[dict[str, Any]] = []
+        for event in formal_events:
+            event_type = str(event.get("type") or "")
+            if event_type == "meeting.intelligence.applied":
+                intelligence_events.append(event)
+            by_projection[(event_type, str(event.get("aggregate_id") or ""))] = event
+
+        def project_item(item: Any, event_type: str) -> dict[str, Any] | None:
+            if not isinstance(item, dict):
+                return None
+            item_id = str(item.get("id") or "")
+            event = by_projection.get((event_type, item_id))
+            if event is None:
+                return None
+            payload = dict(event.get("payload") or {})
+            return {
+                **item,
+                "source": payload.get("source"),
+                "job_id": payload.get("job_id"),
+                "batch_id": payload.get("batch_id"),
+                "provider": payload.get("provider"),
+                "model": payload.get("model"),
+                "llm_called": payload.get("llm_called"),
+                "formal_evidence": payload.get("evidence"),
+            }
+
+        current_topic = snapshot.get("current_topic")
+        topic_event = by_projection.get(("meeting.topic.updated", "current-topic"))
+        if topic_event is None:
+            current_topic = None
+        elif isinstance(current_topic, dict):
+            topic_payload = dict(topic_event.get("payload") or {})
+            current_topic = {
+                **current_topic,
+                "source": topic_payload.get("source"),
+                "job_id": topic_payload.get("job_id"),
+                "batch_id": topic_payload.get("batch_id"),
+                "provider": topic_payload.get("provider"),
+                "model": topic_payload.get("model"),
+                "llm_called": topic_payload.get("llm_called"),
+                "formal_evidence": topic_payload.get("evidence"),
+            }
+        projected = {
+            **snapshot,
+            "suggestions": [],
+            "current_topic": current_topic,
+            "open_questions": [
+                item for item in (
+                    project_item(value, "meeting.open_question.updated")
+                    for value in snapshot.get("open_questions") or []
+                ) if item is not None
+            ],
+            "decision_candidates": [
+                item for item in (
+                    project_item(value, "meeting.decision.updated")
+                    for value in snapshot.get("decision_candidates") or []
+                ) if item is not None
+            ],
+            "action_items": [
+                item for item in (
+                    project_item(value, "meeting.action_item.updated")
+                    for value in snapshot.get("action_items") or []
+                ) if item is not None
+            ],
+            "risks": [
+                item for item in (
+                    project_item(value, "meeting.risk.updated")
+                    for value in snapshot.get("risks") or []
+                ) if item is not None
+            ],
+            "follow_up": snapshot.get("follow_up") if intelligence_events else None,
+        }
+        if projected["follow_up"] is not None and intelligence_events:
+            latest_payload = dict(intelligence_events[-1].get("payload") or {})
+            projected["follow_up"] = {
+                **dict(projected["follow_up"]),
+                "source": latest_payload.get("source"),
+                "job_id": latest_payload.get("job_id"),
+                "batch_id": latest_payload.get("batch_id"),
+                "provider": latest_payload.get("provider"),
+                "model": latest_payload.get("model"),
+                "llm_called": latest_payload.get("llm_called"),
+                "formal_evidence": latest_payload.get("evidence"),
+            }
+
+        intelligence_jobs = [
+            job for job in v2_persistence.list_jobs(meeting_id=meeting_id)
+            if job.get("kind") == "intelligence"
+        ]
+        active_jobs = [job for job in intelligence_jobs if job.get("status") in {"pending", "running", "retry_wait"}]
+        deferred = next(
+            (job for job in reversed(active_jobs) if job.get("error_class") == "ProviderRuntimeNotConfiguredDeferred"),
+            None,
+        )
+        failed = next((job for job in reversed(intelligence_jobs) if job.get("status") == "failed"), None)
+        runtime = dict(projected.get("runtime") or {})
+        if deferred is not None:
+            runtime["ai"] = {
+                "state": "paused",
+                "label": "AI 已暂停",
+                "level": None,
+                "detail": "LLM Provider 不可用，实时理解已暂停",
+                "error_class": "ProviderRuntimeNotConfiguredDeferred",
+            }
+        elif failed is not None:
+            runtime["ai"] = {
+                "state": "error",
+                "label": "AI 处理失败",
+                "level": None,
+                "detail": "实时理解未生成正式结果",
+                "error_class": failed.get("error_class"),
+            }
+        elif active_jobs:
+            runtime["ai"] = {"state": "busy", "label": "AI 正在处理", "level": None, "detail": None}
+        projected["runtime"] = runtime
+        diagnostics = dict(projected.get("diagnostics") or {})
+        diagnostics["formal_ai_projection"] = "llm_first_only"
+        projected["diagnostics"] = diagnostics
+        return projected
+
+    def _purge_legacy_meeting_projection(meeting_id: str, deletion_scope: str) -> None:
+        """Keep compatibility repositories inside the same privacy boundary as V2."""
+
+        if v2_persistence is not None and deletion_scope in {"derived", "transcript", "all"}:
+            for job in v2_persistence.list_jobs(meeting_id=meeting_id):
+                if str(job.get("status") or "") not in {
+                    "pending",
+                    "running",
+                    "retry_wait",
+                }:
+                    continue
+                try:
+                    pipeline_traces.record_cancelled(str(job["id"]))
+                except KeyError:
+                    pass
+        if deletion_scope == "all":
+            try:
+                asr_live_repo.delete(meeting_id)
+            except KeyError:
+                pass
+            try:
+                repo.delete(meeting_id)
+            except KeyError:
+                pass
+        else:
+
+            def scrub(existing: dict[str, Any]) -> dict[str, Any]:
+                scrubbed = dict(existing)
+                if deletion_scope in {"derived", "transcript"}:
+                    for key in (
+                        "approach_cards",
+                        "auto_suggestion",
+                        "llm_execution_runs",
+                        "minutes",
+                        "realtime_intelligence",
+                        "realtime_transcript_correction",
+                        "suggestion_cards",
+                    ):
+                        scrubbed.pop(key, None)
+                    if deletion_scope == "derived":
+                        scrubbed["events"] = [
+                            event
+                            for event in list(scrubbed.get("events") or [])
+                            if str(event.get("event_type") or "")
+                            not in {
+                                "suggestion_card",
+                                "transcript_revision",
+                            }
+                        ]
+                if deletion_scope == "transcript":
+                    scrubbed["events"] = []
+                    for key in ("asr_semantic_quality", "post_meeting_asr_profile"):
+                        scrubbed.pop(key, None)
+                if deletion_scope == "recording":
+                    scrubbed.pop("audio", None)
+                return scrubbed
+
+            try:
+                asr_live_repo.update(meeting_id, scrub)
+            except KeyError:
+                pass
+        if deletion_scope in {"recording", "all"}:
+            asr_stream.clear_session_hotwords(meeting_id)
+
+    data_governance_service = (
+        DataGovernanceService(
+            persistence=v2_persistence,
+            data_dir=data_dir_path,
+            meeting_preparation_store=meeting_preparation_store,
+            pre_purge=_purge_legacy_meeting_projection,
+        )
+        if v2_persistence is not None and data_dir_path is not None
+        else None
+    )
+    app.state.data_governance = data_governance_service
+    realtime_slo = RealtimeSLOStore(
+        state_path=(data_dir_path / "diagnostics" / "realtime-ai-slo.json" if data_dir_path is not None else None)
+    )
+    pipeline_traces = PipelineTraceCollector(
+        max_traces=2_048,
+        on_evict=realtime_slo.observe,
+    )
     app.state.pipeline_traces = pipeline_traces
+    app.state.realtime_slo = realtime_slo
     audio_active_marks: dict[str, int] = {}
     app.state.audio_active_marks = audio_active_marks
     recording_capture_lease_ms = 30_000
@@ -591,6 +1441,9 @@ def create_app(
     recording_asset_locks_guard = threading.Lock()
     active_v2_capture_tasks: dict[str, set[asyncio.Task[Any]]] = {}
     app.state.active_v2_capture_tasks = active_v2_capture_tasks
+    recording_import_wake_event = asyncio.Event()
+    recording_import_stop_event = asyncio.Event()
+    app.state.recording_import_worker_task = None
     app.state.desktop_parent_watchdog_task = None
 
     def _recording_asset_lock(meeting_id: str) -> threading.Lock:
@@ -619,6 +1472,16 @@ def create_app(
                 {"relative_path": f"audio_assets/{meeting_id}/audio.wav"},
             )
 
+    async def _cancel_meeting_capture_tasks(meeting_id: str) -> int:
+        capture_tasks = tuple(active_v2_capture_tasks.get(meeting_id, ()))
+        current_task = asyncio.current_task()
+        capture_tasks = tuple(task for task in capture_tasks if task is not current_task)
+        for capture_task in capture_tasks:
+            capture_task.cancel()
+        if capture_tasks:
+            await asyncio.gather(*capture_tasks, return_exceptions=True)
+        return len(capture_tasks)
+
     async def _begin_deletion_fence(meeting_id: str) -> dict[str, Any] | None:
         deletion_job = (
             v2_persistence.create_deletion_job(
@@ -629,13 +1492,7 @@ def create_app(
             if v2_persistence is not None
             else None
         )
-        capture_tasks = tuple(active_v2_capture_tasks.get(meeting_id, ()))
-        current_task = asyncio.current_task()
-        capture_tasks = tuple(task for task in capture_tasks if task is not current_task)
-        for capture_task in capture_tasks:
-            capture_task.cancel()
-        if capture_tasks:
-            await asyncio.gather(*capture_tasks, return_exceptions=True)
+        await _cancel_meeting_capture_tasks(meeting_id)
         return deletion_job
 
     async def _complete_deletion_facts(
@@ -661,13 +1518,52 @@ def create_app(
 
         return await asyncio.to_thread(complete)
 
+    def _transcript_source_track(audio_source: Any) -> str | None:
+        normalized = str(audio_source or "").strip().lower()
+        if normalized in {
+            "microphone",
+            "browser_live_mic",
+            "tauri_native_mic",
+            "native_microphone_streaming",
+        }:
+            return "microphone"
+        if normalized in {"system_audio", "tauri_system_audio", "macos_system_audio"}:
+            return "system_audio"
+        if normalized in {"uploaded_file", "imported_file"}:
+            return "uploaded_file"
+        return None
+
+    def _uses_source_segment_namespace(audio_source: Any) -> bool:
+        return str(audio_source or "").strip().lower() in {
+            "tauri_native_mic",
+            "native_microphone_streaming",
+            "tauri_system_audio",
+            "macos_system_audio",
+        }
+
     def _commit_v2_final(session_id: str, event: dict[str, Any]) -> dict[str, Any] | None:
         if v2_persistence is None:
             return None
-        segment_id = str(event.get("segment_id") or "").strip()
+        raw_segment_id = str(event.get("segment_id") or "").strip()
         text = str(event.get("text") or "").strip()
-        if not segment_id or not text:
+        if not raw_segment_id or not text:
             raise ValueError("V2 final commit requires segment_id and text")
+        source_track = _transcript_source_track(
+            event.get("source_track") or event.get("audio_source") or event.get("input_source")
+        )
+        use_source_namespace = bool(
+            event.get(
+                "use_source_segment_namespace",
+                source_track in {"microphone", "system_audio"},
+            )
+        )
+        segment_id = (
+            f"{source_track}:{raw_segment_id}"
+            if use_source_namespace
+            and source_track in {"microphone", "system_audio"}
+            and not raw_segment_id.startswith(f"{source_track}:")
+            else raw_segment_id
+        )
         normalized_text = str(event.get("normalized_text") or text).strip()
         evidence_hash = transcript_evidence_hash(segment_id, normalized_text)
         committed = v2_persistence.commit_final_and_enqueue(
@@ -680,7 +1576,10 @@ def create_app(
             ended_at_ms=int(event.get("end_ms") or event.get("received_at_ms") or 0),
             evidence_hash=evidence_hash,
             now_ms=time.time_ns() // 1_000_000,
+            speaker_id=(str(event["speaker_id"]) if event.get("speaker_id") is not None else None),
+            speaker_confidence=event.get("speaker_confidence"),
             correlation_id=session_id,
+            source_track=source_track,
         )
         _log.info(
             "meeting.v2.final_committed",
@@ -697,7 +1596,7 @@ def create_app(
                 )
                 audio_active_ns = audio_active_marks.get(session_id)
                 if audio_active_ns is not None:
-                    pipeline_traces.record(
+                    pipeline_traces.observe(
                         job_id,
                         "audio_active",
                         meeting_id=session_id,
@@ -705,7 +1604,7 @@ def create_app(
                         generation_id=generation_id,
                         monotonic_ns=audio_active_ns,
                     )
-                pipeline_traces.record(
+                pipeline_traces.observe(
                     job_id,
                     "final_committed",
                     meeting_id=session_id,
@@ -714,7 +1613,7 @@ def create_app(
                     monotonic_ns=trace_at_ns,
                     attributes={"segment_id": segment_id},
                 )
-                pipeline_traces.record(
+                pipeline_traces.observe(
                     job_id,
                     "job_queued",
                     meeting_id=session_id,
@@ -730,6 +1629,383 @@ def create_app(
 
     app.state.commit_v2_final = _commit_v2_final
 
+    import_runtime_methods = (
+        "create_import_job",
+        "get_import_job",
+        "list_import_jobs",
+        "claim_import_job",
+        "update_import_job_stage",
+        "complete_import_job",
+        "fail_import_job",
+        "recover_interrupted_import_jobs",
+    )
+    import_worker_id = f"recording-import-{uuid.uuid4().hex}"
+    import_lease_ms = 30_000
+    import_heartbeat_seconds = 5.0
+
+    class _ImportLeaseLost(RuntimeError):
+        pass
+
+    class _FileAsrComponentMissing(RuntimeError):
+        pass
+
+    def _recording_import_runtime_ready() -> bool:
+        return v2_persistence is not None and all(
+            callable(getattr(v2_persistence, method, None)) for method in import_runtime_methods
+        )
+
+    async def _update_recording_import_stage(
+        *,
+        job_id: str,
+        stage: str,
+        progress: int,
+    ) -> dict[str, Any]:
+        if v2_persistence is None:
+            raise _ImportLeaseLost("recording import persistence is unavailable")
+        updated = await asyncio.to_thread(
+            v2_persistence.update_import_job_stage,
+            job_id=job_id,
+            worker_id=import_worker_id,
+            stage=stage,
+            progress=progress,
+            now_ms=time.time_ns() // 1_000_000,
+            lease_ms=import_lease_ms,
+        )
+        if updated is None:
+            raise _ImportLeaseLost(f"recording import lease was lost: {job_id}")
+        return updated
+
+    async def _run_import_blocking_stage(
+        *,
+        job_id: str,
+        stage: str,
+        progress: int,
+        function: Any,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        await _update_recording_import_stage(
+            job_id=job_id,
+            stage=stage,
+            progress=progress,
+        )
+        operation = asyncio.create_task(
+            asyncio.to_thread(function, *args, **dict(kwargs or {})),
+            name=f"recording-import-{stage}-{job_id}",
+        )
+        try:
+            while True:
+                done, _ = await asyncio.wait(
+                    (operation,),
+                    timeout=import_heartbeat_seconds,
+                )
+                if operation in done:
+                    return operation.result()
+                await _update_recording_import_stage(
+                    job_id=job_id,
+                    stage=stage,
+                    progress=progress,
+                )
+        except asyncio.CancelledError:
+            operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
+            raise
+
+    def _upsert_import_asr_live_record(
+        *,
+        meeting_id: str,
+        normalized_text: str,
+        asr_report: dict[str, Any],
+        audio_asset: dict[str, Any],
+    ) -> None:
+        streaming_events = (
+            [
+                {
+                    "event_type": "final",
+                    "segment_id": "import_seg_0001",
+                    "text": normalized_text,
+                    "start_ms": 0,
+                    "end_ms": int(audio_asset.get("duration_ms") or 0),
+                    "received_at_ms": 0,
+                    "confidence": 0.9,
+                }
+            ]
+            if normalized_text
+            else []
+        )
+        live_events = build_asr_live_events(
+            session_id=meeting_id,
+            provider="local_funasr_batch",
+            streaming_events=streaming_events,
+            is_mock=False,
+        )
+        semantic_quality = (
+            evaluate_semantic_quality(normalized_text)
+            if normalized_text
+            else {
+                "status": "not_evaluated",
+                "blocker": None,
+                "quality_failure_reasons": ["transcript_empty"],
+            }
+        )
+        record = {
+            "session_id": meeting_id,
+            "provider": "local_funasr_batch",
+            "provider_mode": "real",
+            "is_mock": False,
+            "asr_fallback_used": False,
+            "degradation_reasons": (
+                [ASR_SEMANTIC_QUALITY_BLOCKER]
+                if semantic_quality.get("blocker") == ASR_SEMANTIC_QUALITY_BLOCKER
+                else []
+            ),
+            "asr_semantic_quality": semantic_quality,
+            "post_meeting_asr_profile": _post_meeting_asr_profile(asr_report),
+            "audio_source": "uploaded_file",
+            "input_source": "uploaded_file",
+            "audio": audio_asset,
+            "source": ASR_LIVE_SOURCE,
+            "trace_kind": ASR_LIVE_TRACE_KIND,
+            "events": live_events,
+        }
+        try:
+            existing = asr_live_repo.get(meeting_id)
+        except KeyError:
+            asr_live_repo.create(record)
+        else:
+            asr_live_repo.replace({**existing, **record})
+
+    async def _execute_recording_import_job(job: dict[str, Any]) -> None:
+        if v2_persistence is None or data_dir_path is None:
+            raise RuntimeError("recording import runtime requires persistent storage")
+        job_id = str(job["id"])
+        meeting_id = str(job["meeting_id"])
+        source_path = audio_assets.safe_audio_path(
+            data_dir_path,
+            str(job["source_relative_path"]),
+        )
+        canonical_path: Path | None = None
+        try:
+            await _update_recording_import_stage(
+                job_id=job_id,
+                stage="reading",
+                progress=5,
+            )
+            source_size = await asyncio.to_thread(lambda: source_path.stat().st_size)
+            if source_size <= 0 or source_size != int(job["file_size_bytes"]):
+                raise ValueError("managed import source is missing, empty, or incomplete")
+            if not batch_transcribe.is_available():
+                raise _FileAsrComponentMissing("local file ASR component is unavailable")
+
+            await _update_recording_import_stage(
+                job_id=job_id,
+                stage="normalizing",
+                progress=20,
+            )
+            asr_report = await _run_import_blocking_stage(
+                job_id=job_id,
+                stage="transcribing",
+                progress=40,
+                function=batch_transcribe.transcribe_file_report,
+                args=(source_path,),
+                kwargs={"preserve_preprocessed": True},
+            )
+            raw_text = str(asr_report.get("text") or "").strip()
+            normalized_text = _normalize_text(raw_text)
+            canonical_path = Path(str(asr_report.get("normalized_audio_path") or source_path))
+            if not canonical_path.exists():
+                canonical_path = await _run_import_blocking_stage(
+                    job_id=job_id,
+                    stage="transcribing",
+                    progress=55,
+                    function=batch_transcribe.ensure_wav_16k_mono,
+                    args=(source_path,),
+                )
+            managed_root = data_dir_path.resolve()
+            canonical_path = canonical_path.resolve()
+            if managed_root != canonical_path and managed_root not in canonical_path.parents:
+                raise ValueError("normalized import audio escaped the managed data directory")
+            if canonical_path.suffix.lower() != ".wav":
+                raise ValueError("imported audio could not be normalized to WAV")
+
+            audio_asset = await asyncio.to_thread(
+                audio_assets.persist_imported_wav_asset_from_path,
+                data_dir=data_dir_path,
+                session_id=meeting_id,
+                source_path=canonical_path,
+                original_filename=str(job["original_filename"]),
+            )
+            meeting = v2_persistence.get_meeting(meeting_id)
+            await asyncio.to_thread(
+                v2_persistence.register_imported_recording,
+                meeting_id=meeting_id,
+                source_type="imported_file",
+                relative_path=str(audio_asset["relative_path"]),
+                sha256=str(audio_asset["sha256"]),
+                sample_rate_hz=int(audio_asset["sample_rate_hz"] or 0),
+                sample_count=int(
+                    round(int(audio_asset["duration_ms"] or 0) * int(audio_asset["sample_rate_hz"] or 0) / 1_000)
+                ),
+                duration_ms=int(audio_asset["duration_ms"] or 0),
+                file_size_bytes=int(audio_asset["file_size_bytes"] or 0),
+                started_at_ms=int(meeting.get("started_at_ms") or time.time_ns() // 1_000_000),
+                now_ms=time.time_ns() // 1_000_000,
+            )
+            await asyncio.to_thread(
+                _upsert_import_asr_live_record,
+                meeting_id=meeting_id,
+                normalized_text=normalized_text,
+                asr_report=asr_report,
+                audio_asset=audio_asset,
+            )
+
+            await _update_recording_import_stage(
+                job_id=job_id,
+                stage="correcting",
+                progress=70,
+            )
+            if normalized_text:
+                _commit_v2_final(
+                    meeting_id,
+                    {
+                        "segment_id": "import_seg_0001",
+                        "text": raw_text,
+                        "normalized_text": normalized_text,
+                        "start_ms": 0,
+                        "end_ms": int(audio_asset["duration_ms"] or 0),
+                        "received_at_ms": time.time_ns() // 1_000_000,
+                        "source_track": "uploaded_file",
+                    },
+                )
+            await asyncio.to_thread(
+                v2_persistence.end_meeting,
+                meeting_id=meeting_id,
+                now_ms=time.time_ns() // 1_000_000,
+                correlation_id=meeting_id,
+            )
+            executor = getattr(app.state, "v2_executor", None)
+            if executor is not None:
+                executor.wake()
+            await _update_recording_import_stage(
+                job_id=job_id,
+                stage="reviewing",
+                progress=90,
+            )
+            completed = await asyncio.to_thread(
+                v2_persistence.complete_import_job,
+                job_id=job_id,
+                worker_id=import_worker_id,
+                now_ms=time.time_ns() // 1_000_000,
+            )
+            if completed is None:
+                raise _ImportLeaseLost(f"recording import lease was lost: {job_id}")
+        finally:
+            playback_path = audio_assets.safe_audio_path(
+                data_dir_path,
+                f"audio_assets/{meeting_id}/audio.wav",
+            )
+            if canonical_path is not None and canonical_path not in {source_path, playback_path}:
+                canonical_path.unlink(missing_ok=True)
+
+    async def _fail_recording_import_job(
+        job: dict[str, Any],
+        error: Exception,
+    ) -> None:
+        if v2_persistence is None:
+            return
+        if isinstance(error, _FileAsrComponentMissing):
+            error_class = "file_asr_component_missing"
+            message = "本地文件转写组件未安装或尚未就绪，原始录音已保留。"
+            retryable = False
+        elif isinstance(error, subprocess.TimeoutExpired):
+            error_class = "file_asr_timeout"
+            message = "本地文件转写超时，原始录音已保留。"
+            retryable = True
+        elif isinstance(error, OSError):
+            error_class = "file_import_io_error"
+            message = "本地录音读取或写入失败，原始录音已保留。"
+            retryable = True
+        else:
+            error_class = "file_import_processing_failed"
+            message = "本地录音处理失败，原始录音已保留。"
+            retryable = False
+        now_ms = time.time_ns() // 1_000_000
+        failed = await asyncio.to_thread(
+            v2_persistence.fail_import_job,
+            job_id=str(job["id"]),
+            worker_id=import_worker_id,
+            error_class=error_class,
+            error_message=message,
+            retryable=retryable,
+            next_attempt_at_ms=now_ms + 1_000,
+            now_ms=now_ms,
+        )
+        if failed is None:
+            _log.warning(
+                "meeting.recording_import.failure_not_persisted",
+                import_job_id=job["id"],
+                meeting_id=job["meeting_id"],
+                error_class=error_class,
+            )
+
+    async def _recording_import_worker() -> None:
+        if v2_persistence is None:
+            return
+        while not recording_import_stop_event.is_set():
+            try:
+                job = await asyncio.to_thread(
+                    v2_persistence.claim_import_job,
+                    worker_id=import_worker_id,
+                    now_ms=time.time_ns() // 1_000_000,
+                    lease_ms=import_lease_ms,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                _log.error(
+                    "meeting.recording_import.claim_failed",
+                    error_class=type(exc).__name__,
+                )
+                await asyncio.sleep(0.25)
+                continue
+            if job is None:
+                recording_import_wake_event.clear()
+                try:
+                    async with asyncio.timeout(0.25):
+                        await recording_import_wake_event.wait()
+                except TimeoutError:
+                    pass
+                continue
+            try:
+                await _execute_recording_import_job(job)
+            except asyncio.CancelledError:
+                raise
+            except _ImportLeaseLost as exc:
+                _log.warning(
+                    "meeting.recording_import.lease_lost",
+                    import_job_id=job["id"],
+                    meeting_id=job["meeting_id"],
+                    error_class=type(exc).__name__,
+                )
+            except Exception as exc:
+                _log.error(
+                    "meeting.recording_import.failed",
+                    import_job_id=job["id"],
+                    meeting_id=job["meeting_id"],
+                    error_class=type(exc).__name__,
+                )
+                try:
+                    await _fail_recording_import_job(job, exc)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as persistence_exc:
+                    _log.error(
+                        "meeting.recording_import.failure_write_failed",
+                        import_job_id=job["id"],
+                        meeting_id=job["meeting_id"],
+                        error_class=type(persistence_exc).__name__,
+                    )
+
     def _record_audio_active(
         session_id: str,
         observation: dict[str, Any],
@@ -741,6 +2017,12 @@ def create_app(
 
     app.state.record_audio_active = _record_audio_active
 
+    def _v2_recording_track_id(source_type: str, explicit_track_id: object = None) -> str:
+        explicit = str(explicit_track_id or "").strip()
+        if explicit in {"microphone", "system_audio"}:
+            return explicit
+        return "system_audio" if "system_audio" in source_type else "microphone"
+
     def _record_v2_audio_chunk(
         session_id: str,
         chunk: dict[str, Any],
@@ -750,18 +2032,23 @@ def create_app(
         if v2_persistence is None:
             return None
         source_type = str(chunk.get("source_type") or "microphone")
-        track = "microphone" if "mic" in source_type else source_type
+        track = _v2_recording_track_id(source_type, chunk.get("track_id"))
         return v2_persistence.record_audio_chunk(
             meeting_id=session_id,
             track=track,
-            epoch=0,
-            chunk_seq=int(chunk["chunk_index"]),
+            epoch=int(chunk.get("epoch") or 0),
+            chunk_seq=int(chunk["sequence"] if chunk.get("sequence") is not None else chunk["chunk_index"]),
             relative_path=str(chunk["relative_path"]),
             sha256=str(chunk["sha256"]),
             sample_rate_hz=int(chunk["sample_rate_hz"]),
             sample_count=int(chunk["sample_count"]),
             duration_ms=int(chunk["duration_ms"]),
             file_size_bytes=int(chunk["file_size_bytes"]),
+            captured_at_ms=(int(chunk["timestamp_ms"]) if chunk.get("timestamp_ms") is not None else None),
+            source_sequence_start=chunk.get("source_sequence_start"),
+            source_sequence_end=chunk.get("source_sequence_end"),
+            source_timestamp_start_ms=chunk.get("source_timestamp_start_ms"),
+            source_timestamp_end_ms=chunk.get("source_timestamp_end_ms"),
             now_ms=time.time_ns() // 1_000_000,
             lease_owner=lease_owner,
             lease_ms=recording_capture_lease_ms if lease_owner is not None else None,
@@ -778,11 +2065,11 @@ def create_app(
         if v2_persistence is None:
             return None
         source_type = str(metadata.get("source_type") or "browser_live_mic")
-        track = "microphone" if "mic" in source_type else source_type
+        track = _v2_recording_track_id(source_type, metadata.get("track_id"))
         return v2_persistence.begin_recording(
             meeting_id=session_id,
             track=track,
-            epoch=0,
+            epoch=int(metadata.get("epoch") or 0),
             source_type=source_type,
             sample_rate_hz=int(metadata.get("sample_rate_hz") or 16_000),
             lease_owner=lease_owner,
@@ -795,14 +2082,16 @@ def create_app(
         *,
         source_type: str,
         lease_owner: str,
+        track_id: str | None = None,
+        epoch: int = 0,
     ) -> bool:
         if v2_persistence is None:
             return True
-        track = "microphone" if "mic" in source_type else source_type
+        track = _v2_recording_track_id(source_type, track_id)
         return v2_persistence.heartbeat_recording(
             meeting_id=session_id,
             track=track,
-            epoch=0,
+            epoch=int(epoch),
             lease_owner=lease_owner,
             lease_ms=recording_capture_lease_ms,
             now_ms=time.time_ns() // 1_000_000,
@@ -818,6 +2107,8 @@ def create_app(
             session_id,
             source_type=str(chunk.get("source_type") or "browser_live_mic"),
             lease_owner=lease_owner,
+            track_id=(str(chunk["track_id"]) if chunk.get("track_id") else None),
+            epoch=int(chunk.get("epoch") or 0),
         )
 
     def _seal_v2_recording(
@@ -829,11 +2120,12 @@ def create_app(
         if v2_persistence is None:
             return None
         source_type = str(metadata.get("source_type") or "browser_live_mic")
-        track = "microphone" if "mic" in source_type else source_type
+        track = _v2_recording_track_id(source_type, metadata.get("track_id"))
+        epoch = int(metadata.get("epoch") or 0)
         sealed = v2_persistence.seal_recording_and_enqueue_export(
             meeting_id=session_id,
             track=track,
-            epoch=0,
+            epoch=epoch,
             lease_owner=lease_owner,
             output_relative_path=str(metadata.get("relative_path") or f"audio_assets/{session_id}/audio.wav"),
             expected_journal_sha256=(str(metadata["journal_sha256"]) if metadata.get("journal_sha256") else None),
@@ -986,6 +2278,9 @@ def create_app(
             "currentSession": session_cost,
             "today": today_cost,
             "month": month_cost,
+            "currentSessionTokens": sum(int(record.get("total_tokens") or 0) for record in session_records),
+            "todayTokens": sum(int(record.get("total_tokens") or 0) for record in today_records),
+            "monthTokens": sum(int(record.get("total_tokens") or 0) for record in month_records),
             "breakdown": breakdown,
             "currency": "CNY",
             "costStatus": cost_status,
@@ -1140,6 +2435,36 @@ def create_app(
             "llm_usage_total_tokens": sum(int(record.get("total_tokens") or 0) for record in usage_records),
         }
 
+    def _meeting_llm_usage_summary(session_id: str) -> dict[str, Any]:
+        records = settings_usage_repo.list_usage(session_id=session_id)
+        rates = _llm_cost_rates()
+        estimated_cost = _estimated_period_cost(records, rates)
+        purposes: dict[str, dict[str, int]] = {}
+        for record in records:
+            purpose = str(record.get("purpose") or "unknown")
+            summary = purposes.setdefault(
+                purpose,
+                {
+                    "call_count": 0,
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                },
+            )
+            summary["call_count"] += 1
+            summary["prompt_tokens"] += int(record.get("prompt_tokens") or 0)
+            summary["completion_tokens"] += int(record.get("completion_tokens") or 0)
+            summary["total_tokens"] += int(record.get("total_tokens") or 0)
+        return {
+            "call_count": len(records),
+            "prompt_tokens": sum(int(record.get("prompt_tokens") or 0) for record in records),
+            "completion_tokens": sum(int(record.get("completion_tokens") or 0) for record in records),
+            "total_tokens": sum(int(record.get("total_tokens") or 0) for record in records),
+            "estimated_cost_cny": estimated_cost,
+            "cost_status": "estimated" if estimated_cost is not None else "unavailable",
+            "purposes": purposes,
+        }
+
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     if FRONTEND_V2_DIST_DIR.joinpath("assets").is_dir():
         app.mount(
@@ -1196,6 +2521,10 @@ def create_app(
             result["instance_proof"] = health_proof(local_api_token)
         return result
 
+    @app.get("/v2/diagnostics/application-schema")
+    def application_schema_diagnostics() -> dict[str, object]:
+        return dict(application_schema_migration_report)
+
     def _require_v2_persistence() -> V2Persistence:
         if v2_persistence is None:
             raise HTTPException(
@@ -1206,6 +2535,137 @@ def create_app(
                 },
             )
         return v2_persistence
+
+    def _require_data_governance() -> DataGovernanceService:
+        if data_governance_service is None:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "data_governance_unavailable",
+                    "message": "Data governance requires a persistent local data directory",
+                },
+            )
+        return data_governance_service
+
+    def _require_meeting_preparation_store() -> MeetingPreparationStore:
+        if meeting_preparation_store is None:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "meeting_preparation_unavailable",
+                    "message": "Meeting preparation requires a persistent data directory",
+                },
+            )
+        return meeting_preparation_store
+
+    def _review_document_kind(value: str) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized not in REVIEW_DOCUMENT_KINDS:
+            raise HTTPException(status_code=422, detail="unsupported review document kind")
+        return normalized
+
+    @app.get("/v2/data-governance/settings")
+    def get_v2_data_governance_settings() -> dict[str, Any]:
+        return _require_data_governance().get_settings()
+
+    @app.patch("/v2/data-governance/settings")
+    def patch_v2_data_governance_settings(payload: dict[str, Any]) -> dict[str, Any]:
+        if set(payload) != {"retention_policy"}:
+            raise HTTPException(
+                status_code=422,
+                detail="settings must contain only retention_policy",
+            )
+        try:
+            return _require_data_governance().set_retention_policy(
+                payload["retention_policy"],
+                now_ms=time.time_ns() // 1_000_000,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/v2/data-governance/deletions/{job_id}")
+    def get_v2_data_deletion_job(job_id: str) -> dict[str, Any]:
+        try:
+            return _require_v2_persistence().get_deletion_job(job_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="deletion job not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/v2/data-governance/audit")
+    def get_v2_data_governance_audit(
+        meeting_id: str | None = Query(default=None),
+        deletion_job_id: str | None = Query(default=None),
+        limit: int = Query(default=200, ge=1, le=1_000),
+    ) -> dict[str, Any]:
+        try:
+            events = _require_v2_persistence().list_data_governance_audit_events(
+                meeting_id=meeting_id,
+                deletion_job_id=deletion_job_id,
+                limit=limit,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"events": events}
+
+    def _current_realtime_slo_reports() -> dict[str, Any]:
+        return realtime_slo.report_all(active_traces=pipeline_traces.slo_snapshots())
+
+    @app.get("/v2/diagnostics/realtime-ai-slo")
+    def get_v2_realtime_ai_slo_reports() -> dict[str, Any]:
+        return _current_realtime_slo_reports()
+
+    @app.get("/v2/meetings/{meeting_id}/realtime-ai-slo")
+    def get_v2_meeting_realtime_ai_slo(meeting_id: str) -> dict[str, Any]:
+        persistence = _require_v2_persistence()
+        if not persistence.meeting_exists(meeting_id):
+            raise HTTPException(status_code=404, detail=f"meeting not found: {meeting_id}")
+        report = realtime_slo.report(
+            meeting_id=meeting_id,
+            active_traces=pipeline_traces.slo_snapshots(),
+        )
+        report["token_usage"] = _meeting_llm_usage_summary(meeting_id)
+        return report
+
+    @app.get("/v2/meetings/{meeting_id}/preparation")
+    def get_v2_meeting_preparation(meeting_id: str) -> dict[str, Any]:
+        store = _require_meeting_preparation_store()
+        try:
+            preparation = store.get(meeting_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if preparation is None:
+            return {
+                "meeting_id": meeting_id,
+                "hotwords": [],
+                "input_source": "microphone",
+                "input_device_id": None,
+                "input_device_name": None,
+                "notice_acknowledged": False,
+                "updated_at_ms": 0,
+            }
+        return preparation.to_dict()
+
+    @app.put("/v2/meetings/{meeting_id}/preparation")
+    def put_v2_meeting_preparation(
+        meeting_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        store = _require_meeting_preparation_store()
+        try:
+            preparation = store.save(
+                meeting_id,
+                hotwords=payload.get("hotwords") or [],
+                input_source=str(payload.get("input_source") or "microphone"),
+                input_device_id=payload.get("input_device_id"),
+                input_device_name=payload.get("input_device_name"),
+                notice_acknowledged=bool(payload.get("notice_acknowledged", False)),
+                updated_at_ms=time.time_ns() // 1_000_000,
+            )
+            asr_stream.set_session_hotwords(meeting_id, list(preparation.hotwords))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return preparation.to_dict()
 
     @app.post("/v2/meetings", status_code=201)
     def create_v2_meeting(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1238,35 +2698,80 @@ def create_app(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {"meeting": meeting, "storage_preflight": preflight.to_dict()}
 
-    @app.post("/v2/meetings/import-audio", status_code=201)
-    async def import_v2_meeting_audio(file: UploadFile = File(...)) -> dict[str, Any]:
-        """Import one local recording into the canonical V2 meeting pipeline."""
+    @app.patch("/v2/meetings/{meeting_id}")
+    def update_v2_meeting(meeting_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        persistence = _require_v2_persistence()
+        try:
+            title = _validated_v2_meeting_title(payload.get("title"))
+            meeting = persistence.update_meeting_title(
+                meeting_id=meeting_id,
+                title=title,
+                title_source="user",
+                now_ms=time.time_ns() // 1_000_000,
+            )
+            snapshot = _v2_snapshot_with_meeting_metadata(persistence, meeting_id)
+            snapshot = _decorate_v2_snapshot(snapshot, meeting_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="meeting not found") from None
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"meeting": meeting, "snapshot": snapshot}
+
+    @app.post("/v2/meetings/import-audio", status_code=202)
+    async def import_v2_meeting_audio(
+        response: Response,
+        file: UploadFile = File(...),
+        title: str = Form(""),
+    ) -> dict[str, Any]:
+        """Persist an upload and enqueue the durable local import pipeline."""
 
         persistence = _require_v2_persistence()
         if data_dir_path is None:
             raise HTTPException(status_code=503, detail="persistent data directory is unavailable")
-        if not batch_transcribe.is_available():
-            raise HTTPException(status_code=422, detail="FunASR offline batch path is not ready")
+        if not _recording_import_runtime_ready():
+            raise HTTPException(
+                status_code=503,
+                detail="durable recording import persistence is unavailable",
+            )
 
-        import os as _os
-        import tempfile
-
-        suffix = Path(file.filename or "").suffix.lower() or ".wav"
-        fd, tmp_path = tempfile.mkstemp(suffix=suffix)
-        _os.close(fd)
-        tmp = Path(tmp_path)
+        raw_filename = str(file.filename or "recording")
+        original_filename = Path(raw_filename.replace("\\", "/")).name[:255] or "recording"
+        suffix = Path(original_filename).suffix.lower() or ".audio"
+        if len(suffix) > 12 or "/" in suffix or "\\" in suffix:
+            suffix = ".audio"
         meeting_id = "import_" + uuid.uuid4().hex[:20]
-        created_meeting = False
+        session_dir = audio_assets.safe_audio_path(
+            data_dir_path,
+            Path("audio_assets") / meeting_id,
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        staged_path = session_dir / f".uploading{suffix}"
+        source_audio_asset: dict[str, Any] | None = None
+        meeting_created = False
 
-        async def rollback_meeting() -> None:
-            if not created_meeting:
-                return
-            deletion_job = await _begin_deletion_fence(meeting_id)
-            await _complete_deletion_facts(deletion_job)
+        async def rollback_unqueued_import() -> None:
+            if meeting_created:
+                deletion_job = await _begin_deletion_fence(meeting_id)
+                await _complete_deletion_facts(deletion_job)
+            elif source_audio_asset is not None:
+                await asyncio.to_thread(
+                    audio_assets.delete_audio_asset,
+                    data_dir_path,
+                    source_audio_asset,
+                )
+
+        explicit_title = bool(str(title or "").strip())
+        fallback_title = Path(original_filename).stem or "录音导入"
+        cleaned_title = re.sub(
+            r"[/\\\x00-\x1f\x7f]+",
+            " ",
+            str(title if explicit_title else fallback_title),
+        )
+        cleaned_title = " ".join(cleaned_title.split())[:200] or "录音导入"
 
         try:
             uploaded_bytes = 0
-            with tmp.open("wb") as uploaded_file:
+            with staged_path.open("wb") as uploaded_file:
                 while chunk := await file.read(1024 * 1024):
                     uploaded_bytes += len(chunk)
                     if uploaded_bytes > 500 * 1024 * 1024:
@@ -1276,159 +2781,139 @@ def create_app(
                         )
                     uploaded_file.write(chunk)
                 uploaded_file.flush()
-                _os.fsync(uploaded_file.fileno())
+                os.fsync(uploaded_file.fileno())
+            if uploaded_bytes <= 0:
+                raise HTTPException(status_code=422, detail="录音文件为空")
 
-            asr_report = await asyncio.to_thread(
-                batch_transcribe.transcribe_file_report,
-                tmp,
-                preserve_preprocessed=True,
-            )
-            raw_text = str(asr_report.get("text") or "").strip()
-            normalized_text = _normalize_text(raw_text)
-            canonical_path = Path(str(asr_report.get("normalized_audio_path") or tmp))
-            if not canonical_path.exists():
-                canonical_path = await asyncio.to_thread(batch_transcribe.ensure_wav_16k_mono, tmp)
-            if canonical_path.suffix.lower() != ".wav":
-                raise ValueError("导入音频无法转换为标准 WAV")
-
-            created = persistence.create_meeting(
-                meeting_id=meeting_id,
-                title=Path(file.filename or "录音导入").stem[:200] or "录音导入",
-                now_ms=time.time_ns() // 1_000_000,
-            )
-            created_meeting = True
             source_audio_asset = await asyncio.to_thread(
                 audio_assets.persist_uploaded_audio_asset_from_path,
                 data_dir=data_dir_path,
                 session_id=meeting_id,
                 source_type="imported_original",
-                filename=file.filename or "recording",
-                source_path=tmp,
+                filename=original_filename,
+                source_path=staged_path,
             )
-            audio_asset = await asyncio.to_thread(
-                audio_assets.persist_imported_wav_asset_from_path,
-                data_dir=data_dir_path,
-                session_id=meeting_id,
-                source_path=canonical_path,
-                original_filename=file.filename or "recording",
-            )
-            persistence.register_imported_recording(
+            now_ms = time.time_ns() // 1_000_000
+            title_source = "user" if explicit_title else "import"
+            meeting = persistence.create_meeting(
                 meeting_id=meeting_id,
-                source_type="imported_file",
-                relative_path=str(audio_asset["relative_path"]),
-                sha256=str(audio_asset["sha256"]),
-                sample_rate_hz=int(audio_asset["sample_rate_hz"] or 0),
-                sample_count=int(
-                    round(
-                        int(audio_asset["duration_ms"] or 0)
-                        * int(audio_asset["sample_rate_hz"] or 0)
-                        / 1_000
-                    )
-                ),
-                duration_ms=int(audio_asset["duration_ms"] or 0),
-                file_size_bytes=int(audio_asset["file_size_bytes"] or 0),
-                started_at_ms=int(created["started_at_ms"] or time.time_ns() // 1_000_000),
-                now_ms=time.time_ns() // 1_000_000,
+                title=cleaned_title,
+                title_source=title_source,
+                now_ms=now_ms,
             )
-
-            streaming_events = [
-                {
-                    "event_type": "final",
-                    "segment_id": "import_seg_0001",
-                    "text": normalized_text,
-                    "start_ms": 0,
-                    "end_ms": int(audio_asset["duration_ms"] or 0),
-                    "received_at_ms": 0,
-                    "confidence": 0.9,
-                }
-            ] if normalized_text else []
-            live_events = build_asr_live_events(
-                session_id=meeting_id,
-                provider="local_funasr_batch",
-                streaming_events=streaming_events,
-                is_mock=False,
-            )
-            semantic_quality = evaluate_semantic_quality(normalized_text) if normalized_text else {
-                "status": "not_evaluated",
-                "blocker": None,
-                "quality_failure_reasons": ["transcript_empty"],
-            }
-            asr_live_repo.create(
-                {
-                    "session_id": meeting_id,
-                    "provider": "local_funasr_batch",
-                    "provider_mode": "real",
-                    "is_mock": False,
-                    "asr_fallback_used": False,
-                    "degradation_reasons": (
-                        [ASR_SEMANTIC_QUALITY_BLOCKER]
-                        if semantic_quality.get("blocker") == ASR_SEMANTIC_QUALITY_BLOCKER
-                        else []
-                    ),
-                    "asr_semantic_quality": semantic_quality,
-                    "post_meeting_asr_profile": _post_meeting_asr_profile(asr_report),
-                    "audio_source": "uploaded_file",
-                    "input_source": "uploaded_file",
-                    "audio": audio_asset,
-                    "source": ASR_LIVE_SOURCE,
-                    "trace_kind": ASR_LIVE_TRACE_KIND,
-                    "events": live_events,
-                }
-            )
-            if normalized_text:
-                _commit_v2_final(
-                    meeting_id,
-                    {
-                        "segment_id": "import_seg_0001",
-                        "text": raw_text,
-                        "normalized_text": normalized_text,
-                        "start_ms": 0,
-                        "end_ms": int(audio_asset["duration_ms"] or 0),
-                        "received_at_ms": time.time_ns() // 1_000_000,
-                    },
-                )
-            ended = persistence.end_meeting(
+            meeting = {**meeting, "title_source": title_source}
+            meeting_created = True
+            import_job = persistence.create_import_job(
                 meeting_id=meeting_id,
-                now_ms=time.time_ns() // 1_000_000,
-                correlation_id=meeting_id,
+                source_relative_path=str(source_audio_asset["relative_path"]),
+                original_filename=original_filename,
+                file_size_bytes=int(source_audio_asset["file_size_bytes"]),
+                now_ms=now_ms,
             )
-            executor = getattr(app.state, "v2_executor", None)
-            if executor is not None:
-                executor.wake()
-            return {
-                "meeting": ended,
-                "meeting_id": meeting_id,
-                "source": "uploaded_file",
-                "provider": "local_funasr_batch",
-                "raw_transcript": raw_text,
-                "transcript": normalized_text,
-                "audio": audio_asset,
-                "source_audio": source_audio_asset,
-                "snapshot": persistence.get_snapshot(meeting_id),
-                "jobs": persistence.list_jobs(meeting_id=meeting_id),
-            }
         except HTTPException:
-            await rollback_meeting()
+            await rollback_unqueued_import()
             raise
-        except subprocess.TimeoutExpired as exc:
-            await rollback_meeting()
-            raise HTTPException(status_code=408, detail="录音文件识别超时，请尝试较短的录音") from exc
-        except (RuntimeError, ValueError, OSError) as exc:
-            await rollback_meeting()
+        except (OSError, ValueError, KeyError) as exc:
+            await rollback_unqueued_import()
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         finally:
-            tmp.unlink(missing_ok=True)
-            normalized_path = tmp.with_suffix(".16k.wav")
-            if normalized_path != tmp:
-                normalized_path.unlink(missing_ok=True)
+            staged_path.unlink(missing_ok=True)
+            try:
+                session_dir.rmdir()
+            except OSError:
+                pass
+
+        recording_import_wake_event.set()
+        response.headers["Location"] = f"/v2/meetings/{meeting_id}/import-job"
+        return {
+            "meeting": meeting,
+            "meeting_id": meeting_id,
+            "source": "uploaded_file",
+            "provider": "local_funasr_batch",
+            "source_audio": source_audio_asset,
+            "import_job": import_job,
+        }
+
+    @app.get("/v2/meetings/{meeting_id}/import-job")
+    def get_v2_recording_import_job(meeting_id: str) -> dict[str, Any]:
+        persistence = _require_v2_persistence()
+        jobs = persistence.list_import_jobs(meeting_id=meeting_id)
+        if not jobs:
+            raise HTTPException(status_code=404, detail="recording import job not found")
+        return {"import_job": jobs[0]}
+
+    @app.post("/v2/meetings/{meeting_id}/import-job/retry", status_code=202)
+    async def retry_v2_recording_import_job(
+        meeting_id: str,
+        response: Response,
+    ) -> dict[str, Any]:
+        persistence = _require_v2_persistence()
+        jobs = await asyncio.to_thread(
+            persistence.list_import_jobs,
+            meeting_id=meeting_id,
+        )
+        if not jobs:
+            raise HTTPException(status_code=404, detail="recording import job not found")
+        current = jobs[0]
+        if current.get("status") != "failed":
+            raise HTTPException(
+                status_code=409,
+                detail="only a failed recording import job can be retried",
+            )
+        source_path = (
+            audio_assets.safe_audio_path(
+                data_dir_path,
+                str(current["source_relative_path"]),
+            )
+            if data_dir_path is not None
+            else None
+        )
+        if source_path is None or not source_path.is_file():
+            raise HTTPException(
+                status_code=409,
+                detail="the original recording is missing and cannot be retried",
+            )
+        retry_import_job = getattr(persistence, "retry_import_job", None)
+        if not callable(retry_import_job):
+            raise HTTPException(
+                status_code=503,
+                detail="durable recording import retry persistence is unavailable",
+            )
+        try:
+            retried = await asyncio.to_thread(
+                retry_import_job,
+                job_id=str(current["id"]),
+                now_ms=time.time_ns() // 1_000_000,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if retried is None:
+            raise HTTPException(
+                status_code=409,
+                detail="recording import job could not be retried",
+            )
+        recording_import_wake_event.set()
+        response.headers["Location"] = f"/v2/meetings/{meeting_id}/import-job"
+        return {"meeting_id": meeting_id, "import_job": retried}
 
     @app.get("/v2/meetings")
-    def list_v2_meetings(limit: int = 100) -> dict[str, Any]:
+    def list_v2_meetings(
+        limit: int = 100,
+        query: str = "",
+        status: str = "all",
+        before_updated_at_ms: int | None = None,
+        before_meeting_id: str | None = None,
+    ) -> dict[str, Any]:
         try:
-            meetings = _require_v2_persistence().list_meetings(limit=limit)
+            return _require_v2_persistence().list_meetings_page(
+                limit=limit,
+                query=query,
+                status=status,
+                before_updated_at_ms=before_updated_at_ms,
+                before_meeting_id=before_meeting_id,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return {"meetings": meetings}
 
     @app.get("/v2/meetings/{meeting_id}/snapshot")
     def get_v2_meeting_snapshot(
@@ -1436,10 +2921,12 @@ def create_app(
         segment_limit: int = 500,
     ) -> dict[str, Any]:
         try:
-            snapshot = _require_v2_persistence().get_snapshot(
+            snapshot = _v2_snapshot_with_meeting_metadata(
+                _require_v2_persistence(),
                 meeting_id,
                 segment_limit=segment_limit,
             )
+            snapshot = _decorate_v2_snapshot(snapshot, meeting_id)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         try:
@@ -1449,7 +2936,8 @@ def create_app(
         degradation_reasons = [
             str(reason)
             for reason in live_record.get("degradation_reasons") or []
-            if str(reason) in {
+            if str(reason)
+            in {
                 "asr_semantic_quality_blocked",
                 "asr_no_final",
                 "asr_final_empty",
@@ -1473,15 +2961,259 @@ def create_app(
         meeting_id: str,
         after_transcript_seq: int = 0,
         limit: int = 200,
+        include_source_duplicates: bool = False,
     ) -> dict[str, Any]:
         try:
             return _require_v2_persistence().list_transcript_segments(
                 meeting_id,
                 after_transcript_seq=after_transcript_seq,
                 limit=limit,
+                include_source_duplicates=include_source_duplicates,
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/v2/meetings/{meeting_id}/semantic-paragraphs")
+    def get_v2_meeting_semantic_paragraphs(meeting_id: str) -> dict[str, Any]:
+        try:
+            return _require_v2_persistence().list_semantic_paragraphs(meeting_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="meeting not found") from None
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/v2/meetings/{meeting_id}/speakers")
+    def get_v2_meeting_speakers(meeting_id: str) -> dict[str, Any]:
+        try:
+            return _require_v2_persistence().list_meeting_speakers(meeting_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="meeting not found") from None
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.patch("/v2/meetings/{meeting_id}/speakers/{speaker_id}")
+    def rename_v2_meeting_speaker(
+        meeting_id: str,
+        speaker_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        speaker_label = payload.get("speaker_label")
+        if not isinstance(speaker_label, str):
+            raise HTTPException(status_code=422, detail="speaker_label must be a string")
+        try:
+            speaker = _require_v2_persistence().rename_meeting_speaker(
+                meeting_id=meeting_id,
+                speaker_id=speaker_id,
+                speaker_label=speaker_label,
+                now_ms=time.time_ns() // 1_000_000,
+            )
+        except KeyError:
+            raise HTTPException(status_code=404, detail="speaker not found") from None
+        except SpeakerLabelConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"speaker": speaker}
+
+    @app.get("/v2/meetings/{meeting_id}/documents/{document_kind}")
+    def get_v2_review_document(meeting_id: str, document_kind: str) -> dict[str, Any]:
+        kind = _review_document_kind(document_kind)
+        try:
+            document = _require_v2_persistence().get_review_document(meeting_id, kind)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"document": document}
+
+    @app.patch("/v2/meetings/{meeting_id}/documents/{document_kind}")
+    def save_v2_review_document(
+        meeting_id: str,
+        document_kind: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        kind = _review_document_kind(document_kind)
+        try:
+            document = _require_v2_persistence().save_user_final_document(
+                meeting_id=meeting_id,
+                document_kind=kind,
+                expected_revision=int(payload.get("expected_revision") or 0),
+                content=payload.get("content_json"),
+                now_ms=time.time_ns() // 1_000_000,
+            )
+        except ReviewDocumentConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "review_document_revision_conflict",
+                    "expected_revision": exc.expected_revision,
+                    "current_revision": exc.current_revision,
+                    "current_document": exc.current_document,
+                },
+            ) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"document": document}
+
+    @app.get("/v2/meetings/{meeting_id}/documents/{document_kind}/revisions")
+    def list_v2_review_document_revisions(
+        meeting_id: str,
+        document_kind: str,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        kind = _review_document_kind(document_kind)
+        try:
+            revisions = _require_v2_persistence().list_review_document_revisions(
+                meeting_id,
+                kind,
+                limit=limit,
+            )
+        except KeyError:
+            revisions = []
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"meeting_id": meeting_id, "document_kind": kind, "revisions": revisions}
+
+    @app.post("/v2/meetings/{meeting_id}/documents/{document_kind}/regenerate")
+    def regenerate_v2_review_document(meeting_id: str, document_kind: str) -> dict[str, Any]:
+        kind = _review_document_kind(document_kind)
+        job_kind = {
+            "minutes": "minutes",
+            "decisions": "minutes",
+            "action_items": "minutes",
+            "risks": "minutes",
+            "transcript": "index",
+        }[kind]
+        try:
+            result = _require_v2_persistence().enqueue_review_job(
+                meeting_id=meeting_id,
+                kind=job_kind,
+                now_ms=time.time_ns() // 1_000_000,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        executor = getattr(app.state, "v2_executor", None)
+        if executor is not None:
+            executor.wake()
+        return {
+            "document_kind": kind,
+            "preserve_user_final": True,
+            "job": result["job"],
+            "created": result["created"],
+        }
+
+    @app.post("/v2/meetings/{meeting_id}/jobs/{job_kind}/retry")
+    def retry_v2_review_job(meeting_id: str, job_kind: str) -> dict[str, Any]:
+        kind = str(job_kind or "").strip().lower()
+        if kind not in {"minutes", "approach", "index"}:
+            raise HTTPException(status_code=422, detail="unsupported review job kind")
+        try:
+            result = _require_v2_persistence().enqueue_review_job(
+                meeting_id=meeting_id,
+                kind=kind,
+                now_ms=time.time_ns() // 1_000_000,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        executor = getattr(app.state, "v2_executor", None)
+        if executor is not None:
+            executor.wake()
+        return {"job": result["job"], "created": result["created"]}
+
+    @app.get("/v2/meetings/{meeting_id}/export")
+    def export_v2_meeting(
+        meeting_id: str,
+        export_format: str = Query("markdown", alias="format"),
+    ) -> Response:
+        if not SESSION_ID_PATTERN.fullmatch(meeting_id):
+            raise HTTPException(status_code=422, detail="meeting_id contains unsafe characters")
+        normalized_format = str(export_format or "").strip().lower()
+        formats = {
+            "markdown": ("md", "text/markdown"),
+            "docx": (
+                "docx",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ),
+            "json": ("json", "application/json"),
+        }
+        if normalized_format not in formats:
+            detail = _v2_export_problem(
+                "unsupported_export_format",
+                "The requested meeting export format is not supported.",
+                retryable=False,
+            )
+            detail["supported_formats"] = sorted(formats)
+            raise HTTPException(status_code=422, detail=detail)
+        persistence = _require_v2_persistence()
+        try:
+            payload = _v2_export_payload(persistence, meeting_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="meeting not found") from None
+        except Exception as exc:
+            _log.warning(
+                "meeting.export.storage_failed",
+                export_format=normalized_format,
+                error_class=type(exc).__name__,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail=_v2_export_problem(
+                    "export_storage_unavailable",
+                    "The local meeting data could not be read for export.",
+                    retryable=True,
+                ),
+            ) from None
+        extension, media_type = formats[normalized_format]
+        try:
+            if normalized_format == "markdown":
+                content: str | bytes = _render_v2_export_markdown(payload)
+            elif normalized_format == "docx":
+                content = render_docx(payload)
+            else:
+                content = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        except Exception as exc:
+            _log.warning(
+                "meeting.export.generation_failed",
+                export_format=normalized_format,
+                error_class=type(exc).__name__,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=_v2_export_problem(
+                    "export_document_generation_failed",
+                    "The meeting document could not be generated.",
+                    retryable=True,
+                ),
+            ) from None
+        try:
+            content_disposition = _v2_export_content_disposition(
+                payload["meeting"],
+                extension=extension,
+            )
+            return _v2_export_download_response(
+                content,
+                media_type=media_type,
+                content_disposition=content_disposition,
+                extension=extension,
+            )
+        except Exception as exc:
+            _log.warning(
+                "meeting.export.download_contract_failed",
+                export_format=normalized_format,
+                error_class=type(exc).__name__,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=_v2_export_problem(
+                    "export_download_contract_failed",
+                    "The generated meeting document could not be prepared for download.",
+                    retryable=True,
+                ),
+            ) from None
 
     @app.post("/v2/meetings/{meeting_id}/end")
     def end_v2_meeting(meeting_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1526,7 +3258,7 @@ def create_app(
             executor.wake()
         return {
             "meeting": meeting,
-            "snapshot": persistence.get_snapshot(meeting_id),
+            "snapshot": _decorate_v2_snapshot(persistence.get_snapshot(meeting_id), meeting_id),
             "jobs": [job for job in jobs if job["kind"] in {"minutes", "approach", "index"}],
         }
 
@@ -1551,26 +3283,119 @@ def create_app(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {"suggestion": suggestion}
 
+    def _set_v2_entity_status(
+        meeting_id: str,
+        entity_id: str,
+        status: str,
+    ) -> dict[str, Any]:
+        persistence = _require_v2_persistence()
+        if status == "ignore":
+            status = "dismissed"
+        try:
+            entity = persistence.set_entity_status(
+                meeting_id=meeting_id,
+                entity_id=entity_id,
+                status=status,
+                now_ms=time.time_ns() // 1_000_000,
+                correlation_id=meeting_id,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"entity": entity}
+
+    @app.post("/v2/meetings/{meeting_id}/entities/{entity_id}/confirm")
+    def confirm_v2_entity(meeting_id: str, entity_id: str) -> dict[str, Any]:
+        return _set_v2_entity_status(meeting_id, entity_id, "confirmed")
+
+    @app.post("/v2/meetings/{meeting_id}/entities/{entity_id}/dismiss")
+    def dismiss_v2_entity(meeting_id: str, entity_id: str) -> dict[str, Any]:
+        return _set_v2_entity_status(meeting_id, entity_id, "dismissed")
+
+    @app.post("/v2/meetings/{meeting_id}/entities/{entity_id}/ignore")
+    def ignore_v2_entity(meeting_id: str, entity_id: str) -> dict[str, Any]:
+        return _set_v2_entity_status(meeting_id, entity_id, "dismissed")
+
+    @app.patch("/v2/meetings/{meeting_id}/entities/{entity_id}")
+    def update_v2_entity_status(
+        meeting_id: str,
+        entity_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        return _set_v2_entity_status(
+            meeting_id,
+            entity_id,
+            str(payload.get("status") or payload.get("action") or "").strip().lower(),
+        )
+
     @app.delete("/v2/meetings/{meeting_id}")
-    async def delete_v2_meeting(meeting_id: str) -> dict[str, Any]:
+    async def delete_v2_meeting(
+        meeting_id: str,
+        request: Request,
+        scope: Literal["recording", "derived", "transcript", "all"] = Query(default="all"),
+    ) -> dict[str, Any]:
         persistence = _require_v2_persistence()
         if not persistence.meeting_exists(meeting_id):
             raise HTTPException(status_code=404, detail=f"meeting not found: {meeting_id}")
-        job = await _begin_deletion_fence(meeting_id)
-        if job is None:
-            raise HTTPException(status_code=503, detail="V2 deletion storage unavailable")
+        governance = _require_data_governance()
         try:
-            completed = await asyncio.to_thread(_execute_v2_deletion_job, job)
-        except (OSError, sqlite3.Error, ValueError) as exc:
+            normalized_scope = normalize_deletion_scope(scope)
+            meeting = persistence.get_meeting(meeting_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=f"meeting not found: {meeting_id}") from exc
+        if normalized_scope == "derived" and str(meeting.get("state") or "") == "live":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "active_ai_derivation",
+                    "message": "结束会议后才能单独删除 AI 整理，避免实时任务再次写入。",
+                },
+            )
+        cancelled_capture_count = 0
+        if normalized_scope in {"recording", "transcript", "all"}:
+            cancelled_capture_count = await _cancel_meeting_capture_tasks(meeting_id)
+        request_key = str(request.headers.get("idempotency-key") or "").strip()
+        if len(request_key) > 200 or any(ord(character) < 32 for character in request_key):
+            raise HTTPException(status_code=422, detail="Idempotency-Key is invalid")
+        if request_key:
+            idempotency_key = f"api.delete:{normalized_scope}:{meeting_id}:{request_key}"
+        elif normalized_scope == "all":
+            idempotency_key = f"meeting.delete:all:{meeting_id}"
+        else:
+            idempotency_key = f"api.delete:{normalized_scope}:{meeting_id}:{uuid.uuid4().hex}"
+        job: dict[str, Any] | None = None
+        try:
+            job = await asyncio.to_thread(
+                governance.request_deletion,
+                meeting_id=meeting_id,
+                deletion_scope=normalized_scope,
+                now_ms=time.time_ns() // 1_000_000,
+                idempotency_key=idempotency_key,
+            )
+            completed = await asyncio.to_thread(
+                governance.execute_deletion_job,
+                job_id=str(job["id"]),
+                now_ms=time.time_ns() // 1_000_000,
+            )
+        except (OSError, sqlite3.Error, ValueError, KeyError) as exc:
             raise HTTPException(
                 status_code=500,
                 detail={
                     "error": "meeting_deletion_failed",
-                    "job_id": job["id"],
+                    "job_id": str(job["id"]) if job is not None else None,
                     "error_class": type(exc).__name__,
                 },
             ) from exc
-        return {"deleted": True, "deletion_job": completed}
+        return {
+            "deleted": True,
+            "deletion_scope": normalized_scope,
+            "cancelled_capture_count": cancelled_capture_count,
+            "meeting_deleted": normalized_scope == "all",
+            "deletion_job": completed,
+        }
 
     @app.get("/v2/meetings/{meeting_id}/events")
     async def get_v2_meeting_events(
@@ -1599,7 +3424,7 @@ def create_app(
                         after_seq=cursor,
                         limit=limit,
                     )
-                    events = page["events"]
+                    events = [_decorate_v2_formal_event(event) for event in page["events"]]
                     if events:
                         for event in events:
                             cursor = max(cursor, int(event["seq"]))
@@ -1634,7 +3459,10 @@ def create_app(
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return page
+        return {
+            **page,
+            "events": [_decorate_v2_formal_event(event) for event in page["events"]],
+        }
 
     @app.get("/v2/meetings/{meeting_id}/traces")
     def get_v2_meeting_traces(meeting_id: str) -> dict[str, Any]:
@@ -1649,14 +3477,55 @@ def create_app(
         chunks = persistence.list_audio_chunks(meeting_id)
         recordings = persistence.list_recording_sessions(meeting_id)
         exports = persistence.list_recording_exports(meeting_id=meeting_id)
-        relative_path = f"audio_assets/{meeting_id}/audio.wav"
+        derivations = persistence.list_recording_derivations(meeting_id)
+        track_states = []
+        for recording in recordings:
+            track_chunks = [
+                chunk
+                for chunk in chunks
+                if chunk["track_id"] == recording["track_id"] and int(chunk["epoch"]) == int(recording["epoch"])
+            ]
+            track_states.append(
+                {
+                    **recording,
+                    "first_sequence": (min(int(chunk["sequence"]) for chunk in track_chunks) if track_chunks else None),
+                    "last_sequence": (max(int(chunk["sequence"]) for chunk in track_chunks) if track_chunks else None),
+                    "first_timestamp_ms": (
+                        min(int(chunk["timestamp_ms"]) for chunk in track_chunks) if track_chunks else None
+                    ),
+                    "last_timestamp_ms": (
+                        max(int(chunk["timestamp_ms"]) for chunk in track_chunks) if track_chunks else None
+                    ),
+                    "playback_url": (
+                        f"/v2/meetings/{meeting_id}/audio/tracks/"
+                        f"{recording['track_id']}/content?epoch={recording['epoch']}"
+                        if recording["status"] == "ready"
+                        else None
+                    ),
+                }
+            )
+        ready_recordings = sorted(
+            (recording for recording in recordings if recording["status"] == "ready"),
+            key=lambda recording: (
+                recording["track_id"] != "microphone",
+                -int(recording["epoch"]),
+            ),
+        )
+        default_recording = ready_recordings[0] if ready_recordings else None
+        relative_path = (
+            str(default_recording["output_relative_path"])
+            if default_recording is not None and default_recording.get("output_relative_path")
+            else f"audio_assets/{meeting_id}/audio.wav"
+        )
         path = audio_assets.safe_audio_path(data_dir_path, relative_path) if data_dir_path is not None else None
         recording_statuses = {str(recording["status"]) for recording in recordings}
         assembled_file = bool(path is not None and path.is_file() and not path.is_symlink())
-        assembled = assembled_file and (not recordings or "ready" in recording_statuses)
+        assembled = assembled_file and (not recordings or default_recording is not None)
         status = (
-            "failed"
-            if "failed" in recording_statuses
+            "partial_failure"
+            if "failed" in recording_statuses and recording_statuses != {"failed"}
+            else "failed"
+            if recording_statuses == {"failed"}
             else "recording"
             if "active" in recording_statuses
             else "assembling"
@@ -1673,11 +3542,19 @@ def create_app(
             "format": "wav" if assembled else None,
             "file_size_bytes": path.stat().st_size if assembled and path is not None else 0,
             "chunk_count": len(chunks),
-            "duration_ms": sum(int(chunk["duration_ms"]) for chunk in chunks),
-            "tracks": sorted({str(chunk["track"]) for chunk in chunks}),
+            "duration_ms": max(
+                [int(recording["duration_ms"]) for recording in recordings]
+                or [sum(int(chunk["duration_ms"]) for chunk in chunks)]
+            ),
+            "tracks": sorted(
+                {str(chunk["track_id"]) for chunk in chunks} | {str(recording["track_id"]) for recording in recordings}
+            ),
+            "track_states": track_states,
             "chunks": chunks,
             "recordings": recordings,
             "exports": exports,
+            "derived_assets": derivations,
+            "mixed_create_url": f"/v2/meetings/{meeting_id}/audio/mixed",
         }
 
     @app.get("/v2/meetings/{meeting_id}/audio/content")
@@ -1687,19 +3564,179 @@ def create_app(
             raise HTTPException(status_code=404, detail=f"meeting not found: {meeting_id}")
         if data_dir_path is None:
             raise HTTPException(status_code=404, detail="meeting audio is unavailable")
-        path = audio_assets.safe_audio_path(
-            data_dir_path,
-            f"audio_assets/{meeting_id}/audio.wav",
-        )
         recordings = persistence.list_recording_sessions(meeting_id)
-        if recordings and not any(recording["status"] == "ready" for recording in recordings):
+        ready_recordings = sorted(
+            (recording for recording in recordings if recording["status"] == "ready"),
+            key=lambda recording: (
+                recording["track_id"] != "microphone",
+                -int(recording["epoch"]),
+            ),
+        )
+        if recordings and not ready_recordings:
             raise HTTPException(status_code=409, detail="meeting audio is still being assembled")
+        relative_path = (
+            str(ready_recordings[0]["output_relative_path"])
+            if ready_recordings and ready_recordings[0].get("output_relative_path")
+            else f"audio_assets/{meeting_id}/audio.wav"
+        )
+        path = audio_assets.safe_audio_path(data_dir_path, relative_path)
         if not path.is_file() or path.is_symlink():
             raise HTTPException(status_code=404, detail="meeting audio is not assembled yet")
         return FileResponse(
             path,
             media_type="audio/wav",
             filename=f"{meeting_id}.wav",
+            content_disposition_type="inline",
+        )
+
+    @app.get("/v2/meetings/{meeting_id}/audio/tracks/{track_id}/content")
+    def get_v2_meeting_track_audio_content(
+        meeting_id: str,
+        track_id: Literal["microphone", "system_audio"],
+        epoch: int = Query(default=0, ge=0),
+    ) -> FileResponse:
+        persistence = _require_v2_persistence()
+        if data_dir_path is None:
+            raise HTTPException(status_code=404, detail="meeting audio is unavailable")
+        try:
+            recording = persistence.get_recording_session(
+                meeting_id,
+                track=track_id,
+                epoch=epoch,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if recording["status"] != "ready":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "audio_track_not_ready",
+                    "track_id": track_id,
+                    "epoch": epoch,
+                    "status": recording["status"],
+                    "error_class": recording["error_class"],
+                },
+            )
+        path = audio_assets.safe_audio_path(
+            data_dir_path,
+            str(recording["output_relative_path"]),
+        )
+        if not path.is_file() or path.is_symlink():
+            raise HTTPException(status_code=404, detail="track audio asset is missing")
+        return FileResponse(
+            path,
+            media_type="audio/wav",
+            filename=f"{meeting_id}-{track_id}-epoch-{epoch}.wav",
+            content_disposition_type="inline",
+        )
+
+    @app.post("/v2/meetings/{meeting_id}/audio/mixed", status_code=201)
+    def create_v2_meeting_mixed_audio(meeting_id: str) -> dict[str, Any]:
+        persistence = _require_v2_persistence()
+        if not persistence.meeting_exists(meeting_id):
+            raise HTTPException(status_code=404, detail=f"meeting not found: {meeting_id}")
+        if data_dir_path is None:
+            raise HTTPException(status_code=503, detail="meeting audio storage is unavailable")
+        recordings = persistence.list_recording_sessions(meeting_id)
+        latest = {
+            track_id: max(
+                (recording for recording in recordings if recording["track_id"] == track_id),
+                key=lambda recording: int(recording["epoch"]),
+                default=None,
+            )
+            for track_id in ("microphone", "system_audio")
+        }
+        not_ready = {
+            track_id: (
+                {
+                    "status": recording["status"],
+                    "epoch": recording["epoch"],
+                    "error_class": recording["error_class"],
+                }
+                if recording is not None
+                else {"status": "missing", "epoch": None, "error_class": None}
+            )
+            for track_id, recording in latest.items()
+            if recording is None or recording["status"] != "ready"
+        }
+        if not_ready:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "audio_tracks_not_ready", "tracks": not_ready},
+            )
+        sources = [latest["microphone"], latest["system_audio"]]
+        identity = persistence.mixed_recording_identity(meeting_id, sources)
+        existing = next(
+            (
+                asset
+                for asset in persistence.list_recording_derivations(meeting_id)
+                if asset["asset_id"] == identity["asset_id"]
+            ),
+            None,
+        )
+        if existing is not None:
+            existing_path = audio_assets.safe_audio_path(
+                data_dir_path,
+                str(existing["output_relative_path"]),
+            )
+            if (
+                existing_path.is_file()
+                and not existing_path.is_symlink()
+                and existing_path.stat().st_size == int(existing["file_size_bytes"])
+            ):
+                current = audio_assets.audio_metadata_for_file(
+                    data_dir=data_dir_path,
+                    session_id=meeting_id,
+                    relative_path=str(existing["output_relative_path"]),
+                    source_type="local_derived_mix",
+                    sample_rate_hz=None,
+                    sample_count=None,
+                )
+                if current["sha256"] == existing["output_sha256"]:
+                    return {"asset": existing}
+        try:
+            with _recording_asset_lock(meeting_id):
+                output = audio_assets.derive_local_mixed_wav_asset(
+                    data_dir=data_dir_path,
+                    meeting_id=meeting_id,
+                    asset_id=str(identity["asset_id"]),
+                    sources=identity["sources"],
+                )
+                asset = persistence.register_mixed_recording_derivation(
+                    meeting_id=meeting_id,
+                    sources=identity["sources"],
+                    output=output,
+                    now_ms=time.time_ns() // 1_000_000,
+                )
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "mixed_audio_derivation_failed"},
+            ) from exc
+        return {"asset": asset}
+
+    @app.get("/v2/meetings/{meeting_id}/audio/mixed/{asset_id}/content")
+    def get_v2_meeting_mixed_audio_content(meeting_id: str, asset_id: str) -> FileResponse:
+        persistence = _require_v2_persistence()
+        if data_dir_path is None:
+            raise HTTPException(status_code=404, detail="meeting audio is unavailable")
+        try:
+            asset = persistence.get_recording_derivation(meeting_id, asset_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if asset["status"] != "ready":
+            raise HTTPException(status_code=409, detail="mixed audio is not ready")
+        path = audio_assets.safe_audio_path(
+            data_dir_path,
+            str(asset["output_relative_path"]),
+        )
+        if not path.is_file() or path.is_symlink():
+            raise HTTPException(status_code=404, detail="mixed audio asset is missing")
+        return FileResponse(
+            path,
+            media_type="audio/wav",
+            filename=f"{meeting_id}-mixed.wav",
+            content_disposition_type="inline",
         )
 
     @app.post("/v2/traces/{trace_id}/ui-rendered")
@@ -1808,6 +3845,125 @@ def create_app(
         except (UnsafeManagedPathError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    @app.get("/providers/status")
+    def provider_status() -> dict[str, Any]:
+        return provider_config_runtime.get_status().to_dict()
+
+    def _web_provider_config_response(*, errors: list[str] | None = None) -> dict[str, Any]:
+        config = llm_service.LlmConfig.from_env()
+        runtime_status = provider_config_runtime.get_status(config).to_dict()
+        response_errors = list(errors or [])
+        configured_error = getattr(app.state, "web_provider_config_error", None)
+        if configured_error:
+            response_errors.append(configured_error)
+        return {
+            "command_status": "error" if response_errors else "ok",
+            "configured": config is not None,
+            "api_key_present": config is not None,
+            "base_url": config.base_url if config is not None else None,
+            "model": config.model if config is not None else None,
+            "realtime_model": config.realtime_model if config is not None else None,
+            "api_style": config.api_style if config is not None else None,
+            "provider_label": (
+                llm_service.provider_identifier(config)
+                if config is not None
+                else "openai_compatible_gateway"
+            ),
+            "runtime_synced": bool(runtime_status.get("runtime_synced")),
+            "probe_status": runtime_status.get("probe_status", "not_run"),
+            "errors": response_errors,
+        }
+
+    @app.get("/providers/config")
+    def get_web_provider_config() -> dict[str, Any]:
+        """Return Web-local provider metadata without ever returning the API key."""
+
+        return _web_provider_config_response()
+
+    @app.put("/providers/config")
+    def put_web_provider_config(payload: WebProviderConfigRequest) -> dict[str, Any]:
+        store = getattr(app.state, "web_provider_config_store", None)
+        if store is None:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "web_provider_storage_unavailable",
+                    "message": "当前运行实例没有可用的本地 AI 配置目录",
+                },
+            )
+        current = llm_service.LlmConfig.from_env()
+        try:
+            stored = store.load()
+        except (OSError, ValueError) as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "invalid_provider_config", "message": "本地 AI 配置无效，请重新保存"},
+            ) from exc
+        supplied_key = payload.api_key.get_secret_value().strip() if payload.api_key is not None else ""
+        api_key = supplied_key or (
+            str(stored["api_key"]) if stored is not None else (current.api_key if current is not None else "")
+        )
+        if not api_key:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "api_key_required", "message": "请输入 API Key"},
+            )
+        try:
+            metadata = llm_service.configure_runtime(
+                base_url=payload.base_url,
+                api_key=api_key,
+                model=payload.model,
+                realtime_model=payload.realtime_model,
+                provider_label=payload.provider_label,
+                api_style=payload.api_style,
+            )
+            config = llm_service.LlmConfig.from_env()
+            if config is None:
+                raise ValueError("provider runtime was not configured")
+            store.save(
+                {
+                    "base_url": config.base_url,
+                    "api_key": config.api_key,
+                    "model": config.model,
+                    "realtime_model": config.realtime_model,
+                    "provider_label": config.provider_label,
+                    "api_style": config.api_style,
+                }
+            )
+            app.state.web_provider_config_error = None
+        except (OSError, TypeError, ValueError) as exc:
+            _log.warning(
+                "provider.web_config.save_failed",
+                error_type=type(exc).__name__,
+            )
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "invalid_provider_config", "message": "AI 配置保存失败，请检查地址、模型和密钥"},
+            ) from None
+        return {**_web_provider_config_response(), **metadata, "command_status": "ok"}
+
+    @app.delete("/providers/config")
+    def delete_web_provider_config() -> dict[str, Any]:
+        store = getattr(app.state, "web_provider_config_store", None)
+        if store is None:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "web_provider_storage_unavailable",
+                    "message": "当前运行实例没有可用的本地 AI 配置目录",
+                },
+            )
+        try:
+            store.clear()
+            llm_service.clear_runtime_config()
+            app.state.web_provider_config_error = None
+        except (OSError, ValueError):
+            raise HTTPException(
+                status_code=500,
+                detail={"error": "provider_config_clear_failed", "message": "AI 配置移除失败"},
+            ) from None
+        return _web_provider_config_response()
+
     @app.get("/providers/health")
     def providers_health() -> dict[str, Any]:
         llm_config = llm_service.LlmConfig.from_env()
@@ -1820,6 +3976,8 @@ def create_app(
                 "configured": bool(llm_meta.get("configured_from_env")),
                 "provider": str(llm_meta.get("provider") or "not_configured"),
                 "model": str(llm_meta.get("model") or "not_called"),
+                "realtime_model": str(llm_meta.get("realtime_model") or "not_called"),
+                "api_style": str(llm_meta.get("api_style") or "not_configured"),
                 "is_mock": bool(llm_meta.get("is_mock", False)),
                 "credential_configured": llm_config is not None,
             },
@@ -1842,6 +4000,115 @@ def create_app(
             },
             "degradation": get_degradation_controller().to_status_dict(),
         }
+
+    @app.get("/v2/diagnostics/bundle")
+    def export_diagnostic_bundle() -> Response:
+        try:
+            provider_status = providers_health()
+        except (OSError, RuntimeError, ValueError):
+            realtime_asr_providers = _realtime_asr_providers()
+            provider_status = {
+                "llm": {
+                    "configured": False,
+                    "provider": "invalid_config",
+                    "model": "not_called",
+                    "api_style": "invalid_config",
+                },
+                "asr": {
+                    "file_asr_available": batch_transcribe.is_available(),
+                    "realtime_asr_available": bool(realtime_asr_providers),
+                },
+            }
+        counters = _metrics.metrics.snapshot()
+
+        def latency_metrics(prefix: str) -> dict[str, Any]:
+            values: dict[str, Any] = {}
+            count = counters.get(f"{prefix}_count")
+            average = counters.get(f"{prefix}_avg_ms")
+            maximum = counters.get(f"{prefix}_max_ms")
+            if count is not None:
+                values["observation_count"] = count
+            if average is not None:
+                values["avg_latency_ms"] = average
+            if maximum is not None:
+                values["max_latency_ms"] = maximum
+            return values
+
+        slo_stage_metrics: list[dict[str, Any]] = []
+        for meeting_report in _current_realtime_slo_reports()["meetings"].values():
+            for lane_name, lane_report in meeting_report["lanes"].items():
+                metrics = lane_report["metrics"]
+                slo_stage_metrics.append(
+                    {
+                        "stage": f"realtime_ai_{lane_name}",
+                        "sample_count": lane_report["count"],
+                        "missing_trace_count": lane_report["missing_trace_count"],
+                        "cancelled_count": lane_report["cancelled_count"],
+                        "retry_count": lane_report["retry_count"],
+                        "final_to_first_token_p95_ms": metrics["final_to_first_token_ms"]["p95_ms"],
+                        "final_to_event_p95_ms": metrics["final_to_event_emitted_ms"]["p95_ms"],
+                        "queue_wait_p95_ms": metrics["queue_wait_ms"]["p95_ms"],
+                        "provider_ttft_p95_ms": metrics["provider_ttft_ms"]["p95_ms"],
+                        "provider_total_p95_ms": metrics["provider_total_ms"]["p95_ms"],
+                        "event_to_ui_p95_ms": metrics["event_to_ui_ms"]["p95_ms"],
+                    }
+                )
+
+        llm_status = dict(provider_status.get("llm") or {})
+        asr_status = dict(provider_status.get("asr") or {})
+        snapshot = {
+            "version": {
+                "app_version": app.version,
+                "architecture": platform.machine(),
+                "os": platform.system(),
+            },
+            "config_summary": {
+                "app_mode": "desktop_local" if local_api_token else "local_web",
+                "language": "zh-CN",
+                "network_mode": "local_audio_remote_llm_only",
+                "recording_enabled": True,
+                "provider_mode": "openai_compatible" if llm_status.get("configured") else "not_configured",
+            },
+            "provider_capabilities": {
+                "llm": {
+                    "kind": "llm",
+                    "provider": llm_status.get("provider"),
+                    "model": llm_status.get("model"),
+                    "protocol": llm_status.get("api_style"),
+                    "configured": bool(llm_status.get("configured")),
+                    "supports_streaming": bool(llm_status.get("configured")),
+                },
+                "realtime_asr": {
+                    "kind": "realtime_asr",
+                    "provider": "local_funasr",
+                    "available": bool(asr_status.get("realtime_asr_available")),
+                    "supports_realtime": bool(asr_status.get("realtime_asr_available")),
+                    "mode": "local",
+                },
+                "file_asr": {
+                    "kind": "file_asr",
+                    "provider": "local_funasr_batch",
+                    "available": bool(asr_status.get("file_asr_available")),
+                    "supports_file_asr": bool(asr_status.get("file_asr_available")),
+                    "mode": "local",
+                },
+            },
+            "stage_metrics": [
+                {"stage": "asr", **latency_metrics("asr_latency")},
+                {"stage": "llm", **latency_metrics("llm_latency")},
+                *slo_stage_metrics,
+            ],
+            "errors": [],
+        }
+        payload = diagnostic_bundle.build_diagnostic_bundle_bytes(snapshot)
+        return Response(
+            content=payload,
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": ('attachment; filename="meeting-copilot-diagnostics.zip"'),
+                "Cache-Control": "no-store",
+            },
+        )
 
     @app.get("/providers/asr/runtime")
     def asr_runtime_status() -> dict[str, Any]:
@@ -1894,6 +4161,7 @@ def create_app(
         cache_key = (
             config.base_url,
             config.model,
+            config.realtime_model,
             llm_service.provider_identifier(config),
             llm_service.runtime_config_generation(),
         )
@@ -1907,6 +4175,7 @@ def create_app(
                     "message": "LLM探测正在进行中，请稍后重试",
                 },
             )
+        provider_config_runtime.mark_probe_started(config)
         try:
             now = time.monotonic()
             _enforce_llm_budget("provider_probe", purpose="provider_probe", config=config)
@@ -1918,12 +4187,14 @@ def create_app(
                 cached_result = dict(provider_probe_cache["result"])
                 cached_result["ok"] = True
                 cached_result["cached"] = True
+                provider_config_runtime.mark_probe_succeeded(config)
                 return cached_result
-            result = llm_service.probe_gateway(config)
+            probe_config = llm_service.realtime_config(config)
+            result = llm_service.probe_gateway(probe_config)
             _record_llm_usage(
                 "provider_probe",
                 purpose="provider_probe",
-                config=config,
+                config=probe_config,
                 usage=dict(result.get("usage") or {}),
             )
             provider_probe_cache.update(
@@ -1933,30 +4204,40 @@ def create_app(
                     "result": dict(result),
                 }
             )
+            provider_config_runtime.mark_probe_succeeded(config)
             return {
                 "ok": True,
                 **result,
             }
         except Exception as exc:
+            provider_config_runtime.mark_probe_failed(config)
             if isinstance(exc, HTTPException):
                 raise
-            _log.warning("llm.probe.failed", error_type=type(exc).__name__)
+            status_code = getattr(exc, "status_code", None)
+            provider_code = getattr(exc, "provider_code", None)
+            _log.warning(
+                "llm.probe.failed",
+                error_type=type(exc).__name__,
+                status_code=status_code if isinstance(status_code, int) else None,
+                provider_code=provider_code if isinstance(provider_code, str) else None,
+            )
             raise HTTPException(
                 status_code=502,
                 detail={
                     "ok": False,
                     "error": "llm_probe_failed",
                     "error_type": type(exc).__name__,
-                    "message": f"LLM探测失败: {type(exc).__name__}",
+                    "message": llm_service.provider_failure_message(exc),
                 },
             ) from None
         finally:
             lane_lease.release()
 
     def _require_authenticated_desktop_runtime() -> None:
-        if not bool(app.state.local_api_auth.get("enabled")) or os.environ.get(
-            "MEETING_COPILOT_DESKTOP_RUNTIME"
-        ) != "1":
+        if (
+            not bool(app.state.local_api_auth.get("enabled"))
+            or os.environ.get("MEETING_COPILOT_DESKTOP_RUNTIME") != "1"
+        ):
             raise HTTPException(
                 status_code=403,
                 detail={
@@ -1969,8 +4250,9 @@ def create_app(
     def get_desktop_provider_config() -> dict[str, Any]:
         _require_authenticated_desktop_runtime()
         config = llm_service.LlmConfig.from_env()
+        runtime_status = provider_config_runtime.get_status(config).to_dict()
         return {
-            "configured": config is not None,
+            **runtime_status,
             "runtime_override": llm_service.runtime_configured(),
             **llm_service.provider_metadata(config),
         }
@@ -1985,15 +4267,18 @@ def create_app(
                 base_url=payload.base_url,
                 api_key=payload.api_key.get_secret_value(),
                 model=payload.model,
+                realtime_model=payload.realtime_model,
                 provider_label=payload.provider_label,
+                api_style=payload.api_style,
             )
         except ValueError as exc:
             raise HTTPException(
                 status_code=422,
                 detail={"error": "invalid_provider_config", "message": str(exc)},
             ) from None
+        runtime_status = provider_config_runtime.get_status().to_dict()
         return {
-            "configured": True,
+            **runtime_status,
             "runtime_override": True,
             **metadata,
         }
@@ -2003,11 +4288,44 @@ def create_app(
         _require_authenticated_desktop_runtime()
         llm_service.clear_runtime_config()
         config = llm_service.LlmConfig.from_env()
+        runtime_status = provider_config_runtime.get_status(config).to_dict()
         return {
-            "configured": config is not None,
+            **runtime_status,
             "runtime_override": False,
             **llm_service.provider_metadata(config),
         }
+
+    def _require_next006_failpoints_enabled() -> None:
+        _require_authenticated_desktop_runtime()
+        if os.environ.get("MEETING_COPILOT_ENABLE_NEXT006_FAILPOINTS") != "1":
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error": "next006_failpoints_disabled",
+                    "message": "NEXT-006 test failpoints are disabled",
+                },
+            )
+
+    @app.get("/desktop/test/failpoints/storage-write")
+    def get_next006_storage_failpoint() -> dict[str, Any]:
+        _require_next006_failpoints_enabled()
+        return storage_write_failpoint.snapshot()
+
+    @app.put("/desktop/test/failpoints/storage-write")
+    def put_next006_storage_failpoint(
+        payload: Next006StorageFailpointRequest,
+    ) -> dict[str, Any]:
+        _require_next006_failpoints_enabled()
+        return storage_write_failpoint.arm(
+            scope=payload.scope,
+            failure=payload.failure,
+            count=payload.count,
+        )
+
+    @app.delete("/desktop/test/failpoints/storage-write")
+    def delete_next006_storage_failpoint() -> dict[str, Any]:
+        _require_next006_failpoints_enabled()
+        return storage_write_failpoint.reset()
 
     @app.post("/degradation/reset")
     def degradation_reset() -> dict[str, Any]:
@@ -2066,6 +4384,27 @@ def create_app(
 
     @app.websocket("/live/asr/stream/ws/{session_id}")
     async def asr_stream_ws(websocket: WebSocket, session_id: str):
+        if v2_persistence is not None and v2_persistence.meeting_exists(session_id):
+            preparation = meeting_preparation_store.get(session_id) if meeting_preparation_store is not None else None
+            if preparation is None or not preparation.notice_acknowledged:
+                await websocket.accept()
+                await websocket.send_text(
+                    json.dumps(
+                        {
+                            "event_type": "provider_error",
+                            "error_code": "recording_notice_required",
+                            "message": "开始录音前需要确认录音告知。",
+                            "recoverable": True,
+                            "recording_saved": False,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                await websocket.close(
+                    code=1008,
+                    reason="recording notice acknowledgement required",
+                )
+                return
         route_task = asyncio.current_task()
         if route_task is not None:
             active_v2_capture_tasks.setdefault(session_id, set()).add(route_task)
@@ -2080,6 +4419,56 @@ def create_app(
 
             route_task.add_done_callback(unregister_capture_task)
         audio_source = str(websocket.query_params.get("audio_source") or "").strip() or None
+        pcm_protocol = str(websocket.query_params.get("pcm_protocol") or "").strip() or None
+        native_track_id = _transcript_source_track(audio_source)
+        native_capture_epoch: int | None = None
+        native_source = str(audio_source or "").strip().lower() in {
+            "tauri_native_mic",
+            "native_microphone_streaming",
+            "tauri_system_audio",
+            "macos_system_audio",
+        }
+        if native_source:
+            try:
+                native_capture_epoch = int(websocket.query_params.get("capture_epoch") or 0)
+            except (TypeError, ValueError):
+                native_capture_epoch = 0
+            if (
+                pcm_protocol != asr_stream.NATIVE_PCM_PROTOCOL_NAME
+                or native_track_id not in {"microphone", "system_audio"}
+                or native_capture_epoch <= 0
+            ):
+                await websocket.accept()
+                await websocket.send_text(
+                    json.dumps(
+                        {
+                            "event_type": "provider_error",
+                            "error_code": "native_pcm_identity_invalid",
+                            "message": "本地音频协议或采集批次无效，请重新启动客户端后开始会议。",
+                            "recording_saved": False,
+                            "recoverable": True,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                await websocket.close(code=1008, reason="native PCM identity required")
+                return
+        elif pcm_protocol is not None:
+            await websocket.accept()
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "event_type": "provider_error",
+                        "error_code": "native_pcm_source_invalid",
+                        "message": "本地音频协议只能用于桌面原生音频轨道。",
+                        "recording_saved": False,
+                        "recoverable": True,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            await websocket.close(code=1008, reason="native PCM source required")
+            return
         if data_dir_path is not None:
             try:
                 storage_preflight = preflight_meeting_storage(
@@ -2113,16 +4502,35 @@ def create_app(
         capture_lease_owner = f"capture:{uuid.uuid4().hex}"
         capture_source_type = audio_source or "live_asr_stream"
         capture_started = False
+        capture_recording: dict[str, Any] | None = None
 
         def begin_capture(metadata: dict[str, Any]) -> None:
-            nonlocal capture_source_type, capture_started
+            nonlocal capture_source_type, capture_started, capture_recording
             capture_source_type = str(metadata.get("source_type") or capture_source_type)
-            _begin_v2_recording(
+            capture_recording = _begin_v2_recording(
                 session_id,
                 metadata,
                 lease_owner=capture_lease_owner,
             )
             capture_started = True
+
+        def abort_capture_setup() -> None:
+            nonlocal capture_started, capture_recording
+            recording = capture_recording
+            if v2_persistence is None or recording is None:
+                capture_started = False
+                capture_recording = None
+                return
+            v2_persistence.abort_recording_setup(
+                meeting_id=session_id,
+                track=str(recording["track"]),
+                epoch=int(recording["epoch"]),
+                lease_owner=capture_lease_owner,
+                capture_generation=int(recording["capture_generation"]),
+                now_ms=time.time_ns() // 1_000_000,
+            )
+            capture_started = False
+            capture_recording = None
 
         async def heartbeat_capture() -> None:
             while True:
@@ -2134,6 +4542,8 @@ def create_app(
                     session_id,
                     source_type=capture_source_type,
                     lease_owner=capture_lease_owner,
+                    track_id=(str(capture_recording.get("track")) if capture_recording else native_track_id),
+                    epoch=(int(capture_recording.get("epoch") or 0) if capture_recording else int(native_capture_epoch or 0)),
                 )
                 if not renewed:
                     _log.error(
@@ -2166,11 +4576,13 @@ def create_app(
                     lease_owner=capture_lease_owner,
                 ),
                 "on_audio_recording_started": begin_capture,
+                "on_audio_recording_setup_failed": abort_capture_setup,
                 "on_audio_recording_sealed": lambda metadata: _seal_v2_recording(
                     session_id,
                     metadata,
                     lease_owner=capture_lease_owner,
                 ),
+                "audio_asset_lock": _recording_asset_lock(session_id),
             }
             if not degradation.can_run_asr():
                 await asr_stream.handle_recording_only_stream(
@@ -2180,6 +4592,9 @@ def create_app(
                     audio_source=audio_source,
                     audio_asset_data_dir=data_dir_path,
                     degradation_reason="degradation_level_3_recording_only",
+                    pcm_protocol=pcm_protocol,
+                    native_track_id=native_track_id if native_source else None,
+                    native_capture_epoch=native_capture_epoch,
                     **common_recording_callbacks,
                 )
                 return
@@ -2191,11 +4606,23 @@ def create_app(
                 audio_source=audio_source,
                 audio_asset_data_dir=data_dir_path,
                 l3_normalize_enabled=l3_normalize_enabled,
-                on_final_committed=lambda event: _commit_v2_final(session_id, event),
+                on_final_committed=lambda event: _commit_v2_final(
+                    session_id,
+                    {
+                        **event,
+                        "source_track": _transcript_source_track(audio_source),
+                        "use_source_segment_namespace": _uses_source_segment_namespace(audio_source),
+                    },
+                ),
                 on_audio_active=lambda observation: _record_audio_active(
                     session_id,
                     observation,
                 ),
+                diarization_persistence=v2_persistence,
+                diarization_enabled=v2_persistence is not None,
+                pcm_protocol=pcm_protocol,
+                native_track_id=native_track_id if native_source else None,
+                native_capture_epoch=native_capture_epoch,
                 **common_recording_callbacks,
             )
         finally:
@@ -2764,8 +5191,7 @@ def create_app(
                     (
                         export
                         for export in exports
-                        if str(export.get("status") or "") == "succeeded"
-                        and isinstance(export.get("output"), dict)
+                        if str(export.get("status") or "") == "succeeded" and isinstance(export.get("output"), dict)
                     ),
                     None,
                 )
@@ -2970,6 +5396,7 @@ def create_app(
                         "purpose": "auto_suggestion",
                     },
                 )
+            config = llm_service.realtime_config(config)
             _ensure_llm_provider_allowed_for_derivation(
                 config,
                 allow_non_acceptance_execution=False,
@@ -3203,6 +5630,7 @@ def create_app(
                     status_code=422,
                     detail="Realtime correction requires LLM_GATEWAY_BASE_URL / LLM_GATEWAY_API_KEY",
                 )
+            config = llm_service.realtime_config(config)
             _ensure_llm_provider_allowed_for_derivation(config, allow_non_acceptance_execution=False)
             audit_metadata = llm_service.provider_audit_metadata(
                 config,
@@ -3526,7 +5954,10 @@ def create_app(
                 corrected_batch, usage, degraded = asr_correct.correct_transcript(
                     indexed_batch,
                     replace(config, timeout_seconds=min(config.timeout_seconds, 25.0), max_retries=0),
+                    raise_on_failure=True,
                 )
+                if degraded:
+                    raise RuntimeError("strict realtime correction returned a degraded fallback")
                 _record_llm_usage(
                     session_id,
                     purpose="realtime_transcript_correction",
@@ -3535,6 +5966,8 @@ def create_app(
                 )
             except Exception as exc:
                 completed_at_ms = int(time.time() * 1_000)
+                provider_retryable = bool(getattr(exc, "retryable", False))
+                terminal_failure_threshold = 2 if provider_retryable else 1
 
                 def commit_provider_failure(latest: dict[str, Any]) -> dict[str, Any]:
                     existing = dict(latest.get("realtime_transcript_correction") or {})
@@ -3545,7 +5978,9 @@ def create_app(
                     for segment_id in segment_ids:
                         failure_counts[segment_id] = failure_counts.get(segment_id, 0) + 1
                     terminal_failed_segment_ids = sorted(
-                        segment_id for segment_id, count in failure_counts.items() if count >= 2
+                        segment_id
+                        for segment_id, count in failure_counts.items()
+                        if count >= terminal_failure_threshold
                     )
                     failed = realtime_transcript_correction.apply_revision_events(
                         latest,
@@ -3574,13 +6009,11 @@ def create_app(
                         retry=retry_count > 0,
                     )
 
-                asr_live_repo.update(session_id, commit_provider_failure)
-                raise HTTPException(
-                    status_code=502,
-                    detail=llm_service.provider_error_payload(
-                        error_code="realtime_correction_provider_failed",
-                        message="Realtime correction provider request failed",
-                    ),
+                failed_record = asr_live_repo.update(session_id, commit_provider_failure)
+                failed_status = dict(failed_record.get("realtime_transcript_correction") or {})
+                terminal_segment_ids = set(failed_status.get("terminal_failed_segment_ids") or [])
+                raise RealtimeCorrectionProviderError(
+                    retryable=(provider_retryable and not set(segment_ids).issubset(terminal_segment_ids)),
                 ) from exc
             decoded = realtime_transcript_correction.decode_indexed_batch(corrected_batch, final_events)
             batch_at_ms = max((int(event.get("at_ms") or 0) for event in final_events), default=0)
@@ -3787,9 +6220,7 @@ def create_app(
         finally:
             lane_lease.release()
 
-    app.state.run_asr_live_session_realtime_corrections_once = (
-        run_asr_live_session_realtime_corrections_once
-    )
+    app.state.run_asr_live_session_realtime_corrections_once = run_asr_live_session_realtime_corrections_once
 
     def _get_asr_live_record_for_derivation(session_id: str) -> dict[str, Any]:
         try:
@@ -4202,6 +6633,7 @@ def create_app(
                         "LLM_GATEWAY_API_KEY not configured in environment"
                     ),
                 )
+            config = llm_service.realtime_config(config)
             _ensure_llm_provider_allowed_for_derivation(
                 config,
                 allow_non_acceptance_execution=allow_non_acceptance_execution,
@@ -4485,7 +6917,10 @@ def create_app(
             allow_non_acceptance_execution=allow_non_acceptance_execution,
         )
         _enforce_llm_budget(session_id, purpose="minutes_markdown", config=config)
-        markdown, usage, degraded = llm_service.build_minutes(_transcript_text_from_record(record), config)
+        markdown, structured, usage, degraded = llm_service.build_minutes_artifact(
+            _transcript_text_from_record(record),
+            config,
+        )
         _record_llm_usage(
             session_id,
             purpose="minutes_markdown",
@@ -4494,6 +6929,7 @@ def create_app(
         )
         minutes_payload = {
             "minutes_md": markdown,
+            "minutes_json": structured,
             "llm_usage": usage,
             "degraded": degraded,
         }
@@ -4506,6 +6942,7 @@ def create_app(
             "session_id": session_id,
             "execution_boundary": execution_boundary,
             "minutes_md": markdown,
+            "minutes": structured,
             "llm_usage": usage,
             "degraded": degraded,
             **(
@@ -4541,7 +6978,10 @@ def create_app(
         )
         llm_provider = llm_service.provider_metadata(config)
         _enforce_llm_budget(session_id, purpose="minutes_json", config=config)
-        parsed, usage, degraded = llm_service.build_minutes_json(_transcript_text_from_record(record), config)
+        markdown, parsed, usage, degraded = llm_service.build_minutes_artifact(
+            _transcript_text_from_record(record),
+            config,
+        )
         _record_llm_usage(
             session_id,
             purpose="minutes_json",
@@ -4551,7 +6991,10 @@ def create_app(
         minutes = dict(record.get("minutes") or {})
         minutes.update(
             {
+                "minutes_md": markdown,
                 "minutes_json": parsed,
+                "llm_usage": usage,
+                "degraded": degraded,
                 "minutes_json_llm_usage": usage,
                 "minutes_json_degraded": degraded,
             }
@@ -4564,6 +7007,7 @@ def create_app(
         return {
             "session_id": session_id,
             "execution_boundary": execution_boundary,
+            "minutes_md": markdown,
             "minutes": parsed,
             "llm_provider": llm_provider,
             "llm_usage": usage,
@@ -5334,7 +7778,7 @@ def create_app(
         *,
         attributes: dict[str, Any] | None = None,
     ) -> None:
-        pipeline_traces.record(
+        pipeline_traces.observe(
             str(job["id"]),
             stage,
             meeting_id=str(job["meeting_id"]),
@@ -5366,17 +7810,11 @@ def create_app(
                 "elapsed_ms": int(gate.get("elapsed_ms") or 0),
                 "retry_after_ms": int(gate.get("retry_after_ms") or 0),
                 "oversized_segment_count": len(gate.get("oversized_segment_ids") or []),
-                "policy_version": str(
-                    gate.get("policy_version")
-                    or realtime_transcript_correction.POLICY_VERSION
-                ),
+                "policy_version": str(gate.get("policy_version") or realtime_transcript_correction.POLICY_VERSION),
             },
             "status": {
                 "status": str(status.get("status") or "unknown"),
-                "policy_version": str(
-                    status.get("policy_version")
-                    or realtime_transcript_correction.POLICY_VERSION
-                ),
+                "policy_version": str(status.get("policy_version") or realtime_transcript_correction.POLICY_VERSION),
                 "processed_segment_count": len(status.get("processed_segment_ids") or []),
                 "revised_segment_count": len(status.get("revised_segment_ids") or []),
                 "skipped_segment_count": len(status.get("skipped_segment_ids") or []),
@@ -5385,11 +7823,226 @@ def create_app(
             "v2_reconciliation": reconciliation,
         }
 
-    def _default_v2_correction_job_handler(job: dict[str, Any]) -> dict[str, Any]:
-        result = app.state.run_asr_live_session_realtime_corrections_once(
-            str(job["meeting_id"]),
-            RunRealtimeCorrectionsRequest(force=str(job.get("idempotency_key") or "").endswith("meeting.ended")),
+    async def _default_v2_intelligence_job_handler(job: dict[str, Any]) -> dict[str, Any]:
+        """Run the single LLM-first semantic lane for the packaged runtime."""
+
+        if v2_persistence is None:
+            raise RuntimeError("V2 persistence is unavailable")
+        config = llm_service.LlmConfig.from_env()
+        if config is None:
+            raise ProviderRuntimeNotConfiguredDeferred()
+        config = llm_service.realtime_config(config)
+        _ensure_llm_provider_allowed_for_derivation(
+            config,
+            allow_non_acceptance_execution=False,
         )
+        meeting_id = str(job["meeting_id"])
+        all_segments = _v2_complete_transcript(v2_persistence, meeting_id)
+        target_id = str(job.get("evidence_segment_id") or "")
+        target = next(
+            (segment for segment in all_segments if str(segment.get("segment_id") or "") == target_id),
+            None,
+        )
+        if target is None:
+            raise RuntimeError("intelligence evidence segment no longer exists")
+        semantic_paragraphs = v2_persistence.list_semantic_paragraphs(meeting_id).get("paragraphs") or []
+        target_paragraph = next(
+            (paragraph for paragraph in semantic_paragraphs if target_id in set(paragraph.get("checkpoint_ids") or [])),
+            None,
+        )
+        if target_paragraph is not None:
+            paragraph_ids = set(target_paragraph.get("checkpoint_ids") or [])
+            new_segments = [
+                segment for segment in all_segments if str(segment.get("segment_id") or "") in paragraph_ids
+            ]
+            first_paragraph_seq = (
+                min(int(segment.get("transcript_seq") or 0) for segment in new_segments)
+                if new_segments
+                else int(target.get("transcript_seq") or 0)
+            )
+            context = [
+                segment for segment in all_segments if int(segment.get("transcript_seq") or 0) < first_paragraph_seq
+            ][-3:]
+        else:
+            new_segments = [target]
+            context = [
+                segment
+                for segment in all_segments
+                if int(segment.get("transcript_seq") or 0) < int(target.get("transcript_seq") or 0)
+            ][-3:]
+        snapshot = v2_persistence.get_snapshot(meeting_id, segment_limit=100)
+        topic = snapshot.get("current_topic") or {}
+        rolling_state = {
+            "topic": {
+                "title": str(topic.get("text") or ""),
+                "summary": str((topic.get("evidence") or {}).get("summary") or ""),
+            }
+            if topic
+            else None,
+            "open_items": [
+                {
+                    "id": str(item.get("id") or ""),
+                    "type": kind,
+                    "text": str(item.get("text") or ""),
+                    "status": str(item.get("status") or ""),
+                }
+                for kind, items in (
+                    ("decision", snapshot.get("decision_candidates") or []),
+                    ("action_item", snapshot.get("action_items") or []),
+                    ("risk", snapshot.get("risks") or []),
+                    ("open_question", snapshot.get("open_questions") or []),
+                )
+                for item in items[-24:]
+            ],
+            "version": int(job.get("input_version") or 1),
+        }
+        preparation = meeting_preparation_store.get(meeting_id) if meeting_preparation_store is not None else None
+        request = RealtimeIntelligenceRequest.from_payload(
+            meeting_id=meeting_id,
+            state_revision=int(job.get("input_version") or 1),
+            new_paragraphs=[
+                {
+                    "id": str(segment.get("segment_id") or ""),
+                    "text": str(segment.get("normalized_text") or segment.get("text") or ""),
+                    "revision": int(segment.get("revision") or 1),
+                    "start_ms": segment.get("started_at_ms"),
+                    "end_ms": segment.get("ended_at_ms"),
+                    "speaker": segment.get("speaker"),
+                }
+                for segment in new_segments
+            ],
+            context_paragraphs=[
+                {
+                    "id": str(segment.get("segment_id") or ""),
+                    "text": str(segment.get("normalized_text") or segment.get("text") or ""),
+                    "revision": int(segment.get("revision") or 1),
+                    "start_ms": segment.get("started_at_ms"),
+                    "end_ms": segment.get("ended_at_ms"),
+                    "speaker": segment.get("speaker"),
+                }
+                for segment in context
+            ],
+            rolling_state=rolling_state,
+            glossary=list(preparation.hotwords) if preparation is not None else [],
+        )
+        provider = OpenAICompatibleStreamingProvider(
+            base_url=config.base_url,
+            api_key=config.api_key,
+            model=config.model,
+            client=app.state.streaming_llm_client,
+            timeout_seconds=min(config.timeout_seconds, 25.0),
+            api_style=config.api_style,
+        )
+
+        def before_intelligence_attempt(_attempt: int) -> None:
+            _enforce_llm_budget(
+                meeting_id,
+                purpose="realtime_intelligence",
+                config=config,
+            )
+
+        def record_intelligence_attempt_usage(usage: dict[str, Any] | None, _attempt: int) -> None:
+            _record_llm_usage(
+                meeting_id,
+                purpose="realtime_intelligence",
+                config=config,
+                usage=usage,
+            )
+
+        result = await run_realtime_intelligence(
+            request=request,
+            provider=provider,
+            before_attempt=before_intelligence_attempt,
+            on_usage=record_intelligence_attempt_usage,
+        )
+        formal_event_context = build_llm_first_event_context(
+            request=request,
+            response=result["response"],
+            job_id=str(job["id"]),
+            batch_id=realtime_intelligence_batch_id(request),
+            provider=llm_service.provider_identifier(config),
+            model=str(result.get("model") or config.model),
+            evidence_hash=str(target.get("evidence_hash") or "") or None,
+        )
+        app.state.llm_first_event_contexts[str(job["id"])] = formal_event_context
+        for stage, field in (
+            ("provider_connected", "connected_at"),
+            ("first_token", "first_token_at"),
+            ("provider_completed", "completed_at"),
+        ):
+            timestamp = (result.get("timings") or {}).get(field)
+            if isinstance(timestamp, (int, float)):
+                pipeline_traces.observe(
+                    str(job["id"]),
+                    stage,
+                    meeting_id=meeting_id,
+                    job_id=str(job["id"]),
+                    generation_id=str(job.get("generation_id") or "") or None,
+                    monotonic_ns=int(float(timestamp) * 1_000_000_000),
+                )
+        try:
+            applied = await asyncio.to_thread(
+                v2_persistence.apply_intelligence_response,
+                meeting_id=meeting_id,
+                job_id=str(job["id"]),
+                response=result["response"].to_dict(),
+                now_ms=time.time_ns() // 1_000_000,
+            )
+        except Exception as exc:
+            _log.error(
+                "meeting.v2.intelligence_projection_failed",
+                meeting_id=meeting_id,
+                job_id=str(job["id"]),
+                error_class=type(exc).__name__,
+                error_detail=str(exc),
+            )
+            raise
+        _mark_v2_job_stage(
+            job,
+            "validated",
+            attributes={
+                "revision_count": applied["revision_count"],
+                "state_change_count": applied["state_change_count"],
+                "ttft_ms": result["ttft_ms"],
+            },
+        )
+        _mark_v2_job_stage(
+            job,
+            "event_emitted",
+            attributes={"state_change_count": applied["state_change_count"]},
+        )
+        return {
+            "schema_version": "v2_realtime_intelligence_job_output.v1",
+            "applied": applied,
+            "formal_event_context": formal_event_context,
+            "transport_mode": result["transport_mode"],
+            "ttft_ms": result["ttft_ms"],
+            "repair_ttft_ms": result.get("repair_ttft_ms"),
+            "provider_attempt_count": result.get("provider_attempt_count", 1),
+            "repair_attempted": result.get("repair_attempted", False),
+            "usage": result.get("usage"),
+            "model": result.get("model"),
+        }
+
+    def _default_v2_correction_job_handler(job: dict[str, Any]) -> dict[str, Any]:
+        if v2_persistence is not None and v2_persistence.semantic_projection_mode == "llm_first":
+            return {
+                "schema_version": "v2_correction_job_output.v2",
+                "skipped": True,
+                "reason": "llm_first_intelligence_lane",
+            }
+        if llm_service.LlmConfig.from_env() is None:
+            raise ProviderRuntimeNotConfiguredDeferred()
+        force = str(job.get("idempotency_key") or "").endswith("meeting.ended") or int(job.get("attempts") or 0) > 1
+        try:
+            result = app.state.run_asr_live_session_realtime_corrections_once(
+                str(job["meeting_id"]),
+                RunRealtimeCorrectionsRequest(force=force),
+            )
+        except HTTPException as exc:
+            if exc.status_code in {422, 503} and llm_service.LlmConfig.from_env() is None:
+                raise ProviderRuntimeNotConfiguredDeferred() from None
+            raise
         persisted_revisions = [
             dict(event)
             for event in (_get_asr_live_record_for_derivation(str(job["meeting_id"])).get("events") or [])
@@ -5509,12 +8162,19 @@ def create_app(
     ) -> dict[str, Any]:
         if v2_persistence is None:
             raise RuntimeError("V2 persistence is unavailable")
+        if v2_persistence.semantic_projection_mode == "llm_first":
+            return {
+                "generated_card_count": 0,
+                "reason": "llm_first_intelligence_lane",
+            }
         dependency_status = await _wait_for_blocked_quality_correction(job)
         if dependency_status != "ready":
             return {
                 "generated_card_count": 0,
                 "reason": dependency_status,
             }
+        if llm_service.LlmConfig.from_env() is None:
+            raise ProviderRuntimeNotConfiguredDeferred()
         session_id = str(job["meeting_id"])
         lane_lease = llm_lane_locks.try_acquire(session_id, "suggestion")
         if lane_lease is None:
@@ -5533,10 +8193,8 @@ def create_app(
 
             config = llm_service.LlmConfig.from_env()
             if config is None:
-                raise HTTPException(
-                    status_code=503,
-                    detail={"error": "llm_provider_not_configured", "purpose": "auto_suggestion"},
-                )
+                raise ProviderRuntimeNotConfiguredDeferred()
+            config = llm_service.realtime_config(config)
             _ensure_llm_provider_allowed_for_derivation(
                 config,
                 allow_non_acceptance_execution=False,
@@ -5587,6 +8245,7 @@ def create_app(
                 model=config.model,
                 client=streaming_client,
                 timeout_seconds=min(config.timeout_seconds, 25.0),
+                api_style=config.api_style,
             )
             try:
                 result = await generate_streaming_suggestion(
@@ -5630,7 +8289,7 @@ def create_app(
             ):
                 timestamp = timings.get(field)
                 if isinstance(timestamp, (int, float)):
-                    pipeline_traces.record(
+                    pipeline_traces.observe(
                         str(job["id"]),
                         stage,
                         meeting_id=session_id,
@@ -5712,63 +8371,88 @@ def create_app(
         finally:
             lane_lease.release()
 
+    app.state.v2_intelligence_job_handler_impl = _default_v2_intelligence_job_handler
     app.state.v2_correction_job_handler_impl = _default_v2_correction_job_handler
     app.state.v2_suggestion_job_handler_impl = _default_v2_suggestion_job_handler
 
     def _wait_for_v2_correction_jobs(
         meeting_id: str,
         *,
-        timeout_seconds: float = 30.0,
-    ) -> None:
+        timeout_seconds: float = 8.0,
+    ) -> dict[str, Any]:
         if v2_persistence is None:
-            return
+            return {"correction_degraded": True, "reason": "v2_persistence_unavailable"}
+        lane = "intelligence" if v2_persistence.semantic_projection_mode == "llm_first" else "correction"
         deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < deadline:
             correction_jobs = v2_persistence.list_jobs(
                 meeting_id=meeting_id,
-                lane="correction",
+                lane=lane,
             )
-            terminal_failures = [
-                item
-                for item in correction_jobs
-                if item["status"] == "failed"
-                or (
-                    item["status"] == "cancelled"
-                    and item.get("error_class") != "evidence_superseded"
+            active = [item for item in correction_jobs if item["status"] in {"pending", "running", "retry_wait"}]
+            if active and all(
+                item["status"] == "retry_wait" and item.get("error_class") == "ProviderRuntimeNotConfiguredDeferred"
+                for item in active
+            ):
+                return {
+                    "correction_degraded": True,
+                    "reason": f"{lane}_provider_not_configured",
+                    "lane": lane,
+                    "job_count": len(correction_jobs),
+                }
+            if not active:
+                succeeded = [item for item in correction_jobs if item["status"] == "succeeded"]
+                degraded = not correction_jobs or not succeeded
+                reason = (
+                    f"{lane}_jobs_missing"
+                    if not correction_jobs
+                    else f"{lane}_has_no_successful_job"
+                    if not succeeded
+                    else None
                 )
-            ]
-            if terminal_failures:
-                statuses = ",".join(f"{item['id']}={item['status']}" for item in terminal_failures)
-                raise RuntimeError(f"post-meeting output blocked by transcript correction: {statuses}")
-            if not any(item["status"] in {"pending", "running", "retry_wait"} for item in correction_jobs):
-                if (
-                    not correction_jobs
-                    and v2_persistence.list_transcript_segments(
-                        meeting_id,
-                        limit=1,
-                    )["segments"]
-                ):
-                    raise RuntimeError("post-meeting output blocked: transcript correction jobs are missing")
-                if correction_jobs and not any(item["status"] == "succeeded" for item in correction_jobs):
-                    raise RuntimeError(
-                        "post-meeting output blocked: transcript correction has no successful replacement"
+                if degraded:
+                    _log.warning(
+                        "meeting.post_job.realtime_quality_degraded",
+                        meeting_id=meeting_id,
+                        lane=lane,
+                        reason=reason,
                     )
-                return
+                return {
+                    "correction_degraded": degraded,
+                    "reason": reason,
+                    "lane": lane,
+                    "job_count": len(correction_jobs),
+                }
             time.sleep(0.1)
-        raise TimeoutError("post-meeting job timed out waiting for transcript correction")
+        _log.warning(
+            "meeting.post_job.realtime_quality_wait_timeout",
+            meeting_id=meeting_id,
+            lane=lane,
+            timeout_seconds=timeout_seconds,
+        )
+        return {
+            "correction_degraded": True,
+            "reason": f"{lane}_wait_timeout",
+            "lane": lane,
+        }
 
     app.state.wait_for_v2_correction_jobs = _wait_for_v2_correction_jobs
 
     def _run_v2_minutes_job(job: dict[str, Any]) -> dict[str, Any]:
         if v2_persistence is None:
             raise RuntimeError("V2 persistence is unavailable")
-        _wait_for_v2_correction_jobs(str(job["meeting_id"]))
-        result = _asr_live_session_minutes_response(
-            str(job["meeting_id"]),
-            CreateLlmExecutionRunsRequest(mode="enabled"),
-            allow_non_acceptance_execution=False,
-            execution_boundary="durable_post_meeting_job",
-        )
+        quality_gate = _wait_for_v2_correction_jobs(str(job["meeting_id"]))
+        try:
+            result = _asr_live_session_minutes_response(
+                str(job["meeting_id"]),
+                CreateLlmExecutionRunsRequest(mode="enabled"),
+                allow_non_acceptance_execution=False,
+                execution_boundary="durable_post_meeting_job",
+            )
+        except HTTPException as exc:
+            if exc.status_code in {422, 503} and llm_service.LlmConfig.from_env() is None:
+                raise ProviderRuntimeNotConfiguredDeferred() from None
+            raise
         markdown = str(result.get("minutes_md") or "").strip()
         if not markdown:
             raise RuntimeError("minutes job returned empty markdown")
@@ -5776,40 +8460,60 @@ def create_app(
             meeting_id=str(job["meeting_id"]),
             job_id=str(job["id"]),
             markdown=markdown,
-            structured=None,
-            degraded=bool(result.get("degraded")),
+            structured=(dict(result["minutes"]) if isinstance(result.get("minutes"), dict) else None),
+            degraded=bool(result.get("degraded")) or bool(quality_gate["correction_degraded"]),
             now_ms=time.time_ns() // 1_000_000,
         )
-        return {**result, "v2_minutes": artifact}
+        return {
+            **result,
+            "correction_degraded": bool(quality_gate["correction_degraded"]),
+            "correction_degraded_reason": quality_gate.get("reason"),
+            "v2_minutes": artifact,
+        }
 
     def _run_v2_approach_job(job: dict[str, Any]) -> dict[str, Any]:
         if v2_persistence is None:
             raise RuntimeError("V2 persistence is unavailable")
-        _wait_for_v2_correction_jobs(str(job["meeting_id"]))
-        result = _asr_live_session_approach_cards_response(
-            str(job["meeting_id"]),
-            CreateLlmExecutionRunsRequest(mode="enabled"),
-            allow_non_acceptance_execution=False,
-            execution_boundary="durable_post_meeting_job",
-        )
+        quality_gate = _wait_for_v2_correction_jobs(str(job["meeting_id"]))
+        try:
+            result = _asr_live_session_approach_cards_response(
+                str(job["meeting_id"]),
+                CreateLlmExecutionRunsRequest(mode="enabled"),
+                allow_non_acceptance_execution=False,
+                execution_boundary="durable_post_meeting_job",
+            )
+        except HTTPException as exc:
+            if exc.status_code in {422, 503} and llm_service.LlmConfig.from_env() is None:
+                raise ProviderRuntimeNotConfiguredDeferred() from None
+            raise
         artifact = v2_persistence.save_approach_cards(
             meeting_id=str(job["meeting_id"]),
             job_id=str(job["id"]),
             cards=[dict(card) for card in result.get("approach_cards") or []],
-            degraded=bool(result.get("degraded")),
+            degraded=bool(result.get("degraded")) or bool(quality_gate["correction_degraded"]),
             now_ms=time.time_ns() // 1_000_000,
         )
-        return {**result, "v2_approach": artifact}
+        return {
+            **result,
+            "correction_degraded": bool(quality_gate["correction_degraded"]),
+            "correction_degraded_reason": quality_gate.get("reason"),
+            "v2_approach": artifact,
+        }
 
     def _run_v2_index_job(job: dict[str, Any]) -> dict[str, Any]:
         if v2_persistence is None:
             raise RuntimeError("V2 persistence is unavailable")
-        _wait_for_v2_correction_jobs(str(job["meeting_id"]))
-        return v2_persistence.rebuild_search_document(
+        quality_gate = _wait_for_v2_correction_jobs(str(job["meeting_id"]))
+        indexed = v2_persistence.rebuild_search_document(
             meeting_id=str(job["meeting_id"]),
             job_id=str(job["id"]),
             now_ms=time.time_ns() // 1_000_000,
         )
+        return {
+            **indexed,
+            "correction_degraded": bool(quality_gate["correction_degraded"]),
+            "correction_degraded_reason": quality_gate.get("reason"),
+        }
 
     app.state.v2_post_job_handler_impls = {
         "minutes": _run_v2_minutes_job,
@@ -5843,6 +8547,9 @@ def create_app(
                     repo.delete(meeting_id)
                 except KeyError:
                     pass
+                if meeting_preparation_store is not None:
+                    meeting_preparation_store.delete(meeting_id)
+                asr_stream.clear_session_hotwords(meeting_id)
                 return v2_persistence.complete_deletion_and_purge(
                     job_id=str(job["id"]),
                     now_ms=time.time_ns() // 1_000_000,
@@ -5865,6 +8572,8 @@ def create_app(
             track=str(job["track"]),
             epoch=int(job["epoch"]),
         )
+        output_relative_path = str(job["output_relative_path"])
+        uses_track_layout = "/tracks/" in f"/{output_relative_path}"
         with _recording_asset_lock(str(job["meeting_id"])):
             metadata = audio_assets.assemble_realtime_wav_asset(
                 data_dir=data_dir_path,
@@ -5874,6 +8583,9 @@ def create_app(
                 expected_chunk_count=int(job["input_chunk_count"]),
                 expected_sample_count=int(job["input_sample_count"]),
                 expected_journal_sha256=str(job["input_journal_sha256"]),
+                track_id=str(job["track"]) if uses_track_layout else None,
+                epoch=int(job["epoch"]),
+                started_at_ms=int(recording["started_at_ms"]),
             )
         try:
             asr_live_repo.update(
@@ -5901,6 +8613,10 @@ def create_app(
         _mark_v2_job_stage(job, "job_claimed", attributes={"lane": "correction"})
         return app.state.v2_correction_job_handler_impl(job)
 
+    async def _run_v2_intelligence_job(job: dict[str, Any]) -> dict[str, Any]:
+        _mark_v2_job_stage(job, "job_claimed", attributes={"lane": "intelligence"})
+        return await app.state.v2_intelligence_job_handler_impl(job)
+
     def _run_v2_suggestion_job(job: dict[str, Any]) -> Any:
         _mark_v2_job_stage(job, "job_claimed", attributes={"lane": "suggestion"})
         return app.state.v2_suggestion_job_handler_impl(job)
@@ -5912,10 +8628,13 @@ def create_app(
             correction_handler=_run_v2_correction_job,
             suggestion_handler=_run_v2_suggestion_job,
             additional_handlers={
+                "intelligence": _run_v2_intelligence_job,
                 "minutes": lambda job: _dispatch_v2_post_job("minutes", job),
                 "approach": lambda job: _dispatch_v2_post_job("approach", job),
                 "index": lambda job: _dispatch_v2_post_job("index", job),
             },
+            retry_observer=pipeline_traces.record_retry,
+            cancellation_observer=pipeline_traces.record_cancelled,
         )
     app.state.v2_executor = v2_executor
     app.state.streaming_llm_client = None
@@ -5927,21 +8646,65 @@ def create_app(
                 trust_env=False,
             )
         if v2_executor is not None:
-            for deletion_job in v2_persistence.list_deletion_jobs(
-                statuses=("pending", "running"),
-            ):
-                try:
-                    await asyncio.to_thread(_execute_v2_deletion_job, deletion_job)
-                except (OSError, sqlite3.Error, ValueError, KeyError) as exc:
-                    _log.error(
-                        "v2_deletion_recovery_failed",
-                        deletion_job_id=deletion_job["id"],
-                        meeting_id=deletion_job["meeting_id"],
-                        error_class=type(exc).__name__,
-                    )
             if recording_export_executor is not None:
                 await recording_export_executor.start()
             await v2_executor.start()
+
+    async def _start_data_governance() -> None:
+        if data_governance_service is None or v2_persistence is None:
+            return
+        for deletion_job in v2_persistence.list_deletion_jobs(
+            statuses=("pending", "running", "failed"),
+        ):
+            try:
+                await asyncio.to_thread(
+                    data_governance_service.execute_deletion_job,
+                    job_id=str(deletion_job["id"]),
+                    now_ms=time.time_ns() // 1_000_000,
+                )
+            except (OSError, sqlite3.Error, ValueError, KeyError) as exc:
+                _log.error(
+                    "v2_deletion_recovery_failed",
+                    deletion_job_id=deletion_job["id"],
+                    meeting_id=deletion_job["meeting_id"],
+                    error_class=type(exc).__name__,
+                )
+        try:
+            retention_result = await asyncio.to_thread(
+                data_governance_service.run_retention_if_due,
+                now_ms=time.time_ns() // 1_000_000,
+            )
+            if retention_result.get("claimed"):
+                _log.info(
+                    "meeting.data_governance.retention_completed",
+                    deletion_job_count=len(retention_result.get("deletion_jobs") or []),
+                    error_count=len(retention_result.get("errors") or []),
+                )
+        except (OSError, sqlite3.Error, ValueError, KeyError) as exc:
+            _log.error(
+                "meeting.data_governance.retention_failed",
+                error_class=type(exc).__name__,
+            )
+
+    async def _start_recording_import_runtime() -> None:
+        if not _recording_import_runtime_ready() or v2_persistence is None:
+            _log.warning("meeting.recording_import.runtime_unavailable")
+            return
+        recovered = await asyncio.to_thread(
+            v2_persistence.recover_interrupted_import_jobs,
+            now_ms=time.time_ns() // 1_000_000,
+        )
+        if recovered:
+            _log.info("meeting.recording_import.recovered", count=recovered)
+        existing = app.state.recording_import_worker_task
+        if existing is not None and not existing.done():
+            return
+        recording_import_stop_event.clear()
+        recording_import_wake_event.set()
+        app.state.recording_import_worker_task = asyncio.create_task(
+            _recording_import_worker(),
+            name="recording-import-worker",
+        )
 
     async def _start_desktop_parent_watchdog() -> None:
         parent_pid = desktop_parent_watchdog.configured_parent_pid()
@@ -5959,6 +8722,21 @@ def create_app(
             if os.environ.get("MEETING_COPILOT_DESKTOP_RUNTIME") == "1" and not ready:
                 raise RuntimeError("packaged desktop FunASR resident worker failed to become ready")
 
+    async def _recover_abandoned_desktop_recordings() -> None:
+        if os.environ.get("MEETING_COPILOT_DESKTOP_RUNTIME") != "1" or v2_persistence is None or data_dir_path is None:
+            return
+        recovered = await asyncio.to_thread(
+            reconcile_and_recover_abandoned_recordings,
+            v2_persistence,
+            data_dir=data_dir_path,
+            now_ms=time.time_ns() // 1_000_000,
+        )
+        if recovered:
+            _log.warning(
+                "meeting.recording.runtime_restart_recovered",
+                count=len(recovered),
+            )
+
     async def _stop_desktop_parent_watchdog() -> None:
         task = app.state.desktop_parent_watchdog_task
         app.state.desktop_parent_watchdog_task = None
@@ -5971,6 +8749,17 @@ def create_app(
         cancelled_count = await _cancel_active_capture_tasks(active_v2_capture_tasks)
         if cancelled_count:
             _log.info("meeting.capture.shutdown_cancelled", count=cancelled_count)
+
+    async def _stop_recording_import_runtime() -> None:
+        task = app.state.recording_import_worker_task
+        app.state.recording_import_worker_task = None
+        if task is None:
+            return
+        recording_import_stop_event.set()
+        recording_import_wake_event.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
     async def _stop_v2_executor() -> None:
         if v2_executor is not None:
@@ -5986,16 +8775,27 @@ def create_app(
         if client is not None and not client.is_closed:
             await client.aclose()
 
+    async def _checkpoint_realtime_slo() -> None:
+        await asyncio.to_thread(
+            realtime_slo.checkpoint,
+            active_traces=pipeline_traces.slo_snapshots(),
+        )
+
     async def _stop_funasr_resident_worker() -> None:
         await asyncio.to_thread(asr_stream.shutdown_funasr_resident_manager)
 
+    app.router.add_event_handler("startup", _recover_abandoned_desktop_recordings)
     app.router.add_event_handler("startup", _start_funasr_resident_worker)
     app.router.add_event_handler("startup", _start_desktop_parent_watchdog)
+    app.router.add_event_handler("startup", _start_data_governance)
     app.router.add_event_handler("startup", _start_v2_executor)
+    app.router.add_event_handler("startup", _start_recording_import_runtime)
     app.router.add_event_handler("shutdown", _stop_desktop_parent_watchdog)
     app.router.add_event_handler("shutdown", _stop_active_v2_capture_tasks)
+    app.router.add_event_handler("shutdown", _stop_recording_import_runtime)
     app.router.add_event_handler("shutdown", _stop_v2_executor)
     app.router.add_event_handler("shutdown", _stop_recording_export_executor)
+    app.router.add_event_handler("shutdown", _checkpoint_realtime_slo)
     app.router.add_event_handler("shutdown", _close_streaming_llm_client)
     app.router.add_event_handler("shutdown", _stop_funasr_resident_worker)
     app.router.add_event_handler("shutdown", _close_created_sqlite_repositories)
@@ -6941,7 +9741,11 @@ def create_runtime_app() -> FastAPI:
     runtime_data_dir = _runtime_data_dir()
     managed_log_stream = ManagedRotatingLogStream(data_dir=runtime_data_dir)
     configure_logging(stream=managed_log_stream)
-    runtime_app = create_app(data_dir=runtime_data_dir, prewarm_funasr=True)
+    runtime_app = create_app(
+        data_dir=runtime_data_dir,
+        prewarm_funasr=True,
+        semantic_projection_mode="llm_first",
+    )
     runtime_app.state.managed_log_path = str(managed_log_stream.rotator.path)
     runtime_app.state.managed_log_stream = managed_log_stream
     return runtime_app

@@ -1,7 +1,9 @@
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { isMeetingAudioContentUrl } from "./meeting_audio_url_contract.mjs";
 
 const baseUrl = String(process.env.MEETING_COPILOT_BASE_URL || "http://127.0.0.1:8767").replace(/\/+$/, "");
 const meetingId = String(process.env.MEETING_COPILOT_MEETING_ID || "").trim();
@@ -23,15 +25,19 @@ let chrome;
 try {
   await mkdir(artifactRoot, { recursive: true });
   chrome = spawn(chromePath, [
-    "--headless=new",
     "--disable-gpu",
+    "--disable-background-networking",
+    "--disable-component-update",
+    "--disable-default-apps",
+    "--disable-sync",
+    "--metrics-recording-only",
     "--no-first-run",
     "--no-default-browser-check",
     `--remote-debugging-port=${chromePort}`,
     `--user-data-dir=${chromeUserDataDir}`,
     "about:blank",
   ], { stdio: "ignore" });
-  await waitForHttp(`http://127.0.0.1:${chromePort}/json/version`, 30_000);
+  await waitForHttp(`http://127.0.0.1:${chromePort}/json/version`, 60_000);
 
   const page = await createCdpPage(chromePort, `${baseUrl}/workbench`);
   await setViewport(page, { width: 1440, height: 900, mobile: false });
@@ -79,13 +85,19 @@ try {
   await capture(page, "04-transcript-desktop.png", { fullPage: false, width: 1440, height: 900 });
 
   await clickTab(page, "录音");
-  await waitFor(page, `document.querySelector('audio')?.getAttribute('src')?.includes('/audio/content') === true`);
+  await waitFor(
+    page,
+    `(${isMeetingAudioContentUrl.toString()})(document.querySelector('audio')?.getAttribute('src'), location.origin)`,
+  );
   const audio = await evaluate(page, () => ({
     source: document.querySelector("audio")?.getAttribute("src"),
     controls: document.querySelector("audio")?.controls === true,
     facts: document.querySelector(".audio-facts")?.textContent?.trim(),
   }));
-  assert(audio.controls && audio.source?.includes("/audio/content"), `audio player unavailable: ${JSON.stringify(audio)}`);
+  assert(
+    audio.controls && isMeetingAudioContentUrl(audio.source, baseUrl),
+    `audio player unavailable: ${JSON.stringify(audio)}`,
+  );
   await capture(page, "05-audio-desktop.png", { fullPage: false, width: 1440, height: 900 });
 
   await setViewport(page, { width: 375, height: 812, mobile: true });
@@ -134,8 +146,8 @@ try {
       diagnostics.network_failures,
       diagnostics.http_5xx,
     ].every((items) => items.length === 0) ? "go" : "no_go",
-    meeting_id: meetingId,
-    base_url: baseUrl,
+    meeting_id_hash: shortEvidenceHash(meetingId),
+    base_url_kind: new URL(baseUrl).hostname === "127.0.0.1" ? "loopback" : "non_loopback",
     home,
     review,
     transcript,
@@ -149,7 +161,7 @@ try {
   console.log(JSON.stringify({ verdict: report.verdict, artifact_root: artifactRoot, screenshots, home, review, transcript, audio, mobile }, null, 2));
 } finally {
   for (const socket of sockets) socket.close();
-  chrome?.kill("SIGTERM");
+  await terminateChild(chrome);
   await rm(chromeUserDataDir, { recursive: true, force: true });
 }
 
@@ -176,11 +188,36 @@ async function createCdpPage(debugPort, url) {
     }
     for (const handler of handlers.get(message.method) || []) handler(message.params || {});
   });
+  socket.addEventListener("close", () => {
+    for (const request of pending.values()) request.reject(new Error("Chrome DevTools connection closed"));
+    pending.clear();
+  });
   const page = {
-    send(method, params = {}) {
+    send(method, params = {}, timeoutMs = 15_000) {
       const id = nextId++;
-      socket.send(JSON.stringify({ id, method, params }));
-      return new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
+      return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          pending.delete(id);
+          reject(new Error(`Chrome DevTools command timed out: ${method}`));
+        }, timeoutMs);
+        pending.set(id, {
+          resolve(value) {
+            clearTimeout(timeout);
+            resolve(value);
+          },
+          reject(error) {
+            clearTimeout(timeout);
+            reject(error);
+          },
+        });
+        try {
+          socket.send(JSON.stringify({ id, method, params }));
+        } catch (error) {
+          pending.delete(id);
+          clearTimeout(timeout);
+          reject(error);
+        }
+      });
     },
     on(method, handler) {
       handlers.set(method, [...(handlers.get(method) || []), handler]);
@@ -194,12 +231,25 @@ async function createCdpPage(debugPort, url) {
   page.on("Network.requestWillBeSent", (params) => urls.set(params.requestId, params.request?.url || ""));
   page.on("Network.loadingFailed", (params) => {
     const url = urls.get(params.requestId) || "";
-    if (url.endsWith("/favicon.ico")) return;
-    if (url.includes("/audio/content") && params.errorText === "net::ERR_ABORTED") {
-      diagnostics.allowlisted_network_cancellations.push({ url, error: params.errorText, reason: "media_element_unloaded" });
+    const mediaCancellation = isMeetingAudioContentUrl(url, baseUrl) && params.errorText === "net::ERR_ABORTED";
+    const canceledWithoutRequestUrl = params.canceled === true && !url;
+    if (url.endsWith("/favicon.ico") || mediaCancellation || canceledWithoutRequestUrl) {
+      diagnostics.allowlisted_network_cancellations.push({
+        url: url || null,
+        error: params.errorText,
+        type: params.type || null,
+        canceled: params.canceled === true,
+        reason: mediaCancellation ? "media_element_unloaded" : "browser_request_cancelled_before_url_mapping",
+      });
       return;
     }
-    diagnostics.network_failures.push({ url, error: params.errorText });
+    diagnostics.network_failures.push({
+      url,
+      error: params.errorText,
+      type: params.type || null,
+      canceled: params.canceled === true,
+      blocked_reason: params.blockedReason || null,
+    });
   });
   page.on("Network.responseReceived", (params) => {
     if (Number(params.response?.status || 0) >= 500) diagnostics.http_5xx.push({ url: params.response?.url, status: params.response?.status });
@@ -248,7 +298,18 @@ async function capture(page, fileName, options) {
   });
   const output = path.join(artifactRoot, fileName);
   await writeFile(output, Buffer.from(result.data, "base64"));
-  screenshots.push(output);
+  screenshots.push(fileName);
+}
+
+async function terminateChild(child) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  const exited = new Promise((resolve) => child.once("exit", resolve));
+  try { child.kill("SIGTERM"); } catch { return; }
+  await Promise.race([exited, delay(3_000)]);
+  if (child.exitCode === null && child.signalCode === null) {
+    try { child.kill("SIGKILL"); } catch { return; }
+    await Promise.race([exited, delay(1_000)]);
+  }
 }
 
 async function waitFor(page, expression, timeoutMs = 15_000) {
@@ -275,6 +336,10 @@ async function waitForHttp(url, timeoutMs) {
 
 function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function shortEvidenceHash(value) {
+  return createHash("sha256").update(String(value)).digest("hex").slice(0, 16);
 }
 
 function assert(condition, message) {

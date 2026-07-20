@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-dual-track-adapter-collect-events"
+description = "Enables the dual_track_adapter_collect_events command without any pre-configured scope."
+commands.allow = ["dual_track_adapter_collect_events"]
+
+[[permission]]
+identifier = "deny-dual-track-adapter-collect-events"
+description = "Denies the dual_track_adapter_collect_events command without any pre-configured scope."
+commands.deny = ["dual_track_adapter_collect_events"]

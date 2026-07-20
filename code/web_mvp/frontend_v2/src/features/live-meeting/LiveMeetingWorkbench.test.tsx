@@ -2,9 +2,76 @@ import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { MeetingApi } from "../../api/client";
 import type { MeetingEventTransport } from "../../api/eventTransport";
-import type { MeetingSnapshot } from "../../domain/events";
+import type { FormalAiProvenance, MeetingSnapshot } from "../../domain/events";
 import { LiveMeetingWorkbench } from "./LiveMeetingWorkbench";
 import type { BrowserMicrophoneController } from "./useBrowserMicrophone";
+
+beforeEach(() => {
+  delete window.__TAURI__;
+  delete window.__TAURI_INTERNALS__;
+  vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+    if (String(input).endsWith("/v2/storage/preflight")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        allowed: true,
+        writable_capacity_bytes: 4 * 1024 ** 3,
+        estimated_meeting_bytes: 110 * 1024 ** 2,
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }));
+    }
+    return Promise.resolve(new Response(JSON.stringify({
+      llm: { configured: true, model: "gpt-test" },
+      asr: { realtime_asr_available: true, realtime_providers: ["funasr_realtime"] },
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }));
+  }));
+  Object.defineProperty(navigator, "mediaDevices", {
+    configurable: true,
+    value: {
+      enumerateDevices: vi.fn().mockResolvedValue([
+        {
+          kind: "audioinput",
+          deviceId: "mic-1",
+          label: "MacBook Microphone",
+          groupId: "group-1",
+          toJSON: () => ({}),
+        },
+      ]),
+      getUserMedia: vi.fn(),
+    },
+  });
+});
+
+async function confirmMeetingPreflight(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(screen.getByRole("button", { name: "开始会议" }));
+  const dialog = await screen.findByRole("dialog", { name: "准备开始会议" });
+  await within(dialog).findByText("本地中文实时识别可用");
+  await user.click(within(dialog).getByLabelText("我已告知参会者并确认可以录音"));
+  await user.click(within(dialog).getByRole("button", { name: "开始会议" }));
+}
+
+function formalAi(
+  suffix: string,
+  quote = "支付服务周五上线但是负责人还没定",
+): FormalAiProvenance {
+  return {
+    source: "llm_first",
+    jobId: `job-${suffix}`,
+    batchId: "batch-1",
+    provider: "openai_compatible_gateway",
+    model: "fixture-model",
+    llmCalled: true,
+    evidence: {
+      segmentIds: ["segment-1"],
+      quote,
+      evidenceHash: "hash-1",
+      stateRevision: 1,
+    },
+  };
+}
 
 function realSnapshot(): MeetingSnapshot {
   return {
@@ -47,14 +114,67 @@ function realSnapshot(): MeetingSnapshot {
         createdAtMs: 7_100,
         updatedAtMs: 7_800,
         committedAtMs: 7_800,
+        formalAi: formalAi("suggestion-1"),
       },
     ],
+    decisionCandidates: [
+      {
+        id: "decision-1",
+        text: "先灰度 5%",
+        status: "candidate",
+        confidence: 0.86,
+        evidenceSegmentIds: ["segment-1"],
+        evidenceSpans: [{
+          segmentId: "segment-1",
+          transcriptSeq: 1,
+          startMs: 2_000,
+          endMs: 6_000,
+          quote: "支付服务周五上线但是负责人还没定",
+        }],
+        updatedAtMs: 7_200,
+        formalAi: formalAi("decision-1"),
+      },
+      {
+        id: "decision-2",
+        text: "错误率超过 1% 就回滚",
+        status: "confirmed",
+        confidence: 0.94,
+        evidenceSegmentIds: ["segment-1"],
+        evidenceSpans: [],
+        updatedAtMs: 7_300,
+        formalAi: formalAi("decision-2"),
+      },
+    ],
+    actionItems: [{
+      id: "action-1",
+      text: "补充回滚演练",
+      status: "candidate",
+      confidence: 0.81,
+      evidenceSegmentIds: ["segment-1"],
+      evidenceSpans: [],
+      owner: "张三",
+      deadline: "周五",
+      updatedAtMs: 7_400,
+      formalAi: formalAi("action-1"),
+    }],
+    risks: [{
+      id: "risk-1",
+      text: "P99 延迟可能超标",
+      status: "candidate",
+      confidence: 0.75,
+      evidenceSegmentIds: ["segment-1"],
+      evidenceSpans: [],
+      mitigation: "超过 900ms 立即回滚",
+      updatedAtMs: 7_500,
+      formalAi: formalAi("risk-1"),
+    }],
     currentTopic: {
       id: "topic-1",
       text: "支付服务上线安排",
       status: "active",
       evidenceSegmentIds: ["segment-1"],
       updatedAtMs: 7_000,
+      formalAi: formalAi("topic-1"),
     },
     openQuestions: [
       {
@@ -63,6 +183,7 @@ function realSnapshot(): MeetingSnapshot {
         status: "open",
         evidenceSegmentIds: ["segment-1"],
         updatedAtMs: 7_000,
+        formalAi: formalAi("question-1"),
       },
     ],
     minutes: null,
@@ -83,11 +204,33 @@ function realSnapshot(): MeetingSnapshot {
 function dependencies() {
   const api: MeetingApi = {
     createMeeting: vi.fn().mockResolvedValue(undefined),
+    saveMeetingPreparation: vi.fn().mockResolvedValue(undefined),
     importRecording: vi.fn().mockResolvedValue({ meetingId: "imported-meeting" }),
+    retryImportJob: vi.fn().mockResolvedValue({
+      id: "import-job-1",
+      meetingId: "imported-meeting",
+      status: "pending",
+      stage: "reading",
+      progress: 0,
+      errorClass: null,
+      errorMessage: null,
+      retryable: false,
+      updatedAtMs: Date.now(),
+    }),
+    updateMeetingTitle: vi.fn().mockResolvedValue(undefined),
     deleteMeeting: vi.fn().mockResolvedValue(undefined),
     listMeetings: vi.fn().mockResolvedValue({ meetings: [] }),
     getSnapshot: vi.fn().mockResolvedValue(realSnapshot()),
     getTranscript: vi.fn().mockResolvedValue(realSnapshot().segments),
+    getSpeakers: vi.fn().mockResolvedValue([]),
+    renameSpeaker: vi.fn().mockImplementation(async (meetingId, speakerId, speakerLabel) => ({
+      meetingId,
+      speakerId,
+      speakerLabel,
+      ordinal: 1,
+      createdAtMs: 1_000,
+      updatedAtMs: 2_000,
+    })),
     getEvents: vi.fn().mockResolvedValue({
       meetingId: "meeting-1",
       afterSeq: 4,
@@ -108,8 +251,27 @@ function dependencies() {
       format: "wav",
       chunks: [],
     }),
+    exportMeeting: vi.fn().mockResolvedValue(undefined),
+    exportDiagnosticBundle: vi.fn().mockResolvedValue(undefined),
+    saveReviewDocument: vi.fn().mockImplementation(async (meetingId, kind, expectedRevision, contentJson) => ({
+      documentId: `${meetingId}-${kind}`,
+      meetingId,
+      kind,
+      revision: expectedRevision + 1,
+      sourceRevision: null,
+      contentJson,
+      aiVersion: 1,
+      userVersion: 1,
+      source: "user_final",
+      dirtyState: null,
+      updatedAtMs: Date.now(),
+    })),
+    getDocumentRevisions: vi.fn().mockResolvedValue([]),
+    regenerateDocument: vi.fn().mockResolvedValue(undefined),
+    retryReviewJob: vi.fn().mockResolvedValue(undefined),
     endMeeting: vi.fn().mockResolvedValue(undefined),
     saveSuggestionFeedback: vi.fn().mockResolvedValue(undefined),
+    saveFactStatus: vi.fn().mockResolvedValue(undefined),
     markUiRendered: vi.fn().mockResolvedValue(undefined),
   };
   const transport: MeetingEventTransport = {
@@ -145,6 +307,52 @@ function microphoneController(
 }
 
 describe("LiveMeetingWorkbench", () => {
+  it("loads, renames, and refreshes a stable speaker through the shared live transcript", async () => {
+    const user = userEvent.setup();
+    const { api, transport } = dependencies();
+    const attributedSnapshot = {
+      ...realSnapshot(),
+      segments: realSnapshot().segments.map((segment) => ({
+        ...segment,
+        speakerId: "cluster-a",
+        speakerLabel: "Speaker 1",
+        speakerConfidence: 0.91,
+      })),
+    };
+    vi.mocked(api.getSnapshot).mockResolvedValue(attributedSnapshot);
+    vi.mocked(api.getTranscript).mockResolvedValue(attributedSnapshot.segments);
+    vi.mocked(api.getSpeakers)
+      .mockResolvedValueOnce([{
+        meetingId: "meeting-1",
+        speakerId: "cluster-a",
+        speakerLabel: "Speaker 1",
+        ordinal: 1,
+        createdAtMs: 1_000,
+        updatedAtMs: 1_000,
+      }])
+      .mockResolvedValue([{
+        meetingId: "meeting-1",
+        speakerId: "cluster-a",
+        speakerLabel: "张工",
+        ordinal: 1,
+        createdAtMs: 1_000,
+        updatedAtMs: 2_000,
+      }]);
+
+    render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} />);
+
+    await user.click(await screen.findByRole("button", { name: "Speaker 1" }));
+    const input = screen.getByRole("textbox", { name: "重命名 Speaker 1" });
+    await user.clear(input);
+    await user.type(input, "张工");
+    await user.click(screen.getByRole("button", { name: "保存 Speaker 1 的名称" }));
+
+    await waitFor(() => expect(api.renameSpeaker).toHaveBeenCalledWith("meeting-1", "cluster-a", "张工"));
+    expect(await screen.findByRole("button", { name: "张工" })).toBeVisible();
+    expect(api.getSpeakers).toHaveBeenCalledWith("meeting-1", expect.any(AbortSignal));
+    await waitFor(() => expect(api.getSpeakers).toHaveBeenCalledTimes(2));
+  });
+
   it("exposes recording import from the meeting list and opens the imported review", async () => {
     const user = userEvent.setup();
     const { api, transport } = dependencies();
@@ -158,12 +366,15 @@ describe("LiveMeetingWorkbench", () => {
       />,
     );
 
+    await user.click(screen.getByRole("button", { name: "导入录音" }));
+    expect(await screen.findByRole("dialog", { name: "导入录音" })).toHaveTextContent("WAV、MP3、M4A、AAC、FLAC、MP4、MOV");
     const input = screen.getByLabelText("选择要导入的录音文件") as HTMLInputElement;
     const file = new File(["audio"], "review.wav", { type: "audio/wav" });
     await user.upload(input, file);
+    await user.click(screen.getByRole("button", { name: "开始导入" }));
 
-    expect(api.importRecording).toHaveBeenCalledWith(file);
-    expect(onOpenMeeting).toHaveBeenCalledWith("imported-meeting");
+    await waitFor(() => expect(api.importRecording).toHaveBeenCalledWith(file, "review"));
+    await waitFor(() => expect(onOpenMeeting).toHaveBeenCalledWith("imported-meeting"));
   });
 
   it("shows an import failure on the meeting list instead of hiding it in a toast", async () => {
@@ -172,8 +383,10 @@ describe("LiveMeetingWorkbench", () => {
     vi.mocked(api.importRecording).mockRejectedValue(new Error("本地转写不可用"));
     render(<LiveMeetingWorkbench meetingId={null} api={api} transport={transport} />);
 
+    await user.click(screen.getByRole("button", { name: "导入录音" }));
     const input = screen.getByLabelText("选择要导入的录音文件") as HTMLInputElement;
     await user.upload(input, new File(["audio"], "broken.wav", { type: "audio/wav" }));
+    await user.click(screen.getByRole("button", { name: "开始导入" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent("本地转写不可用");
   });
@@ -183,6 +396,7 @@ describe("LiveMeetingWorkbench", () => {
     const { api, transport } = dependencies();
     render(<LiveMeetingWorkbench meetingId={null} api={api} transport={transport} />);
 
+    await user.click(screen.getByRole("button", { name: "导入录音" }));
     const input = screen.getByLabelText("选择要导入的录音文件") as HTMLInputElement;
     await user.upload(input, new File([], "empty.wav", { type: "audio/wav" }));
 
@@ -213,12 +427,144 @@ describe("LiveMeetingWorkbench", () => {
       />,
     );
 
-    await user.click(screen.getByRole("button", { name: "开始会议" }));
+    await confirmMeetingPreflight(user);
 
+    await waitFor(() => expect(microphone.start).toHaveBeenCalled());
     expect(onCreateMeeting).toHaveBeenCalledOnce();
-    expect(api.createMeeting).toHaveBeenCalledWith("rec_new_meeting");
-    expect(microphone.start).toHaveBeenCalledWith("rec_new_meeting");
+    expect(api.createMeeting).toHaveBeenCalledWith("rec_new_meeting", null, "microphone");
+    expect(api.saveMeetingPreparation).toHaveBeenCalledWith(
+      "rec_new_meeting",
+      expect.objectContaining({
+        inputDeviceId: "mic-1",
+        noticeAcknowledged: true,
+      }),
+    );
+    expect(microphone.start).toHaveBeenCalledWith("rec_new_meeting", {
+      inputDeviceId: "mic-1",
+      inputSource: "microphone",
+    });
     expect(order).toEqual(["meeting-created", "microphone-started"]);
+  });
+
+  it("passes the packaged system-audio selection to the single capture owner", async () => {
+    const user = userEvent.setup();
+    const { api, transport } = dependencies();
+    const capture = microphoneController();
+    const invokeMock = vi.fn(async (command: string, args?: Record<string, unknown>) => {
+      void args;
+      if (command === "system_audio_adapter_prepare") {
+        return {
+          command_status: "ok",
+          status: "not_started",
+          source: "system_audio",
+          helper_present: true,
+          captures_audio: false,
+          fallback_source: null,
+          errors: [],
+        };
+      }
+      throw new Error(`unexpected command: ${command}`);
+    });
+    window.__TAURI__ = {
+      core: {
+        invoke: <T,>(command: string, args?: Record<string, unknown>) => (
+          invokeMock(command, args) as Promise<T>
+        ),
+      },
+    };
+
+    render(
+      <LiveMeetingWorkbench
+        meetingId={null}
+        api={api}
+        transport={transport}
+        microphoneController={capture}
+        onCreateMeeting={() => "rec_system_audio"}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "开始会议" }));
+    const dialog = await screen.findByRole("dialog", { name: "准备开始会议" });
+    await within(dialog).findByText("本地中文实时识别可用");
+    await user.click(within(dialog).getByRole("radio", { name: "系统音频" }));
+    await waitFor(() => expect(within(dialog).getByRole("radio", { name: "系统音频" }))
+      .toHaveAttribute("aria-checked", "true"));
+    await user.click(within(dialog).getByLabelText("我已告知参会者并确认可以录音"));
+    await user.click(within(dialog).getByRole("button", { name: "开始会议" }));
+
+    await waitFor(() => expect(capture.start).toHaveBeenCalledWith("rec_system_audio", {
+      inputDeviceId: null,
+      inputSource: "system_audio",
+    }));
+    expect(api.saveMeetingPreparation).toHaveBeenCalledWith(
+      "rec_system_audio",
+      expect.objectContaining({ inputSource: "system_audio", inputDeviceName: "系统音频" }),
+    );
+    expect(invokeMock.mock.calls.some(([command]) => String(command).startsWith("mic_adapter_"))).toBe(false);
+  });
+
+  it("creates a two-track meeting intent and starts the dual-track capture owner once", async () => {
+    const user = userEvent.setup();
+    const { api, transport } = dependencies();
+    const capture = microphoneController();
+    const invokeMock = vi.fn(async (command: string, args?: Record<string, unknown>) => {
+      void args;
+      if (command === "dual_track_adapter_status") {
+        return {
+          command_status: "ok",
+          status: "not_recording",
+          requested_mode: "dual_track",
+          active_mode: "none",
+          active_track_count: 0,
+          microphone: { command_status: "ok", status: "not_started", helper_present: true, captures_audio: false, errors: [] },
+          system_audio: { command_status: "ok", status: "not_started", helper_present: true, captures_audio: false, fallback_source: null, errors: [] },
+        };
+      }
+      throw new Error(`unexpected command: ${command}`);
+    });
+    window.__TAURI__ = {
+      core: {
+        invoke: <T,>(command: string, args?: Record<string, unknown>) => (
+          invokeMock(command, args) as Promise<T>
+        ),
+      },
+    };
+
+    render(
+      <LiveMeetingWorkbench
+        meetingId={null}
+        api={api}
+        transport={transport}
+        microphoneController={capture}
+        onCreateMeeting={() => "rec_dual_track"}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "开始会议" }));
+    const dialog = await screen.findByRole("dialog", { name: "准备开始会议" });
+    const dualTrack = await within(dialog).findByRole("radio", { name: "双轨" });
+    await user.click(dualTrack);
+    await user.click(within(dialog).getByLabelText("我已告知参会者并确认可以录音"));
+    await user.click(within(dialog).getByRole("button", { name: "开始会议" }));
+
+    await waitFor(() => expect(api.createMeeting).toHaveBeenCalledWith(
+      "rec_dual_track",
+      null,
+      "dual_track",
+    ));
+    expect(api.saveMeetingPreparation).toHaveBeenCalledWith(
+      "rec_dual_track",
+      expect.objectContaining({
+        inputSource: "dual_track",
+        inputDeviceId: null,
+        inputDeviceName: "麦克风 + 系统音频",
+      }),
+    );
+    expect(capture.start).toHaveBeenCalledOnce();
+    expect(capture.start).toHaveBeenCalledWith("rec_dual_track", {
+      inputDeviceId: null,
+      inputSource: "dual_track",
+    });
   });
 
   it("returns to the meeting list when creating a new meeting fails", async () => {
@@ -236,7 +582,7 @@ describe("LiveMeetingWorkbench", () => {
       />,
     );
 
-    await user.click(screen.getByRole("button", { name: "开始会议" }));
+    await confirmMeetingPreflight(user);
 
     await waitFor(() => expect(onBackToMeetings).toHaveBeenCalledOnce());
   });
@@ -259,7 +605,7 @@ describe("LiveMeetingWorkbench", () => {
       />,
     );
 
-    await user.click(screen.getByRole("button", { name: "开始会议" }));
+    await confirmMeetingPreflight(user);
 
     await waitFor(() => {
       expect(api.deleteMeeting).toHaveBeenCalledWith("rec_mic_timeout");
@@ -341,6 +687,62 @@ describe("LiveMeetingWorkbench", () => {
     expect(screen.queryByText("AI 已校正")).not.toBeInTheDocument();
   });
 
+  it("uses correction status instead of semantic paragraph revision for AI labels", async () => {
+    const { api, transport } = dependencies();
+    const snapshot = realSnapshot();
+    vi.mocked(api.getSnapshot).mockResolvedValue({
+      ...snapshot,
+      segments: snapshot.segments.map((segment) => ({
+        ...segment,
+        revision: 2,
+        correctionStatus: "no_change",
+      })),
+      semanticParagraphs: [{
+        meetingId: "meeting-1",
+        paragraphId: "paragraph-1",
+        revision: 3,
+        text: snapshot.segments[0].normalizedText,
+        startMs: 2_000,
+        endMs: 6_000,
+        status: "active",
+        checkpointIds: ["segment-1"],
+        createdAtMs: 6_100,
+        updatedAtMs: 7_000,
+      }],
+    });
+
+    render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} />);
+
+    expect(await screen.findByText("已检查，无需修改")).toBeVisible();
+    expect(screen.queryByText("AI 已校正")).not.toBeInTheDocument();
+  });
+
+  it("shows a real correction before/after comparison", async () => {
+    const user = userEvent.setup();
+    const { api, transport } = dependencies();
+    const snapshot = realSnapshot();
+    vi.mocked(api.getSnapshot).mockResolvedValue({
+      ...snapshot,
+      segments: snapshot.segments.map((segment) => ({
+        ...segment,
+        correctionStatus: "changed",
+        correctionBeforeText: segment.text,
+        correctionAfterText: segment.normalizedText,
+      })),
+    });
+
+    render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} />);
+
+    await user.click(await screen.findByText("查看修正对照"));
+    const details = screen.getByText("查看修正对照").closest("details");
+    expect(details).not.toBeNull();
+    if (details) {
+      expect(within(details).getByText("识别")).toBeVisible();
+      expect(within(details).getByText("AI")).toBeVisible();
+      expect(within(details).getByText("支付服务周五上线但是负责人还没定")).toBeVisible();
+    }
+  });
+
   it("keeps internal runtime terminology inside the diagnostics drawer", async () => {
     const user = userEvent.setup();
     const { api, transport } = dependencies();
@@ -353,6 +755,52 @@ describe("LiveMeetingWorkbench", () => {
     const drawer = screen.getByRole("dialog", { name: "会议连接详情" });
     expect(within(drawer).getByText(/provider_mode/)).toBeVisible();
     expect(within(drawer).getByText(/acceptance_gate/)).toBeVisible();
+  });
+
+  it("re-reads diagnostics without creating, uploading, saving, exporting, or invoking AI work", async () => {
+    const user = userEvent.setup();
+    const { api, transport } = dependencies();
+    render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} />);
+    await screen.findByText("支付服务上线安排");
+    const readsBefore = vi.mocked(api.getSnapshot).mock.calls.length;
+
+    await user.click(screen.getByRole("button", { name: "打开运行诊断" }));
+    const drawer = screen.getByRole("dialog", { name: "会议连接详情" });
+    await user.click(within(drawer).getByRole("button", { name: "重新读取状态" }));
+
+    await waitFor(() => expect(api.getSnapshot).toHaveBeenCalledTimes(readsBefore + 1));
+    expect(api.createMeeting).not.toHaveBeenCalled();
+    expect(api.saveMeetingPreparation).not.toHaveBeenCalled();
+    expect(api.importRecording).not.toHaveBeenCalled();
+    expect(api.retryImportJob).not.toHaveBeenCalled();
+    expect(api.updateMeetingTitle).not.toHaveBeenCalled();
+    expect(api.deleteMeeting).not.toHaveBeenCalled();
+    expect(api.exportMeeting).not.toHaveBeenCalled();
+    expect(api.exportDiagnosticBundle).not.toHaveBeenCalled();
+    expect(api.saveReviewDocument).not.toHaveBeenCalled();
+    expect(api.regenerateDocument).not.toHaveBeenCalled();
+    expect(api.retryReviewJob).not.toHaveBeenCalled();
+    expect(api.endMeeting).not.toHaveBeenCalled();
+    expect(api.saveSuggestionFeedback).not.toHaveBeenCalled();
+    expect(api.saveFactStatus).not.toHaveBeenCalled();
+    expect(api.markUiRendered).not.toHaveBeenCalled();
+  });
+
+  it("exports one redacted runtime bundle from the diagnostics drawer", async () => {
+    const user = userEvent.setup();
+    const { api, transport } = dependencies();
+    render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} />);
+    await screen.findByText("支付服务上线安排");
+
+    await user.click(screen.getByRole("button", { name: "打开运行诊断" }));
+    const drawer = screen.getByRole("dialog", { name: "会议连接详情" });
+    await user.click(within(drawer).getByRole("button", { name: "导出脱敏诊断包" }));
+
+    await waitFor(() => expect(api.exportDiagnosticBundle).toHaveBeenCalledOnce());
+    expect(api.createMeeting).not.toHaveBeenCalled();
+    expect(api.importRecording).not.toHaveBeenCalled();
+    expect(api.exportMeeting).not.toHaveBeenCalled();
+    expect(api.endMeeting).not.toHaveBeenCalled();
   });
 
   it("saves suggestion feedback only after the typed command succeeds", async () => {
@@ -404,6 +852,17 @@ describe("LiveMeetingWorkbench", () => {
         created_at_ms: 8_000,
         updated_at_ms: 9_000,
         committed_at_ms: 9_000,
+        source: "llm_first",
+        llm_called: true,
+        batch_id: "batch-2",
+        provider: "openai_compatible_gateway",
+        model: "fixture-model",
+        evidence: {
+          segment_ids: ["segment-1"],
+          quote: "请确认回滚窗口",
+          evidence_hash: "hash-1",
+          state_revision: 1,
+        },
       },
       publishedAtMs: null,
     };
@@ -440,8 +899,6 @@ describe("LiveMeetingWorkbench", () => {
     vi.mocked(microphone.end).mockImplementation(async () => {
       order.push("audio-end");
     });
-    vi.spyOn(window, "confirm").mockReturnValue(true);
-
     render(
       <LiveMeetingWorkbench
         meetingId="meeting-1"
@@ -457,11 +914,44 @@ describe("LiveMeetingWorkbench", () => {
     expect(order).toEqual(["audio-end", "api-end"]);
   });
 
+  it("does not show an unsupported pause command for system-audio capture", async () => {
+    const { api, transport } = dependencies();
+    const systemAudio = microphoneController({
+      phase: "recording",
+      asrReady: false,
+      inputLevelAvailable: true,
+      statusMessage: "已连接但当前无系统声音",
+      systemAudioHealth: {
+        transportReady: true,
+        pcmSeen: true,
+        audiblePcmSeen: false,
+        asrReady: false,
+      },
+    });
+    systemAudio.inputSource = "system_audio";
+    systemAudio.supportsPause = false;
+
+    render(
+      <LiveMeetingWorkbench
+        meetingId="meeting-1"
+        api={api}
+        transport={transport}
+        microphoneController={systemAudio}
+      />,
+    );
+
+    await screen.findByText("支付服务上线安排");
+    expect(screen.queryByRole("button", { name: "暂停录音" })).not.toBeInTheDocument();
+    expect(within(screen.getByLabelText("会议运行状态")).getAllByTitle("已连接但当前无系统声音")).toHaveLength(2);
+    expect(screen.getByLabelText("系统音频分层健康状态")).toHaveTextContent("传输已连接PCM已接收声音当前静音识别准备中");
+    expect(screen.getByText("已连接但当前无系统声音")).toBeVisible();
+    expect(screen.getByRole("button", { name: "结束并整理" })).toBeVisible();
+  });
+
   it("opens recent meetings from the start screen", async () => {
     const user = userEvent.setup();
     const { api, transport } = dependencies();
     const onOpenMeeting = vi.fn();
-    vi.spyOn(window, "confirm").mockReturnValue(true);
     vi.mocked(api.listMeetings).mockResolvedValue({
       meetings: [{
         meetingId: "meeting-history",
@@ -493,8 +983,10 @@ describe("LiveMeetingWorkbench", () => {
     await user.click(await screen.findByRole("button", { name: "打开会议：网关改造评审" }));
     expect(onOpenMeeting).toHaveBeenCalledWith("meeting-history");
 
-    await user.click(screen.getByRole("button", { name: "删除会议：网关改造评审" }));
-    await waitFor(() => expect(api.deleteMeeting).toHaveBeenCalledWith("meeting-history"));
+    await user.click(screen.getByRole("button", { name: "管理本地数据：网关改造评审" }));
+    await user.click(screen.getByRole("radio", { name: /整场会议/ }));
+    await user.click(screen.getByRole("button", { name: "删除整场会议" }));
+    await waitFor(() => expect(api.deleteMeeting).toHaveBeenCalledWith("meeting-history", "all"));
     expect(screen.queryByRole("button", { name: "打开会议：网关改造评审" })).not.toBeInTheDocument();
   });
 
@@ -505,6 +997,9 @@ describe("LiveMeetingWorkbench", () => {
     vi.mocked(api.getSnapshot).mockResolvedValue({
       ...realSnapshot(),
       activePartial: null,
+      decisionCandidates: [],
+      actionItems: [],
+      risks: [],
       runtime: { ...realSnapshot().runtime, phase: "ended" },
       minutes: {
         meetingId: "meeting-1",
@@ -512,7 +1007,12 @@ describe("LiveMeetingWorkbench", () => {
         version: 1,
         status: "ready",
         markdown: "# 会议结论\n\n确认灰度发布。\n\n## 行动项\n\n- 张三跟进",
-        structured: null,
+        structured: {
+          decisions: ["确认灰度发布"],
+          action_items: [{ item: "张三跟进", owner: "张三", deadline: "周五" }],
+          risks: ["回滚负责人尚未确认"],
+          open_questions: ["P99 阈值是多少"],
+        },
         createdAtMs: 9_000,
         updatedAtMs: 9_000,
       },
@@ -533,7 +1033,7 @@ describe("LiveMeetingWorkbench", () => {
     );
 
     expect(await screen.findByRole("tab", { name: "复盘" })).toBeVisible();
-    expect(screen.getByRole("heading", { level: 1, name: "会议复盘" })).toBeVisible();
+    expect(screen.getByRole("heading", { level: 1, name: "支付服务发布评审" })).toBeVisible();
     expect(screen.queryByRole("heading", { level: 1, name: "实时会议" })).not.toBeInTheDocument();
     expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual([
       "复盘", "决策与待办", "会议文字", "录音",
@@ -543,6 +1043,19 @@ describe("LiveMeetingWorkbench", () => {
     expect(screen.getByText(/确认灰度发布/)).toBeVisible();
     expect(screen.getByRole("list")).toHaveTextContent("张三跟进");
     expect(screen.queryByRole("button", { name: "结束并整理" })).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("tab", { name: "决策与待办" }));
+    expect(screen.getByRole("heading", { level: 2, name: "决策与待办" })).toBeVisible();
+    expect(screen.getByText("确认灰度发布")).toBeVisible();
+    expect(screen.getByText("张三跟进")).toBeVisible();
+    expect(screen.getByText("负责人：张三 · 截止：周五")).toBeVisible();
+    expect(screen.getByText("回滚负责人尚未确认")).toBeVisible();
+    expect(screen.getByText("P99 阈值是多少")).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: "导出会议" }));
+    await user.click(screen.getByRole("menuitem", { name: "JSON" }));
+    await waitFor(() => expect(api.exportMeeting).toHaveBeenCalledWith("meeting-1", "json"));
+    expect(screen.getByText("已导出 JSON")).toBeVisible();
 
     await screen.findByRole("button", { name: "返回会议列表" });
     await user.click(screen.getByRole("button", { name: "返回会议列表" }));
@@ -554,6 +1067,54 @@ describe("LiveMeetingWorkbench", () => {
     await waitFor(() => expect(api.getAudio).toHaveBeenCalledWith("meeting-1", expect.any(AbortSignal)));
     expect(document.querySelector("audio")).toHaveAttribute("src", "/audio.wav");
     expect(screen.getByText("录音分片")).toBeVisible();
+  });
+
+  it("recovers decisions and actions from markdown-only legacy minutes", async () => {
+    const user = userEvent.setup();
+    const { api, transport } = dependencies();
+    vi.mocked(api.getSnapshot).mockResolvedValue({
+      ...realSnapshot(),
+      activePartial: null,
+      decisionCandidates: [],
+      actionItems: [],
+      risks: [],
+      runtime: { ...realSnapshot().runtime, phase: "ended" },
+      minutes: {
+        meetingId: "meeting-1",
+        jobId: "legacy-minutes",
+        version: 1,
+        status: "ready",
+        markdown: [
+          "# 会议纪要",
+          "## 已确认决策",
+          "- 先灰度 5%",
+          "## 行动项",
+          "- 确认回滚负责人 (owner: 李四, deadline: 上线前)",
+          "## 风险",
+          "- P99 延迟超标",
+          "## 未闭环问题",
+          "- 监控 owner 是谁",
+        ].join("\n"),
+        structured: null,
+        createdAtMs: 9_000,
+        updatedAtMs: 9_000,
+      },
+    });
+
+    render(
+      <LiveMeetingWorkbench
+        meetingId="meeting-1"
+        api={api}
+        transport={transport}
+      />,
+    );
+
+    await user.click(await screen.findByRole("tab", { name: "决策与待办" }));
+    expect(screen.getByText("先灰度 5%")).toBeVisible();
+    expect(screen.getByText("确认回滚负责人")).toBeVisible();
+    expect(screen.getByText("负责人：李四 · 截止：上线前")).toBeVisible();
+    expect(screen.getByText("P99 延迟超标")).toBeVisible();
+    expect(screen.getByText("监控 owner 是谁")).toBeVisible();
   });
 
   it("shows semantic-quality pause instead of provider failure after meeting end", async () => {
@@ -576,9 +1137,9 @@ describe("LiveMeetingWorkbench", () => {
     render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} />);
 
     expect(await screen.findByText("会议纪要：识别质量不足，已暂停")).toBeVisible();
-    expect(screen.getByText("方案与风险：识别质量不足，已暂停")).toBeVisible();
+    expect(screen.getByText("分析建议：识别质量不足，已暂停")).toBeVisible();
     expect(screen.getByText(/正式会议纪要已暂停/)).toBeVisible();
-    expect(screen.getByText(/方案与风险推断已暂停/)).toBeVisible();
+    expect(screen.getByText(/分析建议生成已暂停/)).toBeVisible();
     expect(screen.queryByText("会议纪要：生成失败")).not.toBeInTheDocument();
   });
 
@@ -610,10 +1171,91 @@ describe("LiveMeetingWorkbench", () => {
       />,
     );
 
-    expect(await screen.findByRole("heading", { level: 1, name: "会议复盘" })).toBeVisible();
+    expect(await screen.findByRole("heading", { level: 1, name: "支付服务发布评审" })).toBeVisible();
     const statuses = screen.getByLabelText("会议运行状态");
     expect(within(statuses).getByText("输入已结束")).toBeVisible();
     expect(within(statuses).queryByText("检测中")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "结束并整理" })).not.toBeInTheDocument();
+  });
+
+  it("does not enter review until the backend confirms that the meeting ended", async () => {
+    const { api, transport } = dependencies();
+    const microphone = microphoneController({
+      phase: "ended",
+      asrReady: false,
+      statusMessage: "录音已安全封存，正在整理",
+    });
+
+    render(
+      <LiveMeetingWorkbench
+        meetingId="meeting-1"
+        api={api}
+        transport={transport}
+        microphoneController={microphone}
+      />,
+    );
+
+    expect(await screen.findByRole("heading", { level: 1, name: "支付服务发布评审" })).toBeVisible();
+    expect(screen.queryByRole("heading", { level: 1, name: "会议复盘" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "结束并整理" })).toBeVisible();
+  });
+
+  it("keeps the meeting end command available after microphone interruption", async () => {
+    const { api, transport } = dependencies();
+    vi.mocked(api.getSnapshot).mockResolvedValue({
+      ...realSnapshot(),
+      runtime: {
+        ...realSnapshot().runtime,
+        phase: "unknown",
+        recording: { state: "error", label: "录音中断", level: null, detail: "连接已断开" },
+        input: { state: "error", label: "不可用", level: 0, detail: "连接已断开" },
+      },
+    });
+    const microphone = microphoneController({
+      phase: "error",
+      error: "系统麦克风已停止，会议文字可能不再更新",
+      statusMessage: "系统麦克风已停止，会议文字可能不再更新",
+    });
+
+    render(
+      <LiveMeetingWorkbench
+        meetingId="meeting-1"
+        api={api}
+        transport={transport}
+        microphoneController={microphone}
+      />,
+    );
+
+    expect(await screen.findByRole("button", { name: "重新开始录音" })).toBeVisible();
+    expect(screen.getAllByRole("button", { name: "结束并整理" })).toHaveLength(1);
+  });
+
+  it("shows realtime meeting facts with strict candidate labels and persists confirm or dismiss actions", async () => {
+    const user = userEvent.setup();
+    const { api, transport } = dependencies();
+
+    render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} />);
+
+    const facts = await screen.findByRole("region", { name: "会议事实" });
+    expect(within(facts).getByText("候选决策")).toBeVisible();
+    expect(within(facts).getByText("已确认决策")).toBeVisible();
+    expect(within(facts).getByText("先灰度 5%")).toBeVisible();
+    expect(within(facts).getByText("错误率超过 1% 就回滚")).toBeVisible();
+    expect(within(facts).getByText("负责人：张三 · 截止：周五")).toBeVisible();
+    expect(within(facts).getByText("应对：超过 900ms 立即回滚")).toBeVisible();
+
+    await user.click(within(facts).getByRole("button", { name: "查看“先灰度 5%”的依据" }));
+    const segment = screen.getByText("支付服务周五上线，但是负责人还没确定。").closest(".transcript-segment");
+    await waitFor(() => expect(segment).toHaveClass("is-evidence-target"));
+
+    await user.click(within(facts).getByRole("button", { name: "确认候选决策“先灰度 5%”" }));
+    expect(api.saveFactStatus).toHaveBeenCalledWith("meeting-1", "decision", "decision-1", "confirmed");
+
+    await user.click(within(facts).getByRole("button", { name: "忽略候选风险“P99 延迟可能超标”" }));
+    expect(api.saveFactStatus).toHaveBeenCalledWith("meeting-1", "risk", "risk-1", "dismissed");
+    await waitFor(() => expect(within(facts).queryByText("P99 延迟可能超标")).not.toBeInTheDocument());
+
+    expect(screen.getByRole("heading", { name: "AI 实时建议" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "未闭环问题" })).toBeVisible();
   });
 });

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef } from "react";
 import type { MeetingApi } from "../api/client";
 import type { MeetingEventTransport } from "../api/eventTransport";
+import { isFormalLlmFirstPayload, isRealtimeAiProjectionEventType } from "../domain/events";
 import type { MeetingEvent, MeetingViewState, SuggestionFeedback } from "../domain/events";
 import { createInitialMeetingState, meetingReducer } from "../domain/reducer";
 
@@ -25,6 +26,7 @@ export function useMeetingProjection(
 
   const queueRenderAck = (event: MeetingEvent) => {
     if (event.type !== "suggestion.committed" && event.type !== "transcript.segment.revised") return;
+    if (isRealtimeAiProjectionEventType(event.type) && !isFormalLlmFirstPayload(event.payload)) return;
     const jobId = typeof event.payload.job_id === "string" && event.payload.job_id.trim()
       ? event.payload.job_id.trim()
       : event.causationId;
@@ -86,6 +88,25 @@ export function useMeetingProjection(
     [api, normalizedMeetingId],
   );
 
+  const loadSpeakers = useCallback(
+    async (signal?: AbortSignal) => {
+      if (!normalizedMeetingId) return;
+      dispatch({ type: "speakers.loading" });
+      try {
+        const speakers = await api.getSpeakers(normalizedMeetingId, signal);
+        dispatch({ type: "speakers.received", speakers });
+      } catch (error) {
+        if (signal?.aborted) return;
+        dispatch({
+          type: "speakers.failed",
+          error: error instanceof Error ? error.message : "说话人信息加载失败",
+        });
+        throw error;
+      }
+    },
+    [api, normalizedMeetingId],
+  );
+
   useEffect(() => {
     if (!normalizedMeetingId) return;
     const controller = new AbortController();
@@ -96,6 +117,7 @@ export function useMeetingProjection(
     const start = async () => {
       try {
         await refreshSnapshot(controller.signal);
+        void loadSpeakers(controller.signal).catch(() => undefined);
       } catch (error) {
         if (controller.signal.aborted) return;
         dispatch({
@@ -125,7 +147,7 @@ export function useMeetingProjection(
               dispatch({
                 type: "connection.changed",
                 connection: "reconnecting",
-                error: error instanceof Error ? error.message : "会议状态同步失败",
+                error: error instanceof Error ? error.message : "会议状态读取失败",
               });
             }
           });
@@ -140,7 +162,7 @@ export function useMeetingProjection(
             dispatch({
               type: "connection.changed",
               connection: "reconnecting",
-              error: error instanceof Error ? error.message : "会议状态同步失败",
+              error: error instanceof Error ? error.message : "会议状态读取失败",
             });
           }
         });
@@ -153,7 +175,7 @@ export function useMeetingProjection(
       unsubscribe();
       if (snapshotTimer !== undefined) window.clearInterval(snapshotTimer);
     };
-  }, [loadAudio, normalizedMeetingId, refreshSnapshot, transport]);
+  }, [loadAudio, loadSpeakers, normalizedMeetingId, refreshSnapshot, transport]);
 
   useEffect(() => {
     if (state.runtime.phase !== "ended") return;
@@ -207,11 +229,20 @@ export function useMeetingProjection(
         await api.saveSuggestionFeedback(normalizedMeetingId, suggestionId, feedback);
         dispatch({ type: "suggestion.feedback_saved", suggestionId, feedback });
       },
-      refresh: () => refreshSnapshot(),
+      async refresh() {
+        await refreshSnapshot();
+        await loadSpeakers().catch(() => undefined);
+      },
       loadFullTranscript: () => loadFullTranscript(),
       loadAudio: () => loadAudio(),
+      async renameSpeaker(speakerId: string, speakerLabel: string) {
+        if (!normalizedMeetingId) return;
+        const speaker = await api.renameSpeaker(normalizedMeetingId, speakerId, speakerLabel);
+        dispatch({ type: "speaker.renamed", speaker });
+        await Promise.allSettled([refreshSnapshot(), loadSpeakers()]);
+      },
     }),
-    [api, loadAudio, loadFullTranscript, normalizedMeetingId, refreshSnapshot, state.ending],
+    [api, loadAudio, loadFullTranscript, loadSpeakers, normalizedMeetingId, refreshSnapshot, state.ending],
   );
 
   return { state, actions, transportKind: transport.kind };

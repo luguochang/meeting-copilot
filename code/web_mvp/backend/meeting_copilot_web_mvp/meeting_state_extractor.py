@@ -43,6 +43,37 @@ _CLEAR_ANSWER_RE = re.compile(
 _DIRECT_ANSWER_RE = re.compile(r"^(?:是的|不是|对|不对|可以|不可以|支持|不支持)[，,。；;\s]")
 _ANAPHORIC_ANSWER_RE = re.compile(r"^(?:这个问题|刚才的问题)?(?:的)?(?:答案|结论)(?:是|为)")
 
+# Formal facts require explicit commitment or an observed risk. Tentative
+# planning language is deliberately excluded from these patterns.
+_DECISION_RE = re.compile(
+    r"(?:结论是|决定(?:采用|使用|选择|改为|切换到)?|最终(?:采用|使用|选择)|"
+    r"确定为|已确认|已经确认|明确为|定为|拍板|同意(?:采用|使用|选择)?|"
+    r"通过(?:了)?|正式采用|正式使用|采用)"
+)
+_DECISION_WEAK_RE = re.compile(r"(?:可能|也许|或许|大概|考虑|倾向于|建议|可以考虑|暂定)")
+_ACTION_RE = re.compile(
+    r"(?:负责|完成|处理|跟进|落实|提交|验证|检查|修复|切换|迁移|上线|回滚)"
+)
+_ACTION_OWNER_RE = re.compile(
+    r"(?:由|请|让)\s*([A-Za-z0-9_\-\u4e00-\u9fff]{1,20}?)\s*"
+    r"(?:负责|完成|处理|跟进|落实|提交|验证|检查|修复|切换|迁移|上线|回滚)"
+    r"|^([A-Za-z0-9_\-\u4e00-\u9fff]{1,20}?)\s*(?:负责|将|要)"
+)
+_ACTION_COMMITMENT_RE = re.compile(
+    r"(?:负责|需要在|必须在|应在|请|安排|计划在|截止|最晚|落实|完成|跟进)"
+)
+_DEADLINE_RE = re.compile(
+    r"(?:在|于|截止(?:到|于)?|最晚(?:在|于)?|不晚于)\s*"
+    r"([^，。！？?!；;\s]+?)(?:之前|以前|前|完成|结束|上线|提交|落地)"
+    r"|(?:截止|最晚)\s*([^，。！？?!；;\s]+)"
+)
+_RISK_RE = re.compile(
+    r"(?:风险是|风险为|存在[^，。！？?!；;]{0,24}风险|有[^，。！？?!；;]{0,24}风险|"
+    r"会导致|可能导致|担心(?:会)?|隐患是|回滚失败|数据不一致)"
+)
+_RISK_DISCUSSION_RE = re.compile(r"(?:讨论|看看|评估|分析)(?:一下)?[^。！？?!；;]*(?:风险|隐患)")
+_MITIGATION_RE = re.compile(r"(?:需要|应当|应该|建议|可通过|通过|先)\s*([^。！？?!；;]+)")
+
 _FILLER_VALUES = {
     "嗯",
     "嗯嗯",
@@ -132,10 +163,11 @@ def extract_meeting_state(
     replaying all committed segments produces the complete projection.
     """
 
-    topic, questions = _load_previous_state(previous_state)
+    topic, questions, decision_candidates, action_items, risks = _load_previous_state(previous_state)
 
     for raw_segment in segments:
         segment_id, text, updated_at_ms = _canonical_segment(raw_segment)
+        segment_context = _segment_context(raw_segment, segment_id, text)
         topic, questions = _advance_lifecycle(
             topic,
             questions,
@@ -150,7 +182,12 @@ def extract_meeting_state(
 
             if uncertain and matching_question is not None:
                 # An uncertain response is not new evidence that the question is answered.
-                topic = _topic_projection(sentence, segment_id, updated_at_ms)
+                topic = _topic_projection(
+                    sentence,
+                    segment_id,
+                    updated_at_ms,
+                    context=segment_context,
+                )
                 continue
 
             if _looks_like_question(sentence):
@@ -159,6 +196,7 @@ def extract_meeting_state(
                     sentence=sentence,
                     segment_id=segment_id,
                     updated_at_ms=updated_at_ms,
+                    context=segment_context,
                 )
             else:
                 questions = _apply_clear_answer(
@@ -166,15 +204,46 @@ def extract_meeting_state(
                     sentence=sentence,
                     segment_id=segment_id,
                     updated_at_ms=updated_at_ms,
+                    context=segment_context,
                 )
 
             if _is_meaningful(sentence):
-                topic = _topic_projection(sentence, segment_id, updated_at_ms)
+                topic = _topic_projection(
+                    sentence,
+                    segment_id,
+                    updated_at_ms,
+                    context=segment_context,
+                )
 
-    return {
+            decision = _decision_candidate(sentence, segment_context)
+            if decision is not None:
+                decision_candidates = _merge_fact(
+                    decision_candidates,
+                    decision,
+                    fact_type="decision_candidate",
+                )
+            action = _action_item(sentence, segment_context)
+            if action is not None:
+                action_items = _merge_fact(action_items, action, fact_type="action_item")
+            risk = _risk(sentence, segment_context)
+            if risk is not None:
+                risks = _merge_fact(risks, risk, fact_type="risk")
+
+    state = {
         "current_topic": deepcopy(topic),
         "open_questions": deepcopy(questions[-3:]),
     }
+    # Existing callers rely on the historical two-key shape for ordinary
+    # transcripts. Persistence expands these to empty arrays in its snapshot.
+    if decision_candidates or action_items or risks:
+        state.update(
+            {
+                "decision_candidates": deepcopy(decision_candidates),
+                "action_items": deepcopy(action_items),
+                "risks": deepcopy(risks),
+            }
+        )
+    return state
 
 
 def _advance_lifecycle(
@@ -237,11 +306,38 @@ def _canonical_segment(segment: Mapping[str, Any]) -> tuple[str, str, int | None
     return segment_id, canonical.strip(), updated_at
 
 
+def _segment_context(
+    segment: Mapping[str, Any],
+    segment_id: str,
+    text: str,
+) -> dict[str, Any]:
+    def integer(*names: str) -> int | None:
+        for name in names:
+            value = segment.get(name)
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value
+        return None
+
+    return {
+        "segment_id": segment_id,
+        "transcript_seq": integer("transcript_seq", "transcriptSeq"),
+        "start_ms": integer("start_ms", "startMs", "started_at_ms", "startedAtMs"),
+        "end_ms": integer("end_ms", "endMs", "ended_at_ms", "endedAtMs"),
+        "text": text,
+    }
+
+
 def _load_previous_state(
     previous_state: Mapping[str, Any] | None,
-) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+) -> tuple[
+    dict[str, Any] | None,
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
     if previous_state is None:
-        return None, []
+        return None, [], [], [], []
     if not isinstance(previous_state, Mapping):
         raise TypeError("previous_state must be a mapping")
 
@@ -272,13 +368,165 @@ def _load_previous_state(
                 "text": text,
                 "status": status,
                 "evidence_segment_ids": _unique_strings(evidence),
+                "confidence": float(raw_question.get("confidence") or 0.8),
+                "evidence": dict(raw_question.get("evidence") or {})
+                if isinstance(raw_question.get("evidence"), Mapping)
+                else {},
                 "updated_at_ms": raw_question.get(
                     "updated_at_ms",
                     raw_question.get("updatedAtMs"),
                 ),
             }
         )
-    return topic, questions[-3:]
+    return (
+        topic,
+        questions[-3:],
+        _load_fact_list(previous_state.get("decision_candidates", previous_state.get("decisionCandidates", []))),
+        _load_fact_list(previous_state.get("action_items", previous_state.get("actionItems", []))),
+        _load_fact_list(previous_state.get("risks", [])),
+    )
+
+
+def _load_fact_list(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return []
+    facts: list[dict[str, Any]] = []
+    for raw in value:
+        if not isinstance(raw, Mapping) or not str(raw.get("text") or "").strip():
+            continue
+        evidence = raw.get("evidence")
+        evidence = dict(evidence) if isinstance(evidence, Mapping) else {}
+        evidence_items = raw.get("evidence_items", raw.get("evidenceItems", []))
+        if not isinstance(evidence_items, Sequence) or isinstance(evidence_items, (str, bytes)):
+            evidence_items = []
+        evidence_items = [dict(item) for item in evidence_items if isinstance(item, Mapping)]
+        if evidence and not evidence_items:
+            evidence_items = [evidence]
+        facts.append(
+            {
+                "id": str(raw.get("id") or "").strip(),
+                "text": str(raw.get("text") or "").strip(),
+                "status": str(raw.get("status") or "candidate"),
+                "confidence": float(raw.get("confidence") or 0.0),
+                "evidence": evidence,
+                "evidence_items": evidence_items,
+                "evidence_segment_ids": _unique_strings(raw.get("evidence_segment_ids", [])),
+                "updated_at_ms": raw.get("updated_at_ms"),
+                "owner": raw.get("owner"),
+                "deadline": raw.get("deadline"),
+                "mitigation": raw.get("mitigation"),
+            }
+        )
+    return facts
+
+
+def _evidence(context: Mapping[str, Any], quote: str) -> dict[str, Any]:
+    return {
+        "segment_id": context.get("segment_id"),
+        "transcript_seq": context.get("transcript_seq"),
+        "start_ms": context.get("start_ms"),
+        "end_ms": context.get("end_ms"),
+        "quote": quote,
+    }
+
+
+def _fact_base(
+    *,
+    prefix: str,
+    text: str,
+    confidence: float,
+    context: Mapping[str, Any],
+) -> dict[str, Any]:
+    evidence = _evidence(context, text)
+    return {
+        "id": _stable_id(prefix, _compact(text)),
+        "text": text,
+        "status": "candidate",
+        "confidence": confidence,
+        "evidence": evidence,
+        "evidence_items": [evidence],
+        "evidence_segment_ids": [str(context["segment_id"])],
+        "updated_at_ms": context.get("end_ms"),
+    }
+
+
+def _decision_candidate(sentence: str, context: Mapping[str, Any]) -> dict[str, Any] | None:
+    compact = _compact(sentence)
+    if not _DECISION_RE.search(sentence) or _DECISION_WEAK_RE.search(compact):
+        return None
+    if _EXPLANATORY_FRAME_RE.search(compact) or _looks_like_question(sentence):
+        return None
+    return _fact_base(
+        prefix="decision",
+        text=sentence,
+        confidence=0.9 if re.search(r"(?:结论是|决定|确定为|已确认|最终|拍板)", sentence) else 0.82,
+        context=context,
+    )
+
+
+def _action_item(sentence: str, context: Mapping[str, Any]) -> dict[str, Any] | None:
+    if not _ACTION_RE.search(sentence) or not _ACTION_COMMITMENT_RE.search(sentence):
+        return None
+    if _is_uncertain(sentence) or re.search(r"(?:以后|有空|可以让|看看)", sentence):
+        return None
+    owner_match = _ACTION_OWNER_RE.search(sentence)
+    owner = next((value for value in owner_match.groups() if value), None) if owner_match else None
+    if sentence.lstrip().startswith(("需要", "必须", "应当", "应该", "计划", "安排")):
+        owner = None
+    deadline_match = _DEADLINE_RE.search(sentence)
+    deadline = next((value for value in deadline_match.groups() if value), None) if deadline_match else None
+    action = _fact_base(prefix="action", text=sentence, confidence=0.88, context=context)
+    action.update({"owner": owner, "deadline": deadline})
+    return action
+
+
+def _risk(sentence: str, context: Mapping[str, Any]) -> dict[str, Any] | None:
+    if not _RISK_RE.search(sentence) or _RISK_DISCUSSION_RE.search(sentence):
+        return None
+    risk = _fact_base(prefix="risk", text=sentence, confidence=0.84, context=context)
+    mitigation_match = _MITIGATION_RE.search(sentence)
+    mitigation = mitigation_match.group(1).strip(" ，,：:") if mitigation_match else None
+    risk["mitigation"] = mitigation or None
+    return risk
+
+
+def _merge_fact(
+    facts: list[dict[str, Any]],
+    candidate: dict[str, Any],
+    *,
+    fact_type: str,
+) -> list[dict[str, Any]]:
+    existing = next((fact for fact in facts if fact.get("id") == candidate.get("id")), None)
+    if existing is None:
+        return [*facts, candidate]
+
+    evidence_ids = _unique_strings(
+        [*(existing.get("evidence_segment_ids") or []), *(candidate.get("evidence_segment_ids") or [])]
+    )
+    evidence_items = list(existing.get("evidence_items") or [])
+    for item in candidate.get("evidence_items") or []:
+        if item not in evidence_items:
+            evidence_items.append(item)
+    existing.update(
+        {
+            "text": candidate["text"],
+            "confidence": max(float(existing.get("confidence") or 0.0), float(candidate["confidence"])),
+            "evidence": candidate["evidence"],
+            "evidence_items": evidence_items,
+            "evidence_segment_ids": evidence_ids,
+            "updated_at_ms": candidate.get("updated_at_ms"),
+        }
+    )
+    if existing.get("status") not in {"confirmed", "dismissed"}:
+        existing["status"] = "candidate"
+    if fact_type == "action_item":
+        if existing.get("owner") is None:
+            existing["owner"] = candidate.get("owner")
+        if existing.get("deadline") is None:
+            existing["deadline"] = candidate.get("deadline")
+    if fact_type == "risk" and existing.get("mitigation") is None:
+        existing["mitigation"] = candidate.get("mitigation")
+    return facts
 
 
 def _sentences(text: str) -> list[str]:
@@ -349,11 +597,16 @@ def _topic_projection(
     sentence: str,
     segment_id: str,
     updated_at_ms: int | None,
+    *,
+    context: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    evidence = _evidence(context or {"segment_id": segment_id}, sentence)
     return {
         "id": _stable_id("topic", _compact(sentence)),
         "text": sentence,
         "status": "active",
+        "confidence": 0.8,
+        "evidence": evidence,
         "evidence_segment_ids": [segment_id],
         "updated_at_ms": updated_at_ms,
     }
@@ -365,7 +618,9 @@ def _record_question(
     sentence: str,
     segment_id: str,
     updated_at_ms: int | None,
+    context: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    evidence = _evidence(context or {"segment_id": segment_id}, sentence)
     existing = _best_matching_question(sentence, questions, only_open=False, for_deduplication=True)
     if existing is not None:
         evidence = existing["evidence_segment_ids"]
@@ -373,6 +628,8 @@ def _record_question(
             evidence.append(segment_id)
         existing["updated_at_ms"] = updated_at_ms
         existing["status"] = "open"
+        existing["confidence"] = max(float(existing.get("confidence") or 0.0), 0.8)
+        existing["evidence"] = evidence
         # Move a repeated question to the end so the three-item window remains recent.
         return [question for question in questions if question is not existing] + [existing]
 
@@ -380,6 +637,8 @@ def _record_question(
         "id": _stable_id("question", _question_key(sentence)),
         "text": sentence,
         "status": "open",
+        "confidence": 0.8,
+        "evidence": evidence,
         "evidence_segment_ids": [segment_id],
         "updated_at_ms": updated_at_ms,
     }
@@ -392,6 +651,7 @@ def _apply_clear_answer(
     sentence: str,
     segment_id: str,
     updated_at_ms: int | None,
+    context: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     if _is_uncertain(sentence) or not _looks_like_clear_answer(sentence):
         return questions
@@ -413,6 +673,8 @@ def _apply_clear_answer(
     if segment_id not in matching["evidence_segment_ids"]:
         matching["evidence_segment_ids"].append(segment_id)
     matching["updated_at_ms"] = updated_at_ms
+    matching["confidence"] = max(float(matching.get("confidence") or 0.0), 0.8)
+    matching["evidence"] = _evidence(context or {"segment_id": segment_id}, sentence)
     return questions
 
 

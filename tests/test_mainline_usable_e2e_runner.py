@@ -316,11 +316,25 @@ def test_runner_uses_asr_event_artifact_as_mainline_trial_source(tmp_path):
 
 def test_runner_reports_local_shadow_preview_release_readiness(tmp_path):
     tool = load_tool_module()
-    asr_quality_decision_path = (
-        tool.REPO_ROOT
-        / "artifacts/tmp/asr_reports/funasr.synthetic-smoke.asr-quality-decision-chunk20_hotword.json"
-    )
-    asr_quality_decision = json.loads(asr_quality_decision_path.read_text(encoding="utf-8"))
+    asr_quality_decision = {
+        "decision_mode": "asr_quality_decision_gate",
+        "decision_id": "DRV-032",
+        "decision_version": "asr_quality_decision_gate.v1",
+        "decision_status": "blocked_by_funasr_smoke_assembly_input_guard",
+        "quality_exit_status": "not_exited",
+        "blocked_reasons": ["engineering normalized_recall must be >= 0.8"],
+        "safe_to_run_funasr_smoke_now": False,
+        "safe_to_download_models_now": False,
+        "safe_to_download_public_audio_now": False,
+        "safe_to_extract_public_audio_now": False,
+        "safe_to_call_public_audio_asr_now": False,
+        "safe_to_capture_microphone_now": False,
+        "safe_to_read_user_audio_now": False,
+        "safe_to_read_configs_local_now": False,
+        "safe_to_call_remote_asr_now": False,
+        "safe_to_call_llm_now": False,
+        "safe_to_run_cargo_tauri_now": False,
+    }
 
     report = tool.run_mainline_usable_e2e_selftest(
         session_id="local_shadow_preview_release_readiness_test",

@@ -126,8 +126,9 @@ def test_history_button_opens_the_single_history_modal_without_e2e_bypass():
 
     assert "function openHistoryModal" in js
     assert "function loadSessionHistoryForModal" in js
-    history_handler = js[js.index('$("btn-history").addEventListener("click"'):]
+    history_handler = js[js.index('const btnHistory = $("btn-history")'):]
     history_handler = history_handler[: history_handler.index('$("btn-auto-suggestion-toggle")')]
+    assert 'btnHistory.addEventListener("click"' in history_handler
     assert "openHistoryModal()" in history_handler
     assert "await loadSessionHistoryForModal()" in history_handler
     assert 'document.querySelector("#review-workspace > summary").click()' not in e2e

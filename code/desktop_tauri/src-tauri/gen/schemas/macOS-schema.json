@@ -213,10 +213,46 @@
           "markdownDescription": "Enables the asr_worker_stop command without any pre-configured scope."
         },
         {
-          "description": "Enables the mic_adapter_delete_audio_chunks command without any pre-configured scope.",
+          "description": "Enables the dual_track_adapter_cleanup command without any pre-configured scope.",
           "type": "string",
-          "const": "allow-mic-adapter-delete-audio-chunks",
-          "markdownDescription": "Enables the mic_adapter_delete_audio_chunks command without any pre-configured scope."
+          "const": "allow-dual-track-adapter-cleanup",
+          "markdownDescription": "Enables the dual_track_adapter_cleanup command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the dual_track_adapter_collect_events command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-dual-track-adapter-collect-events",
+          "markdownDescription": "Enables the dual_track_adapter_collect_events command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the dual_track_adapter_start command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-dual-track-adapter-start",
+          "markdownDescription": "Enables the dual_track_adapter_start command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the dual_track_adapter_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-dual-track-adapter-status",
+          "markdownDescription": "Enables the dual_track_adapter_status command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the dual_track_adapter_stop command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-dual-track-adapter-stop",
+          "markdownDescription": "Enables the dual_track_adapter_stop command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the mic_adapter_cleanup command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-mic-adapter-cleanup",
+          "markdownDescription": "Enables the mic_adapter_cleanup command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the mic_adapter_collect_events command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-mic-adapter-collect-events",
+          "markdownDescription": "Enables the mic_adapter_collect_events command without any pre-configured scope."
         },
         {
           "description": "Enables the mic_adapter_pause command without any pre-configured scope.",
@@ -229,6 +265,12 @@
           "type": "string",
           "const": "allow-mic-adapter-prepare",
           "markdownDescription": "Enables the mic_adapter_prepare command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the mic_adapter_probe command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-mic-adapter-probe",
+          "markdownDescription": "Enables the mic_adapter_probe command without any pre-configured scope."
         },
         {
           "description": "Enables the mic_adapter_resume command without any pre-configured scope.",
@@ -273,6 +315,12 @@
           "markdownDescription": "Enables the provider_config_status command without any pre-configured scope."
         },
         {
+          "description": "Enables the provider_config_sync command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-provider-config-sync",
+          "markdownDescription": "Enables the provider_config_sync command without any pre-configured scope."
+        },
+        {
           "description": "Enables the runtime_get_status command without any pre-configured scope.",
           "type": "string",
           "const": "allow-runtime-get-status",
@@ -289,6 +337,42 @@
           "type": "string",
           "const": "allow-session-prepare",
           "markdownDescription": "Enables the session_prepare command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the system_audio_adapter_cleanup command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-system-audio-adapter-cleanup",
+          "markdownDescription": "Enables the system_audio_adapter_cleanup command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the system_audio_adapter_collect_events command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-system-audio-adapter-collect-events",
+          "markdownDescription": "Enables the system_audio_adapter_collect_events command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the system_audio_adapter_prepare command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-system-audio-adapter-prepare",
+          "markdownDescription": "Enables the system_audio_adapter_prepare command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the system_audio_adapter_start command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-system-audio-adapter-start",
+          "markdownDescription": "Enables the system_audio_adapter_start command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the system_audio_adapter_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-system-audio-adapter-status",
+          "markdownDescription": "Enables the system_audio_adapter_status command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the system_audio_adapter_stop command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-system-audio-adapter-stop",
+          "markdownDescription": "Enables the system_audio_adapter_stop command without any pre-configured scope."
         },
         {
           "description": "Denies the asr_worker_cleanup command without any pre-configured scope.",
@@ -327,10 +411,46 @@
           "markdownDescription": "Denies the asr_worker_stop command without any pre-configured scope."
         },
         {
-          "description": "Denies the mic_adapter_delete_audio_chunks command without any pre-configured scope.",
+          "description": "Denies the dual_track_adapter_cleanup command without any pre-configured scope.",
           "type": "string",
-          "const": "deny-mic-adapter-delete-audio-chunks",
-          "markdownDescription": "Denies the mic_adapter_delete_audio_chunks command without any pre-configured scope."
+          "const": "deny-dual-track-adapter-cleanup",
+          "markdownDescription": "Denies the dual_track_adapter_cleanup command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the dual_track_adapter_collect_events command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-dual-track-adapter-collect-events",
+          "markdownDescription": "Denies the dual_track_adapter_collect_events command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the dual_track_adapter_start command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-dual-track-adapter-start",
+          "markdownDescription": "Denies the dual_track_adapter_start command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the dual_track_adapter_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-dual-track-adapter-status",
+          "markdownDescription": "Denies the dual_track_adapter_status command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the dual_track_adapter_stop command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-dual-track-adapter-stop",
+          "markdownDescription": "Denies the dual_track_adapter_stop command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the mic_adapter_cleanup command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-mic-adapter-cleanup",
+          "markdownDescription": "Denies the mic_adapter_cleanup command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the mic_adapter_collect_events command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-mic-adapter-collect-events",
+          "markdownDescription": "Denies the mic_adapter_collect_events command without any pre-configured scope."
         },
         {
           "description": "Denies the mic_adapter_pause command without any pre-configured scope.",
@@ -343,6 +463,12 @@
           "type": "string",
           "const": "deny-mic-adapter-prepare",
           "markdownDescription": "Denies the mic_adapter_prepare command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the mic_adapter_probe command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-mic-adapter-probe",
+          "markdownDescription": "Denies the mic_adapter_probe command without any pre-configured scope."
         },
         {
           "description": "Denies the mic_adapter_resume command without any pre-configured scope.",
@@ -387,6 +513,12 @@
           "markdownDescription": "Denies the provider_config_status command without any pre-configured scope."
         },
         {
+          "description": "Denies the provider_config_sync command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-provider-config-sync",
+          "markdownDescription": "Denies the provider_config_sync command without any pre-configured scope."
+        },
+        {
           "description": "Denies the runtime_get_status command without any pre-configured scope.",
           "type": "string",
           "const": "deny-runtime-get-status",
@@ -403,6 +535,42 @@
           "type": "string",
           "const": "deny-session-prepare",
           "markdownDescription": "Denies the session_prepare command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the system_audio_adapter_cleanup command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-system-audio-adapter-cleanup",
+          "markdownDescription": "Denies the system_audio_adapter_cleanup command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the system_audio_adapter_collect_events command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-system-audio-adapter-collect-events",
+          "markdownDescription": "Denies the system_audio_adapter_collect_events command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the system_audio_adapter_prepare command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-system-audio-adapter-prepare",
+          "markdownDescription": "Denies the system_audio_adapter_prepare command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the system_audio_adapter_start command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-system-audio-adapter-start",
+          "markdownDescription": "Denies the system_audio_adapter_start command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the system_audio_adapter_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-system-audio-adapter-status",
+          "markdownDescription": "Denies the system_audio_adapter_status command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the system_audio_adapter_stop command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-system-audio-adapter-stop",
+          "markdownDescription": "Denies the system_audio_adapter_stop command without any pre-configured scope."
         },
         {
           "description": "Default core plugins set.\n#### This default permission set includes:\n\n- `core:path:default`\n- `core:event:default`\n- `core:window:default`\n- `core:webview:default`\n- `core:app:default`\n- `core:image:default`\n- `core:resources:default`\n- `core:menu:default`\n- `core:tray:default`",

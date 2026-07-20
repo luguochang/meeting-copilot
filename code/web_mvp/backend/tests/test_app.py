@@ -131,14 +131,16 @@ def test_execution_preview_uses_locally_normalized_final_as_llm_evidence():
                     "segment_id": "s1",
                     "text": "ment gate 和 t九九",
                     "normalized_text": "payment-gateway 和 P99",
-                    "evidence_spans": [{
-                        "id": "asr_ev_s1",
-                        "segment_id": "s1",
-                        "quote": "ment gate 和 t九九",
-                        "start_ms": 0,
-                        "end_ms": 1000,
-                        "status": "active",
-                    }],
+                    "evidence_spans": [
+                        {
+                            "id": "asr_ev_s1",
+                            "segment_id": "s1",
+                            "quote": "ment gate 和 t九九",
+                            "start_ms": 0,
+                            "end_ms": 1000,
+                            "status": "active",
+                        }
+                    ],
                 },
             },
             {
@@ -162,6 +164,7 @@ def test_execution_preview_uses_locally_normalized_final_as_llm_evidence():
 
     assert preview["evidence_spans"][0]["quote"] == "payment-gateway 和 P99"
     assert "ment gate" not in preview["evidence_context"]
+
 
 TAURI_NOOP_COMMANDS = [
     ("runtime.get_status", "runtime_get_status"),
@@ -537,12 +540,8 @@ def _shadow_candidate_report_for_feedback_ingestion(audio_written=True):
         },
         "audio_retention": {
             "audio_chunk_root": "artifacts/tmp/desktop_mic_adapter_runtime/audio_chunks",
-            "audio_chunk_write_status": "written_by_user_approved_shadow_test"
-            if audio_written
-            else "not_written",
-            "audio_delete_status": "deleted_after_review"
-            if audio_written
-            else "not_applicable_no_audio_written",
+            "audio_chunk_write_status": "written_by_user_approved_shadow_test" if audio_written else "not_written",
+            "audio_delete_status": "deleted_after_review" if audio_written else "not_applicable_no_audio_written",
             "retention_policy": "delete_audio_chunks_before_session_discard",
         },
         "known_limitations": [
@@ -660,17 +659,9 @@ def _card_lifecycle_append_idempotency_key(
     session_id: str,
     event_type: str,
     card_id: str = "card_dry_run_001",
-    request_id: str = (
-        "asr_llm_request_draft_"
-        "asr_suggestion_candidate_asr_state_event_asr_seg_001"
-    ),
+    request_id: str = ("asr_llm_request_draft_asr_suggestion_candidate_asr_state_event_asr_seg_001"),
 ) -> str:
-    return (
-        "live_asr_card_lifecycle_append:"
-        f"{session_id}:"
-        f"{request_id}:"
-        f"{event_type}:{card_id}"
-    )
+    return f"live_asr_card_lifecycle_append:{session_id}:{request_id}:{event_type}:{card_id}"
 
 
 def _append_persisted_lifecycle_event(
@@ -693,10 +684,7 @@ def _append_persisted_lifecycle_event(
             event_type,
             card_id,
         ),
-        "request_id": (
-            "asr_llm_request_draft_"
-            "asr_suggestion_candidate_asr_state_event_asr_seg_001"
-        ),
+        "request_id": ("asr_llm_request_draft_asr_suggestion_candidate_asr_state_event_asr_seg_001"),
         "request_draft_event_id": "llm_request_draft:asr_state_event_asr_seg_001",
     }
     if event_type == "suggestion_card":
@@ -756,6 +744,7 @@ def _install_no_llm_config_or_secret_read_guards(monkeypatch, tmp_path, label: s
     original_getenv = os.getenv
     original_environ_get = os.environ.get
     original_environ_getitem = os.environ.__class__.__getitem__
+
     def is_llm_config_path(path) -> bool:
         try:
             candidate = Path(path)
@@ -973,9 +962,7 @@ def _install_no_native_audio_or_process_guards(monkeypatch, label: str):
 def _asr_live_payload_without_revision(session_id: str):
     payload = _asr_live_payload(session_id=session_id)
     payload["streaming_events"] = [
-        event
-        for event in payload["streaming_events"]
-        if event.get("event_type") != "revision"
+        event for event in payload["streaming_events"] if event.get("event_type") != "revision"
     ]
     return payload
 
@@ -1212,7 +1199,9 @@ def test_provider_health_endpoint_masks_llm_secret_and_disables_remote_asr_by_de
         "configured": True,
         "provider": "openai_compatible_gateway",
         "model": "gpt-provider-health",
+        "realtime_model": "gpt-provider-health",
         "is_mock": False,
+        "api_style": "chat_completions",
         "credential_configured": True,
     }
     assert body["asr"]["file_provider"] == "local_funasr_batch"
@@ -1264,20 +1253,24 @@ def test_asr_live_sessions_list_endpoint_hides_mock_sessions_by_default(tmp_path
 
 
 def test_asr_live_session_summary_exposes_recovery_authority_fields():
-    summary = app_module._asr_live_session_summary({
-        "session_id": "recoverable_real_session",
-        "provider": "funasr_realtime",
-        "provider_mode": "real",
-        "is_mock": False,
-        "created_at_epoch_ms": 1_700_000_000_100,
-        "last_activity_at_epoch_ms": 1_700_000_000_900,
-        "audio": {"saved": True},
-        "events": [{
-            "event_type": "transcript_final",
-            "at_ms": 1000,
-            "payload": {"segment_id": "seg_1", "normalized_text": "已经确认的会议文字"},
-        }],
-    })
+    summary = app_module._asr_live_session_summary(
+        {
+            "session_id": "recoverable_real_session",
+            "provider": "funasr_realtime",
+            "provider_mode": "real",
+            "is_mock": False,
+            "created_at_epoch_ms": 1_700_000_000_100,
+            "last_activity_at_epoch_ms": 1_700_000_000_900,
+            "audio": {"saved": True},
+            "events": [
+                {
+                    "event_type": "transcript_final",
+                    "at_ms": 1000,
+                    "payload": {"segment_id": "seg_1", "normalized_text": "已经确认的会议文字"},
+                }
+            ],
+        }
+    )
 
     assert summary["created_at_ms"] == 1_700_000_000_100
     assert summary["last_activity_at_ms"] == 1_700_000_000_900
@@ -1287,22 +1280,26 @@ def test_asr_live_session_summary_exposes_recovery_authority_fields():
 
 
 def test_asr_live_session_summary_never_marks_mock_or_empty_session_recoverable():
-    mock_summary = app_module._asr_live_session_summary({
-        "session_id": "mock_session",
-        "provider": "local_mock_asr",
-        "provider_mode": "mock",
-        "is_mock": True,
-        "last_activity_at_epoch_ms": 1_700_000_000_900,
-        "events": [{"event_type": "transcript_final", "payload": {"text": "演示文字"}}],
-    })
-    empty_summary = app_module._asr_live_session_summary({
-        "session_id": "empty_real_session",
-        "provider": "funasr_realtime",
-        "provider_mode": "real",
-        "is_mock": False,
-        "last_activity_at_epoch_ms": 1_700_000_001_000,
-        "events": [],
-    })
+    mock_summary = app_module._asr_live_session_summary(
+        {
+            "session_id": "mock_session",
+            "provider": "local_mock_asr",
+            "provider_mode": "mock",
+            "is_mock": True,
+            "last_activity_at_epoch_ms": 1_700_000_000_900,
+            "events": [{"event_type": "transcript_final", "payload": {"text": "演示文字"}}],
+        }
+    )
+    empty_summary = app_module._asr_live_session_summary(
+        {
+            "session_id": "empty_real_session",
+            "provider": "funasr_realtime",
+            "provider_mode": "real",
+            "is_mock": False,
+            "last_activity_at_epoch_ms": 1_700_000_001_000,
+            "events": [],
+        }
+    )
 
     assert mock_summary["recoverable"] is False
     assert empty_summary["has_transcript"] is False
@@ -1318,23 +1315,29 @@ def test_asr_live_sessions_list_is_sorted_by_wall_clock_activity_not_session_id(
         "is_mock": False,
         "source": "asr_live_event_source",
         "trace_kind": "asr_live_trace",
-        "events": [{
-            "event_type": "transcript_final",
-            "payload": {"segment_id": "seg_1", "normalized_text": "真实会议文字"},
-        }],
+        "events": [
+            {
+                "event_type": "transcript_final",
+                "payload": {"segment_id": "seg_1", "normalized_text": "真实会议文字"},
+            }
+        ],
     }
-    repository.create({
-        **base_record,
-        "session_id": "aaa_older",
-        "created_at_epoch_ms": 1_700_000_000_000,
-        "last_activity_at_epoch_ms": 1_700_000_001_000,
-    })
-    repository.create({
-        **base_record,
-        "session_id": "zzz_newer",
-        "created_at_epoch_ms": 1_700_000_002_000,
-        "last_activity_at_epoch_ms": 1_700_000_003_000,
-    })
+    repository.create(
+        {
+            **base_record,
+            "session_id": "aaa_older",
+            "created_at_epoch_ms": 1_700_000_000_000,
+            "last_activity_at_epoch_ms": 1_700_000_001_000,
+        }
+    )
+    repository.create(
+        {
+            **base_record,
+            "session_id": "zzz_newer",
+            "created_at_epoch_ms": 1_700_000_002_000,
+            "last_activity_at_epoch_ms": 1_700_000_003_000,
+        }
+    )
 
     response = TestClient(create_app(data_dir=tmp_path)).get("/live/asr/sessions")
 
@@ -1394,38 +1397,42 @@ def test_asr_live_event_metadata_rechecks_persisted_transcript_quality(tmp_path)
     events = app_module.build_asr_live_events(
         session_id=session_id,
         provider="sherpa_onnx_realtime",
-        streaming_events=[{
-            "event_type": "final",
-            "segment_id": "quality_seg_1",
-            "text": bad_text,
-            "start_ms": 0,
-            "end_ms": 3_000,
-            "received_at_ms": 3_000,
-            "confidence": 0.9,
-        }],
+        streaming_events=[
+            {
+                "event_type": "final",
+                "segment_id": "quality_seg_1",
+                "text": bad_text,
+                "start_ms": 0,
+                "end_ms": 3_000,
+                "received_at_ms": 3_000,
+                "confidence": 0.9,
+            }
+        ],
         is_mock=False,
     )
-    app.state.asr_live_repository.create({
-        "session_id": session_id,
-        "source": "live_asr_stream",
-        "trace_kind": "live_event",
-        "provider": "sherpa_onnx_realtime",
-        "provider_mode": "real",
-        "is_mock": False,
-        "input_source": "real_mic",
-        "degradation_reasons": [],
-        # Simulate a session persisted before the v3 quality policy existed.
-        "asr_semantic_quality": {
-            "schema_version": "asr_semantic_quality.v1",
-            "policy_version": "general_chinese_technical_meeting.v2",
-            "status": "passed",
-            "blocker": None,
-        },
-        "suggestion_cards": [{"card_id": "stale_card"}],
-        "approach_cards": [{"card_id": "stale_approach"}],
-        "minutes": {"minutes_md": "旧纪要"},
-        "events": events,
-    })
+    app.state.asr_live_repository.create(
+        {
+            "session_id": session_id,
+            "source": "live_asr_stream",
+            "trace_kind": "live_event",
+            "provider": "sherpa_onnx_realtime",
+            "provider_mode": "real",
+            "is_mock": False,
+            "input_source": "real_mic",
+            "degradation_reasons": [],
+            # Simulate a session persisted before the v3 quality policy existed.
+            "asr_semantic_quality": {
+                "schema_version": "asr_semantic_quality.v1",
+                "policy_version": "general_chinese_technical_meeting.v2",
+                "status": "passed",
+                "blocker": None,
+            },
+            "suggestion_cards": [{"card_id": "stale_card"}],
+            "approach_cards": [{"card_id": "stale_approach"}],
+            "minutes": {"minutes_md": "旧纪要"},
+            "events": events,
+        }
+    )
 
     response = client.get(f"/live/asr/sessions/{session_id}/events")
 
@@ -1455,36 +1462,40 @@ def test_asr_live_quality_migration_clears_stale_semantic_degradation(tmp_path):
     events = app_module.build_asr_live_events(
         session_id=session_id,
         provider="funasr_realtime",
-        streaming_events=[{
-            "event_type": "final",
-            "segment_id": "general_seg_1",
-            "text": "今天聊聊天气，下午一起散步。",
-            "start_ms": 0,
-            "end_ms": 3_000,
-            "received_at_ms": 3_000,
-            "confidence": 0.9,
-        }],
+        streaming_events=[
+            {
+                "event_type": "final",
+                "segment_id": "general_seg_1",
+                "text": "今天聊聊天气，下午一起散步。",
+                "start_ms": 0,
+                "end_ms": 3_000,
+                "received_at_ms": 3_000,
+                "confidence": 0.9,
+            }
+        ],
         is_mock=False,
     )
-    app.state.asr_live_repository.create({
-        "session_id": session_id,
-        "source": "live_asr_stream",
-        "trace_kind": "live_event",
-        "provider": "funasr_realtime",
-        "provider_mode": "real",
-        "is_mock": False,
-        "input_source": "browser_live_mic",
-        "degradation_reasons": ["asr_semantic_quality_blocked", "degraded_asr_session"],
-        "asr_semantic_quality": {
-            "policy_version": "general_chinese_technical_meeting.v2",
-            "status": "blocked",
-            "blocker": "asr_semantic_quality_blocked",
-        },
-        "events": events,
-        "suggestion_cards": [],
-        "approach_cards": [],
-        "minutes": {},
-    })
+    app.state.asr_live_repository.create(
+        {
+            "session_id": session_id,
+            "source": "live_asr_stream",
+            "trace_kind": "live_event",
+            "provider": "funasr_realtime",
+            "provider_mode": "real",
+            "is_mock": False,
+            "input_source": "browser_live_mic",
+            "degradation_reasons": ["asr_semantic_quality_blocked", "degraded_asr_session"],
+            "asr_semantic_quality": {
+                "policy_version": "general_chinese_technical_meeting.v2",
+                "status": "blocked",
+                "blocker": "asr_semantic_quality_blocked",
+            },
+            "events": events,
+            "suggestion_cards": [],
+            "approach_cards": [],
+            "minutes": {},
+        }
+    )
 
     response = client.get(f"/live/asr/sessions/{session_id}/events")
 
@@ -1578,8 +1589,7 @@ def test_create_asr_live_session_events_json_and_sse_use_asr_boundary():
     created = create_response.json()
     assert created["session_id"] == "local_asr_stream_review"
     assert {
-        key: created["event_source"][key]
-        for key in ["source", "trace_kind", "transport", "provider", "is_mock"]
+        key: created["event_source"][key] for key in ["source", "trace_kind", "transport", "provider", "is_mock"]
     } == {
         "source": "live_asr_stream",
         "trace_kind": "live_event",
@@ -1635,9 +1645,7 @@ def test_create_asr_live_session_events_json_and_sse_use_asr_boundary():
     assert events[-1]["payload"]["final_event_count"] == 4
     assert events[-1]["payload"]["revision_event_count"] == 1
     assert "suggestion_card" not in [event["event_type"] for event in events]
-    suggestion_candidates = [
-        event for event in events if event["event_type"] == "suggestion_candidate_event"
-    ]
+    suggestion_candidates = [event for event in events if event["event_type"] == "suggestion_candidate_event"]
     assert [event["payload"]["gap_rule_id"] for event in suggestion_candidates] == [
         "release.rollback.owner.required",
         "release.rollback.owner.required",
@@ -1645,15 +1653,9 @@ def test_create_asr_live_session_events_json_and_sse_use_asr_boundary():
         "risk.rollback.validation",
         "action.owner.deadline.confirmation",
     ]
-    assert {event["payload"]["llm_call_status"] for event in suggestion_candidates} == {
-        "not_called"
-    }
-    assert {event["payload"]["card_status"] for event in suggestion_candidates} == {
-        "not_created"
-    }
-    request_drafts = [
-        event for event in events if event["event_type"] == "llm_request_draft_event"
-    ]
+    assert {event["payload"]["llm_call_status"] for event in suggestion_candidates} == {"not_called"}
+    assert {event["payload"]["card_status"] for event in suggestion_candidates} == {"not_created"}
+    request_drafts = [event for event in events if event["event_type"] == "llm_request_draft_event"]
     assert [event["payload"]["gap_rule_id"] for event in request_drafts] == [
         "release.rollback.owner.required",
         "release.rollback.owner.required",
@@ -1661,18 +1663,10 @@ def test_create_asr_live_session_events_json_and_sse_use_asr_boundary():
         "risk.rollback.validation",
         "action.owner.deadline.confirmation",
     ]
-    assert {event["payload"]["request_status"] for event in request_drafts} == {
-        "draft_only"
-    }
-    assert {event["payload"]["llm_call_status"] for event in request_drafts} == {
-        "not_called"
-    }
-    assert {event["payload"]["schema_status"] for event in request_drafts} == {
-        "not_generated"
-    }
-    assert {event["payload"]["card_status"] for event in request_drafts} == {
-        "not_created"
-    }
+    assert {event["payload"]["request_status"] for event in request_drafts} == {"draft_only"}
+    assert {event["payload"]["llm_call_status"] for event in request_drafts} == {"not_called"}
+    assert {event["payload"]["schema_status"] for event in request_drafts} == {"not_generated"}
+    assert {event["payload"]["card_status"] for event in request_drafts} == {"not_created"}
     assert request_drafts[0]["payload"]["target_candidate_id"] == suggestion_candidates[0]["payload"]["candidate_id"]
     state_events = [event for event in events if event["event_type"] == "state_event"]
     assert [event["payload"]["target_type"] for event in state_events] == [
@@ -1711,18 +1705,14 @@ def test_create_asr_live_session_events_json_and_sse_use_asr_boundary():
         "source": "live_asr_stream",
         "state_origin": "local_deterministic_asr_skeleton",
     }
-    scheduler_event = next(
-        event for event in events if event["event_type"] == "scheduler_event"
-    )
+    scheduler_event = next(event for event in events if event["event_type"] == "scheduler_event")
     assert scheduler_event["payload"]["scheduler_event_type"] == "llm_candidate_queued"
     assert scheduler_event["payload"]["decision_reason"] == "state_change"
     assert scheduler_event["payload"]["would_call_llm"] is True
     assert scheduler_event["payload"]["llm_call_status"] == "not_called"
     assert scheduler_event["payload"]["budget_remaining"] == 79
     assert scheduler_event["payload"]["model"] == "not-called"
-    skipped_scheduler_event = [
-        event for event in events if event["event_type"] == "scheduler_event"
-    ][1]
+    skipped_scheduler_event = [event for event in events if event["event_type"] == "scheduler_event"][1]
     assert skipped_scheduler_event["payload"]["scheduler_event_type"] == "llm_candidate_skipped"
     assert skipped_scheduler_event["payload"]["decision_reason"] == "cooldown"
     assert skipped_scheduler_event["payload"]["would_call_llm"] is False
@@ -1751,9 +1741,7 @@ def test_create_asr_live_session_events_json_and_sse_use_asr_boundary():
     assert "draft_only" in sse_response.text
     assert "not_generated" in sse_response.text
     sse_events = [
-        json.loads(line.removeprefix("data: "))
-        for line in sse_response.text.splitlines()
-        if line.startswith("data: ")
+        json.loads(line.removeprefix("data: ")) for line in sse_response.text.splitlines() if line.startswith("data: ")
     ]
     assert sse_events == events
 
@@ -1785,8 +1773,7 @@ def test_create_asr_live_session_from_local_event_file_uses_worker_handoff_bound
     assert created["ingest_mode"] == "local_asr_event_file"
     assert created["events_path"] == "artifacts/tmp/asr_events/api-review-001.sherpa.events.json"
     assert {
-        key: created["event_source"][key]
-        for key in ("source", "trace_kind", "transport", "provider", "is_mock")
+        key: created["event_source"][key] for key in ("source", "trace_kind", "transport", "provider", "is_mock")
     } == {
         "source": "live_asr_stream",
         "trace_kind": "live_event",
@@ -2036,9 +2023,7 @@ def test_create_asr_live_session_from_local_event_file_handles_absolute_and_miss
     monkeypatch,
 ):
     monkeypatch.setattr(app_module, "REPO_ROOT", tmp_path)
-    inside_absolute_path = (
-        tmp_path / "artifacts" / "tmp" / "asr_events" / "inside-absolute.events.json"
-    )
+    inside_absolute_path = tmp_path / "artifacts" / "tmp" / "asr_events" / "inside-absolute.events.json"
     inside_absolute_path.parent.mkdir(parents=True, exist_ok=True)
     inside_absolute_path.write_text(
         json.dumps(_asr_live_payload()["streaming_events"], ensure_ascii=False),
@@ -2077,9 +2062,7 @@ def test_create_asr_live_session_from_local_event_file_handles_absolute_and_miss
     )
 
     assert inside_response.status_code == 201
-    assert inside_response.json()["events_path"] == (
-        "artifacts/tmp/asr_events/inside-absolute.events.json"
-    )
+    assert inside_response.json()["events_path"] == ("artifacts/tmp/asr_events/inside-absolute.events.json")
     assert outside_response.status_code == 422
     outside_detail = outside_response.json()["detail"]
     assert outside_detail["ingest_status"] == "blocked_by_path_validation"
@@ -2149,9 +2132,7 @@ def test_create_asr_live_session_from_local_event_file_rejects_duplicate_session
             "events_path": replacement_events_path,
         },
     )
-    read_response = client.get(
-        "/live/asr/sessions/duplicate_local_asr_file_handoff/events"
-    )
+    read_response = client.get("/live/asr/sessions/duplicate_local_asr_file_handoff/events")
 
     assert first_response.status_code == 201
     assert duplicate_response.status_code == 422
@@ -2190,12 +2171,8 @@ def test_create_asr_live_session_from_local_event_file_persists_across_app_insta
     )
 
     second_client = TestClient(create_app(data_dir=tmp_path / "repo-data"))
-    json_response = second_client.get(
-        "/live/asr/sessions/persisted_local_asr_file_handoff/events"
-    )
-    sse_response = second_client.get(
-        "/live/asr/sessions/persisted_local_asr_file_handoff/events.sse"
-    )
+    json_response = second_client.get("/live/asr/sessions/persisted_local_asr_file_handoff/events")
+    sse_response = second_client.get("/live/asr/sessions/persisted_local_asr_file_handoff/events.sse")
 
     assert create_response.status_code == 201
     assert json_response.status_code == 200
@@ -2252,25 +2229,19 @@ def test_create_asr_live_session_keeps_multi_state_scheduler_pairs_at_api_bounda
         "evaluation_summary",
     ]
     assert events[1]["payload"]["target_type"] == "DecisionCandidate"
-    assert events[2]["payload"]["source_event_ids"] == [
-        "asr_state_event_asr_seg_multi_001"
-    ]
+    assert events[2]["payload"]["source_event_ids"] == ["asr_state_event_asr_seg_multi_001"]
     assert events[3]["payload"]["target_type"] == "DecisionCandidate"
     assert events[3]["payload"]["gap_rule_id"] == "release.rollback.owner.required"
     assert events[4]["payload"]["target_candidate_id"] == events[3]["payload"]["candidate_id"]
     assert events[5]["payload"]["target_type"] == "OpenQuestion"
     assert events[5]["payload"]["state_item"]["question"] == "先灰度 10%，谁负责回滚？"
-    assert events[6]["payload"]["source_event_ids"] == [
-        "asr_question_event_asr_seg_multi_001"
-    ]
+    assert events[6]["payload"]["source_event_ids"] == ["asr_question_event_asr_seg_multi_001"]
     assert events[7]["payload"]["target_type"] == "OpenQuestion"
     assert events[7]["payload"]["gap_rule_id"] == "open.question.followup"
     assert events[8]["payload"]["target_candidate_id"] == events[7]["payload"]["candidate_id"]
 
     sse_events = [
-        json.loads(line.removeprefix("data: "))
-        for line in sse_response.text.splitlines()
-        if line.startswith("data: ")
+        json.loads(line.removeprefix("data: ")) for line in sse_response.text.splitlines() if line.startswith("data: ")
     ]
     assert sse_events == events
 
@@ -2282,9 +2253,7 @@ def test_asr_live_suggestion_candidates_endpoint_returns_only_candidate_queue():
         json=_asr_live_payload(session_id="local_asr_candidate_query_review"),
     )
 
-    response = client.get(
-        "/live/asr/sessions/local_asr_candidate_query_review/suggestion-candidates"
-    )
+    response = client.get("/live/asr/sessions/local_asr_candidate_query_review/suggestion-candidates")
 
     assert create_response.status_code == 201
     assert response.status_code == 200
@@ -2308,9 +2277,7 @@ def test_asr_live_suggestion_candidates_endpoint_returns_only_candidate_queue():
         20,
         25,
     ]
-    assert "llm_request_draft_event" not in [
-        candidate["event_type"] for candidate in candidates
-    ]
+    assert "llm_request_draft_event" not in [candidate["event_type"] for candidate in candidates]
     assert [candidate["payload"]["gap_rule_id"] for candidate in candidates] == [
         "release.rollback.owner.required",
         "release.rollback.owner.required",
@@ -2318,18 +2285,10 @@ def test_asr_live_suggestion_candidates_endpoint_returns_only_candidate_queue():
         "risk.rollback.validation",
         "action.owner.deadline.confirmation",
     ]
-    assert {candidate["payload"]["candidate_policy_version"] for candidate in candidates} == {
-        "asr-candidate-policy.v1"
-    }
-    assert {candidate["payload"]["confidence_source"] for candidate in candidates} == {
-        "local_deterministic_heuristic"
-    }
-    assert {candidate["payload"]["llm_call_status"] for candidate in candidates} == {
-        "not_called"
-    }
-    assert {candidate["payload"]["card_status"] for candidate in candidates} == {
-        "not_created"
-    }
+    assert {candidate["payload"]["candidate_policy_version"] for candidate in candidates} == {"asr-candidate-policy.v1"}
+    assert {candidate["payload"]["confidence_source"] for candidate in candidates} == {"local_deterministic_heuristic"}
+    assert {candidate["payload"]["llm_call_status"] for candidate in candidates} == {"not_called"}
+    assert {candidate["payload"]["card_status"] for candidate in candidates} == {"not_created"}
     assert candidates[0]["event_id"] == "suggestion_candidate:asr_state_event_asr_seg_001"
     assert candidates[0]["at_ms"] == 3500
     assert "payload" in candidates[0]
@@ -2364,9 +2323,7 @@ def test_asr_live_suggestion_candidates_endpoint_returns_empty_queue_for_transcr
         },
     )
 
-    response = client.get(
-        "/live/asr/sessions/local_asr_candidate_empty_review/suggestion-candidates"
-    )
+    response = client.get("/live/asr/sessions/local_asr_candidate_empty_review/suggestion-candidates")
 
     assert create_response.status_code == 201
     assert response.status_code == 200
@@ -2387,9 +2344,7 @@ def test_asr_live_suggestion_candidates_endpoint_reads_persisted_record_across_a
     )
 
     second_client = TestClient(create_app(data_dir=tmp_path))
-    response = second_client.get(
-        "/live/asr/sessions/persisted_asr_candidate_query_review/suggestion-candidates"
-    )
+    response = second_client.get("/live/asr/sessions/persisted_asr_candidate_query_review/suggestion-candidates")
 
     assert create_response.status_code == 201
     assert response.status_code == 200
@@ -2424,9 +2379,7 @@ def test_asr_live_llm_request_drafts_endpoint_returns_only_request_draft_queue()
         json=_asr_live_payload(session_id="local_asr_request_draft_query_review"),
     )
 
-    response = client.get(
-        "/live/asr/sessions/local_asr_request_draft_query_review/llm-request-drafts"
-    )
+    response = client.get("/live/asr/sessions/local_asr_request_draft_query_review/llm-request-drafts")
 
     assert create_response.status_code == 201
     assert response.status_code == 200
@@ -2444,21 +2397,11 @@ def test_asr_live_llm_request_drafts_endpoint_returns_only_request_draft_queue()
         "llm_request_draft_event",
     ]
     assert [draft["sequence"] for draft in drafts] == [6, 11, 16, 21, 26]
-    assert "suggestion_candidate_event" not in [
-        draft["event_type"] for draft in drafts
-    ]
-    assert {draft["payload"]["request_status"] for draft in drafts} == {
-        "draft_only"
-    }
-    assert {draft["payload"]["llm_call_status"] for draft in drafts} == {
-        "not_called"
-    }
-    assert {draft["payload"]["schema_status"] for draft in drafts} == {
-        "not_generated"
-    }
-    assert {draft["payload"]["card_status"] for draft in drafts} == {
-        "not_created"
-    }
+    assert "suggestion_candidate_event" not in [draft["event_type"] for draft in drafts]
+    assert {draft["payload"]["request_status"] for draft in drafts} == {"draft_only"}
+    assert {draft["payload"]["llm_call_status"] for draft in drafts} == {"not_called"}
+    assert {draft["payload"]["schema_status"] for draft in drafts} == {"not_generated"}
+    assert {draft["payload"]["card_status"] for draft in drafts} == {"not_created"}
     assert drafts[0]["event_id"] == "llm_request_draft:asr_state_event_asr_seg_001"
     assert drafts[0]["at_ms"] == 3500
     assert "payload" in drafts[0]
@@ -2493,9 +2436,7 @@ def test_asr_live_llm_request_drafts_endpoint_returns_empty_queue_for_transcript
         },
     )
 
-    response = client.get(
-        "/live/asr/sessions/local_asr_request_draft_empty_review/llm-request-drafts"
-    )
+    response = client.get("/live/asr/sessions/local_asr_request_draft_empty_review/llm-request-drafts")
 
     assert create_response.status_code == 201
     assert response.status_code == 200
@@ -2518,9 +2459,7 @@ def test_asr_live_llm_request_drafts_endpoint_reads_persisted_record_across_app_
     )
 
     second_client = TestClient(create_app(data_dir=tmp_path))
-    response = second_client.get(
-        "/live/asr/sessions/persisted_asr_request_draft_query_review/llm-request-drafts"
-    )
+    response = second_client.get("/live/asr/sessions/persisted_asr_request_draft_query_review/llm-request-drafts")
 
     assert create_response.status_code == 201
     assert response.status_code == 200
@@ -2548,7 +2487,6 @@ def test_asr_live_llm_request_drafts_endpoint_returns_404_for_missing_session():
     assert "ASR live session not found: missing_asr_review" in response.text
 
 
-
 def test_asr_live_llm_execution_previews_endpoint_returns_preview_queue_without_calling_llm():
     client = TestClient(create_app())
     create_response = client.post(
@@ -2556,12 +2494,8 @@ def test_asr_live_llm_execution_previews_endpoint_returns_preview_queue_without_
         json=_asr_live_payload(session_id="local_asr_execution_preview_review"),
     )
 
-    response = client.get(
-        "/live/asr/sessions/local_asr_execution_preview_review/llm-execution-previews"
-    )
-    events_response = client.get(
-        "/live/asr/sessions/local_asr_execution_preview_review/events"
-    )
+    response = client.get("/live/asr/sessions/local_asr_execution_preview_review/llm-execution-previews")
+    events_response = client.get("/live/asr/sessions/local_asr_execution_preview_review/events")
 
     assert create_response.status_code == 201
     assert response.status_code == 200
@@ -2585,20 +2519,14 @@ def test_asr_live_llm_execution_previews_endpoint_returns_preview_queue_without_
     ]
     assert previews[0] == {
         "execution_id": (
-            "asr_llm_execution_preview_"
-            "asr_llm_request_draft_asr_suggestion_candidate_asr_state_event_asr_seg_001"
+            "asr_llm_execution_preview_asr_llm_request_draft_asr_suggestion_candidate_asr_state_event_asr_seg_001"
         ),
         "execution_status": "preview_only",
-        "request_id": (
-            "asr_llm_request_draft_"
-            "asr_suggestion_candidate_asr_state_event_asr_seg_001"
-        ),
+        "request_id": ("asr_llm_request_draft_asr_suggestion_candidate_asr_state_event_asr_seg_001"),
         "request_draft_event_id": "llm_request_draft:asr_state_event_asr_seg_001",
         "request_draft_sequence": 6,
         "request_type": "llm_suggestion_card_draft",
-        "target_candidate_id": (
-            "asr_suggestion_candidate_asr_state_event_asr_seg_001"
-        ),
+        "target_candidate_id": ("asr_suggestion_candidate_asr_state_event_asr_seg_001"),
         "target_type": "DecisionCandidate",
         "target_id": "asr_decision_asr_seg_001",
         "gap_rule_id": "release.rollback.owner.required",
@@ -2646,15 +2574,9 @@ def test_asr_live_llm_execution_previews_endpoint_returns_preview_queue_without_
     assert all(preview["segment_batch"] for preview in previews)
     assert events_response.status_code == 200
     assert events_response.json()["events"] == create_response.json()["live_events"]
-    assert "llm_schema_result" not in [
-        event["event_type"] for event in events_response.json()["events"]
-    ]
-    assert "suggestion_card" not in [
-        event["event_type"] for event in events_response.json()["events"]
-    ]
-    assert "suggestion_silenced" not in [
-        event["event_type"] for event in events_response.json()["events"]
-    ]
+    assert "llm_schema_result" not in [event["event_type"] for event in events_response.json()["events"]]
+    assert "suggestion_card" not in [event["event_type"] for event in events_response.json()["events"]]
+    assert "suggestion_silenced" not in [event["event_type"] for event in events_response.json()["events"]]
 
 
 def test_asr_live_llm_execution_previews_endpoint_returns_empty_queue_for_transcript_only_session():
@@ -2686,9 +2608,7 @@ def test_asr_live_llm_execution_previews_endpoint_returns_empty_queue_for_transc
         },
     )
 
-    response = client.get(
-        "/live/asr/sessions/local_asr_execution_preview_empty_review/llm-execution-previews"
-    )
+    response = client.get("/live/asr/sessions/local_asr_execution_preview_empty_review/llm-execution-previews")
 
     assert create_response.status_code == 201
     assert response.status_code == 200
@@ -2711,9 +2631,7 @@ def test_asr_live_llm_execution_previews_endpoint_reads_persisted_record_across_
     )
 
     second_client = TestClient(create_app(data_dir=tmp_path))
-    response = second_client.get(
-        "/live/asr/sessions/persisted_asr_execution_preview_review/llm-execution-previews"
-    )
+    response = second_client.get("/live/asr/sessions/persisted_asr_execution_preview_review/llm-execution-previews")
 
     assert create_response.status_code == 201
     assert response.status_code == 200
@@ -2733,9 +2651,7 @@ def test_asr_live_llm_execution_previews_endpoint_reads_persisted_record_across_
 def test_asr_live_llm_execution_previews_endpoint_returns_404_for_missing_session():
     client = TestClient(create_app())
 
-    response = client.get(
-        "/live/asr/sessions/missing_asr_review/llm-execution-previews"
-    )
+    response = client.get("/live/asr/sessions/missing_asr_review/llm-execution-previews")
 
     assert response.status_code == 404
     assert "ASR live session not found: missing_asr_review" in response.text
@@ -2747,17 +2663,13 @@ def test_asr_live_llm_execution_runs_disabled_endpoint_returns_skipped_runs_with
         "/live/asr/mock/sessions",
         json=_asr_live_payload(session_id="local_asr_execution_disabled_run_review"),
     )
-    events_before_response = client.get(
-        "/live/asr/sessions/local_asr_execution_disabled_run_review/events"
-    )
+    events_before_response = client.get("/live/asr/sessions/local_asr_execution_disabled_run_review/events")
 
     response = client.post(
         "/live/asr/sessions/local_asr_execution_disabled_run_review/llm-execution-runs",
         json={"mode": "disabled"},
     )
-    events_after_response = client.get(
-        "/live/asr/sessions/local_asr_execution_disabled_run_review/events"
-    )
+    events_after_response = client.get("/live/asr/sessions/local_asr_execution_disabled_run_review/events")
 
     assert create_response.status_code == 201
     assert events_before_response.status_code == 200
@@ -2790,20 +2702,14 @@ def test_asr_live_llm_execution_runs_disabled_endpoint_returns_skipped_runs_with
         "run_status": "skipped",
         "skip_reason": "llm_executor_disabled",
         "execution_id": (
-            "asr_llm_execution_preview_"
-            "asr_llm_request_draft_asr_suggestion_candidate_asr_state_event_asr_seg_001"
+            "asr_llm_execution_preview_asr_llm_request_draft_asr_suggestion_candidate_asr_state_event_asr_seg_001"
         ),
         "execution_status": "preview_only",
-        "request_id": (
-            "asr_llm_request_draft_"
-            "asr_suggestion_candidate_asr_state_event_asr_seg_001"
-        ),
+        "request_id": ("asr_llm_request_draft_asr_suggestion_candidate_asr_state_event_asr_seg_001"),
         "request_draft_event_id": "llm_request_draft:asr_state_event_asr_seg_001",
         "request_draft_sequence": 6,
         "request_type": "llm_suggestion_card_draft",
-        "target_candidate_id": (
-            "asr_suggestion_candidate_asr_state_event_asr_seg_001"
-        ),
+        "target_candidate_id": ("asr_suggestion_candidate_asr_state_event_asr_seg_001"),
         "target_type": "DecisionCandidate",
         "target_id": "asr_decision_asr_seg_001",
         "gap_rule_id": "release.rollback.owner.required",
@@ -2854,15 +2760,9 @@ def test_asr_live_llm_execution_runs_disabled_endpoint_returns_skipped_runs_with
     assert events_after_response.status_code == 200
     assert events_before_response.json()["events"] == events_after_response.json()["events"]
     assert events_after_response.json()["events"] == create_response.json()["live_events"]
-    assert "llm_schema_result" not in [
-        event["event_type"] for event in events_after_response.json()["events"]
-    ]
-    assert "suggestion_card" not in [
-        event["event_type"] for event in events_after_response.json()["events"]
-    ]
-    assert "suggestion_silenced" not in [
-        event["event_type"] for event in events_after_response.json()["events"]
-    ]
+    assert "llm_schema_result" not in [event["event_type"] for event in events_after_response.json()["events"]]
+    assert "suggestion_card" not in [event["event_type"] for event in events_after_response.json()["events"]]
+    assert "suggestion_silenced" not in [event["event_type"] for event in events_after_response.json()["events"]]
 
 
 def test_asr_live_llm_execution_runs_disabled_endpoint_returns_empty_runs_for_transcript_only_session():
@@ -2902,10 +2802,7 @@ def test_asr_live_llm_execution_runs_disabled_endpoint_returns_empty_runs_for_tr
     assert create_response.status_code == 201
     assert response.status_code == 200
     body = response.json()
-    assert {
-        key: body[key]
-        for key in ("session_id", "source", "trace_kind", "executor_mode", "run_count", "runs")
-    } == {
+    assert {key: body[key] for key in ("session_id", "source", "trace_kind", "executor_mode", "run_count", "runs")} == {
         "session_id": "local_asr_execution_disabled_empty_review",
         "source": "live_asr_stream",
         "trace_kind": "live_event",
@@ -2916,8 +2813,10 @@ def test_asr_live_llm_execution_runs_disabled_endpoint_returns_empty_runs_for_tr
     assert body["llm_provider"] == {
         "provider": "not_configured",
         "model": "not_called",
+        "realtime_model": "not_called",
         "configured_from_env": False,
         "is_mock": False,
+        "api_style": "not_configured",
     }
 
 
@@ -3138,7 +3037,13 @@ def test_demo_derivation_endpoint_can_execute_mock_session_without_public_bypass
     class FakeClient:
         def post_json(self, url, headers, body, timeout):
             return {
-                "choices": [{"message": {"content": '{"suggestion_text":"建议确认 owner","confidence":0.8,"trigger_reason":"owner 缺失"}'}}],
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"suggestion_text":"建议确认 owner","confidence":0.8,"trigger_reason":"owner 缺失"}'
+                        }
+                    }
+                ],
                 "usage": {"prompt_tokens": 100, "completion_tokens": 30, "total_tokens": 130},
             }
 
@@ -3176,7 +3081,13 @@ def test_asr_live_llm_execution_runs_enabled_calls_llm_and_creates_real_cards(mo
         def post_json(self, url, headers, body, timeout):
             self.calls += 1
             return {
-                "choices": [{"message": {"content": '{"suggestion_text":"建议确认 owner","confidence":0.8,"trigger_reason":"owner 缺失"}'}}],
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"suggestion_text":"建议确认 owner","confidence":0.8,"trigger_reason":"owner 缺失"}'
+                        }
+                    }
+                ],
                 "usage": {"prompt_tokens": 100, "completion_tokens": 30, "total_tokens": 130},
             }
 
@@ -3250,10 +3161,7 @@ def test_asr_live_llm_execution_runs_enabled_caps_long_meeting_candidates(monkey
             {
                 "event_type": "final",
                 "segment_id": f"asr_long_seg_{index:03d}",
-                "text": (
-                    f"第 {index} 个接口发布先灰度 5%，如果错误率超过 0.1% 就回滚，"
-                    "谁负责回滚？"
-                ),
+                "text": (f"第 {index} 个接口发布先灰度 5%，如果错误率超过 0.1% 就回滚，谁负责回滚？"),
                 "start_ms": start_ms,
                 "end_ms": start_ms + 7_000,
                 "received_at_ms": start_ms + 7_500,
@@ -3285,9 +3193,7 @@ def test_asr_live_llm_execution_runs_enabled_caps_long_meeting_candidates(monkey
     create_response = client.post("/live/asr/mock/sessions", json=payload)
     assert create_response.status_code == 201
     candidate_count = sum(
-        1
-        for event in create_response.json()["live_events"]
-        if event["event_type"] == "llm_request_draft_event"
+        1 for event in create_response.json()["live_events"] if event["event_type"] == "llm_request_draft_event"
     )
     assert candidate_count > 3
 
@@ -3373,9 +3279,7 @@ def test_asr_live_llm_execution_runs_enabled_persists_cards_for_history(monkeypa
                     {
                         "message": {
                             "content": (
-                                '{"suggestion_text":"建议确认 owner",'
-                                '"confidence":0.8,'
-                                '"trigger_reason":"owner 缺失"}'
+                                '{"suggestion_text":"建议确认 owner","confidence":0.8,"trigger_reason":"owner 缺失"}'
                             )
                         }
                     }
@@ -3407,10 +3311,7 @@ def test_asr_live_llm_execution_runs_enabled_persists_cards_for_history(monkeypa
     assert record["suggestion_cards"]
     assert record["suggestion_cards"][0]["suggestion_text"] == "建议确认 owner"
     assert record["suggestion_cards"][0]["evidence_span_ids"]
-    indexed = {
-        item["session_id"]: item
-        for item in history.json()["sessions"]
-    }
+    indexed = {item["session_id"]: item for item in history.json()["sessions"]}
     assert indexed["local_asr_execution_persist_cards"]["suggestion_card_count"] >= 1
 
 
@@ -3438,9 +3339,7 @@ def test_asr_live_llm_execution_runs_disabled_endpoint_rejects_empty_body():
         json=_asr_live_payload(session_id="local_asr_execution_empty_body_review"),
     )
 
-    response = client.post(
-        "/live/asr/sessions/local_asr_execution_empty_body_review/llm-execution-runs"
-    )
+    response = client.post("/live/asr/sessions/local_asr_execution_empty_body_review/llm-execution-runs")
 
     assert create_response.status_code == 201
     assert response.status_code == 422
@@ -3462,7 +3361,6 @@ def test_asr_live_llm_execution_runs_disabled_endpoint_rejects_extra_fields():
     assert create_response.status_code == 201
     assert response.status_code == 422
     assert "Extra inputs are not permitted" in response.text
-
 
 
 def test_asr_live_session_persists_json_events_across_app_instances(tmp_path):
@@ -3585,10 +3483,13 @@ def test_delete_asr_live_session_initial_read_failure_is_structured_and_fail_clo
     assert "DO_NOT_LEAK_INITIAL_READ_DETAIL" not in delete_response.text
     assert audio_delete_called is False
     with sqlite3.connect(tmp_path / "meeting_copilot.db") as connection:
-        assert connection.execute(
-            "SELECT COUNT(*) FROM asr_live_sessions WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()[0] == 1
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM asr_live_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()[0]
+            == 1
+        )
 
 
 @pytest.mark.parametrize(
@@ -3657,14 +3558,20 @@ def test_delete_session_initial_live_read_failure_is_structured_and_fail_closed(
     assert "DO_NOT_LEAK_INITIAL_READ_DETAIL" not in delete_response.text
     assert audio_delete_called is False
     with sqlite3.connect(tmp_path / "meeting_copilot.db") as connection:
-        assert connection.execute(
-            "SELECT COUNT(*) FROM sessions WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()[0] == 1
-        assert connection.execute(
-            "SELECT COUNT(*) FROM asr_live_sessions WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()[0] == 1
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM asr_live_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()[0]
+            == 1
+        )
 
 
 def test_delete_asr_live_session_keeps_audio_when_record_delete_fails(
@@ -3875,13 +3782,14 @@ def test_delete_asr_live_session_persists_cleanup_job_and_retries_idempotently(
             "SELECT audio_json FROM pending_audio_cleanup WHERE session_id = ?",
             (session_id,),
         ).fetchone()[0]
-        assert connection.execute(
-            "SELECT COUNT(*) FROM asr_live_sessions WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()[0] == 0
-    assert json.loads(pending_json) == {
-        "relative_path": f"audio_assets/{session_id}/audio.wav"
-    }
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM asr_live_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()[0]
+            == 0
+        )
+    assert json.loads(pending_json) == {"relative_path": f"audio_assets/{session_id}/audio.wav"}
     assert "DO_NOT_PERSIST_SECRET" not in pending_json
     assert audio_path.is_file()
 
@@ -3893,10 +3801,13 @@ def test_delete_asr_live_session_persists_cleanup_job_and_retries_idempotently(
     assert attempts == 2
     assert not audio_path.exists()
     with sqlite3.connect(tmp_path / "meeting_copilot.db") as connection:
-        assert connection.execute(
-            "SELECT COUNT(*) FROM pending_audio_cleanup WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM pending_audio_cleanup WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_delete_session_persists_cleanup_job_and_retries_idempotently(
@@ -3945,18 +3856,27 @@ def test_delete_session_persists_cleanup_job_and_retries_idempotently(
     assert first_response.json()["delete_scope"]["audio"] == "cleanup_pending"
     assert first_response.json()["audio_cleanup_pending"] is True
     with sqlite3.connect(tmp_path / "meeting_copilot.db") as connection:
-        assert connection.execute(
-            "SELECT COUNT(*) FROM sessions WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()[0] == 0
-        assert connection.execute(
-            "SELECT COUNT(*) FROM asr_live_sessions WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()[0] == 0
-        assert connection.execute(
-            "SELECT COUNT(*) FROM pending_audio_cleanup WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()[0] == 1
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM asr_live_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM pending_audio_cleanup WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()[0]
+            == 1
+        )
 
     retry_response = client.delete(f"/sessions/{session_id}")
 
@@ -3964,10 +3884,13 @@ def test_delete_session_persists_cleanup_job_and_retries_idempotently(
     assert attempts == 2
     assert not audio_path.exists()
     with sqlite3.connect(tmp_path / "meeting_copilot.db") as connection:
-        assert connection.execute(
-            "SELECT COUNT(*) FROM pending_audio_cleanup WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM pending_audio_cleanup WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_delete_session_rolls_back_both_rows_and_cleanup_job_when_live_delete_fails(
@@ -4003,18 +3926,27 @@ def test_delete_session_rolls_back_both_rows_and_cleanup_job_when_live_delete_fa
         "audio": "retained_not_attempted",
     }
     with sqlite3.connect(tmp_path / "meeting_copilot.db") as connection:
-        assert connection.execute(
-            "SELECT COUNT(*) FROM sessions WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()[0] == 1
-        assert connection.execute(
-            "SELECT COUNT(*) FROM asr_live_sessions WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()[0] == 1
-        assert connection.execute(
-            "SELECT COUNT(*) FROM pending_audio_cleanup WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM asr_live_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM pending_audio_cleanup WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_create_asr_live_session_rejects_unsafe_session_id_with_json_persistence(tmp_path):
@@ -4045,7 +3977,10 @@ def test_asr_live_draft_review_json_summarizes_audit_record_without_llm(tmp_path
     assert body["review_type"] == "asr_live_draft"
     assert body["is_formal_report"] is False
     assert body["llm_call_status"] == "not_called"
-    assert body["transcript_text"] == "先灰度 10%。先灰度 5%，不是 10%。谁负责回滚？如果错误率超过 0.1% 就回滚。张三下周三补充兼容性测试用例。"
+    assert (
+        body["transcript_text"]
+        == "先灰度 10%。先灰度 5%，不是 10%。谁负责回滚？如果错误率超过 0.1% 就回滚。张三下周三补充兼容性测试用例。"
+    )
     assert [segment["id"] for segment in body["transcript_segments"]] == [
         "asr_seg_001",
         "asr_seg_001_rev1",
@@ -4070,9 +4005,7 @@ def test_asr_live_draft_review_json_summarizes_audit_record_without_llm(tmp_path
         "llm_candidate_skipped",
         "llm_candidate_skipped",
     ]
-    assert {item["llm_call_status"] for item in body["scheduler_decisions"]} == {
-        "not_called"
-    }
+    assert {item["llm_call_status"] for item in body["scheduler_decisions"]} == {"not_called"}
     assert [item["gap_rule_id"] for item in body["suggestion_candidates"]] == [
         "release.rollback.owner.required",
         "release.rollback.owner.required",
@@ -4080,12 +4013,8 @@ def test_asr_live_draft_review_json_summarizes_audit_record_without_llm(tmp_path
         "risk.rollback.validation",
         "action.owner.deadline.confirmation",
     ]
-    assert {item["candidate_policy_version"] for item in body["suggestion_candidates"]} == {
-        "asr-candidate-policy.v1"
-    }
-    assert {item["confidence_source"] for item in body["suggestion_candidates"]} == {
-        "local_deterministic_heuristic"
-    }
+    assert {item["candidate_policy_version"] for item in body["suggestion_candidates"]} == {"asr-candidate-policy.v1"}
+    assert {item["confidence_source"] for item in body["suggestion_candidates"]} == {"local_deterministic_heuristic"}
     assert [item["confidence"] for item in body["suggestion_candidates"]] == [
         0.9,
         0.9,
@@ -4107,12 +4036,8 @@ def test_asr_live_draft_review_json_summarizes_audit_record_without_llm(tmp_path
         [],
         [],
     ]
-    assert {item["llm_call_status"] for item in body["suggestion_candidates"]} == {
-        "not_called"
-    }
-    assert {item["card_status"] for item in body["suggestion_candidates"]} == {
-        "not_created"
-    }
+    assert {item["llm_call_status"] for item in body["suggestion_candidates"]} == {"not_called"}
+    assert {item["card_status"] for item in body["suggestion_candidates"]} == {"not_created"}
     assert [item["gap_rule_id"] for item in body["llm_request_drafts"]] == [
         "release.rollback.owner.required",
         "release.rollback.owner.required",
@@ -4120,18 +4045,10 @@ def test_asr_live_draft_review_json_summarizes_audit_record_without_llm(tmp_path
         "risk.rollback.validation",
         "action.owner.deadline.confirmation",
     ]
-    assert {item["request_status"] for item in body["llm_request_drafts"]} == {
-        "draft_only"
-    }
-    assert {item["schema_status"] for item in body["llm_request_drafts"]} == {
-        "not_generated"
-    }
-    assert {item["llm_call_status"] for item in body["llm_request_drafts"]} == {
-        "not_called"
-    }
-    assert {item["card_status"] for item in body["llm_request_drafts"]} == {
-        "not_created"
-    }
+    assert {item["request_status"] for item in body["llm_request_drafts"]} == {"draft_only"}
+    assert {item["schema_status"] for item in body["llm_request_drafts"]} == {"not_generated"}
+    assert {item["llm_call_status"] for item in body["llm_request_drafts"]} == {"not_called"}
+    assert {item["card_status"] for item in body["llm_request_drafts"]} == {"not_created"}
     assert body["llm_request_drafts"][0]["candidate_confidence_level"] == "high"
     assert body["llm_request_drafts"][0]["candidate_degradation_reasons"] == []
     assert body["evaluation_summary"]["final_event_count"] == 4
@@ -4198,7 +4115,6 @@ def test_create_asr_live_session_rejects_unknown_streaming_event_type():
     assert "unsupported ASR streaming event_type: draft" in response.text
 
 
-
 def test_list_demo_fixtures_exposes_engineering_and_boundary_metadata():
     client = TestClient(create_app())
 
@@ -4214,30 +4130,20 @@ def test_list_demo_fixtures_exposes_engineering_and_boundary_metadata():
         "mixed-terms-sync",
         "schema-degradation-review",
     }.issubset(fixture_ids)
-    release = next(
-        fixture
-        for fixture in response.json()["fixtures"]
-        if fixture["id"] == "release-review"
-    )
+    release = next(fixture for fixture in response.json()["fixtures"] if fixture["id"] == "release-review")
     assert release["source"] == "fixture"
     assert release["scenario_type"] == "release_review"
     assert release["is_engineering_meeting"] is True
     assert release["expected_gap_rule_count"] == 2
     assert "AC-PCWEB-009" in release["expected_gate_tags"]
 
-    mixed = next(
-        fixture
-        for fixture in response.json()["fixtures"]
-        if fixture["id"] == "mixed-terms-sync"
-    )
+    mixed = next(fixture for fixture in response.json()["fixtures"] if fixture["id"] == "mixed-terms-sync")
     assert mixed["is_engineering_meeting"] is False
     assert mixed["expected_gap_rule_count"] == 0
     assert "AC-PCWEB-014" in mixed["expected_gate_tags"]
 
     degradation = next(
-        fixture
-        for fixture in response.json()["fixtures"]
-        if fixture["id"] == "schema-degradation-review"
+        fixture for fixture in response.json()["fixtures"] if fixture["id"] == "schema-degradation-review"
     )
     assert degradation["is_engineering_meeting"] is True
     assert degradation["expected_gap_rule_count"] == 1
@@ -4307,8 +4213,7 @@ def test_demo_fixture_session_exposes_replay_event_timeline():
     card_event = next(
         event
         for event in events
-        if event["event_type"] == "suggestion_card"
-        and event["payload"]["card_id"] == "card_001"
+        if event["event_type"] == "suggestion_card" and event["payload"]["card_id"] == "card_001"
     )
     assert card_event["at_ms"] == 23100
     assert card_event["payload"]["gap_rule_id"] == "release.rollback.owner.required"
@@ -4340,9 +4245,7 @@ def test_demo_fixture_session_exposes_llm_scheduler_trace_events():
         if event["event_type"] in {"llm_scheduled", "llm_schema_result", "suggestion_card"}
     }
     state_events_by_id = {
-        event["payload"]["event_id"]: event
-        for event in events
-        if event["event_type"] == "state_event"
+        event["payload"]["event_id"]: event for event in events if event["event_type"] == "state_event"
     }
     for card in cards:
         card_id = card["id"]
@@ -4501,9 +4404,7 @@ def test_mock_live_session_events_json_and_sse_use_live_boundary():
     assert sse_response.status_code == 200
     assert sse_response.headers["content-type"].startswith("text/event-stream")
     sse_events = [
-        json.loads(line.removeprefix("data: "))
-        for line in sse_response.text.splitlines()
-        if line.startswith("data: ")
+        json.loads(line.removeprefix("data: ")) for line in sse_response.text.splitlines() if line.startswith("data: ")
     ]
     assert sse_events == events
     assert "event: transcript_partial" in sse_response.text
@@ -4523,14 +4424,10 @@ def test_api_review_fixture_preserves_revision_segment_after_core_gate():
     assert response.status_code == 201
     snapshot = response.json()["snapshot"]
     revision_segment = next(
-        segment
-        for segment in snapshot["transcript"]["segments"]
-        if segment["id"] == "seg_002_rev1"
+        segment for segment in snapshot["transcript"]["segments"] if segment["id"] == "seg_002_rev1"
     )
     revision_evidence = next(
-        evidence
-        for evidence in snapshot["transcript"]["evidence_spans"]
-        if evidence["id"] == "ev_002_rev1"
+        evidence for evidence in snapshot["transcript"]["evidence_spans"] if evidence["id"] == "ev_002_rev1"
     )
     assert revision_segment["revision_of"] == "seg_002"
     assert revision_evidence["revision_of"] == "ev_002"
@@ -4580,11 +4477,7 @@ def test_schema_degradation_fixture_records_failures_without_strong_suggestions(
     snapshot = body["snapshot"]
     evaluation = body["evaluation_summary"]
     cards = snapshot["suggestion_cards"]
-    blocking_cards = [
-        card
-        for card in cards
-        if card["schema_result"] in {"failed", "timeout", "invalid"}
-    ]
+    blocking_cards = [card for card in cards if card["schema_result"] in {"failed", "timeout", "invalid"}]
     assert len(blocking_cards) == 3
     assert all(card["show_or_silence_decision"] != "show" for card in blocking_cards)
     assert evaluation["passes_minimum_gate"] is True
@@ -4599,22 +4492,12 @@ def test_schema_degradation_fixture_records_failures_without_strong_suggestions(
     }
 
     events = body["replay_events"]
-    silenced_events = [
-        event for event in events if event["event_type"] == "suggestion_silenced"
-    ]
-    shown_events = [
-        event for event in events if event["event_type"] == "suggestion_card"
-    ]
+    silenced_events = [event for event in events if event["event_type"] == "suggestion_silenced"]
+    shown_events = [event for event in events if event["event_type"] == "suggestion_card"]
     assert len(silenced_events) == 3
     assert len(shown_events) == 1
-    assert {
-        event["payload"]["schema_result"]
-        for event in silenced_events
-    } == {"failed", "timeout", "invalid"}
-    assert all(
-        event["payload"]["show_or_silence_decision"] != "show"
-        for event in silenced_events
-    )
+    assert {event["payload"]["schema_result"] for event in silenced_events} == {"failed", "timeout", "invalid"}
+    assert all(event["payload"]["show_or_silence_decision"] != "show" for event in silenced_events)
 
 
 def test_schema_degradation_replay_stream_exposes_silenced_events_in_json_and_sse():
@@ -4639,15 +4522,12 @@ def test_schema_degradation_replay_stream_exposes_silenced_events_in_json_and_ss
             schema_event = next(
                 item
                 for item in events
-                if item["event_type"] == "llm_schema_result"
-                and item["payload"]["card_id"] == card_id
+                if item["event_type"] == "llm_schema_result" and item["payload"]["card_id"] == card_id
             )
             assert schema_event["sequence"] < event["sequence"]
 
     sse_events = [
-        json.loads(line.removeprefix("data: "))
-        for line in sse_response.text.splitlines()
-        if line.startswith("data: ")
+        json.loads(line.removeprefix("data: ")) for line in sse_response.text.splitlines() if line.startswith("data: ")
     ]
     assert sse_events == events
     assert "event: suggestion_silenced" in sse_response.text
@@ -4664,11 +4544,7 @@ def test_schema_degradation_replay_evaluation_preserves_fixture_gate_metadata():
     response = client.get("/sessions/demo_schema_degradation_gate_metadata/events")
 
     assert response.status_code == 200
-    evaluation_event = next(
-        event
-        for event in response.json()["events"]
-        if event["event_type"] == "evaluation_summary"
-    )
+    evaluation_event = next(event for event in response.json()["events"] if event["event_type"] == "evaluation_summary")
     assert evaluation_event["payload"]["source"] == "replay_snapshot"
     assert evaluation_event["payload"]["expected_gap_rule_count"] == 1
     assert evaluation_event["payload"]["gap_rule_count"] == 1
@@ -4683,9 +4559,7 @@ def test_update_card_status_rejects_silenced_schema_card_without_mutating_record
         json={"session_id": "demo_schema_degradation_status_guard"},
     )
     silenced_card = next(
-        card
-        for card in created.json()["snapshot"]["suggestion_cards"]
-        if card["schema_result"] == "failed"
+        card for card in created.json()["snapshot"]["suggestion_cards"] if card["schema_result"] == "failed"
     )
 
     rejected = client.patch(
@@ -4697,11 +4571,7 @@ def test_update_card_status_rejects_silenced_schema_card_without_mutating_record
     assert rejected.status_code == 422
     assert "silenced suggestion card cannot be updated" in rejected.text
     assert fetched.status_code == 200
-    still_silenced = next(
-        card
-        for card in fetched.json()["suggestion_cards"]
-        if card["id"] == silenced_card["id"]
-    )
+    still_silenced = next(card for card in fetched.json()["suggestion_cards"] if card["id"] == silenced_card["id"])
     assert still_silenced["status"] == "new"
 
 
@@ -4818,11 +4688,7 @@ def test_create_allows_non_strong_audit_card_using_stale_evidence():
 
     assert created.status_code == 201
     snapshot = created.json()
-    evidence = next(
-        item
-        for item in snapshot["transcript"]["evidence_spans"]
-        if item["id"] == "ev_002"
-    )
+    evidence = next(item for item in snapshot["transcript"]["evidence_spans"] if item["id"] == "ev_002")
     assert evidence["status"] == "stale"
     assert evidence["replaced_by"] == "ev_002_rev"
     assert snapshot["suggestion_cards"][0]["show_or_silence_decision"] == "draft"
@@ -5025,9 +4891,7 @@ def test_json_repository_persists_session_and_card_status_across_instances(tmp_p
         "/sessions/meeting_001/cards/card_001/status",
         json={"status": "kept"},
     )
-    reloaded_client = TestClient(
-        create_app(repository=JsonFileSessionRepository(tmp_path))
-    )
+    reloaded_client = TestClient(create_app(repository=JsonFileSessionRepository(tmp_path)))
     fetched = reloaded_client.get("/sessions/meeting_001")
 
     assert updated.status_code == 200
@@ -5084,6 +4948,128 @@ def test_create_app_uses_single_sqlite_database_when_data_dir_is_provided(tmp_pa
 
     reloaded = TestClient(create_app(data_dir=tmp_path)).get("/sessions/meeting_001")
     assert reloaded.status_code == 200
+
+
+def test_create_app_bootstraps_formal_schema_before_compatibility_steps_and_repositories(
+    monkeypatch,
+    tmp_path,
+):
+    calls = []
+    real_bootstrap = app_module.bootstrap_application_schema
+    real_json_import = app_module.migrate_json_to_sqlite
+    real_session_repository = app_module.SqliteSessionRepository
+
+    def bootstrap(*args, **kwargs):
+        calls.append("formal_schema")
+        return real_bootstrap(*args, **kwargs)
+
+    def import_legacy_json(*args, **kwargs):
+        calls.append("legacy_json_import")
+        return real_json_import(*args, **kwargs)
+
+    def migrate_shadow(*args, **kwargs):
+        calls.append("v1_to_v2_data_shadow")
+        return {"status": "no_source_records"}
+
+    def open_session_repository(*args, **kwargs):
+        calls.append("first_repository")
+        return real_session_repository(*args, **kwargs)
+
+    monkeypatch.setattr(app_module, "bootstrap_application_schema", bootstrap)
+    monkeypatch.setattr(app_module, "migrate_json_to_sqlite", import_legacy_json)
+    monkeypatch.setattr(app_module, "migrate_v1_to_v2", migrate_shadow)
+    monkeypatch.setattr(app_module, "SqliteSessionRepository", open_session_repository)
+
+    app = create_app(data_dir=tmp_path)
+    with TestClient(app) as client:
+        assert client.get("/health").status_code == 200
+
+    assert calls[:4] == [
+        "formal_schema",
+        "legacy_json_import",
+        "v1_to_v2_data_shadow",
+        "first_repository",
+    ]
+
+
+def test_create_app_fails_closed_on_formal_schema_error_before_compatibility_or_repository_open(
+    monkeypatch,
+    tmp_path,
+):
+    forbidden_path = tmp_path / "private-customer-name" / "meeting_copilot.db"
+    later_calls = []
+
+    def fail_schema(*args, **kwargs):
+        raise OSError(f"could not migrate {forbidden_path}")
+
+    def forbidden_step(*args, **kwargs):
+        later_calls.append("called")
+        raise AssertionError("startup continued after formal schema failure")
+
+    monkeypatch.setattr(app_module, "bootstrap_application_schema", fail_schema)
+    monkeypatch.setattr(app_module, "migrate_json_to_sqlite", forbidden_step)
+    monkeypatch.setattr(app_module, "migrate_v1_to_v2", forbidden_step)
+    monkeypatch.setattr(app_module, "SqliteSessionRepository", forbidden_step)
+
+    with pytest.raises(
+        RuntimeError,
+        match="Application SQLite schema bootstrap failed: OSError",
+    ) as captured:
+        create_app(data_dir=tmp_path)
+
+    assert later_calls == []
+    assert str(forbidden_path) not in str(captured.value)
+
+
+def test_application_schema_diagnostic_is_safe_and_startup_bootstrap_is_idempotent(tmp_path):
+    first_app = create_app(data_dir=tmp_path)
+    with TestClient(first_app) as client:
+        first = client.get("/v2/diagnostics/application-schema")
+
+    second_app = create_app(data_dir=tmp_path)
+    with TestClient(second_app) as client:
+        second = client.get("/v2/diagnostics/application-schema")
+
+    assert first.status_code == 200
+    assert first.json() == {
+        "schema_version": "application-schema-migration-report.v1",
+        "status": "ready",
+        "storage": "sqlite",
+        "source_version": 0,
+        "final_version": 3,
+        "applied_versions": [1, 2, 3],
+        "migrated": True,
+        "backup_created": False,
+    }
+    assert second.status_code == 200
+    assert second.json() == {
+        "schema_version": "application-schema-migration-report.v1",
+        "status": "ready",
+        "storage": "sqlite",
+        "source_version": 3,
+        "final_version": 3,
+        "applied_versions": [],
+        "migrated": False,
+        "backup_created": False,
+    }
+    serialized = json.dumps(first.json()) + json.dumps(second.json())
+    assert str(tmp_path) not in serialized
+    assert "migration_backups" not in serialized
+    assert first_app.state.application_schema_migration_report == first.json()
+    assert second_app.state.application_schema_migration_report == second.json()
+
+
+def test_in_memory_application_schema_diagnostic_is_explicitly_not_applicable():
+    app = create_app()
+
+    response = TestClient(app).get("/v2/diagnostics/application-schema")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "schema_version": "application-schema-migration-report.v1",
+        "status": "not_applicable",
+        "storage": "memory",
+    }
 
 
 def test_create_app_closes_all_created_sqlite_repositories_on_shutdown(tmp_path):
@@ -5149,6 +5135,49 @@ def test_new_app_does_not_inherit_previous_runtime_degradation():
 
     assert response.status_code == 200
     assert response.json()["level"] == 0
+
+
+def test_packaged_startup_recovers_recording_owned_by_crashed_runtime(monkeypatch, tmp_path):
+    monkeypatch.setenv("MEETING_COPILOT_DESKTOP_RUNTIME", "1")
+    app = create_app(data_dir=tmp_path)
+    persistence = app.state.v2_persistence
+    persistence.create_meeting(
+        meeting_id="crashed-runtime-recording",
+        title="崩溃恢复会议",
+        now_ms=1_000,
+    )
+    persistence.begin_recording(
+        meeting_id="crashed-runtime-recording",
+        track="microphone",
+        epoch=0,
+        source_type="browser_live_mic",
+        sample_rate_hz=16_000,
+        lease_owner="capture-from-dead-runtime",
+        lease_ms=30_000,
+        now_ms=1_000,
+    )
+
+    with TestClient(app) as client:
+        assert client.get("/health").status_code == 200
+        recording = persistence.get_recording_session(
+            "crashed-runtime-recording",
+            track="microphone",
+            epoch=0,
+        )
+        assert recording["status"] == "interrupted"
+        assert recording["error_class"] == "runtime_restarted"
+        resumed = persistence.begin_recording(
+            meeting_id="crashed-runtime-recording",
+            track="microphone",
+            epoch=0,
+            source_type="browser_live_mic",
+            sample_rate_hz=16_000,
+            lease_owner="capture-from-new-runtime",
+            lease_ms=30_000,
+            now_ms=2_000,
+        )
+        assert resumed["status"] == "active"
+        assert resumed["capture_generation"] == 2
 
 
 def test_create_app_fails_closed_when_sqlite_migration_fails(monkeypatch, tmp_path):

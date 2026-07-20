@@ -249,6 +249,25 @@ def test_sequential_sessions_reuse_process_finalize_keeps_worker_and_text_is_iso
     }
 
 
+def test_session_hotwords_are_sent_once_on_start_and_bounded(manager_and_factory):
+    manager, factory = manager_and_factory
+
+    session = manager.create_session(
+        "meeting-hotwords",
+        hotwords=("P99", "订单中台", "p99"),
+    )
+    assert session.wait_ready(1.0) is True
+    session.abort()
+
+    assert factory.processes[0].commands[0] == {
+        "command": "start_session",
+        "session_id": "meeting-hotwords",
+        "hotwords": ["P99", "订单中台"],
+    }
+    with pytest.raises(ValueError, match="bounded"):
+        manager.create_session("too-many", hotwords=tuple(f"term-{i}" for i in range(51)))
+
+
 def test_manager_status_requires_global_worker_ready_and_records_exit(manager_and_factory):
     manager, factory = manager_and_factory
 
@@ -259,6 +278,10 @@ def test_manager_status_requires_global_worker_ready_and_records_exit(manager_an
     assert before["process_running"] is True
     assert before["process_ready"] is False
     assert before["pid"] == process.pid
+    assert before["pool_mode"] == "bounded_process_per_session"
+    assert before["max_worker_count"] == 2
+    assert before["worker_count"] == 1
+    assert before["available_worker_count"] == 2
 
     process.emit_event({"event_type": "ready", "provider": "funasr_realtime"})
     assert manager.wait_process_ready(1.0) is True
@@ -299,9 +322,11 @@ def test_abort_releases_session_and_next_session_reuses_worker(manager_and_facto
     ]
 
 
-def test_concurrent_start_fails_closed_with_exactly_one_active_session(manager_and_factory):
+def test_two_concurrent_sessions_get_distinct_workers_and_third_fails_closed(
+    manager_and_factory,
+):
     manager, factory = manager_and_factory
-    barrier = threading.Barrier(3)
+    barrier = threading.Barrier(4)
     successes: list[funasr_resident.FunasrResidentSession] = []
     failures: list[Exception] = []
 
@@ -315,6 +340,7 @@ def test_concurrent_start_fails_closed_with_exactly_one_active_session(manager_a
     threads = [
         threading.Thread(target=start, args=("concurrent-a",)),
         threading.Thread(target=start, args=("concurrent-b",)),
+        threading.Thread(target=start, args=("concurrent-c",)),
     ]
     for thread in threads:
         thread.start()
@@ -323,13 +349,67 @@ def test_concurrent_start_fails_closed_with_exactly_one_active_session(manager_a
         thread.join(timeout=1.0)
 
     assert all(not thread.is_alive() for thread in threads)
-    assert len(successes) == 1
+    assert len(successes) == 2
     assert len(failures) == 1
     assert isinstance(failures[0], funasr_resident.FunasrResidentBusyError)
-    assert successes[0].wait_ready(1.0) is True
-    assert manager.process_start_count == 1
-    assert len(factory.processes) == 1
-    successes[0].abort()
+    assert all(session.wait_ready(1.0) for session in successes)
+    assert len({session.worker_id for session in successes}) == 2
+    assert manager.process_start_count == 2
+    assert len(factory.processes) == 2
+    assert manager.status()["active_session_count"] == 2
+    for session in successes:
+        session.abort()
+
+
+def test_duplicate_meeting_ids_route_dual_tracks_to_isolated_workers_and_reuse_capacity(
+    manager_and_factory,
+):
+    manager, factory = manager_and_factory
+
+    microphone = manager.create_session("meeting-dual")
+    system_audio = manager.create_session("meeting-dual")
+    assert microphone.wait_ready(1.0) is True
+    assert system_audio.wait_ready(1.0) is True
+    assert microphone.worker_id != system_audio.worker_id
+    assert manager.status()["active_session_ids"] == ["meeting-dual", "meeting-dual"]
+
+    microphone.recognize_chunk(b"microphone-only")
+    system_audio.recognize_chunk(b"system-audio-only")
+    microphone_events = microphone.finalize()
+    system_audio_events = system_audio.finalize()
+
+    assert _final_text(microphone_events) == "microphone-only"
+    assert _final_text(system_audio_events) == "system-audio-only"
+    assert manager.completed_session_count == 2
+    assert manager.status()["active_session_count"] == 0
+    assert manager.status()["available_worker_count"] == 2
+
+    replacement = manager.create_session("meeting-next")
+    assert replacement.wait_ready(1.0) is True
+    replacement.abort()
+    assert manager.process_start_count == 2
+    assert len(factory.processes) == 2
+
+
+def test_shutdown_aborts_and_reaps_every_active_worker(manager_and_factory):
+    manager, factory = manager_and_factory
+    sessions = [
+        manager.create_session("shutdown-dual"),
+        manager.create_session("shutdown-dual"),
+    ]
+    assert all(session.wait_ready(1.0) for session in sessions)
+
+    manager.shutdown()
+
+    assert len(factory.processes) == 2
+    assert all(process.poll() == 0 for process in factory.processes)
+    assert all(process.commands[-2]["command"] == "abort_session" for process in factory.processes)
+    assert all(process.commands[-1] == {"command": "shutdown"} for process in factory.processes)
+    assert all(process.wait_calls >= 1 for process in factory.processes)
+    assert all(process.kill_calls == 0 for process in factory.processes)
+    for session in sessions:
+        with pytest.raises(funasr_resident.FunasrResidentUnavailableError, match="shut down"):
+            session.recognize_chunk(b"closed")
 
 
 def test_crash_fails_active_session_and_automatically_restarts_only_once(manager_and_factory):

@@ -3,7 +3,9 @@ import json
 from threading import Barrier, Event
 import time
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
+import pytest
 
 from meeting_copilot_web_mvp import app as app_module, asr_correct, asr_stream, llm_service
 from meeting_copilot_web_mvp.app import create_app
@@ -135,7 +137,7 @@ def test_realtime_correction_setting_fails_closed_before_provider_and_updates_ex
     monkeypatch.setattr(
         asr_correct,
         "correct_transcript",
-        lambda raw, cfg: provider_calls.append(raw),
+        lambda raw, cfg, **kwargs: provider_calls.append(raw),
     )
     client = TestClient(create_app(data_dir=tmp_path))
     context, ws = _start_live_session(
@@ -185,7 +187,7 @@ def test_realtime_correction_setting_fails_closed_before_provider_and_updates_ex
         monkeypatch.setattr(
             asr_correct,
             "correct_transcript",
-            lambda raw, cfg: (
+            lambda raw, cfg, **kwargs: (
                 provider_calls.append(raw) or raw,
                 {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
                 False,
@@ -210,7 +212,7 @@ def test_realtime_correction_setting_fails_closed_before_provider_and_updates_ex
 def test_realtime_correction_gate_closed_makes_zero_llm_calls(monkeypatch, tmp_path):
     _configure_llm(monkeypatch)
     calls = []
-    monkeypatch.setattr(asr_correct, "correct_transcript", lambda raw, cfg: calls.append(raw))
+    monkeypatch.setattr(asr_correct, "correct_transcript", lambda raw, cfg, **kwargs: calls.append(raw))
     client = TestClient(create_app(data_dir=tmp_path))
     _enable_l2(client)
     context, ws = _start_live_session(
@@ -240,7 +242,7 @@ def test_realtime_correction_interval_opens_without_new_asr_event(monkeypatch, t
     monkeypatch.setattr(app_module.time, "time", lambda: now_seconds["value"])
     calls = []
 
-    def correct(raw, cfg):
+    def correct(raw, cfg, **kwargs):
         calls.append(raw)
         return raw.replace("恢度", "灰度"), {"total_tokens": 3}, False
 
@@ -281,7 +283,7 @@ def test_realtime_correction_force_calls_once_and_persists_revision(monkeypatch,
     _configure_llm(monkeypatch)
     calls = []
 
-    def correct(raw, cfg):
+    def correct(raw, cfg, **kwargs):
         calls.append(raw)
         persisted = SqliteAsrLiveSessionRepository(tmp_path).get("correction_force")
         reservation = persisted["realtime_transcript_correction"]["reservation"]
@@ -366,7 +368,7 @@ def test_multi_segment_fallback_records_usage_once_in_batch_audit(monkeypatch, t
         lambda sid: _TwoSegmentCorrectionRecognizer(sid, "unused"),
     )
 
-    def correct(raw, cfg):
+    def correct(raw, cfg, **kwargs):
         return (
             raw.replace("灰度百分之五", "灰度 5%")
             .replace("百分之零点一", "0.1%")
@@ -414,7 +416,7 @@ def test_partial_correction_keeps_accepted_revision_and_reports_rejected_segment
 ):
     _configure_llm(monkeypatch)
 
-    def correct(raw, cfg):
+    def correct(raw, cfg, **kwargs):
         del cfg
         first_marker = "<<<MC_SEGMENT:0001:corr_seg_1>>>"
         second_marker = "<<<MC_SEGMENT:0002:corr_seg_2>>>"
@@ -469,7 +471,7 @@ def test_partial_correction_keeps_accepted_revision_and_reports_rejected_segment
 def test_provider_failure_commits_reservation_and_single_batch_audit(monkeypatch, tmp_path):
     _configure_llm(monkeypatch)
 
-    def fail(raw, cfg):
+    def fail(raw, cfg, **kwargs):
         persisted = SqliteAsrLiveSessionRepository(tmp_path).get("correction_provider_failure")
         assert persisted["realtime_transcript_correction"]["reservation"]["status"] == "reserved"
         raise RuntimeError("provider unavailable at https://private.example/v1?api_key=sk-secret")
@@ -518,13 +520,119 @@ def test_provider_failure_commits_reservation_and_single_batch_audit(monkeypatch
         context.__exit__(None, None, None)
 
 
+def test_real_correction_client_failure_uses_502_audit_instead_of_rejected_original(
+    monkeypatch,
+    tmp_path,
+):
+    _configure_llm(monkeypatch)
+    monkeypatch.setattr(llm_service.time, "sleep", lambda *a: None)
+    calls = []
+
+    class FailingClient:
+        def post_json(self, url, headers, body, timeout):
+            calls.append(body)
+            raise llm_service.LlmProviderHttpError(401, provider_code="INVALID_API_KEY")
+
+    monkeypatch.setattr(asr_correct, "HttpxLlmClient", FailingClient)
+    client = TestClient(create_app(data_dir=tmp_path), raise_server_exceptions=False)
+    _enable_l2(client)
+    context, ws = _start_live_session(
+        monkeypatch,
+        client,
+        "correction_real_client_failure",
+        "接口先灰度百分之五。",
+    )
+    try:
+        response = client.post(
+            "/live/asr/sessions/correction_real_client_failure/realtime-corrections/run-once",
+            json={"force": True},
+        )
+
+        assert response.status_code == 502
+        assert response.json()["detail"] == {
+            "error_code": "realtime_correction_provider_failed",
+            "message": "Realtime correction provider request failed",
+        }
+        assert "private.example" not in response.text
+        assert "sk-secret" not in response.text
+        assert len(calls) == 1
+        fetched = client.get("/live/asr/sessions/correction_real_client_failure/events").json()
+        status = fetched["realtime_transcript_correction"]
+        assert status["status"] == "provider_failed_terminal"
+        assert status["terminal_failed_segment_ids"] == ["corr_seg_1"]
+        assert status["reservation"]["status"] == "provider_failed"
+        assert status.get("rejected_segment_ids", []) == []
+        assert not any(event.get("event_type") == "transcript_revision" for event in fetched["events"])
+        assert [audit["status"] for audit in status["batch_audits"]] == ["provider_failed"]
+    finally:
+        ws.send_text("END")
+        context.__exit__(None, None, None)
+
+
+def test_durable_correction_second_attempt_retries_once_failed_provider_segment(
+    monkeypatch,
+    tmp_path,
+):
+    _configure_llm(monkeypatch)
+    monkeypatch.setattr(llm_service.time, "sleep", lambda *a: None)
+    calls = []
+
+    class FailingClient:
+        def post_json(self, url, headers, body, timeout):
+            calls.append(body)
+            raise llm_service.LlmProviderTransportError("transport")
+
+    monkeypatch.setattr(asr_correct, "HttpxLlmClient", FailingClient)
+    app = create_app(data_dir=tmp_path)
+    client = TestClient(app, raise_server_exceptions=False)
+    _enable_l2(client)
+    long_final = (
+        "接口先灰度百分之五，如果错误率超过百分之零点一就回滚，"
+        "负责人今天补齐监控看板和告警阈值，并确认发布窗口与回滚脚本。"
+        "上线前还要完成容量检查、数据库备份演练和依赖服务健康检查。"
+    )
+    assert len(long_final) >= 80
+    context, ws = _start_live_session(
+        monkeypatch,
+        client,
+        "durable_correction_provider_retry",
+        long_final,
+    )
+    try:
+        persistence = app.state.v2_persistence
+        job = persistence.list_jobs(
+            meeting_id="durable_correction_provider_retry",
+            lane="correction",
+        )[0]
+
+        with pytest.raises(HTTPException) as first_failure:
+            app.state.v2_correction_job_handler_impl({**job, "attempts": 1})
+        with pytest.raises(HTTPException) as second_failure:
+            app.state.v2_correction_job_handler_impl({**job, "attempts": 2})
+
+        assert first_failure.value.status_code == 502
+        assert second_failure.value.status_code == 502
+        assert getattr(first_failure.value, "retryable", True) is True
+        assert getattr(second_failure.value, "retryable", True) is False
+        assert len(calls) == 2
+        fetched = client.get("/live/asr/sessions/durable_correction_provider_retry/events").json()
+        status = fetched["realtime_transcript_correction"]
+        assert status["failure_counts"] == {"corr_seg_1": 2}
+        assert status["terminal_failed_segment_ids"] == ["corr_seg_1"]
+        assert status.get("rejected_segment_ids", []) == []
+        assert [audit["retry"] for audit in status["batch_audits"]] == [False, True]
+    finally:
+        ws.send_text("END")
+        context.__exit__(None, None, None)
+
+
 def test_provider_failure_consumes_segment_budget_after_one_retry(monkeypatch, tmp_path):
     _configure_llm(monkeypatch)
     calls = []
 
-    def fail(raw, cfg):
+    def fail(raw, cfg, **kwargs):
         calls.append(raw)
-        raise RuntimeError("https://private.example/v1?api_key=sk-secret")
+        raise llm_service.LlmProviderTransportError("transport")
 
     monkeypatch.setattr(asr_correct, "correct_transcript", fail)
     client = TestClient(create_app(data_dir=tmp_path), raise_server_exceptions=False)
@@ -574,7 +682,7 @@ def test_two_app_instances_atomically_claim_one_realtime_correction_batch(monkey
     release_provider = Event()
     calls = []
 
-    def correct(raw, cfg):
+    def correct(raw, cfg, **kwargs):
         calls.append(raw)
         provider_entered.set()
         assert release_provider.wait(timeout=3)
@@ -633,7 +741,7 @@ def test_realtime_correction_rejects_batch_when_markers_are_not_preserved(monkey
     monkeypatch.setattr(
         asr_correct,
         "correct_transcript",
-        lambda raw, cfg: ("没有任何分隔符的输出", {"total_tokens": 3}, False),
+        lambda raw, cfg, **kwargs: ("没有任何分隔符的输出", {"total_tokens": 3}, False),
     )
     client = TestClient(create_app(data_dir=tmp_path))
     _enable_l2(client)
@@ -664,9 +772,9 @@ def test_rejected_correction_is_not_processed_and_gets_one_forced_retry(monkeypa
     _configure_llm(monkeypatch)
     calls = []
 
-    def unchanged(raw, cfg):
+    def unchanged(raw, cfg, **kwargs):
         calls.append(raw)
-        return raw, {"total_tokens": 2}, True
+        return raw.replace("接口先灰度五趴。", "完全不同的事实。"), {"total_tokens": 2}, False
 
     monkeypatch.setattr(asr_correct, "correct_transcript", unchanged)
     client = TestClient(create_app(data_dir=tmp_path))
@@ -701,7 +809,7 @@ def test_unchanged_success_is_processed_without_paid_stop_retry(monkeypatch, tmp
     _configure_llm(monkeypatch)
     calls = []
 
-    def unchanged_success(raw, cfg):
+    def unchanged_success(raw, cfg, **kwargs):
         calls.append(raw)
         return raw, {"total_tokens": 2}, False
 
@@ -770,7 +878,7 @@ def test_semantic_quality_blocker_is_recovered_before_formal_suggestion(
         "lag 最高到了八万，告警延迟了六分钟。临时扩容已经止血，根因可能是库存。"
     )
 
-    def correct_batch(raw, cfg):
+    def correct_batch(raw, cfg, **kwargs):
         lines = raw.splitlines()
         return raw.replace(lines[1], corrected_text, 1), {"total_tokens": 42}, False
 

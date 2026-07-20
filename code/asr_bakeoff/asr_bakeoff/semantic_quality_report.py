@@ -25,6 +25,7 @@ def run_semantic_quality_report(dataset_path: Path, output_path: Path) -> dict[s
         if sample["expected_status"] == "passed" and sample["actual_status"] == "blocked"
     )
     status_match_count = sum(1 for sample in sample_reports if sample["status_matches_expected"])
+    unexpected_status_count = len(sample_reports) - status_match_count
     keyword_recalls = [
         float(sample["keyword_recall"])
         for sample in sample_reports
@@ -48,9 +49,12 @@ def run_semantic_quality_report(dataset_path: Path, output_path: Path) -> dict[s
             "sample_count": len(sample_reports),
             "expected_passed_count": sum(1 for sample in sample_reports if sample["expected_status"] == "passed"),
             "expected_blocked_count": sum(1 for sample in sample_reports if sample["expected_status"] == "blocked"),
+            "expected_warning_count": sum(1 for sample in sample_reports if sample["expected_status"] == "warning"),
             "actual_passed_count": sum(1 for sample in sample_reports if sample["actual_status"] == "passed"),
             "actual_blocked_count": sum(1 for sample in sample_reports if sample["actual_status"] == "blocked"),
+            "actual_warning_count": sum(1 for sample in sample_reports if sample["actual_status"] == "warning"),
             "expected_status_match_count": status_match_count,
+            "unexpected_status_count": unexpected_status_count,
             "false_pass_count": false_pass_count,
             "false_block_count": false_block_count,
             "keyword_recall_average": _avg(keyword_recalls),
@@ -60,7 +64,9 @@ def run_semantic_quality_report(dataset_path: Path, output_path: Path) -> dict[s
             "realtime_asr_default_order": ["sherpa_onnx_realtime", "funasr_realtime"],
             "remote_asr_default_enabled": False,
             "semantic_quality_gate_required": True,
-            "decision_status": "accepted" if false_pass_count == 0 and false_block_count == 0 else "blocked",
+            "decision_status": "accepted"
+            if unexpected_status_count == 0 and false_pass_count == 0 and false_block_count == 0
+            else "blocked",
         },
         "samples": sample_reports,
     }

@@ -18,6 +18,7 @@ CANDIDATE_POLICY_VERSION = "asr-candidate-policy.v1"
 PARTIAL_HINT_POLICY_VERSION = "partial-hint-policy.v1"
 LOW_ASR_CONFIDENCE_THRESHOLD = 0.80
 SHORT_EVIDENCE_TEXT_LENGTH = 6
+TECHNICAL_DISCUSSION_MIN_TEXT_LENGTH = 12
 ADJACENT_FINAL_CONTEXT_GAP_MS = 1_000
 QUESTION_MARKERS = ("谁", "吗", "怎么", "如何", "是否", "有没有", "还是", "哪种", "哪个", "还没有确认", "?", "？")
 ENGINEERING_CONTEXT_MARKERS = (
@@ -577,6 +578,15 @@ def _local_state_scheduler_events(
     )
     segment_id = str(raw_event["segment_id"])
     state_specs = _extract_local_state_specs(text, segment_id, evidence_ids, segment_batch)
+    if not state_specs and _should_create_technical_discussion_candidate(raw_event, text):
+        state_specs = [
+            _technical_discussion_candidate_spec(
+                segment_id=segment_id,
+                text=text,
+                evidence_ids=evidence_ids,
+                segment_batch=segment_batch,
+            )
+        ]
     if not state_specs:
         return [], scheduler_state
 
@@ -619,6 +629,11 @@ def _local_state_scheduler_events(
                 has_state_change=True,
                 state=current_scheduler_state,
             )
+        candidate_only = bool(state_spec.get("candidate_only"))
+        candidate_rule = _suggestion_candidate_rule(str(state_spec["target_type"]))
+        source_event_ids = list(
+            state_spec.get("source_event_ids") or [state_event_id]
+        )
         state_event = {
             "id": f"state:{state_event_id}",
             "event_type": "state_event",
@@ -641,7 +656,11 @@ def _local_state_scheduler_events(
             "payload": {
                 "scheduler_event_type": scheduler_decision.event_type,
                 "card_id": "",
-                "gap_rule_id": "asr.state_candidate.review",
+                "gap_rule_id": (
+                    candidate_rule["gap_rule_id"]
+                    if candidate_only
+                    else "asr.state_candidate.review"
+                ),
                 "trigger_source": "live_asr_scheduler_log",
                 "trigger_reason": scheduler_decision.reason,
                 "decision_reason": scheduler_decision.reason,
@@ -651,7 +670,7 @@ def _local_state_scheduler_events(
                 "call_count_last_hour": scheduler_decision.call_count_last_hour,
                 "budget_remaining": scheduler_decision.budget_remaining,
                 "segment_batch": list(state_spec["segment_batch"]),
-                "source_event_ids": [state_event_id],
+                "source_event_ids": source_event_ids,
                 "prompt_version": "not-called",
                 "model": "not-called",
             },
@@ -684,9 +703,12 @@ def _local_state_scheduler_events(
                 "_sort_step": state_index * 4 + 3,
                 "payload": _llm_request_draft_payload(candidate_payload),
             }
-            events.extend([state_event, scheduler_event, suggestion_candidate_event, llm_request_draft_event])
+            if candidate_only:
+                events.extend([scheduler_event, suggestion_candidate_event, llm_request_draft_event])
+            else:
+                events.extend([state_event, scheduler_event, suggestion_candidate_event, llm_request_draft_event])
         else:
-            events.extend([state_event, scheduler_event])
+            events.extend([scheduler_event] if candidate_only else [state_event, scheduler_event])
         current_scheduler_state = scheduler_decision.state_after
     return events, current_scheduler_state
 
@@ -835,7 +857,7 @@ def _suggestion_candidate_payload(
         "suggested_prompt": rule["suggested_prompt"],
         "trigger_reason": rule["trigger_reason"],
         "decision_reason": scheduler_decision.reason,
-        "source_event_ids": [state_event_id],
+        "source_event_ids": list(state_spec.get("source_event_ids") or [state_event_id]),
         "scheduler_event_type": scheduler_decision.event_type,
         "evidence_span_ids": evidence_ids,
         "segment_batch": segment_batch,
@@ -967,6 +989,15 @@ def _confidence_level(confidence: float) -> str:
 
 
 def _suggestion_candidate_rule(target_type: str) -> dict[str, str]:
+    if target_type == "TechnicalDiscussion":
+        return {
+            "gap_rule_id": "technical.discussion.open_loop",
+            "suggested_prompt": (
+                "检查本段技术讨论是否存在尚未明确的决策、风险、owner、截止时间或验收口径；"
+                "只生成当前最值得现场追问的一项。"
+            ),
+            "trigger_reason": "Live ASR captured an open-ended technical discussion worth one focused follow-up.",
+        }
     if target_type == "DecisionCandidate":
         return {
             "gap_rule_id": "release.rollback.owner.required",
@@ -995,6 +1026,45 @@ def _suggestion_candidate_rule(target_type: str) -> dict[str, str]:
         "gap_rule_id": "state.candidate.review",
         "suggested_prompt": "确认该状态候选是否需要补充上下文。",
         "trigger_reason": "Live ASR captured a state candidate that may need review.",
+    }
+
+
+def _should_create_technical_discussion_candidate(
+    raw_event: dict[str, Any],
+    text: str,
+) -> bool:
+    return bool(
+        raw_event.get("event_type") == "final"
+        and len("".join(text.split())) >= TECHNICAL_DISCUSSION_MIN_TEXT_LENGTH
+        and _is_engineering_meeting(text)
+        and not _looks_like_already_closed_context(text)
+    )
+
+
+def _technical_discussion_candidate_spec(
+    *,
+    segment_id: str,
+    text: str,
+    evidence_ids: list[str],
+    segment_batch: list[str],
+) -> dict[str, Any]:
+    candidate_id = f"asr_technical_discussion_{segment_id}"
+    return {
+        "state_event_id": candidate_id,
+        "target_type": "TechnicalDiscussion",
+        "target_id": candidate_id,
+        "state_item": {
+            "id": candidate_id,
+            "description": text,
+            "evidence_span_ids": evidence_ids,
+            "source": ASR_LIVE_SOURCE,
+            "state_origin": "local_deterministic_suggestion_opportunity",
+        },
+        "evidence_span_ids": evidence_ids,
+        "segment_batch": segment_batch,
+        "source_event_ids": [f"transcript_final:{segment_id}"],
+        "candidate_origin": "local_deterministic_technical_discussion_opportunity",
+        "candidate_only": True,
     }
 
 

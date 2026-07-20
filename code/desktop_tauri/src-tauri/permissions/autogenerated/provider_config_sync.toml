@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-provider-config-sync"
+description = "Enables the provider_config_sync command without any pre-configured scope."
+commands.allow = ["provider_config_sync"]
+
+[[permission]]
+identifier = "deny-provider-config-sync"
+description = "Denies the provider_config_sync command without any pre-configured scope."
+commands.deny = ["provider_config_sync"]

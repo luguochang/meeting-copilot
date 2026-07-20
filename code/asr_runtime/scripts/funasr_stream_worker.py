@@ -54,6 +54,7 @@ class ResidentCommand:
     command: str
     session_id: str | None
     pcm_bytes: bytes = b""
+    hotwords: tuple[str, ...] = ()
 
 
 @dataclass
@@ -68,6 +69,7 @@ class SessionState:
     inference_calls: int = 0
     inference_total_s: float = 0.0
     inference_max_s: float = 0.0
+    hotwords: tuple[str, ...] = ()
 
 
 def encode_resident_command(
@@ -75,13 +77,18 @@ def encode_resident_command(
     *,
     session_id: str | None = None,
     pcm_bytes: bytes = b"",
+    hotwords: list[str] | tuple[str, ...] | None = None,
 ) -> bytes:
     payload: dict[str, object] = {"command": command}
     if session_id is not None:
         payload["session_id"] = session_id
     if command == "audio":
         payload["pcm_base64"] = base64.b64encode(pcm_bytes).decode("ascii")
+    elif command == "start_session" and hotwords is not None:
+        payload["hotwords"] = list(_normalize_session_hotwords(hotwords))
     elif pcm_bytes:
+        raise ResidentProtocolError("invalid_command_fields", session_id=session_id)
+    elif hotwords is not None:
         raise ResidentProtocolError("invalid_command_fields", session_id=session_id)
     decode_resident_command_header(payload)
     if command == "audio":
@@ -100,7 +107,11 @@ def decode_resident_command_header(payload: object) -> ResidentCommandHeader:
     expected_fields = _RESIDENT_COMMAND_FIELDS.get(command)
     if expected_fields is None:
         raise ResidentProtocolError("unknown_command", session_id=error_session_id)
-    if frozenset(payload) != expected_fields:
+    actual_fields = frozenset(payload)
+    accepted_fields = {expected_fields}
+    if command == "start_session":
+        accepted_fields.add(expected_fields | {"hotwords"})
+    if actual_fields not in accepted_fields:
         raise ResidentProtocolError("invalid_command_fields", session_id=error_session_id)
     if command == "shutdown":
         return ResidentCommandHeader(command=command, session_id=None)
@@ -131,9 +142,17 @@ def decode_resident_command(line: bytes | str) -> ResidentCommand:
         raise ResidentProtocolError("invalid_json") from exc
     header = decode_resident_command_header(payload)
     pcm_bytes = b""
+    hotwords: tuple[str, ...] = ()
     if header.command == "audio":
         pcm_bytes = _decode_pcm_base64(payload["pcm_base64"], session_id=header.session_id)
-    return ResidentCommand(command=header.command, session_id=header.session_id, pcm_bytes=pcm_bytes)
+    elif header.command == "start_session" and "hotwords" in payload:
+        hotwords = _normalize_session_hotwords(payload["hotwords"], session_id=header.session_id)
+    return ResidentCommand(
+        command=header.command,
+        session_id=header.session_id,
+        pcm_bytes=pcm_bytes,
+        hotwords=hotwords,
+    )
 
 
 def read_resident_command(stdin) -> ResidentCommand | None:
@@ -172,6 +191,40 @@ def _decode_pcm_base64(value: object, *, session_id: str | None) -> bytes:
     if len(pcm_bytes) % 4:
         raise ResidentProtocolError("audio_payload_unaligned", session_id=session_id)
     return pcm_bytes
+
+
+def _normalize_session_hotwords(
+    value: object,
+    *,
+    session_id: str | None = None,
+) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)) or len(value) > 50:
+        raise ResidentProtocolError("invalid_hotwords", session_id=session_id)
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_item in value:
+        if not isinstance(raw_item, str):
+            raise ResidentProtocolError("invalid_hotwords", session_id=session_id)
+        item = raw_item.strip()
+        key = item.casefold()
+        if not item or len(item) > 64 or any(ord(character) < 32 for character in item):
+            raise ResidentProtocolError("invalid_hotwords", session_id=session_id)
+        if key not in seen:
+            seen.add(key)
+            normalized.append(item)
+    return tuple(normalized)
+
+
+def _merge_hotwords(*groups: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for item in group:
+            key = item.casefold()
+            if key not in seen:
+                seen.add(key)
+                merged.append(item)
+    return tuple(merged)
 
 
 def _parse_chunk_size(value: str) -> list[int]:
@@ -350,12 +403,13 @@ def _generate_chunk(
     state: SessionState,
     pcm_bytes: bytes,
     dtype: str,
+    is_final: bool = False,
 ) -> None:
     chunk = np_module.frombuffer(pcm_bytes, dtype=dtype)
     kw = {
         "input": chunk,
         "cache": state.cache,
-        "is_final": False,
+        "is_final": is_final,
         "chunk_size": args.chunk_size,
         "encoder_chunk_look_back": args.encoder_chunk_look_back,
         "decoder_chunk_look_back": args.decoder_chunk_look_back,
@@ -432,7 +486,9 @@ def _process_resident_audio(
     flush: bool,
 ) -> None:
     chunk_stride_bytes = chunk_stride_samples(args.chunk_size) * 4
-    while len(state.audio_buffer) >= chunk_stride_bytes:
+    # Keep one stride pending so END can mark the true final audio as is_final.
+    # The 300 ms transport cadence bounds the added streaming delay.
+    while len(state.audio_buffer) > chunk_stride_bytes:
         chunk_bytes = bytes(state.audio_buffer[:chunk_stride_bytes])
         del state.audio_buffer[:chunk_stride_bytes]
         _generate_chunk(
@@ -455,6 +511,7 @@ def _process_resident_audio(
             state=state,
             pcm_bytes=tail_bytes,
             dtype="<f4",
+            is_final=True,
         )
 
 
@@ -476,7 +533,10 @@ def _run_resident_mode(
         if command.command == "start_session":
             if state is not None:
                 raise ResidentProtocolError("concurrent_session", session_id=command.session_id)
-            state = SessionState(session_id=command.session_id)
+            state = SessionState(
+                session_id=command.session_id,
+                hotwords=_merge_hotwords(tuple(hotwords), command.hotwords),
+            )
             _emit_session_started(command.session_id)
             continue
         if command.command == "shutdown":
@@ -494,7 +554,7 @@ def _run_resident_mode(
                 model=model,
                 np_module=np_module,
                 args=args,
-                hotwords=hotwords,
+                hotwords=list(state.hotwords),
                 state=state,
                 flush=False,
             )
@@ -504,7 +564,7 @@ def _run_resident_mode(
                 model=model,
                 np_module=np_module,
                 args=args,
-                hotwords=hotwords,
+                hotwords=list(state.hotwords),
                 state=state,
                 flush=True,
             )

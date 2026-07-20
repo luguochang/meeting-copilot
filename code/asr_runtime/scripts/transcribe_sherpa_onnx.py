@@ -9,7 +9,11 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import soundfile as sf
+
+try:
+    import soundfile as sf
+except ModuleNotFoundError:  # CLI help and capability probes must remain available.
+    sf = None
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -76,6 +80,8 @@ def stream_events(
     num_threads: int = 2,
     chunk_ms: int = 500,
 ) -> list[StreamingTranscriptEvent]:
+    if sf is None:
+        raise RuntimeError("soundfile is required to transcribe audio with sherpa-onnx")
     started = time.monotonic()
     import sherpa_onnx
 

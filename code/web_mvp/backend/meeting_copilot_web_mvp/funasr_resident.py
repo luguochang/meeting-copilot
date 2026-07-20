@@ -1,9 +1,9 @@
-"""Process-resident FunASR worker lifecycle and per-meeting session adapter.
+"""Bounded process-resident FunASR pool and per-stream session adapter.
 
-The worker owns the expensive model.  A session owns only streaming cache and
-events, so sequential meetings reuse one process without sharing transcript
-state.  The protocol is newline-delimited JSON; raw PCM is base64 encoded in
-``audio`` commands to keep command boundaries explicit and recoverable.
+Each worker owns one expensive model and at most one active streaming cache.
+Two lazy process slots allow microphone and system audio to run concurrently
+without sharing model state.  The protocol is newline-delimited JSON; raw PCM
+is base64 encoded in ``audio`` commands to keep boundaries recoverable.
 """
 
 from __future__ import annotations
@@ -22,10 +22,14 @@ WRITE_QUEUE_MAX_COMMANDS = 256
 PROCESS_WAIT_TIMEOUT_S = 5.0
 SESSION_ABORT_TIMEOUT_S = 2.0
 SESSION_FINALIZE_MAX_TIMEOUT_S = 30.0
+DEFAULT_RESIDENT_WORKER_COUNT = 2
+MAX_RESIDENT_WORKER_COUNT = 2
+MAX_SESSION_HOTWORDS = 50
+MAX_SESSION_HOTWORD_CHARACTERS = 64
 
 
 class FunasrResidentBusyError(RuntimeError):
-    """Raised when a second meeting tries to claim the single local model."""
+    """Raised when all bounded resident workers already own a session."""
 
 
 class FunasrResidentUnavailableError(RuntimeError):
@@ -57,9 +61,10 @@ class FunasrResidentSession:
     fallback_used = False
     degradation_reasons: list[str] = []
 
-    def __init__(self, manager: "FunasrResidentWorkerManager", session_id: str):
+    def __init__(self, manager: "_FunasrResidentWorkerSlot", session_id: str):
         self._manager = manager
         self.session_id = session_id
+        self.worker_id = manager.worker_id
         self._events: "queue.Queue[dict[str, Any]]" = queue.Queue()
         self._ready_event = threading.Event()
         self._ended_event = threading.Event()
@@ -200,8 +205,8 @@ class FunasrResidentSession:
             events.append(event)
 
 
-class FunasrResidentWorkerManager:
-    """Own one FunASR model process and serialize sequential meeting sessions."""
+class _FunasrResidentWorkerSlot:
+    """Own one model process and serialize sessions within that process."""
 
     def __init__(
         self,
@@ -209,7 +214,9 @@ class FunasrResidentWorkerManager:
         *,
         environment: Mapping[str, str] | None = None,
         popen_factory: Callable[..., Any] = subprocess.Popen,
+        worker_id: int = 1,
     ) -> None:
+        self.worker_id = worker_id
         self._command = [*command, "--resident"]
         self._environment = dict(environment) if environment is not None else None
         self._popen_factory = popen_factory
@@ -260,6 +267,7 @@ class FunasrResidentWorkerManager:
             )
             return {
                 "schema_version": "funasr_resident_status.v1",
+                "worker_id": self.worker_id,
                 "spawned": generation is not None,
                 "process_running": process_running,
                 "process_ready": process_ready,
@@ -272,9 +280,15 @@ class FunasrResidentWorkerManager:
                 "last_error": self._last_error,
             }
 
-    def create_session(self, session_id: str) -> FunasrResidentSession:
+    def create_session(
+        self,
+        session_id: str,
+        *,
+        hotwords: Sequence[str] = (),
+    ) -> FunasrResidentSession:
         if not session_id.strip():
             raise ValueError("session_id must not be empty")
+        normalized_hotwords = _normalize_session_hotwords(hotwords)
         with self._lock:
             if self._shutdown:
                 raise FunasrResidentUnavailableError("FunASR resident worker manager is shut down")
@@ -286,10 +300,13 @@ class FunasrResidentWorkerManager:
             session = FunasrResidentSession(self, session_id)
             self._active_session = session
             try:
-                self._enqueue_locked(generation, {
+                start_command: dict[str, Any] = {
                     "command": "start_session",
                     "session_id": session_id,
-                })
+                }
+                if normalized_hotwords:
+                    start_command["hotwords"] = list(normalized_hotwords)
+                self._enqueue_locked(generation, start_command)
             except Exception:
                 self._active_session = None
                 raise
@@ -413,19 +430,19 @@ class FunasrResidentWorkerManager:
             target=self._writer_loop,
             args=(generation,),
             daemon=True,
-            name=f"funasr-resident-writer-{number}",
+            name=f"funasr-resident-{self.worker_id}-writer-{number}",
         )
         generation.reader = threading.Thread(
             target=self._reader_loop,
             args=(generation,),
             daemon=True,
-            name=f"funasr-resident-reader-{number}",
+            name=f"funasr-resident-{self.worker_id}-reader-{number}",
         )
         generation.stderr_reader = threading.Thread(
             target=self._stderr_loop,
             args=(generation,),
             daemon=True,
-            name=f"funasr-resident-stderr-{number}",
+            name=f"funasr-resident-{self.worker_id}-stderr-{number}",
         )
         self._generation = generation
         self.process_start_count += 1
@@ -589,3 +606,201 @@ class FunasrResidentWorkerManager:
             process.wait(timeout=PROCESS_WAIT_TIMEOUT_S)
         except Exception:
             pass
+
+    def _is_idle(self) -> bool:
+        with self._lock:
+            return not self._shutdown and self._active_session is None
+
+
+class FunasrResidentWorkerManager:
+    """Bounded pool of single-session resident FunASR model processes.
+
+    A FunASR online model keeps mutable streaming cache, so sharing one model
+    instance across microphone and system-audio sessions is unsafe.  The pool
+    keeps that process-level isolation, starts the second worker lazily, and
+    pins every session object to one slot for its complete lifetime.
+    """
+
+    def __init__(
+        self,
+        command: Sequence[str],
+        *,
+        environment: Mapping[str, str] | None = None,
+        popen_factory: Callable[..., Any] = subprocess.Popen,
+        max_workers: int = DEFAULT_RESIDENT_WORKER_COUNT,
+    ) -> None:
+        if (
+            not isinstance(max_workers, int)
+            or isinstance(max_workers, bool)
+            or not 1 <= max_workers <= MAX_RESIDENT_WORKER_COUNT
+        ):
+            raise ValueError(
+                f"max_workers must be between 1 and {MAX_RESIDENT_WORKER_COUNT}"
+            )
+        self._command = tuple(command)
+        self._environment = dict(environment) if environment is not None else None
+        self._popen_factory = popen_factory
+        self._max_workers = max_workers
+        self._lock = threading.RLock()
+        self._slots: list[_FunasrResidentWorkerSlot] = []
+        self._shutdown = False
+
+    @property
+    def max_workers(self) -> int:
+        return self._max_workers
+
+    @property
+    def process_start_count(self) -> int:
+        with self._lock:
+            return sum(slot.process_start_count for slot in self._slots)
+
+    @property
+    def completed_session_count(self) -> int:
+        with self._lock:
+            return sum(slot.completed_session_count for slot in self._slots)
+
+    @property
+    def _generation(self) -> _WorkerGeneration | None:
+        """Compatibility view of the prewarmed/primary worker generation."""
+        with self._lock:
+            return self._slots[0]._generation if self._slots else None
+
+    def start(self) -> None:
+        """Prewarm one worker; the second worker remains lazy until dual-track use."""
+        with self._lock:
+            if self._shutdown:
+                raise FunasrResidentUnavailableError(
+                    "FunASR resident worker manager is shut down"
+                )
+            slot = self._primary_slot_locked()
+            slot.start()
+
+    def wait_process_ready(self, timeout: float | None = None) -> bool:
+        with self._lock:
+            if not self._slots:
+                return False
+            slot = self._slots[0]
+        return slot.wait_process_ready(timeout)
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            slot_statuses = [slot.status() for slot in self._slots]
+            max_workers = self._max_workers
+            shutdown = self._shutdown
+
+        active_session_ids = [
+            str(status["active_session_id"])
+            for status in slot_statuses
+            if status.get("active_session_id") is not None
+        ]
+        running_worker_count = sum(bool(status["process_running"]) for status in slot_statuses)
+        ready_worker_count = sum(bool(status["process_ready"]) for status in slot_statuses)
+        primary = slot_statuses[0] if slot_statuses else {}
+        latest_failure = next(
+            (
+                status
+                for status in reversed(slot_statuses)
+                if status.get("last_exit_code") is not None or status.get("last_error") is not None
+            ),
+            {},
+        )
+        return {
+            "schema_version": "funasr_resident_status.v1",
+            "spawned": any(bool(status["spawned"]) for status in slot_statuses),
+            "process_running": running_worker_count > 0,
+            "process_ready": ready_worker_count > 0,
+            "pid": primary.get("pid"),
+            "generation": primary.get("generation"),
+            "active_session_id": active_session_ids[0] if active_session_ids else None,
+            "process_start_count": sum(
+                int(status["process_start_count"]) for status in slot_statuses
+            ),
+            "completed_session_count": sum(
+                int(status["completed_session_count"]) for status in slot_statuses
+            ),
+            "last_exit_code": latest_failure.get("last_exit_code"),
+            "last_error": latest_failure.get("last_error"),
+            "pool_mode": "bounded_process_per_session",
+            "max_worker_count": max_workers,
+            "worker_count": len(slot_statuses),
+            "running_worker_count": running_worker_count,
+            "ready_worker_count": ready_worker_count,
+            "active_session_count": len(active_session_ids),
+            "active_session_ids": active_session_ids,
+            "available_worker_count": 0 if shutdown else max_workers - len(active_session_ids),
+            "workers": slot_statuses,
+            "shutdown": shutdown,
+        }
+
+    def create_session(
+        self,
+        session_id: str,
+        *,
+        hotwords: Sequence[str] = (),
+    ) -> FunasrResidentSession:
+        if not session_id.strip():
+            raise ValueError("session_id must not be empty")
+        normalized_hotwords = _normalize_session_hotwords(hotwords)
+        with self._lock:
+            if self._shutdown:
+                raise FunasrResidentUnavailableError(
+                    "FunASR resident worker manager is shut down"
+                )
+            slot = next((candidate for candidate in self._slots if candidate._is_idle()), None)
+            if slot is None:
+                if len(self._slots) >= self._max_workers:
+                    raise FunasrResidentBusyError(
+                        "FunASR resident worker pool has no available capacity"
+                    )
+                slot = self._new_slot_locked()
+            return slot.create_session(session_id, hotwords=normalized_hotwords)
+
+    def shutdown(self) -> None:
+        with self._lock:
+            if self._shutdown:
+                return
+            self._shutdown = True
+            slots = tuple(self._slots)
+        for slot in slots:
+            slot.shutdown()
+
+    def _primary_slot_locked(self) -> _FunasrResidentWorkerSlot:
+        if self._slots:
+            return self._slots[0]
+        return self._new_slot_locked()
+
+    def _new_slot_locked(self) -> _FunasrResidentWorkerSlot:
+        if len(self._slots) >= self._max_workers:
+            raise FunasrResidentBusyError(
+                "FunASR resident worker pool has no available capacity"
+            )
+        slot = _FunasrResidentWorkerSlot(
+            self._command,
+            environment=self._environment,
+            popen_factory=self._popen_factory,
+            worker_id=len(self._slots) + 1,
+        )
+        self._slots.append(slot)
+        return slot
+
+
+def _normalize_session_hotwords(values: Sequence[str]) -> tuple[str, ...]:
+    if isinstance(values, (str, bytes)) or len(values) > MAX_SESSION_HOTWORDS:
+        raise ValueError("session hotwords must be a bounded sequence")
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_item in values:
+        if not isinstance(raw_item, str):
+            raise ValueError("session hotwords must contain strings")
+        item = raw_item.strip()
+        key = item.casefold()
+        if (
+            not item
+            or len(item) > MAX_SESSION_HOTWORD_CHARACTERS
+            or any(ord(character) < 32 for character in item)
+        ):
+            raise ValueError("session hotword is invalid")
+        if key not in seen:
+            seen.add(key)
+            normalized.append(item)
+    return tuple(normalized)

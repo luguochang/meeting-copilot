@@ -1,12 +1,31 @@
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { isMeetingAudioContentUrl } from "./meeting_audio_url_contract.mjs";
+
+const NON_ACCEPTANCE_FAKE_SCOPE = "non_acceptance_fake_audio_fake_llm_mainline";
+const REAL_ACCEPTANCE_SCOPE = "acceptance_real_mic_real_local_asr_real_relay_mainline";
 
 if (process.argv[2] === "--evaluate-report-contract") {
   const report = await evaluateArtifactReportContract(process.argv[3]);
   await new Promise((resolve, reject) => {
     process.stdout.write(`${JSON.stringify(report)}\n`, (error) => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
+  process.exit(0);
+}
+
+if (process.argv[2] === "--evaluate-scope-contract") {
+  const candidate = await readArtifactJson(path.dirname(path.resolve(process.argv[3])), path.basename(process.argv[3]));
+  const initialBlockers = Array.isArray(candidate.initial_blockers) ? candidate.initial_blockers : [];
+  delete candidate.initial_blockers;
+  applyScopeAwareReportContract(candidate, initialBlockers);
+  await new Promise((resolve, reject) => {
+    process.stdout.write(`${JSON.stringify(candidate)}\n`, (error) => {
       if (error) reject(error);
       else resolve();
     });
@@ -20,6 +39,11 @@ const sourceAudio = path.resolve(
   process.env.MEETING_COPILOT_REAL_MIC_SOURCE_AUDIO
     || path.join(repoRoot, "artifacts", "tmp", "audio_fixtures", "two-turn-release-incident-16k.wav"),
 );
+const fakeAudioFile = process.env.MEETING_COPILOT_FAKE_AUDIO_FILE
+  ? path.resolve(process.env.MEETING_COPILOT_FAKE_AUDIO_FILE)
+  : "";
+const acceptanceScope = fakeAudioFile ? NON_ACCEPTANCE_FAKE_SCOPE : REAL_ACCEPTANCE_SCOPE;
+const inputAudioFile = fakeAudioFile || sourceAudio;
 const artifactRoot = path.resolve(
   process.env.MEETING_COPILOT_ARTIFACT_ROOT
     || path.join(repoRoot, "artifacts", "tmp", "browser_live_mic", `v2-real-mic-${Date.now()}`),
@@ -27,18 +51,25 @@ const artifactRoot = path.resolve(
 const chromePath = process.env.CHROME_BIN || "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const chromePort = Number(process.env.MEETING_COPILOT_E2E_CHROME_PORT || "9251");
 const chromeUserDataDir = await mkdtemp(path.join(tmpdir(), "meeting-copilot-v2-real-mic-"));
-const diagnostics = { runtime_exceptions: [], console_errors: [], network_failures: [], http_5xx: [] };
+const diagnostics = {
+  runtime_exceptions: [],
+  console_errors: [],
+  network_failures: [],
+  http_5xx: [],
+  allowlisted_network_cancellations: [],
+};
 const recordingSamples = [];
 const sockets = [];
 let chrome;
 let player;
+let meetingId = null;
 
 try {
   await mkdir(artifactRoot, { recursive: true });
   await waitForHttp(`${baseUrl}/health`, 30_000);
-  await readFile(sourceAudio);
+  await readFile(inputAudioFile);
 
-  chrome = spawn(chromePath, [
+  const chromeArgs = [
     "--disable-gpu",
     "--no-first-run",
     "--no-default-browser-check",
@@ -47,7 +78,16 @@ try {
     `--remote-debugging-port=${chromePort}`,
     `--user-data-dir=${chromeUserDataDir}`,
     "about:blank",
-  ], { stdio: "ignore" });
+  ];
+  if (fakeAudioFile) {
+    chromeArgs.splice(
+      4,
+      0,
+      "--use-fake-device-for-media-stream",
+      `--use-file-for-fake-audio-capture=${fakeAudioFile}`,
+    );
+  }
+  chrome = spawn(chromePath, chromeArgs, { stdio: "ignore" });
   await waitForHttp(`http://127.0.0.1:${chromePort}/json/version`, 30_000);
 
   const page = await createCdpPage(chromePort, `${baseUrl}/workbench`);
@@ -55,19 +95,31 @@ try {
   await waitFor(page, `document.querySelectorAll('.start-meeting-button').length === 1`, 20_000);
   await capture(page, "01-before-start.png");
   await evaluate(page, () => document.querySelector(".start-meeting-button")?.click());
+  await waitFor(page, `document.querySelector('.meeting-preflight-dialog') !== null`, 10_000);
+  await waitFor(page, `document.querySelector('.preflight-consent input') !== null`, 10_000);
+  await evaluate(page, () => document.querySelector('.preflight-consent input')?.click());
+  await waitFor(
+    page,
+    `document.querySelector('.meeting-preflight-actions .primary-button')?.disabled === false`,
+    20_000,
+  );
+  await capture(page, "01a-preflight-ready.png");
+  await evaluate(page, () => document.querySelector('.meeting-preflight-actions .primary-button')?.click());
   await waitFor(page, `document.querySelector('.end-meeting-button') !== null`, 30_000);
   await waitFor(page, `new URL(location.href).searchParams.has('meeting_id')`, 10_000);
-  const meetingId = await evaluate(page, () => new URL(location.href).searchParams.get("meeting_id"));
+  meetingId = await evaluate(page, () => new URL(location.href).searchParams.get("meeting_id"));
   if (!meetingId) throw new Error("V2 start did not bind a meeting_id");
 
-  player = spawn("afplay", [sourceAudio], { stdio: "ignore" });
+  player = fakeAudioFile ? null : spawn("afplay", [sourceAudio], { stdio: "ignore" });
   const playbackStartedAtMs = Date.now();
   let firstTextAtMs = null;
   let firstFinalAtMs = null;
   let firstSuggestionAtMs = null;
   let firstCorrectionAtMs = null;
-  let playerFinished = false;
-  player.once("exit", () => { playerFinished = true; });
+  let playerFinished = Boolean(fakeAudioFile);
+  player?.once("exit", () => { playerFinished = true; });
+  const minimumObservationMs = fakeAudioFile ? 5_000 : 30_000;
+  const expectedLiveSegmentCount = fakeAudioFile ? 2 : 1;
 
   const recordingDeadline = Date.now() + 50_000;
   while (Date.now() < recordingDeadline) {
@@ -77,9 +129,9 @@ try {
       segment_count: document.querySelectorAll('.transcript-segment').length,
       partial_count: document.querySelectorAll('.active-partial').length,
       partial_text: document.querySelector('.active-partial p')?.textContent?.trim() || "",
-      suggestion_count: document.querySelectorAll('.suggestion-card').length,
-      suggestion_text: document.querySelector('.suggestion-card blockquote')?.textContent?.trim() || "",
-      corrected_count: document.querySelectorAll('.correction-mark').length,
+      suggestion_count: document.querySelectorAll('.suggestion-card, .follow-up-card').length,
+      suggestion_text: document.querySelector('.suggestion-card blockquote, .follow-up-card blockquote')?.textContent?.trim() || "",
+      corrected_count: document.querySelectorAll('.correction-mark--changed').length,
     }));
     recordingSamples.push(sample);
     if (firstTextAtMs === null && (sample.partial_count > 0 || sample.segment_count > 0)) firstTextAtMs = sample.at_ms;
@@ -88,12 +140,12 @@ try {
     if (firstCorrectionAtMs === null && sample.corrected_count > 0) firstCorrectionAtMs = sample.at_ms;
     if (
       playerFinished
-      && sample.segment_count > 0
+      && sample.segment_count >= expectedLiveSegmentCount
       && sample.suggestion_count > 0
       && sample.corrected_count > 0
-      && Date.now() - playbackStartedAtMs > 30_000
+      && Date.now() - playbackStartedAtMs > minimumObservationMs
     ) break;
-    await delay(1_000);
+    await delay(fakeAudioFile ? 100 : 1_000);
   }
   await capture(page, "02-live-transcript-and-suggestion.png");
 
@@ -127,10 +179,13 @@ try {
       },
       rows: [...document.querySelectorAll('.review-transcript .transcript-segment')].map((row) => {
         const rowRect = row.getBoundingClientRect();
+        const correctionMark = row.querySelector('.correction-mark');
         return {
           segment_id: row.getAttribute('data-segment-id') || "",
           text: row.querySelector('p')?.textContent?.trim() || "",
-          corrected: Boolean(row.querySelector('.correction-mark')),
+          correction_status_marked: Boolean(correctionMark),
+          correction_status_class: correctionMark?.className || "",
+          corrected: Boolean(row.querySelector('.correction-mark--changed')),
           visible: Boolean(
             row.getClientRects().length
             && rowRect.height > 0
@@ -146,7 +201,11 @@ try {
   const transcriptUi = transcriptUiState.rows;
   await capture(page, "04-complete-transcript.png");
   await clickTab(page, "录音");
-  await waitFor(page, `document.querySelector('audio')?.getAttribute('src')?.includes('/audio/content') === true`, 20_000);
+  await waitFor(
+    page,
+    `(${isMeetingAudioContentUrl.toString()})(document.querySelector('audio')?.getAttribute('src'), location.origin)`,
+    20_000,
+  );
   await capture(page, "05-recording.png");
 
   const snapshot = await fetchJson(`${baseUrl}/v2/meetings/${encodeURIComponent(meetingId)}/snapshot`);
@@ -193,15 +252,35 @@ try {
   ]));
   const traceRevisionCount = observabilityContract.trace_revision_count;
   const llmEvidence = legacyEvidence.llm_evidence || {};
+  const v2LlmTraceCount = Array.isArray(traces.traces)
+    ? traces.traces.filter(v2LlmCallTrace).length
+    : 0;
+  const transcriptSegments = segments.map((segment) => ({
+    segment_id: segment.segment_id,
+    text: String(segment.text || "").trim(),
+    normalized_text: String(segment.normalized_text || segment.text || "").trim(),
+    started_at_ms: segment.started_at_ms,
+    ended_at_ms: segment.ended_at_ms,
+    revision: Number(segment.revision || 1),
+    correction_before_text: segment.correction_before_text,
+    correction_after_text: segment.correction_after_text,
+  }));
+  const reviewJobKinds = ["minutes", "approach", "index"];
   const report = {
     schema_version: "workbench-v2-real-mic-mainline.v1",
     verdict: "pending",
-    meeting_id: meetingId,
-    input_mode: "real_browser_microphone_with_acoustic_speaker_source",
+    acceptance_scope: acceptanceScope,
+    acceptance_eligible: !fakeAudioFile,
+    counts_as_real_release_go: false,
+    meeting_id_hash: shortEvidenceHash(meetingId),
+    input_mode: fakeAudioFile
+      ? "fake_browser_microphone_audio_file"
+      : "real_browser_microphone_with_acoustic_speaker_source",
     ui_coverage: "visible_chrome",
-    fake_media_device_used: false,
+    fake_media_device_used: Boolean(fakeAudioFile),
+    fake_audio_file: fakeAudioFile ? path.basename(fakeAudioFile) : null,
     media_permission_auto_accepted: true,
-    source_audio: sourceAudio,
+    source_audio: path.basename(inputAudioFile),
     playback_started_at_ms: playbackStartedAtMs,
     first_text_latency_ms: firstTextAtMs === null ? null : firstTextAtMs - playbackStartedAtMs,
     first_final_latency_ms: firstFinalAtMs === null ? null : firstFinalAtMs - playbackStartedAtMs,
@@ -217,11 +296,14 @@ try {
     transcript_revision_count: observabilityContract.transcript_revision_count,
     transcript_revision_event_count: revisedEvents.length,
     trace_revision_count: traceRevisionCount,
+    revised_segment_ids: [...revisedSegmentIds].sort(),
+    transcript_segments: transcriptSegments,
     transcript_ui: {
       row_count: transcriptUi.length,
       scroll_container: transcriptUiState.container,
       all_rows_visible: transcriptUi.every((row) => row.visible),
       canonical_text_match: transcriptUi.every((row) => canonicalById.get(row.segment_id) === row.text),
+      status_mark_count: transcriptUi.filter((row) => row.correction_status_marked).length,
       corrected_row_count: transcriptUi.filter((row) => row.corrected).length,
       corrected_ids_match: transcriptUi
         .filter((row) => row.corrected)
@@ -229,11 +311,14 @@ try {
         && [...revisedSegmentIds].every((segmentId) => transcriptUi.some((row) => row.segment_id === segmentId && row.corrected)),
     },
     committed_suggestion_count: suggestions.filter((item) => item.status === "committed").length,
+    follow_up_ready: Boolean(snapshot.follow_up?.question),
     correction_jobs: observabilityContract.correction_jobs.map(jobSummary),
     suggestion_jobs: observabilityContract.suggestion_jobs.map(jobSummary),
     review_jobs: Object.fromEntries(Object.entries(reviewJobs).map(([kind, job]) => [kind, jobSummary(job)])),
+    review_jobs_complete: reviewJobKinds.every((kind) => reviewJobs[kind]?.status === "succeeded"),
     minutes_ready: Boolean(snapshot.minutes?.markdown),
     approach_card_count: Array.isArray(snapshot.approach_cards) ? snapshot.approach_cards.length : 0,
+    index_ready: snapshot.review?.indexed === true && reviewJobs.index?.status === "succeeded",
     formal_derivation_status: snapshot.diagnostics?.formal_derivation_status
       || snapshot.formal_derivation_status
       || null,
@@ -252,42 +337,20 @@ try {
       llm_provider: llmEvidence.provider,
       llm_model: llmEvidence.model,
       llm_is_mock: llmEvidence.is_mock,
-      llm_called: llmEvidence.llm_called,
-      llm_call_count: llmEvidence.llm_call_count,
+      llm_called: llmEvidence.llm_called === true || v2LlmTraceCount > 0,
+      llm_call_count: Math.max(Number(llmEvidence.llm_call_count || 0), v2LlmTraceCount),
+      legacy_llm_called: llmEvidence.llm_called === true,
+      v2_llm_trace_count: v2LlmTraceCount,
       llm_usage_total_tokens: llmEvidence.llm_usage_total_tokens,
       gateway_base_url_kind: llmEvidence.gateway_base_url_kind,
     },
     history_reopened: historyUiReopened && newestHistoryMeetingId === meetingId,
     event_count: Array.isArray(events.events) ? events.events.length : 0,
     trace_count: Array.isArray(traces.traces) ? traces.traces.length : 0,
+    browser_diagnostics_clean: browserDiagnosticsClean(diagnostics),
     diagnostics,
   };
-  const blockers = [...observabilityContract.blockers];
-  if (!report.live_partial_observed) blockers.push("live_partial_missing");
-  if (!report.live_final_observed || report.transcript_segment_count < 1) blockers.push("live_final_missing");
-  if (!report.live_suggestion_observed || report.committed_suggestion_count < 1) blockers.push("realtime_suggestion_missing");
-  if (!report.live_correction_observed) blockers.push("realtime_correction_not_visible");
-  if (report.transcript_revision_count < 1 && !blockers.includes("correction_projection_missing")) blockers.push("correction_projection_missing");
-  if (
-    report.transcript_ui.row_count !== report.transcript_segment_count
-    || !report.transcript_ui.all_rows_visible
-    || !report.transcript_ui.canonical_text_match
-    || !report.transcript_ui.corrected_ids_match
-  ) blockers.push("transcript_ui_projection_mismatch");
-  if (!report.minutes_ready || report.approach_card_count < 1) {
-    blockers.push(
-      report.formal_derivation_status === "suppressed_by_asr_semantic_quality"
-        ? "post_meeting_review_paused_by_asr_quality"
-        : "post_meeting_review_missing",
-    );
-  }
-  if (!report.audio.assembled || report.audio.content_http_status !== 200 || report.audio.content_bytes <= 44) blockers.push("recording_missing");
-  if (report.provider.asr_provider_mode !== "real" || report.provider.asr_is_mock !== false) blockers.push("real_local_asr_missing");
-  if (!report.provider.llm_called || report.provider.llm_is_mock !== false || report.provider.gateway_base_url_kind !== "remote") blockers.push("real_relay_missing");
-  if (!report.history_reopened) blockers.push("history_reopen_missing");
-  if (diagnostics.runtime_exceptions.length || diagnostics.console_errors.length || diagnostics.http_5xx.length) blockers.push("browser_runtime_errors");
-  report.blockers = blockers;
-  report.verdict = blockers.length ? "no_go" : "go";
+  applyScopeAwareReportContract(report, observabilityContract.blockers);
 
   await writeFile(path.join(artifactRoot, "recording-samples.json"), JSON.stringify(recordingSamples, null, 2));
   await writeFile(path.join(artifactRoot, "snapshot.json"), JSON.stringify(snapshot, null, 2));
@@ -295,14 +358,24 @@ try {
   await writeFile(path.join(artifactRoot, "traces.json"), JSON.stringify(traces, null, 2));
   await writeFile(path.join(artifactRoot, "report.json"), JSON.stringify(report, null, 2));
   console.log(JSON.stringify({ artifact_root: artifactRoot, ...report }, null, 2));
-  if (report.verdict !== "go") throw new Error(`V2 real microphone mainline failed: ${blockers.join(",")}`);
+  if (report.blockers.length) throw new Error(`contract blockers: ${report.blockers.join(",")}`);
+} catch (error) {
+  const scopedMessage = `V2 mainline failed [acceptance_scope=${acceptanceScope}]: ${error.message}`;
+  await mkdir(artifactRoot, { recursive: true });
+  await writeFile(path.join(artifactRoot, "error-report.json"), JSON.stringify({
+    schema_version: "workbench-v2-mainline-error.v1",
+    acceptance_scope: acceptanceScope,
+    acceptance_eligible: !fakeAudioFile,
+    counts_as_real_release_go: false,
+    error: scopedMessage,
+    diagnostics,
+  }, null, 2));
+  throw new Error(scopedMessage, { cause: error });
 } finally {
-  if (player && player.exitCode === null) player.kill("SIGTERM");
+  await terminateChild(player);
+  await endMeetingIfStillLive(meetingId);
   for (const socket of sockets) socket.close();
-  if (chrome && chrome.exitCode === null) {
-    chrome.kill("SIGTERM");
-    await delay(1_000);
-  }
+  await terminateChild(chrome);
   await rm(chromeUserDataDir, {
     recursive: true,
     force: true,
@@ -402,6 +475,11 @@ function traceRevisionValue(trace) {
   return Number.isFinite(rawValue) && rawValue > 0 ? rawValue : 0;
 }
 
+function v2LlmCallTrace(trace) {
+  return trace?.stages?.job_queued?.attributes?.lane === "intelligence"
+    && Number.isFinite(Number(trace?.stages?.validated?.attributes?.ttft_ms));
+}
+
 function revisionEventSegmentId(event) {
   return String(event?.aggregate_id || event?.payload?.segment_id || "").trim();
 }
@@ -436,13 +514,155 @@ function correctionLaneComplete(jobs) {
     && jobs.every(correctionJobTerminalAccepted);
 }
 
+function applyScopeAwareReportContract(report, initialBlockers = []) {
+  const blockers = [];
+  const addBlocker = (blocker) => {
+    if (!blockers.includes(blocker)) blockers.push(blocker);
+  };
+  for (const blocker of initialBlockers) addBlocker(blocker);
+
+  const fakeScope = report.acceptance_scope === NON_ACCEPTANCE_FAKE_SCOPE;
+  const realScope = report.acceptance_scope === REAL_ACCEPTANCE_SCOPE;
+  if (!fakeScope && !realScope) addBlocker("acceptance_scope_invalid");
+  if (!report.live_partial_observed) addBlocker("live_partial_missing");
+  if (!report.live_final_observed || Number(report.transcript_segment_count || 0) < 1) {
+    addBlocker("live_final_missing");
+  }
+  if (
+    !report.live_suggestion_observed
+    || (Number(report.committed_suggestion_count || 0) < 1 && !report.follow_up_ready)
+  ) addBlocker("realtime_suggestion_missing");
+  if (!report.live_correction_observed) addBlocker("realtime_correction_not_visible");
+  if (realScope && Number(report.transcript_revision_count || 0) < 1) {
+    addBlocker("correction_projection_missing");
+  }
+
+  const transcriptUi = report.transcript_ui || {};
+  if (
+    transcriptUi.row_count !== report.transcript_segment_count
+    || !transcriptUi.all_rows_visible
+    || !transcriptUi.canonical_text_match
+    || !transcriptUi.corrected_ids_match
+  ) addBlocker("transcript_ui_projection_mismatch");
+
+  if (!report.minutes_ready) {
+    addBlocker(
+      report.formal_derivation_status === "suppressed_by_asr_semantic_quality"
+        ? "post_meeting_review_paused_by_asr_quality"
+        : "minutes_missing",
+    );
+  }
+  if (Number(report.approach_card_count || 0) < 1) addBlocker("approach_missing");
+  if (!report.index_ready) addBlocker("index_missing");
+  if (!report.review_jobs_complete) addBlocker("review_jobs_incomplete");
+
+  const audio = report.audio || {};
+  if (
+    !audio.assembled
+    || Number(audio.duration_ms || 0) <= 0
+    || Number(audio.chunk_count || 0) <= 0
+    || audio.content_http_status !== 200
+    || Number(audio.content_bytes || 0) <= 44
+  ) addBlocker("recording_missing");
+  if (!report.history_reopened) addBlocker("history_reopen_missing");
+  if (!browserDiagnosticsClean(report.diagnostics)) addBlocker("browser_runtime_errors");
+
+  if (fakeScope) {
+    const segments = Array.isArray(report.transcript_segments) ? report.transcript_segments : [];
+    const first = segments.find((segment) => segment.segment_id === "scripted_segment_1");
+    const second = segments.find((segment) => segment.segment_id === "scripted_segment_2");
+    const exactlyTwoSegments = segments.length === 2
+      && Number(report.transcript_segment_count) === 2
+      && Boolean(first)
+      && Boolean(second);
+    const timestampsValid = exactlyTwoSegments
+      && segments.every((segment) => (
+        Number.isFinite(Number(segment.started_at_ms))
+        && Number.isFinite(Number(segment.ended_at_ms))
+        && Number(segment.started_at_ms) < Number(segment.ended_at_ms)
+      ))
+      && Number(first.started_at_ms) === 0
+      && Number(first.ended_at_ms) === 600
+      && Number(second.started_at_ms) === 6_000
+      && Number(second.ended_at_ms) === 6_600;
+    const revisedIds = Array.isArray(report.revised_segment_ids)
+      ? report.revised_segment_ids.map((value) => String(value)).sort()
+      : [];
+    const firstOriginal = String(first?.correction_before_text || first?.text || "");
+    const firstCorrected = String(first?.correction_after_text || first?.normalized_text || "");
+    const secondOriginal = String(second?.correction_before_text || second?.text || "");
+    const secondCorrected = String(second?.correction_after_text || second?.normalized_text || "");
+    const expectedSingleTypoCorrection = exactlyTwoSegments
+      && revisedIds.length === 1
+      && revisedIds[0] === "scripted_segment_1"
+      && Number(report.transcript_revision_count) === 1
+      && Number(report.transcript_revision_event_count) === 1
+      && Number(transcriptUi.corrected_row_count) === 1
+      && Number(first.revision) > 1
+      && firstOriginal.includes("cheout outservice")
+      && firstCorrected.includes("checkout-service")
+      && !firstCorrected.includes("cheout outservice")
+      && Number(second.revision) === 1
+      && secondOriginal === secondCorrected;
+
+    report.scripted_fixture = {
+      exactly_two_transcript_segments: exactlyTwoSegments,
+      timestamps_valid: timestampsValid,
+      expected_single_typo_correction: expectedSingleTypoCorrection,
+    };
+    if (!exactlyTwoSegments) addBlocker("non_acceptance_fake_expected_two_transcript_segments_missing");
+    if (!timestampsValid) addBlocker("non_acceptance_fake_scripted_timestamp_invalid");
+    if (!expectedSingleTypoCorrection) {
+      addBlocker("non_acceptance_fake_expected_single_typo_correction_mismatch");
+    }
+    if (!report.follow_up_ready) addBlocker("non_acceptance_fake_follow_up_missing");
+    if (
+      report.provider?.asr_provider !== "scripted_chinese_e2e_asr"
+      || report.provider?.asr_provider_mode !== "mock"
+      || report.provider?.asr_is_mock !== true
+    ) addBlocker("non_acceptance_fake_scripted_asr_missing");
+    const localGatewayProvesNonAcceptance = report.provider?.gateway_base_url_kind === "local";
+    if (
+      !report.provider?.llm_called
+      || (!localGatewayProvesNonAcceptance && report.provider?.llm_is_mock !== true)
+      || report.provider?.gateway_base_url_kind !== "local"
+    ) addBlocker("non_acceptance_fake_local_llm_missing");
+  }
+
+  if (realScope) {
+    if (report.provider?.asr_provider_mode !== "real" || report.provider?.asr_is_mock !== false) {
+      addBlocker("real_local_asr_missing");
+    }
+    if (
+      !report.provider?.llm_called
+      || report.provider?.llm_is_mock !== false
+      || report.provider?.gateway_base_url_kind !== "remote"
+    ) addBlocker("real_relay_missing");
+  }
+
+  report.acceptance_eligible = realScope;
+  report.blockers = blockers;
+  report.verdict = blockers.length
+    ? (fakeScope ? "failed_non_acceptance" : "no_go")
+    : (fakeScope ? "passed_non_acceptance" : "go");
+  report.counts_as_real_release_go = realScope && blockers.length === 0;
+  return report;
+}
+
+function browserDiagnosticsClean(value) {
+  const diagnostics = value && typeof value === "object" ? value : {};
+  return ["runtime_exceptions", "console_errors", "network_failures", "http_5xx"]
+    .every((key) => Array.isArray(diagnostics[key]) && diagnostics[key].length === 0);
+}
+
 async function evaluateArtifactReportContract(artifactDirectory) {
   if (!artifactDirectory) throw new Error("--evaluate-report-contract requires an artifact directory");
   const root = path.resolve(artifactDirectory);
-  const [snapshot, events, traces] = await Promise.all([
+  const [snapshot, events, traces, mainlineReport] = await Promise.all([
     readArtifactJson(root, "snapshot.json"),
     readArtifactJson(root, "events.json"),
     readArtifactJson(root, "traces.json"),
+    readOptionalArtifactJson(root, "report.json"),
   ]);
   const contract = evaluateJobAndRevisionContract({
     snapshot,
@@ -450,7 +670,7 @@ async function evaluateArtifactReportContract(artifactDirectory) {
     events,
     traces,
   });
-  return {
+  const report = {
     schema_version: "workbench-v2-real-mic-report-contract.v1",
     verdict: contract.blockers.length ? "no_go" : "go",
     blockers: contract.blockers,
@@ -461,10 +681,29 @@ async function evaluateArtifactReportContract(artifactDirectory) {
     transcript_revision_event_count: contract.revised_events.length,
     trace_revision_count: contract.trace_revision_count,
   };
+  if (mainlineReport?.acceptance_scope === NON_ACCEPTANCE_FAKE_SCOPE) {
+    applyScopeAwareReportContract(mainlineReport, contract.blockers);
+    report.schema_version = "workbench-v2-non-acceptance-report-contract.v1";
+    report.acceptance_scope = NON_ACCEPTANCE_FAKE_SCOPE;
+    report.acceptance_eligible = false;
+    report.counts_as_real_release_go = false;
+    report.verdict = mainlineReport.verdict;
+    report.blockers = mainlineReport.blockers;
+  }
+  return report;
 }
 
 async function readArtifactJson(root, fileName) {
   return JSON.parse(await readFile(path.join(root, fileName), "utf-8"));
+}
+
+async function readOptionalArtifactJson(root, fileName) {
+  try {
+    return await readArtifactJson(root, fileName);
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
 }
 
 async function waitForReviewArtifacts(meetingId, timeoutMs) {
@@ -548,11 +787,36 @@ async function createCdpPage(debugPort, url) {
     }
     for (const handler of handlers.get(message.method) || []) handler(message.params || {});
   });
+  socket.addEventListener("close", () => {
+    for (const request of pending.values()) request.reject(new Error("Chrome DevTools connection closed"));
+    pending.clear();
+  });
   const page = {
-    send(method, params = {}) {
+    send(method, params = {}, timeoutMs = 15_000) {
       const id = nextId++;
-      socket.send(JSON.stringify({ id, method, params }));
-      return new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
+      return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          pending.delete(id);
+          reject(new Error(`Chrome DevTools command timed out: ${method}`));
+        }, timeoutMs);
+        pending.set(id, {
+          resolve(value) {
+            clearTimeout(timeout);
+            resolve(value);
+          },
+          reject(error) {
+            clearTimeout(timeout);
+            reject(error);
+          },
+        });
+        try {
+          socket.send(JSON.stringify({ id, method, params }));
+        } catch (error) {
+          pending.delete(id);
+          clearTimeout(timeout);
+          reject(error);
+        }
+      });
     },
     on(method, handler) {
       handlers.set(method, [...(handlers.get(method) || []), handler]);
@@ -566,8 +830,25 @@ async function createCdpPage(debugPort, url) {
   page.on("Network.requestWillBeSent", (params) => urls.set(params.requestId, params.request?.url || ""));
   page.on("Network.loadingFailed", (params) => {
     const failedUrl = urls.get(params.requestId) || "";
-    if (failedUrl.endsWith("/favicon.ico") || (failedUrl.includes("/audio/content") && params.errorText === "net::ERR_ABORTED")) return;
-    diagnostics.network_failures.push({ url: failedUrl, error: params.errorText });
+    const mediaCancellation = isMeetingAudioContentUrl(failedUrl, baseUrl) && params.errorText === "net::ERR_ABORTED";
+    const canceledWithoutRequestUrl = params.canceled === true && !failedUrl;
+    if (failedUrl.endsWith("/favicon.ico") || mediaCancellation || canceledWithoutRequestUrl) {
+      diagnostics.allowlisted_network_cancellations.push({
+        url: failedUrl || null,
+        error: params.errorText,
+        type: params.type || null,
+        canceled: params.canceled === true,
+        reason: mediaCancellation ? "media_element_unloaded" : "browser_request_cancelled_before_url_mapping",
+      });
+      return;
+    }
+    diagnostics.network_failures.push({
+      url: failedUrl,
+      error: params.errorText,
+      type: params.type || null,
+      canceled: params.canceled === true,
+      blocked_reason: params.blockedReason || null,
+    });
   });
   page.on("Network.responseReceived", (params) => {
     if (Number(params.response?.status || 0) >= 500) diagnostics.http_5xx.push({ url: params.response?.url, status: params.response?.status });
@@ -615,8 +896,57 @@ async function setViewport(page, { width, height }) {
 }
 
 async function capture(page, fileName) {
-  const result = await page.send("Page.captureScreenshot", { format: "png", captureBeyondViewport: false, fromSurface: true });
+  let result;
+  try {
+    result = await page.send(
+      "Page.captureScreenshot",
+      { format: "png", captureBeyondViewport: false, fromSurface: true },
+      15_000,
+    );
+  } catch (error) {
+    if (!String(error?.message || error).includes("command timed out")) throw error;
+    result = await page.send(
+      "Page.captureScreenshot",
+      { format: "png", captureBeyondViewport: false, fromSurface: false },
+      15_000,
+    );
+  }
   await writeFile(path.join(artifactRoot, fileName), Buffer.from(result.data, "base64"));
+}
+
+async function endMeetingIfStillLive(meetingId) {
+  if (!meetingId) return;
+  try {
+    const snapshot = await fetch(
+      `${baseUrl}/v2/meetings/${encodeURIComponent(meetingId)}/snapshot`,
+      { signal: AbortSignal.timeout(5_000) },
+    );
+    if (!snapshot.ok) return;
+    const payload = await snapshot.json();
+    if (payload.runtime?.phase === "ended") return;
+    await fetch(
+      `${baseUrl}/v2/meetings/${encodeURIComponent(meetingId)}/end`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "end_and_review" }),
+        signal: AbortSignal.timeout(5_000),
+      },
+    );
+  } catch {
+    // Cleanup is best effort; the original test failure remains authoritative.
+  }
+}
+
+async function terminateChild(child) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  const exited = new Promise((resolve) => child.once("exit", resolve));
+  try { child.kill("SIGTERM"); } catch { return; }
+  await Promise.race([exited, delay(3_000)]);
+  if (child.exitCode === null && child.signalCode === null) {
+    try { child.kill("SIGKILL"); } catch { return; }
+    await Promise.race([exited, delay(1_000)]);
+  }
 }
 
 async function fetchJson(url) {
@@ -641,4 +971,8 @@ async function waitForHttp(url, timeoutMs) {
 
 function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function shortEvidenceHash(value) {
+  return createHash("sha256").update(String(value)).digest("hex").slice(0, 16);
 }

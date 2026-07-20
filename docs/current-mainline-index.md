@@ -10,27 +10,27 @@
 >
 > 文档真相与历史归档索引：`docs/archive/readiness-index.md`
 >
-> 当前代码候选基线：`3bcc852` (`fix: rollback meeting when microphone startup fails`)，工作树 clean；当前 runtime/app/packaged evidence 已重新绑定该候选
+> 当前 HEAD 基线：`8eafc92` (`docs: bind phase0-2 evidence to current packaged app`)；其上存在本轮可审计的 Phase 0-2 主流程收口修改，工作树不是 clean，不能把旧 provenance 冒充为当前 clean commit
 >
 > 最新 clean provenance：`artifacts/tmp/release_provenance/phase0-clean-commit-20260717-r6/manifest.json`
 >
-> 最新 clean packaged runtime 证据：`artifacts/tmp/packaged_runtime_supervisor_smoke/phase3-native-mic-packaged-smoke-20260716-r2/evidence.json`
+> 当前 relocatable runtime：`artifacts/tmp/macos_bundled_runtime/phase0-2-mainline-r8-runtime-20260717/evidence.json`
 
-> 最新 relocatable runtime：`artifacts/tmp/macos_bundled_runtime/phase3-ipc-runtime-20260717-r1/evidence.json`
+> 当前固定 Tauri UI 候选：`artifacts/tmp/local-alpha/tauri_runtime_package/current/evidence.json`；app 固定为 `artifacts/tmp/local-alpha/tauri_runtime_package/current/Meeting Copilot.app`，binary SHA-256=`1c39fa83a7a48d80e88d0efe827aac2327f65eff67cc7ad1a5bebc2578f8b993`，整包 ad-hoc 签名和 `codesign --verify --deep --strict` 通过。r11/r12 只作为已授权麦克风和回放历史证据，不能冒充最新源码同场证据
 
-> 最新 Tauri resource app：`artifacts/tmp/tauri_runtime_package/phase3-ipc-tauri-20260717-r1/evidence.json`；binary SHA-256=`18368babca86b6656ab56e9089fcb5ca933377a45415bade22bbeaf634af1d3d`
+> 当前 packaged supervisor：`artifacts/tmp/packaged_runtime_supervisor_smoke/phase0-2-mainline-r9-supervisor-worker-reap-20260717/evidence.json`；app/backend/FunASR worker/端口全部自然回收
 
-> 最新 packaged WebView IPC 证据：`artifacts/tmp/packaged_tauri_ipc_smoke/phase3-packaged-tauri-ipc-20260717-r1/evidence.json`；真实 React 页面已调用 runtime/provider/mic prepare，未启动录音或绕过授权
+> 当前 packaged WebView IPC：`artifacts/tmp/packaged_tauri_ipc_smoke/phase0-2-mainline-r9-ipc-20260717/evidence.json`；runtime/provider/native mic prepare 通过，未绕过录音同意或启动麦克风
 
-> 当前提交 runtime bundle：`artifacts/tmp/macos_bundled_runtime/phase0-2-current-runtime-bundle-20260717-r2/evidence.json`
+> 当前 packaged AI 主链：`artifacts/tmp/packaged_ai_mainline_smoke/phase0-2-mainline-r9-ai-worker-reap-20260717/evidence.json`；本地 fake OpenAI-compatible provider，不计远端 relay 或 UI 麦克风证据；FunASR worker 自然退出且未强制清理
 
-> 当前提交 packaged app：`artifacts/tmp/tauri_runtime_package/phase0-2-current-tauri-20260717-r1/evidence.json`
+> 当前开发 DMG/临时安装：`artifacts/tmp/macos_dmg_install_smoke/phase0-2-mainline-r9-dmg-install-worker-reap-20260717/evidence.json`；DMG SHA-256=`abd55ccf4d37090738e6f8ec3bda71fe01c103a420cefefd622d632ac0ec94ec`，不是公开发布签名包
 
-> 当前提交 packaged IPC：`artifacts/tmp/packaged_tauri_ipc_smoke/phase0-2-current-packaged-ipc-20260717-r1/evidence.json`
+> 当前 r7 浏览器视觉/事实交互：`artifacts/tmp/browser_visual/phase0-2-mainline-r7-preflight-20260717/evidence.json`；桌面/375px 预检、canonical evidence 回跳、confirm/dismiss 与刷新重放通过
 
-> 当前提交 packaged AI 主链：`artifacts/tmp/packaged_ai_mainline_smoke/phase0-2-current-packaged-ai-20260717-r1/evidence.json`
+> 当前 packaged native mic/UI 证据：`artifacts/tmp/packaged_native_mic_ui/phase0-2-mainline-r11-r12-20260717/evidence.json`；r11 真实麦克风 + 本地 FunASR 连续 270.6 秒并保存 55 chunks/16 段文字，r12 真实打开同一持久化会议、单按钮结束、完整文字和录音播放通过。该证据明确不是 r12 同包真实 relay 同场 Go
 
-> 最新 packaged AI 主链证据：`artifacts/tmp/packaged_ai_mainline_smoke/phase3-packaged-ai-mainline-20260717-r2/evidence.json`；本地 fake OpenAI-compatible provider，不计远端 relay 或 UI 证据
+> 当前固定客户端启动证据：`artifacts/tmp/local-alpha/fixed-client-mainline-20260717/evidence.json`；最新源码包已启动 bundled backend/FunASR，会前本地条件通过，普通 metadata 保存不再触发 SecurityAgent。显式“连接 AI”已正确进入一次 Keychain 授权等待；未读取/代输密码，未发付费请求
 
 > 最新 P0-P2 逐项完成报告：`docs/p0-p2-completion-report-2026-07-17.md`
 
@@ -40,6 +40,32 @@
 >
 > 历史 packaged 业务证据：`artifacts/tmp/packaged_mainline/packaged-r9-final-real-mic-20260716/report.json`；它不绑定当前 clean 候选代码
 
+> 2026-07-17 DEC-412/413/414/415 增量：共享工作区当前存在未提交 r7 修改，下面的审计不构成新的 clean commit 或公开发布 provenance。
+>
+> DEC-412 当前状态：V2 Markdown/JSON 导出 focused Go。两种格式使用同一 allowlisted payload 和完整 V2 canonical transcript；backend focused `3 passed, 2 warnings`。导出不包含 provider raw config、API key、Authorization、base URL、prompt、LLM request/response、原始音频 bytes 或本地音频路径。
+>
+> DEC-413 当前状态：五类事实存储、投影和状态写回 focused Go。current topic、decision candidate、action item、risk、open question 已进入后端 canonical snapshot/event 和 React 同一投影；前端状态写回已统一为后端 canonical `PATCH /v2/meetings/{id}/entities/{entityId}`。r7 source-server 浏览器已验证 evidence 回跳、confirm/dismiss 和刷新重放；packaged native-mic 同场仍待验。
+
+> DEC-414 当前状态：会前预检、浏览器输入设备、录音告知、会议级本地 hotwords、Provider/成本/隐私可见性 focused Go。自定义 hotwords 为保证隔离和实际生效暂走独立本地 FunASR sidecar；system audio/mixed 尚未接入正式主链，不作为可选项展示。
+
+> DEC-415 当前状态：后端 V2 是录音 journal、chunk、recording session、WAV、回放和删除的唯一 canonical owner；历史 Tauri 本地 audio chunk runtime/命令已删除，native helper 只把 PCM 送入认证后的后端链路。
+
+> DEC-416 当前状态：Phase 0 已在权威计划中记录同场约 60 秒 microphone + ScreenCaptureKit system audio 双轨非空 WAV，并关闭可行性 scope；ignored 原始 artifact 当前未随 clean 工作树保留，Phase 3/发布前必须重新附着。正式 system audio/mixed 产品接线属于 Phase 3，不是 Phase 0-2 的隐藏完成条件。
+
+> DEC-417 当前状态：r8 UI 启动终止时发现 backend leader 先退出后 FunASR worker 成为 `PPID=1`；r9 已改为按整个 Unix process group 回收，并把 supervisor、AI 和 DMG smoke 升级为 FunASR 存活即 No-Go。
+
+> DEC-418 当前状态：native helper 的 async-main `dispatchMain()` SIGTRAP 已修复；长连接增加 ping/资源超时、前端增加同会议有界自动重连，中断后仍保留唯一“结束并整理”。r11 跨过旧 90.6 秒故障点并持续到 270.6 秒，但仍发生 socket disconnect，因此长会稳定性不能写成已完全关闭。
+
+> DEC-419 当前状态：禁止提取、读取、保存或自动填写 Mac 登录密码。ad-hoc 包路径变化会产生新的 TCC/Keychain 身份；r12 新路径在 `request_permission` 超时并正确回滚新会议。内部最终验收和发布必须固定安装路径，并使用稳定 Developer ID/Team ID 签名，使麦克风和凭据权限只授权一次。
+
+> DEC-420 当前状态：Provider runtime 未同步时 correction/suggestion job 使用不消耗 attempts 的 durable defer；会前桌面页提供显式“连接 AI”，真实 correction Provider/解析失败不再伪装成正常原文，终态 AI 失败与 suggestion draft rejection 可见并可重放。
+
+> DEC-421 当前状态：已有密钥时普通 Provider metadata 保存不读取 Keychain、不注入 backend；只有显式 sync 才读取既有凭据，真实 probe 继续作为独立可能计费动作。源码回归为 frontend `80 passed`、受影响 backend `99 passed`、Rust `34 passed, 1 ignored`。
+
+> DEC-422 当前状态：`codexai.club/gpt-5.6-sol` 在固定客户端中以 Responses 探测得到 `401 INVALID_API_KEY`，显式保存并同步 Chat Completions 后，同一真实 probe 于 `2026-07-18T02:32:28Z` 返回 200。当前主链固定显式使用 Chat Completions，不做 401 协议自动双投；错误文案同时提示凭据来源与协议路由，不再把所有 401 简化为 Key 无效。
+
+> 端口边界：浏览器上下文 `8767` 当前指向旧 worktree `/Users/chase/Documents/面试/meeting-copilot` 的独立 uvicorn，不是 `meeting-copilot-phase0-clean` 也不是固定安装包；`8767-8770` 历史开发实例不继承安装包的 Keychain runtime sync，不得用来判断当前 Provider 主链。
+
 当前事实：
 
 - DEC-404 已关闭 packaged localhost WebView 的 Tauri ACL 阻塞：构建时为 19 个应用 command 生成 permission manifest，运行时只给 `main` 窗口和本次 `http://127.0.0.1:<random-port>/*` 授权，拒绝 `localhost`、隐式端口和远端 origin。新 `.app` 的真实 React WebView 已成功调用 `runtime_get_status`、`provider_config_status`、`mic_adapter_prepare` 并通过 Rust command 写出 IPC evidence；app/backend/端口全部回收。
@@ -48,7 +74,7 @@
 - V2 已增加首次 snapshot 中性加载态、复盘返回会议列表/popstate 同步，并修复 `_dedupe_strings` 只返回第一个原因的问题。当前尚未把“用户在真实打包页面点击开始录音 -> 真实 mic -> relay -> UI 建议/修正 -> 结束复盘”压成同一次自动化证据，不能把独立通过的 IPC prepare、native helper 和 backend AI smoke 拼接成 UI E2E。
 - DEC-405 修复 V2 开始会议失败的一致性缺陷：新 meeting 创建成功但麦克风/native helper 启动失败时，前端先调用 V2 delete 完成 tombstone/资产回滚，再返回列表；create 本身失败不误删，已存在会议启动失败不删除既有资产。当前 clean browser failure-path 复测为历史 0 行、API meeting 列表为空、console warn/error 0；frontend 全量 `55 passed`。该项不替代 packaged 真实麦克风 UI 证据。
 - DEC-406 已为当前提交补齐隔离 Rust/Tauri 工具链、runtime bundle、`.app`、packaged IPC、supervisor 和 local AI 主链证据。当前 `.app` 可启动 bundled backend/FunASR，local AI smoke 的 transcript/suggestion/correction/recording/review jobs 全部闭合；该证据不等于 UI 点击证据，Mac 锁屏仍是唯一未执行的同场桌面门禁。
-- 新 `.app` 的 UI 点击运行已经准备并启动，但 macOS 自动化接口返回 Mac locked；测试 app/backend/local provider 已全部清理。下一次只在用户解锁后继续该单一门禁，不重复 runtime、provider 或 ASR 基础横评。
+- Mac 已解锁并完成 r11/r12 真实 native mic、文字、结束和回放证据；当前未完成原因已收窄为最新源码尚未与固定 app identity、真实 `codexai.club/gpt-5.5` 压成同一场会议。下一次只继续该单一门禁，不重复 runtime、provider 或 ASR 基础横评。
 - `/workbench` 已切换为 React/TypeScript V2 权威入口；`/workbench-v2` 是别名，`/workbench-legacy` 只保留旧页面。
 - 正式 correction/suggestion 由后台 durable executor 在 final 同一 SQLite 事务入队；浏览器不触发付费 AI。建议通过 SSE 流式展示草稿并使用 commit barrier，只有显式 `VITE_EVENT_TRANSPORT=poll` 才回退轮询。
 - Phase 1A 远程幂等提示已接入：suggestion durable job 与 correction preview 的稳定 key 先做 SHA-256 脱敏，再作为 `Idempotency-Key` 发送；stream -> non-stream fallback、429/5xx retry 和 backend lease 恢复沿用同一值。原始 meeting/job ID 不进入 header；本地提交仍由 SQLite CAS 保证，中转站不支持该 header 时仍只能提供 at-least-once provider 执行。
@@ -70,6 +96,11 @@
 - DEC-401 已关闭上述 clean packaged runtime 执行门禁。首次真实运行发现 relocation probe 仍硬编码 `30s`，而 backend resident prewarm 和 Rust supervisor 预算为 `45/60s`；将 probe 统一为 `60s` 后，2.106 GB runtime 在仓库外启动，backend `44.731s` 就绪、FunASR `5.232s` ready，外部 symlink 为 0。当前 Tauri `.app` 已包含 backend Python 3.13、FunASR Python 3.11、依赖和 online Paraformer 模型；packaged smoke 通过 bootstrap/HMAC/resident-ready，将 14.8425 秒受控中文技术会议 WAV 送入 app backend WebSocket，得到 1 个非空 `funasr_realtime` final，并验证 app/backend/端口全部回收。该证据关闭 packaged runtime 工程门禁，不关闭 native mic、ASR 中文质量、Keychain、供应链、签名或 clean Mac。
 - DEC-402 已把 native microphone 连接进 Tauri 主链：Swift AVAudioEngine helper、Rust supervisor、authenticated backend WebSocket、pause/resume/stop lifecycle 和 V2 native/browser adaptive selection 均已实现并通过 TDD；最新 relocatable runtime、Tauri resource app 和 synthetic packaged ASR smoke 均通过。真实麦克风 UI 尚未通过，因为本轮 Computer Use 遇到 macOS 锁屏，未能触发权限和真实音频；因此当前状态是 `M3 implementation ready / real mic evidence pending`，不是 Mac Internal Alpha 功能出口完成。
 - DEC-403 已完成包内 native helper 的真实麦克风执行门禁。首次 30 秒运行暴露 CoreAudio 回调包被 backend 固定按 300ms 计时，产生约 3x timeline 漂移；Swift helper 改为固定 4,800-sample 帧并在 END 前排空尾帧后，受控中文音频经扬声器进入真实麦克风，得到 2 个技术内容 final、state/scheduler/suggestion candidate/LLM request draft、30.382 秒/7 chunks/972,278B WAV，app/backend/端口全部清理。该证据只关闭 real packaged helper execution，不关闭 Tauri IPC/UI、中文语义质量或 packaged relay 正式建议同场。
+- DEC-412 已完成 V2 portable export 的最小主流程：`GET /v2/meetings/{id}/export?format=markdown|json` 使用显式内容白名单；Markdown/JSON 复用同一 `_v2_export_payload()`，完整文字由 V2 transcript cursor 按 `transcript_seq` 读取 canonical `normalized_text`。前端复盘页已有两种下载入口；导出不新增 provider 调用或费用，也不改变 packaged native mic 和公开发布状态。
+- DEC-413 已把实时五类事实接入 V2 durable snapshot/event 和 React “会议事实”投影，逐条 evidence、candidate/confirmed/dismissed 持久化、evidence 回跳和 canonical entity PATCH 写回已有 focused 覆盖。真实 packaged UI 同场确认/忽略仍是外部验收项，不再是 URL/HTTP method 代码缺口。
+- DEC-414 已把会前预检、设备选择、录音告知、会议级热词和 Provider 成本/隐私边界接入产品入口；默认仍为本地 ASR、远程 ASR 关闭、原始音频不上传。带自定义热词时使用独立本地 FunASR sidecar，system audio/mixed 继续保持未实现边界。
+- DEC-415 已收口录音资产归属：Tauri 不再维护第二份 chunk manifest 或删除命令，后端 V2 统一持久化、组装、回放和删除；`tests/test_desktop_audio_owner_contract.py` 与当前 Rust/scaffold 聚焦回归通过。
+- DEC-417 已修复 packaged app 异常/竞态退出后的 FunASR 模型进程泄漏。r9 supervisor 与 AI 主链均记录 worker PID，并证明 app/backend/worker/端口自然退出、`forced_cleanup=false`；smoke 若只能强制清理则必须判 No-Go。
 - 本次 ASR 为 packaged 本地 `funasr_realtime`、`provider_mode=real`、`is_mock=false`；LLM 为远程 OpenAI-compatible `gpt-5.5`、`is_mock=false`，5 次调用、3598 tokens；未启用远程 ASR。runtime exception、console error、network failure 和 HTTP 5xx 均为 0。
 - Phase 1C 的 20 个中文技术会议核心触发点已使用生产同源提示词和真实 `gpt-5.5` 完成两阶段价值门禁：先生成并记录 evidence/TTFT/usage，再逐条人工语义审查。结果为 provider success `20/20`、evidence correct `20/20`、可直接追问且总调用耗时 <=20s `20/20`、重复 `0`、无 evidence `0`、unsupported claim `0`；总用量 4665 tokens。证据：`artifacts/tmp/product_value_gate/phase1c-gpt55-20260716-r1/report.json`。
 - 录音采用默认 5 秒 chunk journal、独立 capture lease 和后台 WAV export job。每个 chunk 在触碰文件系统前先做 lease fence；fsync 后、SQLite commit 前崩溃产生的磁盘块会先由 journal 校验并补齐 SQLite，再恢复过期 capture；对账写入同时校验扫描时的 `capture_generation + expired lease`，续租或 resume 后的陈旧扫描不能越权补块。相同 epoch 的重复捕获使用递增 `capture_generation`，迟到 seal 只能同 journal 幂等返回，不能把 `ready/exporting/failed` 降级。WebSocket `END` 只封存 journal，不同步扫描整场录音。独立子进程真实 `SIGKILL` 证据仍为 `RPO=4000ms`、`RTO=15ms`，两个 durable AI job 同时恢复成功：`artifacts/tmp/v2_recovery_process/2026-07-15-recording-lease/report.json`。
@@ -1734,3 +1765,102 @@ clean checkout 的验证结果：后端 `901 passed, 1 warning`，前端 `40 pas
 结果为 `dirty_tracked_count=0`、`untracked_source_count=0`、`tracked_sensitive_count=0`，DMG path/hash 一致，但总 verdict 仍为 `no_go`。剩余 blocker 只包括旧 evidence 非 release Go、4 个 FunASR 模型的不可变 revision/制品清单/再分发状态，以及 FFmpeg bundle 的 revision/hash/再分发状态。
 
 因此当前真实里程碑是：Phase 1A-1C 与 Phase 2 Browser Vertical/M2 功能出口已完成，Phase 0 clean source baseline 已完成；可公开发布的 Mac 客户端仍未完成。下一主线转入 Phase 3 native mic/system audio、bundle 内 runtime、Keychain 和 clean Mac E2E，不再重复已通过的 Browser Vertical 测评。
+
+## 2026-07-17 当前 packaged native UI 候选
+
+当前主线候选已补齐：native helper 异步权限等待、helper stderr 错误回传、`partial/final` 白名单事件队列、React 300ms 实时投影、helper 运行态监控，以及“只有服务端 ended 才进入复盘”的状态一致性。
+
+权威候选制品：
+
+- runtime：`artifacts/tmp/macos_bundled_runtime/phase0-2-mainline-runtime-20260717-r1/evidence.json`
+- app：`artifacts/tmp/tauri_runtime_package/phase0-2-mainline-tauri-20260717-r1/evidence.json`
+- app binary SHA-256：`a31a20eb6451d9993d1dc5f788c3902f3f28b58c268246e5cd777bdb5ad4ee91`
+
+当前代码验证：frontend `57 passed`；Rust `29 passed, 1 ignored`；typecheck、ESLint、production build、cargo fmt 通过。
+
+当前唯一 Phase 0-2 UI 主链门禁：Mac 解锁后，从该 `.app` 的 React 页面完成一次“开始会议 -> 允许麦克风 -> partial/final -> AI 建议/修正 -> 结束 -> 录音/文字/纪要/方案/历史”同场验证。锁屏期间的 packaged IPC probe 严格为 No-Go，不作为成功证据。公开发布仍受稳定签名/TCC、公证、clean Mac 和模型再分发授权约束。
+
+r2 覆盖更新：真实旧包测试发现 app 终止后 helper 可能成为孤儿进程，现已增加父进程存活监控和 WebSocket 断开 fail-closed。后续 UI 验证必须使用以下 r2 制品，r1 不再是最终候选：
+
+- runtime：`artifacts/tmp/macos_bundled_runtime/phase0-2-mainline-r2-runtime-20260717/evidence.json`
+- app：`artifacts/tmp/tauri_runtime_package/phase0-2-mainline-r2-tauri-20260717/evidence.json`
+- native helper SHA-256：`fc70ae580c7d70e46bf7493861472110935e96816d471cd08afdebe95107e423`
+
+r2 packaged 回归：
+
+- supervisor：`artifacts/tmp/packaged_runtime_supervisor_smoke/phase0-2-mainline-r2-supervisor-20260717/evidence.json`
+- local AI mainline：`artifacts/tmp/packaged_ai_mainline_smoke/phase0-2-mainline-r2-ai-20260717/evidence.json`
+- 结果：非空 partial/final、V2 segments、建议、修正、录音/WAV、minutes/approach/index 和进程清理全部通过；remote/paid/private-audio flags 全为 0。
+
+## 2026-07-17 r5 凭据启动与会后数据修复
+
+最新内部候选更新为 r5：
+
+- runtime：`artifacts/tmp/macos_bundled_runtime/phase0-2-mainline-r5-runtime-20260717/evidence.json`
+- app：`artifacts/tmp/tauri_runtime_package/phase0-2-mainline-r5-tauri-20260717/evidence.json`
+- UI/权限/复盘：`artifacts/tmp/packaged_ui_mainline/phase0-2-mainline-r5-ui-20260717/evidence.json`
+- app binary SHA-256：`258b6e78103fe4d0e06c11cc711a575e54e99723b2453399d2ff24ae2f927f4e`
+
+r5 关闭了两个主流程缺陷：macOS 启动不再自动读取 Keychain 或启动 `SecurityAgent`，已保存配置显示“AI 待连接”，只有显式“连接并测试”才访问凭据；会后 minutes 同时持久化结构化 JSON 和 Markdown，“决策与待办”展示决策、行动项、负责人/截止、风险和未闭环问题，并兼容历史 Markdown-only 会议。
+
+当前验证：frontend `59 passed`；backend minutes/V2 integration `35 passed`；Rust `30 passed, 1 ignored`；lint、production build、cargo fmt、diff check 通过。r5 启动 15 秒 `SecurityAgent` 不存在，当前 provider 元数据为 `0600`，未读取 Mac 登录密码或 Keychain secret。既有会议历史重开、4 段文字、AI 校正、纪要、方案、决策/待办和 54 秒录音继续可见，录音 Range 为 `206 audio/wav`。
+
+严格边界不变：r5 不是公开发行包，也不是新的 packaged native microphone 同场成功证据。真实 packaged mic 仍需稳定 Apple 签名身份后重跑；Developer ID、notary/staple、clean Mac、Windows 真机和模型/依赖再分发授权仍为公开发布 blocker。
+
+## 2026-07-17 r6 业务主链、凭据并发与整包签名收口
+
+r6 取代 r5 成为最新内部候选：
+
+- runtime：`artifacts/tmp/macos_bundled_runtime/phase0-2-mainline-r6-runtime-20260717/evidence.json`
+- app：`artifacts/tmp/tauri_runtime_package/phase0-2-mainline-r6-tauri-20260717/evidence.json`
+- packaged local AI：`artifacts/tmp/packaged_ai_mainline_smoke/phase0-2-mainline-r6-signed-ai-20260717/evidence.json`
+- 汇总：`artifacts/tmp/packaged_ui_mainline/phase0-2-mainline-r6-mainline-20260717/evidence.json`
+- 签名后 app binary SHA-256：`e242b734c80387526f18c9b003d844abec078b1b5e789ca0c37c077ca2f51981`
+
+本轮只处理主流程缺陷，没有新增 ASR/provider 横评：
+
+1. 所有桌面平台启动均改为显式连接；即使 `MEETING_COPILOT_AUTO_SYNC_PROVIDER=1`，r6 启动 15 秒后也没有 `SecurityAgent`。`sync/save/clear` 串行化，保存和清除改为异步 command。
+2. minutes JSON 经过 bounded schema 规范化，一次调用同时生成 Markdown 与结构化制品；独立 JSON endpoint 也同步覆盖两者，避免分叉和重复计费语义。
+3. 会后页始终保留用户收藏建议，区分生成中/失败/质量暂停，去重待确认问题，兼容历史 `已确认重点`，忽略代码块和嵌套列表。
+4. 旧 packager 只留下 linker ad-hoc 标记，整包 deep/strict 验证会失败；新 packager 自动对 `.app` 深度 ad-hoc 签名并 fail-closed 验证。r6 `codesign --verify --deep --strict` 已通过。
+
+验证：frontend `65 passed`；backend minutes/G5/V2 `41 passed`；Rust `32 passed, 1 ignored`；packager `7 passed`；lint/build/Ruff/compile/fmt/diff check 全部通过。签名后的 packaged local AI 主链再次通过：本地 FunASR final、canonical transcript、流式建议、修正、30 秒录音/WAV、minutes/approach/index 和进程清理均成功，远端调用、费用和用户私有音频读取均为 0。
+
+当前 Mac 再次锁屏，所以 r6 没有伪造最新窗口截图，`counts_as_latest_visual_ui_evidence=false`；r5 的页面截图仍是上一版视觉证据。剩余的同场 packaged native microphone UI 门禁、Developer ID、公证、Gatekeeper、clean Mac、Windows 真机和再分发授权继续保持未完成。r6 是严格验证过的 Mac 内部业务候选，不是公开发布包。
+
+## 2026-07-18 r2 真实远端 AI 同场主链完成
+
+当前内部权威候选更新为：
+
+- runtime：`artifacts/tmp/local-alpha/macos_bundled_runtime/phase0-2-current-20260718-r2/MeetingCopilotRuntime.bundle`
+- app：`artifacts/tmp/local-alpha/tauri_runtime_package/phase0-2-current-20260718-r2/Meeting Copilot.app`
+- 脱敏证据：`artifacts/tmp/local-alpha/packaged_ui_mainline/phase0-2-current-20260718-r2/evidence.json`
+- app binary SHA-256：`f396522c6f9f0d69614d0f9816c0e9e0ec72e6db66b2a73ef13b4042cc9d670a`
+
+该候选在同一场真实 packaged 客户端会议中完成了：native macOS 麦克风、本地中文 FunASR、实时追加文字、远端大模型修正、流式 AI 建议、录音分片与 WAV、单一“结束并整理”、结构化纪要、方案、索引、决策/待办/风险、历史重开和真实播放。测试信号为本机中文 TTS 经扬声器外放后由真实麦克风采集，不是向后端注入 mock transcript；原始音频未上传，远程 ASR 保持关闭。
+
+真实远端 Provider 使用 `openai_compatible_gateway + gpt-5.6-sol + chat_completions`。Responses 路径的历史探测观察到 401；固定为 Chat Completions 后真实 probe 返回 200，同场共执行 7 次远端调用、3547 tokens。该观测说明当前 relay contract 应选择 Chat Completions，但不能单独证明 Responses 协议本身导致 401。当前 `provider-config.json` 只保存非敏感 metadata；Key 仍在系统凭据库。应用重启后若未执行显式同步，后端状态是 `not_configured`，不是远端 401；同时运行多个 `.app` 会形成多个独立 backend runtime，只有收到同步命令的实例可使用 AI，因此验收只允许一个固定候选实例。
+
+性能实测：首个 final 在开始后 34.508 秒，首条建议在首个 final 后约 19.7 秒提交；录音结束后约 53 秒生成方案、约 53 秒生成纪要。三次修正调用在会中执行，但唯一改变文本的 revision 在结束后约 4.1 秒才可见，因此不能宣称每次修正都在录音期可见。`asr_correct.py` 的 bounded correction 输出 token cap 是明确的后续性能项，不再为此启动新 provider bake-off。
+
+WebKit 对有效 `206 Range` WAV 未产生 metadata 的真实缺陷已修复：播放器优先保持 Range；3.5 秒仍无 metadata 或直接加载失败时，改用同源认证 fetch 生成临时 Blob URL，卸载时回收。r2 页面已显示 `00:36 / 02:24`，播放时间推进和暂停通过。
+
+r2 证据保存后关闭 app，约 2 秒内其 backend、resident FunASR 和随机端口全部自然退出，`forced_cleanup=false`。`8767-8770` 历史开发服务不属于本候选，也未被混入该生命周期结论。
+
+当前结论：**Phase 0-2 内部产品主链 Go**。这不等于公开发布 Go；Developer ID、hardened runtime、notary/staple、Gatekeeper/clean Mac、Windows 真机和模型/依赖再分发批准仍保持未完成。
+
+## 2026-07-18 Phase 0-2 后续产品缺口讨论入口
+
+后续产品能力、平台差异和发布缺口已集中记录在：
+
+`docs/post-phase0-2-product-gap-and-roadmap-discussion-2026-07-18.md`
+
+该文档当前状态为 `Discussion Draft / 未确认 / 未授权实施`。它明确区分 Phase 0-2 已完成的 Mac 内部主链和后续未完成项，包含 system audio、mixed 双轨、多人说话人、自然中文质量、AI 延迟、长会议、诊断、Provider 启动体验、Mac 公开发布、Windows、Web 定位和数据治理。用户后续提出的问题继续追加到该讨论稿；在讨论确认前不据此启动实现，也不重新开启 ASR/provider 横评。
+
+## 2026-07-20 Web Provider 配置与共享主链复核
+
+- Web 与桌面共用 `ProviderSettingsControl` 和 OpenAI-compatible Provider 合同；本轮验证了 Web `PUT /providers/config` 保存到受控本地目录后，runtime 能实际驱动 LLM lane，而不是只更新页面状态。
+- 可见 Chrome + scripted ASR + loopback fake gateway 主链报告：`artifacts/tmp/web-provider-scripted-mainline-20260720-r2/report.json`，结果 `passed_non_acceptance`。实时文字、单段修正、实时建议/追问、录音、minutes/approach/index、历史回开和浏览器诊断均通过；该报告不计真实 ASR、真实 relay 或发布 Go。
+- 首次使用 Chrome fake audio file 的失败证据保留在 `artifacts/tmp/web-provider-fake-mainline-20260720/error-report.json`：输入约 `-43 dB` 近静音，FunASR 无 final，业务层正确没有创建 correction job。后续不得把这条路径当作稳定脚本 ASR，也不得通过 mock 文本掩盖无声输入。
+- 本轮修正了非验收 evidence contract：loopback gateway 本身足以证明 local fake；远端/未知 Provider 仍必须按真实门禁处理。Node focused contract `7 passed`，backend full `1250 passed, 1 skipped, 1 warning`，frontend `210 passed`，typecheck/lint/build 通过。
+- 测试结束后 `8795` 与临时 `8782` 均已清除 Provider 配置，当前页面仍可在“配置 AI”中由用户显式保存真实 relay；不新增远程 ASR，不上传原始音频，真实 Provider 调用可能产生中转站费用。

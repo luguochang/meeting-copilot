@@ -2,10 +2,12 @@ import { createServer } from "node:http";
 
 const port = Number(process.env.MEETING_COPILOT_FAKE_LLM_PORT || "18776");
 const correctionMode = process.env.MEETING_COPILOT_FAKE_LLM_CORRECTION_MODE || "unchanged";
+const acceptanceScope = "non_acceptance_fake_audio_fake_llm_mainline";
 
 function correctTechnicalTerms(value) {
   return String(value || "")
     .replace(/tracout/gi, "checkout")
+    .replace(/cheout\s+outservice/gi, "checkout-service")
     .replace(/check\s+(?:acout|kout|out)(?:\s+out)?\s+service/gi, "checkout service")
     .replace(/check\s+kout/gi, "checkout")
     .replace(/acout/gi, "account")
@@ -27,6 +29,55 @@ function correctionSource(user) {
   return user;
 }
 
+function realtimeIntelligenceResponse(user) {
+  const payload = JSON.parse(user || "{}");
+  const paragraph = Array.isArray(payload.new_paragraphs) ? payload.new_paragraphs[0] : null;
+  if (!paragraph?.id || !paragraph?.text) {
+    return {
+      paragraph_revisions: [],
+      topic_update: null,
+      state_changes: [],
+      follow_up: null,
+    };
+  }
+  const original = String(paragraph.text);
+  const corrected = correctTechnicalTerms(original);
+  return {
+    paragraph_revisions: corrected === original ? [] : [{
+      target_id: String(paragraph.id),
+      expected_revision: Number(paragraph.revision || 1),
+      corrected_text: corrected,
+      change_count: 1,
+    }],
+    topic_update: {
+      operation: "update",
+      title: "灰度发布与回滚评审",
+      summary: "正在确认灰度比例、性能阈值和回滚责任。",
+      evidence_segment_ids: [String(paragraph.id)],
+      evidence_quote: original,
+    },
+    state_changes: [{
+      type: "decision",
+      operation: "add",
+      item_id: `decision:${String(paragraph.id)}`,
+      content: "先进行小比例灰度验证，异常时立即回滚",
+      owner: null,
+      deadline: null,
+      status: "candidate",
+      evidence_segment_ids: [String(paragraph.id)],
+      evidence_quote: original,
+      confidence: 0.94,
+    }],
+    follow_up: {
+      question: "建议确认回滚负责人和监控 owner。",
+      reason: "会议原话提出了回滚与监控责任，但尚未给出明确人选。",
+      evidence_segment_ids: [String(paragraph.id)],
+      evidence_quote: original,
+      urgency: "high",
+    },
+  };
+}
+
 const server = createServer(async (req, res) => {
   if (req.method !== "POST" || req.url !== "/v1/chat/completions") {
     res.writeHead(404, { "Content-Type": "application/json" });
@@ -39,7 +90,9 @@ const server = createServer(async (req, res) => {
   const system = body.messages?.[0]?.content || "";
   const user = body.messages?.[1]?.content || "";
   let content;
-  if (system.includes("ASR 转写修正器")) {
+  if (system.includes("中文会议实时理解引擎")) {
+    content = JSON.stringify(realtimeIntelligenceResponse(user));
+  } else if (system.includes("ASR 转写修正器")) {
     content = correctionMode === "rewrite_technical_terms" ? correctTechnicalTerms(user) : user;
   } else if (system.includes("中文技术会议实时副驾驶")) {
     content = "建议确认灰度阈值、回滚负责人和异常时的执行步骤？";
@@ -49,7 +102,7 @@ const server = createServer(async (req, res) => {
     ]);
   } else if (system.includes("纪要")) {
     content = JSON.stringify({
-      background: "真实麦克风自测发布评审",
+      background: "非验收 scripted audio 发布评审",
       decisions: ["先灰度 5%"],
       action_items: [{ item: "确认缓存窗口、延迟监控、回滚负责人和自动化测试", owner: "待确认", deadline: "上线前" }],
       risks: ["P99 延迟、错误率和回滚负责人未进入门禁会导致发布风险"],
@@ -60,7 +113,7 @@ const server = createServer(async (req, res) => {
     const response = {
       suggestion_text: "建议明确灰度比例、P99 阈值、回滚负责人、监控 owner 和自动化测试范围。",
       confidence: 0.88,
-      trigger_reason: "真实麦克风会议讨论了发布风险",
+      trigger_reason: "非验收 scripted 会议讨论了发布风险",
     };
     if (correctionMode === "rewrite_technical_terms") {
       const original = correctionSource(user);
@@ -77,7 +130,12 @@ const server = createServer(async (req, res) => {
 });
 
 server.listen(port, "127.0.0.1", () => {
-  process.stdout.write(JSON.stringify({ status: "fake_llm_gateway_started", port }) + "\n");
+  process.stdout.write(JSON.stringify({
+    status: "fake_llm_gateway_started",
+    port,
+    acceptance_scope: acceptanceScope,
+    counts_as_real_release_go: false,
+  }) + "\n");
 });
 
 process.on("SIGTERM", () => {

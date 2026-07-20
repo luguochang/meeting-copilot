@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
 import re
 from typing import Any, Iterable
@@ -468,11 +469,19 @@ def _correction_is_safe(original: str, corrected: str) -> bool:
     return similarity >= MIN_SIMILARITY
 
 
+def correction_is_safe(original: str, corrected: str) -> bool:
+    """Return whether a non-empty correction preserves bounded meeting facts."""
+
+    return _correction_is_safe(original, corrected)
+
+
 _CHINESE_DIGITS = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
 _CHINESE_UNITS = {"十": 10, "百": 100, "千": 1_000, "万": 10_000, "亿": 100_000_000}
 _CHINESE_NUMBER_CHARS = "零〇一二两三四五六七八九十百千万亿点"
 _NUMBER_FACT_RE = re.compile(
-    rf"百分之(?P<percent_cn>[{_CHINESE_NUMBER_CHARS}]+)"
+    rf"千分之(?P<permille>[{_CHINESE_NUMBER_CHARS}\d.]+)"
+    rf"|万分之(?P<permyriad>[{_CHINESE_NUMBER_CHARS}\d.]+)"
+    rf"|百分之(?P<percent_cn>[{_CHINESE_NUMBER_CHARS}]+)"
     rf"|(?P<percent_ar>\d+(?:\.\d+)?)\s*(?:%|％|趴)"
     rf"|(?P<percent_pai>[{_CHINESE_NUMBER_CHARS}]+)趴"
     r"|(?:周|星期)(?P<weekday>[一二三四五六日天])"
@@ -505,7 +514,11 @@ def _fact_signature(text: str) -> tuple[tuple[str, ...], tuple[str, ...], tuple[
     numbers: list[str] = []
     for match in _NUMBER_FACT_RE.finditer(source):
         groups = match.groupdict()
-        if groups.get("percent_cn"):
+        if groups.get("permille"):
+            numbers.append(f"percent:{_scaled_percent(groups['permille'], divisor=10)}")
+        elif groups.get("permyriad"):
+            numbers.append(f"percent:{_scaled_percent(groups['permyriad'], divisor=100)}")
+        elif groups.get("percent_cn"):
             numbers.append(f"percent:{_canonical_number(groups['percent_cn'])}")
         elif groups.get("percent_ar"):
             numbers.append(f"percent:{_canonical_number(groups['percent_ar'])}")
@@ -549,6 +562,10 @@ def _semantic_equivalence_text(text: str) -> str:
 
     def replace_number(match: re.Match[str]) -> str:
         groups = match.groupdict()
+        if groups.get("permille"):
+            return f" MC_PERCENT_{_scaled_percent(groups['permille'], divisor=10)} "
+        if groups.get("permyriad"):
+            return f" MC_PERCENT_{_scaled_percent(groups['permyriad'], divisor=100)} "
         if groups.get("percent_cn"):
             return f" MC_PERCENT_{_canonical_number(groups['percent_cn'])} "
         if groups.get("percent_ar"):
@@ -577,6 +594,15 @@ def _canonical_number(value: str) -> str:
         decimals = "".join(str(_CHINESE_DIGITS[char]) for char in decimal_part if char in _CHINESE_DIGITS)
         return _trim_decimal(f"{integer}.{decimals or '0'}")
     return str(_chinese_integer(raw))
+
+
+def _scaled_percent(value: str, *, divisor: int) -> str:
+    canonical = _canonical_number(value)
+    try:
+        scaled = Decimal(canonical) / Decimal(divisor)
+    except (InvalidOperation, ValueError):
+        return canonical
+    return _trim_decimal(format(scaled, "f"))
 
 
 def _chinese_integer(value: str) -> int:

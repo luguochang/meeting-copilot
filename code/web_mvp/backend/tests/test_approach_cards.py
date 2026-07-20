@@ -133,7 +133,7 @@ def test_call_with_retry_succeeds_after_transient_failures(monkeypatch):
         def post_json(self, url, headers, body, timeout):
             self.calls += 1
             if self.calls < 3:
-                raise RuntimeError("503 Service unavailable")
+                raise llm_service.LlmProviderHttpError(503)
             return {"choices": [{"message": {"content": '{"suggestion_text":"ok","confidence":0.8,"trigger_reason":"x"}'}}], "usage": {"total_tokens": 5}}
 
     config = llm_service.LlmConfig(base_url="https://gw.example", api_key="sk-x", model="m1")

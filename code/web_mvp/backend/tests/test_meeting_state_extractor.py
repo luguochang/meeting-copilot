@@ -14,6 +14,8 @@ def segment(seq: int, text: str, *, normalized_text: str | None = None) -> dict[
         "transcript_seq": seq,
         "text": text,
         "normalized_text": normalized_text if normalized_text is not None else text,
+        "started_at_ms": seq * 1_000 - 900,
+        "ended_at_ms": seq * 1_000,
         "updated_at_ms": seq * 1_000,
     }
 
@@ -79,6 +81,14 @@ def test_latest_meaningful_sentence_becomes_topic_and_filler_does_not_replace_it
         "id": state["current_topic"]["id"],
         "text": "今天讨论订单服务从单库迁移到分片架构。",
         "status": "active",
+        "confidence": 0.8,
+        "evidence": {
+            "segment_id": "segment-1",
+            "transcript_seq": 1,
+            "start_ms": 100,
+            "end_ms": 1_000,
+            "quote": "今天讨论订单服务从单库迁移到分片架构。",
+        },
         "evidence_segment_ids": ["segment-1"],
         "updated_at_ms": 1_000,
     }
@@ -137,9 +147,17 @@ def test_clear_answer_marks_matching_question_answered() -> None:
     assert state["open_questions"] == [
         {
             "id": state["open_questions"][0]["id"],
-            "text": "订单接口的超时时间是多少？",
-            "status": "answered",
-            "evidence_segment_ids": ["segment-1", "segment-2"],
+                "text": "订单接口的超时时间是多少？",
+                "status": "answered",
+                "confidence": 0.8,
+                "evidence": {
+                    "segment_id": "segment-2",
+                    "transcript_seq": 2,
+                    "start_ms": 1_100,
+                    "end_ms": 2_000,
+                    "quote": "订单接口的超时时间确定为三秒。",
+                },
+                "evidence_segment_ids": ["segment-1", "segment-2"],
             "updated_at_ms": 2_000,
         }
     ]
@@ -301,3 +319,62 @@ def test_explanatory_sentence_with_question_word_is_not_an_open_question() -> No
 
     assert state["open_questions"] == []
     assert state["current_topic"]["text"] == "这部分需要说明为什么采用本地 ASR。"
+
+
+def test_extracts_conservative_decision_action_and_risk_facts_with_canonical_evidence() -> None:
+    state = extract_meeting_state(
+        [
+            segment(
+                1,
+                "结论是采用蓝绿发布方案。由李明负责在周五前完成数据库迁移。"
+                "风险是双写数据不一致，需要先做校验。",
+            )
+        ]
+    )
+
+    decision = state["decision_candidates"][0]
+    assert decision["id"]
+    assert decision["text"] == "结论是采用蓝绿发布方案。"
+    assert decision["status"] == "candidate"
+    assert decision["confidence"] >= 0.8
+    assert decision["evidence"] == {
+        "segment_id": "segment-1",
+        "transcript_seq": 1,
+        "start_ms": 100,
+        "end_ms": 1_000,
+        "quote": "结论是采用蓝绿发布方案。",
+    }
+    assert decision["evidence_segment_ids"] == ["segment-1"]
+
+    action = state["action_items"][0]
+    assert action["text"] == "由李明负责在周五前完成数据库迁移。"
+    assert action["owner"] == "李明"
+    assert action["deadline"] == "周五"
+    assert action["evidence"]["quote"] == action["text"]
+
+    risk = state["risks"][0]
+    assert risk["text"] == "风险是双写数据不一致，需要先做校验。"
+    assert risk["mitigation"] == "先做校验"
+    assert risk["evidence"]["segment_id"] == "segment-1"
+
+
+def test_candidate_facts_are_not_invented_from_uncertain_or_generic_sentences() -> None:
+    state = extract_meeting_state(
+        [
+            segment(1, "可能采用蓝绿发布方案。") ,
+            segment(2, "大家讨论一下回滚风险。") ,
+            segment(3, "以后可以让李明看看迁移。") ,
+        ]
+    )
+
+    assert state.get("decision_candidates", []) == []
+    assert state.get("action_items", []) == []
+    assert state.get("risks", []) == []
+
+
+def test_action_item_keeps_unknown_owner_and_deadline_as_null() -> None:
+    state = extract_meeting_state([segment(1, "需要在下周完成数据库迁移。")])
+
+    action = state["action_items"][0]
+    assert action["owner"] is None
+    assert action["deadline"] == "下周"

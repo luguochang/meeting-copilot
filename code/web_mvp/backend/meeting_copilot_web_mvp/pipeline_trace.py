@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
+import logging
 import time
 from threading import RLock
 from types import MappingProxyType
@@ -21,6 +23,9 @@ PIPELINE_STAGES = (
 )
 
 _STAGE_INDEX = {stage: index for index, stage in enumerate(PIPELINE_STAGES)}
+DEFAULT_MAX_TRACES = 2_048
+
+_log = logging.getLogger(__name__)
 
 
 def _required(value: str, field: str) -> str:
@@ -78,6 +83,9 @@ class PipelineTrace:
         self._generation_id = _optional_id(generation_id, "generation_id")
         self._clock_ns = clock_ns
         self._marks: dict[str, StageMark] = {}
+        self._lane: str | None = None
+        self._retry_count = 0
+        self._cancelled = False
         self._lock = RLock()
 
     @property
@@ -93,11 +101,7 @@ class PipelineTrace:
     @property
     def stage_marks(self) -> Mapping[str, StageMark]:
         with self._lock:
-            ordered = {
-                stage: self._marks[stage]
-                for stage in PIPELINE_STAGES
-                if stage in self._marks
-            }
+            ordered = {stage: self._marks[stage] for stage in PIPELINE_STAGES if stage in self._marks}
         return MappingProxyType(ordered)
 
     def bind(
@@ -154,7 +158,14 @@ class PipelineTrace:
             existing = self._marks.get(stage)
             if existing is not None:
                 return existing
+            requested_lane = mark_attributes.get("lane")
+            if requested_lane is not None:
+                normalized_lane = _required(str(requested_lane), "lane")
+                if self._lane is not None and self._lane != normalized_lane:
+                    raise ValueError(f"lane is already bound to {self._lane!r}")
             self._validate_stage_order(stage, timestamp)
+            if requested_lane is not None:
+                self._lane = normalized_lane
             mark = StageMark(
                 stage=stage,
                 monotonic_ns=timestamp,
@@ -163,18 +174,41 @@ class PipelineTrace:
             self._marks[stage] = mark
             return mark
 
+    def record_retry(self, *, count: int = 1) -> int:
+        if isinstance(count, bool) or not isinstance(count, int):
+            raise TypeError("retry count must be an integer")
+        if count <= 0:
+            raise ValueError("retry count must be positive")
+        with self._lock:
+            self._retry_count += count
+            return self._retry_count
+
+    def record_cancelled(self) -> bool:
+        with self._lock:
+            self._cancelled = True
+            return self._cancelled
+
+    def slo_snapshot(self) -> dict[str, Any]:
+        """Return the allowlist-only state consumed by realtime SLO aggregation."""
+
+        with self._lock:
+            stages = {stage: self._marks[stage].monotonic_ns for stage in PIPELINE_STAGES if stage in self._marks}
+            lane = self._lane
+            retry_count = self._retry_count
+            cancelled = self._cancelled
+        return {
+            "trace_id": self.trace_id,
+            "meeting_id": self.meeting_id,
+            "lane": lane or "unknown",
+            "stages": stages,
+            "retry_count": retry_count,
+            "cancelled": cancelled,
+        }
+
     def _validate_stage_order(self, stage: str, timestamp: int) -> None:
         stage_index = _STAGE_INDEX[stage]
-        earlier = [
-            mark
-            for recorded_stage, mark in self._marks.items()
-            if _STAGE_INDEX[recorded_stage] < stage_index
-        ]
-        later = [
-            mark
-            for recorded_stage, mark in self._marks.items()
-            if _STAGE_INDEX[recorded_stage] > stage_index
-        ]
+        earlier = [mark for recorded_stage, mark in self._marks.items() if _STAGE_INDEX[recorded_stage] < stage_index]
+        later = [mark for recorded_stage, mark in self._marks.items() if _STAGE_INDEX[recorded_stage] > stage_index]
         if earlier and timestamp < max(mark.monotonic_ns for mark in earlier):
             raise ValueError(f"{stage} timestamp precedes the latest recorded stage")
         if later and timestamp > min(mark.monotonic_ns for mark in later):
@@ -220,11 +254,7 @@ class PipelineTrace:
         with self._lock:
             job_id = self._job_id
             generation_id = self._generation_id
-            stages = {
-                stage: self._marks[stage].to_dict()
-                for stage in PIPELINE_STAGES
-                if stage in self._marks
-            }
+            stages = {stage: self._marks[stage].to_dict() for stage in PIPELINE_STAGES if stage in self._marks}
         return {
             "trace_id": self.trace_id,
             "meeting_id": self.meeting_id,
@@ -236,11 +266,25 @@ class PipelineTrace:
 
 
 class PipelineTraceCollector:
-    """Thread-safe in-memory collector for lightweight pipeline traces."""
+    """Thread-safe bounded in-memory collector for lightweight pipeline traces."""
 
-    def __init__(self, *, clock_ns: Callable[[], int] = time.monotonic_ns) -> None:
+    def __init__(
+        self,
+        *,
+        clock_ns: Callable[[], int] = time.monotonic_ns,
+        max_traces: int = DEFAULT_MAX_TRACES,
+        on_evict: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
+        if isinstance(max_traces, bool) or not isinstance(max_traces, int):
+            raise TypeError("max_traces must be an integer")
+        if max_traces <= 0:
+            raise ValueError("max_traces must be positive")
+        if on_evict is not None and not callable(on_evict):
+            raise TypeError("on_evict must be callable")
         self._clock_ns = clock_ns
-        self._traces: dict[str, PipelineTrace] = {}
+        self._max_traces = max_traces
+        self._on_evict = on_evict
+        self._traces: OrderedDict[str, PipelineTrace] = OrderedDict()
         self._lock = RLock()
 
     def create(
@@ -257,23 +301,53 @@ class PipelineTraceCollector:
         generation_id = _optional_id(generation_id, "generation_id")
 
         with self._lock:
-            existing = self._traces.get(trace_id)
-            if existing is not None:
-                if existing.meeting_id != meeting_id:
-                    raise ValueError(
-                        f"trace_id {trace_id!r} is already associated with meeting_id "
-                        f"{existing.meeting_id!r}"
-                    )
-                return existing.bind(job_id=job_id, generation_id=generation_id)
-            trace = PipelineTrace(
+            trace, evicted = self._create_locked(
                 trace_id=trace_id,
                 meeting_id=meeting_id,
                 job_id=job_id,
                 generation_id=generation_id,
-                clock_ns=self._clock_ns,
             )
-            self._traces[trace_id] = trace
-            return trace
+        self._notify_evicted(evicted)
+        return trace
+
+    def _create_locked(
+        self,
+        *,
+        trace_id: str,
+        meeting_id: str,
+        job_id: str | None,
+        generation_id: str | None,
+    ) -> tuple[PipelineTrace, list[dict[str, Any]]]:
+        existing = self._traces.get(trace_id)
+        if existing is not None:
+            if existing.meeting_id != meeting_id:
+                raise ValueError(f"trace_id {trace_id!r} is already associated with meeting_id {existing.meeting_id!r}")
+            return existing.bind(job_id=job_id, generation_id=generation_id), []
+        trace = PipelineTrace(
+            trace_id=trace_id,
+            meeting_id=meeting_id,
+            job_id=job_id,
+            generation_id=generation_id,
+            clock_ns=self._clock_ns,
+        )
+        self._traces[trace_id] = trace
+        evicted: list[dict[str, Any]] = []
+        while len(self._traces) > self._max_traces:
+            _, oldest = self._traces.popitem(last=False)
+            evicted.append(oldest.slo_snapshot())
+        return trace, evicted
+
+    def _notify_evicted(self, snapshots: list[dict[str, Any]]) -> None:
+        if self._on_evict is None:
+            return
+        for snapshot in snapshots:
+            try:
+                self._on_evict(snapshot)
+            except Exception as exc:
+                _log.error(
+                    "Pipeline trace eviction sink failed; error_class=%s",
+                    type(exc).__name__,
+                )
 
     def get(self, trace_id: str) -> PipelineTrace:
         trace_id = _required(trace_id, "trace_id")
@@ -294,17 +368,66 @@ class PipelineTraceCollector:
         monotonic_ns: int | None = None,
         attributes: Mapping[str, Any] | None = None,
     ) -> StageMark:
-        trace = self.create(
-            trace_id=trace_id,
-            meeting_id=meeting_id,
-            job_id=job_id,
-            generation_id=generation_id,
-        )
-        return trace.mark(
-            stage,
-            monotonic_ns=monotonic_ns,
-            attributes=attributes,
-        )
+        trace_id = _required(trace_id, "trace_id")
+        meeting_id = _required(meeting_id, "meeting_id")
+        job_id = _optional_id(job_id, "job_id")
+        generation_id = _optional_id(generation_id, "generation_id")
+        evicted: list[dict[str, Any]] = []
+        try:
+            with self._lock:
+                trace, evicted = self._create_locked(
+                    trace_id=trace_id,
+                    meeting_id=meeting_id,
+                    job_id=job_id,
+                    generation_id=generation_id,
+                )
+                mark = trace.mark(
+                    stage,
+                    monotonic_ns=monotonic_ns,
+                    attributes=attributes,
+                )
+        finally:
+            self._notify_evicted(evicted)
+        return mark
+
+    def observe(
+        self,
+        trace_id: str,
+        stage: str,
+        *,
+        meeting_id: str,
+        job_id: str | None = None,
+        generation_id: str | None = None,
+        monotonic_ns: int | None = None,
+        attributes: Mapping[str, Any] | None = None,
+    ) -> StageMark | None:
+        """Record an operational metric without allowing it to stop product work."""
+
+        try:
+            return self.record(
+                trace_id,
+                stage,
+                meeting_id=meeting_id,
+                job_id=job_id,
+                generation_id=generation_id,
+                monotonic_ns=monotonic_ns,
+                attributes=attributes,
+            )
+        except (TypeError, ValueError) as exc:
+            _log.warning(
+                "Pipeline trace observation dropped; stage=%s error_class=%s",
+                stage,
+                type(exc).__name__,
+            )
+            return None
+
+    def record_retry(self, trace_id: str, *, count: int = 1) -> int:
+        with self._lock:
+            return self.get(trace_id).record_retry(count=count)
+
+    def record_cancelled(self, trace_id: str) -> bool:
+        with self._lock:
+            return self.get(trace_id).record_cancelled()
 
     def find(
         self,
@@ -333,6 +456,11 @@ class PipelineTraceCollector:
         with self._lock:
             traces = list(self._traces.values())
         return [trace.to_dict() for trace in traces]
+
+    def slo_snapshots(self) -> list[dict[str, Any]]:
+        with self._lock:
+            traces = list(self._traces.values())
+        return [trace.slo_snapshot() for trace in traces]
 
     def __len__(self) -> int:
         with self._lock:

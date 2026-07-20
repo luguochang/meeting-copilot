@@ -2,10 +2,34 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+import logging
 from threading import Lock
 
+import pytest
+
+from meeting_copilot_web_mvp import v2_pipeline
 from meeting_copilot_web_mvp.v2_persistence import V2Persistence
 from meeting_copilot_web_mvp.v2_pipeline import DurableJobExecutor
+
+
+@pytest.mark.parametrize(
+    "category",
+    ["structural", "truncated", "evidence", "stale", "semantic_safety"],
+)
+def test_intelligence_validation_error_class_keeps_only_safe_category(category):
+    error_type = type("IntelligenceResponseValidationError", (ValueError,), {})
+    error = error_type("must not be persisted")
+    error.category = category
+
+    assert v2_pipeline._handler_error_class(error) == f"intelligence_validation_{category}"
+
+
+def test_intelligence_validation_error_class_rejects_unknown_category():
+    error_type = type("IntelligenceResponseValidationError", (ValueError,), {})
+    error = error_type("must not be persisted")
+    error.category = "provider_response_text"
+
+    assert v2_pipeline._handler_error_class(error) == "IntelligenceResponseValidationError"
 
 
 class MutableClock:
@@ -140,6 +164,7 @@ def test_failed_handler_retries_after_backoff_and_then_succeeds(tmp_path):
         committed = _commit_final(persistence, final_number=1, now_ms=1_000)
         clock = MutableClock(10_000)
         suggestion_calls = 0
+        retried_job_ids: list[str] = []
 
         async def correction_handler(job: dict):
             return {"ok": job["id"]}
@@ -160,6 +185,7 @@ def test_failed_handler_retries_after_backoff_and_then_succeeds(tmp_path):
             retry_initial_ms=250,
             retry_max_ms=1_000,
             now_ms=clock,
+            retry_observer=retried_job_ids.append,
         )
         suggestion_job_id = committed["job_ids"]["suggestion"]
         try:
@@ -177,6 +203,7 @@ def test_failed_handler_retries_after_backoff_and_then_succeeds(tmp_path):
             assert succeeded["attempts"] == 2
             assert succeeded["output"] == {"suggestion_text": "重试成功"}
             assert suggestion_calls == 2
+            assert retried_job_ids == [suggestion_job_id]
         finally:
             await executor.stop()
             persistence.close()
@@ -233,6 +260,71 @@ def test_handler_can_request_a_bounded_retry_delay(tmp_path):
     asyncio.run(scenario())
 
 
+def test_deferred_provider_wait_does_not_consume_job_attempts(tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger="meeting_copilot_web_mvp.v2_pipeline")
+
+    class ProviderRuntimeNotConfiguredDeferred(RuntimeError):
+        preserve_attempt = True
+        retry_after_ms = 10_000
+
+    async def scenario() -> None:
+        persistence = V2Persistence(tmp_path / "meeting_copilot.db")
+        committed = _commit_final(persistence, final_number=1, now_ms=1_000)
+        clock = MutableClock(10_000)
+        suggestion_calls = 0
+
+        async def correction_handler(job: dict):
+            return {"ok": job["id"]}
+
+        async def suggestion_handler(job: dict):
+            nonlocal suggestion_calls
+            suggestion_calls += 1
+            if suggestion_calls <= 4:
+                raise ProviderRuntimeNotConfiguredDeferred("connect the configured provider")
+            return {"suggestion_text": "连接后生成成功", "job_id": job["id"]}
+
+        executor = DurableJobExecutor(
+            persistence,
+            correction_handler=correction_handler,
+            suggestion_handler=suggestion_handler,
+            worker_id="provider-wait-test",
+            poll_interval_ms=5,
+            retry_initial_ms=250,
+            retry_max_ms=30_000,
+            now_ms=clock,
+        )
+        suggestion_job_id = committed["job_ids"]["suggestion"]
+        try:
+            await executor.start()
+            for expected_calls in range(1, 5):
+                await _wait_until(
+                    lambda: suggestion_calls == expected_calls
+                    and persistence.get_job(suggestion_job_id)["status"] == "retry_wait"
+                )
+                waiting = persistence.get_job(suggestion_job_id)
+                assert waiting["attempts"] == 0
+                assert waiting["error_class"] == "ProviderRuntimeNotConfiguredDeferred"
+                clock.advance(10_000)
+                executor.wake("suggestion")
+
+            await _wait_until(lambda: persistence.get_job(suggestion_job_id)["status"] == "succeeded")
+            succeeded = persistence.get_job(suggestion_job_id)
+            assert succeeded["attempts"] == 1
+            assert suggestion_calls == 5
+            deferred_records = [
+                record
+                for record in caplog.records
+                if "ProviderRuntimeNotConfiguredDeferred" in record.getMessage()
+            ]
+            assert deferred_records
+            assert all(record.levelno < 30 for record in deferred_records)
+        finally:
+            await executor.stop()
+            persistence.close()
+
+    asyncio.run(scenario())
+
+
 def test_non_retryable_handler_failure_reaches_terminal_state_once(tmp_path):
     class NonRetryableProviderError(RuntimeError):
         retryable = False
@@ -266,6 +358,60 @@ def test_non_retryable_handler_failure_reaches_terminal_state_once(tmp_path):
             assert failed["error_class"] == "NonRetryableProviderError"
             await asyncio.sleep(0.03)
             assert suggestion_calls == 1
+        finally:
+            await executor.stop()
+            persistence.close()
+
+    asyncio.run(scenario())
+
+
+def test_correction_timeout_preserves_original_and_next_segment_continues(tmp_path):
+    async def scenario() -> None:
+        persistence = V2Persistence(tmp_path / "meeting_copilot.db")
+        first = _commit_final(
+            persistence,
+            final_number=1,
+            now_ms=1_000,
+            max_attempts=1,
+        )
+        second = _commit_final(
+            persistence,
+            final_number=2,
+            now_ms=2_000,
+            max_attempts=1,
+        )
+        correction_calls: list[int] = []
+
+        async def correction_handler(job: dict):
+            correction_calls.append(int(job["input_transcript_seq"]))
+            if job["id"] == first["job_ids"]["correction"]:
+                raise TimeoutError("provider timed out")
+            return {"no_revision_needed": True}
+
+        async def suggestion_handler(job: dict):
+            return {"ok": job["id"]}
+
+        executor = DurableJobExecutor(
+            persistence,
+            correction_handler=correction_handler,
+            suggestion_handler=suggestion_handler,
+            worker_id="correction-timeout-test",
+            poll_interval_ms=5,
+        )
+        try:
+            await executor.start()
+            await _wait_until(
+                lambda: persistence.get_job(first["job_ids"]["correction"])["status"] == "failed"
+                and persistence.get_job(second["job_ids"]["correction"])["status"] == "succeeded"
+            )
+
+            segments = persistence.list_transcript_segments("meeting-1", limit=10)["segments"]
+            assert correction_calls == [1, 2]
+            assert segments[0]["normalized_text"] == "第 1 段会议文本"
+            assert segments[0]["correction_status"] == "failed_preserved_original"
+            assert segments[0]["correction_error_class"] == "TimeoutError"
+            assert segments[1]["normalized_text"] == "第 2 段会议文本"
+            assert segments[1]["correction_status"] == "no_change"
         finally:
             await executor.stop()
             persistence.close()

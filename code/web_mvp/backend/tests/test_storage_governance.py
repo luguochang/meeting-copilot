@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections import namedtuple
 from io import StringIO
+import os
+import stat
 import pytest
 
 from meeting_copilot_web_mvp.logging_config import (
@@ -18,6 +20,7 @@ from meeting_copilot_web_mvp.storage_governance import (
     ManagedLogRotator,
     UnsafeManagedPathError,
     estimate_pcm16_storage_bytes,
+    harden_managed_storage_permissions,
     preflight_meeting_storage,
     scan_managed_storage,
 )
@@ -89,6 +92,32 @@ def test_scan_rejects_symlink_as_managed_root(tmp_path):
 
     with pytest.raises(UnsafeManagedPathError, match="root"):
         scan_managed_storage(linked_data)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows uses inherited per-user ACLs")
+def test_harden_managed_storage_tightens_existing_tree(tmp_path):
+    data_dir = tmp_path / "data"
+    nested = data_dir / "audio_assets" / "meeting-1"
+    nested.mkdir(parents=True)
+    database = data_dir / "meeting_copilot.db"
+    database.write_bytes(b"database")
+    audio = nested / "audio.wav"
+    audio.write_bytes(b"audio")
+    os.chmod(data_dir, 0o755)
+    os.chmod(nested, 0o755)
+    os.chmod(database, 0o644)
+    os.chmod(audio, 0o644)
+
+    report = harden_managed_storage_permissions(data_dir)
+
+    assert report == {"directory_count": 2, "file_count": 2, "already_hardened": 0}
+    assert stat.S_IMODE(data_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(nested.stat().st_mode) == 0o700
+    assert stat.S_IMODE(database.stat().st_mode) == 0o600
+    assert stat.S_IMODE(audio.stat().st_mode) == 0o600
+    second = harden_managed_storage_permissions(data_dir)
+    assert second == {"directory_count": 0, "file_count": 0, "already_hardened": 1}
+    assert stat.S_IMODE((data_dir / ".storage-permissions-v1").stat().st_mode) == 0o600
 
 
 def test_preflight_allows_meeting_and_returns_structured_capacity(tmp_path):

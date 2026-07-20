@@ -46,6 +46,22 @@ def test_bundle_command_uses_skip_jenkins_and_no_internet_enable(tmp_path):
     assert str(tmp_path / "source") in command
 
 
+def test_direct_hdiutil_command_keeps_dmg_creation_finder_free(tmp_path):
+    tool = load_tool_module()
+
+    command = tool.build_direct_hdiutil_command(
+        output_dmg=tmp_path / "Meeting Copilot.dmg",
+        source_dir=tmp_path / "source",
+        volume_name="Meeting Copilot",
+    )
+
+    assert command[:2] == ["hdiutil", "create"]
+    assert "-srcfolder" in command
+    assert "-format" in command
+    assert "UDZO" in command
+    assert "osascript" not in " ".join(command)
+
+
 def test_resolve_output_root_requires_artifacts_tmp_for_safety(tmp_path):
     tool = load_tool_module()
 

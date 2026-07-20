@@ -25746,3 +25746,1386 @@ Tauri 启动 bundled backend 后会把主 WebView 导航到随机 `http://127.0.
 - Computer Use 仍返回 Mac locked，因此尚未执行“打包页面点击开始会议 -> 系统权限 -> native mic -> 页面文字/建议/修正 -> 结束复盘”的同场操作。
 - 公开发布仍 No-Go：未完成 Developer ID、notary/staple、Gatekeeper、separate clean Mac 和模型/FFmpeg 再分发授权。
 - 运行期间 remote ASR/LLM、paid service 和用户私有音频读取均为 `0`。
+
+# DEC-407: native mic 主流程必须回传实时 ASR 事件，并以服务端结束态决定是否进入复盘
+
+时间：2026-07-17
+
+状态：Accepted / Implemented / Candidate packaged / UI same-session pending unlock
+
+## 本次真实问题
+
+当前 packaged app 点击“开始会议”时，日志出现 `fatal: microphone permission was denied`，旧 Tauri 页面最终只显示 30 秒后的 `native microphone helper readiness timed out`。这掩盖了 helper 的真实错误，也会让用户误以为是 ASR 或大模型响应慢。
+
+即使 helper 启动成功，Swift helper 收到后端 WebSocket 的 `partial/final` 事件后只写 stdout；React 只通过 V2 事件流看到已确认段落，桌面实时页面没有“正在识别”的 partial 文字。另一个状态缺陷是：本地麦克风先结束但后端返回 `asr_finalization_pending` 时，旧页面会误切到“会议复盘”。
+
+## 决策与实现
+
+1. Swift native helper 的麦克风权限请求改为 Swift concurrency continuation，不再用主线程同步 semaphore 等待权限回调，避免权限回调被自身阻塞成超时。
+2. Rust supervisor 在 helper 提前退出或 ready 超时时读取 `native-mic.stderr.log`，把具体错误回传给 `mic_adapter_start`，不再只返回泛化 timeout。
+3. Rust supervisor 将 helper stdout 做受控解析和有界队列，只允许 `asr_starting`、`asr_ready`、`partial`、`final`、`end_of_stream`、`error`、`provider_error` 进入 `mic_adapter_collect_events`。不传递音频、cookie、密钥或任意 stdout 内容。
+4. React native microphone controller 每 300ms 拉取该队列并更新 `activePartial`、ASR ready 状态和 helper 异常状态；队列上限为 128，避免长会议内存无界增长。
+5. `LiveMeetingWorkbench` 只有服务端 V2 meeting phase 为 `ended` 时才进入复盘；本地录音结束但服务端仍为 `live/ending` 时保持实时页，允许继续等待或再次结束。
+
+## TDD 与构建证据
+
+- 前端新增 native partial 投影测试，以及“服务端未 ended 不进入复盘”测试；frontend 全量为 `57 passed`，typecheck、ESLint、production build 通过。
+- Rust native mic suite 为 `29 passed, 1 ignored`；包含 helper stderr 错误传播和 partial 事件队列测试；`cargo fmt --check` 通过。
+- 当前候选 runtime bundle：`artifacts/tmp/macos_bundled_runtime/phase0-2-mainline-runtime-20260717-r1/evidence.json`；backend、FunASR、V2 dist、native helper、external symlink=0。
+- 当前候选 packaged app：`artifacts/tmp/tauri_runtime_package/phase0-2-mainline-tauri-20260717-r1/evidence.json`；`cargo-tauri build` exit 0，required packaged files missing=0，app binary SHA-256=`a31a20eb6451d9993d1dc5f788c3902f3f28b58c268246e5cd777bdb5ad4ee91`。
+- 新包的自动 IPC smoke 因 Mac 锁屏未完成 WebView probe，证据为 `artifacts/tmp/packaged_tauri_ipc_smoke/phase0-2-native-events-packaged-ipc-20260717-r1/evidence.json`，严格记为 `no_go_packaged_tauri_ipc_page_smoke`；app、backend、随机端口已回收。不得把该次失败拼接成成功。
+
+## 权限与发布边界
+
+- 当前日志的权限拒绝来自 unsigned/ad-hoc 裸 helper；helper 的 embedded `Info.plist` 存在，但不等于稳定 TCC 授权主体。
+- 真实 UI 权限验证必须在用户手动解锁后进行，并由用户在系统权限提示中允许；本轮不重置 TCC、不绕过锁屏。
+- 正式发布仍需要稳定 Developer ID 签名、nested helper/bundle 的 TCC 归属验证、`codesign --verify --deep --strict`、公证/staple、clean Mac 安装验收。当前候选包是内部验证包，不是公开发布包。
+
+# DEC-408: app 或 backend 不在时 native helper 必须自动停止采音
+
+时间：2026-07-17
+
+状态：Accepted / Implemented / Candidate packaged / Real UI rerun pending unlock
+
+## 真实问题
+
+一次旧候选包的真实麦克风测试中，测试 app 进程被终止后，native helper 被系统重新托管为 `PPID=1`，继续保留麦克风采集进程。旧 backend 已退出，helper 的 WebSocket 已断开，但 helper 只写 `websocket receive failed` 日志，不主动结束。这会造成资源泄漏，并且在异常退出场景下存在不符合用户预期的持续采音风险。
+
+## 决策与实现
+
+1. helper 启动时记录真实父进程 PID，每秒检查 `getppid()` 和 `kill(parentPID, 0)`；父进程消失或父子关系改变时，立即停止 AVAudioEngine、关闭 WebSocket 并退出。
+2. WebSocket receive failure 不再只写日志；helper 会切回主队列执行 `stop()` 并以失败状态退出，避免 backend 已不可达时继续采音。
+3. 该行为不依赖前端轮询或用户点击结束，是 native helper 自身的 fail-closed 边界。
+
+## 验证与候选制品
+
+- Swift helper 使用 `xcrun swiftc` 针对 macOS 13 arm64 编译通过。
+- r2 relocatable runtime：`artifacts/tmp/macos_bundled_runtime/phase0-2-mainline-r2-runtime-20260717/evidence.json`，native helper SHA-256=`fc70ae580c7d70e46bf7493861472110935e96816d471cd08afdebe95107e423`。
+- r2 packaged app：`artifacts/tmp/tauri_runtime_package/phase0-2-mainline-r2-tauri-20260717/evidence.json`，required packaged files missing=0。
+- 旧测试 app、旧 backend、旧 helper 和外放进程均已终止；当前无 Meeting Copilot app/helper 残留。锁屏解锁后从 r2 候选重新执行同场主流程，旧候选结果不计入 Go。
+
+# DEC-409: macOS 启动禁止自动弹出 Keychain，凭据读取改为显式连接
+
+时间：2026-07-17
+
+状态：Accepted / Implemented / Packaged r6 verified
+
+## 问题与结论
+
+用户不可能也不应把 Mac 登录密码交给应用或自动化。r4 实测证明：仅依赖 ad-hoc `codesign` 的 Team ID 判断仍会启动 `SecurityAgent`；显式设置 `MEETING_COPILOT_AUTO_SYNC_PROVIDER=0` 后，同一包不再启动 `SecurityAgent`。因此当前 macOS 内部候选不得在启动阶段自动读取 Keychain。
+
+## 决策与实现
+
+1. `provider_config_status` 只读取 `provider-config.json` 元数据，不调用 `CredentialStore::get()`；单元测试使用拒绝凭据读取的 store 锁定该行为。
+2. macOS、Windows 和其他桌面平台统一采用显式连接；旧 `MEETING_COPILOT_AUTO_SYNC_PROVIDER=1/true/yes/on` 不能恢复启动自动同步。未来只有在稳定签名、系统凭据库和 clean-machine 回归通过后，才允许重新评审自动恢复。
+3. 新增异步 `provider_config_sync`。只有用户主动点击“连接并测试”才允许读取 Keychain；未同步的已保存配置显示“AI 待连接”，不伪装成已连接。
+4. `provider_config_save/clear` 仍属于用户显式动作，并通过 `spawn_blocking` 异步执行，避免凭据库或 backend I/O 阻塞 UI；`sync/save/clear` 使用同一操作锁，禁止并发操作把旧凭据重新注入 backend。
+5. 禁止提取、读取、记录或保存用户 Mac 登录密码；不得用放宽 Keychain ACL、保存明文密码或反复要求用户盯屏作为开发方案。
+
+## r6 证据
+
+- 显式设置旧值 `MEETING_COPILOT_AUTO_SYNC_PROVIDER=1` 启动签名后的 r6，15 秒后 `SecurityAgent` 仍不存在；bundled backend 和 FunASR 正常运行。
+- r6 没有自动读取 Keychain、没有远端 ASR/LLM、没有新增费用，也没有读取或保存 Mac 登录密码。
+- Rust `32 passed, 1 ignored`；frontend `65 passed`；backend minutes/V2 integration `41 passed`；typecheck、ESLint、production build、Ruff、Python compile、cargo fmt、diff check 通过。
+- 证据：`artifacts/tmp/packaged_ui_mainline/phase0-2-mainline-r6-mainline-20260717/evidence.json`。
+
+## 边界
+
+r6 是本地 ad-hoc 深度签名的内部候选，不是公开发行包。自动恢复策略仍需 Developer ID、稳定 Team ID、notary/staple 和 clean-machine 验证；在此之前以显式“连接并测试”为唯一桌面凭据读取入口。
+
+# DEC-410: 会后任务必须同时持久化结构化纪要，决策页兼容旧 Markdown 制品
+
+时间：2026-07-17
+
+状态：Accepted / Implemented / Packaged r6 business mainline Go
+
+## 根因
+
+会后 LLM 已返回 `decisions/action_items/risks/open_questions` JSON，但旧 durable minutes handler 调用 `build_minutes()` 后只保留 Markdown，并以 `structured=None` 写入 V2。结果是“复盘”页有纪要，“决策与待办”却只读取用户手动保留的会中建议，真实决策和行动项显示为空。
+
+## 决策与实现
+
+1. 新增 `build_minutes_artifact()`，一次模型调用同时返回 Markdown、结构化 JSON、usage 和 degraded 状态，避免重复调用和重复计费。
+2. enabled minutes response 同时持久化 `minutes_md` 与 `minutes_json`；V2 durable job 把结构化内容写入 `minutes.structured_json`。
+3. “决策与待办”直接展示已确认决策、行动项、负责人、截止时间、风险和未闭环问题；用户明确保留的会中建议始终保留独立入口，不再因结构化纪要存在而消失。
+4. 旧会议只有 Markdown 时，通过受控标题和顶层列表解析恢复四类内容；支持历史 `已确认重点`，忽略 fenced code 和嵌套列表，旧 `owner/deadline` 转换为中文“负责人/截止”。
+5. 合法 JSON 仍必须经过 bounded schema 规范化；错误字段类型、空制品和多行 Markdown 注入统一降级，不得把失败保存成成功空纪要。结构化空数组具有权威语义，模型纪要问题与实时问题按规范化文本去重。
+
+## 验证
+
+- backend：结构化 minutes 单调用、schema 降级、endpoint response、durable V2 snapshot 持久化均有测试，minutes/G5/V2 integration `41 passed`。
+- frontend：结构化纪要、保留建议、任务状态、问题去重和 Markdown-only 旧会议均有回归，frontend `65 passed`。
+- r5 重新打开既有 4 段会议后，页面可见“先灰度 5%”、行动项、负责人/截止、P99 风险和监控 owner 未闭环问题；录音 Range 返回 `206`，为 16 kHz/16-bit/mono WAV。
+- 证据：`artifacts/tmp/packaged_ui_mainline/phase0-2-mainline-r5-ui-20260717/02-review-actions.png`。
+
+# DEC-411: 内部 `.app` 必须完成整包 ad-hoc 签名并通过 deep/strict 验证
+
+时间：2026-07-17
+
+状态：Accepted / Implemented / Packaged r6 verified / Public release No-Go
+
+## 根因
+
+`cargo-tauri build --no-sign` 生成的主 Mach-O 带 linker ad-hoc 标记，但复制 2GB runtime resource 后，旧打包器没有重新封装整个 app。真实执行 `codesign --verify --deep --strict` 返回 `code has no resources but signature indicates they must be present`。因此“能启动”和“资源完整”不能替代整包签名验证。
+
+## 决策与实现
+
+1. `tools/package_tauri_runtime_app.py` 在复制 `.app` 和验证 runtime inventory 后，执行 `codesign --force --deep --sign -`，随后必须执行 `codesign --verify --deep --strict`。
+2. 任一步失败都直接终止打包，不生成 Go evidence；签名和验证命令、退出码写入 `evidence.json`。
+3. app binary SHA-256 必须在签名后计算，避免 evidence 指向签名前二进制。
+4. 本地 ad-hoc 仅用于内部运行和资源封装验证，不得替代 Developer ID、hardened runtime、notary/staple、Gatekeeper 或 clean Mac 发布验收。
+
+## TDD 与真实证据
+
+- packager 单元测试 `7 passed`，覆盖签名顺序、deep/strict 参数和验证失败 fail-closed；Ruff 通过。
+- r6 package evidence 的 `local_signing.deep_strict_verified=true`，签名后 app binary SHA-256=`e242b734c80387526f18c9b003d844abec078b1b5e789ca0c37c077ca2f51981`。
+- 签名后的同一 app 重新跑 packaged local AI 主链：FunASR final、2 段 canonical transcript、1 条流式建议、1 次修正、6 个录音 chunk/30 秒 WAV、minutes/approach/index 全部成功，app/backend/端口全部回收。
+- 证据：`artifacts/tmp/tauri_runtime_package/phase0-2-mainline-r6-tauri-20260717/evidence.json`、`artifacts/tmp/packaged_ai_mainline_smoke/phase0-2-mainline-r6-signed-ai-20260717/evidence.json`。
+
+# DEC-412: V2 Markdown/JSON 导出必须使用内容白名单和同一 canonical transcript
+
+时间：2026-07-17
+
+状态：Accepted / Implemented / Focused export Go / Public release unchanged
+
+## 背景
+
+V2 会议已经有独立的 canonical transcript、结构化纪要、建议、方案和录音状态，但导出如果直接序列化 session snapshot、legacy event 或运行时配置，容易把 partial、内部调度字段、请求上下文或凭据带出工作区。Markdown 和 JSON 也不能各自选择一套文字来源，否则用户下载的内容会与页面复盘不一致。
+
+## 决策与实现
+
+1. V2 只提供 `GET /v2/meetings/{meeting_id}/export?format=markdown|json`。格式由 query 参数明确选择，未知会议返回 `404`，不接受任意文件路径或任意对象序列化。
+2. 导出 payload 使用显式 allowlist：会议基本元数据、完整 V2 transcript、当前议题、未闭环问题、decision/action/risk 事实、已提交建议及其证据段引用、minutes、approach cards、review job 状态和录音摘要。当前实现不导出 partial、内部事件全文、LLM request/response body、prompt、raw audio bytes/path、provider raw config、API key、Authorization、base URL 或其他 secret。
+3. Markdown 和 JSON 都由同一个 `_v2_export_payload()` 生成。完整文字由 V2 transcript cursor 读取，按 `transcript_seq` 排序，并以每个段落的 `normalized_text` 作为 canonical 导出文字；Markdown 只是该 payload 的可读投影，不重新从 legacy event 或页面 DOM 拼接文字。
+4. JSON 使用稳定的 `meeting_copilot.meeting_export.v1` schema；Markdown 保留会议纪要、用户保留的会中建议和“完整会议文字”三类主内容。两种格式都带有可回跳的 evidence segment ID，但不把未提交 candidate 伪装成正式建议。
+5. 前端复盘页通过同一 endpoint 下载 Markdown/JSON，按响应的 `Content-Disposition` 生成文件名，并在浏览器端释放 Blob URL；导出失败显示真实 HTTP 错误，不清空当前复盘。
+
+## 验证与边界
+
+- `code/web_mvp/backend/tests/test_v2_export.py` 当前 focused 结果为 `3 passed, 2 warnings`：JSON schema/portable fields、Markdown 完整文字和未知会议 `404` 均通过；JSON 断言不包含 `api_key`。
+- 前端已有导出菜单、Markdown/JSON 请求和下载回归；当前 parser/reducer/workbench targeted run 为 `43 passed`。
+- 该决策证明的是 V2 导出契约和当前本地业务链路，不证明 packaged UI 用户点击后的 native microphone 同场成功，也不关闭 Developer ID、notary/staple、Gatekeeper、clean Mac、Windows 或模型/依赖再分发门禁。
+
+## 成本、隐私与复审
+
+- 导出只读取已持久化 V2 数据，不新增 ASR/LLM 调用、远程上传或费用。
+- allowlist 扩展必须新增 schema 字段、secret negative test 和同一 canonical transcript 回归；不能通过“把整个 snapshot 转 JSON”绕过审查。
+- 若未来 DEC-413 的五类事实加入导出，必须显式增加对应的事实字段和 evidence span，且继续复用同一 canonical transcript；不能让 Markdown/JSON 各自补事实。
+
+# DEC-413: 实时五类会议事实必须由后端持有 canonical 状态并逐条绑定证据
+
+时间：2026-07-17
+
+状态：Accepted / Implemented / Cross-stack contract focused Go / Packaged same-session pending
+
+## 背景
+
+实时会议页需要同时回答“会议正在讨论什么、做了什么决定、谁要做什么、有什么风险、还有什么没闭环”。如果这些内容只存在于 LLM suggestion card、前端本地推断或会后 Markdown，用户无法区分候选与确认，也无法从事实逐条回到原始会议文字。V2 snapshot、事实持久化和 React 投影已经补入当前工作树，但 confirm/dismiss 的真实客户端到服务端契约仍需同一路径闭合。
+
+## 决策与事实模型
+
+1. 实时五类事实固定为：`current_topic`、`decision_candidates`、`action_items`、`risks`、`open_questions`。每条事实必须有稳定 `id`、事实文本/结构化字段、`status`、置信度（如有）、`updated_at_ms`、来源 segment ID 列表和逐条 `evidence_spans`。
+2. 对需要人工确认的事实，`status` 统一使用 `candidate -> confirmed | dismissed`。`dismissed` 是持久化终态，默认视图可以隐藏，但后端仍保留它，避免旧 snapshot、重连或重复 ASR 把用户已忽略的事实重新显示。`current_topic` 和 `open_questions` 可以保留领域生命周期字段（如 `active/changed/expired`、`open/answered/carried_over/expired`），但不能用这些字段替代事实的 review status 语义。
+3. 每个 `evidence_span` 至少包含 `segment_id`、`transcript_seq`、时间范围、quote 和当前 canonical evidence identity。事实只能引用 canonical transcript 的已确认段落或其当前有效 revision；缺 evidence、指向已 superseded revision 或 evidence hash 不匹配时，事实只能降级为不可确认，不得渲染为已确认事实。
+4. 后端是 canonical owner：从 canonical transcript 生成/更新五类事实，持久化事实状态和 evidence，接受 confirm/dismiss 命令，并追加带 `aggregate_type/aggregate_id/correlation_id/causation_id` 的事实事件。前端不能自行用关键词、旧 snapshot 或 suggestion card 重建事实状态。
+5. 前端只消费同一份 V2 snapshot 与增量 event stream，按事实 ID 合并更新，并把 evidence span 映射回同一份 canonical transcript。点击确认、忽略或查看依据只发后端命令；只有后端成功响应后才可更新当前视图，后续 event/snapshot 继续作为权威重放结果，前端不得自行提取或覆盖事实。
+6. suggestion card、minutes 和导出都是事实的下游投影。候选事实可以触发需要补充 owner、deadline、风险或回滚口径的建议，但没有逐条 evidence 的候选不能升级为正式卡；会后结构化纪要也不能反向覆盖实时事实的状态。
+
+## 当前实现审计
+
+- `meeting_state_extractor.py` 已从有序 canonical segments 识别并合并 topic、decision candidate、action item、risk、open question；`meeting_entities` 已持久化五类 kind、confidence、evidence、owner/deadline/mitigation 和 version/seq。
+- `V2Persistence.get_snapshot()` 已返回五类事实；decision/action/risk 追加 `meeting.*.updated` 事件，`set_entity_status()` 持久化 `candidate/confirmed/dismissed` 且保留 evidence。React parser/reducer/NowRail 已显示事实、证据回跳和确认/忽略控件。
+- focused 证据已转绿：export/entity/structured-minutes backend 为 `6 passed, 27 deselected, 2 warnings`；frontend client/reducer/workbench 为 `43 passed`。
+- 状态写回契约已统一：`HttpMeetingApi.saveFactStatus()` 调用 `PATCH /v2/meetings/{id}/entities/{entityId}`，body 为 `{"status":"confirmed|dismissed"}`，与 FastAPI canonical endpoint 一致。前端不再调用不存在的 `/facts/{type}/{id}`；client、reducer、Workbench 和 backend entity focused tests 均通过。
+
+## 进入 Implemented 的验收条件
+
+- V2 snapshot 同时提供五类事实；每条事实都有稳定 ID、状态和逐条 evidence span。
+- 前后端统一 confirm/dismiss endpoint、HTTP method 和 payload，并增加真实 `HttpMeetingApi -> FastAPI` 契约测试；持久化状态和事实事件可重放，旧 snapshot 不得覆盖更新后的终态。
+- React live page 和 review page 使用同一 parser/reducer 投影，事实点击能定位 canonical transcript，console/runtime/network/HTTP 5xx 仍为 0。
+- focused backend/frontend tests 全部通过，并至少有一条 same-session 主流程证据证明 candidate、confirmed、dismissed 和 evidence 回跳都来自后端 canonical owner。
+
+endpoint 契约已经闭合；packaged native mic 同场 UI 仍需在可交互 Mac 上执行 candidate -> confirm/dismiss -> snapshot 重放和 evidence 回跳。该外部 UI 门禁不再阻止代码契约标为 Implemented，但仍阻止 Phase 0-2 packaged UI 和公开发布标为全部完成。
+
+# DEC-414: 会前预检必须先确认本地链路、录音告知和会议级技术词
+
+时间：2026-07-17
+
+状态：Accepted / Implemented / Focused mainline Go / System audio pending
+
+## 背景
+
+旧首页点击“开始会议”后立即创建 meeting 并请求麦克风。用户在开始前看不到本地 ASR、存储、AI、录音告知和技术词状态，也无法选择浏览器麦克风。Provider 健康、token/费用账本和隐私策略已经存在于后端，但产品设置没有展示，导致用户无法判断哪些能力免费、哪些操作会调用中转站。
+
+## 决策与实现
+
+1. “开始会议/开始录音”先打开紧凑会前预检，显示本地存储、本地中文实时 ASR 和 AI 配置状态；本地 ASR 或存储不可用时禁止开始，AI 未配置时允许本地录音/转写但明确说明无实时 AI 建议。
+2. 浏览器模式列出音频输入设备并把选中的 `deviceId` 传给 `getUserMedia`；Tauri native 模式明确使用系统默认麦克风，不展示一个无法真正生效的设备选择。
+3. 用户必须确认已告知参会者并同意录音；界面提供可复制的会议告知文案。应用仍禁止隐蔽录音和后台自动监听。
+4. 会议级技术词通过 `PUT /v2/meetings/{id}/preparation` 保存在受管本地目录，最多 50 项、单项最多 64 字符，拒绝控制字符和目录逃逸。配置只包含 hotwords、输入设备元数据和告知确认，不包含 API key、音频或 provider secret；删除会议会同步删除配置并清理运行时 hotword registry。
+5. FunASR 命令合并默认词库和本次会议 hotwords。当前 resident protocol 只能在进程启动时固定 hotwords，因此带自定义词的会议使用独立本地 sidecar，确保词表生效且不会串到下一场会议；代价是一次本地模型冷启动。未设置自定义词时继续使用 resident 快路径。
+6. 当前正式输入源只开放 `microphone`。`system_audio`/`mixed` 不做静默降级，也不在未接入主链前提供假选项；ScreenCaptureKit spike 成功不等于产品链路完成。
+7. AI 设置抽屉只在用户打开时读取 `/providers/health` 和 `/settings/cost-stats`，展示 provider/model、连接状态、本地 ASR 默认免费、远程 ASR 默认关闭、原始音频默认不上传、本次/今日费用和 token。未配置价格时显示“已记录 token，未配置单价，无法估算”，不得误报 0 元；“连接并测试”明确提示可能产生一次真实中转站调用和费用。
+
+## TDD 与边界
+
+- backend preparation/hotword/API focused：`11 passed`；五类事实、导出和 preparation 主链聚焦：`22 passed, 96 deselected`。
+- frontend preflight/browser capture/client/reducer/workbench/provider focused：`58 passed`；TypeScript、ESLint 和 production build 通过。
+- 以上验证不调用远程 ASR，不读取 Keychain 或 Mac 登录密码；除用户显式“连接并测试”外，打开页面和会前预检不会新增中转站调用。
+- packaged r7 runtime、app、supervisor、IPC 和本地 AI 主链已构建并通过；真实 packaged native microphone、system audio/mixed、Developer ID、notary/staple、Gatekeeper、clean Mac 和 Windows 真机继续保持未完成。
+
+# DEC-415: 后端 V2 是录音资产的唯一 canonical owner
+
+时间：2026-07-17
+
+状态：Accepted / Implemented / Focused ownership Go / Packaged microphone pending
+
+## 背景
+
+历史桌面实现同时存在 Tauri 本地 audio chunk runtime 与后端 V2 recording journal。双 owner 会让同一会议出现两套 chunk manifest、两条删除路径和不同的恢复语义；即使页面正常，也无法可靠回答“哪一份录音是正式资产、删除会议是否真的清干净”。
+
+## 决策与实现
+
+1. 后端 V2 独占 recording journal、`audio_chunks`、`recording_sessions`、WAV assembly、Range playback、meeting export 和 deletion fence；所有浏览器、native microphone、未来 system audio 输入最终都必须进入同一套后端录音事务。
+2. 删除 Tauri `desktop_audio_chunk_runtime.rs`、`mic_adapter_delete_audio_chunks` command 及生成权限；Tauri 不再保存第二份 PCM chunk manifest，也不负责会议资产删除。
+3. native Swift helper 只采集 PCM 并通过认证后的 loopback WebSocket 发送；Rust supervisor 负责 helper lifecycle、bounded event relay 和 fail-closed 退出，不成为录音持久化 owner。
+4. 删除会议时以后端 deletion job 为唯一结果；前端不得先清桌面文件再把后端失败伪装为成功。历史回放和导出也只读取后端 V2 的相对受管路径。
+5. system audio/mixed 接入时必须复用该 owner 模型，以 track/source metadata 区分输入，不允许再建第三套文件生命周期。
+
+## TDD 与边界
+
+- 新增 `tests/test_desktop_audio_owner_contract.py`，旧 `tests/test_desktop_audio_chunk_runtime.py` 删除；当前 desktop ownership/scaffold 聚焦为 `14 passed`，Rust 为 `32 passed, 1 ignored`。
+- r7 packaged local AI 主链由后端生成 6 个 chunk、30 秒 WAV、playback URL 和 ready recording session；meeting review jobs 全部成功，app/backend/端口全部回收。
+- 决策关闭的是录音资产归属和删除架构分叉，不等于 packaged React UI 真实麦克风同场已通过，也不证明 system audio/mixed 已接入。
+- 该路径不读取 Keychain 或 Mac 登录密码，不启用远程 ASR；本地录音默认不上传。
+
+# DEC-416: Phase 0-2 关闭 system audio 可行性风险，正式产品接线留在 Phase 3
+
+时间：2026-07-17
+
+状态：Accepted / Phase 0 spike Go / Phase 3 product integration pending
+
+## 范围冲突
+
+早期 `P2-4` 文档曾把 Mac 系统音频写进当轮交付；当前权威 `production-maturity-architecture-and-execution-plan-2026-07-14.md` 已把 Phase 0-2 与 Phase 3 分开：Phase 0 负责 native capture 高风险可行性，Phase 1A-1C 负责 durable/streaming/V2 产品体验，Phase 2 负责长会录音与恢复，正式 packaged mic/system audio adapter 属于 Phase 3 Mac Internal Alpha。
+
+## 决策
+
+1. Phase 0 的 system audio 验收是 ScreenCaptureKit 在当前 Mac 同场产生至少 60 秒非空 WAV，并保留 microphone/system audio 两条独立轨；现有约 60.7 秒麦克风与约 60.5 秒系统音频证据满足该 spike，不把它写成正式产品链路。
+2. Phase 0-2 当前唯一 packaged UI 门禁固定为：React 显式开始 -> native microphone -> 本地 ASR partial/final -> 建议/修正 -> 结束 -> 录音/文字/纪要/方案/历史。同一场通过后即可关闭 Phase 0-2 内部功能目标，不要求在本轮临时扩展双轨协议。
+3. 正式 `system_audio` 在 Phase 3 先以单源互斥模式接入同一 canonical WebSocket/ASR/recording owner；`mixed/both` 必须等独立 track 路径、回放和混合 ASR 协议完成后再开放。UI 不展示未接入的假选项，也不把权限失败静默降级成麦克风。
+4. Phase 3 system audio 继续是 Mac Internal Alpha 的真实产品缺口，不能因为从 Phase 0-2 出口排除就宣称产品最终支持系统音频。
+
+## 依据与后续接口
+
+- Phase 0 双轨结果由权威生产成熟度计划记录为约 60.7 秒/60.5 秒；原始路径曾为 `code/desktop_tauri/spikes/macos_capture/.build/phase0-both-60s-20260716/evidence.json`，但该 ignored artifact 当前未保留在 clean 工作树。它足以维持已接受的 scope 决策，不足以作为新的 release provenance；进入 Phase 3/公开发布前必须重新附着或重跑该单项证据。
+- 当前 formal native helper 仍是 AVAudioEngine microphone-only；后端 V2 已有 track/source metadata 和单一资产 owner，可作为 Phase 3 接线基础。
+- Phase 3 第一切片只开放 `microphone | system_audio` 两种互斥 source；不在现有单路 WebSocket 上并发两个 writer，也不让两轨竞争固定 `audio.wav`。
+- 该范围决策不触发 Screen Recording 权限，不读取密码或 Keychain，不新增远程 ASR 与费用。
+
+# DEC-417: packaged backend 停止必须回收完整 FunASR process group
+
+时间：2026-07-17
+
+状态：Accepted / Implemented / Packaged r9 verified
+
+## 根因
+
+r8 桌面 UI 无法通过 AX 读取后停止 app，backend leader 正常退出，但 FunASR resident worker 变成 `PPID=1` 并继续占用模型内存。Rust `stop_child_process_group()` 在 `child.try_wait()` 返回 leader 已退出时直接 return；即使 descendant 仍属于同一 process group，也不会再发送 TERM/KILL。backend parent watchdog 使用 `_exit` 的快速失败路径，使该竞态可以稳定出现。
+
+## 决策与实现
+
+1. Unix stop 不再以 group leader 是否退出作为完成条件；始终向 `-pgid` 发送 TERM，并用 `kill(-pgid, 0)` 判断整个 group 是否仍存在。
+2. 超时后向完整 group 发送 KILL，再等待 group 消失并回收 leader handle。不存在的 group 返回 ESRCH，权限不足 EPERM 仍视为存在，保持 fail-closed。
+3. 新增真实 Rust 测试：shell 作为 group leader 启动 `sleep` 后立即退出，stop 必须仍杀死 descendant；该测试通过。
+4. packaged supervisor、local AI mainline 和 DMG install smoke 都必须定位 bundle 内 `funasr_stream_worker.py --resident` PID，并验证 app/backend/worker/端口全部退出。若脚本被迫单独 TERM/KILL worker，证据记录 `forced_cleanup=true` 且判 No-Go。
+
+## r9 证据与边界
+
+- app：`artifacts/tmp/tauri_runtime_package/phase0-2-mainline-r9-tauri-20260717/evidence.json`。
+- supervisor：`artifacts/tmp/packaged_runtime_supervisor_smoke/phase0-2-mainline-r9-supervisor-worker-reap-20260717/evidence.json`，worker PID 被记录且自然退出。
+- AI 主链：`artifacts/tmp/packaged_ai_mainline_smoke/phase0-2-mainline-r9-ai-worker-reap-20260717/evidence.json`，`funasr_worker_exited=true`、`funasr_worker_forced_cleanup=false`。
+- DMG 安装：`artifacts/tmp/macos_dmg_install_smoke/phase0-2-mainline-r9-dmg-install-worker-reap-20260717/evidence.json`，挂载、临时安装和 worker 回收全部通过，DMG SHA-256=`abd55ccf4d37090738e6f8ec3bda71fe01c103a420cefefd622d632ac0ec94ec`。
+- 修复关闭 packaged 进程树资源泄漏，不替代 native microphone UI 同场验收、Developer ID/notary/clean Mac 或 Windows 真机。
+
+# DEC-418: native microphone 必须可恢复断流，会议结束命令不依赖浏览器 confirm
+
+时间：2026-07-17
+
+状态：Accepted / Implemented / Packaged execution verified / Long-session root cause pending
+
+## 根因与决策
+
+1. r9 helper 已成功获得麦克风、建立 WebSocket 并启动 AVAudioEngine，但 async `main()` 恢复到主队列后调用 `dispatchMain()`，触发 libdispatch `SIGTRAP`。主入口改回同步，进程入口持有 main loop，异步 Task 只执行权限与采集。
+2. helper 使用 ephemeral URLSession、显式请求/资源超时和 15 秒 ping；receive/send 失败在停止期不误报。父进程丢失、duration 到期和连接错误写入不含凭据的阶段日志。
+3. React native hook 在 helper 意外停止后，针对同一 meeting 进行有界自动重连。稳定 30 秒后重置连续失败计数，单次最多三次；重连中显示真实状态，最终失败才进入 error。
+4. 麦克风中断或 meeting phase 为 unknown 时仍保留唯一“结束并整理”，同时提供“重新开始录音”。结束动作不再依赖 Tauri WebView 中不可可靠自动化的 `window.confirm`；结束不是删除，录音资产仍由 V2 保留。
+5. `asr.stream.aborted` 只记录安全 `error_class`，不记录可能包含路径、URL、请求或凭据的原始异常文本。
+
+## 证据与边界
+
+- r11 真实 packaged React + native microphone + local FunASR 连续 270.6 秒、16 段文字、55 chunks，跨过旧 90.6 秒中断点；最终仍出现 socket disconnect，因此长连接根因未关闭。
+- r12 可打开中断会议并直接结束；完整文字、271 秒录音和真实播放通过。证据：`artifacts/tmp/packaged_native_mic_ui/phase0-2-mainline-r11-r12-20260717/evidence.json`。
+- focused frontend `26 passed`，Swift helper 编译和 native contract tests 通过。
+- 自动重连是韧性层，不得把周期性断流掩盖成完全稳定；后续必须用安全 `error_class` 和固定签名候选定位根因。
+
+# DEC-419: macOS 权限稳定性依赖固定代码身份，禁止密码提取或自动化
+
+时间：2026-07-17
+
+状态：Accepted / Security invariant / Stable signing pending
+
+## 决策
+
+1. 项目不得提取、读取、保存、记录、回显或自动填写用户的 Mac 登录密码；不得使用 `sudo`、脚本化 SecurityAgent 或绕过 TCC/Keychain。
+2. 本地 ad-hoc 包每次改变 app 路径或代码身份，macOS 都可能把 microphone/Keychain 视为新主体。r12 新路径停在 `request_permission` 并 readiness timeout，即使 helper SHA-256/CDHash 与 r11 相同，也不能借此推断用户已经对新 app identity 授权。
+3. 内部最终候选必须固定安装到同一路径；公开发行必须使用稳定 Developer ID Application、Team ID、hardened runtime、notary/staple 和 Gatekeeper 验证。稳定 identity 才能让麦克风和凭据访问成为一次授权，而不是每个 ad-hoc build 重复弹窗。
+4. Provider 启动继续使用显式连接策略。页面启动、预检和状态展示只读非敏感 metadata；读取已保存 API Key 和真实 relay probe 只能由用户显式操作触发，并明确可能产生费用。
+
+## 当前边界
+
+- `provider-config.json` 只保存 base URL、model 和 provider label，不保存 API Key 或密码；当前非敏感 base URL 已纠正为 `https://codexai.club`。
+- 本轮没有读取 Keychain、没有调用远端 ASR/LLM、没有产生付费请求。真实 relay 同场仍需 action-time 计费确认，不能为追求“全绿”绕过该边界。
+
+# DEC-420: Provider 未同步是可恢复等待，不得消耗 AI job 永久重试预算
+
+时间：2026-07-17
+
+状态：Accepted / Implemented / Focused mainline Go / Real relay same-session pending
+
+## 根因
+
+桌面 backend 每次启动后只接受进程内 Provider runtime override；启动阶段又按 DEC-409 禁止自动读取 Keychain。旧 durable executor 仍会立即 claim 每个 final 的 correction/suggestion job，Provider 尚未显式同步时按普通错误在 1 秒、2 秒后耗尽三次机会，导致用户稍后连接 AI 也无法补回早期会议内容。
+
+另一个真实缺陷是 `asr_correct.correct_transcript()` 默认吞掉 Provider/解析异常并返回原文。realtime durable correction 因此可能把真实调用失败误记为正常 degradation/rejection。suggestion 在部分 token 后失败时还会遗留永久 draft，而 runtime 状态在所有 job failed 后误报“AI 已同步”。
+
+## 决策与实现
+
+1. 增加 `ProviderRuntimeNotConfiguredDeferred`，标记 `preserve_attempt=true` 和 10 秒 retry delay。`DurableJobExecutor` 调用 V2 `defer_job`，原子释放 lease、回到 `retry_wait` 并撤销本次 claim 增加的 attempt；Provider 连接后继续原 job。
+2. correction、suggestion 及依赖 correction 的会后任务统一识别该等待语义。真正的 Provider 网络/协议错误仍使用有限重试，不得借“等待配置”无限掩盖。
+3. `correct_transcript(raise_on_failure=True)` 只用于 realtime durable correction；普通文件导入保持 graceful fallback。第一次真实 correction failure 可重试，第二次达到既有 failure budget 后终态失败，安全 502 不包含底层异常文本。
+4. runtime AI 状态优先显示 active job；没有 active job且 correction/suggestion 存在终态失败时显示 `AI 处理失败` 和 allowlist error class。suggestion 终态失败与 draft rejection/event append 位于同一 SQLite transaction。
+5. 桌面会前页只在用户点击时调用 `provider_config_sync`，不调用 `/providers/llm/probe`；同步成功后必须重新读取 backend health。AI 未连接仍允许本地录音/转写，但 job 不会永久丢失。
+
+## 验证与边界
+
+- 前端全量 `80 passed`；后端受影响模块 `99 passed`；桌面 Rust `34 passed, 1 ignored`。
+- lint、typecheck、production build、Ruff、Rust fmt 和 diff check 通过。
+- 所有 Provider 测试使用本地 fake client；本决策不证明 `codexai.club/gpt-5.5` 当前可用，也不替代同一 packaged 会议的真实付费证据。
+
+# DEC-421: 保存 Provider metadata 不得读取既有 Keychain secret
+
+时间：2026-07-17
+
+状态：Accepted / Implemented / Rust focused Go / Stable signed identity pending
+
+## 真实问题
+
+r12 设置页已显示正确的 `codexai.club/gpt-5.5` 和“密钥已保存在系统凭据库”。API Key 留空点击普通“保存”时，旧 `provider_config_save` 为了回滚和立即注入 backend 仍读取 Keychain，启动了 `SecurityAgent` 并让 UI 长时间处于 disabled busy。用户并没有点击“连接并测试”，这与显式凭据读取边界不一致。
+
+## 决策与实现
+
+1. 已有 metadata 且 API Key 留空时，`provider_config_save` 只验证并原子写入 base URL/model metadata；不得调用 credential `get/set`，不得配置 backend，返回 `runtime_synced=false`。
+2. 用户输入新 API Key 时才允许写入系统凭据库；输入格式先验证，再写 metadata 和 credential。失败时恢复 metadata，不记录或回显 secret。
+3. `provider_config_sync` 仍是读取既有凭据并注入 backend 的唯一操作；真实连接 probe 仍是独立的可能计费动作。保存、同步、清除继续共享串行锁。
+4. 项目不以明文文件、放宽 Keychain ACL、Mac 登录密码或 SecurityAgent 自动化换取无弹窗。开发期最终验收复用固定 app path；生产依赖稳定 Developer ID/Team ID 身份。
+
+## 验证与边界
+
+- Rust provider tests 证明 metadata-only save 对拒绝 credential read/set 的 store 仍成功，invalid replacement key 不修改旧 metadata。
+- Rust 全量 `34 passed, 1 ignored`；被忽略项仍是显式本机 Keychain integration smoke，不在普通测试中触发系统授权。
+- 本决策减少非必要弹窗，但第一次由稳定应用身份读取既有系统凭据仍需要用户本人授权，不能也不会通过密码提取绕过。
+
+# DEC-422: Provider 401 必须区分密钥来源与接口协议
+
+时间：2026-07-18
+
+状态：Accepted / Diagnosed / Real relay recovered
+
+## 真实现象与证据
+
+固定安装客户端在显式同步 Provider 后，多次调用 `/providers/llm/probe` 得到远端 `HTTP 401` 和 allowlisted `INVALID_API_KEY`。本机 Codex 的非敏感配置同时使用 `https://codexai.club`、`gpt-5.6-sol` 和 `wire_api=responses`，但 Codex 与 Meeting Copilot 分别从独立凭据存储读取认证信息，因此“本机 Codex 可用”不能证明当前桌面客户端读取的是同一凭据，也不能证明中转站对两个协议使用相同认证路由。
+
+在同一固定客户端中显式保存并同步 `api_style=chat_completions` 后，`2026-07-18T02:32:27Z` 的 `/desktop/provider/config` 返回 200，随后真实 `/providers/llm/probe` 于 `2026-07-18T02:32:28Z` 返回 200。当前非敏感 metadata 已固定为 `https://codexai.club`、`gpt-5.6-sol`、`chat_completions`，不含 API Key。
+
+另一个独立问题是端口/工作树混用：当前浏览器上下文的 `8767` 进程工作目录为旧的 `/Users/chase/Documents/面试/meeting-copilot/code/web_mvp/backend`，不是本轮 `/Users/chase/Documents/面试/meeting-copilot-phase0-clean`；固定安装包则使用自己的 bundled backend 和随机端口。旧开发实例不会继承安装包的 Keychain runtime sync，因此不能用 `8767` 页面判断当前安装包的 Provider 状态。
+
+## 决策与实现
+
+1. `codexai.club + gpt-5.6-sol` 在 Meeting Copilot 当前主链固定使用 Chat Completions；不得根据 `gpt-5*` 模型名自动切换到 Responses。
+2. 不在 401 后自动双投另一个协议，避免重复计费、重复副作用和错误掩盖。协议只允许用户显式选择并持久化为非敏感 metadata。
+3. 401 文案不再只说“检查 API Key”。Responses 请求被拒绝时，同时提示凭据来源可能不同和 Responses 认证路由可能不兼容，并建议显式切换到 Chat Completions；Chat Completions 请求被拒绝时提示检查当前应用保存的 Key、协议与模型权限。
+4. API Key 继续只存系统凭据库；文档、日志、普通配置、测试和 evidence 不保存、不回显、不比较其值或指纹。
+
+## 当前边界
+
+- 本次已经有真实 200 证据，不再重复发起付费探测。
+- 现有证据只能表述为“Responses 路径观察到 401，Chat Completions 路径观察到 200”；不得进一步断言 Responses 协议本身导致认证失败。中转站路由、模型授权和凭据来源仍可能共同影响结果。
+- 真实客户端验收必须从固定安装包进入；`8767-8770` 的历史开发实例不作为当前主线证据。
+- 该结论只绑定当前中转站、模型和客户端实现，不宣称所有国产 OpenAI-compatible Provider 都不支持 Responses。
+- 用户在对话中暴露过的测试 Key 应按已暴露凭据处理并在后续轮换；代码和仓库不得继续传播该值。
+
+# DEC-423: WebKit 录音 metadata 失败采用 Range-first 与认证 Blob 回退
+
+时间：2026-07-18
+
+状态：Accepted / Implemented / Real packaged playback Go
+
+## 真实问题
+
+Phase 0-2 r2 的录音已经由后端成功导出，内容端点返回 `206 Range`；文件是有效的 PCM WAV：16 kHz、mono、16-bit、144.089 秒、4,610,900 bytes。Tauri/WebKit 的原生 `<audio>` 仍长期显示 `00:00 / 00:00`，无法播放。该现象不能继续被页面解释成“录音为空”，否则会掩盖一个真实的客户端媒体兼容缺陷。
+
+## 决策与实现
+
+1. 播放器首先使用正常同源媒体 URL，保留 Range 请求、流式读取和长会议低内存优势。
+2. 直接加载后 3.5 秒仍没有有效 metadata，或媒体元素明确加载失败时，前端使用同源认证 fetch 获取同一个 WAV；只有 Blob 大小通过最低有效性检查后才创建临时 Blob URL 并 remount 播放器。
+3. Blob URL 在替换或组件卸载时必须 revoke；加载中、失败和重试状态必须显式可见。后端返回有效录音时不得显示“无录音”。
+4. Blob fallback 只在 direct Range metadata 失败时发生。它会把完整 WAV 保存在 WebView 内存中，因此是兼容性回退，不是长会议的默认播放方式。
+
+## 真实验证
+
+- source tests：focused frontend `8 passed`，frontend full `81 passed`。
+- typecheck、lint、production build 和 `git diff --check` 通过。
+- r2 packaged 页面显示总时长 `02:24`；播放后 elapsed time 前进，暂停成功。
+- 截图：`artifacts/tmp/local-alpha/packaged_ui_mainline/phase0-2-current-20260718-r2/recording-playback-fixed.png`。
+
+## 边界
+
+- 该决策证明当前 macOS Tauri/WebKit 包能够回放已保存 WAV，不证明 Windows WebView2 必然具有相同故障或需要相同回退。
+- 超长会议若频繁进入 Blob fallback，仍需后续考虑本地文件协议或受认证的 media-source 方案；当前 Phase 0-2 先以 Range-first 保持主路径的低内存行为。
+- 本决策不改变“原始音频仅本地保存、默认不上传远端 LLM/ASR”的隐私边界。
+
+# DEC-424: 实时会议语义改为 LLM-first 增量理解，关键词规则退出正式结果
+
+时间：2026-07-18
+
+状态：Accepted product direction / Not implemented
+
+## 背景
+
+真实用户试用发现，当前决定、待办、风险和开放问题主要依赖“决定/负责/风险是”等关键词和正则提取。该实现速度快、无额外费用，但不能结合多人上下文、否定、反问、条件、话题变化和后续修正理解真实会议，也不符合 AI 会议副驾驶的核心产品定位。
+
+同时存在一组关联主链缺陷：15 秒 ASR checkpoint 被直接展示为用户段落；修正只处理局部批次且后续任务可能发生 `V2TranscriptRevisionConflict`；“AI 已校正”不展示真实差异；“现在最值得追问”实际是最新候选而不是全局排序；历史回看、Provider 连接状态和麦克风输入反馈均缺少可信闭环。
+
+## 决策
+
+1. 决定、待办、风险、开放问题、主题变化和追问建议全部改由 OpenAI-compatible LLM 基于新增自然段和滚动会议状态做增量结构化分析。
+2. 关键词和正则不再产生正式语义结果，也不得在模型不可用时伪装成 AI 结果。确定性代码只负责时间/队列调度、去重、幂等、Schema 校验、证据存在性校验、成本上限、安全边界和失败恢复。
+3. 实时输入采用“新增自然段 + 前 2-3 段只读上下文 + 有界滚动状态”，禁止每轮重发完整会议全文。partial 不调用模型，连续新增内容按短 debounce 合并。
+4. 默认优先使用一次 realtime intelligence call 同时返回目标段落修正、主题/状态增量和至多一条追问建议，以减少重复输入和计费。Provider 能力不足时才按能力档案拆分 lane。
+5. 每个 AI 项目必须带 evidence segment IDs 和原文引用，状态采用 `add/update/resolve/noop`；无证据、目标版本过期或结构校验失败时拒绝提交，不由关键词结果顶替。
+6. 实时任务路由到低延迟、低成本国产 OpenAI-compatible 模型；会后复盘允许独立强模型。AI 慢或失败不得阻塞本地 ASR、录音、完整历史回看和会后复盘。
+7. 技术 checkpoint、当前 partial 和用户可读 semantic paragraph 分层保存与展示；完整会议文字必须在会中持续可回看，用户翻历史时停止自动抢滚。
+8. 现有 keyword extractor 在迁移完成前只属于 legacy implementation，不再作为目标产品设计；迁移必须通过 SDD、接口契约、RED/GREEN 测试和真实页面验收完成。
+
+## Token、成本和体验边界
+
+- 不发送重复 partial，不重发全文；使用滚动状态、有界上下文、prompt caching、动态输出 token 和 evidence hash 去重。
+- 模型忙时合并未处理增量，不为每个 15 秒 checkpoint 创建重复调用。
+- 目标为原始文字 1-3 秒、修正 3-6 秒、状态/追问 5-10 秒可见；记录 TTFT、总耗时、token、重试和每会议估算成本。
+- 达到预算上限时降低 AI 分析频率并明确告知，不能停止本地录音和转写。
+- 模型无改动必须显示“已检查，无需修改”；只有真实 diff 才显示“修正 N 处”。
+
+## 影响范围
+
+- `meeting_state_extractor.py` 的语义职责退出正式主链。
+- transcript checkpoint/paragraph 数据模型、durable job identity、LLM structured output、state upsert、suggestion ranking、错误分类和前端状态需要重新形成 SDD/API/TDD 契约。
+- NEXT-003、NEXT-005 和新增 NEXT-013 至 NEXT-016 共同构成实时会议产品化主线。
+
+## 关联文档
+
+- `docs/post-phase0-2-product-gap-and-roadmap-discussion-2026-07-18.md`
+- `docs/p0-p2-completion-report-2026-07-17.md`
+
+## 复审条件
+
+- 若选定国产模型无法稳定返回结构化 JSON，可通过 Provider capability profile 拆分任务或增加一次受控结构修复；不得恢复关键词语义结果作为静默 fallback。
+- 若一次统一 intelligence call 无法满足 5-10 秒体验或影响修正可靠性，可拆为并行 correction/state lanes，但必须共享同一 evidence version、保持幂等并避免重复发送全文。
+
+# DEC-425: 会后 AI 结果必须进入用户最终稿、可重试、可命名和可导出
+
+时间：2026-07-18
+
+状态：Accepted product direction / Not implemented
+
+## 背景
+
+真实用户试用发现，结束会议后的复盘、决策与待办、风险建议和完整会议文字目前主要是只读展示。AI 输出不可能天然等于用户最终想要的内容，用户需要继续校正、补充、确认、删除和导出。当前会议纪要失败时，文字和录音虽然仍然存在，但页面缺少针对单个产物的重试入口；决策、待办和风险又部分依赖 minutes 解析，容易因为一个整理任务失败而一起消失。
+
+同时发现：会议创建没有给前端提供正式命名流程，历史记录大量显示“未命名会议”；“立即同步”实际只是读取本地 snapshot；导入录音在安装包中依赖开发环境的离线 FunASR 路径和用户模型缓存，内部 `offline batch path` 错误被用户误解为本地服务离线。
+
+## 决策
+
+1. 会后页面从只读报告改为可继续工作的会议文档，提供复盘文档、决策与待办、风险与建议、完整文字、录音五个工作区。
+2. AI 生成内容与用户最终内容分层保存：`ai_generated` 作为初稿，`user_final` 作为导出和正式使用版本。AI 重新生成只能生成新草稿或差异，不能覆盖用户修改。
+3. 复盘正文使用成熟的结构化文档编辑模型，支持撤销/重做、自动保存、版本历史、乐观并发和断网草稿恢复；不使用脆弱的手写 `contenteditable` 作为长期方案。
+4. 决策、待办、风险和建议以结构化字段保存和编辑，保留状态、负责人、截止时间、证据、speaker 和时间；用户可以确认、驳回、修改和手工新增。
+5. 完整文字保留原始 ASR、AI 修正版和用户最终文字三层。用户编辑不修改原始事件；文字变更后，派生复盘标记为基于旧版本，用户明确触发后才能重新整理。
+6. 会议名称是正式字段。会前允许用户输入，空缺时使用日期时间兜底；实时 LLM 可以生成建议主题，但用户手工标题具有最高优先级并阻止 AI 覆盖。历史记录必须支持搜索、分页/加载更多和状态筛选。
+7. 会议纪要、方案与风险、索引等会后任务独立重试、独立显示失败和恢复动作。一个产物失败不得隐藏文字、录音或其他已完成事实；重新生成不得覆盖用户最终稿。
+8. 导出以用户最终稿为准，首发支持 Markdown、DOCX 和高级 JSON。DOCX 在本地 backend 生成，录音独立导出，不新增额外云服务或远程 ASR 费用。
+9. 录音导入改为有说明、有确认、有进度的本地后台任务。首发只宣传已在 packaged runtime 验收的 WAV、MP3、M4A、AAC、FLAC、MP4、MOV 和 500MB 上限。内部错误转换成明确的本地组件/格式/磁盘/转写阶段提示。
+10. 安装包必须通过 runtime manifest 注入 bundled 文件转写 Python、worker 和模型路径，不依赖开发仓库或用户 ModelScope 缓存。离线文件转写模型可以作为安装包可选资源或首次下载的本地模型包，但必须显示体积、版本、SHA-256 和安装状态。
+11. “立即同步”不是产品同步功能。普通页面移除该动作；诊断内改为“重新读取状态”，说明只从本地会议服务刷新 snapshot。云同步未来单独设计。
+
+## 影响范围
+
+- 新增 NEXT-017 至 NEXT-023，形成会后产品化和安装包导入主线。
+- `ReviewWorkspace`、会议历史、会议 title API、review artifact/revision 数据模型、独立重试 API、Markdown/DOCX 导出、导入任务状态和 packaged runtime manifest 需要分别形成 SDD/API/TDD 契约。
+- 既有 minutes、approach、index job 不再作为一个整体报告处理；必须与实时结构化事实和用户稿分离。
+
+## 成本、隐私和发布边界
+
+- 编辑、自动保存、版本和 DOCX 生成均在本地执行，不新增远程费用。
+- 录音导入默认本地转码和本地 FunASR；AI 整理仍只调用用户配置的 OpenAI-compatible LLM。
+- 约 2GB 级离线文件转写模型会增加安装包或首次资源包体积，需要在公开发布阶段展示磁盘和下载成本，但不产生必然的云端服务费用。
+- 公开发布前必须在无开发仓库、无用户模型缓存的干净 Mac 上完成导入和导出验收。
+
+## 关联文档
+
+- `docs/post-phase0-2-product-gap-and-roadmap-discussion-2026-07-18.md`
+- `docs/p0-p2-completion-report-2026-07-17.md`
+- `docs/decision-log.md#dec-424`
+
+## 复审条件
+
+- 若 DOCX 本地生成依赖过大，可先交付 Markdown，再将 DOCX 作为本地可选组件；不得把用户内容上传第三方文档转换服务作为默认方案。
+- 若离线文件模型包导致安装包不可接受，可采用可验证的首次本地资源安装；不得恢复到依赖开发环境路径的实现，也不得把缺模型显示成网络离线。
+
+# DEC-426: 本地优先压缩包交付、稳定应用身份和 Web/客户端共享契约
+
+时间：2026-07-18
+
+状态：Accepted operating constraint / Applies to future implementation and self-test
+
+## 背景
+
+后续产品最终以可安装/可解压运行的 PC 客户端交付，用户不希望每次重新打包、重新启动或普通功能自测都需要人在电脑旁反复授权麦克风和 Keychain。与此同时，项目存在 Web 开发入口、旧开发端口和 packaged client，多套运行实例可能造成页面、Provider 状态和能力判断不一致。
+
+## 决策
+
+1. 交付采用本地优先桌面客户端：录音、实时/文件 ASR、SQLite、历史、会后编辑、导出和本地 backend/worker 均在本机完成。
+2. 除用户主动配置的 OpenAI-compatible LLM 文字请求外，不接云同步、不上传原始音频、不接付费远程 ASR、不默认启用远程遥测。LLM 请求只携带必要的文字上下文，不携带原始音频。
+3. Web 和客户端共享同一套 React/TypeScript UI、API schema、事件、reducer、编辑文档模型和导出契约；平台差异只能通过 microphone/backend/credential/capability adapter 表达，不复制两套业务页面。
+4. Web 本地开发服务器用于快速 UI、接口和 E2E 自测；packaged client 是采集、打包、权限、本地数据目录、导出和发布能力的唯一最终验收真相。Web 通过不等于客户端通过。
+5. macOS 权限不能通过文件夹授权替代。文件夹权限不等于麦克风 TCC 或 Keychain 权限；项目不得提取 Mac 密码、绕过 TCC、脚本化 SecurityAgent、放宽 Keychain ACL 或模拟用户点击。
+6. 通过固定 `/Applications/Meeting Copilot.app`、稳定 Bundle ID、稳定 Developer ID/Team ID、Hardened Runtime、Notarization 和同身份升级，把麦克风/Keychain 授权收敛为稳定身份下的一次显式授权。ad-hoc 临时路径、应用移动、换签名身份、卸载重装或系统重置权限后再次弹窗属于 macOS 约束，不能承诺完全消失。
+7. 普通自动化优先使用模拟音频、测试 WAV、fake microphone、fake LLM 和仓库外测试凭据注入；真实麦克风、Keychain 和未来 Screen Recording 只执行有明确证据目标的 packaged gate，不作为每轮开发的前置人工动作。
+8. Provider 生产凭据继续使用 Keychain；自动化测试凭据只能存在仓库外的 `0600` 测试注入位置，不能写进普通配置、仓库、日志、截图、evidence 或导出物。
+9. packaged runtime 必须通过 runtime manifest 注入 backend Python、FunASR Python、worker 和模型路径，不依赖开发仓库、用户缓存或全局工具。缺少实时模型、文件模型、backend 或 Provider 时，必须显示对应组件状态，不统一显示“离线”。
+10. 运行约束必须覆盖无人值守的启动/退出、backend/ASR/native mic 子进程回收、随机 loopback 端口、数据目录、历史恢复、编辑自动保存和导出；不要求用户每次守在电脑旁观察密码或授权弹窗。
+
+## Web 与客户端当前实际差异
+
+- Web 使用浏览器 `getUserMedia`，桌面使用原生 AVAudioEngine。
+- Web 依赖外部本地 backend，桌面由 app 自带 bundled backend、FunASR 和 supervisor。
+- Web 不直接管理 Keychain，桌面通过 Tauri IPC + macOS Keychain。
+- Web 的页面和业务状态应保持一致，但系统音频、权限、离线能力和运行目录不能宣称完全相同。
+
+这意味着不做两套前端 UI，而是做一套共享 UI 加平台 adapter，并在每项功能完成后分别跑 Web component/E2E 和 packaged client smoke。
+
+## 成本、隐私和发布影响
+
+- 不新增云同步、远程 ASR 或第三方文件转码服务的费用。
+- 本地离线文件转写模型约为 2GB 级别，可能作为安装包可选资源或首次安装的本地模型包；这增加磁盘/下载体积，但不等于新增云服务费用。
+- 发布包必须能在没有开发仓库、没有外部模型缓存和没有全局 ffmpeg 的干净 Mac 上完成主流程。
+
+## 关联文档
+
+- `docs/runtime-operating-constraints.md`
+- `docs/post-phase0-2-product-gap-and-roadmap-discussion-2026-07-18.md`
+- `docs/decision-log.md#dec-420`
+- `docs/decision-log.md#dec-421`
+- `docs/decision-log.md#dec-425`
+
+## 复审条件
+
+- 若 Apple 发布签名、应用身份或系统权限模型发生变化，重新验证稳定身份下的授权复用，不通过绕过权限解决。
+- 若未来确实要做 Web 云端 SaaS，必须另立产品决策，重新评估音频上传、账号、租户、加密、计费、保留和合规边界；不得在当前本地优先产品中隐式加入云同步。
+
+# DEC-427: 执行目标必须覆盖路线文档全部未完成事项并逐项自测
+
+时间：2026-07-18
+
+状态：Accepted current execution scope / Restored and clarified by DEC-431
+
+## 背景
+
+之前将执行目标错误收窄为只完成部分 P0 主线，容易在实时主链通过后把会后编辑、导出、录音导入、系统音频、多人 speaker、稳定性、打包、Windows/Web 边界等仍未完成事项留在文档里，造成“阶段通过”被误解为“产品全部完成”。
+
+## 决策
+
+1. 当前执行目标改为：完成最近持续追加的路线文档中所有尚未完成事项，即 NEXT-001 至 NEXT-023、运行约束和 DEC-426 关联门禁，并完成对应自动化/模拟/packaged/必要真实权限自测。
+2. 每个 NEXT 必须标记 `Implemented`、`Partial`、`Blocked` 或 `Not started`，并提供代码路径、测试命令、运行证据和剩余边界。
+3. 不得只完成 P0-A 或部分 Web 页面后宣称全量交付；系统音频、Windows、公开发布资质、真实多人质量等若受外部条件阻断，必须明确列为阻断，不得用 mock 冒充。
+4. Web 和桌面客户端只维护一套共享前端业务实现；Web/本地模拟用于效率，packaged client 是权限、打包、本地运行和发布验收真相。
+5. 用户不需要为普通开发和自测持续在电脑旁；真实麦克风、Keychain、Screen Recording 只在固定身份下执行专项 gate，系统授权不能绕过。
+
+## 关联清单
+
+- `docs/full-roadmap-execution-checklist-2026-07-18.md`
+- `docs/post-phase0-2-product-gap-and-roadmap-discussion-2026-07-18.md`
+- `docs/runtime-operating-constraints.md`
+
+# DEC-428: 本轮目标先完成持续追加的文档包，不把路线文档误当成本轮全量代码执行目标
+
+时间：2026-07-18
+
+状态：Historical / Superseded by DEC-431
+
+## 背景
+
+`DEC-427` 将近期持续追加的产品路线文档解释为本轮必须立即完成的 NEXT-001 至 NEXT-023 全量代码、平台、打包、权限和发布验收范围。这会把“把需求和边界写清楚”与“把所有未来路线实现完”混成一个目标，导致执行持续扩张、反复评估，无法给用户一个明确的文档交付物。
+
+## 决策
+
+1. 当前回合的唯一目标是完成文档包：
+   - `docs/post-phase0-2-product-gap-and-roadmap-discussion-2026-07-18.md`
+   - `docs/runtime-operating-constraints.md`
+   - `docs/full-roadmap-execution-checklist-2026-07-18.md`
+   - `docs/decision-log.md` 中对应的决策记录。
+2. 文档完成的定义是：产品初心、首发边界、Web/packaged 关系、成本/隐私/授权约束、NEXT-001 至 NEXT-023 的当前状态、验收出口、阻断证据要求和后续顺序均已分类、互相引用且没有把未实现事项写成已完成。
+3. 本轮文档完成不等于 NEXT-001 至 NEXT-023 完成，不等于真实麦克风、系统音频、自然多人中文质量、Windows、干净 Mac、签名公证或公开发布完成。
+4. 后续代码开发必须从文档收口后的单个 NEXT 或明确阶段目标重新立项，先写 SDD/API/TDD，再实现和自测；不得因为本轮文档状态为完成而跳过实现验收。
+5. `DEC-427` 仍保留为历史决策记录，但其“全量执行”不再是本轮目标；本记录是当前回合的范围覆盖。
+
+## 验收结果
+
+- 三份主文档各自职责已明确。
+- 全量清单保留 NEXT 条目真实状态，并明确“文档完成 != 代码完成”。
+- 运行约束补充了文档收口与实现非目标。
+- 路线讨论稿更新了已开始实现的实时主链/会后能力状态，避免将 `Not implemented` 与已有 partial code 混淆。
+- 本轮不以任何新增代码测试结果宣称产品全量交付。
+
+# DEC-429: 当前执行计划固定为持续追加文档包的完成
+
+时间：2026-07-18
+
+状态：Historical / Superseded by DEC-431
+
+## 背景
+
+在 `DEC-428` 已经明确“先完成持续追加的文档包”之后，执行目标又被扩大成了 NEXT-001 至 NEXT-023 的全量代码、平台、权限和发布验收。这重新引入了本次需要避免的范围膨胀，也会让文档交付和产品代码交付再次混为一谈。
+
+## 决策
+
+1. 当前执行计划的唯一交付物是持续追加的产品缺口与路线文档包：
+   - `docs/post-phase0-2-product-gap-and-roadmap-discussion-2026-07-18.md`
+   - `docs/runtime-operating-constraints.md`
+   - `docs/full-roadmap-execution-checklist-2026-07-18.md`
+   - `docs/decision-log.md` 中与本范围相关的决策记录。
+2. 本文档包必须完成内容分类、状态校准、验收出口、真实阻断边界、成本/隐私/权限约束、Web 与 packaged client 的关系以及后续实施顺序，并通过文档一致性检查。
+3. 文档包完成只代表需求和路线已经可追溯，不代表 NEXT-001 至 NEXT-023 已实现，也不代表产品已经通过真实麦克风、系统音频、自然多人中文、Windows、签名公证、干净 Mac 或公开发布验收。
+4. NEXT 条目的代码实现必须在文档包收口后按单个条目重新立项，遵循 SDD/API/TDD、实现、自动化测试和专项真实验收；不得借本次文档完成提前宣称代码完成。
+5. 本记录覆盖当前执行计划中任何与上述文档包冲突的范围解释；`DEC-427` 作为历史记录保留，`DEC-428` 继续作为文档包收口决策。
+
+## 验收出口
+
+- 三份主文档职责互不重叠且相互引用。
+- 所有 NEXT 条目都有真实状态和验收出口，未实现项没有被写成 Go。
+- 运行约束明确本地优先、仅远程 LLM、权限不可绕过和 Web/客户端共享边界。
+- 文档一致性检查结果已记录，且未用代码测试或旧 evidence 冒充文档完成。
+
+# DEC-430: 将当前目标重新收敛为“持续追加文档完成”
+
+时间：2026-07-18
+
+状态：Historical / Superseded by DEC-431
+
+## 背景
+
+用户再次确认，当前需要设定的目标是完成最近持续追加的文档，而不是立即执行文档中所有后续路线。此前的持久化执行目标仍保留了全量路线执行口径，容易使实施继续扩张，偏离本轮明确的文档交付物。
+
+## 决策
+
+1. 当前唯一目标是完成并验证以下文档包：
+   - `docs/post-phase0-2-product-gap-and-roadmap-discussion-2026-07-18.md`
+   - `docs/runtime-operating-constraints.md`
+   - `docs/full-roadmap-execution-checklist-2026-07-18.md`
+   - 本决策日志中的范围和验收记录。
+2. 本轮完成标准只包含文档职责、产品初心、首发边界、Web/packaged 关系、成本/隐私/授权约束、NEXT-001 至 NEXT-023 的真实状态、验收出口、阻断证据要求和后续实施顺序的一致性收口。
+3. 本轮不把任何 NEXT 条目的代码实现、接口迁移、真实麦克风、系统音频、自然多人中文质量、Windows、签名公证、干净 Mac 或公开发布门禁作为完成条件。
+4. 文档包收口后，后续开发必须另行以单个 NEXT 或明确阶段建立 SDD/API/TDD 目标；不得用本轮文档完成宣称产品代码完成。
+
+## 验收出口
+
+- 三份主文档职责互不重叠且相互引用。
+- NEXT-001 至 NEXT-023 各有唯一真实状态、验收出口、阻断边界和后续顺序。
+- 文档明确“文档完成 != 代码完成”，且没有把 mock、spike 或旧测试证据写成产品完成。
+- 文档一致性检查结果写回文档包，后续执行范围不再回到全量路线。
+
+# DEC-431: 完成持续追加文档中的全部事项，而不是只完成文档文字
+
+时间：2026-07-18
+
+状态：Accepted current execution scope / Supersedes DEC-428, DEC-429 and DEC-430
+
+## 背景
+
+此前将用户所说“设定刚才一直在追加的文档完成为目标”误解为只完成 Markdown 文档的整理、校对和一致性检查，并连续通过 DEC-428 至 DEC-430 把代码实现排除在目标之外。该解释与用户此前“完成文档里的所有事和自测”的明确要求冲突，也会再次造成主流程长期停留在评估和文档阶段。
+
+## 决策
+
+1. 当前唯一持久目标是完成持续追加文档包中列出的全部事项，即 `NEXT-001` 至 `NEXT-023`、运行约束和关联验收门禁的实现、自测、证据与状态回写；不是只把文档内容写完整。
+2. 文档基线已经整理完成，但不能据此关闭目标。每个 `Partial`、`Blocked` 或 `Not started` 条目都必须继续推进。
+3. 能在当前代码、本机和自动化环境中完成的事项必须实际实现；受 Developer ID、公证、Windows 真机、真实自然多人样本、硬件或 macOS 系统权限约束的事项，必须给出可复现的真实阻断证据、所需外部输入和解锁后的验收步骤，不得伪造完成。
+4. 开发按 SDD/TDD 和依赖顺序分批执行；优先关闭真实用户主流程 `NEXT-013` 至 `NEXT-023`，再推进系统音频、多人、稳定性、诊断和平台发布条目。分批通过不等于总目标完成。
+5. Web 与 packaged client 继续共享一套 React UI、API schema、事件和 reducer；mock、fake audio、fake LLM、spike 和 Web 证据只能关闭对应工程门禁，不能代替真实输入源、packaged、Windows 或公开发布验收。
+
+## 完成出口
+
+- `docs/full-roadmap-execution-checklist-2026-07-18.md` 中所有可实现项均有代码、自动化测试和运行证据。
+- 必要的模拟音频/fake LLM 主链、当前 packaged client 专项、导入、编辑、重试、导出、历史恢复和诊断交互均完成。
+- 外部阻断项具有可复现证据、明确责任边界、所需输入和解锁后的验收命令，不以 mock/spike 冒充 Go。
+- 决策日志、路线稿、运行约束、全量清单和最终交付报告与当前代码及 evidence 一致。
+
+# DEC-432: 本地数据采用分类删除、持久化保留策略和显式审计
+
+时间：2026-07-18
+
+状态：Accepted and implemented / Packaged UI regression pending final candidate
+
+## 决策
+
+1. 默认保留策略为 `local_until_user_deletes`，不会静默自动删除；用户可选择 30、90 或 365 天，自动保留任务由 SQLite 24 小时持久门禁控制，不做高频轮询。
+2. 删除范围固定为 `recording`、`derived`、`transcript`、`all`：分别表示仅录音、仅 AI 派生物、文字及依赖文字的 AI 派生物、整场会议。
+3. 分类删除使用 durable deletion job、幂等键、状态、失败重试和独立审计；整场删除保留不含会议内容的治理审计，不保留 transcript、audio、数据库导出或自由错误文本。
+4. `recording`、`transcript` 和 `all` 删除前取消该会议的进程内采集任务；删除同时覆盖 V2 数据、受控本地文件、会前准备和兼容投影，不能只隐藏历史列表。
+5. 共享前端不得使用 `window.confirm` 一键整场删除。历史页先展示删除范围与影响，默认选择破坏范围最小的“仅录音”；只有 `all` 成功后移除历史行。
+6. 正式接口为 `GET/PATCH /v2/data-governance/settings`、带 `scope` 的 `DELETE /v2/meetings/{id}`、删除 job 查询和审计查询。未来云同步必须另立治理决策，不能复用当前本地保留语义。
+
+## 当前证据
+
+- 数据治理核心、API、兼容投影和共享前端专项测试已通过。
+- 共享前端全量测试、typecheck、lint 和 production build 已通过。
+- 最终 packaged candidate 尚未重建，因此本决策不能单独关闭全部 NEXT-012 发布门禁。
+
+# DEC-433: Mac 系统音频使用正式 ScreenCaptureKit 单源适配器
+
+时间：2026-07-18
+
+状态：Accepted implementation / Real TCC and packaged end-to-end gate pending
+
+## 决策
+
+1. macOS 系统音频使用 app 内正式 Swift `ScreenCaptureKit` helper，不从产品运行时调用 Phase 0 spike，不接付费远程 ASR。
+2. helper 把系统音频转换为 `16 kHz / mono / Float32 LE` 并只发送到经过认证的随机 `127.0.0.1` WebSocket；不得写私有原始录音副本、上传 PCM 或调用远程 Provider。
+3. `microphone` 与 `system_audio` 在 NEXT-001 阶段严格互斥。会前由用户显式选择；权限拒绝必须返回 `permission_denied`、`fallback_source=null`，不得静默改用麦克风。
+4. 录音 journal、WAV、ASR、历史、回放、导出和删除继续由现有 V2 owner 管理。系统音频 helper 只负责采集和本地传输，不建立第二套会议资产。
+5. `mixed` 仍属于 NEXT-002，在双 track、时间戳、去重和任一轨失败语义完成前不得展示假选项。
+
+## 当前证据和边界
+
+- Swift helper、Rust supervisor、命令清单、bundle manifest、ad-hoc package 和无权限构建门禁已通过专项测试。
+- 共享 UI 接线、真实 TCC 拒绝/允许、Tauri IPC、真实 PCM、ASR、录音、历史和清理仍必须绑定最终重建 candidate 验收；在此之前 NEXT-001 保持 Partial。
+
+# DEC-434: 实时 AI 可观测性使用有界、内容无关的持久化 SLO
+
+时间：2026-07-18
+
+状态：Accepted and implemented / Final packaged evidence pending
+
+## 决策
+
+1. 实时 AI trace 默认最多保留 2,048 条原始阶段记录；淘汰前只把 allowlist 阶段时间、lane、重试和取消计数折叠到持久化 SLO，不保存 transcript、prompt、provider response、API Key、音频或 stage attributes。
+2. 会议/lane 指标覆盖 final 到首 token、final 到事件、排队、Provider TTFT、Provider 总耗时、事件到 UI；无样本必须返回 `null/no_data`，不能显示伪造的 `0ms`。
+3. SLO 使用 p50/p95/max、有界最近样本和累计 count；correction、intelligence、suggestion 分别使用明确阈值和 `pass/fail/no_data/insufficient_data` verdict。
+4. store 采用 `0600` 临时文件、`fsync` 和原子替换持久化，最多保留 256 个会议和 2,048 个 active checkpoint；进程退出前 checkpoint，重启后同 trace 完成时替换旧 checkpoint，不能重复计数。
+5. 会议级 SLO API同时返回本次 LLM 输入/输出 token、调用次数和可选 CNY 估算；价格未配置时保留 token，成本状态为 `unavailable`。
+6. 一键诊断包只包含去标识化的阶段聚合，不包含 meeting ID、会议标题、原文、路径、secret 或原始 trace。
+
+## 当前证据
+
+- SLO store、trace 淘汰、重试/取消、会议/全局 API、真实流式 fake gateway 的 intelligence timing/token 和诊断包脱敏测试已通过。
+- 最终 packaged candidate 仍需跑真实/模拟主链并记录达到或未达到 SLO 的实际样本；实现通过不等于性能门禁通过。
+
+# DEC-435: 说话人身份采用会议内稳定映射，系统不猜真实姓名
+
+时间：2026-07-18
+
+状态：Accepted and implemented / Real diarization quality gate pending
+
+## 决策
+
+1. ASR/diarization 只提供会议内 `speaker_id` 和可选置信度；持久层按首次出现顺序生成稳定的 `Speaker 1/2/3`，不得从声音、文字或上下文猜测真实姓名。
+2. transcript segment、semantic paragraph、事件、API、共享前端和导出统一携带 `speaker_id`、`speaker_label`、`speaker_confidence`；speaker 变化强制结束上一自然段，不能把不同人发言错误拼接。
+3. 用户可以在会中和会后手工重命名。重命名在 SQLite 事务内回填既有文字和自然段，按会议隔离，刷新后保留；同一会议内重复 label 返回明确 `409`。
+4. 低置信度只显示克制提示，不自动改名。当前 speaker 数据模型和 UI 完成不等于本地 diarization 模型质量通过；自然多人中文、串音和远场仍由 NEXT-003/NEXT-004 的真实门禁关闭。
+
+## 当前证据
+
+- speaker persistence、API、事件透传、共享 reducer、会中/会后 UI、重命名和导出专项通过。
+- backend full `1120 passed`；frontend full `18 files / 146 tests passed`，typecheck、lint、build 通过。
+
+# DEC-436: 三格式导出以用户最终稿为准并保持完全本地生成
+
+时间：2026-07-18
+
+状态：Accepted and implemented / Packaged download gate pending
+
+## 决策
+
+1. Markdown、DOCX、JSON 均优先导出最新 `user_final`；AI 再生成不得覆盖用户稿，用户再次编辑后下一次导出必须立即反映新版本。
+2. DOCX 由本地代码在内存中生成，不调用远程文档服务，也不在服务端遗留隐式导出文件；三种格式只通过下载响应交付。
+3. JSON 同时保留原始 ASR、AI canonical、用户最终稿、版本来源、speaker、时间、证据哈希和修订审计，便于后续自动化与追溯。
+4. 文件名按会议标题和日期生成并清洗路径/控制字符；不支持格式、存储不可用、文档生成失败和下载合同失败使用稳定错误类，响应不得泄露绝对路径或底层自由异常。
+
+## 当前证据
+
+- export focused tests、speaker/export 集成测试和 ruff 通过；backend full 回归通过。
+- 最终 packaged candidate 的实际下载、打开和用户编辑后再导出仍需在 NEXT-020 gate 中验收。
+
+# DEC-437: 无人值守主链必须有命令超时和会议强制收尾
+
+时间：2026-07-18
+
+状态：Accepted and implemented
+
+## 背景
+
+首次可见 Chrome fake microphone 主链中，业务已经产生两段 final、AI 修正和追问，但一次 CDP screenshot 请求没有返回。旧控制器没有命令超时，导致脚本长期挂起、会议继续录音，不能作为生产级无人值守验证工具。
+
+## 决策
+
+1. 每个 Chrome DevTools Protocol 命令必须在 15 秒内完成；超时后移除 pending request 并返回明确错误，WebSocket 关闭时拒绝全部挂起请求。
+2. screenshot 超时只允许一次 `fromSurface=false` 的有界 fallback，不能无限重试。
+3. 主链无论成功、合同失败或页面控制失败，finally 都先查询 meeting snapshot；仍为 live 时调用 `end_and_review`，随后关闭 CDP、Chrome 和临时 profile，不能留下孤儿录音。
+4. fake ASR 和 fake LLM 必须分别显式标记 `is_mock=true`；缺少任一标记时范围合同必须 No-Go，不能因使用本地 loopback 就默认视为 mock 或真实 Provider。
+5. 可交付 report 不记录绝对音频路径或原始 meeting ID，只记录音频文件名和 meeting ID 短哈希；fake 主链继续标记 `acceptance_eligible=false`、`counts_as_real_release_go=false`。
+
+## 当前证据
+
+- 修复后可见 Chrome 主链得到 `passed_non_acceptance`：partial、final、AI 修正、追问、会后三任务、录音、完整文字、历史回开均通过，浏览器错误为 0。
+- 首 partial `834ms`、首 final `1050ms`、首建议/修正 `3179ms`；这些是 scripted ASR/mock LLM 工程延迟，不替代真实本地 ASR 与真实 relay SLO。
+- evidence：`artifacts/evidence/v2-fake-mainline-r4/`。其中 `report.json` 为脱敏主报告；snapshot/events/traces 仅含脚本化测试内容，仍不作为公开用户数据样本。
+
+# DEC-438: 将 NEXT-022 内部 packaged 工程闭环与公开发布门禁分层记录
+
+时间：2026-07-19
+
+状态：Historical / Internal scope overclaim; superseded by DEC-439
+
+## 背景
+
+最新本机 packaged 文件 ASR 已经完成 WAV、M4A、MP3 三格式真实模型 smoke，旧的“packaged models absent”不再准确描述内部工程状态。同时，当前 app 仍是本机 ad-hoc artifact，模型来源含 mutable `master`，发布级再分发审批、签名公证和 clean Mac 尚未闭环。若只写一个 Go 或 Blocked，会把工程可运行性和外部可发布资格混成同一结论。
+
+375px 产品回归也已修复“录音”tab 与导出按钮 overlap，需要记录为共享前端门禁通过，但同样不能外推为 packaged 公开发布通过。
+
+## 决策
+
+1. `NEXT-001` 至 `NEXT-023` 继续作为不可缩减的执行范围；本决策只校准已有证据边界，不关闭全量路线目标。
+2. `NEXT-022` 分两层记账：packaged runtime/model plumbing 和 WAV/M4A/MP3 真实执行 smoke 为 **Internal engineering Go**；签名、公证、供应链和 clean Mac 为 **Public release No-Go/Blocked**。
+3. 内部 smoke 的主证据固定为 `artifacts/tmp/next022-packaged-file-asr-smoke-20260719-r2/evidence.json`：`status=passed`、`duration_seconds=137.139`，三格式任务均成功持久化，且 `fake_asr_used=false`、`remote_asr_used=false`、`global_ffmpeg_used=false`。
+4. 当前性能/体积观测记录为：三个模型冷启动约 `74s`、模型执行 RTF 约 `0.46`、app 逻辑体积约 `4.50GB`（`4,498,694,100 bytes`）。它们是本机工程 smoke 数据，不是模型质量 benchmark、长期 SLO 或 clean Mac 结果。
+5. 受控 model-pack manifest 基于上游 Apache-2.0 的内部 `redistribution_status=approved`，只证明本轮包内控制清单允许 smoke；模型版本仍来自 mutable `master`，公开发布所需的不可变 revision 和完整模型/依赖再分发审批仍是 blocker。不得把两个审批层级合并。
+6. Developer ID 稳定签名、Hardened Runtime、签名公证/stapling、Gatekeeper 和独立 clean Mac 安装/升级/运行仍阻断公开发布；`NEXT-009` 必须保持 Public release No-Go，不能因 NEXT-022 内部 Go 改写为 Go。
+7. `375px` overlap 修复由 `artifacts/evidence/v2-product-smoke-iab/report.json` 记录：`verdict=go`、`exportOverlapWidth=0`、录音 tab 全宽可见、无横向溢出且 `browser_error_count=0`；frontend full 为 `18 files / 146 tests passed`。该 Go 仅关闭共享前端响应式回归。
+
+## 边界
+
+- **内部工程闭环**回答指定代码和本机 artifact 是否真实跑通；**外部门禁**回答该 artifact 是否具备可签名、公证、合规再分发并在 clean Mac 复现的公开发布资格。
+- Internal engineering Go 不蕴含 Public release Go，不关闭 `NEXT-009`，也不替代真实权限、自然多人质量、长会、Windows 真机或 `NEXT-001` 至 `NEXT-023` 其他未完成门禁。
+
+# DEC-439: NEXT-022 必须通过防劫持、sealed hash 和 Tauri supervisor 后才能记内部 Go
+
+时间：2026-07-19
+
+状态：Accepted / Hardening and r2 rebuild in progress
+
+## 背景
+
+对 `DEC-438` 主证据的独立对抗审计确认，WAV、M4A、MP3 的真实模型执行和 SQLite 持久化确实发生过，但 runner 直接启动 app 资源包中的 backend，没有经过 Tauri/Rust supervisor；宿主环境仍可覆盖 Python、worker 或模型路径，三项 no-fake/no-remote/no-global-FFmpeg 字段也是静态写入。Rust/Python capability 只检查存在性，没有完整复核 sealed component hash。FFmpeg wrapper 许可证也不能代表实际 GPL-enabled FFmpeg binary 已获公开再分发批准。
+
+## 决策
+
+1. `DEC-438` 的 Internal engineering Go 结论撤回；旧 evidence 降级为“app 资源包 + direct backend API 的本机真实模型执行证据”。
+2. NEXT-022 内部关闭必须同时满足：清除或拒绝宿主 ASR 路径覆盖；从实际受控来源推导 no-fake/no-remote/no-global-FFmpeg；校验 sealed component inventory；启动 Tauri binary 并经过 Rust supervisor；在同一重建 candidate 上完成文件导入和进程清理。
+3. 模型 README/内部控制清单只能表示 `internal_controlled_smoke`，不能使用容易误读为法律批准的公开 `approved`；FFmpeg binary provenance、对应许可证材料和公开再分发状态必须独立记录为 unresolved，缺失时公开发布 fail closed。
+4. 当前 r1 可作为加固前基线，不能成为最终 candidate。完成代码和 focused/full tests 后必须重建 r2，重新运行 supervisor、真实模型三格式、完整 packaged API/UI 和脱敏 evidence。
+5. `NEXT-009`、clean Mac、Developer ID、公证、Windows、真实系统音频和自然多人质量继续保持各自真实阻断，不被 NEXT-022 工程进展覆盖。
+
+# DEC-440: r3 关闭 NEXT-022 内部 packaged 工程门禁，但不关闭公开发布
+
+时间：2026-07-19
+
+状态：Accepted / Internal packaged engineering Go; public release remains No-Go
+
+## 背景
+
+DEC-439 撤回了未经 Rust supervisor、防宿主路径劫持和 evidence 关联验证的早期内部 Go。r3 已在同一 App binary 和 runtime manifest 上完成打包、Rust supervisor、三格式真实模型和完整 packaged API 主链。同时，两次真实 No-Go 揭示旧同 Bundle ID 实例和 AppKit crash-history state restoration modal 会使无人值守启动停在 Tauri setup 之前。
+
+## 决策
+
+1. `full-roadmap-candidate-20260719-r3` 是当前 NEXT-022 内部工程候选；App binary SHA-256 为 `b27ddb29f29af9b422ccdc0842e142b01750a78785f05f5b565e649929e13f83`。
+2. Rust 启动时对 shared runtime 和大型模型目录执行 metadata shape、required files、symlink 边界和 manifest mirror 校验；launcher、worker、converter 等小文件继续完整哈希。构建期仍计算 sealed full hash，公开发布真实性最终依赖稳定 code signing。
+3. supervisor gate 在 `18.604s` 内完成 bundled backend、认证 bootstrap、FunASR 非空中文 final 和自然清理；hardened WAV/M4A/MP3 gate 在 `79.97s` 内完成真实包内模型转写，package association verified，且未使用 fake/remote/global FFmpeg。
+4. packaged authenticated API gate 的 37 项全部通过；packaged fake-AI 主链通过。两者使用明确 fake OpenAI-compatible gateway，只证明业务编排，不计作真实 LLM、UI、真实权限或公开发布证据。
+5. 所有 packaged 自动化 runner 必须传入 AppKit no-restoration arguments，避免 crash-history modal 阻塞 setup；测试必须保留第一次 RED 和两次 No-Go evidence。真实产品崩溃恢复仍由 NEXT-006/NEXT-009 专项关闭。
+6. NEXT-022 记为 **Internal packaged engineering Go / overall Partial**。mutable 模型来源、FFmpeg/模型公开再分发审计、Developer ID、Hardened Runtime、公证/stapling、Gatekeeper 和 clean Mac 仍使 NEXT-009 与公开发布保持 No-Go。
+
+## 主证据
+
+- `artifacts/tmp/tauri_runtime_package/full-roadmap-candidate-20260719-r3/evidence.json`
+- `artifacts/tmp/packaged_runtime_supervisor_smoke/full-roadmap-candidate-20260719-r3-supervisor-r3/evidence.json`
+- `artifacts/tmp/next022-hardened-direct-r3/evidence.json`
+- `artifacts/tmp/full_roadmap_packaged_acceptance/full-roadmap-candidate-20260719-r3-acceptance/report.json`
+- `artifacts/tmp/packaged_ai_mainline_smoke/full-roadmap-candidate-20260719-r3-ai/evidence.json`
+
+# DEC-441: 用 r6 关闭真实 relay 协议主链疑问，但不关闭实时性能、UI 或全量路线
+
+时间：2026-07-19
+
+状态：Accepted / Real packaged provider API mainline Go; performance and full roadmap remain open
+
+## 背景
+
+r5 packaged candidate 已证明真实 Provider 配置和会后 minutes/approach 可用，但实时 intelligence 因模型结构响应不符合严格合同而失败。原 prompt 只列字段名，没有完整声明类型、枚举、null 和逐字 evidence 规则；动态输出预算最低为 `256`。公开合成技术会议复现过 `follow_up.urgency=null`，因此不能把失败解释成网络偶发，也不能通过反复重跑碰运气。
+
+## 决策
+
+1. 实时 intelligence prompt 明确声明字段类型、枚举、null、paragraph ID/revision 和逐字 evidence 约束；输出预算调整为 `768..4096`。
+2. 首次严格解析失败时，允许同一调用内最多一次受控结构修复，使用独立确定性幂等键；repair 不向 UI 流式暴露无效 JSON。第二次仍失败则保持 fail-closed，保留原始文字，不生成关键词语义 fallback。
+3. r6 candidate 固定为 `artifacts/tmp/tauri_runtime_package/full-roadmap-candidate-20260719-r6/Meeting Copilot.app`，App binary SHA-256 为 `1b6b16ad6fffd7a3771d9c49aed4397cfe23bc2fda9dd36f63f1f05922cb8ef3`。
+4. r6 真实 relay evidence 为 `artifacts/tmp/packaged_real_provider_mainline_smoke/full-roadmap-candidate-20260719-r6-real-provider-architecture/evidence.json`：`status=go_packaged_real_remote_llm_mainline_not_ui_not_public_release`，真实 `responses` Provider、非 mock、3 次调用、`3125` tokens；同一 session 产生主题、决定、待办、开放问题、追问和 `meeting.intelligence.applied`，修正达到 `no_change` 终态，会后产物和全部进程清理完成。
+5. 本次 TTFT `19,563.405ms`、provider total `23,459.874ms`，明确不满足当前实时 SLO。`NEXT-005` 保持 Partial；后续优先验证更快国产小模型、短上下文、能力感知结构化输出和异步展示，不以最终成功掩盖用户等待时间。
+6. r6 supervisor 和 37/37 packaged authenticated API acceptance 分别通过；后者使用明确 fake gateway，只证明确定性业务编排。两者均不能替代真实 UI、真实 microphone、Screen Recording/TCC、自然多人、长会、签名公证或 Windows。
+7. `NEXT-001` 至 `NEXT-023` 总目标继续 Active。r6 只关闭“真实 OpenAI-compatible relay 能否驱动 packaged backend 实时智能主链”的技术疑问，不关闭 `NEXT-005` 性能、`NEXT-015/016` 完整 UI/可靠性，也不关闭总产品交付目标。
+8. r6 文件 ASR direct-backend evidence 为 `artifacts/tmp/next022-hardened-direct-r6/evidence.json`：同一 App binary/package evidence 下 WAV/M4A/MP3 真实模型执行与持久化通过，耗时 `81.818s`，但 claim scope 明确 `rust_supervisor=false`、`tauri_supervisor=false`；它不能替代 UI/Rust 同进程导入、clean Mac 或公开发布。
+
+## 剩余可靠性债务
+
+- paragraph correction 已复用 transcript correction 的长度、相似度和事实签名安全门禁；负责人、日期、比例数值、决策极性或技术实体变化现在归类为 `semantic_safety` 并保留原文，中文分数与等价百分比先精确换算后允许格式归一化。该源码增量尚未打入 r6，下一 candidate 仍需真实变化 revision 与 UI diff 证明。
+- 真实 relay 需要重复公开样本观测 first-pass/repair success rate、P95/P99 和实际成本，单次 Go 不能替代可靠性分布。
+
+## 同轮后续补强
+
+- r6 证据完成后，当前源码新增 per-attempt usage callback：首次调用和 repair 的 usage 都在解析前立即进入 ledger，repair 前重新执行预算门禁，成功路径不再重复记账。
+- validation error 现在带稳定 category；`structural/truncated` 最多 repair 一次，`evidence/stale/semantic_safety` 直接 fail-closed。未知 evidence 和过期 revision 专项均证明只调用 Provider 一次。
+- 浏览器真实麦克风 acceptance 测试原先只等待 `audio.assembled`，会与并行持久化的 `evaluation_summary` 竞态；测试改为等待两个公开终态，连续 10 次通过。
+- paragraph fact-preservation focused 为 `77 passed`，当前 backend full 为 `1141 passed, 1 warning`；上一完整跨栈回归为 root `516 passed, 1 skipped, 2 warnings`、frontend `151 passed`、Rust `65 passed, 2 ignored`。这些补强晚于 r6 package，不得倒算为 r6 packaged evidence，下一 candidate 必须重新执行真实 relay、supervisor、fake acceptance 和 UI gates。
+
+# DEC-443: 可见 UI 录音回放必须接受整体、轨道和混合三类本地 URL
+
+时间：2026-07-19
+
+状态：Accepted and implemented / shared UI fake mainline passed; real permission gates remain open
+
+## 背景
+
+共享 UI 的录音回放已经支持麦克风/系统音频轨和混合回放，但旧 E2E runner 只判断 `/v2/meetings/{id}/audio/content`。在 r13 visible Chrome 主链中，产品正确请求 `/v2/meetings/{id}/audio/tracks/microphone/content?epoch=0` 并获得 `206`，旧门禁却把它报为缺少播放器。
+
+## 决策
+
+1. 新增共享 `isMeetingAudioContentUrl()` 合同，要求同源、`/v2/meetings/{id}/audio/` 前缀和合法 `content` 结尾；支持 legacy overall、`tracks/microphone`、`tracks/system_audio` 和 `mixed/{asset}`。
+2. product smoke 和 real mainline 的 DOM wait、source assertion、媒体 abort allowlist 共用同一合同，Node tests 覆盖合法/非法 URL。
+3. E2E 报告必须同时验证 `audio.controls=true` 和 URL 合同，不能只看服务端 `/audio=assembled`。
+
+## 证据
+
+- RED：`artifacts/tmp/browser_live_mic/r13-full-ui-mainline-r2/error-report.json`；对应现场 `/audio/tracks/microphone/content` 已返回 206，证明是门禁陈旧而非播放器缺失。
+- GREEN：`artifacts/tmp/browser_live_mic/r13-full-ui-mainline-r3/report.json`，`verdict=passed_non_acceptance`；首文字 `515ms`、首 final `1,024ms`、首建议/修正 `2,955ms`，两段 transcript、1 revision、录音 2 chunks、review/history 和 cleanup 全通过，浏览器错误为 0。
+- 合同测试：`node --test code/web_mvp/e2e/workbench_v2_fake_mainline.test.mjs` 为 `6 passed`；相关 Python static/E2E contract focused `16 passed`。
+
+## 边界
+
+此决策只修正共享 UI 与真实本地回放 URL 的验收合同，不关闭真实麦克风、Screen Recording/TCC、真实 relay、自然多人中文、长会或公开发布门禁。
+
+# DEC-442: 后端崩溃恢复以连续音频、ASR 重连和录音组装共同判定
+
+时间：2026-07-19
+
+状态：Accepted / NEXT-006 backend-crash short gate passed; full NEXT-006 remains Partial
+
+## 背景
+
+r7 证明旧 soak 只要 backend health 恢复就可能误判 GREEN；r8 虽然 supervisor 拉起新 backend，但旧 capture lease 和 resident FunASR session 使音频只送达约 10.8 秒。r10 通过 startup recovery 和 setup 顺序修复恢复到 `50.927s/60s`，但 pipeline trace 顺序异常仍会终止 ASR WebSocket。trace 隔离后，r12 又暴露 background export 重写 manifest 时间和 setup failure 泄漏新租约的问题，造成 262 次 `recording_resume_failed`。
+
+## 决策
+
+1. backend crash 子门禁只有在新 backend PID、durable state、post-fault ASR ready 和 post-fault audio growth 同时成立时通过；health-only recovery 明确失败。
+2. 已有音频 manifest 拥有起始时间线。export/recovery 不能用 SQLite 的近似毫秒值覆盖；writer setup 与 export 对同一 meeting 使用同一资产锁。
+3. writer setup 取得 capture lease 后失败时，按 exact owner/generation CAS 中断本次 capture，释放 lease 并 abort recognizer。stale rollback 返回 no-op，不能影响更新 generation。
+4. operational pipeline trace 使用 fail-open `observe()`；无效指标丢弃并记录脱敏 stage/error class，严格 `record()` 仍保留给测试和不变量验证。指标异常不能进入 ASR、录音或用户主链异常域。
+5. r13 是本决策的 packaged candidate，App binary SHA-256 为 `49105d37e9b340f36958413295ecdb724a1f07f9fb9ee5c3c8b03a76e9feeaf3`。backend full 在锁定 Python 3.13 环境为 `1153 passed, 1 warning`。
+
+## 证据和边界
+
+- RED：`artifacts/tmp/next006-real-sut/next006-r12-continuous-backend-recovery/report.json`。
+- GREEN：`artifacts/tmp/next006-real-sut/next006-r13-continuous-backend-recovery/report.json`。RTO `5.934s`，post-fault ready/audio growth 通过，`53.95s/60s` 音频送达，最终录音 `53.104s`、11 chunks、1,699,378 bytes、ready/assembled，meeting end 200，SQLite quick check ok，全部进程退出。
+- 本次未配置 LLM Provider，AI jobs 的 `retry_wait` 是明确保留的未关闭状态，不得把 queue/sqlite aggregate failure 隐藏为全量 GREEN。
+- Provider disconnect/429/5xx、disk-write、ASR worker crash、App crash、1h/3h、sleep/wake、真实设备切换仍开放。DEC-442 只关闭 backend-crash short gate；`NEXT-006` 和 `NEXT-001..023` 总目标继续 Active。
+
+# DEC-444: 三份持续追加文档是唯一完整目标，任何批次目标不得覆盖它
+
+时间：2026-07-19
+
+状态：Accepted / Active full-roadmap target lock
+
+## 背景
+
+执行过程中多次把“当前一轮自测”“修复主链红灯”或“建立完整文档”描述成目标，造成用户合理担心总目标再次被缩小。用户再次明确：目标是完成此前持续追加文档中记录的全部事项，而不是只完成某个评测、候选包或文档整理批次。
+
+## 决策
+
+1. 唯一持久目标固定为 `post-phase0-2-product-gap-and-roadmap-discussion-2026-07-18.md`、`runtime-operating-constraints.md` 和 `full-roadmap-execution-checklist-2026-07-18.md` 的完整执行范围。
+2. `NEXT-001` 至 `NEXT-023` 必须逐项完成代码、接口/存储迁移、共享 UI、focused/full tests、packaged/真实专项、脱敏 evidence 和文档回写。
+3. 当前回归、r14 构建、Provider 性能、自动 diarization、TCC、Windows 和公开发布只是该目标的子步骤；不得创建更小目标覆盖持久目标，也不得因某一子步骤通过就标记总目标完成。
+4. fake、synthetic、shared Web、API-only、direct Provider 或 helper-only evidence 只能关闭其明确声明的范围。真实 microphone、ScreenCaptureKit、自然多人中文、Windows、稳定签名、公证和 clean machine 仍须真实证据。
+5. 外部条件必须生成严格 blocker 包，包含缺失输入、复现、已有替代证据、解锁条件和验收命令。未经 blocker 包审计的“需要外部条件”不能作为目标完成依据。
+
+## 当前审计结论
+
+- 严格审计为：`NEXT-011` 已按本地 Web 定位闭合；17 项已实现部分能力但仍缺最终范围证据；`NEXT-003/009/010` 有实质未实现；`NEXT-004/008` 主要受外部条件影响但 blocker 包仍需补齐。
+- 当前源码基线为 frontend `181/181`、backend `.venv` `1162/1162`、Rust `70 passed / 2 ignored` 和 `cargo check` 通过；这些结果只恢复绿色开发基线，不关闭全量目标。
+
+# DEC-445：`8767` 旧工作树与 clean 主线 UI 分离，视觉层必须移植而非覆盖业务
+
+时间：2026-07-19
+
+状态：Accepted / visual layer implemented; clean candidate verification pending
+
+## 背景
+
+用户在 `http://127.0.0.1:8767/workbench` 看到的页面并不是当前完整主线。进程 `PID 16795` 的工作目录是：
+
+```text
+/Users/chase/Documents/面试/meeting-copilot/code/web_mvp/backend
+```
+
+而当前正式开发与验收工作区是：
+
+```text
+/Users/chase/Documents/面试/meeting-copilot-phase0-clean
+```
+
+旧工作树的 `frontend_v2` 包含另一轮视觉改版（品牌资源、窄侧栏导航、动效和布局层），但它只有约 36 个源文件；clean 主线约 60 个源文件，并包含本地 API base 安全约束、Provider 设置、会前检查、会议命名、录音导入、原生音源适配、speaker revision、可编辑会后文档、独立重试和 Markdown/DOCX/JSON 导出等业务能力。直接把旧目录覆盖到 clean 主线会回退这些能力，不能称为 UI 合并。
+
+## 决策
+
+1. 不停止或改写当前旧的 `8767` 进程；它仅作为历史/旧工作树对照证据，不代表当前候选实现，也不得继续作为主线验收入口。
+2. `phase0-clean` 保持唯一实现主线。旧仓库只提取已经明确需要的视觉层资产：品牌图、BrandMark、产品导航的视觉结构、窄侧栏布局、motion-aware scrolling 和相关 CSS token；所有业务组件、API schema、事件、reducer、数据持久化、导出和权限边界以 clean 主线为准。
+3. Web 与 macOS 客户端继续共享同一套 React/TypeScript 页面；平台差异只能落在本地 API、Tauri/原生音频、凭据和 capability adapter。不得因为旧仓库存在另一套页面而维护两套产品 UI。
+4. 视觉移植完成后，必须在新端口启动 clean 服务，与 `8767` 做并排对照，并以 `1440x900`、`1280x800` 和 `390x844` 复核：主动作唯一、实时文字为主内容且持续可回看、AI 修正/建议可见、录音/历史/设置/导入/编辑/导出可达，不能出现重复结束会议按钮或被内层滚动裁掉的首屏内容。
+5. 本决策不关闭任何 `NEXT-001` 至 `NEXT-023`。旧 `8767` 页面的 mock/历史数据、视觉效果或已运行进程不能作为 clean 主线业务、真实 ASR、真实 Provider、packaged client 或公开发布证据。
+
+## 当前核查证据
+
+- `8767`：旧仓库 backend 进程，不能代表 clean 主线。
+- clean 前端：视觉层已移植到工作树并通过 frontend `24` 个测试文件、`197/197`、typecheck、lint 和 production build；尚未形成最终 candidate package，不能把这项 UI 结果描述成全量产品或发布包完成。
+- 旧目录与 clean 目录存在大规模业务差异；当前策略是增量移植视觉层，避免覆盖生产功能。
+- clean backend 已在 `8788`、clean Vite 前端已在 `5188` 启动并通过页面加载/空状态 DOM 核查；`5174` 仍是 clean 前端但代理到旧 `8767`，不作为本轮同源验收入口。
+
+## 验收边界
+
+视觉层合并只能关闭对应的共享前端视觉/布局回归。它不替代真实麦克风、真实 FunASR、自然多人中文 diarization、真实 Provider 延迟、Tauri 权限、签名公证、Windows 或公开发布验收。
+
+# DEC-446：多 Agent 中断后以落盘代码和独立回归恢复，不依赖最后回复
+
+时间：2026-07-19
+
+状态：Accepted / execution constraint
+
+## 背景
+
+本轮多个 Agent 曾因上游 `502` 或上下文切换返回 `not_found`。SQLite 与 diarization 打包改动已经进入共享工作树，但部分 Agent 的最后总结不可用。若把最后回复当成唯一交接，容易重复实现、覆盖并行改动或错误丢弃已有结果。
+
+## 决策
+
+1. 每个 Agent 必须获得唯一主线绝对路径、互斥文件所有权、测试命令、证据边界和完整目标约束。
+2. Agent 成果以共享工作树中的文件、diff、测试和 evidence 为准；最后回复只用于加速审查，不是完成证明。
+3. 中断时先检查负责文件是否落盘，并重新执行负向/正向测试。缺总结不等于代码丢失；也不得凭旧上下文覆盖现有文件。
+4. 主线程必须独立复核 focused gate；跨模块改动还须进入全后端、前端、root、Rust 和 packaged 回归。
+5. 本规则不降低证据标准。mock、Web、API 或 helper 结果仍不能替代真实权限、自然多人、Windows 或公开发布门禁。
+
+# DEC-447：SQLite application schema 由单一 V2 注册表显式 bootstrap 并 fail closed
+
+时间：2026-07-19
+
+状态：Accepted and implemented / packaged upgrade gate remains open
+
+## 决策
+
+1. application schema 固定为 V2；legacy repository schema 和完整 V2 DDL、additive columns、实体表重建、标题/数据回填、索引与 seed 纳入同一确定性 fingerprint 材料。
+2. `create_app` 启动顺序固定为正式 schema bootstrap、legacy JSON 兼容导入、V1 到 V2 数据迁移、repository 构造；正式 bootstrap 失败时不得继续启动。
+3. 唯一已知预发布 V2 fingerprint 只有在表、列、索引、实体 kind、foreign key 与所有回填不变量完成只读审计后才可升级。审计不得调用迁移函数修复候选数据库。
+4. 缺少 additive column 或程序化索引时保持旧 fingerprint 和数据库形状不变，由正式 migrator 因 mismatch 拒绝启动。
+5. `/v2/diagnostics/application-schema` 只返回版本、是否迁移和是否创建备份，不暴露数据库/备份路径、SQL、用户内容或 Provider 信息。
+
+## 证据与边界
+
+- schema focused `10/10`；SQLite/app 相关回归 `227/227`；当前 backend full `1218/1218`。
+- 仍需在下一 packaged candidate 执行真实旧数据升级、回滚、安装覆盖和 clean Mac 门禁；本决策不关闭 `NEXT-009`。
+
+# DEC-448：NEXT-003 进入真实本地 diarization Partial，模型清单只允许内部受控打包
+
+时间：2026-07-19
+
+状态：Accepted / Internal controlled model smoke passed; packaged and natural acceptance open
+
+## 决策
+
+1. `NEXT-003` 从 Not started 改为 Partial。真实本地 FunASR VAD/CAM++ worker、PCM 旁路、speaker turn/revision、持久化、重命名、共享 UI 与导出已存在。
+2. 新受控清单固定 VAD `v2.0.4`、CAM++ `v1.0.0` 和 allowlisted file/inventory hashes；模型源必须由 operator 显式传入，三项输入缺一拒绝，不从用户缓存自动推断。
+3. 清单只声明 `verified_for_internal_packaging` 和 `public_redistribution_unresolved`。它不能批准公开再分发，也不能替代 Developer ID、公证、clean machine 或 Windows。
+4. 受控真实 worker smoke 使用两个同人中文样本和一个不同人样本：同人样本合并为第一 turn，不同人形成第二 turn；总 samples 连续，2 个 speaker，未下载模型，stdout 为纯 JSONL，stderr 不含 PCM。
+5. packager 在进入下一 candidate 前必须修复源 bundle symlink 的写越界风险、manifest/inventory 绑定、不完整模型误判和原始 operator manifest 泄漏路径；完成前不得打包该模型对。
+
+## 证据边界
+
+- `artifacts/evidence/diarization-controlled-real-model-smoke-20260719.json`
+- 该 evidence 明确 `acceptance_eligible=false`；自然多人、重叠、口音、噪声、长会和 packaged app 仍开放。
+
+# DEC-449：macOS public release runner 必须复用严格 signer，禁止 `--deep`
+
+时间：2026-07-19
+
+状态：Accepted and implemented / Public release remains No-Go
+
+## 决策
+
+1. public release runner 不再执行递归 `codesign --deep`，而是调用 `tools/macos_codesign.py::sign_and_verify` 的 Developer ID 模式。
+2. 在进入 DMG、公证、stapling 和 Gatekeeper 之前，必须验证 exact identity、Hardened Runtime、secure timestamp、每个计划 target 已签名，以及每个 target 的 runtime、identity、entitlements 均通过。
+3. staging、严格签名/验证、DMG 构建/签名、公证、stapling 或 Gatekeeper 任一步失败都立即 fail closed；不得回退旧 signer，也不得在严格签名失败后提交公证。
+4. evidence 只记录有界状态和命令结果，不读取或记录 notary credential 值。
+
+## 证据与边界
+
+- strict signer 与 public runner 的 focused 合同测试当前为 `28/28` 通过，源码中无 `--deep` fallback。
+- runner 现在明确区分 Apple 分发通道与公开发布资格：即使未来 Apple 分发通道完成，evidence 也必须保持 `counts_as_public_release_package=false`，直到再分发 provenance 与独立 clean machine 验收完成。
+- 当前外部预检 evidence `artifacts/tmp/release_external_preflight_current-20260719-r15-blocker/evidence.json` 记录 Developer ID identity 为 `0`、notarytool 可用但 notary profile 缺失、Gatekeeper 未验收、Windows 真机未验收；模型/FFmpeg 再分发许可也未闭环。因此 `NEXT-009` 仍为 Partial / Public release No-Go。
+- 当前没有读取或记录任何 notary credential、Keychain password 或其他 secret；本决策只记录有界状态和 blocker 类别。
+
+# DEC-450：Workbench runtime identity 必须绑定当前 clean 主线，不能只看 `/health=ok`
+
+时间：2026-07-19
+
+状态：Accepted and implemented / runtime identity gate passed; packaged and public-release boundaries remain open
+
+## 背景
+
+历史上 `8767` 可能由旧工作树提供。仅检查端口可访问或 `/health=ok`，无法证明页面、backend、schema 和源码来自当前 clean 主线，也可能把旧进程错误地当作本轮候选。为避免旧实例、残留 PID 或外来进程污染验收，workbench 启动器增加了可验证的受管 runtime identity。
+
+## 决策
+
+1. 当前主线 runtime 必须同时通过 health service contract、application schema diagnostic contract、`frontend_v2/dist/index.html` asset hash、受管 PID file、process start marker、目标端口绑定和当前源码 fingerprint；缺一即 fail closed。
+2. runtime identity 记录只存脱敏的受管运行事实，文件权限固定为 `0600`。它不存 Provider secret、Authorization、用户文字稿、音频或完整环境变量。
+3. 占用目标端口但没有匹配受管 identity 的旧/外来进程必须返回 `blocked_port_in_use`，不得自动 kill、复用或把其页面当作当前候选。只有明确属于本次启动器管理范围的 stale child 才允许按所有权规则清理。
+4. `stop` 同样必须验证受管 identity；缺失或不匹配时只能报告 `blocked_foreign_process`，不得向外来 PID 发送终止信号。
+5. 该 gate 证明“当前 clean workbench runtime 身份可信”，不证明实时 ASR、真实 Provider、真实麦克风、TCC、自然多人中文、packaged UI、签名公证、Windows 或公开发布已经完成。
+
+## 证据与边界
+
+- focused tests：workbench runtime identity `12/12` 通过；覆盖当前身份复用、schema/asset contract、旧/伪装外来进程拒绝、foreign PID 不终止、启动失败清理和 `0600` 权限。
+- 临时真实集成：端口 `8791` start/status/stop 均通过；身份记录为 `0600`，进程被回收，临时 runtime 已停止。
+- 代码证据：`tools/workbench_server.py`、`tests/test_workbench_server_runtime_identity.py`、`tests/test_workbench_server_tool.py`。
+- `http://127.0.0.1:8767/workbench` 仍可能属于旧工作树；它不能作为 DEC-450 通过或当前 clean 主线产品验收的证据。验收报告必须记录工作树、端口、受管数据目录和 runtime identity。
+
+# DEC-451：macOS app principal 负责主可执行文件 entitlement，r15-r5 仅关闭内部签名包门禁
+
+时间：2026-07-19
+
+状态：Accepted and implemented / signer contract ready; packaged runtime smoke blocked on local signing identity; product and public-release gates remain open
+
+## 背景
+
+旧的签名计划把 `Contents/MacOS/meeting-copilot-desktop` 当作独立的无 entitlement signing step，随后又对 `.app` 使用主 app 的 `audio-input` entitlement。macOS 实际把 `.app` 与主可执行文件作为同一主签名主体，导致实际签名后的主可执行文件正确拥有 `audio-input`，但旧验证器错误报告 `main-executable must not use entitlements`。
+
+## 决策
+
+1. 主可执行文件保留在 Mach-O inventory 和最终验证范围中，但不再作为独立 signing step；`.app` 是唯一的 `main-app` principal，负责最终写入主 app 的最小 `com.apple.security.device.audio-input=true`。
+2. 固定路径 `Contents/Resources/MeetingCopilotRuntime.bundle/bin/meeting-copilot-native-mic` 继续作为独立 `native-mic` signing step，并只允许同一最小 audio-input entitlement。
+3. 其他 nested Mach-O 继续禁止 entitlement；签名继续 inside-out、Hardened Runtime、无 `--deep`。主 app principal 和主可执行文件必须分别验证 runtime、identity 和 entitlement 一致性。
+4. focused signer tests 已更新并通过 `22/22`；root 回归此前通过 `616 passed, 1 skipped, 1 warning`。`ruff check` 通过。
+
+## r15-r5 证据
+
+- 包路径：`artifacts/tmp/tauri_runtime_package/full-roadmap-candidate-20260719-r15-r5/Meeting Copilot.app`。
+- Tauri release build 通过；最终 app logical size `4,408,093,204` bytes，当前机器为 `arm64`。
+- 334 个 Mach-O 目标逐个签名和严格验证通过；`uses_deep=false`、Hardened Runtime 和 entitlements verification 均为 `true`。
+- file-ASR、中文 realtime ASR、VAD/CAM++、FFmpeg 和 runtime manifest 的资源封装与签名合同已通过；这只证明包可被逐目签名和严格检查，不证明 backend 在 Hardened Runtime 下能够加载 Python 原生扩展。
+
+## 边界
+
+- 该结果只关闭“当前源代码可生成并严格验证内部 ad-hoc 包”的子门禁，不关闭 `NEXT-001..023`。
+- packaged runtime supervisor、packaged API 主链、packaged UI、真实麦克风/TCC、真实 system audio、真实 Provider、自然多人中文、clean Mac、Windows、Developer ID/notary/Gatekeeper 和模型/FFmpeg 公共再分发仍未完成或未解锁。
+- `4.4GB` 包体积是当前内部候选的客观成本，必须在交付设计中继续评估；不得隐含下载、动态模型联网或默认云同步。
+- 该决策和 evidence 不包含 API key、Authorization、Keychain password、完整 Provider URL、用户文字稿或音频内容。
+
+# DEC-452：Hardened Runtime 下的 Python 原生扩展必须使用共同 Team ID，当前机器形成可复现外部阻断
+
+时间：2026-07-19
+
+状态：Accepted / Reproducible external environment blocker / packaged supervisor No-Go
+
+## 背景
+
+r15-r6 的 `.app`、bundled Python 和 `pydantic_core` 均已按 inside-out 规则使用 Hardened Runtime 和 ad-hoc 签名，`codesign --verify --strict` 逐目标通过，但 packaged supervisor 启动 backend 时仍失败。失败发生在业务 API、ASR、LLM 和 UI 之前：Python 加载 `pydantic_core/_pydantic_core.cpython-313-darwin.so` 被 macOS library validation 拒绝。
+
+## 证据
+
+1. 当前机器执行 `security find-identity -v -p codesigning` 返回 `0 valid identities found`。
+2. r15-r6 的 `.app`、`backend-python/bin/python3.13` 和 `pydantic_core` 的签名元数据均显示 `Signature=adhoc`、`TeamIdentifier=not set`，不能形成受 Hardened Runtime library validation 接受的共同 Developer Team ID。
+3. supervisor evidence：`artifacts/tmp/packaged_runtime_supervisor_smoke/full-roadmap-candidate-20260719-r15-r6-mainline/evidence.json`，状态为 `no_go_packaged_runtime_supervisor_smoke`。
+4. backend stderr：`~/Library/Logs/com.meetingcopilot.desktop/backend.stderr.log`，首个错误为：`code signature ... not valid for use in process: mapping process and mapped file (non-platform) have different Team IDs`，目标为 `pydantic_core/_pydantic_core.cpython-313-darwin.so`。
+
+## 决策与禁止事项
+
+1. 不把逐文件签名通过写成 packaged runtime 可运行；r15-r6 的首个 packaged 主链门禁保持 No-Go。
+2. 不通过加入 `com.apple.security.cs.disable-library-validation`、关闭 Hardened Runtime、使用 `--deep` 或伪造 Team ID 来“修复”。这些做法违反本项目最小权限和 inside-out 签名约束，不能作为生产方案。
+3. 正式解锁条件是安装可用的 Apple/Developer ID signing identity，并以同一身份重签 app principal、bundled Python 和需要加载的原生扩展，再在 Hardened Runtime 下重跑 supervisor smoke。
+4. 在身份解锁前，Web、loopback API、模拟音频/fake LLM 和非 packaged 业务回归可以继续执行；不得把它们写成 packaged client 证据。
+
+## 影响范围
+
+该阻断直接影响 packaged supervisor、packaged API/UI、真实 packaged 麦克风/system audio 和 macOS 安装运行门禁；不影响当前源码的 backend/frontend/Rust 单元测试，也不证明业务主链本身不可实现。`NEXT-009`、`NEXT-001`、`NEXT-002`、`NEXT-006`、`NEXT-021`、`NEXT-022` 的 packaged 部分继续保持 Partial/No-Go，完整路线目标保持 Active。
+
+# DEC-453：非验收模拟主链的 Provider 元数据必须由启动器强制标记为 mock
+
+时间：2026-07-19
+
+状态：Accepted and implemented / non-acceptance browser mainline passed
+
+## 决策
+
+1. `code/web_mvp/e2e/fake_asr_backend.py` 是非验收测试入口；它强制设置 `LLM_GATEWAY_IS_MOCK=true`，不能依赖调用者额外传环境变量。
+2. 本地 fake OpenAI-compatible gateway 只能用于验证共享 UI、WebSocket、持久化、durable jobs、实时修正/建议、会后产物、录音和历史回开，任何 evidence 必须保留 `acceptance_scope=non_acceptance_fake_audio_fake_llm_mainline`。
+3. 证据合同发现 Provider 元数据错误时必须失败，不能通过把 local gateway 写成 `real` 来让报告变绿。
+
+## 证据
+
+- `artifacts/tmp/browser_live_mic/r15-mainline-20260719-rerun/report.json`：`verdict=passed_non_acceptance`、`live_partial_observed=true`、`live_final_observed=true`、`live_suggestion_observed=true`、`live_correction_observed=true`，review jobs、录音、全文和历史回开均通过。
+- 首次失败 evidence 保留在同一批次的 `artifacts/tmp/browser_live_mic/r15-mainline-20260719/error-report.json`，其唯一 blocker 为 `non_acceptance_fake_local_llm_missing`；原因是 fake backend 未设置 mock metadata，已由启动器修复。
+- 当前复核：root `617 passed, 1 skipped, 1 warning`；fake backend、packaged acceptance contract 和 supervisor contract focused `19 passed`。
+
+## 边界
+
+该决策只关闭当前源码非验收模拟主链的可重复性和证据诚实性子门禁，不关闭真实麦克风、真实中文 ASR、真实多人、真实 Provider、packaged runtime、TCC、Windows、长会稳定性或公开发布。
+
+# DEC-454：真实麦克风必须区分采集成功、ASR 质量和 AI 配置状态
+
+时间：2026-07-19
+
+状态：Accepted and implemented / real microphone capture observed; ASR quality and production AI remain No-Go
+
+## 决策
+
+1. clean Workbench 必须通过 runtime identity gate 后才能作为证据入口。旧 `8792` 只有 HTTP 200 但 `managed_pid_missing`，不计入 clean 主线；新受管入口为 `8793`。
+2. 录音采集、ASR final、ASR 中文质量、实时 AI 建议/修正和会后 LLM 产物分别记账。任何一项成功都不能替代其他项。
+3. 没有 Provider 配置时允许录音和本地转写继续，但 UI 必须显示“等待配置 AI”，不能显示成无限“正在重试”；`ProviderRuntimeNotConfiguredDeferred` 是可恢复等待状态，不是已发生的真实重试成功。
+4. 即使没有 final 文字，已保存音频也必须保留并可复盘；ASR 质量不足或无声输入不得导致录音被删除或被假报为成功。
+
+## 真实证据
+
+- `8793` clean runtime：受管 identity 全部 verified，浏览器麦克风 preflight 返回 RMS `0.3%` 和“正常收到声音，麦克风可用”。
+- `artifacts/evidence/real-mic-workbench-20260719-clean-8793/`：真实麦克风录音 `60.8s`、`13` chunks、`1,945,710` bytes、`assembled=true`，无 final 文字；它证明采集/保存，不证明 ASR 质量。
+- `artifacts/evidence/real-mic-workbench-20260719/01-live-real-mic.png`：另一场真实短流程产生 1 个 final，但存在明显中文串词和断句问题；AI 未配置，因此没有真实 LLM 建议/修正证据。
+- UI focused `10/10`、frontend full `199 passed`、typecheck/lint/build 通过；新增测试分别覆盖 Provider 未配置和没有 final 文字的状态投影。
+
+## 边界
+
+该决策关闭真实麦克风采集“权限/录音是否能走通”和无 Provider 状态文案的当前源码子门禁；不关闭中文 ASR 质量、自然多人、真实 Provider、录音期间 AI 建议/修正、packaged TCC、长会议、Windows 或公开发布。
+
+# DEC-455：系统权限不得绕过，本地会议数据和桌面运行文件统一 owner-only
+
+时间：2026-07-19
+
+状态：Accepted and implemented / local POSIX storage permission sub-gate closed; system authorization and public release remain open
+
+## 背景
+
+用户要求无人值守开发和自测，不希望每轮都手动处理 macOS 授权。审计同时发现，当前本机 packaged app-data 中 Provider metadata 已是 `0600`，但应用根目录、backend runtime-data、SQLite、会议准备 JSON、历史录音、native microphone ready 状态和日志仍有 `0755/0644` 文件。它们包含用户会议数据或运行标识，违反本地优先的数据治理边界。
+
+## 决策
+
+1. 不通过修改 TCC 数据库、脚本化 SecurityAgent、放宽 Keychain ACL、关闭 Hardened Runtime、模拟用户点击或伪造 Team ID 绕过 macOS 权限。文件系统完全访问不能替代麦克风、Screen Recording 或 Keychain 授权。
+2. 自动化优先使用公开/模拟音频和仓库外 `0600` 测试 Provider 配置；生产客户端只在用户显式开始采集或连接 Provider 时访问系统权限。固定 Bundle ID、Team ID、签名身份和安装路径后，目标是首次授权一次、后续升级复用，而不是强制接管系统提示。
+3. Python 存储层新增共享 owner-only 合同：私有目录 `0700`、私有文件 `0600`；应用启动对历史 data tree 执行一次版本化迁移，SQLite 主文件及 WAL/SHM/journal、会议准备、实时录音 chunk/manifest/WAV、导入音频和 legacy JSON 原子写入均收紧。
+4. Tauri/Rust 新增同一语义的 `private_storage` 模块，bundled backend data/log、native microphone、system audio 的 runtime 目录、ready 状态和日志统一收紧，并在状态文件无法保护时 fail closed。
+5. Windows 继续依赖 per-user app-data ACL；本轮 POSIX mode 证据不能替代 Windows ACL 真机审计，也不能关闭 `NEXT-010`。
+
+## 实施与证据
+
+- backend full：`1222 passed, 1 warning`；warning 是 Starlette/httpx 上游弃用提示。
+- 存储 focused：`135 passed`；覆盖 MeetingPreparation、实时录音、SQLite/WAL/SHM、data governance 和一次性历史权限迁移。
+- Rust full：`71 passed, 2 ignored`；新增 private storage、native mic/system audio lifecycle 的目录、ready 文件和日志权限断言。
+- 根级 packaged/audio contract：`43 passed`。
+- 根级完整回归：`617 passed, 1 skipped, 1 warning`；`git diff --check` 通过，三份权威文档分别完整包含 `23` 个 NEXT 编号。
+- 本机历史迁移：packaged app-data 根树共收紧 `115` 个目录、`757` 个文件；抽查 app-data、runtime-data、meeting preparation、native-mic 目录为 `0700`，Provider metadata、SQLite、历史音频、ready 状态和迁移标记为 `0600`。证据只记录数量和 mode，不记录路径外的用户内容、API Key、文字稿或音频。
+- 当前源码受管 Web runtime：`http://127.0.0.1:8794/workbench`；runtime identity 的 loopback、health、schema、asset hash、managed PID、port、process start marker 和源码 fingerprint 全部 verified。首屏 DOM 显示配置 AI、导入录音、开始会议、历史搜索/筛选，按钮可用、无横向溢出，浏览器 error/warning 为 0。
+- 当前源码 non-acceptance 浏览器主链复跑：`artifacts/tmp/browser_live_mic/r15-mainline-final-20260719-rerun2/report.json`；首文字 `511ms`、首 final `713ms`、首建议/修正 `2952ms`，实时文字、修正、建议、录音、复盘和历史重开通过，ASR/LLM 均为 mock，因此不计真实验收。
+
+## 边界
+
+该决策关闭 `NEXT-012` 的 POSIX 本地数据最小权限和历史权限迁移子门禁，也降低普通自动化反复访问 Keychain/麦克风的必要性；它不关闭真实 TCC 允许/拒绝、稳定 Apple 签名、Developer ID、公证、clean Mac、Windows ACL、真实 Provider、自然多人中文、长会或公开发布。完整 `NEXT-001..023` 目标继续 Active。
+
+# DEC-456：Native PCM v2 身份必须贯通录音持久化，ready 不得伪装为采集成功
+
+时间：2026-07-20
+
+状态：Accepted and implemented / source and automated gates green; current packaged real display gate blocked
+
+## 决策
+
+1. 原生 microphone 与 system-audio helper 统一使用 `native_pcm_v2`，携带独立 track、capture epoch、sequence、timestamp 和 Float32 PCM payload。backend 在进入 ASR 前严格解码和拒绝重复、跳号、逆序、错轨、错 epoch、非法长度和值。
+2. native identity 不止存在于 event：录音 writer 把 frame identity 跨 chunk 边界聚合，SQLite V3 `audio_chunks` 持久化完整 source sequence/timestamp range；浏览器裸 PCM 保持四字段为空。
+3. ready 只在 authenticated loopback transport、完整 PCM frame 和成功 binary send 都成立后写入。静音是显式 `audible_pcm_seen=false`，不等于采集失败或可听成功。
+4. sidecar/WebSocket 终止必须先完成业务收尾，再发送错误/close；sidecar kill 和 session executor shutdown 必须幂等，避免重复 kill、CancelledError、孤儿线程或子进程。
+
+## 证据
+
+- backend：受管 Python 3.13 full `1247 passed, 1 skipped, 1 warning`；native PCM integration、SQLite migration、audio writer、sidecar/diarization focused 均通过。
+- desktop Rust：外部 `CARGO_TARGET_DIR` full `73 passed, 2 ignored`。
+- shared frontend：`210 passed`，typecheck、lint、production build 通过。
+- focused native/system/packaged gate tests：`25 passed`；Swift native helpers 当前源码编译成功。
+
+## 边界
+
+当前机器 `CGPreflightScreenCaptureAccess=true`，但 `CGGetActiveDisplayList=0`；当前 helper 无 capturable display，返回 `content_unavailable`，所以尚无当前 candidate 的真实 system-audio PCM/ASR/recording/UI evidence。该结果是可复现外部显示会话阻断，不得写成权限已通过或真实采集已通过。`NEXT-001`、`NEXT-002` 和全量 `NEXT-001..023` 目标继续 `Partial/Active`。
+
+# DEC-457：Web 与桌面共用 Provider 业务合同，配置存储按运行时适配
+
+时间：2026-07-20
+
+状态：Accepted and implemented / Web local configuration enabled
+
+## 决策
+
+1. Web 与 macOS 客户端继续使用同一个 `ProviderSettingsControl`、同一套 OpenAI 兼容字段和同一套真实 Provider probe；平台差异只放在存储/IPC adapter，不复制业务 UI 或 LLM 调用逻辑。
+2. 桌面端保持 Tauri IPC + 系统凭据库路径；本地 Web runtime 使用当前 `data_dir/settings/provider.json`，目录 `0700`、密钥文件 `0600`，原子写入。Web API 只返回连接元数据和 `api_key_present`，绝不返回密钥。
+3. Web 配置启动时恢复到当前 backend 进程的 runtime config，保存/删除即时影响实时建议、实时修正和会后生成；探测仍调用统一的 `/providers/llm/probe`，不新增模型协议或额外收费服务。
+4. Web 没有 Tauri 时不再显示“请在桌面客户端配置 AI”；如果本地实例没有可用受控数据目录，接口明确返回不可用错误，而不是假报已连接。
+
+## 证据
+
+- backend Provider focused：`tests/test_web_provider_config.py` 与 `tests/test_desktop_provider_config.py` 共 `9 passed`。
+- frontend Provider focused：`ProviderSettingsControl.test.tsx` `7 passed`；新增 Web 分支覆盖保存、真实 probe 请求和不回填密钥。
+- Web 端密钥不进入响应体、前端重新打开设置时保持空白；本地配置文件仅在受控 data directory 写入。
+
+## 边界
+
+该决策解决的是“Web 页面有入口但无法配置 AI”的产品阻断，不代表真实 relay 已通过当前环境的 401/协议/模型能力验证，也不关闭真实中文 ASR、packaged client、TCC、Windows 或公开发布门禁。保存真实 Provider 仍可能产生中转站费用，系统默认不上传原始音频。
+
+# DEC-458：Web Provider 配置必须用可见主链验证，fake 音频输入失败不得误判为业务失败
+
+时间：2026-07-20
+
+状态：Accepted and implemented / Web-configured non-acceptance mainline passed
+
+## 决策
+
+1. Web Provider 配置不是只验证表单保存：必须验证同一运行时配置能够驱动实时文字后的 LLM 修正、实时建议、追问、会后 minutes/approach/index、录音和历史回开。
+2. macOS Chrome `--use-file-for-fake-audio-capture` 仅作为媒体输入工具，不能称为脚本化 ASR。当前机器的 `v2-fake-mainline-12s.wav` 测得约 `-43 dB`，FunASR 没有稳定 final；这种输入层失败必须保留为失败证据，不得通过降级或伪造文字让主链变绿。
+3. 无人值守 UI 主链使用仓库内明确标记为 mock 的 `code/web_mvp/e2e/fake_asr_backend.py`，只验证 WebSocket、录音、SQLite、durable jobs、共享 React UI 和本地 OpenAI-compatible gateway 的编排；报告固定为 `acceptance_scope=non_acceptance_fake_audio_fake_llm_mainline`，不计真实 ASR、真实 relay 或公开发布。
+4. 非验收合同将 loopback gateway 视为 fake 的充分证据，即使 Web `/providers/config` 保存路径的生产配置固定 `is_mock=false`；远程或未知 gateway 仍必须 fail closed，不能伪装成 fake。
+
+## 证据
+
+- 首次错误证据：`artifacts/tmp/web-provider-fake-mainline-20260720/error-report.json`，错误为 `transcript correction job is missing`；同场录音已保存约 `50.487s`，但 ASR 没有可用 V2 final，snapshot 明确 `degradation_reasons=["asr_no_final"]`、`segment_count=0`，因此没有 correction job 是正确的 fail-closed 行为。
+- 复跑证据：`artifacts/tmp/web-provider-scripted-mainline-20260720-r2/report.json`，`verdict=passed_non_acceptance`；首文字 `304ms`、首 final `710ms`、首建议/修正 `2756ms`，两段中文文字、1 条技术术语修正、追问、录音 `5230ms/2 chunks`、三类会后任务、历史重开和浏览器 runtime/console/network/HTTP 5xx 全部通过。
+- 本次 Provider 是通过 Web `PUT /providers/config` 写入 `127.0.0.1` 本地 fake gateway 后实际调用的；测试结束已调用 `DELETE /providers/config`，`8795` 和临时 `8782` 均恢复 `configured=false`，没有保留测试密钥。
+- 证据合同修复文件：`code/web_mvp/e2e/workbench_v2_real_mic_mainline.mjs`、`code/web_mvp/e2e/workbench_v2_fake_mainline.test.mjs`；focused Node 合同为 `7 passed`。
+- 本轮正式回归：backend `1250 passed, 1 skipped, 1 warning`；frontend `210 passed`，typecheck、lint、production build 通过。
+
+## 边界
+
+该决策只关闭 Web 配置驱动共享非验收主链的可见验证，不关闭真实中文 ASR 质量、真实多人会议、真实远程 relay、真实麦克风/TCC、packaged macOS、Windows、长会稳定性、签名公证或公开发布。当前 `8795` 可访问但 Provider 未配置，用户若要真实验证需在页面“配置 AI”中保存自己的 OpenAI-compatible relay；系统不会自动恢复本轮测试配置。

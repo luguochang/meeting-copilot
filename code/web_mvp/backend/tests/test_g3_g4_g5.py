@@ -68,6 +68,7 @@ def test_g5_minutes_json_returns_structured_json_and_persists_across_restart(mon
     assert "灰度 5%" in minutes["decisions"]
     assert minutes["action_items"][0]["owner"] == "张三"
     assert "rollback" in minutes["risks"][0]
+    assert "灰度 5%" in body["minutes_md"]
     assert body["llm_usage"]["total_tokens"] == 100
 
     reopened = TestClient(create_app(data_dir=tmp_path))
@@ -75,5 +76,6 @@ def test_g5_minutes_json_returns_structured_json_and_persists_across_restart(mon
     assert restored.status_code == 200
     restored_minutes = restored.json()["minutes"]
     assert restored_minutes["minutes_json"]["background"] == "灰度发布评审"
+    assert "灰度 5%" in restored_minutes["minutes_md"]
     assert restored_minutes["minutes_json_llm_usage"]["total_tokens"] == 100
     assert restored.json()["formal_derivation_status"] == "available"

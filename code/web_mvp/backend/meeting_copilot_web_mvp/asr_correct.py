@@ -41,14 +41,22 @@ def correct_transcript(
     raw_text: str,
     config: LlmConfig,
     client: LlmClient | None = None,
+    *,
+    raise_on_failure: bool = False,
 ) -> tuple[str, dict[str, int], bool]:
     """L2 LLM correction. Returns (corrected_text, usage_record, degraded).
 
-    On LLM failure, degrades to the raw text (caller can still normalize it).
+    On LLM failure, ordinary callers degrade to the raw text. Durable realtime
+    callers can request the original provider or parsing error for retry/audit.
     """
     if not raw_text:
         return raw_text, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}, False
-    client = client or HttpxLlmClient()
+    if client is None:
+        client = HttpxLlmClient()
+        try:
+            client.api_style = config.api_style
+        except (AttributeError, TypeError):
+            pass
     body = {
         "model": config.model,
         "messages": [
@@ -74,7 +82,9 @@ def correct_transcript(
         content = data["choices"][0]["message"]["content"].strip()
         usage = data.get("usage", {})
     except Exception as exc:
-        _log.error("asr_correct.failed", error=str(exc), exc_info=True)
+        _log.error("asr_correct.failed", error_class=type(exc).__name__)
+        if raise_on_failure:
+            raise
         return raw_text, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}, True
     usage_record = {
         "prompt_tokens": int(usage.get("prompt_tokens", 0)),

@@ -40,6 +40,25 @@ def test_real_ws_asr_stream_persists_session_and_feeds_llm_cards(monkeypatch):
 
     class FakeLlmClient:
         def post_json(self, url, headers, body, timeout):
+            if "会议纪要" in body["messages"][0]["content"]:
+                return {
+                    "choices": [{
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "background": "灰度发布讨论",
+                                    "decisions": ["先灰度 5%"],
+                                    "action_items": [],
+                                    "risks": [],
+                                    "open_questions": ["谁负责回滚"],
+                                    "evidence_quotes": ["先灰度 5%。谁负责回滚？"],
+                                },
+                                ensure_ascii=False,
+                            )
+                        }
+                    }],
+                    "usage": {"prompt_tokens": 90, "completion_tokens": 30, "total_tokens": 120},
+                }
             return {"choices": [{"message": {"content": '{"suggestion_text":"建议确认 rollback 负责人","confidence":0.85,"trigger_reason":"owner 缺失"}'}}], "usage": {"prompt_tokens": 90, "completion_tokens": 30, "total_tokens": 120}}
 
     monkeypatch.setattr(llm_service, "HttpxLlmClient", lambda: FakeLlmClient())

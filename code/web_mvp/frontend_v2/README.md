@@ -9,28 +9,38 @@ contains no fixture or demo meeting data.
 With the backend running, open:
 
 ```text
-http://127.0.0.1:8767/workbench
+http://127.0.0.1:<runtime-port>/workbench
 ```
 
 `/workbench-v2` is an alias. `/workbench-legacy` is the retained legacy UI.
 SSE is the default event transport. Set `VITE_EVENT_TRANSPORT=poll` only for
-the explicit compatibility fallback.
+the explicit compatibility fallback. The runtime port is selected by the
+current local backend or packaged desktop supervisor; do not assume that a
+historical process on `8767` belongs to this worktree.
 
 ## Development
 
 ```bash
 npm install
-npm run dev
+VITE_DEV_API_TARGET=http://127.0.0.1:<backend-port> npm run dev
 ```
 
-The Vite development proxy targets `http://127.0.0.1:8767` by default. Open a
-specific meeting in development with:
+The Vite development proxy requires an explicit local backend target so a
+frontend worktree cannot silently connect to an unrelated historical process.
+Open a specific meeting in development with:
 
 ```text
-http://127.0.0.1:5174/?meeting_id=<meeting-id>
+http://127.0.0.1:5174/workbench-assets/?meeting_id=<meeting-id>
 ```
 
-Set `VITE_DEV_API_TARGET` when the backend uses another address.
+Set `VITE_DEV_API_TARGET` for every development run, for example:
+
+```bash
+VITE_DEV_API_TARGET=http://127.0.0.1:8788 npm run dev -- --host 127.0.0.1 --port 5188
+```
+
+The target must be a loopback URL. Production and packaged builds continue to
+use the same-origin backend selected by the desktop runtime.
 
 ## Backend contracts
 

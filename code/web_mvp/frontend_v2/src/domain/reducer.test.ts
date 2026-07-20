@@ -32,6 +32,9 @@ function snapshot(overrides: Partial<MeetingSnapshot> = {}): MeetingSnapshot {
     segments: [],
     activePartial: null,
     suggestions: [],
+    decisionCandidates: [],
+    actionItems: [],
+    risks: [],
     currentTopic: null,
     openQuestions: [],
     minutes: null,
@@ -73,6 +76,22 @@ function event(overrides: Partial<MeetingEvent> = {}): MeetingEvent {
     },
     publishedAtMs: null,
     ...overrides,
+  };
+}
+
+function formalAiPayload(segmentId = "segment-1") {
+  return {
+    source: "llm_first",
+    job_id: "job-1",
+    batch_id: "batch-1",
+    provider: "openai_compatible_gateway",
+    model: "fast-model",
+    llm_called: true,
+    llm_call_status: "called",
+    evidence: {
+      segment_ids: [segmentId],
+      quote: "需要明确回滚负责人。",
+    },
   };
 }
 
@@ -174,6 +193,7 @@ describe("meetingReducer", () => {
       correlationId: committed.generationId,
       causationId: "revision-2",
       payload: {
+        ...formalAiPayload(),
         ...committed,
         suggestion_id: committed.suggestionId,
         meeting_id: committed.meetingId,
@@ -229,6 +249,7 @@ describe("meetingReducer", () => {
       correlationId: committed.generationId,
       causationId: "revision-2",
       payload: {
+        ...formalAiPayload(),
         ...committed,
         suggestion_id: committed.suggestionId,
         meeting_id: committed.meetingId,
@@ -365,6 +386,7 @@ describe("meetingReducer", () => {
       correlationId: "generation-1",
       causationId: "job-1",
       payload: {
+        ...formalAiPayload(),
         suggestion_id: "suggestion-1",
         meeting_id: "meeting-1",
         job_id: "job-1",
@@ -416,6 +438,116 @@ describe("meetingReducer", () => {
       finalDraftSeq: 2,
       text: "谁负责本次上线，回滚窗口是什么？",
     });
+  });
+
+  it("projects the LLM follow-up with its reason and evidence", () => {
+    const current = meetingReducer(createInitialMeetingState("meeting-1"), {
+      type: "events.received",
+      events: [event({
+        seq: 2,
+        type: "meeting.intelligence.applied",
+        aggregateType: "meeting_intelligence",
+        aggregateId: "intelligence-1",
+        payload: {
+          ...formalAiPayload("segment-2"),
+          follow_up: {
+            question: "请确认回滚负责人。",
+            reason: "会议已经讨论发布方案，但尚未明确回滚负责人。",
+            evidence_segment_ids: ["segment-2"],
+            evidence_quote: "需要明确回滚负责人。",
+            urgency: "high",
+          },
+        },
+      })],
+      receivedAtMs: 2_000,
+    });
+
+    expect(current.followUp).toEqual({
+      question: "请确认回滚负责人。",
+      reason: "会议已经讨论发布方案，但尚未明确回滚负责人。",
+      evidenceSegmentIds: ["segment-2"],
+      evidenceQuote: "需要明确回滚负责人。",
+      urgency: "high",
+      formalAi: {
+        source: "llm_first",
+        jobId: "job-1",
+        batchId: "batch-1",
+        provider: "openai_compatible_gateway",
+        model: "fast-model",
+        llmCalled: true,
+        evidence: {
+          segmentIds: ["segment-2"],
+          quote: "需要明确回滚负责人。",
+          evidenceHash: null,
+          stateRevision: null,
+        },
+      },
+    });
+  });
+
+  it("does not project an intelligence event without a called LLM envelope", () => {
+    const current = meetingReducer(createInitialMeetingState("meeting-1"), {
+      type: "events.received",
+      events: [event({
+        seq: 2,
+        type: "meeting.intelligence.applied",
+        aggregateType: "meeting_intelligence",
+        aggregateId: "intelligence-not-called",
+        payload: {
+          source: "deterministic_candidate",
+          llm_call_status: "not_called",
+          llm_called: false,
+          job_id: "job-not-called",
+          batch_id: "batch-not-called",
+          provider: "not_configured",
+          model: "not_called",
+          evidence: { segment_ids: ["segment-2"], quote: "需要明确回滚负责人。" },
+          follow_up: {
+            question: "不应进入正式 UI",
+            reason: "这是 deterministic candidate",
+            evidence_segment_ids: ["segment-2"],
+            evidence_quote: "需要明确回滚负责人。",
+            urgency: "high",
+          },
+        },
+      })],
+      receivedAtMs: 2_000,
+    });
+
+    expect(current.followUp).toBeNull();
+  });
+
+  it("does not project a deterministic fact candidate as a formal AI fact", () => {
+    const current = meetingReducer(createInitialMeetingState("meeting-1"), {
+      type: "events.received",
+      events: [event({
+        seq: 2,
+        type: "meeting.decision.updated",
+        aggregateType: "meeting_entity",
+        aggregateId: "decision-draft",
+        payload: {
+          source: "deterministic_candidate",
+          llm_call_status: "not_called",
+          llm_called: false,
+          job_id: "job-draft",
+          batch_id: "batch-draft",
+          provider: "not_configured",
+          model: "not_called",
+          evidence: { segment_ids: ["segment-2"], quote: "需要明确回滚负责人。" },
+          decision: {
+            id: "decision-draft",
+            text: "不应渲染为正式决策",
+            status: "candidate",
+            evidence_segment_ids: ["segment-2"],
+            evidence_spans: [],
+            updated_at_ms: 2_000,
+          },
+        },
+      })],
+      receivedAtMs: 2_000,
+    });
+
+    expect(current.decisionCandidates).toEqual([]);
   });
 
   it("rejects a conflicting generation at the same state revision", () => {
@@ -514,5 +646,222 @@ describe("meetingReducer", () => {
       normalizedText: "AI 修正后的文字。",
       revision: 2,
     });
+  });
+
+  it("hydrates meeting facts and applies the three typed realtime updates", () => {
+    const initial = meetingReducer(createInitialMeetingState("meeting-1"), {
+      type: "snapshot.received",
+      snapshot: snapshot({
+        lastSeq: 1,
+        decisionCandidates: [{
+          id: "decision-1",
+          text: "先灰度 5%",
+          status: "candidate",
+          confidence: 0.82,
+          evidenceSegmentIds: ["segment-1"],
+          evidenceSpans: [],
+          updatedAtMs: 1_000,
+        }],
+        actionItems: [],
+        risks: [],
+      }),
+      receivedAtMs: 1_100,
+    });
+
+    const updated = meetingReducer(initial, {
+      type: "events.received",
+      events: [
+        event({
+          seq: 2,
+          eventId: "decision-event",
+          type: "meeting.decision.updated",
+          aggregateType: "decision",
+          aggregateId: "decision-1",
+          payload: {
+            ...formalAiPayload(),
+            decision: {
+              id: "decision-1",
+              text: "先灰度 10%",
+              status: "confirmed",
+              confidence: 0.91,
+              evidence_segment_ids: ["segment-1"],
+              evidence_spans: [{
+                segment_id: "segment-1",
+                transcript_seq: 1,
+                start_ms: 100,
+                end_ms: 900,
+                quote: "支付服务先灰度百分之十",
+              }],
+              updated_at_ms: 2_000,
+            },
+          },
+        }),
+        event({
+          seq: 3,
+          eventId: "action-event",
+          type: "meeting.action_item.updated",
+          aggregateType: "action_item",
+          aggregateId: "action-1",
+          payload: {
+            ...formalAiPayload(),
+            action_item: {
+              id: "action-1",
+              text: "张三补充回滚演练",
+              status: "candidate",
+              confidence: 0.77,
+              evidence_segment_ids: ["segment-1"],
+              evidence_spans: [],
+              owner: "张三",
+              deadline: "周五",
+              updated_at_ms: 2_100,
+            },
+          },
+        }),
+        event({
+          seq: 4,
+          eventId: "risk-event",
+          type: "meeting.risk.updated",
+          aggregateType: "risk",
+          aggregateId: "risk-1",
+          payload: {
+            ...formalAiPayload(),
+            risk: {
+              id: "risk-1",
+              text: "P99 延迟可能超标",
+              status: "candidate",
+              confidence: 0.74,
+              evidence_segment_ids: ["segment-1"],
+              evidence_spans: [],
+              mitigation: "超过 900ms 立即回滚",
+              updated_at_ms: 2_200,
+            },
+          },
+        }),
+      ],
+      receivedAtMs: 2_300,
+    });
+
+    expect(updated.decisionCandidates).toEqual([
+      expect.objectContaining({ id: "decision-1", text: "先灰度 10%", status: "confirmed" }),
+    ]);
+    expect(updated.decisionCandidates[0].evidenceSpans[0]).toMatchObject({
+      segmentId: "segment-1",
+      quote: "支付服务先灰度百分之十",
+    });
+    expect(updated.actionItems[0]).toMatchObject({ owner: "张三", deadline: "周五" });
+    expect(updated.risks[0]).toMatchObject({ mitigation: "超过 900ms 立即回滚" });
+  });
+
+  it("does not let an older snapshot overwrite a newer fact event", () => {
+    const current = meetingReducer(createInitialMeetingState("meeting-1"), {
+      type: "events.received",
+      events: [event({
+        seq: 2,
+        type: "meeting.decision.updated",
+        aggregateType: "decision",
+        aggregateId: "decision-1",
+        payload: {
+          ...formalAiPayload(),
+          decision: {
+            id: "decision-1",
+            text: "已确认灰度 10%",
+            status: "confirmed",
+            confidence: 0.9,
+            evidence_segment_ids: ["segment-1"],
+            evidence_spans: [],
+            updated_at_ms: 2_000,
+          },
+        },
+      })],
+      receivedAtMs: 2_100,
+    });
+
+    const refreshed = meetingReducer(current, {
+      type: "snapshot.received",
+      snapshot: snapshot({
+        lastSeq: 2,
+        decisionCandidates: [{
+          id: "decision-1",
+          text: "旧候选",
+          status: "candidate",
+          confidence: 0.5,
+          evidenceSegmentIds: ["segment-1"],
+          evidenceSpans: [],
+          updatedAtMs: 1_500,
+        }],
+      }),
+      receivedAtMs: 2_200,
+    });
+
+    expect(refreshed.decisionCandidates[0]).toMatchObject({
+      text: "已确认灰度 10%",
+      status: "confirmed",
+      updatedAtMs: 2_000,
+    });
+  });
+
+  it("projects speaker attribution from events and backfills a durable manual rename", () => {
+    const withAttributedEvent = meetingReducer(createInitialMeetingState("meeting-1"), {
+      type: "events.received",
+      events: [event({
+        payload: {
+          meeting_id: "meeting-1",
+          segment_id: "segment-2",
+          final_id: "final-2",
+          transcript_seq: 2,
+          text: "先确认发布范围。",
+          normalized_text: "先确认发布范围。",
+          revision: 1,
+          speaker_id: "cluster-a",
+          speaker_label: "Speaker 1",
+          speaker_confidence: 0.86,
+        },
+      })],
+      receivedAtMs: 2_100,
+    });
+    expect(withAttributedEvent.segments[0]).toMatchObject({
+      speakerId: "cluster-a",
+      speakerLabel: "Speaker 1",
+      speakerConfidence: 0.86,
+    });
+
+    const semanticParagraph = {
+      meetingId: "meeting-1",
+      paragraphId: "paragraph-1",
+      revision: 1,
+      text: "先确认发布范围。",
+      startMs: 1_000,
+      endMs: 2_000,
+      status: "stable" as const,
+      checkpointIds: ["segment-2"],
+      speakerId: "cluster-a",
+      speakerLabel: "Speaker 1",
+      speakerConfidence: 0.86,
+      createdAtMs: 2_000,
+      updatedAtMs: 2_000,
+    };
+    const beforeRename = {
+      ...withAttributedEvent,
+      fullTranscript: withAttributedEvent.segments,
+      semanticParagraphs: [semanticParagraph],
+      activeParagraph: semanticParagraph,
+    };
+    const renamed = meetingReducer(beforeRename, {
+      type: "speaker.renamed",
+      speaker: {
+        meetingId: "meeting-1",
+        speakerId: "cluster-a",
+        speakerLabel: "张工",
+        ordinal: 1,
+        createdAtMs: 2_000,
+        updatedAtMs: 3_000,
+      },
+    });
+
+    expect(renamed.speakers).toEqual([expect.objectContaining({ speakerLabel: "张工" })]);
+    expect(renamed.segments[0].speakerLabel).toBe("张工");
+    expect(renamed.fullTranscript[0].speakerLabel).toBe("张工");
+    expect(renamed.semanticParagraphs?.[0].speakerLabel).toBe("张工");
+    expect(renamed.activeParagraph?.speakerLabel).toBe("张工");
   });
 });

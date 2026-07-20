@@ -13,15 +13,20 @@ import os
 import re
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Mapping, Protocol
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from dotenv import load_dotenv
 
 from meeting_copilot_web_mvp.logging_config import get_logger
+from meeting_copilot_web_mvp.openai_protocol import (
+    chat_body_to_responses,
+    responses_payload_to_chat,
+    responses_url_for_chat_url,
+)
 from meeting_copilot_web_mvp.streaming_llm_provider import provider_idempotency_header_value
 
 _log = get_logger("meeting_copilot_web_mvp.llm_service")
@@ -33,6 +38,23 @@ _RUNTIME_CONFIG_LOCK = threading.RLock()
 _RUNTIME_CONFIG_PAYLOAD: dict[str, Any] | None = None
 _RUNTIME_CONFIG_GENERATION = 0
 _AUDIT_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$")
+_SAFE_PROVIDER_ERROR_CODES = frozenset(
+    {
+        "API_KEY_REQUIRED",
+        "AUTHENTICATION_ERROR",
+        "ENDPOINT_NOT_FOUND",
+        "INSUFFICIENT_QUOTA",
+        "INVALID_API_KEY",
+        "INVALID_MODEL",
+        "INVALID_REQUEST_ERROR",
+        "MODEL_NOT_FOUND",
+        "NO_AVAILABLE_ACCOUNTS",
+        "PERMISSION_DENIED",
+        "RATE_LIMIT_EXCEEDED",
+        "UNSUPPORTED_ENDPOINT",
+        "UNSUPPORTED_PARAMETER",
+    }
+)
 
 
 class LlmClient(Protocol):
@@ -47,14 +69,170 @@ class LlmClient(Protocol):
     ) -> dict[str, Any]: ...
 
 
+class LlmProviderHttpError(RuntimeError):
+    """A redacted provider HTTP failure safe for logs and API responses."""
+
+    def __init__(
+        self,
+        status_code: int,
+        *,
+        provider_code: str | None = None,
+        api_style: str | None = None,
+    ) -> None:
+        self.status_code = int(status_code)
+        self.provider_code = _safe_provider_error_code(provider_code)
+        self.api_style = (
+            _validated_api_style(api_style)
+            if api_style is not None
+            else None
+        )
+        self.category = _provider_error_category(self.status_code)
+        self.retryable = self.status_code in {408, 409, 425, 429, 504} or self.status_code >= 500
+        suffix = f":{self.provider_code}" if self.provider_code else ""
+        super().__init__(f"llm_provider_http_{self.category}:{self.status_code}{suffix}")
+
+
+class LlmProviderTransportError(RuntimeError):
+    def __init__(self, category: str) -> None:
+        self.category = category if category in {"timeout", "transport"} else "transport"
+        self.retryable = True
+        self.status_code = None
+        self.provider_code = None
+        super().__init__(f"llm_provider_{self.category}")
+
+
 class HttpxLlmClient:
-    """Default LLM client using httpx."""
+    """OpenAI-compatible client using an explicitly selected API style."""
+
+    def __init__(self, *, api_style: str = "chat_completions") -> None:
+        self.api_style = _validated_api_style(api_style)
 
     def post_json(self, url, headers, body, timeout):
         with httpx.Client(timeout=timeout, trust_env=False) as client:
-            resp = client.post(url, headers=headers, json=body)
-            resp.raise_for_status()
-            return resp.json()
+            if self.api_style == "responses":
+                responses_url = responses_url_for_chat_url(url)
+                responses_body = chat_body_to_responses(body, stream=False)
+                response = _provider_post(client, responses_url, headers, responses_body)
+                payload = _response_payload(response)
+                normalized = _require_success_payload(
+                    response,
+                    payload,
+                    api_style=self.api_style,
+                )
+                return responses_payload_to_chat(normalized)
+
+            response = _provider_post(client, url, headers, body)
+            payload = _response_payload(response)
+            return _require_success_payload(
+                response,
+                payload,
+                api_style=self.api_style,
+            )
+
+
+def provider_failure_message(error: Exception) -> str:
+    """Return an actionable message without reflecting provider response text."""
+
+    if isinstance(error, LlmProviderHttpError):
+        code = f"，错误码 {error.provider_code}" if error.provider_code else ""
+        if error.category == "authentication":
+            if error.api_style == "responses":
+                return (
+                    f"AI 中转站认证失败（HTTP {error.status_code}{code}）。"
+                    "请确认 API Key 与当前应用保存的一致；该中转站的 Responses 认证路由也可能不兼容，"
+                    "可切换到 Chat Completions 后重试"
+                )
+            return (
+                f"AI 中转站认证失败（HTTP {error.status_code}{code}）。"
+                "请确认 API Key 与当前应用保存的一致，并检查 Chat Completions 和模型访问权限"
+            )
+        if error.category == "rate_limit":
+            return f"AI 中转站限流或额度不足（HTTP {error.status_code}{code}），请稍后重试"
+        if error.category == "provider_client":
+            return f"AI 中转站不支持当前模型或请求协议（HTTP {error.status_code}{code}）"
+        if error.category == "provider_server":
+            return f"AI 中转站服务暂时不可用（HTTP {error.status_code}{code}）"
+        if error.category == "timeout":
+            return f"AI 中转站请求超时（HTTP {error.status_code}{code}）"
+    if isinstance(error, LlmProviderTransportError):
+        if error.category == "timeout":
+            return "AI 中转站请求超时，请稍后重试"
+        return "无法连接 AI 中转站，请检查网络和中转站地址"
+    if isinstance(error, httpx.TimeoutException):
+        return "AI 中转站请求超时，请稍后重试"
+    if isinstance(error, httpx.RequestError):
+        return "无法连接 AI 中转站，请检查网络和中转站地址"
+    return f"LLM 探测失败: {type(error).__name__}"
+
+
+def _provider_post(
+    client: httpx.Client,
+    url: str,
+    headers: Mapping[str, str],
+    body: Mapping[str, Any],
+) -> Any:
+    try:
+        return client.post(url, headers=headers, json=body)
+    except httpx.TimeoutException:
+        raise LlmProviderTransportError("timeout") from None
+    except httpx.RequestError:
+        raise LlmProviderTransportError("transport") from None
+
+
+def _response_status(response: Any) -> int:
+    value = getattr(response, "status_code", 200)
+    return int(value) if type(value) is int else 200
+
+
+def _response_payload(response: Any) -> Any:
+    try:
+        return response.json()
+    except (TypeError, ValueError):
+        return None
+
+
+def _require_success_payload(
+    response: Any,
+    payload: Any,
+    *,
+    api_style: str | None = None,
+) -> dict[str, Any]:
+    status_code = _response_status(response)
+    if status_code >= 400:
+        raise LlmProviderHttpError(
+            status_code,
+            provider_code=_provider_error_code(payload),
+            api_style=api_style,
+        )
+    if not isinstance(payload, dict):
+        raise ValueError("LLM provider returned invalid JSON")
+    return payload
+
+
+def _provider_error_category(status_code: int) -> str:
+    if status_code in {401, 403}:
+        return "authentication"
+    if status_code == 429:
+        return "rate_limit"
+    if status_code in {408, 504}:
+        return "timeout"
+    if status_code >= 500:
+        return "provider_server"
+    return "provider_client"
+
+
+def _provider_error_code(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    nested = payload.get("error")
+    if isinstance(nested, dict):
+        return _safe_provider_error_code(nested.get("code") or nested.get("type"))
+    return _safe_provider_error_code(payload.get("code") or payload.get("type"))
+
+
+def _safe_provider_error_code(value: Any) -> str | None:
+    normalized = str(value or "").strip().upper()
+    return normalized if normalized in _SAFE_PROVIDER_ERROR_CODES else None
 
 
 @dataclass(repr=False)
@@ -62,13 +240,18 @@ class LlmConfig:
     base_url: str
     api_key: str
     model: str
+    realtime_model: str | None = None
     timeout_seconds: float = 60.0
     provider_label: str = "openai_compatible_gateway"
     is_mock: bool = False
     max_retries: int = 2
+    api_style: str = "chat_completions"
 
     def __post_init__(self) -> None:
         self.base_url = _validated_base_url(self.base_url)
+        self.api_style = _validated_api_style(self.api_style)
+        self.model = _validated_model_name(self.model)
+        self.realtime_model = _validated_model_name(self.realtime_model or self.model)
 
     def __repr__(self) -> str:
         return (
@@ -76,9 +259,11 @@ class LlmConfig:
             f"gateway_host={_gateway_host(self.base_url)!r}, "
             "api_key='<redacted>', "
             f"model={self.model!r}, "
+            f"realtime_model={self.realtime_model!r}, "
             f"timeout_seconds={self.timeout_seconds!r}, "
             f"provider_label={self.provider_label!r}, "
-            f"is_mock={self.is_mock!r}"
+            f"is_mock={self.is_mock!r}, "
+            f"api_style={self.api_style!r}"
             ")"
         )
 
@@ -99,13 +284,16 @@ class LlmConfig:
             key = os.environ.get("LLM_GATEWAY_API_KEY")
         if not base or not key:
             return None
+        model = os.environ.get("LLM_GATEWAY_MODEL", "gpt-5.5")
         return cls(
             base_url=base.rstrip("/"),
             api_key=key,
-            model=os.environ.get("LLM_GATEWAY_MODEL", "gpt-5.5"),
+            model=model,
+            realtime_model=os.environ.get("LLM_GATEWAY_REALTIME_MODEL") or model,
             timeout_seconds=float(os.environ.get("LLM_GATEWAY_TIMEOUT_SECONDS", "60")),
             provider_label=os.environ.get("LLM_GATEWAY_PROVIDER_LABEL", "openai_compatible_gateway"),
             is_mock=_env_bool(os.environ.get("LLM_GATEWAY_IS_MOCK"), default=False),
+            api_style=os.environ.get("LLM_GATEWAY_API_STYLE", "chat_completions"),
         )
 
 
@@ -114,24 +302,30 @@ def configure_runtime(
     base_url: str,
     api_key: str,
     model: str,
+    realtime_model: str | None = None,
     provider_label: str = "openai_compatible_gateway",
+    api_style: str = "chat_completions",
 ) -> dict[str, Any]:
     """Install a process-local provider config without persisting its secret."""
     config = LlmConfig(
         base_url=base_url,
         api_key=api_key,
         model=model,
+        realtime_model=realtime_model,
         provider_label=provider_label,
         is_mock=False,
+        api_style=api_style,
     )
     payload = {
         "base_url": config.base_url,
         "api_key": config.api_key,
         "model": config.model,
+        "realtime_model": config.realtime_model,
         "timeout_seconds": config.timeout_seconds,
         "provider_label": config.provider_label,
         "is_mock": False,
         "max_retries": config.max_retries,
+        "api_style": config.api_style,
     }
     with _RUNTIME_CONFIG_LOCK:
         global _RUNTIME_CONFIG_GENERATION, _RUNTIME_CONFIG_PAYLOAD
@@ -170,14 +364,18 @@ def provider_metadata(config: LlmConfig | None) -> dict[str, Any]:
         return {
             "provider": "not_configured",
             "model": "not_called",
+            "realtime_model": "not_called",
             "is_mock": False,
             "configured_from_env": False,
+            "api_style": "not_configured",
         }
     return {
         "provider": provider_identifier(config),
         "model": config.model,
+        "realtime_model": config.realtime_model,
         "is_mock": bool(config.is_mock),
         "configured_from_env": True,
+        "api_style": config.api_style,
     }
 
 
@@ -186,6 +384,16 @@ def provider_identifier(config: LlmConfig) -> str:
     if _PROVIDER_LABEL_RE.fullmatch(label) and not label.lower().startswith(("http:", "https:")):
         return label
     return _gateway_host(config.base_url)
+
+
+def realtime_config(config: LlmConfig) -> LlmConfig:
+    """Return the same Provider credentials routed to the low-latency model."""
+
+    return replace(
+        config,
+        model=str(config.realtime_model or config.model),
+        realtime_model=str(config.realtime_model or config.model),
+    )
 
 
 def gateway_base_url_kind(base_url: str | None) -> str:
@@ -220,7 +428,7 @@ def probe_gateway(
     """Make one minimal production-shaped request to verify gateway operability."""
     if config.is_mock:
         raise ValueError("mock LLM provider cannot pass production verification")
-    client = client or HttpxLlmClient()
+    client = client or _configured_httpx_client(config)
     data = client.post_json(
         f"{config.base_url}/v1/chat/completions",
         {
@@ -313,6 +521,31 @@ def _validated_base_url(value: str) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, normalized_path, "", ""))
 
 
+def _validated_api_style(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized not in {"chat_completions", "responses"}:
+        raise ValueError("LLM api_style must be chat_completions or responses")
+    return normalized
+
+
+def _validated_model_name(value: str) -> str:
+    normalized = str(value or "").strip()
+    if not normalized or len(normalized) > 128 or any(ord(char) < 32 or ord(char) == 127 for char in normalized):
+        raise ValueError("LLM model must contain 1 to 128 printable characters")
+    return normalized
+
+
+def _configured_httpx_client(config: LlmConfig) -> LlmClient:
+    """Create the production client while keeping injected test doubles simple."""
+
+    client = HttpxLlmClient()
+    try:
+        client.api_style = config.api_style
+    except (AttributeError, TypeError):
+        pass
+    return client
+
+
 def _gateway_host(base_url: str) -> str:
     parsed = urlsplit(base_url)
     host = str(parsed.hostname or "invalid_gateway")
@@ -344,18 +577,15 @@ def _strip_json_fences(content: str) -> str:
 
 
 def _call_with_retry(client, url, headers, body, timeout, retries=2):
-    """Call client.post_json with exponential backoff retry on any error.
-
-    Gateway 5xx / timeouts / network errors are transient — retry before giving
-    up so a flaky LLM gateway doesn't fail the whole batch.
-    """
+    """Retry only failures that can plausibly recover without user action."""
     last_exc = None
     for attempt in range(retries + 1):
         try:
             return client.post_json(url, headers, body, timeout)
         except Exception as exc:
             last_exc = exc
-            if attempt < retries:
+            retryable = bool(getattr(exc, "retryable", False))
+            if attempt < retries and retryable:
                 _log.warning("llm.call.retry", attempt=attempt + 1, error_code=type(exc).__name__)
                 time.sleep(0.5 * (2 ** attempt))
             else:
@@ -369,7 +599,7 @@ def execute_candidate(
     client: LlmClient | None = None,
 ) -> dict[str, Any]:
     """Call LLM for one suggestion candidate preview; return a run with a real card."""
-    client = client or HttpxLlmClient()
+    client = client or _configured_httpx_client(config)
     evidence_context = str(
         preview.get("evidence_context")
         or preview.get("input_summary", "")
@@ -585,7 +815,7 @@ def build_approach_cards(
     On persistent LLM failure (after retry), degrades gracefully: returns ([], zeros, True)
     instead of raising — the endpoint stays 200.
     """
-    client = client or HttpxLlmClient()
+    client = client or _configured_httpx_client(config)
     body = {
         "model": config.model,
         "messages": [
@@ -665,23 +895,92 @@ _MINUTES_SYSTEM_PROMPT = (
 )
 
 
+def _plain_minutes_text(value: Any, field: str, *, max_length: int = 1000) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"minutes field {field} must be a string")
+    normalized = " ".join(value.split())
+    if len(normalized) > max_length:
+        raise ValueError(f"minutes field {field} exceeds {max_length} characters")
+    return normalized
+
+
+def _minutes_string_list(value: Any, field: str) -> list[str]:
+    if not isinstance(value, list) or len(value) > 100:
+        raise ValueError(f"minutes field {field} must be a bounded array")
+    result: list[str] = []
+    for index, item in enumerate(value):
+        text = _plain_minutes_text(item, f"{field}[{index}]")
+        if text and text not in result:
+            result.append(text)
+    return result
+
+
+def _normalize_minutes_payload(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("minutes response must be a JSON object")
+    background = _plain_minutes_text(value.get("background", ""), "background", max_length=4000)
+    decisions = _minutes_string_list(value.get("decisions", []), "decisions")
+    risks = _minutes_string_list(value.get("risks", []), "risks")
+    open_questions = _minutes_string_list(value.get("open_questions", []), "open_questions")
+    evidence_quotes = _minutes_string_list(value.get("evidence_quotes", []), "evidence_quotes")
+    raw_actions = value.get("action_items", [])
+    if not isinstance(raw_actions, list) or len(raw_actions) > 100:
+        raise ValueError("minutes field action_items must be a bounded array")
+    action_items: list[dict[str, str]] = []
+    for index, raw_action in enumerate(raw_actions):
+        if not isinstance(raw_action, dict):
+            raise ValueError(f"minutes field action_items[{index}] must be an object")
+        item = _plain_minutes_text(raw_action.get("item", ""), f"action_items[{index}].item")
+        if not item:
+            raise ValueError(f"minutes field action_items[{index}].item must not be empty")
+        owner = _plain_minutes_text(
+            raw_action.get("owner") or "待确认",
+            f"action_items[{index}].owner",
+        )
+        deadline = _plain_minutes_text(
+            raw_action.get("deadline") or "待确认",
+            f"action_items[{index}].deadline",
+        )
+        normalized_action = {"item": item, "owner": owner, "deadline": deadline}
+        if normalized_action not in action_items:
+            action_items.append(normalized_action)
+    if not any((background, decisions, action_items, risks, open_questions, evidence_quotes)):
+        raise ValueError("minutes response contains no usable content")
+    return {
+        "background": background,
+        "decisions": decisions,
+        "action_items": action_items,
+        "risks": risks,
+        "open_questions": open_questions,
+        "evidence_quotes": evidence_quotes,
+    }
+
+
+def _escape_minutes_markdown(value: str) -> str:
+    return re.sub(r"([\\`*_\[\]<>#])", r"\\\1", value)
+
+
 def _minutes_to_markdown(m: dict[str, Any]) -> str:
-    lines = ["# 会议纪要", "", f"## 背景\n{m.get('background', '')}", ""]
+    lines = ["# 会议纪要", "", f"## 背景\n{_escape_minutes_markdown(m['background'])}", ""]
     lines.append("## 已确认决策")
-    for d in m.get("decisions") or []:
-        lines.append(f"- {d}")
+    for d in m["decisions"]:
+        lines.append(f"- {_escape_minutes_markdown(d)}")
     lines.append("\n## 行动项")
-    for a in m.get("action_items") or []:
-        lines.append(f"- {a.get('item', '')} (owner: {a.get('owner', '待确认')}, deadline: {a.get('deadline', '待确认')})")
+    for a in m["action_items"]:
+        lines.append(
+            f"- {_escape_minutes_markdown(a['item'])} "
+            f"(owner: {_escape_minutes_markdown(a['owner'])}, "
+            f"deadline: {_escape_minutes_markdown(a['deadline'])})"
+        )
     lines.append("\n## 风险")
-    for r in m.get("risks") or []:
-        lines.append(f"- {r}")
+    for risk in m["risks"]:
+        lines.append(f"- {_escape_minutes_markdown(risk)}")
     lines.append("\n## 未闭环问题")
-    for q in m.get("open_questions") or []:
-        lines.append(f"- {q}")
+    for q in m["open_questions"]:
+        lines.append(f"- {_escape_minutes_markdown(q)}")
     lines.append("\n## 证据片段")
-    for e in m.get("evidence_quotes") or []:
-        lines.append(f"> {e}")
+    for e in m["evidence_quotes"]:
+        lines.append(f"> {_escape_minutes_markdown(e)}")
     return "\n".join(lines)
 
 
@@ -692,7 +991,7 @@ def build_minutes_json(
 ) -> tuple[dict[str, Any], dict[str, int], bool]:
     """Generate structured minutes (parsed JSON dict) via LLM. Degrades gracefully.
     Returns (parsed_dict, usage_record, degraded)."""
-    client = client or HttpxLlmClient()
+    client = client or _configured_httpx_client(config)
     body = {
         "model": config.model,
         "messages": [
@@ -707,7 +1006,7 @@ def build_minutes_json(
     try:
         data = _call_with_retry(client, url, headers, body, config.timeout_seconds)
         content = data["choices"][0]["message"]["content"]
-        parsed = json.loads(_strip_json_fences(content))
+        parsed = _normalize_minutes_payload(json.loads(_strip_json_fences(content)))
         usage = data.get("usage", {})
     except Exception as exc:
         _log.error("minutes.call.failed", error=str(exc), exc_info=True)
@@ -718,7 +1017,7 @@ def build_minutes_json(
         "total_tokens": int(usage.get("total_tokens", 0)),
     }
     _log.info("minutes.call.end", tokens=usage_record["total_tokens"])
-    return (parsed if isinstance(parsed, dict) else {}), usage_record, False
+    return parsed, usage_record, False
 
 
 def build_minutes(
@@ -727,7 +1026,21 @@ def build_minutes(
     client: LlmClient | None = None,
 ) -> tuple[str, dict[str, int], bool]:
     """Generate post-meeting minutes (Markdown) via LLM. Degrades gracefully."""
+    markdown, _structured, usage, degraded = build_minutes_artifact(
+        transcript_text,
+        config,
+        client,
+    )
+    return markdown, usage, degraded
+
+
+def build_minutes_artifact(
+    transcript_text: str,
+    config: LlmConfig,
+    client: LlmClient | None = None,
+) -> tuple[str, dict[str, Any], dict[str, int], bool]:
+    """Generate one structured minutes artifact and its Markdown projection."""
     parsed, usage, degraded = build_minutes_json(transcript_text, config, client)
     if degraded:
-        return "", usage, True
-    return _minutes_to_markdown(parsed), usage, False
+        return "", {}, usage, True
+    return _minutes_to_markdown(parsed), parsed, usage, False
