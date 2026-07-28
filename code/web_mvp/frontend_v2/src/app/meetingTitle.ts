@@ -9,7 +9,7 @@ export function fallbackMeetingTitle(timestamp = Date.now(), meetingId = ""): st
       hour12: false,
     }).formatToParts(timestamp);
     const value = Object.fromEntries(parts.map((part) => [part.type, part.value]));
-    return `${value.year}年${value.month}月${value.day}日 ${value.hour}:${value.minute} 的会议`;
+    return `${value.month}月${value.day}日 ${value.hour}:${value.minute} 会议`;
   }
   const suffix = meetingId.trim().slice(-8);
   return suffix ? `会议 ${suffix}` : "会议记录";

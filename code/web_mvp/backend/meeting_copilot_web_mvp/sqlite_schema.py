@@ -772,12 +772,13 @@ def _create_verified_backup(
         destination = None
         source.close()
         source = None
-        os.chmod(temporary_path, 0o600, follow_symlinks=False)
+        if os.name != "nt":
+            os.chmod(temporary_path, 0o600, follow_symlinks=False)
         _require_owner_only_regular_path(
             temporary_path,
             label="temporary migration backup",
         )
-        with temporary_path.open("rb") as backup_file:
+        with temporary_path.open("r+b") as backup_file:
             os.fsync(backup_file.fileno())
         os.replace(temporary_path, final_path)
         _require_owner_only_regular_path(final_path, label="migration backup")
@@ -801,7 +802,8 @@ def _create_owner_only_regular_file(path: Path) -> int:
     flags |= getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags, 0o600)
     try:
-        os.fchmod(descriptor, 0o600)
+        if os.name != "nt":
+            os.fchmod(descriptor, 0o600)
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
             raise MigrationPreflightError(f"path is not a regular file: {path}")
         return descriptor
@@ -820,7 +822,8 @@ def _open_owner_only_regular_file(path: Path) -> int:
     except OSError as exc:
         raise MigrationPreflightError(f"could not open SQLite migration lock: {_safe_error(exc)}") from exc
     try:
-        os.fchmod(descriptor, 0o600)
+        if os.name != "nt":
+            os.fchmod(descriptor, 0o600)
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
             raise MigrationPreflightError(f"SQLite migration lock is not a regular file: {path}")
         return descriptor
@@ -876,12 +879,16 @@ def _require_regular_path(path: Path, *, label: str) -> None:
 
 def _require_owner_only_regular_path(path: Path, *, label: str) -> None:
     _require_regular_path(path, label=label)
+    if os.name == "nt":
+        return
     permissions = stat.S_IMODE(path.lstat().st_mode)
     if permissions != 0o600:
         raise MigrationPreflightError(f"{label} must have owner-only permissions, found {permissions:o}")
 
 
 def _fsync_directory(directory: Path) -> None:
+    if os.name == "nt":
+        return
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     descriptor = os.open(directory, flags)
     try:

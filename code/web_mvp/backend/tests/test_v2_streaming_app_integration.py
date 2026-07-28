@@ -104,7 +104,7 @@ def test_websocket_final_runs_streaming_suggestion_job_without_browser_ai_trigge
         with client.websocket_connect(
             f"/live/asr/stream/ws/{session_id}?audio_source=browser_live_mic"
         ) as websocket:
-            websocket.send_bytes(struct.pack("<f", 0.1) * 800)
+            websocket.send_bytes(struct.pack("<f", 0.1) * 4_800)
             websocket.receive_text()
             websocket.send_text("END")
             while True:

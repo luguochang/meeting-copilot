@@ -8,6 +8,7 @@ from pathlib import Path
 import struct
 import threading
 import time
+from types import SimpleNamespace
 import wave
 import pytest
 from fastapi.testclient import TestClient
@@ -24,6 +25,17 @@ def _force_fake_recognizer(monkeypatch):
     the real sherpa/funasr sidecar (tested separately)."""
     monkeypatch.setattr(asr_stream, "_maybe_sherpa_sidecar", lambda sid: None)
     monkeypatch.setattr(asr_stream, "_maybe_funasr_sidecar", lambda sid: None)
+    monkeypatch.setattr(
+        asr_stream,
+        "refine_pcm_f32",
+        lambda _payload: SimpleNamespace(
+            text="",
+            status="refined",
+            model_id="test-offline-refiner",
+            reason=None,
+            authoritative=True,
+        ),
+    )
 
 
 def test_asr_stream_ws_emits_partial_per_chunk_and_final_on_end():
@@ -714,6 +726,192 @@ def test_asr_stream_reconnect_preserves_audio_and_prior_final_events(monkeypatch
         assert wav_file.getnframes() == 9_600
 
 
+def test_funasr_disconnect_backfills_uncommitted_audio_tail(monkeypatch, tmp_path):
+    class InterruptedFunasrRecognizer:
+        provider = "funasr_realtime"
+        provider_mode = "real"
+        is_mock = False
+        fallback_used = False
+        degradation_reasons = []
+
+        def __init__(self, session_id):
+            self.session_id = session_id
+            self._seq = 0
+
+        def recognize_chunk(self, _pcm):
+            self._seq += 1
+            return [{
+                "event_type": "partial",
+                "segment_id": "online-tail",
+                "text": "张三下周",
+                "start_ms": 0,
+                "end_ms": 300,
+                "confidence": 0.8,
+            }]
+
+        def finalize(self):
+            raise AssertionError("an interrupted recognizer must not own the authoritative final")
+
+        def abort(self):
+            return None
+
+    class InterruptedWebSocket:
+        def __init__(self):
+            self.messages = [{"bytes": struct.pack("<f", 0.05) * 4_800}]
+            self.sent = []
+
+        async def accept(self):
+            return None
+
+        async def receive(self):
+            if self.messages:
+                return self.messages.pop(0)
+            raise RuntimeError("simulated websocket disconnect")
+
+        async def send_text(self, payload):
+            self.sent.append(json.loads(payload))
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(asr_stream, "get_recognizer", lambda sid: InterruptedFunasrRecognizer(sid))
+    monkeypatch.setattr(
+        asr_stream,
+        "refine_pcm_f32",
+        lambda _payload: SimpleNamespace(
+            text="张三下周三完成断线恢复测试。",
+            status="refined",
+            model_id="test-offline-refiner",
+            reason=None,
+            authoritative=True,
+        ),
+    )
+    repo = InMemoryAsrLiveSessionRepository()
+    committed = []
+    sid = "sess_disconnect_tail_backfill"
+
+    asyncio.run(
+        asr_stream.handle_stream(
+            InterruptedWebSocket(),
+            sid,
+            asr_live_repo=repo,
+            audio_source="browser_live_mic",
+            audio_asset_data_dir=tmp_path,
+            native_track_id="microphone",
+            native_capture_epoch=1,
+            on_final_committed=lambda event: committed.append(dict(event)),
+        )
+    )
+
+    record = repo.get(sid)
+    transcript_finals = [
+        event["payload"]
+        for event in record["events"]
+        if event["event_type"] == "transcript_final"
+    ]
+    assert len(transcript_finals) == 1
+    assert transcript_finals[0]["text"] == "张三下周三完成断线恢复测试。"
+    assert transcript_finals[0]["segment_id"] == "microphone:e1:vad_endpoint_001"
+    assert transcript_finals[0]["final_source"] == "local_offline_disconnect_backfill"
+    assert transcript_finals[0]["refinement_status"] == "backfilled"
+    assert transcript_finals[0]["start_ms"] == 0
+    assert transcript_finals[0]["end_ms"] == 300
+    assert len(committed) == 1
+    assert committed[0]["text"] == "张三下周三完成断线恢复测试。"
+    assert committed[0]["authoritative"] is True
+    assert "stream_interrupted" in record["degradation_reasons"]
+    assert record["transcript_backfill"] == {
+        "schema_version": "transcript_backfill.v1",
+        "status": "completed",
+        "capture_epoch": 1,
+        "start_ms": 0,
+        "end_ms": 300,
+        "attempt": 1,
+        "updated_at_ms": record["transcript_backfill"]["updated_at_ms"],
+        "segment_id": "microphone:e1:vad_endpoint_001",
+        "final_source": "local_offline_disconnect_backfill",
+    }
+    assert project_canonical_transcript(session_id=sid, events=record["events"])["full_text"] == (
+        "张三下周三完成断线恢复测试。"
+    )
+    assert record["audio"]["saved"] is True
+
+
+def test_funasr_disconnect_records_failed_backfill_without_inventing_a_final(monkeypatch, tmp_path):
+    class InterruptedFunasrRecognizer:
+        provider = "funasr_realtime"
+        provider_mode = "real"
+        is_mock = False
+        fallback_used = False
+        degradation_reasons = []
+        _seq = 0
+
+        def recognize_chunk(self, _pcm):
+            self._seq += 1
+            return []
+
+        def finalize(self):
+            return []
+
+        def abort(self):
+            return None
+
+    class InterruptedWebSocket:
+        def __init__(self):
+            self.messages = [{"bytes": struct.pack("<f", 0.05) * 4_800}]
+
+        async def accept(self):
+            return None
+
+        async def receive(self):
+            if self.messages:
+                return self.messages.pop(0)
+            raise RuntimeError("simulated websocket disconnect")
+
+        async def send_text(self, _payload):
+            return None
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(asr_stream, "get_recognizer", lambda _sid: InterruptedFunasrRecognizer())
+    monkeypatch.setattr(
+        asr_stream,
+        "refine_pcm_f32",
+        lambda _payload: SimpleNamespace(
+            text="",
+            status="unavailable",
+            model_id=None,
+            reason="offline_refinement_components_missing",
+            authoritative=False,
+        ),
+    )
+    repo = InMemoryAsrLiveSessionRepository()
+    committed = []
+    sid = "sess_disconnect_tail_backfill_failed"
+
+    asyncio.run(
+        asr_stream.handle_stream(
+            InterruptedWebSocket(),
+            sid,
+            asr_live_repo=repo,
+            audio_source="browser_live_mic",
+            audio_asset_data_dir=tmp_path,
+            native_track_id="microphone",
+            native_capture_epoch=1,
+            on_final_committed=lambda event: committed.append(dict(event)),
+        )
+    )
+
+    record = repo.get(sid)
+    assert committed == []
+    assert not any(event["event_type"] == "transcript_final" for event in record["events"])
+    assert record["transcript_backfill"]["status"] == "failed"
+    assert record["transcript_backfill"]["error_class"] == "offline_refinement_unavailable"
+    assert "offline_refinement_unavailable" in record["degradation_reasons"]
+    assert record["audio"]["saved"] is True
+
+
 def test_asr_stream_recording_setup_failure_aborts_recognizer(monkeypatch, tmp_path):
     class SetupRecognizer:
         provider = "test_realtime_asr"
@@ -813,6 +1011,295 @@ def test_app_recording_setup_failure_releases_capture_lease(monkeypatch, tmp_pat
     assert recording["error_class"] == "recording_setup_failed"
     assert resumed["status"] == "active"
     assert resumed["capture_generation"] == recording["capture_generation"] + 1
+
+
+def test_browser_reconnect_writes_a_new_recording_epoch_without_overwriting_prior_audio(
+    monkeypatch,
+    tmp_path,
+):
+    connection_number = 0
+
+    class SilentRecognizer:
+        provider = "test_realtime_asr"
+        provider_mode = "real"
+        is_mock = False
+        fallback_used = False
+        degradation_reasons = []
+
+        def __init__(self, connection_id):
+            self.connection_id = connection_id
+            self._seq = 0
+
+        def recognize_chunk(self, _pcm):
+            self._seq += 1
+            return []
+
+        def finalize(self):
+            return [{
+                "event_type": "final",
+                "segment_id": "reconnected-final",
+                "text": "同一会议续传文字",
+                "start_ms": (self.connection_id - 1) * 1_000,
+                "end_ms": self.connection_id * 1_000,
+                "confidence": 0.9,
+            }]
+
+        def abort(self):
+            return None
+
+    def recognizer_factory(_session_id):
+        nonlocal connection_number
+        connection_number += 1
+        return SilentRecognizer(connection_number)
+
+    monkeypatch.setattr(asr_stream, "get_recognizer", recognizer_factory)
+    app = create_app(data_dir=tmp_path)
+    persistence = app.state.v2_persistence
+    session_id = "browser-new-epoch-on-reconnect"
+    pcm = struct.pack("<f", 0.05) * (16_000 * 5)
+
+    with TestClient(app) as client:
+        prepared = client.put(
+            f"/v2/meetings/{session_id}/preparation",
+            json={
+                "hotwords": [],
+                "input_source": "microphone",
+                "notice_acknowledged": True,
+            },
+        )
+        assert prepared.status_code == 200
+        for epoch in (1, 2):
+            with client.websocket_connect(
+                f"/live/asr/stream/ws/{session_id}"
+                f"?audio_source=browser_live_mic&capture_epoch={epoch}"
+                ) as websocket:
+                websocket.send_bytes(pcm)
+                websocket.send_text("END")
+                with pytest.raises(WebSocketDisconnect):
+                    while True:
+                        websocket.receive_text()
+
+        first = persistence.get_recording_session(session_id, track="microphone", epoch=1)
+        second = persistence.get_recording_session(session_id, track="microphone", epoch=2)
+        segments = client.get(f"/v2/meetings/{session_id}/snapshot").json()["segments"]
+
+    assert first["chunk_count"] == 1
+    assert second["chunk_count"] == 1
+    assert first["journal_sha256"] == second["journal_sha256"]
+    assert first["output_relative_path"] != second["output_relative_path"]
+    assert "epoch-1" in first["output_relative_path"]
+    assert "epoch-2" in second["output_relative_path"]
+    assert len(segments) == 2
+    assert segments[0]["segment_id"].startswith("microphone:e1:")
+    assert segments[1]["segment_id"].startswith("microphone:e2:")
+    assert segments[1]["started_at_ms"] == first["duration_ms"]
+    assert segments[1]["ended_at_ms"] == first["duration_ms"] + 1_000
+
+
+def test_browser_reconnect_backfills_interrupted_tail_into_v2_timeline(monkeypatch, tmp_path):
+    connection_number = 0
+
+    class ReconnectingFunasrRecognizer:
+        provider = "funasr_realtime"
+        provider_mode = "real"
+        is_mock = False
+        fallback_used = False
+        degradation_reasons = []
+
+        def __init__(self, connection_id):
+            self.connection_id = connection_id
+            self._seq = 0
+
+        def recognize_chunk(self, _pcm):
+            self._seq += 1
+            return [{
+                "event_type": "partial",
+                "segment_id": "online-tail",
+                "text": "张三下周" if self.connection_id == 1 else "李四下周",
+                "start_ms": 0,
+                "end_ms": 300,
+                "confidence": 0.8,
+            }]
+
+        def finalize(self):
+            return [{
+                "event_type": "final",
+                "segment_id": "online-tail",
+                "text": "李四下周四完成验收记录。",
+                "start_ms": 0,
+                "end_ms": 300,
+                "confidence": 0.8,
+            }]
+
+        def abort(self):
+            return None
+
+    def recognizer_factory(_session_id):
+        nonlocal connection_number
+        connection_number += 1
+        return ReconnectingFunasrRecognizer(connection_number)
+
+    monkeypatch.setattr(asr_stream, "get_recognizer", recognizer_factory)
+    monkeypatch.setattr(
+        asr_stream,
+        "refine_pcm_f32",
+        lambda payload: SimpleNamespace(
+            text=(
+                "张三下周三完成断线恢复测试。"
+                if struct.unpack_from("<f", payload, 0)[0] < 0.06
+                else "李四下周四完成验收记录。"
+            ),
+            status="refined",
+            model_id="test-offline-refiner",
+            reason=None,
+            authoritative=True,
+        ),
+    )
+    app = create_app(data_dir=tmp_path)
+    persistence = app.state.v2_persistence
+    session_id = "browser-interrupted-tail-backfill"
+    first_pcm = struct.pack("<f", 0.05) * 4_800
+    second_pcm = struct.pack("<f", 0.08) * 4_800
+
+    class EpochWebSocket:
+        def __init__(self, payload, *, interrupted):
+            self.messages = [{"bytes": payload}]
+            if not interrupted:
+                self.messages.append({"text": "END"})
+            self.sent = []
+
+        async def accept(self):
+            return None
+
+        async def receive(self):
+            if self.messages:
+                return self.messages.pop(0)
+            raise RuntimeError("simulated websocket disconnect")
+
+        async def send_text(self, payload):
+            self.sent.append(json.loads(payload))
+
+        async def close(self):
+            return None
+
+    def run_epoch(epoch, payload, *, interrupted):
+        lease_owner = f"capture-{epoch}"
+        capture_recording = {}
+
+        def begin_recording(metadata):
+            recording = app.state.begin_v2_recording(
+                session_id,
+                metadata,
+                lease_owner=lease_owner,
+            )
+            prior_duration_ms = sum(
+                int(item.get("duration_ms") or 0)
+                for item in persistence.list_recording_sessions(session_id)
+                if item["track"] == "microphone" and int(item["epoch"]) < epoch
+            )
+            prior_segment_ends = [
+                int(segment.get("ended_at_ms") or 0)
+                for segment in persistence.get_snapshot(session_id)["segments"]
+                if segment.get("source_track") == "microphone"
+            ]
+            capture_recording.update(recording)
+            capture_recording["timeline_offset_ms"] = prior_duration_ms
+            capture_recording["previous_transcript_end_ms"] = (
+                max(prior_segment_ends) if prior_segment_ends else None
+            )
+
+        def commit_final(event):
+            recording_offset_ms = int(capture_recording["timeline_offset_ms"])
+            previous_end_ms = capture_recording["previous_transcript_end_ms"]
+            raw_start_ms = int(event.get("start_ms") or 0)
+            timeline_adjustment_ms = recording_offset_ms
+            if (
+                recording_offset_ms > 0
+                and previous_end_ms is not None
+                and raw_start_ms >= max(0, int(previous_end_ms) - 250)
+            ):
+                timeline_adjustment_ms = max(0, recording_offset_ms - int(previous_end_ms))
+            return app.state.commit_v2_final(
+                session_id,
+                {
+                    **event,
+                    "source_track": "microphone",
+                    "capture_epoch": epoch,
+                    "timeline_offset_ms": timeline_adjustment_ms,
+                    "use_source_segment_namespace": True,
+                },
+            )
+
+        websocket = EpochWebSocket(payload, interrupted=interrupted)
+        asyncio.run(
+            asr_stream.handle_stream(
+                websocket,
+                session_id,
+                asr_live_repo=app.state.asr_live_repository,
+                audio_source="browser_live_mic",
+                audio_asset_data_dir=tmp_path,
+                on_audio_recording_started=begin_recording,
+                on_audio_chunk_committed=lambda chunk: app.state.record_v2_audio_chunk(
+                    session_id,
+                    chunk,
+                    lease_owner=lease_owner,
+                ),
+                on_audio_recording_sealed=lambda metadata: app.state.seal_v2_recording(
+                    session_id,
+                    metadata,
+                    lease_owner=lease_owner,
+                ),
+                on_final_committed=commit_final,
+                native_track_id="microphone",
+                native_capture_epoch=epoch,
+                diarization_enabled=False,
+            )
+        )
+        return websocket
+
+    first_websocket = run_epoch(1, first_pcm, interrupted=True)
+    second_websocket = run_epoch(2, second_pcm, interrupted=False)
+
+    with TestClient(app) as client:
+        ended = client.post(
+            f"/v2/meetings/{session_id}/end",
+            json={"action": "end_and_review"},
+        )
+        snapshot = client.get(f"/v2/meetings/{session_id}/snapshot").json()
+        live_record = client.get(f"/live/asr/sessions/{session_id}/events").json()
+        raw_degradation_reasons = app.state.asr_live_repository.get(session_id)["degradation_reasons"]
+        first = persistence.get_recording_session(session_id, track="microphone", epoch=1)
+        second = persistence.get_recording_session(session_id, track="microphone", epoch=2)
+
+    segments = snapshot["segments"]
+    assert ended.status_code == 200
+    assert any(event["event_type"] == "partial" for event in first_websocket.sent)
+    assert any(event["event_type"] == "final" for event in second_websocket.sent)
+    assert len(segments) == 2
+    assert [segment["normalized_text"] for segment in segments] == [
+        "张三下周三完成断线恢复测试。",
+        "李四下周四完成验收记录。",
+    ]
+    assert segments[0]["segment_id"].startswith("microphone:e1:")
+    assert segments[1]["segment_id"].startswith("microphone:e2:")
+    assert segments[0]["started_at_ms"] == 0
+    assert segments[0]["ended_at_ms"] == first["duration_ms"]
+    assert segments[1]["started_at_ms"] == first["duration_ms"]
+    assert segments[1]["ended_at_ms"] == first["duration_ms"] + second["duration_ms"]
+    final_payloads = [
+        event["payload"]
+        for event in live_record["events"]
+        if event["event_type"] == "transcript_final"
+    ]
+    assert [payload["final_source"] for payload in final_payloads] == [
+        "local_offline_disconnect_backfill",
+        "local_offline_refinement",
+    ]
+    assert live_record["degradation_reasons"] == []
+    assert "stream_interrupted" in raw_degradation_reasons
+    assert live_record["transcript_backfill"]["status"] == "completed"
+    assert live_record["transcript_backfill"]["capture_epoch"] == 1
+    assert snapshot["diagnostics"]["transcript_backfill"]["status"] == "completed"
 
 
 def test_asr_stream_claims_recording_before_replaying_existing_chunks(monkeypatch, tmp_path):
@@ -2534,6 +3021,7 @@ def test_asr_stream_funasr_end_final_keeps_worker_source_segment_id(
     client = TestClient(create_app(data_dir=tmp_path))
 
     with client.websocket_connect(f"/live/asr/stream/ws/{sid}") as ws:
+        ws.send_bytes(struct.pack("<f", 0.05) * 4_800)
         ws.send_text("END")
         final = json.loads(ws.receive_text())
 
@@ -2755,6 +3243,9 @@ def test_asr_stream_same_session_reconnect_reprojects_from_raw_source(
 def test_asr_stream_marks_bounded_cumulative_rerecognition_without_dropping_source(monkeypatch, tmp_path):
     first = "我们讨论产品目标"
     rerecognized = "我们讨论产品目的和实现计划"
+    second_refined = rerecognized[len(first) - 1 :]
+    refinement_results = iter([first, second_refined])
+    refinement_calls = 0
 
     class RerecognizingFunasrRecognizer:
         provider = "funasr_realtime"
@@ -2782,12 +3273,33 @@ def test_asr_stream_marks_bounded_cumulative_rerecognition_without_dropping_sour
             ]
 
         def finalize(self):
-            return []
+            return [
+                {
+                    "event_type": "final",
+                    "segment_id": f"{self.session_id}_funasr_sc_001",
+                    "text": rerecognized,
+                    "start_ms": 0,
+                    "end_ms": self._seq * 300,
+                    "confidence": 0.88,
+                }
+            ]
 
     def pcm(value: float) -> bytes:
         return struct.pack("<f", value) * 4800
 
+    def refine(_payload):
+        nonlocal refinement_calls
+        refinement_calls += 1
+        return SimpleNamespace(
+            text=next(refinement_results),
+            status="refined",
+            model_id="test-offline-refiner",
+            reason=None,
+            authoritative=True,
+        )
+
     monkeypatch.setattr(asr_stream, "get_recognizer", lambda sid: RerecognizingFunasrRecognizer(sid))
+    monkeypatch.setattr(asr_stream, "refine_pcm_f32", refine)
     client = TestClient(create_app(data_dir=tmp_path))
     sid = "sess_cumulative_rerecognition"
 
@@ -2811,15 +3323,27 @@ def test_asr_stream_marks_bounded_cumulative_rerecognition_without_dropping_sour
         assert second_partial["normalized_text"] == asr_stream._normalize_text(second_partial["text"])
         assert second_final is not None
         assert second_final["event_type"] == "final"
-        assert second_final["projection_reconciled"] is True
+        assert second_final["projection_reconciled"] is False
 
         events_response = client.get(f"/live/asr/sessions/{sid}/events")
         assert events_response.status_code == 200
         body = events_response.json()
         assert body["canonical_transcript"]["active_tail"] is None
-        assert body["canonical_transcript"]["full_text"] == rerecognized
+        assert body["canonical_transcript"]["full_text"] == first + second_refined
 
         ws.send_text("END")
+        try:
+            for _ in range(10):
+                if json.loads(ws.receive_text()).get("event_type") == "evaluation_summary":
+                    break
+        except WebSocketDisconnect:
+            pass
+
+    assert refinement_calls == 2
+    body = client.get(f"/live/asr/sessions/{sid}/events").json()
+    assert body["canonical_transcript"]["active_tail"] is None
+    assert body["canonical_transcript"]["full_text"] == first + second_refined
+    assert "offline_refinement_unavailable" not in body["degradation_reasons"]
 
 
 def test_compacts_cumulative_source_snapshots_to_bounded_restore_checkpoints():
@@ -2864,6 +3388,99 @@ def test_compacts_cumulative_source_snapshots_to_bounded_restore_checkpoints():
     assert events[0]["payload"]["source_snapshot_text"] == "第一段"
 
 
+def test_empty_terminal_refinement_failure_does_not_degrade_committed_finals(monkeypatch):
+    class EmptyTerminalRecognizer:
+        provider = "funasr_realtime"
+        provider_mode = "real"
+        is_mock = False
+        fallback_used = False
+        degradation_reasons = []
+
+        def __init__(self, _session_id):
+            self._seq = 0
+
+        def recognize_chunk(self, _pcm):
+            self._seq += 1
+            return [{
+                "event_type": "partial",
+                "segment_id": "online_source_001",
+                "text": "接口先灰度百分之十" if self._seq == 1 else "",
+                "start_ms": 0,
+                "end_ms": self._seq * 300,
+                "confidence": 0.9,
+            }]
+
+        def finalize(self):
+            return [{
+                "event_type": "final",
+                "segment_id": "online_source_001",
+                "text": "",
+                "start_ms": 0,
+                "end_ms": self._seq * 300,
+                "confidence": 0.9,
+            }]
+
+    class BufferedWebSocket:
+        def __init__(self):
+            self.messages = [
+                {"bytes": struct.pack("<f", value) * 4_800}
+                for value in (0.05, 0.0, 0.0, 0.0, 0.05)
+            ] + [{"text": "END"}]
+            self.sent = []
+
+        async def accept(self):
+            return None
+
+        async def receive(self):
+            return self.messages.pop(0)
+
+        async def send_text(self, payload):
+            self.sent.append(json.loads(payload))
+
+        async def close(self):
+            return None
+
+    refinement_results = iter([
+        SimpleNamespace(
+            text="接口先灰度百分之十。",
+            status="refined",
+            model_id="test-offline-refiner",
+            reason=None,
+            authoritative=True,
+        ),
+        SimpleNamespace(
+            text="",
+            status="empty",
+            model_id="test-offline-refiner",
+            reason="offline_text_empty",
+            authoritative=False,
+        ),
+    ])
+    refinement_calls = 0
+
+    def refine(_payload):
+        nonlocal refinement_calls
+        refinement_calls += 1
+        return next(refinement_results)
+
+    monkeypatch.setattr(asr_stream, "get_recognizer", lambda sid: EmptyTerminalRecognizer(sid))
+    monkeypatch.setattr(asr_stream, "refine_pcm_f32", refine)
+    repo = InMemoryAsrLiveSessionRepository()
+    websocket = BufferedWebSocket()
+
+    asyncio.run(asr_stream.handle_stream(websocket, "empty_terminal_tail", asr_live_repo=repo))
+
+    record = repo.get("empty_terminal_tail")
+    canonical = project_canonical_transcript(
+        session_id="empty_terminal_tail",
+        events=record["events"],
+    )
+    assert refinement_calls == 2
+    assert canonical["committed_text"] == "接口先灰度百分之十。"
+    assert canonical["active_tail"] is None
+    assert "offline_refinement_unavailable" not in record["degradation_reasons"]
+
+
 def test_bounds_legacy_live_projection_without_dropping_the_latest_window():
     finals = [
         {"event_type": "final", "segment_id": f"final-{index}", "text": str(index)}
@@ -2885,3 +3502,152 @@ def test_bounds_legacy_live_projection_without_dropping_the_latest_window():
     assert retained_partials[0]["segment_id"] == "partial-3"
     assert bounded[-1] == end_of_stream
     assert dropped == 8
+
+
+def test_authoritative_final_gate_rejects_single_character_tail_hallucinations():
+    assert asr_stream._is_meaningful_authoritative_final("一。") is False
+    assert asr_stream._is_meaningful_authoritative_final("A!") is False
+    assert asr_stream._is_meaningful_authoritative_final("同意。") is True
+    assert asr_stream._is_meaningful_authoritative_final("OK") is True
+
+
+def test_vad_threshold_treats_measured_room_noise_as_silence():
+    quiet_room_payload = struct.pack("<f", 0.004) * 4_800
+
+    assert asr_stream._float32_pcm_rms(quiet_room_payload) < asr_stream.VAD_SILENCE_RMS_THRESHOLD
+
+
+def test_pcm_duration_uses_sample_count_instead_of_fixed_transport_cadence():
+    assert asr_stream._float32_pcm_duration_ms(struct.pack("<f", 0.1) * 1_600) == 100.0
+    assert asr_stream._float32_pcm_duration_ms(struct.pack("<f", 0.1) * 4_800) == 300.0
+
+
+def test_vad_endpoint_refines_pcm_before_end_without_online_partial(monkeypatch, tmp_path):
+    class DelayedOnlineRecognizer:
+        provider = "funasr_realtime"
+        provider_mode = "real"
+        is_mock = False
+        fallback_used = False
+        degradation_reasons = []
+
+        def __init__(self, session_id):
+            self.session_id = session_id
+            self._seq = 0
+
+        def recognize_chunk(self, _pcm):
+            self._seq += 1
+            return []
+
+        def finalize(self):
+            return []
+
+    monkeypatch.setattr(asr_stream, "get_recognizer", lambda sid: DelayedOnlineRecognizer(sid))
+    monkeypatch.setattr(
+        asr_stream,
+        "refine_pcm_f32",
+        lambda _payload: SimpleNamespace(
+            text="上线先灰度百分之十，异常时立即回滚。",
+            status="refined",
+            model_id="test-offline-refiner",
+            reason=None,
+            authoritative=True,
+        ),
+    )
+    client = TestClient(create_app(data_dir=tmp_path))
+    sid = "sess_vad_without_online_partial"
+    speech = struct.pack("<f", 0.05) * 4_800
+    silence = struct.pack("<f", 0.0) * 4_800
+
+    with client.websocket_connect(f"/live/asr/stream/ws/{sid}?audio_source=browser_live_mic") as ws:
+        for payload in [speech, speech, silence, silence, silence]:
+            ws.send_bytes(payload)
+        final = json.loads(ws.receive_text())
+        ws.send_text("END")
+
+    assert final["event_type"] == "final"
+    assert final["authoritative"] is True
+    assert final["final_source"] == "local_offline_refinement"
+    assert final["text"] == "上线先灰度百分之十，异常时立即回滚。"
+    assert final["start_ms"] == 0
+    assert final["end_ms"] == 600
+    record = client.get(f"/live/asr/sessions/{sid}/events").json()
+    transcript_finals = [event for event in record["events"] if event["event_type"] == "transcript_final"]
+    assert len(transcript_finals) == 1
+
+
+def test_funasr_without_offline_refiner_keeps_terminal_snapshot_non_authoritative(
+    monkeypatch,
+    tmp_path,
+):
+    class OnlineSnapshotRecognizer:
+        provider = "funasr_realtime"
+        provider_mode = "real"
+        is_mock = False
+        fallback_used = False
+        degradation_reasons = []
+
+        def __init__(self, session_id):
+            self.session_id = session_id
+            self._seq = 0
+
+        def recognize_chunk(self, _pcm):
+            self._seq += 1
+            return [
+                {
+                    "event_type": "partial",
+                    "segment_id": f"{self.session_id}_online_001",
+                    "text": "接口先恢度百分之五，谁负责回滚？",
+                    "start_ms": 0,
+                    "end_ms": 300,
+                    "confidence": 0.93,
+                    "authoritative": False,
+                }
+            ]
+
+        def finalize(self):
+            return []
+
+    monkeypatch.setattr(asr_stream, "get_recognizer", lambda sid: OnlineSnapshotRecognizer(sid))
+    monkeypatch.setattr(
+        asr_stream,
+        "refine_pcm_f32",
+        lambda _payload: SimpleNamespace(
+            text="",
+            status="unavailable",
+            model_id=None,
+            reason="offline_refinement_components_missing",
+            authoritative=False,
+        ),
+    )
+    client = TestClient(create_app(data_dir=tmp_path))
+    sid = "sess_offline_refinement_unavailable"
+
+    with client.websocket_connect(f"/live/asr/stream/ws/{sid}") as ws:
+        ws.send_bytes(struct.pack("<f", 0.05) * 4_800)
+        online_partial = json.loads(ws.receive_text())
+        ws.send_text("END")
+        terminal_partial = None
+        for _ in range(4):
+            candidate = json.loads(ws.receive_text())
+            if candidate.get("refinement_status") == "unavailable":
+                terminal_partial = candidate
+                break
+
+    assert online_partial["event_type"] == "partial"
+    assert terminal_partial is not None
+    assert terminal_partial["event_type"] == "partial"
+    assert terminal_partial["authoritative"] is False
+    assert terminal_partial["final_source"] == "online_terminal_partial"
+    assert terminal_partial["refinement_status"] == "unavailable"
+    assert terminal_partial["refinement_reason"] == "offline_refinement_components_missing"
+
+    record = client.get(f"/live/asr/sessions/{sid}/events").json()
+    event_types = [event["event_type"] for event in record["events"]]
+    assert "transcript_partial" in event_types
+    assert "transcript_final" not in event_types
+    assert "suggestion_candidate_event" not in event_types
+    assert "llm_request_draft_event" not in event_types
+    assert "offline_refinement_unavailable" in record["degradation_reasons"]
+    canonical = project_canonical_transcript(session_id=sid, events=record["events"])
+    assert canonical["committed_text"] == ""
+    assert canonical["active_tail"] is not None

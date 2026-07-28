@@ -72,6 +72,30 @@ def _audio_payload(marker: float, sample_count: int = 960) -> bytes:
     return np.full(sample_count, marker, dtype="<f4").tobytes()
 
 
+def test_onnx_adapter_preserves_cache_and_normalizes_online_result_shape():
+    calls = []
+
+    class FakeOnnxModel:
+        def __call__(self, audio, *, param_dict):
+            calls.append((audio, param_dict))
+            param_dict["cache"]["seen"] = True
+            return [{"preds": ("实时文字", ["实", "时", "文", "字"])}]
+
+    cache = {}
+    adapter = funasr_stream_worker.OnnxStreamingModelAdapter(FakeOnnxModel())
+    result = adapter.generate(
+        input=np.ones(960, dtype=np.float32),
+        cache=cache,
+        is_final=False,
+        chunk_size=[0, 1, 0],
+        hotword=["trace_id"],
+    )
+
+    assert result == [{"text": "实时文字"}]
+    assert cache == {"seen": True}
+    assert calls[0][1]["is_final"] is False
+
+
 def test_resident_command_header_encode_and_decode_helpers_round_trip():
     pcm_bytes = _audio_payload(1, sample_count=4)
     encoded = funasr_stream_worker.encode_resident_command(
@@ -221,7 +245,7 @@ def test_resident_mode_marks_the_short_tail_as_final_for_funasr(monkeypatch):
     assert any(event["event_type"] == "final" for event in events)
 
 
-def test_resident_mode_keeps_an_exact_stride_for_final_inference(monkeypatch):
+def test_resident_mode_processes_an_exact_stride_without_waiting_for_end(monkeypatch):
     commands = b"".join(
         [
             funasr_stream_worker.encode_resident_command(
@@ -241,7 +265,44 @@ def test_resident_mode_keeps_an_exact_stride_for_final_inference(monkeypatch):
 
     _run_worker(monkeypatch, commands, ["--resident", "--chunk-size", "0,1,0"])
 
-    assert FakeResidentAutoModel.is_final_flags == [True]
+    assert FakeResidentAutoModel.is_final_flags == [False]
+
+
+def test_resident_mode_aligns_first_preview_stride_to_detected_speech(monkeypatch):
+    commands = b"".join(
+        [
+            funasr_stream_worker.encode_resident_command(
+                "start_session", session_id="speech-aligned"
+            ),
+            funasr_stream_worker.encode_resident_command(
+                "audio",
+                session_id="speech-aligned",
+                pcm_bytes=_audio_payload(0, sample_count=960),
+            ),
+            funasr_stream_worker.encode_resident_command(
+                "audio",
+                session_id="speech-aligned",
+                pcm_bytes=_audio_payload(1, sample_count=960),
+            ),
+            funasr_stream_worker.encode_resident_command(
+                "end_session", session_id="speech-aligned"
+            ),
+            funasr_stream_worker.encode_resident_command("shutdown"),
+        ]
+    )
+
+    events = _run_worker(
+        monkeypatch,
+        commands,
+        ["--resident", "--chunk-size", "0,1,0"],
+    )
+
+    partials = [event for event in events if event["event_type"] == "partial"]
+    telemetry = next(event for event in events if event["event_type"] == "telemetry")
+    assert [event["text"] for event in partials] == ["第一场内容"]
+    assert FakeResidentAutoModel.is_final_flags == [False]
+    assert telemetry["input_samples"] == 1_920
+    assert telemetry["inference_calls"] == 1
 
 
 def test_resident_mode_applies_and_isolates_session_hotwords(monkeypatch):

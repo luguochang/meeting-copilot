@@ -510,11 +510,11 @@ async def _test_runner_repairs_one_invalid_structured_response_and_counts_all_us
     ]
 
 
-def test_runner_does_not_repair_unknown_evidence() -> None:
-    asyncio.run(_test_runner_does_not_repair_unknown_evidence())
+def test_runner_repairs_unknown_evidence_once_before_failing_closed() -> None:
+    asyncio.run(_test_runner_repairs_unknown_evidence_once_before_failing_closed())
 
 
-async def _test_runner_does_not_repair_unknown_evidence() -> None:
+async def _test_runner_repairs_unknown_evidence_once_before_failing_closed() -> None:
     invalid = json.dumps(
         {
             "paragraph_revisions": [],
@@ -537,13 +537,52 @@ async def _test_runner_does_not_repair_unknown_evidence() -> None:
         },
         ensure_ascii=False,
     )
-    provider = _Provider(invalid)
+    valid = json.dumps(
+        {
+            "paragraph_revisions": [],
+            "topic_update": None,
+            "state_changes": [],
+            "follow_up": None,
+        },
+        ensure_ascii=False,
+    )
+    provider = _Provider([invalid, valid])
 
-    with pytest.raises(IntelligenceResponseValidationError) as caught:
-        await run_realtime_intelligence(request=_request(), provider=provider)
+    result = await run_realtime_intelligence(request=_request(), provider=provider)
 
-    assert caught.value.category == "evidence"
-    assert len(provider.calls) == 1
+    assert result["response"].state_changes == ()
+    assert result["repair_attempted"] is True
+    assert len(provider.calls) == 2
+
+
+def test_parser_rejects_transcript_revisions_when_independent_lane_is_disabled() -> None:
+    request = RealtimeIntelligenceRequest.from_payload(
+        meeting_id="meeting-independent-correction",
+        state_revision=1,
+        new_paragraphs=[_paragraph("paragraph-1", "原始转写")],
+        context_paragraphs=[],
+        rolling_state={},
+        allow_paragraph_revisions=False,
+    )
+    content = json.dumps(
+        {
+            "paragraph_revisions": [
+                {
+                    "target_id": "paragraph-1",
+                    "expected_revision": 1,
+                    "corrected_text": "修正后的转写",
+                    "change_count": 1,
+                }
+            ],
+            "topic_update": None,
+            "state_changes": [],
+            "follow_up": None,
+        },
+        ensure_ascii=False,
+    )
+
+    with pytest.raises(IntelligenceResponseValidationError, match="handled independently"):
+        parse_realtime_intelligence_response(content, request=request)
 
 
 def test_runner_does_not_repair_stale_paragraph_revision() -> None:

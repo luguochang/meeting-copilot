@@ -25,8 +25,10 @@ REQUIRED_SCAFFOLD_FILES = (
     "src-tauri/Cargo.lock",
     "src-tauri/build.rs",
     "src-tauri/tauri.conf.json",
+    "src-tauri/tauri.windows.conf.json",
     "src-tauri/capabilities/default.json",
     "src-tauri/icons/icon.png",
+    "src-tauri/icons/icon.ico",
     "src-tauri/src/main.rs",
     "src-tauri/src/lib.rs",
 )
@@ -72,6 +74,7 @@ EXPECTED_BRIDGE_COMMANDS = {
     "mic_adapter_stop": "mic_adapter.stop",
     "mic_adapter_collect_events": "mic_adapter.collect_events",
     "mic_adapter_cleanup": "mic_adapter.cleanup",
+    "windows_audio_devices": "windows.audio_devices",
     "system_audio_adapter_prepare": "system_audio_adapter.prepare",
     "system_audio_adapter_status": "system_audio_adapter.status",
     "system_audio_adapter_collect_events": "system_audio_adapter.collect_events",
@@ -186,6 +189,23 @@ def test_tauri_config_points_to_existing_web_mvp_and_declares_mac_dev_bundle_tar
     assert "NSScreenCaptureUsageDescription" in info_plist
 
 
+def test_windows_tauri_overlay_declares_native_installers_and_webview_bootstrapper():
+    config = json.loads(
+        (DESKTOP_ROOT / "src-tauri" / "tauri.windows.conf.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    bundle = config["bundle"]
+    assert bundle["active"] is True
+    assert set(bundle["targets"]) == {"nsis", "msi"}
+    assert bundle["icon"] == ["icons/icon.ico"]
+    assert bundle["windows"]["webviewInstallMode"] == {
+        "type": "downloadBootstrapper",
+        "silent": True,
+    }
+
+
 def test_tauri_default_icon_exists_for_generate_context_without_bundle_artifacts():
     icon_path = TAURI_ROOT / "icons" / "icon.png"
     icon_bytes = icon_path.read_bytes()
@@ -259,6 +279,7 @@ def test_packaged_workbench_gets_exact_runtime_origin_and_command_permissions():
 
 def test_tauri_lib_binds_bridge_and_mic_adapter_commands():
     lib_rs = _read("src-tauri/src/lib.rs")
+    audio_adapter_rs = _read("src-tauri/src/desktop_audio_adapter_runtime.rs")
 
     public_command_functions = re.findall(r"#\[tauri::command\]\s*pub fn ([a-z0-9_]+)\(", lib_rs)
     assert public_command_functions == []
@@ -285,13 +306,23 @@ def test_tauri_lib_binds_bridge_and_mic_adapter_commands():
     for mic_function, runtime_type in EXPECTED_NATIVE_MIC_COMMANDS.items():
         assert runtime_type in lib_rs
 
-    assert "microphone.prepare()" in lib_rs
-    assert "microphone.status()" in lib_rs
-    assert "microphone.start_with_epoch(" in lib_rs
-    assert "microphone.pause()" in lib_rs
-    assert "microphone.resume()" in lib_rs
-    assert "microphone.stop_for_session(session_id.as_deref())" in lib_rs
-    assert "microphone.cleanup_for_session(session_id.as_deref())" in lib_rs
+    assert "audio.microphone_prepare()" in lib_rs
+    assert "audio.microphone_status()" in lib_rs
+    assert "audio.microphone_start(" in lib_rs
+    assert "audio.microphone_pause()" in lib_rs
+    assert "audio.microphone_resume()" in lib_rs
+    assert "audio.microphone_stop(session_id.as_deref())" in lib_rs
+    assert "audio.microphone_cleanup(session_id.as_deref())" in lib_rs
+
+    assert "self.native_microphone.prepare()" in audio_adapter_rs
+    assert "self.native_microphone.status()" in audio_adapter_rs
+    assert re.search(
+        r"self\.native_microphone\s*\.start_with_epoch\(", audio_adapter_rs
+    )
+    assert "self.native_microphone.pause()" in audio_adapter_rs
+    assert "self.native_microphone.resume()" in audio_adapter_rs
+    assert "self.native_microphone.stop_for_session(session_id)" in audio_adapter_rs
+    assert "self.native_microphone.cleanup_for_session(session_id)" in audio_adapter_rs
 
     for worker_function, runtime_call in EXPECTED_ASR_WORKER_LIFECYCLE_RUNTIME_COMMANDS.items():
         assert re.search(

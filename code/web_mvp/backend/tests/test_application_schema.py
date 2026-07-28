@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import json
+import os
 import sqlite3
 import stat
 from pathlib import Path
@@ -38,7 +39,7 @@ def test_fresh_database_bootstraps_legacy_and_v2_schema(tmp_path: Path) -> None:
 
     assert result.source_version == 0
     assert result.final_version == APPLICATION_SCHEMA_VERSION
-    assert result.applied_versions == (1, 2, 3)
+    assert result.applied_versions == (1, 2, 3, 4, 5, 6)
     assert result.backup_path is None
     assert _version(database_path) == APPLICATION_SCHEMA_VERSION
     assert {
@@ -58,7 +59,11 @@ def test_fresh_database_bootstraps_legacy_and_v2_schema(tmp_path: Path) -> None:
         "review_documents",
         "recording_sessions",
         "deletion_jobs",
-        "data_governance_settings",
+            "data_governance_settings",
+            "ask_threads",
+            "ask_messages",
+            "meeting_notes",
+            "meeting_note_evidence",
     }.issubset(_objects(database_path, "table"))
     assert {
         "idx_llm_usage_timestamp",
@@ -78,6 +83,9 @@ def test_fresh_database_bootstraps_legacy_and_v2_schema(tmp_path: Path) -> None:
         (1, "create_legacy_repository_schema"),
         (2, "create_v2_application_schema"),
         (3, "add_native_pcm_source_ranges"),
+        (4, "add_meeting_ask_ai_workspace"),
+        (5, "add_meeting_notes"),
+        (6, "version_semantic_reading_blocks"),
     ]
 
 
@@ -97,11 +105,12 @@ def test_existing_legacy_v1_database_is_backed_up_and_upgraded_without_data_loss
 
     assert result.source_version == 1
     assert result.final_version == APPLICATION_SCHEMA_VERSION
-    assert result.applied_versions == (2, 3)
+    assert result.applied_versions == (2, 3, 4, 5, 6)
     assert result.backup_path is not None
     backup_stat = result.backup_path.stat()
     assert stat.S_ISREG(backup_stat.st_mode)
-    assert stat.S_IMODE(backup_stat.st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(backup_stat.st_mode) == 0o600
     with sqlite3.connect(result.backup_path) as backup:
         assert backup.execute("PRAGMA user_version").fetchone()[0] == 1
         assert backup.execute("SELECT record_json FROM sessions WHERE session_id = 'preserve-me'").fetchone() == (
@@ -118,8 +127,11 @@ def test_existing_legacy_v1_database_is_backed_up_and_upgraded_without_data_loss
             "SELECT version, name FROM meeting_copilot_schema_migrations ORDER BY version"
         ).fetchall() == [
             (2, "create_v2_application_schema"),
-            (3, "add_native_pcm_source_ranges"),
-        ]
+                (3, "add_native_pcm_source_ranges"),
+                (4, "add_meeting_ask_ai_workspace"),
+                (5, "add_meeting_notes"),
+                (6, "version_semantic_reading_blocks"),
+            ]
 
 
 def test_failed_v2_migration_rolls_back_v1_database_and_retains_verified_backup(
@@ -191,7 +203,7 @@ def test_old_v2_partial_schema_at_version_zero_is_completed_and_preserved(tmp_pa
     result = bootstrap_application_schema(database_path)
 
     assert result.source_version == 0
-    assert result.applied_versions == (1, 2, 3)
+    assert result.applied_versions == (1, 2, 3, 4, 5, 6)
     with sqlite3.connect(database_path) as connection:
         meeting_columns = {row[1] for row in connection.execute("PRAGMA table_info(meetings)").fetchall()}
         entity_columns = {row[1] for row in connection.execute("PRAGMA table_info(meeting_entities)").fetchall()}
@@ -269,7 +281,7 @@ def test_safe_schema_migration_report_excludes_database_and_backup_paths(tmp_pat
         "storage": "sqlite",
         "source_version": 1,
         "final_version": APPLICATION_SCHEMA_VERSION,
-        "applied_versions": [2, 3],
+        "applied_versions": [2, 3, 4, 5, 6],
         "migrated": True,
         "backup_created": True,
     }
@@ -304,6 +316,45 @@ def test_known_prerelease_v2_fingerprint_is_promoted_but_unknown_history_fails_c
 
     with pytest.raises(RuntimeError, match="fingerprint mismatch"):
         bootstrap_application_schema(database_path)
+
+
+def test_prerelease_probe_reopens_after_transient_windows_post_crash_io_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "meeting_copilot.db"
+    bootstrap_application_schema(database_path)
+    real_connect = sqlite3.connect
+    connect_count = 0
+
+    class FailFirstUserVersionRead:
+        def __init__(self, connection: sqlite3.Connection, *, fail: bool) -> None:
+            self._connection = connection
+            self._fail = fail
+
+        def execute(self, statement: str, *args):
+            if self._fail and statement == "PRAGMA user_version":
+                self._fail = False
+                raise sqlite3.OperationalError("disk I/O error")
+            return self._connection.execute(statement, *args)
+
+        def close(self) -> None:
+            self._connection.close()
+
+    def flaky_connect(*args, **kwargs):
+        nonlocal connect_count
+        connect_count += 1
+        return FailFirstUserVersionRead(real_connect(*args, **kwargs), fail=connect_count == 1)
+
+    monkeypatch.setattr(application_schema.sqlite3, "connect", flaky_connect)
+
+    application_schema._promote_known_prerelease_v2_fingerprint(
+        database_path,
+        lock_path=None,
+        timeout_seconds=1.0,
+    )
+
+    assert connect_count == 2
 
 
 @pytest.mark.parametrize(
@@ -355,7 +406,7 @@ def test_concurrent_bootstrap_is_serialized_and_idempotent(tmp_path: Path) -> No
     with ThreadPoolExecutor(max_workers=6) as executor:
         results = list(executor.map(lambda _: bootstrap(), range(6)))
 
-    assert results.count((APPLICATION_SCHEMA_VERSION, (1, 2, 3))) == 1
+    assert results.count((APPLICATION_SCHEMA_VERSION, (1, 2, 3, 4, 5, 6))) == 1
     assert results.count((APPLICATION_SCHEMA_VERSION, ())) == 5
     with sqlite3.connect(database_path) as connection:
         assert connection.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
@@ -397,7 +448,7 @@ def test_v3_migration_preserves_v2_audio_chunks_and_adds_nullable_source_ranges(
     result = bootstrap_application_schema(database_path)
 
     assert result.source_version == 2
-    assert result.applied_versions == (3,)
+    assert result.applied_versions == (3, 4, 5, 6)
     with sqlite3.connect(database_path) as connection:
         columns = {row[1] for row in connection.execute("PRAGMA table_info(audio_chunks)")}
         assert {

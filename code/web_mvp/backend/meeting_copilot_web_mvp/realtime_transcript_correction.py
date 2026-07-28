@@ -240,9 +240,15 @@ def build_revision_event(
 ) -> dict[str, Any] | None:
     del session_id  # The deterministic event id is scoped by its owning session record.
     original_text = _event_text(final_event)
-    corrected = str(corrected_text or "").strip()
+    provider_corrected = str(corrected_text or "").strip()
     segment_id = _event_segment_id(final_event)
-    if not segment_id or not _correction_is_safe(original_text, corrected):
+    if not segment_id or not _correction_is_safe(original_text, provider_corrected):
+        return None
+    # A provider correction can unlock a deterministic contextual rule that
+    # could not match the original ASR text. Keep provider fact-safety as the
+    # gate, then re-run the same idempotent local normalizer used at ingestion.
+    corrected = normalize_asr_terms(provider_corrected).strip()
+    if not corrected or corrected == original_text:
         return None
 
     payload = dict(final_event.get("payload") or {})

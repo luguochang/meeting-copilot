@@ -74,6 +74,25 @@ interface NativeSystemAudioPrepareResponse extends NativeCaptureHealthFields {
   errors?: string[];
 }
 
+interface SelectableAudioDevice {
+  deviceId: string;
+  label: string;
+  isDefault: boolean;
+}
+
+interface WindowsAudioDeviceResponse {
+  devices?: Array<{
+    endpoint_id?: string;
+    display_name?: string;
+    is_default?: boolean;
+  }>;
+}
+
+interface PreflightDevices {
+  microphones: SelectableAudioDevice[];
+  systemAudio: SelectableAudioDevice[];
+}
+
 interface BrowserInputProbe {
   rms: number;
   peakRms: number;
@@ -95,6 +114,26 @@ interface ProviderConfigSyncResponse {
 const MEETING_NOTICE = "本次会议将录音并实时转写，用于生成会议建议和会后纪要。原始音频默认仅保存在本机。";
 const MICROPHONE_PROBE_DURATION_MS = 2_500;
 const AUDIBLE_RMS_THRESHOLD = 0.002;
+
+type MeetingPresetId = NonNullable<MeetingPreparationInput["presetId"]>;
+type MeetingOutputFormat = NonNullable<MeetingPreparationInput["outputFormat"]>;
+type SuggestionPolicy = NonNullable<MeetingPreparationInput["proactiveSuggestionPolicy"]>;
+
+const PRESET_DEFAULTS: Record<MeetingPresetId, {
+  goal: string;
+  focusPoints: string;
+  outputFormat: MeetingOutputFormat;
+}> = {
+  general: { goal: "", focusPoints: "", outputFormat: "standard" },
+  decision: { goal: "形成可执行且有依据的决策", focusPoints: "决策结论、备选方案、决策依据、反对意见", outputFormat: "decision_log" },
+  project: { goal: "同步项目进度并明确下一步", focusPoints: "进展、阻塞、负责人、截止时间", outputFormat: "action_plan" },
+  interview: { goal: "完整记录访谈洞察和待验证假设", focusPoints: "用户原话、痛点、需求、待验证假设", outputFormat: "brief" },
+  brainstorm: { goal: "发散方案并收敛可验证的下一步", focusPoints: "新想法、约束、争议、实验方案", outputFormat: "standard" },
+};
+
+function parseFocusPoints(value: string): string[] {
+  return value.split(/[,，;；\n]+/).map((item) => item.trim()).filter(Boolean).slice(0, 12);
+}
 
 function parseHotwords(value: string): string[] {
   const seen = new Set<string>();
@@ -219,6 +258,19 @@ async function responseJson<T>(response: Response): Promise<T> {
   return body as T;
 }
 
+function windowsAudioDevices(response: WindowsAudioDeviceResponse | null): SelectableAudioDevice[] {
+  if (!Array.isArray(response?.devices)) return [];
+  return response.devices.flatMap((device) => {
+    const deviceId = String(device.endpoint_id ?? "").trim();
+    if (!deviceId) return [];
+    return [{
+      deviceId,
+      label: String(device.display_name ?? "").trim() || "Windows audio device",
+      isDefault: device.is_default === true,
+    }];
+  });
+}
+
 export function MeetingPreflightDialog({
   open,
   busy,
@@ -228,13 +280,21 @@ export function MeetingPreflightDialog({
   const [storage, setStorage] = useState<StoragePreflight | null>(null);
   const [providers, setProviders] = useState<ProviderHealth | null>(null);
   const [providerStatus, setProviderStatus] = useState<ProviderStatus | null>(null);
-  const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
+  const [devices, setDevices] = useState<SelectableAudioDevice[]>([]);
   const [deviceId, setDeviceId] = useState("");
+  const [systemAudioDevices, setSystemAudioDevices] = useState<SelectableAudioDevice[]>([]);
+  const [systemAudioDeviceId, setSystemAudioDeviceId] = useState("");
   const [inputSource, setInputSource] = useState<MeetingInputSource>("microphone");
   const [dualTrackAvailable, setDualTrackAvailable] = useState(false);
   const [systemAudioCheck, setSystemAudioCheck] = useState<SystemAudioCheck>("idle");
   const [hotwordsText, setHotwordsText] = useState("");
   const [title, setTitle] = useState("");
+  const [presetId, setPresetId] = useState<MeetingPresetId>("general");
+  const [meetingGoal, setMeetingGoal] = useState("");
+  const [participantRole, setParticipantRole] = useState("");
+  const [focusPointsText, setFocusPointsText] = useState("");
+  const [outputFormat, setOutputFormat] = useState<MeetingOutputFormat>("standard");
+  const [suggestionPolicy, setSuggestionPolicy] = useState<SuggestionPolicy>("low_frequency");
   const [noticeAcknowledged, setNoticeAcknowledged] = useState(false);
   const [inputCheck, setInputCheck] = useState<InputCheck>("idle");
   const [inputLevel, setInputLevel] = useState(0);
@@ -258,9 +318,25 @@ export function MeetingPreflightDialog({
           typeof value.configured === "boolean" ? value : null
         )).catch(() => null)
         : Promise.resolve(null),
-      nativeDesktop
-        ? Promise.resolve([] as MediaDeviceInfo[])
-        : navigator.mediaDevices?.enumerateDevices?.() ?? Promise.resolve([] as MediaDeviceInfo[]),
+      invoke
+        ? Promise.all([
+          invoke<WindowsAudioDeviceResponse>("windows_audio_devices", { flow: "microphone" }).catch(() => null),
+          invoke<WindowsAudioDeviceResponse>("windows_audio_devices", { flow: "render_loopback" }).catch(() => null),
+        ]).then(([microphones, systemAudio]): PreflightDevices => ({
+          microphones: windowsAudioDevices(microphones),
+          systemAudio: windowsAudioDevices(systemAudio),
+        }))
+        : (navigator.mediaDevices?.enumerateDevices?.() ?? Promise.resolve([] as MediaDeviceInfo[]))
+          .then((browserDevices): PreflightDevices => ({
+            microphones: browserDevices
+              .filter((device) => device.kind === "audioinput")
+              .map((device) => ({
+                deviceId: device.deviceId,
+                label: device.label,
+                isDefault: device.deviceId === "default",
+              })),
+            systemAudio: [],
+          })),
       invoke
         ? dualTrackStatus().catch(() => null)
         : Promise.resolve(null),
@@ -273,12 +349,18 @@ export function MeetingPreflightDialog({
       runtimeStatus ?? providerStatusFromHealth(providerResult),
     );
     setProviderStatus(status);
-    const microphones = deviceResult.filter((device) => device.kind === "audioinput");
+    const microphones = deviceResult.microphones;
     setDevices(microphones);
-    setDeviceId((current) => current || microphones[0]?.deviceId || "");
+    setDeviceId((current) => current || microphones.find((device) => device.isDefault)?.deviceId
+      || microphones[0]?.deviceId || "");
+    setSystemAudioDevices(deviceResult.systemAudio);
+    setSystemAudioDeviceId((current) => current
+      || deviceResult.systemAudio.find((device) => device.isDefault)?.deviceId
+      || deviceResult.systemAudio[0]?.deviceId
+      || "");
     setDualTrackAvailable(Boolean(dualTrackResult && isDualTrackCapabilityAvailable(dualTrackResult)));
     return status;
-  }, [nativeDesktop]);
+  }, []);
 
   useEffect(() => {
     if (!open) return;
@@ -311,6 +393,10 @@ export function MeetingPreflightDialog({
   const selectedDevice = useMemo(
     () => devices.find((device) => device.deviceId === deviceId) ?? null,
     [deviceId, devices],
+  );
+  const selectedSystemAudioDevice = useMemo(
+    () => systemAudioDevices.find((device) => device.deviceId === systemAudioDeviceId) ?? null,
+    [systemAudioDeviceId, systemAudioDevices],
   );
 
   if (!open) return null;
@@ -374,7 +460,10 @@ export function MeetingPreflightDialog({
     try {
       const invoke = resolveTauriInvoke();
       if (invoke) {
-        const response = await invoke<NativeMicProbeResponse>("mic_adapter_probe");
+        const response = await invoke<NativeMicProbeResponse>(
+          "mic_adapter_probe",
+          deviceId ? { deviceId } : undefined,
+        );
         const probeStatus = normalizeNativeProbeStatus(response);
         if (probeStatus === "permission_denied" || probeStatus === "no_device") {
           failureStatus = probeStatus;
@@ -483,12 +572,20 @@ export function MeetingPreflightDialog({
         ...(title.trim() ? { title: title.trim() } : {}),
         hotwords: parseHotwords(hotwordsText),
         inputSource,
-        inputDeviceId: inputSource !== "microphone" || nativeDesktop ? null : deviceId || null,
+        inputDeviceId: inputSource === "microphone"
+          ? deviceId || null
+          : inputSource === "system_audio" ? systemAudioDeviceId || null : null,
         inputDeviceName: inputSource === "dual_track"
           ? "麦克风 + 系统音频"
-          : inputSource === "system_audio" ? "系统音频"
-          : nativeDesktop ? "系统默认麦克风" : selectedDevice?.label || null,
+          : inputSource === "system_audio" ? selectedSystemAudioDevice?.label || "系统音频"
+          : selectedDevice?.label || (nativeDesktop ? "系统默认麦克风" : null),
         noticeAcknowledged: true,
+        ...(presetId !== "general" ? { presetId } : {}),
+        ...(meetingGoal.trim() ? { meetingGoal: meetingGoal.trim() } : {}),
+        ...(participantRole.trim() ? { participantRole: participantRole.trim() } : {}),
+        ...(focusPointsText.trim() ? { focusPoints: parseFocusPoints(focusPointsText) } : {}),
+        ...(outputFormat !== "standard" ? { outputFormat } : {}),
+        ...(suggestionPolicy !== "low_frequency" ? { proactiveSuggestionPolicy: suggestionPolicy } : {}),
       });
     } catch (startError) {
       setError(startError instanceof Error ? startError.message : "声音采集启动失败");
@@ -654,7 +751,27 @@ export function MeetingPreflightDialog({
                     ? "同时采集麦克风和系统音频；任一轨失败都会中止本次采集。"
                     : "将采集本机播放的会议声音，不会同时启动麦克风。"}
                 </p>
-                <small>开始会议时 macOS 会请求“屏幕与系统音频录制”权限。</small>
+                {inputSource === "system_audio" && systemAudioDevices.length ? (
+                  <label>
+                    <span className="sr-only">系统音频设备</span>
+                    <select
+                      value={systemAudioDeviceId}
+                      onChange={(event) => setSystemAudioDeviceId(event.target.value)}
+                      disabled={busy}
+                    >
+                      {systemAudioDevices.map((device, index) => (
+                        <option key={device.deviceId || `system-audio-${index}`} value={device.deviceId}>
+                          {device.label || `系统音频 ${index + 1}`}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                ) : null}
+                <small>
+                  {systemAudioDevices.length
+                    ? "Windows 将从所选播放设备的 WASAPI loopback 采集声音。"
+                    : "开始会议时 macOS 会请求“屏幕与系统音频录制”权限。"}
+                </small>
                 <div className="preflight-native-health" aria-label="系统音频启动检查项">
                   <span><small>传输</small><strong>开始时验证</strong></span>
                   <span><small>PCM</small><strong>开始时验证</strong></span>
@@ -675,6 +792,77 @@ export function MeetingPreflightDialog({
               disabled={busy}
             />
           </label>
+
+          <div className="preflight-ai-context">
+            <label>
+              <span>会议预设</span>
+              <select
+                value={presetId}
+                onChange={(event) => {
+                  const next = event.target.value as MeetingPresetId;
+                  const defaults = PRESET_DEFAULTS[next];
+                  setPresetId(next);
+                  setMeetingGoal(defaults.goal);
+                  setFocusPointsText(defaults.focusPoints);
+                  setOutputFormat(defaults.outputFormat);
+                }}
+                disabled={busy}
+              >
+                <option value="general">通用会议</option>
+                <option value="decision">决策评审</option>
+                <option value="project">项目同步</option>
+                <option value="interview">用户访谈</option>
+                <option value="brainstorm">头脑风暴</option>
+              </select>
+            </label>
+            <label>
+              <span>我的角色</span>
+              <input
+                value={participantRole}
+                onChange={(event) => setParticipantRole(event.target.value)}
+                placeholder="例如：主持人、产品负责人"
+                maxLength={200}
+                disabled={busy}
+              />
+            </label>
+            <label className="preflight-ai-context__wide">
+              <span>会议目标</span>
+              <input
+                value={meetingGoal}
+                onChange={(event) => setMeetingGoal(event.target.value)}
+                placeholder="本场会议需要达成什么结果"
+                maxLength={2_000}
+                disabled={busy}
+              />
+            </label>
+            <label className="preflight-ai-context__wide">
+              <span>重点关注</span>
+              <input
+                value={focusPointsText}
+                onChange={(event) => setFocusPointsText(event.target.value)}
+                placeholder="逗号分隔，例如：决策、风险、负责人"
+                maxLength={1_200}
+                disabled={busy}
+              />
+            </label>
+            <label>
+              <span>整理格式</span>
+              <select value={outputFormat} onChange={(event) => setOutputFormat(event.target.value as MeetingOutputFormat)} disabled={busy}>
+                <option value="standard">标准纪要</option>
+                <option value="decision_log">决策记录</option>
+                <option value="action_plan">行动计划</option>
+                <option value="brief">简报</option>
+              </select>
+            </label>
+            <label>
+              <span>主动建议</span>
+              <select value={suggestionPolicy} onChange={(event) => setSuggestionPolicy(event.target.value as SuggestionPolicy)} disabled={busy}>
+                <option value="low_frequency">低频高信号</option>
+                <option value="standard">标准频率</option>
+                <option value="off">关闭</option>
+              </select>
+            </label>
+          </div>
 
           <label className="preflight-hotwords-field">
             <span>本次会议技术词</span>

@@ -121,3 +121,40 @@ def test_normalized_fun_asr_release_fragments_pass_compound_term_quality_gate():
 
     assert result["status"] == "passed"
     assert result["unknown_latin_tokens"] == []
+
+
+def test_asr_semantic_quality_accepts_normalized_api_path_and_field_identifiers():
+    result = evaluate_semantic_quality(
+        "这个 PR 会把 GET /api/v1/orders 的 response 增加 total_amount 字段，"
+        "同时保留 amount 字段两个版本，避免 mobile-app 和 BI job 解析失败。"
+    )
+
+    assert result["status"] == "passed"
+    assert result["blocker"] is None
+    assert result["unknown_latin_tokens"] == []
+
+
+def test_asr_semantic_quality_warns_but_does_not_block_sparse_unknown_product_names():
+    result = evaluate_semantic_quality(
+        "今天的会议围绕官网部署、代码发布和客户端功能展开。"
+        "大家先梳理了当前页面、用户流程、安装包交付和后续测试安排，"
+        "也确认了明天要完成的发布检查、服务配置和负责人。" * 12
+        + "最后比较 NeonDB、RenderHub、PagePilot、CodeRabbit、LaunchDeck、ShipFast、"
+        "PromptForge、DeployFlow 这些候选服务。"
+    )
+
+    assert result["status"] == "warning"
+    assert result["blocker"] is None
+    assert result["quality_warning"] == "mixed_language_fragmentation"
+    assert result["mixed_language_fragmentation_score"] >= 0.45
+    assert result["mixed_language_fragmentation_density"] < 0.15
+
+
+def test_asr_semantic_quality_accepts_common_cloud_products_and_initialisms():
+    result = evaluate_semantic_quality(
+        "官网代码用 ChatGPT 和 Claude 检查，Cloudflare 配 DNS，Vercel 负责部署，DFC 今天提交 commit。"
+    )
+
+    assert result["status"] == "passed"
+    assert result["blocker"] is None
+    assert result["unknown_latin_tokens"] == []

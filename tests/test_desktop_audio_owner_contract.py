@@ -3,6 +3,14 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TAURI_LIB = REPO_ROOT / "code" / "desktop_tauri" / "src-tauri" / "src" / "lib.rs"
+DESKTOP_AUDIO_ADAPTER = (
+    REPO_ROOT
+    / "code"
+    / "desktop_tauri"
+    / "src-tauri"
+    / "src"
+    / "desktop_audio_adapter_runtime.rs"
+)
 TAURI_COMMANDS = (
     REPO_ROOT
     / "code"
@@ -50,10 +58,16 @@ def test_backend_v2_is_the_only_product_audio_lifecycle_owner() -> None:
 
 def test_native_microphone_only_streams_to_the_backend_canonical_chain() -> None:
     tauri_source = TAURI_LIB.read_text(encoding="utf-8")
+    adapter_source = DESKTOP_AUDIO_ADAPTER.read_text(encoding="utf-8")
 
     assert "native_mic_capture_runtime::NativeMicCaptureSupervisor" in tauri_source
-    assert "microphone.start_with_epoch(" in tauri_source
-    assert "microphone.stop_for_session(session_id.as_deref())" in tauri_source
+    assert "audio.microphone_start(" in tauri_source
+    assert "audio.microphone_stop(session_id.as_deref())" in tauri_source
+    assert "self.native_microphone" in adapter_source
+    assert ".start_with_epoch(session_id, capture_epoch, backend)" in adapter_source
+    assert "self.native_microphone.stop_for_session(session_id)" in adapter_source
+    assert "self.windows.start(" in adapter_source
+    assert "self.windows.stop(AudioFlow::Microphone, session_id)" in adapter_source
 
 
 def test_native_dual_track_capture_keeps_two_named_loopback_tracks() -> None:

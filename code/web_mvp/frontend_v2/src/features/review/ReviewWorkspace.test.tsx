@@ -1,8 +1,10 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import type { MeetingAudioWithTracks } from "../../api/schema";
 import { createInitialMeetingState } from "../../domain/reducer";
 import type { MeetingViewState, ReviewJobStatus, TranscriptSegment } from "../../domain/events";
 import { ReviewWorkspace } from "./ReviewWorkspace";
+import { segmentDomId } from "../live-meeting/domIds";
 
 function segment(sequence: number): TranscriptSegment {
   return {
@@ -96,12 +98,120 @@ describe("ReviewWorkspace", () => {
     vi.unstubAllGlobals();
   });
 
-  it("uses the single-scroll transcript layout and keeps every confirmed segment in the document", async () => {
+  it("defaults multi-epoch recordings to the complete continued meeting", async () => {
+    const state = endedState();
+    state.audioDetail = {
+      meetingId: state.meetingId,
+      status: "saved",
+      overallStatus: "saved",
+      assembled: true,
+      playbackUrl: "/v2/meetings/meeting-review/audio/content",
+      format: "wav",
+      fileSizeBytes: 696_558,
+      chunkCount: 6,
+      durationMs: 21_765,
+      tracks: ["microphone"],
+      chunks: [],
+      expectedTracks: ["microphone"],
+      trackStates: [
+        {
+          trackId: "microphone",
+          source: "microphone",
+          epoch: 1,
+          status: "ready",
+          durationMs: 10_800,
+          chunkCount: 3,
+          fileSizeBytes: 345_644,
+          playbackUrl: "/v2/meetings/meeting-review/audio/tracks/microphone/content?epoch=1",
+          errorClass: null,
+          firstSequence: 0,
+          lastSequence: 2,
+          firstTimestampMs: 1_000,
+          lastTimestampMs: 11_000,
+        },
+        {
+          trackId: "microphone",
+          source: "microphone",
+          epoch: 2,
+          status: "ready",
+          durationMs: 10_965,
+          chunkCount: 3,
+          fileSizeBytes: 350_914,
+          playbackUrl: "/v2/meetings/meeting-review/audio/tracks/microphone/content?epoch=2",
+          errorClass: null,
+          firstSequence: 0,
+          lastSequence: 2,
+          firstTimestampMs: 11_001,
+          lastTimestampMs: 21_001,
+        },
+      ],
+      derivedAssets: [],
+      mixedCreateUrl: "/v2/meetings/meeting-review/audio/mixed",
+    } as MeetingAudioWithTracks;
+    state.audioLoadState = "ready";
+
+    const user = userEvent.setup();
+    const view = render(
+      <ReviewWorkspace
+        state={state}
+        onReloadTranscript={vi.fn()}
+        onReloadAudio={vi.fn()}
+        onExport={vi.fn().mockResolvedValue(undefined)}
+      />,
+    );
+    await user.click(screen.getByRole("tab", { name: "录音" }));
+
+    expect(screen.getByText("已按时间顺序串联 2 段续录 · 0:22")).toBeVisible();
+    expect(screen.getByText("2 段续录")).toBeVisible();
+    expect(screen.queryByText("本次录音不完整")).not.toBeInTheDocument();
+    expect(screen.getByText("1 / 1")).toBeVisible();
+    expect(view.container.querySelector("audio")).toHaveAttribute(
+      "src",
+      "/v2/meetings/meeting-review/audio/content",
+    );
+  });
+
+  it("renders semantic paragraphs while retaining every checkpoint evidence anchor", async () => {
     const user = userEvent.setup();
     const state = {
       ...createInitialMeetingState("meeting-review"),
       fullTranscript: [segment(1), segment(2), segment(3)],
       fullTranscriptState: "ready" as const,
+      decisionCandidates: [{
+        id: "decision-semantic-anchor",
+        text: "确认第二条片段的上下文",
+        status: "confirmed" as const,
+        confidence: 0.95,
+        evidenceSegmentIds: ["segment-2"],
+        evidenceSpans: [],
+        updatedAtMs: 3_000,
+      }],
+      semanticParagraphs: [
+        {
+          meetingId: "meeting-review",
+          paragraphId: "paragraph-1",
+          revision: 2,
+          text: "已确认会议内容 1，已确认会议内容 2。",
+          startMs: 1_000,
+          endMs: 2_800,
+          status: "stable" as const,
+          checkpointIds: ["segment-1", "segment-2"],
+          createdAtMs: 1_000,
+          updatedAtMs: 2_900,
+        },
+        {
+          meetingId: "meeting-review",
+          paragraphId: "paragraph-2",
+          revision: 1,
+          text: "已确认会议内容 3。",
+          startMs: 3_000,
+          endMs: 3_800,
+          status: "stable" as const,
+          checkpointIds: ["segment-3"],
+          createdAtMs: 3_000,
+          updatedAtMs: 3_900,
+        },
+      ],
     };
 
     render(
@@ -113,15 +223,22 @@ describe("ReviewWorkspace", () => {
       />,
     );
 
-    await user.click(screen.getByRole("tab", { name: "会议文字" }));
+    await user.click(screen.getByRole("tab", { name: "决策与待办" }));
+    await user.click(screen.getByRole("button", { name: "查看依据" }));
 
     const panel = screen.getByRole("tabpanel");
     expect(panel).toHaveClass("review-tab-panel--transcript");
-    expect(screen.getAllByText("3 段已确认")).not.toHaveLength(0);
-    expect(panel.querySelectorAll(".transcript-segment")).toHaveLength(3);
-    expect(screen.getByText("已确认会议内容 1")).toBeVisible();
-    expect(screen.getByText("已确认会议内容 2")).toBeVisible();
-    expect(screen.getByText("已确认会议内容 3")).toBeVisible();
+    expect(screen.getByText("2 个语义段落 · 3 条识别片段")).toBeVisible();
+    expect(screen.getAllByText("2 段已确认")).not.toHaveLength(0);
+    expect(panel.querySelectorAll(".transcript-segment")).toHaveLength(2);
+    expect(screen.getByText("已确认会议内容 1，已确认会议内容 2。")).toBeVisible();
+    expect(screen.getByText("已确认会议内容 3。")).toBeVisible();
+    expect(document.getElementById(segmentDomId("segment-1"))).not.toBeNull();
+    expect(document.getElementById(segmentDomId("segment-2"))).not.toBeNull();
+    expect(document.getElementById(segmentDomId("segment-3"))).not.toBeNull();
+    await waitFor(() => expect(
+      document.getElementById(segmentDomId("segment-2"))?.closest(".transcript-segment"),
+    ).toHaveClass("is-evidence-target"));
   });
 
   it("keeps saved live suggestions beside structured minutes and de-duplicates open questions", async () => {

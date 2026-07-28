@@ -1,8 +1,13 @@
 import {
+  AlertTriangle,
+  ArrowDownUp,
   CalendarClock,
   ChevronRight,
+  CircleCheck,
   Database,
+  FileText,
   LoaderCircle,
+  Radio,
   RefreshCw,
   Search,
   Trash2,
@@ -59,11 +64,16 @@ const deletionOptions: Array<{ scope: DataDeletionScope; label: string; descript
   },
 ];
 
-const retentionOptions: Array<{ policy: DataRetentionPolicy; label: string }> = [
-  { policy: "local_until_user_deletes", label: "由我手动删除（默认）" },
-  { policy: "30_days", label: "会议结束 30 天后自动删除" },
-  { policy: "90_days", label: "会议结束 90 天后自动删除" },
-  { policy: "365_days", label: "会议结束 365 天后自动删除" },
+const retentionOptions: Array<{ policy: DataRetentionPolicy; label: string; description: string; badge?: string }> = [
+  {
+    policy: "local_until_user_deletes",
+    label: "手动删除（永久保留）",
+    description: "不会自动删除任何数据，适合长期归档和合规留存。",
+    badge: "无限制",
+  },
+  { policy: "30_days", label: "30 天", description: "会议结束 30 天后自动清理，适合短期项目。", badge: "推荐" },
+  { policy: "90_days", label: "90 天", description: "会议结束 90 天后自动清理，兼顾回溯和空间。" },
+  { policy: "365_days", label: "365 天", description: "会议结束一年后自动清理，适合年度项目。" },
 ];
 
 function formatDate(timestamp: number): string {
@@ -116,6 +126,7 @@ export function MeetingHistory({ api, onOpenMeeting }: MeetingHistoryProps) {
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<HistoryFilter>("all");
+  const [sortOrder, setSortOrder] = useState<"newest" | "oldest">("newest");
   const [hasMore, setHasMore] = useState(false);
   const [nextCursor, setNextCursor] = useState<MeetingHistoryCursor | null>(null);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -265,12 +276,24 @@ export function MeetingHistory({ api, onOpenMeeting }: MeetingHistoryProps) {
     }
   };
 
+  const historyStats = meetings.reduce(
+    (summary, meeting) => {
+      summary[meetingStatus(meeting).filter] += 1;
+      summary.segments += meeting.segmentCount;
+      return summary;
+    },
+    { live: 0, processing: 0, ready: 0, failed: 0, segments: 0 },
+  );
+  const displayedMeetings = [...meetings].sort((left, right) => (
+    sortOrder === "newest" ? right.updatedAtMs - left.updatedAtMs : left.updatedAtMs - right.updatedAtMs
+  ));
+
   return (
     <section className="history-section" aria-labelledby="history-heading">
       <div className="history-heading-row">
         <div>
-          <span className="section-kicker">历史</span>
-          <h2 id="history-heading">会议记录</h2>
+          <span className="section-kicker">会议总览</span>
+          <h2 id="history-heading">全部会议</h2>
         </div>
         <div className="history-heading-actions">
           <button
@@ -294,6 +317,25 @@ export function MeetingHistory({ api, onOpenMeeting }: MeetingHistoryProps) {
         </div>
       </div>
 
+      <div className="history-overview" aria-label="会议记录统计">
+        <article>
+          <span className="history-overview-icon history-overview-icon--live"><Radio size={20} /></span>
+          <div><span>进行中</span><strong>{historyStats.live}</strong><small>正在实时转写</small></div>
+        </article>
+        <article>
+          <span className="history-overview-icon history-overview-icon--processing"><RefreshCw size={20} /></span>
+          <div><span>处理中</span><strong>{historyStats.processing}</strong><small>转写与整理中</small></div>
+        </article>
+        <article>
+          <span className="history-overview-icon history-overview-icon--ready"><CircleCheck size={20} /></span>
+          <div><span>已完成</span><strong>{historyStats.ready}</strong><small>可随时查看</small></div>
+        </article>
+        <article>
+          <span className="history-overview-icon history-overview-icon--segments"><FileText size={20} /></span>
+          <div><span>本地文字</span><strong>{historyStats.segments}</strong><small>识别片段已保存</small></div>
+        </article>
+      </div>
+
       <div className="history-controls">
         <label className="history-search">
           <Search size={16} />
@@ -310,6 +352,14 @@ export function MeetingHistory({ api, onOpenMeeting }: MeetingHistoryProps) {
             <option value="failed">需要处理</option>
           </select>
         </label>
+        <label className="history-sort">
+          <ArrowDownUp size={16} aria-hidden="true" />
+          <span className="sr-only">会议排序</span>
+          <select value={sortOrder} onChange={(event) => setSortOrder(event.target.value as "newest" | "oldest") }>
+            <option value="newest">按时间倒序</option>
+            <option value="oldest">按时间正序</option>
+          </select>
+        </label>
       </div>
 
       {error ? <p className="inline-error">{error}</p> : null}
@@ -319,8 +369,15 @@ export function MeetingHistory({ api, onOpenMeeting }: MeetingHistoryProps) {
           <p>{meetings.length ? "没有符合条件的会议" : "完成的会议会出现在这里"}</p>
         </div>
       ) : null}
+      <div className="history-table-header" aria-hidden="true">
+        <span />
+        <span>会议信息</span>
+        <span>文字</span>
+        <span>状态</span>
+        <span>操作</span>
+      </div>
       <div className="history-list">
-        {meetings.map((meeting) => {
+        {displayedMeetings.map((meeting) => {
           const title = meetingDisplayTitle(meeting.title, meeting.startedAtMs ?? meeting.createdAtMs, meeting.meetingId);
           const status = meetingStatus(meeting);
           return (
@@ -342,9 +399,8 @@ export function MeetingHistory({ api, onOpenMeeting }: MeetingHistoryProps) {
                     {formatDuration(meeting.audioDurationMs)}
                   </span>
                 </span>
-                <span className={`history-row-meta history-row-meta--${status.filter}`}>
-                  {meeting.segmentCount} 段文字 · {status.text}
-                </span>
+                <span className="history-row-count">{meeting.segmentCount} 段文字</span>
+                <span className={`history-row-meta history-row-meta--${status.filter}`}>{status.text}</span>
                 <ChevronRight size={17} aria-hidden="true" />
               </button>
               <button
@@ -424,6 +480,10 @@ export function MeetingHistory({ api, onOpenMeeting }: MeetingHistoryProps) {
                   deleteTarget.meetingId,
                 )}”中删除的内容。
               </p>
+              <div className="deletion-warning" role="note">
+                <AlertTriangle size={16} aria-hidden="true" />
+                <span>删除后无法恢复，请确认所选范围。未选择的录音、文字或 AI 内容会继续保留。</span>
+              </div>
               <fieldset className="deletion-scope-list" disabled={Boolean(deletingId)}>
                 <legend className="sr-only">选择删除范围</legend>
                 {deletionOptions.map((option) => (
@@ -511,21 +571,33 @@ export function MeetingHistory({ api, onOpenMeeting }: MeetingHistoryProps) {
                   正在读取设置
                 </p>
               ) : (
-                <label className="retention-policy-field">
-                  <span>会议数据保留时间</span>
-                  <select
-                    value={retentionPolicy}
-                    onChange={(event) => {
-                      setRetentionPolicy(event.target.value as DataRetentionPolicy);
-                      setSettingsSaved(false);
-                    }}
-                    disabled={settingsSaving || Boolean(settingsError)}
-                  >
+                <fieldset className="retention-policy-field" disabled={settingsSaving || Boolean(settingsError)}>
+                  <legend>会议数据保留时间</legend>
+                  <div className="retention-choice-list">
                     {retentionOptions.map((option) => (
-                      <option value={option.policy} key={option.policy}>{option.label}</option>
+                      <label
+                        className={`retention-choice${retentionPolicy === option.policy ? " is-selected" : ""}`}
+                        key={option.policy}
+                      >
+                        <input
+                          type="radio"
+                          name="retention-policy"
+                          value={option.policy}
+                          checked={retentionPolicy === option.policy}
+                          onChange={() => {
+                            setRetentionPolicy(option.policy);
+                            setSettingsSaved(false);
+                          }}
+                        />
+                        <span>
+                          <strong>{option.label}</strong>
+                          <small>{option.description}</small>
+                        </span>
+                        {option.badge ? <em>{option.badge}</em> : null}
+                      </label>
                     ))}
-                  </select>
-                </label>
+                  </div>
+                </fieldset>
               )}
               <p className="data-governance-note">
                 自动删除仅处理已结束且超过所选期限的会议，删除范围为整场会议。

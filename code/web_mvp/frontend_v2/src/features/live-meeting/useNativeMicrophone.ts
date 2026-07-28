@@ -3,6 +3,7 @@ import { resolveTauriInvoke } from "../../desktop/tauri";
 import type {
   BrowserMicrophoneController,
   BrowserMicrophoneState,
+  MeetingCaptureStartOptions,
 } from "./useBrowserMicrophone";
 
 interface NativeMicCommandResponse {
@@ -21,6 +22,7 @@ interface NativeMicEventsResponse {
 
 interface NativeRuntime {
   meetingId: string;
+  deviceId: string | null;
   startedAtMs: number;
   lastConnectedAtMs: number;
   pausedAtMs: number | null;
@@ -73,6 +75,17 @@ function nativeEventSegmentId(event: Record<string, unknown>): string {
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
+function recoveryRange(event: Record<string, unknown>): string {
+  const startMs = Number(event.gap_start_ms);
+  const endMs = Number(event.gap_end_ms);
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return "中断期间";
+  const format = (value: number) => {
+    const seconds = Math.max(0, Math.floor(value / 1_000));
+    return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
+  };
+  return `${format(startMs)}-${format(endMs)}`;
 }
 
 export function useNativeMicrophone(): NativeMicrophoneController {
@@ -139,6 +152,31 @@ export function useNativeMicrophone(): NativeMicrophoneController {
               statusMessage: "正在收音",
             });
           }
+        } else if (eventType === "capture_recovery") {
+          const recoveryState = String(event.state ?? "");
+          const bufferedFrames = Math.max(0, Number(event.buffered_frame_count) || 0);
+          if (recoveryState === "reconnecting") {
+            updateState({
+              phase: "reconnecting",
+              asrReady: false,
+              error: null,
+              statusMessage: `录音正常，识别正在重连（本地已缓冲 ${bufferedFrames} 帧）`,
+            });
+          } else if (recoveryState === "backfilling") {
+            updateState({
+              phase: "reconnecting",
+              asrReady: true,
+              error: null,
+              statusMessage: `录音正常，正在补齐 ${recoveryRange(event)} 的文字`,
+            });
+          } else if (recoveryState === "recovered") {
+            updateState({
+              phase: "recording",
+              asrReady: true,
+              error: null,
+              statusMessage: "识别恢复完成，录音和文字已续接",
+            });
+          }
         } else if (eventType === "error" || eventType === "provider_error") {
           const message = String(event.message ?? event.detail ?? "实时识别服务异常");
           updateState({ phase: "error", error: message, statusMessage: message });
@@ -166,6 +204,7 @@ export function useNativeMicrophone(): NativeMicrophoneController {
           try {
             const restarted = await invoke<NativeMicCommandResponse>("mic_adapter_start", {
               sessionId: runtime.meetingId,
+              ...(runtime.deviceId ? { deviceId: runtime.deviceId } : {}),
             });
             if (restarted.command_status !== "ok" || !restarted.captures_audio) {
               throw responseError(restarted, "系统麦克风自动恢复失败");
@@ -197,7 +236,10 @@ export function useNativeMicrophone(): NativeMicrophoneController {
     }
   }, [updateState]);
 
-  const start = useCallback(async (meetingId: string) => {
+  const start = useCallback(async (
+    meetingId: string,
+    startOptions: MeetingCaptureStartOptions = {},
+  ) => {
     const normalizedMeetingId = meetingId.trim();
     if (!SESSION_ID_PATTERN.test(normalizedMeetingId)) throw new Error("会议 ID 格式无效");
     const invoke = resolveTauriInvoke();
@@ -210,6 +252,7 @@ export function useNativeMicrophone(): NativeMicrophoneController {
     });
     const runtime: NativeRuntime = {
       meetingId: normalizedMeetingId,
+      deviceId: startOptions.inputDeviceId?.trim() || null,
       startedAtMs: Date.now(),
       lastConnectedAtMs: Date.now(),
       pausedAtMs: null,
@@ -222,6 +265,7 @@ export function useNativeMicrophone(): NativeMicrophoneController {
     try {
       const response = await invoke<NativeMicCommandResponse>("mic_adapter_start", {
         sessionId: normalizedMeetingId,
+        ...(runtime.deviceId ? { deviceId: runtime.deviceId } : {}),
       });
       if (response.command_status !== "ok" || !response.captures_audio) {
         throw responseError(response, "系统麦克风启动失败");
@@ -307,7 +351,7 @@ export function useNativeMicrophone(): NativeMicrophoneController {
   const acknowledgeCommitted = useCallback(() => undefined, []);
 
   useEffect(() => {
-    if (!runtimeRef.current || !["recording", "paused"].includes(state.phase)) return;
+    if (!runtimeRef.current || !["recording", "reconnecting", "paused"].includes(state.phase)) return;
     void collectEvents();
     const eventTimer = window.setInterval(() => {
       void collectEvents();

@@ -41,6 +41,29 @@ def test_build_minutes_to_markdown_with_evidence():
     assert usage["total_tokens"] == 210
 
 
+def test_minutes_prompt_requires_uncertain_asr_owner_to_be_verified():
+    config = llm_service.LlmConfig(base_url="https://gw.example", api_key="sk-x", model="m1")
+    observed = {}
+
+    class FakeClient:
+        def post_json(self, url, headers, body, timeout):
+            observed["system_prompt"] = body["messages"][0]["content"]
+            observed["reasoning_effort"] = body["reasoning_effort"]
+            observed["max_completion_tokens"] = body["max_completion_tokens"]
+            return _minutes_response()
+
+    llm_service.build_minutes_artifact(
+        "李四金。 今天下班前补充 Grafana 看板。",
+        config,
+        client=FakeClient(),
+    )
+
+    assert "owner 填'待确认'" in observed["system_prompt"]
+    assert "需要核对原音" in observed["system_prompt"]
+    assert observed["reasoning_effort"] == "low"
+    assert observed["max_completion_tokens"] == 1_024
+
+
 def test_build_minutes_artifact_keeps_structured_data_and_markdown_in_one_call():
     config = llm_service.LlmConfig(base_url="https://gw.example", api_key="sk-x", model="m1")
 

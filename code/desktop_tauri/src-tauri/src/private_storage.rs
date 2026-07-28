@@ -66,12 +66,11 @@ pub fn harden_private_file(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[cfg(unix)]
     #[test]
     fn directories_and_files_are_owner_only_and_symlinks_fail_closed() {
         let nonce = SystemTime::now()

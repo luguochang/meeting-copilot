@@ -41,6 +41,19 @@ describe("native capture layered health", () => {
       .toBe("系统音频传输已中断");
   });
 
+  it("treats durable reconnect and backfill as recoverable runtime states", () => {
+    expect(nativeCaptureRuntimeFailure({
+      health_status: "recovering",
+      transport_ready: false,
+      pcm_seen: true,
+    })).toBeNull();
+    expect(nativeCaptureRuntimeFailure({
+      health_status: "backfilling",
+      transport_ready: true,
+      pcm_seen: true,
+    })).toBeNull();
+  });
+
   it("preserves cumulative PCM evidence while ASR remains a current state", () => {
     const previous = {
       transportReady: true,

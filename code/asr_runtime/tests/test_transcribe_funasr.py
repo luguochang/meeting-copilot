@@ -248,7 +248,7 @@ def test_stream_worker_merges_non_cumulative_partials_for_final_transcript():
     assert corrected == "先灰度百分之十"
 
 
-def test_stream_worker_emits_accumulated_partial_text_for_live_transcript(monkeypatch):
+def test_stream_worker_keeps_non_cumulative_partials_replaceable(monkeypatch):
     monkeypatch.setitem(
         sys.modules,
         "funasr",
@@ -265,9 +265,17 @@ def test_stream_worker_emits_accumulated_partial_text_for_live_transcript(monkey
     partial_texts = [event["text"] for event in events if event["event_type"] == "partial"]
     assert partial_texts == [
         "发布评审",
-        "发布评审P99延迟超过九百毫秒",
-        "发布评审P99延迟超过九百毫秒张三补SLO看板",
+        "P99延迟超过九百毫秒",
+        "张三补SLO看板",
     ]
+    partials = [event for event in events if event["event_type"] == "partial"]
+    assert all(event["authoritative"] is False for event in partials)
+    assert all(event["partial_semantics"] == "incremental_chunk" for event in partials)
+    terminal = next(event for event in events if event["event_type"] == "final")
+    assert terminal["text"] == "张三补SLO看板"
+    assert terminal["authoritative"] is False
+    assert terminal["partial_semantics"] == "terminal_snapshot"
+    assert terminal["final_source"] == "online_terminal_snapshot"
 
 
 def test_stream_worker_emits_ready_control_event_before_audio_events(monkeypatch):

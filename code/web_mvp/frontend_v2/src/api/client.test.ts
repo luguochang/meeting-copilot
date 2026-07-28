@@ -15,6 +15,105 @@ function response(body: unknown, status = 200): Response {
 }
 
 describe("HttpMeetingApi", () => {
+  it("loads and uploads local capability packages through the typed API", async () => {
+    const body = {
+      schema_version: "meeting_copilot.local_capability_status.v1",
+      platform: "windows-x86_64",
+      base_app_ready: true,
+      installed: false,
+      package_id: null,
+      package_version: null,
+      installed_at: null,
+      realtime_asr_ready: false,
+      file_asr_ready: false,
+      restart_required: false,
+      signature_status: null,
+      release_scope: null,
+      download_page_url: null,
+      import_available: true,
+      errors: [],
+    };
+    const fetchSpy = vi.fn()
+      .mockResolvedValueOnce(response(body))
+      .mockResolvedValueOnce(response({
+        ...body,
+        installed: true,
+        realtime_asr_ready: true,
+        file_asr_ready: true,
+        restart_required: true,
+      }));
+    vi.stubGlobal("fetch", fetchSpy);
+    const api = new HttpMeetingApi();
+    const file = new File(["fixture"], "full.mcpkg", { type: "application/octet-stream" });
+
+    await expect(api.getLocalCapabilities()).resolves.toMatchObject({ installed: false });
+    await expect(api.importLocalCapabilityPackage(file)).resolves.toMatchObject({
+      installed: true,
+      realtimeAsrReady: true,
+      fileAsrReady: true,
+      restartRequired: true,
+    });
+    expect(fetchSpy).toHaveBeenNthCalledWith(
+      2,
+      "/v2/local-capabilities/import",
+      expect.objectContaining({ method: "POST", body: expect.any(FormData) }),
+    );
+  });
+
+  it("parses formal notes and sends versioned autosave updates", async () => {
+    const note = {
+      note_id: "note-1",
+      meeting_id: "meeting/1",
+      title: "发布风险",
+      body: "周五前关闭。",
+      source_kind: "selection",
+      source_message_id: null,
+      version: 2,
+      status: "active",
+      created_at_ms: 10,
+      updated_at_ms: 20,
+      evidence: [{
+        ordinal: 0,
+        meeting_id: "meeting/1",
+        segment_id: "segment-1",
+        transcript_seq: 3,
+        start_ms: 1_000,
+        end_ms: 2_000,
+        quote: "周五前关闭。",
+      }],
+    };
+    const fetchSpy = vi.fn()
+      .mockResolvedValueOnce(response({ notes: [note] }))
+      .mockResolvedValueOnce(response({ note: { ...note, version: 3, body: "周五前关闭，负责人待确认。" } }));
+    vi.stubGlobal("fetch", fetchSpy);
+    const api = new HttpMeetingApi();
+
+    await expect(api.listNotes({ meetingId: "meeting/1", query: "周五" })).resolves.toEqual([
+      expect.objectContaining({
+        noteId: "note-1",
+        meetingId: "meeting/1",
+        sourceKind: "selection",
+        version: 2,
+        evidence: [expect.objectContaining({ segmentId: "segment-1", ordinal: 0 })],
+      }),
+    ]);
+    await expect(api.updateNote("note-1", 2, { body: "周五前关闭，负责人待确认。" })).resolves.toMatchObject({ version: 3 });
+
+    expect(fetchSpy).toHaveBeenNthCalledWith(
+      1,
+      "/v2/notes?meeting_id=meeting%2F1&query=%E5%91%A8%E4%BA%94",
+      expect.objectContaining({ headers: expect.objectContaining({ Accept: "application/json" }) }),
+    );
+    expect(fetchSpy).toHaveBeenNthCalledWith(
+      2,
+      "/v2/notes/note-1",
+      expect.objectContaining({
+        method: "PATCH",
+        body: JSON.stringify({ expected_version: 2, body: "周五前关闭，负责人待确认。" }),
+      }),
+    );
+  });
+
   it("parses the provider status contract and rejects a stale probe after a model switch", async () => {
     const fetchSpy = vi.fn().mockResolvedValue(response({
       configured: true,
@@ -71,6 +170,7 @@ describe("HttpMeetingApi", () => {
       chunk_count: 3,
       duration_ms: 120_000,
       tracks: ["microphone", "system_audio"],
+      expected_tracks: ["microphone", "system_audio"],
       chunks: [],
       track_states: [
         {
@@ -100,6 +200,7 @@ describe("HttpMeetingApi", () => {
 
     await expect(api.getAudio("meeting/dual")).resolves.toMatchObject({
       overallStatus: "partial_failure",
+      expectedTracks: ["microphone", "system_audio"],
       trackStates: [
         expect.objectContaining({ trackId: "microphone", status: "ready", durationMs: 120_000 }),
         expect.objectContaining({
@@ -517,6 +618,8 @@ describe("HttpMeetingApi", () => {
         speakers: [{
           speaker_id: "cluster/a",
           speaker_label: "Speaker 1",
+          label_source: "auto",
+          label_locked: false,
           ordinal: 1,
           created_at_ms: 1_000,
           updated_at_ms: 1_000,
@@ -526,6 +629,8 @@ describe("HttpMeetingApi", () => {
         speaker: {
           speaker_id: "cluster/a",
           speaker_label: "张工",
+          label_source: "user",
+          label_locked: true,
           ordinal: 1,
           created_at_ms: 1_000,
           updated_at_ms: 2_000,
@@ -538,6 +643,8 @@ describe("HttpMeetingApi", () => {
       meetingId: "meeting/1",
       speakerId: "cluster/a",
       speakerLabel: "Speaker 1",
+      labelSource: "auto",
+      labelLocked: false,
       ordinal: 1,
       createdAtMs: 1_000,
       updatedAtMs: 1_000,
@@ -546,6 +653,8 @@ describe("HttpMeetingApi", () => {
       meetingId: "meeting/1",
       speakerId: "cluster/a",
       speakerLabel: "张工",
+      labelSource: "user",
+      labelLocked: true,
     });
 
     expect(fetchSpy).toHaveBeenNthCalledWith(

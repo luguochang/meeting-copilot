@@ -87,6 +87,7 @@ describe("useBrowserMicrophone", () => {
   const stream = new FakeMediaStream();
 
   beforeEach(() => {
+    vi.clearAllMocks();
     FakeAudioContext.latest = null;
     FakeWebSocket.latest = null;
     vi.stubGlobal("WebSocket", FakeWebSocket);
@@ -99,6 +100,7 @@ describe("useBrowserMicrophone", () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllGlobals();
   });
 
@@ -107,7 +109,7 @@ describe("useBrowserMicrophone", () => {
 
     await act(async () => result.current.start("rec_test"));
     const socket = FakeWebSocket.latest!;
-    expect(socket.url).toBe("ws://127.0.0.1:8765/live/asr/stream/ws/rec_test?audio_source=browser_live_mic");
+    expect(socket.url).toBe("ws://127.0.0.1:8765/live/asr/stream/ws/rec_test?audio_source=browser_live_mic&capture_epoch=1");
 
     act(() => socket.open());
     act(() => {
@@ -169,6 +171,31 @@ describe("useBrowserMicrophone", () => {
     expect(stream.track.stop).toHaveBeenCalled();
     expect(FakeAudioContext.latest!.close).toHaveBeenCalled();
     expect(result.current.state.phase).toBe("ended");
+  });
+
+  it("keeps microphone capture alive and reconnects the same meeting after a socket interruption", async () => {
+    vi.useFakeTimers();
+    const { result } = renderHook(() => useBrowserMicrophone());
+    await act(async () => result.current.start("rec_resume"));
+    const firstSocket = FakeWebSocket.latest!;
+    act(() => firstSocket.open());
+    act(() => firstSocket.close());
+
+    expect(result.current.state.phase).toBe("reconnecting");
+    expect(result.current.state.statusMessage).toContain("自动恢复");
+    expect(stream.track.stop).not.toHaveBeenCalled();
+
+    act(() => vi.advanceTimersByTime(500));
+    const resumedSocket = FakeWebSocket.latest!;
+    expect(resumedSocket).not.toBe(firstSocket);
+    expect(firstSocket.url).toContain("capture_epoch=1");
+    expect(resumedSocket.url).toContain("capture_epoch=2");
+    act(() => {
+      resumedSocket.open();
+      resumedSocket.message({ event_type: "asr_ready", ready: true });
+    });
+    expect(result.current.state.phase).toBe("recording");
+    expect(result.current.state.error).toBeNull();
   });
 
   it("stops tracks and the AudioContext when the page unmounts", async () => {

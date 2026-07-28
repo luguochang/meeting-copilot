@@ -421,6 +421,72 @@ def test_correction_job_output_is_bounded_and_omits_cumulative_transcript_state(
     app.state.v2_persistence.close()
 
 
+def test_batched_no_change_correction_settles_every_covered_segment(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_GATEWAY_MODEL", "gpt-5.5")
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    first = app.state.commit_v2_final(
+        "meeting-1",
+        _final_event(segment_id="segment-1", text="接口新增 trace_id 字段。"),
+    )
+    second = app.state.commit_v2_final(
+        "meeting-1",
+        _final_event(segment_id="segment-2", text="老版本调用方需要保持兼容。"),
+    )
+    app.state.asr_live_repository.create(
+        {
+            "session_id": "meeting-1",
+            "source": "live_asr_stream",
+            "trace_kind": "live_event",
+            "provider": "funasr_realtime",
+            "provider_mode": "real",
+            "is_mock": False,
+            "input_source": "browser_live_mic",
+            "events": [],
+        }
+    )
+    monkeypatch.setattr(
+        app.state,
+        "run_asr_live_session_realtime_corrections_once",
+        lambda *_args, **_kwargs: {
+            "session_id": "meeting-1",
+            "called": True,
+            "gate": {
+                "eligible": True,
+                "reason": "eligible",
+                "segment_ids": ["segment-1", "segment-2"],
+            },
+            "status": {
+                "status": "completed",
+                "processed_segment_ids": ["segment-1", "segment-2"],
+                "revised_segment_ids": [],
+            },
+            "revision_count": 0,
+            "transcript_revisions": [],
+            "no_revision_segment_ids": ["segment-1", "segment-2"],
+        },
+    )
+
+    job = app.state.v2_persistence.get_job(second["job_ids"]["correction"])
+    output = app.state.v2_correction_job_handler_impl(job)
+
+    segments = app.state.v2_persistence.list_transcript_segments(
+        "meeting-1",
+        limit=10,
+    )["segments"]
+    assert output["no_revision_segment_count"] == 2
+    assert [segment["correction_status"] for segment in segments] == [
+        "no_change",
+        "no_change",
+    ]
+    assert app.state.v2_persistence.get_job(first["job_ids"]["correction"])["status"] == "cancelled"
+    app.state.v2_persistence.close()
+
+
 def test_semantic_quality_blocked_suggestion_waits_for_same_segment_correction(
     tmp_path,
 ):
@@ -715,6 +781,249 @@ def test_end_waits_for_live_asr_finalization_before_ending_and_scheduling_review
     }
 
 
+def test_notes_api_supports_selection_evidence_search_autosave_and_soft_delete(tmp_path):
+    app = create_app(data_dir=tmp_path)
+    app.state.v2_persistence.create_meeting(
+        meeting_id="notes-api-meeting",
+        title="周会",
+        now_ms=100,
+    )
+
+    with TestClient(app) as client:
+        created_response = client.post(
+            "/v2/meetings/notes-api-meeting/notes",
+            json={
+                "title": "",
+                "body": "风险项需要在周五前关闭。",
+                "source_kind": "selection",
+                "evidence": [
+                    {
+                        "segment_id": "segment-risk",
+                        "transcript_seq": 3,
+                        "start_ms": 10_000,
+                        "end_ms": 12_000,
+                        "quote": "风险项需要在周五前关闭。",
+                    }
+                ],
+            },
+        )
+        assert created_response.status_code == 201
+        created = created_response.json()["note"]
+        assert created["title"] == "风险项需要在周五前关闭"
+        assert created["evidence"][0]["meeting_id"] == "notes-api-meeting"
+
+        listed = client.get("/v2/notes", params={"query": "周五"})
+        assert listed.status_code == 200
+        assert [item["note_id"] for item in listed.json()["notes"]] == [created["note_id"]]
+
+        edited_response = client.patch(
+            f"/v2/notes/{created['note_id']}",
+            json={
+                "expected_version": created["version"],
+                "title": "本周风险",
+                "body": "风险项需要在周五前关闭，负责人待确认。",
+            },
+        )
+        assert edited_response.status_code == 200
+        edited = edited_response.json()["note"]
+        assert edited["version"] == 2
+
+        conflict = client.patch(
+            f"/v2/notes/{created['note_id']}",
+            json={"expected_version": 1, "body": "过期内容"},
+        )
+        assert conflict.status_code == 409
+
+        deleted_response = client.delete(
+            f"/v2/notes/{created['note_id']}",
+            params={"expected_version": edited["version"]},
+        )
+        assert deleted_response.status_code == 200
+        assert deleted_response.json()["note"]["status"] == "deleted"
+        assert client.get("/v2/notes").json()["notes"] == []
+        assert len(client.get("/v2/notes", params={"status": "deleted"}).json()["notes"]) == 1
+
+
+def test_ask_ai_recent_scope_accepts_only_product_time_windows(tmp_path, monkeypatch):
+    app = create_app(data_dir=tmp_path)
+    app.state.commit_v2_final("recent-window-meeting", _final_event())
+    config = llm_service.LlmConfig(
+        base_url="https://example.com/v1",
+        api_key="test-key",
+        model="test-model",
+    )
+    monkeypatch.setattr(llm_service.LlmConfig, "from_env", classmethod(lambda _cls: config))
+
+    with TestClient(app) as client:
+        invalid = client.post(
+            "/v2/meetings/recent-window-meeting/ask/stream",
+            json={"question": "刚才说了什么？", "scope": "recent", "recent_minutes": 2},
+        )
+
+    assert invalid.status_code == 422
+    assert invalid.json()["detail"] == "recent_minutes must be 1, 3, 5, or 10"
+
+
+def test_same_ask_answer_can_create_independent_fact_and_action_item(tmp_path):
+    app = create_app(data_dir=tmp_path)
+    app.state.commit_v2_final("entity-meeting", _final_event())
+    evidence = [{
+        "segment_id": "segment-1",
+        "transcript_seq": 1,
+        "start_ms": 100,
+        "end_ms": 900,
+        "quote": "需要确认发布负责人。",
+    }]
+
+    with TestClient(app) as client:
+        fact = client.post(
+            "/v2/meetings/entity-meeting/entities",
+            json={
+                "kind": "decision_candidate",
+                "text": "先确认发布负责人，再安排上线。",
+                "source_message_id": "assistant-1",
+                "evidence": evidence,
+            },
+        )
+        repeated_fact = client.post(
+            "/v2/meetings/entity-meeting/entities",
+            json={
+                "kind": "decision_candidate",
+                "text": "先确认发布负责人，再安排上线。",
+                "source_message_id": "assistant-1",
+                "evidence": evidence,
+            },
+        )
+        action = client.post(
+            "/v2/meetings/entity-meeting/entities",
+            json={
+                "kind": "action_item",
+                "text": "先确认发布负责人，再安排上线。",
+                "source_message_id": "assistant-1",
+                "evidence": evidence,
+            },
+        )
+        snapshot = client.get("/v2/meetings/entity-meeting/snapshot").json()
+
+    assert fact.status_code == 201
+    assert action.status_code == 201
+    assert repeated_fact.json()["entity"]["id"] == fact.json()["entity"]["id"]
+    assert len(snapshot["decision_candidates"]) == 1
+    assert len(snapshot["action_items"]) == 1
+    assert snapshot["action_items"][0]["owner"] is None
+    assert snapshot["action_items"][0]["deadline"] is None
+
+
+def test_end_waits_for_running_interrupted_tail_backfill(tmp_path):
+    app = create_app(data_dir=tmp_path)
+    persistence = app.state.v2_persistence
+    persistence.create_meeting(meeting_id="meeting-backfill", title=None, now_ms=1_000)
+    app.state.asr_live_repository.create(
+        {
+            "session_id": "meeting-backfill",
+            "source": "live_asr_stream",
+            "trace_kind": "live_event",
+            "provider": "funasr_realtime",
+            "provider_mode": "real",
+            "is_mock": False,
+            "input_source": "browser_live_mic",
+            "degradation_reasons": ["stream_interrupted"],
+            "transcript_backfill": {
+                "schema_version": "transcript_backfill.v1",
+                "status": "running",
+                "capture_epoch": 1,
+                "start_ms": 0,
+                "end_ms": 900,
+            },
+            "events": [],
+        }
+    )
+
+    def finish_backfill():
+        time.sleep(0.05)
+
+        def complete(record):
+            return {
+                **record,
+                "transcript_backfill": {
+                    **dict(record["transcript_backfill"]),
+                    "status": "completed",
+                    "segment_id": "microphone:e1:vad_endpoint_001",
+                },
+            }
+
+        app.state.asr_live_repository.update("meeting-backfill", complete)
+
+    finalizer = threading.Thread(target=finish_backfill)
+    finalizer.start()
+    end_route = next(
+        route
+        for route in app.routes
+        if getattr(route, "path", None) == "/v2/meetings/{meeting_id}/end"
+    )
+    started_at = time.monotonic()
+    response = end_route.endpoint(
+        "meeting-backfill",
+        {"action": "end_and_review"},
+    )
+    elapsed = time.monotonic() - started_at
+    finalizer.join(timeout=1)
+
+    assert elapsed >= 0.04
+    assert response["snapshot"]["runtime"]["phase"] == "ended"
+    assert app.state.asr_live_repository.get("meeting-backfill")["transcript_backfill"]["status"] == "completed"
+    snapshot_route = next(
+        route
+        for route in app.routes
+        if getattr(route, "path", None) == "/v2/meetings/{meeting_id}/snapshot"
+    )
+    recovered_snapshot = snapshot_route.endpoint("meeting-backfill")
+    assert recovered_snapshot["diagnostics"]["degradation_reasons"] == []
+    assert recovered_snapshot["diagnostics"]["transcript_backfill"]["status"] == "completed"
+    recovered_record = app.state.asr_live_repository.get("meeting-backfill")
+    assert recovered_record["degradation_reasons"] == ["stream_interrupted"]
+    assert app_module._asr_live_event_source_metadata(recovered_record)["degradation_reasons"] == []
+
+
+def test_snapshot_retains_interruption_warning_when_tail_backfill_fails(tmp_path):
+    app = create_app(data_dir=tmp_path)
+    persistence = app.state.v2_persistence
+    persistence.create_meeting(meeting_id="meeting-backfill-failed", title=None, now_ms=1_000)
+    app.state.asr_live_repository.create(
+        {
+            "session_id": "meeting-backfill-failed",
+            "source": "live_asr_stream",
+            "provider": "funasr_realtime",
+            "provider_mode": "real",
+            "is_mock": False,
+            "degradation_reasons": ["stream_interrupted"],
+            "transcript_backfill": {
+                "schema_version": "transcript_backfill.v1",
+                "status": "failed",
+                "capture_epoch": 1,
+                "start_ms": 0,
+                "end_ms": 900,
+                "error_class": "OfflineRefinementFailed",
+            },
+            "events": [],
+        }
+    )
+    snapshot_route = next(
+        route
+        for route in app.routes
+        if getattr(route, "path", None) == "/v2/meetings/{meeting_id}/snapshot"
+    )
+
+    snapshot = snapshot_route.endpoint("meeting-backfill-failed")
+
+    assert snapshot["diagnostics"]["degradation_reasons"] == ["stream_interrupted"]
+    assert snapshot["diagnostics"]["transcript_backfill"]["status"] == "failed"
+    failed_record = app.state.asr_live_repository.get("meeting-backfill-failed")
+    assert app_module._asr_live_event_source_metadata(failed_record)["degradation_reasons"] == [
+        "stream_interrupted"
+    ]
+
+
 def test_end_accepts_normalized_evaluation_summary_as_live_asr_finalization():
     assert _live_asr_record_is_finalized(
         {
@@ -762,6 +1071,55 @@ def test_v2_snapshot_exposes_semantic_quality_pause_without_transcript_data(tmp_
     assert diagnostics["formal_derivation_status"] == "suppressed_by_asr_semantic_quality"
     assert diagnostics["degradation_reasons"] == ["asr_semantic_quality_blocked"]
     assert "private_text_should_not_escape" not in str(response.json())
+
+
+def test_v2_snapshot_rechecks_stale_semantic_pause_when_transcript_is_usable(tmp_path):
+    app = create_app(data_dir=tmp_path)
+    persistence = app.state.v2_persistence
+    persistence.create_meeting(meeting_id="meeting-quality-recovered", title=None, now_ms=1_000)
+    text = (
+        "官网代码用 ChatGPT 和 Claude 检查，Cloudflare 配 DNS，Vercel 负责部署，"
+        "DFC 今天提交 commit。"
+    )
+    app.state.asr_live_repository.create(
+        {
+            "session_id": "meeting-quality-recovered",
+            "source": "live_asr_stream",
+            "trace_kind": "live_event",
+            "provider": "funasr_realtime",
+            "provider_mode": "real",
+            "is_mock": False,
+            "input_source": "browser_live_mic",
+            "degradation_reasons": ["asr_semantic_quality_blocked"],
+            "asr_semantic_quality": {
+                "status": "blocked",
+                "blocker": "asr_semantic_quality_blocked",
+            },
+            "events": app_module.build_asr_live_events(
+                session_id="meeting-quality-recovered",
+                provider="funasr_realtime",
+                streaming_events=[
+                    {
+                        "event_type": "final",
+                        "segment_id": "segment-1",
+                        "text": text,
+                        "start_ms": 0,
+                        "end_ms": 3_000,
+                        "received_at_ms": 3_000,
+                        "confidence": 0.9,
+                    }
+                ],
+                is_mock=False,
+            ),
+        }
+    )
+
+    response = TestClient(app).get("/v2/meetings/meeting-quality-recovered/snapshot")
+
+    assert response.status_code == 200
+    diagnostics = response.json()["diagnostics"]
+    assert diagnostics["formal_derivation_status"] == "available"
+    assert "asr_semantic_quality_blocked" not in diagnostics["degradation_reasons"]
 
 
 def test_app_lifecycle_runs_durable_jobs_without_browser_trigger(tmp_path):
@@ -823,6 +1181,49 @@ def test_post_meeting_jobs_degrade_without_blocking_when_correction_is_terminall
     assert quality["correction_degraded"] is True
     assert quality["reason"] == "correction_has_no_successful_job"
 
+    persistence.close()
+
+
+def test_post_meeting_jobs_accept_completed_realtime_correction_projection(tmp_path):
+    app = create_app(data_dir=tmp_path)
+    app.state.commit_v2_final("meeting-1", _final_event())
+    persistence = app.state.v2_persistence
+    now_ms = time.time_ns() // 1_000_000
+    correction = persistence.claim_next_job(
+        worker_id="test-correction",
+        lane="correction",
+        now_ms=now_ms,
+        lease_ms=30_000,
+    )
+    assert correction is not None
+    persistence.fail_job(
+        job_id=correction["id"],
+        worker_id="test-correction",
+        now_ms=now_ms + 1,
+        error_class="CorrectionProjectionFailed",
+    )
+    app.state.asr_live_repository.create(
+        {
+            "session_id": "meeting-1",
+            "source": "live_asr_stream",
+            "provider": "funasr_realtime",
+            "provider_mode": "real",
+            "is_mock": False,
+            "degradation_reasons": [],
+            "events": [],
+            "realtime_transcript_correction": {
+                "status": "completed",
+                "processed_segment_ids": [correction["evidence_segment_id"]],
+                "terminal_failed_segment_ids": [],
+            },
+        }
+    )
+
+    quality = app.state.wait_for_v2_correction_jobs("meeting-1", timeout_seconds=0.1)
+
+    assert quality["correction_degraded"] is False
+    assert quality["reason"] is None
+    assert quality["quality_source"] == "realtime_correction_projection"
     persistence.close()
 
 
@@ -1528,7 +1929,7 @@ def test_v2_import_audio_creates_ended_meeting_transcript_history_and_playback(
     assert body["source_audio"]["source_type"] == "imported_original"
     assert (tmp_path / body["source_audio"]["relative_path"]).read_bytes() == audio_buffer.getvalue()
     assert snapshot.status_code == 200
-    assert snapshot.json()["segments"][0]["text"] == "接口先恢度百分之五，确认负责人。"
+    assert snapshot.json()["segments"][0]["text"] == "接口先灰度百分之五，确认负责人。"
     assert snapshot.json()["runtime"]["phase"] == "ended"
     assert snapshot.json()["minutes"]["markdown"].startswith("# 导入会议复盘")
     assert snapshot.json()["approach_cards"][0]["suggestion_text"] == "确认负责人和回滚条件"
@@ -1599,6 +2000,101 @@ def test_app_lifecycle_exports_a_sealed_recording_without_blocking_websocket_pat
     assert content.status_code == 200
     assert content.headers["content-disposition"].startswith("inline;")
     assert content.content.startswith(b"RIFF")
+
+
+def test_multi_epoch_meeting_audio_content_concatenates_every_continuation(tmp_path):
+    app = create_app(data_dir=tmp_path)
+    meeting_id = "recording-multi-epoch-playback"
+    app.state.v2_persistence.create_meeting(
+        meeting_id=meeting_id,
+        title="断线续录",
+        now_ms=1_000,
+    )
+
+    for epoch, value in ((1, 0.1), (2, 0.2)):
+        lease_owner = f"capture-{epoch}"
+        app.state.begin_v2_recording(
+            meeting_id,
+            {
+                "source_type": "browser_live_mic",
+                "track_id": "microphone",
+                "epoch": epoch,
+                "sample_rate_hz": 16_000,
+            },
+            lease_owner=lease_owner,
+        )
+        writer = RealtimeWavAssetWriter(
+            data_dir=tmp_path,
+            session_id=meeting_id,
+            source_type="browser_live_mic",
+            track_id="microphone",
+            epoch=epoch,
+            on_chunk_committed=lambda chunk, owner=lease_owner: app.state.record_v2_audio_chunk(
+                meeting_id,
+                chunk,
+                lease_owner=owner,
+            ),
+        )
+        writer.write_float32_pcm(struct.pack("<f", value) * 1_600)
+        app.state.seal_v2_recording(
+            meeting_id,
+            writer.seal(),
+            lease_owner=lease_owner,
+        )
+
+    with TestClient(app) as client:
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            audio = client.get(f"/v2/meetings/{meeting_id}/audio")
+            if audio.json()["assembled"] and audio.json().get("continuous_asset"):
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError(f"continuous recording did not finish: {audio.json()}")
+        content = client.get(f"/v2/meetings/{meeting_id}/audio/content")
+
+    body = audio.json()
+    assert body["status"] == "saved"
+    assert body["expected_tracks"] == ["microphone"]
+    assert body["duration_ms"] == 200
+    assert body["continuous_asset"]["kind"] == "continuous"
+    assert body["continuous_asset"]["epochs"] == [1, 2]
+    assert content.status_code == 200
+    with wave.open(BytesIO(content.content), "rb") as replay:
+        assert replay.getframerate() == 16_000
+        assert replay.getnframes() == 3_200
+        frames = replay.readframes(3_200)
+    first = struct.unpack_from("<h", frames, 0)[0]
+    second = struct.unpack_from("<h", frames, 1_600 * 2)[0]
+    assert first == pytest.approx(int(0.1 * 32_767), abs=1)
+    assert second == pytest.approx(int(0.2 * 32_767), abs=1)
+
+
+def test_meeting_audio_expected_tracks_follow_dual_track_preparation(tmp_path):
+    app = create_app(data_dir=tmp_path)
+    meeting_id = "recording-dual-track-expectation"
+    app.state.v2_persistence.create_meeting(
+        meeting_id=meeting_id,
+        title="双轨会议",
+        now_ms=1_000,
+    )
+
+    with TestClient(app) as client:
+        prepared = client.put(
+            f"/v2/meetings/{meeting_id}/preparation",
+            json={
+                "hotwords": [],
+                "input_source": "dual_track",
+                "input_device_id": None,
+                "input_device_name": "麦克风 + 系统音频",
+                "notice_acknowledged": True,
+            },
+        )
+        audio = client.get(f"/v2/meetings/{meeting_id}/audio")
+
+    assert prepared.status_code == 200
+    assert audio.status_code == 200
+    assert audio.json()["expected_tracks"] == ["microphone", "system_audio"]
 
 
 def test_app_audio_chunk_callback_persists_native_pcm_source_range(tmp_path):

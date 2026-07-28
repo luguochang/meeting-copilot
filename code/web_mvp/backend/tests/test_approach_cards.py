@@ -71,6 +71,42 @@ def test_approach_cards_endpoint_returns_cards(monkeypatch):
     assert body["llm_usage"]["total_tokens"] == 250
 
 
+def test_approach_cards_endpoint_uses_authoritative_normalized_text(monkeypatch):
+    observed = {}
+
+    def capture_transcript(transcript_text, _config):
+        observed["transcript_text"] = transcript_text
+        return [], {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}, False
+
+    monkeypatch.setattr(llm_service, "build_approach_cards", capture_transcript)
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_GATEWAY_MODEL", "m1")
+    client = TestClient(create_app())
+    create = client.post("/live/asr/mock/sessions", json={
+        "session_id": "approach_normalized", "provider": "local_mock_asr",
+        "streaming_events": [{
+            "event_type": "final",
+            "segment_id": "s1",
+            "text": "payment gave way 先恢度。",
+            "normalized_text": "payment-gateway 先灰度。",
+            "start_ms": 0,
+            "end_ms": 3200,
+            "received_at_ms": 3500,
+            "confidence": 0.9,
+        }],
+    })
+
+    response = client.post(
+        "/live/asr/demo/sessions/approach_normalized/approach-cards",
+        json={"mode": "enabled"},
+    )
+
+    assert create.status_code == 201
+    assert response.status_code == 200
+    assert observed["transcript_text"] == "payment-gateway 先灰度。"
+
+
 def test_approach_cards_endpoint_persists_cards_for_history(monkeypatch):
     resp = {"choices": [{"message": {"content": json.dumps([
         {"card_type": "approach.risk", "suggestion_text": "补充回滚阈值", "confidence": 0.9, "trigger_reason": "灰度方案", "evidence_quote": "先灰度 5%"}

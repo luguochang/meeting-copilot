@@ -1,0 +1,53 @@
+{
+  "schema_version": "meeting_copilot.controlled_realtime_onnx_pack.v1",
+  "pack_id": "realtime-asr-onnx-zh-cn",
+  "version": "realtime-asr-onnx-zh-cn-20260722-v1",
+  "engine": "onnx",
+  "platform": "windows",
+  "architecture": "x86_64",
+  "python_version": "3.12",
+  "internal_controlled_smoke": {
+    "status": "verified_real_mic_preview",
+    "report": "artifacts/tmp/browser_live_mic/v2-onnx-100ms-release-20260722/report.json",
+    "counts_as_public_release": false
+  },
+  "redistribution": {
+    "status": "public_redistribution_unresolved",
+    "license_id": "Apache-2.0",
+    "license_evidence_sha256": "e424224c75e4d803f2177d916ea614e40b19345bb080b0edb9cc28b45b33133c",
+    "public_redistribution_approved": false
+  },
+  "runtime": {
+    "source_inventory": {
+      "file_count": 21850,
+      "size_bytes": 625884564,
+      "sha256": "b6fdba67a70a3453bd0a3e0b895f6d45eff709d1f02c0e48bf074fa4f9536cd4",
+      "symlink_count": 0
+    },
+    "required_imports": [
+      "funasr_onnx",
+      "onnxruntime",
+      "numpy",
+      "yaml"
+    ]
+  },
+  "model": {
+    "model_id": "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online",
+    "source_revision": "model.pt@699a2514a0542a40ea7f22ec682c8f76d0f47f7b",
+    "exporter": "funasr-onnx-0.4.2",
+    "root": "models/funasr-online-onnx",
+    "files": {
+      "am.mvn": "29b3c740a2c0cfc6b308126d31d7f265fa2be74f3bb095cd2f143ea970896ae5",
+      "config.yaml": "35e6bf41f8c7eaf9a0f787af7fdc8fc5ed75fa8009ade7d3c2f3ef5bce20c648",
+      "decoder.onnx": "895a9ed85cc557024932ecc337ae634b291e9404e970b1dd16cb3637e3ca267d",
+      "model.onnx": "a7954dfc9c1b87a73dddcbbb3e572336ba3db7db05344a05ddb5a3394aa7fb4b",
+      "tokens.json": "2b20c2b12572d682afff84ce1c8d560f67b8b32a4c1f21567411d141ed352127"
+    },
+    "inventory": {
+      "file_count": 5,
+      "size_bytes": 864642753,
+      "sha256": "4841b1db428d59ad3e27d2a8e8cd68a4d09ac2e16a95bde8520c8611a98ff4c3",
+      "symlink_count": 0
+    }
+  }
+}

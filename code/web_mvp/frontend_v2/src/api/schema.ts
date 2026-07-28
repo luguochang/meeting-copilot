@@ -132,6 +132,7 @@ export interface MeetingAudioDerivedAsset {
 
 export interface MeetingAudioWithTracks extends MeetingAudio {
   overallStatus: MeetingAudioOverallStatus;
+  expectedTracks: AudioTrackId[];
   trackStates: MeetingAudioTrackState[];
   derivedAssets: MeetingAudioDerivedAsset[];
   mixedCreateUrl: string | null;
@@ -281,6 +282,7 @@ function parseSegment(value: unknown, index: number): TranscriptSegment {
     normalizedText: optionalString(first(item, "normalized_text", "normalizedText")) ?? text,
     startedAtMs: optionalNumber(first(item, "started_at_ms", "startedAtMs")),
     endedAtMs: optionalNumber(first(item, "ended_at_ms", "endedAtMs")),
+    sourceTrack: optionalString(first(item, "source_track", "sourceTrack")) as TranscriptSegment["sourceTrack"],
     revision: optionalNumber(item.revision) ?? 1,
     evidenceHash: optionalString(first(item, "evidence_hash", "evidenceHash")) ?? "",
     speakerId: optionalString(first(item, "speaker_id", "speakerId")),
@@ -337,6 +339,8 @@ export function parseMeetingSpeaker(
     meetingId: optionalString(first(item, "meeting_id", "meetingId")) ?? fallbackMeetingId,
     speakerId: requiredString(first(item, "speaker_id", "speakerId"), `${field}.speaker_id`),
     speakerLabel: requiredString(first(item, "speaker_label", "speakerLabel"), `${field}.speaker_label`),
+    labelSource: (optionalString(first(item, "label_source", "labelSource")) ?? "auto") as MeetingSpeaker["labelSource"],
+    labelLocked: Boolean(first(item, "label_locked", "labelLocked")),
     ordinal: requiredNumber(item.ordinal, `${field}.ordinal`),
     createdAtMs: optionalNumber(first(item, "created_at_ms", "createdAtMs")) ?? 0,
     updatedAtMs: optionalNumber(first(item, "updated_at_ms", "updatedAtMs")) ?? 0,
@@ -615,6 +619,9 @@ function parseFactBase(value: unknown): {
   evidenceSegmentIds: string[];
   evidenceSpans: EvidenceSpan[];
   updatedAtMs: number;
+  version: number;
+  firstSeenSeq: number;
+  lastUpdatedSeq: number;
   formalAi: FormalAiProvenance | null;
 } | null {
   const item = optionalRecord(value);
@@ -631,6 +638,9 @@ function parseFactBase(value: unknown): {
     evidenceSegmentIds: evidenceSegmentIds(item),
     evidenceSpans,
     updatedAtMs: optionalNumber(first(item, "updated_at_ms", "updatedAtMs")) ?? 0,
+    version: optionalNumber(item.version) ?? 1,
+    firstSeenSeq: optionalNumber(first(item, "first_seen_seq", "firstSeenSeq")) ?? 0,
+    lastUpdatedSeq: optionalNumber(first(item, "last_updated_seq", "lastUpdatedSeq")) ?? 0,
     formalAi: parseFormalAi(item),
   };
 }
@@ -855,7 +865,16 @@ function parseTopic(value: unknown): TopicProjection | null {
 
 function parseQuestion(value: unknown, index: number): OpenQuestionProjection | null {
   if (typeof value === "string" && value.trim()) {
-    return { id: `question-${index}`, text: value.trim(), status: "open", evidenceSegmentIds: [], updatedAtMs: null };
+    return {
+      id: `question-${index}`,
+      text: value.trim(),
+      status: "open",
+      evidenceSegmentIds: [],
+      updatedAtMs: null,
+      version: 1,
+      firstSeenSeq: 0,
+      lastUpdatedSeq: 0,
+    };
   }
   const item = optionalRecord(value);
   if (!item) return null;
@@ -871,6 +890,9 @@ function parseQuestion(value: unknown, index: number): OpenQuestionProjection | 
         : "unknown",
     evidenceSegmentIds: strings(first(item, "evidence_segment_ids", "evidenceSegmentIds")),
     updatedAtMs: optionalNumber(first(item, "updated_at_ms", "updatedAtMs")),
+    version: optionalNumber(item.version) ?? 1,
+    firstSeenSeq: optionalNumber(first(item, "first_seen_seq", "firstSeenSeq")) ?? 0,
+    lastUpdatedSeq: optionalNumber(first(item, "last_updated_seq", "lastUpdatedSeq")) ?? 0,
     formalAi: parseFormalAi(item),
   };
 }
@@ -920,11 +942,19 @@ function parseIndicator(value: unknown, fallbackLabel: string): RuntimeIndicator
   }
   const item = optionalRecord(value);
   if (!item) return { state: "unknown", label: fallbackLabel, level: null, detail: null };
+  const rawCapabilities = optionalRecord(item.capabilities);
   return {
     state: runtimeState(first(item, "state", "status")),
     label: optionalString(item.label) ?? fallbackLabel,
     level: optionalNumber(first(item, "level", "input_level", "inputLevel")),
     detail: optionalString(item.detail),
+    errorClass: optionalString(first(item, "error_class", "errorClass")),
+    capabilities: rawCapabilities
+      ? Object.fromEntries(Object.entries(rawCapabilities).map(([key, capability]) => [
+        key,
+        parseIndicator(capability, key),
+      ]))
+      : undefined,
   };
 }
 
@@ -1207,10 +1237,12 @@ export function parseMeetingAudio(value: unknown): MeetingAudioWithTracks {
   const source = record(value);
   if (!Array.isArray(source.chunks)) throw new ContractError("chunks must be an array");
   const overallStatus = parseMeetingAudioOverallStatus(source.status);
+  const summary = parseAudioSummary(source);
+  const expectedTrackValues = first(source, "expected_tracks", "expectedTracks");
   const trackValues = first(source, "track_states", "trackStates");
   const derivedValues = first(source, "derived_assets", "derivedAssets");
   return {
-    ...parseAudioSummary(source),
+    ...summary,
     meetingId: requiredString(first(source, "meeting_id", "meetingId"), "meeting_id"),
     assembled: optionalBoolean(source.assembled) ?? false,
     playbackUrl: optionalString(first(source, "playback_url", "playbackUrl")),
@@ -1218,6 +1250,11 @@ export function parseMeetingAudio(value: unknown): MeetingAudioWithTracks {
     chunks: source.chunks.map(parseAudioChunk),
     status: overallStatus === "partial_failure" ? "failed" : overallStatus,
     overallStatus,
+    expectedTracks: Array.isArray(expectedTrackValues)
+      ? expectedTrackValues.map((track, index) => parseAudioTrackId(track, `expected_tracks[${index}]`))
+      : summary.tracks.filter((track): track is AudioTrackId => (
+        track === "microphone" || track === "system_audio"
+      )),
     trackStates: Array.isArray(trackValues) ? trackValues.map(parseMeetingAudioTrack) : [],
     derivedAssets: Array.isArray(derivedValues) ? derivedValues.map(parseMeetingAudioDerivedAsset) : [],
     mixedCreateUrl: optionalString(first(source, "mixed_create_url", "mixedCreateUrl")),

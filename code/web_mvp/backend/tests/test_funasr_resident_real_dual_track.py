@@ -58,7 +58,7 @@ def test_real_local_model_runs_two_same_meeting_tracks_without_worker_busy() -> 
         "--model",
         str(model),
         "--chunk-size",
-        "0,30,15",
+        "0,16,8",
         "--encoder-chunk-look-back",
         "4",
         "--decoder-chunk-look-back",

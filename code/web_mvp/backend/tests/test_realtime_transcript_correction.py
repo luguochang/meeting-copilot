@@ -42,6 +42,8 @@ def test_llm_correction_prompt_requires_index_markers_and_facts_to_survive():
     assert "<<<MC_SEGMENT" in asr_correct._SYSTEM
     assert "负责人" in asr_correct._SYSTEM
     assert "事实" in asr_correct._SYSTEM
+    assert "老版本调用方要兼容两个版本" in asr_correct._SYSTEM
+    assert "不得新增或改变" in asr_correct._SYSTEM
 
 
 def test_partial_events_are_never_eligible():
@@ -284,6 +286,26 @@ def test_valid_revision_preserves_evidence_and_non_secret_usage():
     }
     assert "api_key" not in str(revision)
     assert "secret.example" not in str(revision)
+
+
+def test_safe_provider_fix_is_renormalized_before_revision_commit():
+    final = _final(
+        "release",
+        "张三补充兼容性测试用例上限的时候，纤灰度百分之十。",
+    )
+
+    revision = correction.build_revision_event(
+        session_id="corr_session",
+        final_event=final,
+        corrected_text="张三补充兼容性测试用例上限的时候，先灰度百分之十。",
+        source="fallback_batch",
+        usage={"total_tokens": 10},
+    )
+
+    assert revision is not None
+    assert revision["payload"]["text"] == (
+        "张三补充兼容性测试用例上线的时候，先灰度百分之十。"
+    )
 
 
 def test_batch_revision_references_batch_id_without_copying_usage():

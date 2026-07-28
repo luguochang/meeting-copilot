@@ -189,6 +189,13 @@ def build_asr_live_events(
 
     for group_index, raw_event in enumerate(streaming_events):
         event_type = str(raw_event.get("event_type", ""))
+        if event_type == "final" and raw_event.get("authoritative") is False:
+            raw_event = {
+                **raw_event,
+                "event_type": "partial",
+                "candidate_eligible": False,
+            }
+            event_type = "partial"
         if event_type == "partial":
             counts["partial_event_count"] += 1
             events.append(_with_sort_group(_partial_event(raw_event), group_index))
@@ -303,7 +310,29 @@ def _partial_event(raw_event: dict[str, Any]) -> dict[str, Any]:
                 if raw_event.get("source_snapshot_text")
                 else {}
             ),
+            **({"source_track": str(raw_event["source_track"])} if raw_event.get("source_track") else {}),
+            **(
+                {"capture_epoch": int(raw_event["capture_epoch"])}
+                if raw_event.get("capture_epoch") is not None
+                else {}
+            ),
             **({"projection_reconciled": True} if raw_event.get("projection_reconciled") else {}),
+            **(
+                {"authoritative": bool(raw_event["authoritative"])}
+                if "authoritative" in raw_event
+                else {}
+            ),
+            **({"final_source": str(raw_event["final_source"])} if raw_event.get("final_source") else {}),
+            **(
+                {"refinement_status": str(raw_event["refinement_status"])}
+                if raw_event.get("refinement_status")
+                else {}
+            ),
+            **(
+                {"refinement_reason": str(raw_event["refinement_reason"])}
+                if raw_event.get("refinement_reason")
+                else {}
+            ),
             "confidence": raw_event.get("confidence"),
             "is_final": False,
         },
@@ -524,8 +553,30 @@ def _final_payload(
             if raw_event.get("source_snapshot_text")
             else {}
         ),
+        **({"source_track": str(raw_event["source_track"])} if raw_event.get("source_track") else {}),
+        **(
+            {"capture_epoch": int(raw_event["capture_epoch"])}
+            if raw_event.get("capture_epoch") is not None
+            else {}
+        ),
         **({"projection_reconciled": True} if raw_event.get("projection_reconciled") else {}),
         "confidence": raw_event.get("confidence"),
+        "authoritative": bool(raw_event.get("authoritative", True)),
+        **(
+            {"final_source": str(raw_event["final_source"])}
+            if raw_event.get("final_source")
+            else {}
+        ),
+        **(
+            {"refinement_status": str(raw_event["refinement_status"])}
+            if raw_event.get("refinement_status")
+            else {}
+        ),
+        **(
+            {"refinement_reason": str(raw_event["refinement_reason"])}
+            if raw_event.get("refinement_reason")
+            else {}
+        ),
         "is_final": True,
         "evidence_spans": evidence_spans,
     }
@@ -557,6 +608,8 @@ def _partial_evidence(raw_event: dict[str, Any]) -> dict[str, Any]:
 
 def _should_queue_stable_partial_candidate(raw_event: dict[str, Any]) -> bool:
     return bool(
+        raw_event.get("authoritative") is not False
+        and
         raw_event.get("candidate_eligible")
         and str(raw_event.get("candidate_source") or "") == "stable_partial"
     )

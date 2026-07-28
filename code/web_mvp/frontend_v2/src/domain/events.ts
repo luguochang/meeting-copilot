@@ -74,6 +74,7 @@ export interface TranscriptSegment {
   normalizedText: string;
   startedAtMs: number | null;
   endedAtMs: number | null;
+  sourceTrack?: "microphone" | "system_audio" | "uploaded_file" | null;
   revision: number;
   evidenceHash: string;
   speakerId?: string | null;
@@ -111,6 +112,8 @@ export interface MeetingSpeaker {
   meetingId: string;
   speakerId: string;
   speakerLabel: string;
+  labelSource?: "auto" | "user";
+  labelLocked?: boolean;
   ordinal: number;
   createdAtMs: number;
   updatedAtMs: number;
@@ -176,6 +179,9 @@ export interface OpenQuestionProjection {
   status: "open" | "carried_over" | "answered" | "expired" | "unknown";
   evidenceSegmentIds: string[];
   updatedAtMs: number | null;
+  version?: number;
+  firstSeenSeq?: number;
+  lastUpdatedSeq?: number;
   formalAi?: FormalAiProvenance | null;
 }
 
@@ -188,7 +194,7 @@ export interface FollowUpProjection {
   formalAi?: FormalAiProvenance | null;
 }
 
-export type MeetingFactKind = "decision" | "action_item" | "risk";
+export type MeetingFactKind = "decision" | "action_item" | "risk" | "open_question";
 
 export type MeetingFactStatus =
   | "candidate"
@@ -216,6 +222,9 @@ export interface MeetingFactBase {
   evidenceSegmentIds: string[];
   evidenceSpans: EvidenceSpan[];
   updatedAtMs: number;
+  version?: number;
+  firstSeenSeq?: number;
+  lastUpdatedSeq?: number;
   formalAi?: FormalAiProvenance | null;
 }
 
@@ -237,6 +246,8 @@ export interface RuntimeIndicator {
   label: string;
   level: number | null;
   detail: string | null;
+  errorClass?: string | null;
+  capabilities?: Record<string, RuntimeIndicator>;
 }
 
 export interface MeetingRuntime {
@@ -354,6 +365,100 @@ export interface MeetingPreparationInput {
   inputDeviceId: string | null;
   inputDeviceName: string | null;
   noticeAcknowledged: true;
+  presetId?: "general" | "decision" | "project" | "interview" | "brainstorm";
+  meetingGoal?: string | null;
+  participantRole?: string | null;
+  focusPoints?: string[];
+  outputFormat?: "standard" | "decision_log" | "action_plan" | "brief";
+  proactiveSuggestionPolicy?: "off" | "low_frequency" | "standard";
+}
+
+export interface MeetingPreparationSnapshot {
+  meetingId: string;
+  hotwords: string[];
+  inputSource: MeetingInputSource;
+  inputDeviceId: string | null;
+  inputDeviceName: string | null;
+  noticeAcknowledged: boolean;
+  presetId: NonNullable<MeetingPreparationInput["presetId"]>;
+  meetingGoal: string | null;
+  participantRole: string | null;
+  focusPoints: string[];
+  outputFormat: NonNullable<MeetingPreparationInput["outputFormat"]>;
+  proactiveSuggestionPolicy: NonNullable<MeetingPreparationInput["proactiveSuggestionPolicy"]>;
+  version: number;
+  updatedAtMs: number;
+}
+
+export type AskAiScope = "selection" | "recent" | "chapter" | "meeting";
+
+export interface AskAiEvidence {
+  segmentId: string;
+  transcriptSeq: number;
+  startMs: number | null;
+  endMs: number | null;
+  quote: string;
+}
+
+export interface AskAiMessage {
+  messageId: string;
+  threadId: string;
+  meetingId: string;
+  role: "user" | "assistant";
+  content: string;
+  scope: AskAiScope;
+  evidence: AskAiEvidence[];
+  status: "pending" | "completed" | "failed";
+  errorClass: string | null;
+  pinnedKind: "note" | "fact" | "action_item" | null;
+  createdAtMs: number;
+  updatedAtMs: number;
+}
+
+export interface AskAiThread {
+  threadId: string;
+  title: string;
+  createdAtMs: number;
+  updatedAtMs: number;
+  messages: AskAiMessage[];
+}
+
+export type MeetingNoteStatus = "active" | "archived" | "deleted";
+export type MeetingNoteSourceKind = "selection" | "ask_ai" | "manual";
+
+export interface MeetingNoteEvidence {
+  ordinal: number;
+  meetingId: string | null;
+  segmentId: string;
+  transcriptSeq: number | null;
+  startMs: number | null;
+  endMs: number | null;
+  quote: string;
+}
+
+export interface MeetingNote {
+  noteId: string;
+  meetingId: string | null;
+  title: string;
+  body: string;
+  sourceKind: MeetingNoteSourceKind;
+  sourceMessageId: string | null;
+  version: number;
+  status: MeetingNoteStatus;
+  createdAtMs: number;
+  updatedAtMs: number;
+  evidence: MeetingNoteEvidence[];
+}
+
+export interface MeetingChapter {
+  chapterId: string;
+  index: number;
+  title: string;
+  text: string;
+  startMs: number | null;
+  endMs: number | null;
+  paragraphIds: string[];
+  evidenceSegmentIds: string[];
 }
 
 export interface AudioChunk {

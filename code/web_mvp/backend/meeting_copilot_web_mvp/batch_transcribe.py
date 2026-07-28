@@ -9,6 +9,10 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from meeting_copilot_web_mvp.logging_config import get_logger
+from meeting_copilot_web_mvp.local_runtime_paths import (
+    packaged_funasr_environment,
+    read_runtime_manifest,
+)
 
 _log = get_logger("meeting_copilot_web_mvp.batch_transcribe")
 
@@ -626,11 +630,29 @@ def transcribe_file_report(
     _log.info("batch.transcribe.start", audio=str(wav_path), original=str(audio_path))
     try:
         child_env = os.environ.copy()
+        for key in list(child_env):
+            upper = key.upper()
+            if upper.endswith("_API_KEY") or upper in {
+                "AUTHORIZATION",
+                "MEETING_COPILOT_LOCAL_API_TOKEN",
+            }:
+                child_env.pop(key, None)
         child_env.pop("PYTHONHOME", None)
         child_env.pop("PYTHONPATH", None)
         if runtime["packaged_mode"]:
             for env_name in (*_COMPONENT_ENV.values(), *_CONVERTER_ENV):
                 child_env.pop(env_name, None)
+            packaged_environment = packaged_funasr_environment(
+                read_runtime_manifest(),
+                worker_path=resolved["worker"],
+                include_realtime_runtime=False,
+            )
+            if packaged_environment.errors:
+                raise RuntimeError(
+                    "packaged FunASR environment is invalid: "
+                    + ",".join(packaged_environment.errors)
+                )
+            child_env.update(packaged_environment.values)
         child_env.update({
             "PYTHONNOUSERSITE": "1",
             "PYTHONDONTWRITEBYTECODE": "1",

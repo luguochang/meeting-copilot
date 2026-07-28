@@ -841,6 +841,7 @@ export function ReviewWorkspace({
       speakerConfidence: override?.speakerConfidence ?? segment.speakerConfidence ?? null,
     };
   }), [transcript, transcriptOverrides]);
+  const reviewSemanticParagraphs = transcriptEditor.isUserFinal ? [] : (state.semanticParagraphs ?? []);
   const reviewBasedOnOldTranscript = Boolean(
     state.documents?.transcript?.source === "user_final" &&
     (state.documents.minutes?.updatedAtMs ?? state.minutes?.updatedAtMs ?? 0) < (state.documents.transcript.updatedAtMs ?? 0),
@@ -863,16 +864,25 @@ export function ReviewWorkspace({
     : null;
 
   const audioTrackRows = useMemo(() => {
-    const tracks = new Map<AudioTrackId, MeetingAudioTrackState>();
+    const tracks = new Map<AudioTrackId, MeetingAudioTrackState[]>();
     for (const track of audioDetail?.trackStates ?? []) {
-      const current = tracks.get(track.trackId);
-      if (!current || track.epoch >= current.epoch) tracks.set(track.trackId, track);
+      const current = tracks.get(track.trackId) ?? [];
+      current.push(track);
+      tracks.set(track.trackId, current);
     }
-    return (["microphone", "system_audio"] as const).map((trackId) => ({
-      trackId,
-      track: tracks.get(trackId) ?? null,
-    }));
-  }, [audioDetail?.trackStates]);
+    const expectedTracks = audioDetail?.expectedTracks?.length
+      ? audioDetail.expectedTracks
+      : (["microphone", "system_audio"] as const);
+    return expectedTracks.map((trackId) => {
+      const parts = (tracks.get(trackId) ?? []).sort((left, right) => left.epoch - right.epoch);
+      return {
+        trackId,
+        track: parts.length ? parts[parts.length - 1] : null,
+        epochCount: parts.length,
+        durationMs: parts.reduce((total, part) => total + part.durationMs, 0),
+      };
+    });
+  }, [audioDetail?.expectedTracks, audioDetail?.trackStates]);
   const readyAudioTracks = audioTrackRows
     .map(({ track }) => track)
     .filter((track): track is MeetingAudioTrackState => Boolean(track?.status === "ready" && track.playbackUrl));
@@ -881,10 +891,16 @@ export function ReviewWorkspace({
   ) ?? null;
   const mixedAsset = createdMixedAsset ?? serverMixedAsset;
   const mixedReady = Boolean(mixedAsset?.status === "ready" && mixedAsset.playbackUrl);
-  const bothTracksReady = audioTrackRows.every(
+  const bothTracksReady = audioTrackRows.length === 2 && audioTrackRows.every(
     ({ track }) => track?.status === "ready" && Boolean(track.playbackUrl),
   );
   const audioHasTrackData = audioTrackRows.some(({ track }) => track !== null);
+  const continuationTrack = audioTrackRows.find(
+    ({ trackId, epochCount }) => trackId === "microphone" && epochCount > 1,
+  ) ?? audioTrackRows.find(({ epochCount }) => epochCount > 1) ?? null;
+  const hasContinuousReplay = Boolean(
+    continuationTrack && audioDetail?.assembled && audioDetail.playbackUrl,
+  );
   const partialAudioFailure = audioHasTrackData && (
     audioDetail?.overallStatus === "partial_failure"
     || (readyAudioTracks.length > 0 && audioTrackRows.some(({ track }) => (
@@ -895,6 +911,9 @@ export function ReviewWorkspace({
     audioDetail?.overallStatus === "failed" && readyAudioTracks.length === 0
   );
   const selectedAudio = useMemo(() => {
+    if (selectedAudioKey === "continuous" && hasContinuousReplay && audioDetail?.playbackUrl) {
+      return { key: "continuous", label: "会议全程", sourceUrl: audioDetail.playbackUrl };
+    }
     const selectedTrack = readyAudioTracks.find((track) => `track:${track.trackId}:${track.epoch}` === selectedAudioKey);
     if (selectedTrack) {
       return {
@@ -905,6 +924,9 @@ export function ReviewWorkspace({
     }
     if (selectedAudioKey?.startsWith("mixed:") && mixedReady && mixedAsset?.playbackUrl) {
       return { key: selectedAudioKey, label: "混合回放", sourceUrl: mixedAsset.playbackUrl };
+    }
+    if (hasContinuousReplay && audioDetail?.playbackUrl) {
+      return { key: "continuous", label: "会议全程", sourceUrl: audioDetail.playbackUrl };
     }
     const defaultTrack = readyAudioTracks.find((track) => track.trackId === "microphone") ?? readyAudioTracks[0];
     if (defaultTrack) {
@@ -917,7 +939,14 @@ export function ReviewWorkspace({
     return audioDetail?.playbackUrl
       ? { key: "legacy", label: "会议录音", sourceUrl: audioDetail.playbackUrl }
       : null;
-  }, [audioDetail?.playbackUrl, mixedAsset?.playbackUrl, mixedReady, readyAudioTracks, selectedAudioKey]);
+  }, [
+    audioDetail?.playbackUrl,
+    hasContinuousReplay,
+    mixedAsset?.playbackUrl,
+    mixedReady,
+    readyAudioTracks,
+    selectedAudioKey,
+  ]);
 
   useEffect(() => {
     if (state.meetingId) {
@@ -931,10 +960,11 @@ export function ReviewWorkspace({
   useEffect(() => {
     if (activeTab !== "transcript" || !pendingEvidence) return;
     const frame = window.requestAnimationFrame(() => {
-      const element = document.getElementById(segmentDomId(pendingEvidence));
-      element?.scrollIntoView({ behavior: "smooth", block: "center" });
-      element?.focus({ preventScroll: true });
-      element?.classList.add("is-evidence-target");
+      const anchor = document.getElementById(segmentDomId(pendingEvidence));
+      const paragraph = anchor?.closest<HTMLElement>(".transcript-segment") ?? anchor;
+      paragraph?.scrollIntoView({ behavior: "smooth", block: "center" });
+      paragraph?.focus({ preventScroll: true });
+      paragraph?.classList.add("is-evidence-target");
       setPendingEvidence(null);
     });
     return () => window.cancelAnimationFrame(frame);
@@ -949,6 +979,15 @@ export function ReviewWorkspace({
     })),
     [qualityPaused, state.reviewJobs],
   );
+  const failedReviewJobNames = reviewJobEntries
+    .filter(({ job, blockedByQuality }) => (
+      job && ["failed", "cancelled"].includes(job.status) && !blockedByQuality
+    ))
+    .map(({ kind }) => jobNames[kind]);
+  const completedReviewSteps = 1
+    + (state.audioDetail?.assembled ? 1 : 0)
+    + reviewJobEntries.filter(({ state: status }) => status.tone === "success").length;
+  const reviewCompletionPercent = Math.round((completedReviewSteps / (2 + reviewJobEntries.length)) * 100);
 
   const showEvidence = (segmentId: string) => {
     setPendingEvidence(segmentId);
@@ -1087,6 +1126,13 @@ export function ReviewWorkspace({
   return (
     <main className="review-workspace">
       <section className="review-progress" aria-label="会议整理进度">
+        <div className="review-progress-summary">
+          <span className="review-progress-ring">{reviewCompletionPercent}%</span>
+          <span>
+            <strong>纪要完成度</strong>
+            <small>基于文字、录音与 AI 整理任务</small>
+          </span>
+        </div>
         <div className="review-progress-item review-progress-item--success">
           <Check size={16} />
           <span>文字已确认</span>
@@ -1126,13 +1172,14 @@ export function ReviewWorkspace({
           AI 尚未配置，会议文字和录音已保存；配置 AI 后会自动继续生成会后产物。
         </p>
       ) : null}
-      {reviewJobEntries.map(({ kind, job, blockedByQuality }) =>
-        job && ["failed", "cancelled"].includes(job.status) && !blockedByQuality ? (
-          <p key={`${kind}-failure-detail`} className="inline-error">
-            {jobNames[kind]}：{reviewJobError(job)} 文字、录音和其他会议结果已保留。
-          </p>
-        ) : null,
-      )}
+      {failedReviewJobNames.length ? (
+        <p className="inline-error review-failure-summary" role="status">
+          <strong>部分 AI 内容未完成</strong>
+          <span>
+            {failedReviewJobNames.join("、")}未能生成。会议文字和录音已保存，可使用上方对应的重试按钮重新生成。
+          </span>
+        </p>
+      ) : null}
       {Object.entries(jobErrors).map(([kind, error]) => error ? (
         <div key={kind} className="toast toast--error" role="alert">{error}</div>
       ) : null)}
@@ -1222,7 +1269,7 @@ export function ReviewWorkspace({
               ) : !state.minutes && !state.documents?.minutes && providerNotConfigured(state.reviewJobs.minutes) ? (
                 <p className="inline-warning">AI 尚未配置，会议文字和录音已保存；配置 AI 后可重新生成会议纪要。</p>
               ) : !state.minutes && !state.documents?.minutes && state.reviewJobs.minutes?.status === "failed" ? (
-                <p className="inline-error">{reviewJobError(state.reviewJobs.minutes)} 会议文字和录音仍已保存。</p>
+                <p className="review-empty">会议复盘暂未生成，可从上方状态栏重试。</p>
               ) : !state.minutes && !state.documents?.minutes ? (
                 <p className="review-empty">会议纪要正在生成，完成后会自动出现在这里。</p>
               ) : null}
@@ -1257,7 +1304,7 @@ export function ReviewWorkspace({
               ) : providerNotConfigured(state.reviewJobs.approach) ? (
                 <p className="inline-warning">AI 尚未配置，会议文字和录音已保存；配置 AI 后可重新生成分析建议。</p>
               ) : state.reviewJobs.approach?.status === "failed" ? (
-                <p className="inline-error">{reviewJobError(state.reviewJobs.approach)}</p>
+                <p className="review-empty">分析建议暂未生成，可从上方状态栏重试。</p>
               ) : (
                 <p className="review-empty">分析建议正在整理。</p>
               )}
@@ -1469,7 +1516,11 @@ export function ReviewWorkspace({
           <div className="review-transcript">
             <div className="review-section-heading">
               <div>
-                <span className="section-kicker">{transcript.length} 段已确认</span>
+                <span className="section-kicker">
+                  {reviewSemanticParagraphs.length
+                    ? `${reviewSemanticParagraphs.length} 个语义段落 · ${transcript.length} 条识别片段`
+                    : `${transcript.length} 段已确认`}
+                </span>
                 <h2>完整会议文字</h2>
               </div>
               <div className="document-heading-actions">
@@ -1519,11 +1570,13 @@ export function ReviewWorkspace({
             ) : (
               <TranscriptPane
                 segments={displayTranscript}
+                semanticParagraphs={reviewSemanticParagraphs}
                 archivedTranscript=""
                 archivedSegmentCount={0}
                 activePartial={null}
                 connection={state.connection}
-                mergeSegments={false}
+                aiIndicator={state.runtime.ai}
+                liveMode={false}
                 speakers={state.speakers}
                 onRenameSpeaker={onRenameSpeaker}
                 onSeekAudio={seekAudio}
@@ -1565,8 +1618,28 @@ export function ReviewWorkspace({
                     </div>
                   </div>
                 ) : null}
+                {hasContinuousReplay && continuationTrack && audioDetail?.playbackUrl ? (
+                  <div className={`audio-mixed-row ${selectedAudio?.key === "continuous" ? "is-selected" : ""}`}>
+                    <div>
+                      <strong>会议全程</strong>
+                      <span>
+                        已按时间顺序串联 {continuationTrack.epochCount} 段续录 · {formatAudioDuration(continuationTrack.durationMs)}
+                      </span>
+                    </div>
+                    <button
+                      className="secondary-button compact-button"
+                      type="button"
+                      title="播放会议全程"
+                      aria-label="播放会议全程"
+                      onClick={() => setSelectedAudioKey("continuous")}
+                    >
+                      <Play size={14} />
+                      播放
+                    </button>
+                  </div>
+                ) : null}
                 <div className="audio-track-list" aria-label="会议录音轨道">
-                  {audioTrackRows.map(({ trackId, track }) => {
+                  {audioTrackRows.map(({ trackId, track, epochCount, durationMs }) => {
                     const ready = track?.status === "ready" && Boolean(track.playbackUrl);
                     const key = track ? `track:${track.trackId}:${track.epoch}` : null;
                     const selected = key !== null && selectedAudio?.key === key;
@@ -1583,7 +1656,8 @@ export function ReviewWorkspace({
                             </span>
                           </div>
                           <div className="audio-track-meta">
-                            <span>{formatAudioDuration(track?.durationMs ?? 0)}</span>
+                            <span>{formatAudioDuration(durationMs)}</span>
+                            {epochCount > 1 ? <span>{epochCount} 段续录</span> : null}
                             {track?.errorClass ? <span>{audioErrorMessage(track.errorClass)}</span> : null}
                             {!track ? <span>没有发现这条录音</span> : null}
                           </div>
@@ -1659,7 +1733,7 @@ export function ReviewWorkspace({
                 <dl className="audio-facts">
                   <div><dt>会议时长</dt><dd>{formatAudioDuration(audioDetail?.durationMs ?? 0)}</dd></div>
                   <div><dt>录音分片</dt><dd>{audioDetail?.chunkCount ?? 0} 个</dd></div>
-                  <div><dt>已保存轨道</dt><dd>{readyAudioTracks.length} / 2</dd></div>
+                  <div><dt>已保存轨道</dt><dd>{readyAudioTracks.length} / {audioTrackRows.length}</dd></div>
                 </dl>
               </>
             ) : state.audioDetail?.assembled && state.audioDetail.playbackUrl ? (

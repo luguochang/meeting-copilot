@@ -62,6 +62,7 @@ interface CostStatsResponse {
 }
 
 type ProviderPhase = "loading" | "unavailable" | "unconfigured" | "saved" | "configured" | "error";
+type ProviderSettingsSection = "status" | "config" | "usage";
 
 const emptyResponse: ProviderConfigResponse = {
   command_status: "ok",
@@ -182,6 +183,7 @@ function costDisplay(
 
 export function ProviderSettingsControl() {
   const [open, setOpen] = useState(false);
+  const [activeSection, setActiveSection] = useState<ProviderSettingsSection>("status");
   const [phase, setPhase] = useState<ProviderPhase>("loading");
   const [config, setConfig] = useState<ProviderConfigResponse>(emptyResponse);
   const [providerStatus, setProviderStatus] = useState<ProviderStatus>(emptyProviderStatus);
@@ -393,12 +395,22 @@ export function ProviderSettingsControl() {
         ? "读取 AI 配置"
         : "配置 AI";
 
+  const focusSection = (section: ProviderSettingsSection) => {
+    setActiveSection(section);
+    window.requestAnimationFrame(() => {
+      document.getElementById(`provider-${section}-panel`)?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  };
+
   return (
     <>
       <button
         className={`provider-settings-trigger provider-settings-trigger--${phase}`}
         type="button"
-        onClick={() => setOpen(true)}
+        onClick={() => {
+          setActiveSection("status");
+          setOpen(true);
+        }}
         aria-label="打开 AI 设置"
         title={triggerLabel}
       >
@@ -413,14 +425,25 @@ export function ProviderSettingsControl() {
             <header className="drawer-header">
               <div>
                 <span className="eyebrow">AI 设置</span>
-                <h2 id="provider-settings-title">OpenAI 兼容中转站</h2>
+                <div className="provider-title-line">
+                  <h2 id="provider-settings-title">OpenAI 兼容中转站</h2>
+                  <span className={`provider-dialog-status provider-dialog-status--${phase}`}>
+                    {phase === "configured" ? "已启用" : phase === "saved" ? "待连接" : phase === "error" ? "异常" : "未启用"}
+                  </span>
+                </div>
               </div>
               <button className="icon-button" type="button" onClick={() => setOpen(false)} aria-label="关闭 AI 设置" title="关闭">
                 <X size={18} />
               </button>
             </header>
 
-            <section className="provider-settings-form" aria-labelledby="provider-health-title">
+            <nav className="provider-settings-tabs" aria-label="AI 设置分区">
+              <button type="button" aria-pressed={activeSection === "status"} onClick={() => focusSection("status")}>状态</button>
+              <button type="button" aria-pressed={activeSection === "config"} onClick={() => focusSection("config")}>配置</button>
+              <button type="button" aria-pressed={activeSection === "usage"} onClick={() => focusSection("usage")}>用量</button>
+            </nav>
+
+            <section className="provider-settings-form" id="provider-status-panel" aria-labelledby="provider-health-title">
               <span className="eyebrow" id="provider-health-title">Provider 健康与使用边界</span>
               {detailsLoading && !providerHealth && !costStats ? <p className="rail-empty">正在读取 Provider 健康和成本...</p> : null}
               {detailsError ? <p className="inline-error" role="alert">{detailsError}</p> : null}
@@ -469,8 +492,9 @@ export function ProviderSettingsControl() {
                 </dl>
               ) : null}
               <p className="rail-empty">原始音频默认不上传；只有稳定文字发送到 LLM。</p>
-              {costStats ? (
-                <>
+              <div className="provider-usage-block" id="provider-usage-panel">
+                {costStats ? (
+                  <>
                   <span className="eyebrow">Token 与估算费用</span>
                   <dl className="diagnostics-list">
                     <div><dt>本次</dt><dd>{costDisplay(costStats, "currentSession", "本次")}</dd></div>
@@ -484,8 +508,9 @@ export function ProviderSettingsControl() {
                       </dd>
                     </div>
                   </dl>
-                </>
-              ) : null}
+                  </>
+                ) : <p className="rail-empty">暂无用量记录</p>}
+              </div>
             </section>
 
             {phase === "unavailable" ? (
@@ -494,7 +519,7 @@ export function ProviderSettingsControl() {
                 <p>请在 Meeting Copilot 桌面客户端中配置 AI。</p>
               </div>
             ) : (
-              <form className="provider-settings-form" onSubmit={(event) => void save(event)}>
+              <form className="provider-settings-form" id="provider-config-panel" onSubmit={(event) => void save(event)}>
                 <label>
                   <span>中转站地址</span>
                   <input

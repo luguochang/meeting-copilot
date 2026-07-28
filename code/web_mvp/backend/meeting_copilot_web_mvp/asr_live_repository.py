@@ -295,11 +295,12 @@ class JsonFileAsrLiveSessionRepository:
             os.replace(temp_path, path)
             harden_private_file(path)
             temp_path = None
-            directory_fd = os.open(self._records_dir, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            if os.name != "nt":
+                directory_fd = os.open(self._records_dir, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
         finally:
             if temp_path is not None:
                 temp_path.unlink(missing_ok=True)

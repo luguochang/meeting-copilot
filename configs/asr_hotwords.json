@@ -1,3 +1,26 @@
 {
-  "hotwords": ["checkout-service", "error_rate", "P99", "staging", "rollback", "灰度", "回滚", "监控", "兼容性", "测试用例", "支付服务", "发布"]
+  "hotwords": [
+    "checkout-service",
+    "payment-gateway",
+    "order-service",
+    "trace_id",
+    "total_amount",
+    "error_rate",
+    "P99",
+    "P95",
+    "Grafana",
+    "Redis",
+    "GET /api/v1/orders",
+    "mobile-app",
+    "BI job",
+    "staging",
+    "rollback",
+    "灰度",
+    "回滚",
+    "监控",
+    "兼容性",
+    "测试用例",
+    "支付服务",
+    "发布"
+  ]
 }

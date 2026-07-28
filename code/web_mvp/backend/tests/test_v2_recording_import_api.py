@@ -9,6 +9,7 @@ import wave
 from fastapi.testclient import TestClient
 
 from meeting_copilot_web_mvp import app as app_module
+from meeting_copilot_web_mvp.asr_refiner import RefinementResult
 from meeting_copilot_web_mvp import audio_assets
 from meeting_copilot_web_mvp.app import create_app
 
@@ -167,6 +168,53 @@ def test_import_audio_returns_202_before_transcription_and_completes_durable_pip
         allow_transcript.set()
 
 
+def test_import_audio_splits_long_transcript_into_timed_semantic_segments(tmp_path, monkeypatch):
+    transcript = (
+        "第一部分确认中文实时识别需要保留原文，并在句尾使用本地模型完成精修。"
+        "第二部分讨论断线恢复，恢复后继续同一场会议，但写入新的录音批次。"
+        "第三部分明确会议纪要失败不能影响录音、正文和其他会后产物。"
+    )
+    monkeypatch.setattr(app_module.batch_transcribe, "is_available", lambda: True)
+    monkeypatch.setattr(
+        app_module.batch_transcribe,
+        "transcribe_file_report",
+        lambda _path, **_kwargs: {
+            "text": transcript,
+            "raw": {"provider": "funasr"},
+            "audio_duration_seconds": 9.0,
+            "rtf": 0.05,
+        },
+    )
+    monkeypatch.setattr(app_module.batch_transcribe, "ensure_wav_16k_mono", lambda path: path)
+    app = create_app(data_dir=tmp_path)
+    _configure_completed_v2_handlers(app)
+
+    with TestClient(app) as client:
+        imported = client.post(
+            "/v2/meetings/import-audio",
+            files={"file": ("long.wav", _wav_bytes(seconds=9), "audio/wav")},
+        )
+        assert imported.status_code == 202, imported.text
+        meeting_id = imported.json()["meeting_id"]
+        _wait_for_import_job(client, meeting_id, "succeeded")
+        snapshot = client.get(f"/v2/meetings/{meeting_id}/snapshot").json()
+
+    segments = snapshot["segments"]
+    assert len(segments) == 3
+    assert [segment["segment_id"] for segment in segments] == [
+        "import_seg_0001",
+        "import_seg_0002",
+        "import_seg_0003",
+    ]
+    assert "".join(segment["normalized_text"] for segment in segments) == transcript
+    assert segments[0]["started_at_ms"] == 0
+    assert segments[-1]["ended_at_ms"] == 9_000
+    assert all(
+        left["ended_at_ms"] == right["started_at_ms"]
+        for left, right in zip(segments, segments[1:])
+    )
+
+
 def test_import_audio_without_file_asr_keeps_meeting_and_managed_source(
     tmp_path,
     monkeypatch,
@@ -174,6 +222,11 @@ def test_import_audio_without_file_asr_keeps_meeting_and_managed_source(
     transcribe_called = False
 
     monkeypatch.setattr(app_module.batch_transcribe, "is_available", lambda: False)
+    monkeypatch.setattr(
+        app_module.asr_refiner,
+        "refinement_capability",
+        lambda: {"status": "unavailable"},
+    )
 
     def unexpected_transcribe(*_args, **_kwargs):
         nonlocal transcribe_called
@@ -208,6 +261,44 @@ def test_import_audio_without_file_asr_keeps_meeting_and_managed_source(
     assert snapshot.status_code == 200
     assert snapshot.json()["import_job"]["error_class"] == "file_asr_component_missing"
     assert snapshot.json()["segments"] == []
+
+
+def test_import_audio_reuses_resident_offline_refiner_when_batch_runtime_is_missing(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(app_module.batch_transcribe, "is_available", lambda: False)
+    monkeypatch.setattr(
+        app_module.asr_refiner,
+        "refinement_capability",
+        lambda: {"status": "ready", "model_id": "offline"},
+    )
+    monkeypatch.setattr(app_module.batch_transcribe, "ensure_wav_16k_mono", lambda path: path)
+    monkeypatch.setattr(
+        app_module.asr_refiner,
+        "refine_wav_file",
+        lambda _path, **_kwargs: RefinementResult(
+            text="本地常驻模型完成录音导入转写。",
+            status="refined",
+            model_id="offline",
+        ),
+    )
+    app = create_app(data_dir=tmp_path)
+    _configure_completed_v2_handlers(app)
+
+    with TestClient(app) as client:
+        imported = client.post(
+            "/v2/meetings/import-audio",
+            files={"file": ("fallback.wav", _wav_bytes(), "audio/wav")},
+        )
+        assert imported.status_code == 202, imported.text
+        meeting_id = imported.json()["meeting_id"]
+        completed = _wait_for_import_job(client, meeting_id, "succeeded")
+        snapshot = client.get(f"/v2/meetings/{meeting_id}/snapshot").json()
+
+    assert completed["stage"] == "completed"
+    assert snapshot["segments"][0]["normalized_text"] == "本地常驻模型完成录音导入转写。"
+    assert snapshot["runtime"]["phase"] == "ended"
 
 
 def test_import_completion_does_not_wait_for_disconnected_review_provider(

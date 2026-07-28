@@ -538,6 +538,10 @@ def _process_lock_for(path: Path) -> threading.Lock:
 
 
 def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        # Windows does not expose directory handles through os.open(). File
+        # contents are flushed before replacement; DACL validation is separate.
+        return
     descriptor = os.open(path, os.O_RDONLY)
     try:
         os.fsync(descriptor)

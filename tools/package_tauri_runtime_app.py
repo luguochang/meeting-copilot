@@ -48,6 +48,12 @@ EXPECTED_APP_IDENTITY = {
     "app_bundle_name": "Meeting Copilot.app",
     "executable_name": "meeting-copilot-desktop",
 }
+EXPECTED_WINDOWS_APP_IDENTITY = {
+    "product_name": "Meeting Copilot",
+    "bundle_identifier": "com.meetingcopilot.desktop",
+    "app_bundle_name": "Meeting Copilot.exe",
+    "executable_name": "meeting-copilot-desktop.exe",
+}
 FILE_ASR_MODEL_NAMES = ("offline", "vad", "punc")
 DIARIZATION_MODEL_NAMES = ("vad", "camplus")
 DIARIZATION_MODEL_MANIFEST_KEYS = {
@@ -117,7 +123,12 @@ def _validate_runtime_manifest_contract(manifest: dict[str, Any]) -> dict[str, A
         raise ValueError(
             "runtime bundle manifest must not expose source_venv development paths"
         )
-    if manifest.get("app_identity") != EXPECTED_APP_IDENTITY:
+    expected_app_identity = (
+        EXPECTED_WINDOWS_APP_IDENTITY
+        if manifest.get("platform") == "windows"
+        else EXPECTED_APP_IDENTITY
+    )
+    if manifest.get("app_identity") != expected_app_identity:
         raise ValueError("runtime bundle manifest fixed app identity is invalid")
     runtimes = manifest.get("runtimes")
     if not isinstance(runtimes, dict):
@@ -682,27 +693,41 @@ def _validate_runtime_mutation_targets(
 
 
 def _file_inventory(path: Path) -> dict[str, Any]:
-    if path.is_symlink() or not path.is_file():
+    io_path = _extended_windows_path(path)
+    if io_path.is_symlink() or not io_path.is_file():
         raise ValueError(
             f"runtime component file is missing or is a symlink: {path.name}"
         )
     return {
-        "size_bytes": path.stat().st_size,
-        "sha256": sha256_file(path),
+        "size_bytes": io_path.stat().st_size,
+        "sha256": sha256_file(io_path),
     }
+
+
+def _extended_windows_path(path: Path) -> Path:
+    resolved = path.expanduser().resolve(strict=False)
+    if sys.platform != "win32":
+        return resolved
+    value = str(resolved)
+    if value.startswith("\\\\?\\"):
+        return Path(value)
+    if value.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + value[2:])
+    return Path("\\\\?\\" + value)
 
 
 def _directory_inventory(
     path: Path, *, allowed_root: Path | None = None
 ) -> dict[str, Any]:
-    if path.is_symlink() or not path.is_dir():
+    io_path = _extended_windows_path(path)
+    if io_path.is_symlink() or not io_path.is_dir():
         raise ValueError(
             f"runtime component directory is missing or is a symlink: {path.name}"
         )
-    allowed = (allowed_root or path).resolve()
+    allowed = _extended_windows_path(allowed_root or path)
     entries: list[dict[str, Any]] = []
-    for candidate in sorted(path.rglob("*")):
-        relative = candidate.relative_to(path).as_posix()
+    for candidate in sorted(io_path.rglob("*")):
+        relative = candidate.relative_to(io_path).as_posix()
         if candidate.is_symlink():
             resolved = candidate.resolve(strict=False)
             try:
@@ -742,7 +767,7 @@ def _directory_inventory(
         "size_bytes": sum(int(item.get("size_bytes") or 0) for item in entries),
         "sha256": hashlib.sha256(digest_payload).hexdigest(),
         "file_count": sum(item.get("kind") == "file" for item in entries),
-        "symlink_count": sum(candidate.is_symlink() for candidate in path.rglob("*")),
+        "symlink_count": sum(candidate.is_symlink() for candidate in io_path.rglob("*")),
     }
 
 
@@ -854,7 +879,7 @@ def validate_controlled_model_pack(
     expected_license_sha256 = str(redistribution.get("license_sha256") or "").strip()
     if not SHA256_PATTERN.fullmatch(expected_license_sha256):
         raise ValueError("controlled model pack license sha256 is invalid")
-    if sha256_file(license_path) != expected_license_sha256:
+    if sha256_canonical_utf8_text(license_path) != expected_license_sha256:
         raise ValueError("controlled model pack license hash mismatch")
     notice_destination = _safe_bundle_path(
         redistribution.get("notice_destination"),
@@ -2143,6 +2168,14 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def sha256_canonical_utf8_text(path: Path) -> str:
+    """Hash policy text consistently across LF and CRLF Git checkouts."""
+
+    text = path.read_text(encoding="utf-8")
+    canonical = text.replace("\r\n", "\n").replace("\r", "\n")
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _write_runtime_manifest(bundle: Path, manifest: dict[str, Any]) -> None:

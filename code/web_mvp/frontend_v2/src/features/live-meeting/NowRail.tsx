@@ -1,4 +1,4 @@
-import { Bookmark, Check, CircleAlert, Copy, EyeOff, Flag, ListChecks, MessageCircleQuestion, MoreHorizontal, Quote, ShieldAlert, TimerOff, CircleHelp } from "lucide-react";
+import { Bookmark, Check, CircleAlert, CircleHelp, Copy, EyeOff, Flag, GitMerge, ListChecks, MessageCircleQuestion, MoreHorizontal, Pencil, Quote, Save, ShieldAlert, TimerOff, X } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { useMemo, useState } from "react";
 import type {
@@ -25,6 +25,19 @@ interface NowRailProps {
   onEvidence(segmentId: string): void;
   onFeedback(suggestionId: string, feedback: SuggestionFeedback): Promise<void>;
   onFactStatus(factType: MeetingFactKind, factId: string, status: Extract<MeetingFactStatus, "confirmed" | "dismissed">): Promise<void>;
+  onFactEdit?(
+    factType: MeetingFactKind,
+    factId: string,
+    changes: { text: string; owner?: string | null; deadline?: string | null; mitigation?: string | null },
+    expectedVersion: number,
+  ): Promise<void>;
+  onFactMerge?(
+    factType: MeetingFactKind,
+    targetFactId: string,
+    sourceFactId: string,
+    expectedTargetVersion: number,
+    expectedSourceVersion: number,
+  ): Promise<void>;
   onMessage(message: string): void;
 }
 
@@ -49,6 +62,7 @@ function questionIsOpen(question: OpenQuestionProjection): boolean {
 }
 
 type RailFact = DecisionCandidate | ActionItemProjection | RiskProjection;
+type FactView = "active" | "changed" | "resolved";
 
 function isFormalAi(value: { formalAi?: { source: "llm_first"; llmCalled: true } | null }): boolean {
   return value.formalAi?.source === "llm_first" && value.formalAi.llmCalled === true;
@@ -78,26 +92,71 @@ function factEvidenceQuote(fact: RailFact): string {
   return fact.evidenceSpans[0]?.quote || "查看依据";
 }
 
+function factIsResolved(fact: RailFact): boolean {
+  return ["done", "answered", "resolved", "dismissed"].includes(String(fact.status));
+}
+
 function FactRow({
   fact,
   factType,
   onEvidence,
   onStatus,
+  mergeCandidates,
+  onEdit,
+  onMerge,
 }: {
   fact: RailFact;
   factType: MeetingFactKind;
   onEvidence(segmentId: string): void;
   onStatus(factType: MeetingFactKind, factId: string, status: Extract<MeetingFactStatus, "confirmed" | "dismissed">): Promise<void>;
+  mergeCandidates: RailFact[];
+  onEdit?: NowRailProps["onFactEdit"];
+  onMerge?: NowRailProps["onFactMerge"];
 }) {
-  const [saving, setSaving] = useState<Extract<MeetingFactStatus, "confirmed" | "dismissed"> | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [merging, setMerging] = useState(false);
+  const [textDraft, setTextDraft] = useState(fact.text);
+  const [ownerDraft, setOwnerDraft] = useState(factType === "action_item" ? (fact as ActionItemProjection).owner ?? "" : "");
+  const [deadlineDraft, setDeadlineDraft] = useState(factType === "action_item" ? (fact as ActionItemProjection).deadline ?? "" : "");
+  const [mitigationDraft, setMitigationDraft] = useState(factType === "risk" ? (fact as RiskProjection).mitigation ?? "" : "");
+  const [mergeSourceId, setMergeSourceId] = useState("");
   const evidenceId = factEvidenceId(fact);
   const save = async (status: Extract<MeetingFactStatus, "confirmed" | "dismissed">) => {
     if (saving) return;
-    setSaving(status);
+    setSaving(true);
     try {
       await onStatus(factType, fact.id, status);
     } finally {
-      setSaving(null);
+      setSaving(false);
+    }
+  };
+
+  const saveEdit = async () => {
+    if (!onEdit || saving || !textDraft.trim()) return;
+    setSaving(true);
+    try {
+      await onEdit(factType, fact.id, {
+        text: textDraft.trim(),
+        ...(factType === "action_item" ? { owner: ownerDraft.trim() || null, deadline: deadlineDraft.trim() || null } : {}),
+        ...(factType === "risk" ? { mitigation: mitigationDraft.trim() || null } : {}),
+      }, fact.version ?? 1);
+      setEditing(false);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const saveMerge = async () => {
+    const source = mergeCandidates.find((candidate) => candidate.id === mergeSourceId);
+    if (!source || !onMerge || saving) return;
+    setSaving(true);
+    try {
+      await onMerge(factType, fact.id, source.id, fact.version ?? 1, source.version ?? 1);
+      setMerging(false);
+      setMergeSourceId("");
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -105,13 +164,32 @@ function FactRow({
     <li className={`fact-row fact-row--${fact.status}`}>
       <div className="fact-row-main">
         <span className="fact-status-label">{factKindLabel(factType, fact.status)}</span>
-        <p>{fact.text}</p>
-        {factType === "action_item" ? (
+        {editing ? (
+          <div className="fact-inline-editor">
+            <textarea value={textDraft} onChange={(event) => setTextDraft(event.target.value)} aria-label={`编辑${factKindLabel(factType, fact.status)}内容`} />
+            {factType === "action_item" ? (
+              <div><input value={ownerDraft} onChange={(event) => setOwnerDraft(event.target.value)} aria-label="编辑负责人" placeholder="负责人" /><input value={deadlineDraft} onChange={(event) => setDeadlineDraft(event.target.value)} aria-label="编辑截止时间" placeholder="截止时间" /></div>
+            ) : null}
+            {factType === "risk" ? <input value={mitigationDraft} onChange={(event) => setMitigationDraft(event.target.value)} aria-label="编辑风险应对" placeholder="风险应对" /> : null}
+            <div><button type="button" onClick={() => void saveEdit()} disabled={saving || !textDraft.trim()}><Save size={13} />保存</button><button type="button" onClick={() => setEditing(false)} disabled={saving}><X size={13} />取消</button></div>
+          </div>
+        ) : <p>{fact.text}</p>}
+        {!editing && factType === "action_item" ? (
           <span className="fact-detail">
             负责人：{(fact as ActionItemProjection).owner ?? "待定"} · 截止：{(fact as ActionItemProjection).deadline ?? "待定"}
           </span>
         ) : null}
-        {factType === "risk" && (fact as RiskProjection).mitigation ? <span className="fact-detail">应对：{(fact as RiskProjection).mitigation}</span> : null}
+        {!editing && factType === "risk" && (fact as RiskProjection).mitigation ? <span className="fact-detail">应对：{(fact as RiskProjection).mitigation}</span> : null}
+        {merging ? (
+          <div className="fact-merge-control">
+            <select value={mergeSourceId} onChange={(event) => setMergeSourceId(event.target.value)} aria-label="选择要并入的同类事项">
+              <option value="">选择同类事项</option>
+              {mergeCandidates.map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.text}</option>)}
+            </select>
+            <button type="button" onClick={() => void saveMerge()} disabled={!mergeSourceId || saving}><GitMerge size={13} />合并</button>
+            <button type="button" onClick={() => setMerging(false)} disabled={saving}><X size={13} />取消</button>
+          </div>
+        ) : null}
       </div>
       <div className="fact-row-footer">
         <button
@@ -125,12 +203,14 @@ function FactRow({
           <span>{factEvidenceQuote(fact)}</span>
         </button>
         <div className="fact-actions" aria-label={`${fact.text}操作`}>
+          {onEdit ? <button className="icon-button icon-button--small" type="button" onClick={() => setEditing(true)} disabled={saving || merging} title="编辑" aria-label={`编辑“${fact.text}”`}><Pencil size={14} /></button> : null}
+          {onMerge && mergeCandidates.length ? <button className="icon-button icon-button--small" type="button" onClick={() => setMerging(true)} disabled={saving || editing} title="合并同类事项" aria-label={`合并“${fact.text}”`}><GitMerge size={14} /></button> : null}
           {fact.status !== "confirmed" ? (
             <button
               className="icon-button icon-button--small"
               type="button"
               onClick={() => void save("confirmed")}
-              disabled={Boolean(saving)}
+              disabled={saving}
               title="确认事实"
               aria-label={`确认${factKindLabel(factType, fact.status)}“${fact.text}”`}
             >
@@ -141,7 +221,7 @@ function FactRow({
             className="icon-button icon-button--small"
             type="button"
             onClick={() => void save("dismissed")}
-            disabled={Boolean(saving)}
+            disabled={saving}
             title="忽略事实"
             aria-label={`忽略${factKindLabel(factType, fact.status)}“${fact.text}”`}
           >
@@ -161,6 +241,9 @@ function FactGroup({
   dismissedFactIds,
   onEvidence,
   onStatus,
+  view,
+  onEdit,
+  onMerge,
 }: {
   icon: LucideIcon;
   label: string;
@@ -169,11 +252,21 @@ function FactGroup({
   dismissedFactIds: Set<string>;
   onEvidence(segmentId: string): void;
   onStatus(factType: MeetingFactKind, factId: string, status: Extract<MeetingFactStatus, "confirmed" | "dismissed">): Promise<void>;
+  view: FactView;
+  onEdit?: NowRailProps["onFactEdit"];
+  onMerge?: NowRailProps["onFactMerge"];
 }) {
   const Icon = icon;
   const visible = facts
     .filter((fact) => isFormalAi(fact))
-    .filter((fact) => fact.status !== "dismissed" && !dismissedFactIds.has(`${factType}:${fact.id}`))
+    .filter((fact) => view === "resolved"
+      ? factIsResolved(fact)
+      : view === "changed"
+        ? true
+        : !factIsResolved(fact) && !dismissedFactIds.has(`${factType}:${fact.id}`))
+    .sort((left, right) => view === "changed"
+      ? right.updatedAtMs - left.updatedAtMs
+      : (left.firstSeenSeq ?? 0) - (right.firstSeenSeq ?? 0))
     .slice(0, 4);
   return (
     <div className="fact-group">
@@ -190,6 +283,9 @@ function FactGroup({
               factType={factType}
               onEvidence={onEvidence}
               onStatus={onStatus}
+              mergeCandidates={facts.filter((candidate) => candidate.id !== fact.id && !factIsResolved(candidate))}
+              onEdit={onEdit}
+              onMerge={onMerge}
             />
           ))}
         </ul>
@@ -209,6 +305,8 @@ export function NowRail({
   onEvidence,
   onFeedback,
   onFactStatus,
+  onFactEdit,
+  onFactMerge,
   onMessage,
 }: NowRailProps) {
   const suggestion = useMemo(
@@ -222,6 +320,8 @@ export function NowRail({
   const [saving, setSaving] = useState<SuggestionFeedback | null>(null);
   const [dismissedFactIds, setDismissedFactIds] = useState<Set<string>>(new Set());
   const [factStatusOverrides, setFactStatusOverrides] = useState<Record<string, MeetingFactStatus>>({});
+  const [savingQuestionId, setSavingQuestionId] = useState<string | null>(null);
+  const [factView, setFactView] = useState<FactView>("active");
   const text = suggestion ? suggestionText(suggestion) : "";
 
   const withFactStatusOverrides = <T extends RailFact>(factType: MeetingFactKind, facts: T[]): T[] => facts.map((fact) => {
@@ -294,7 +394,7 @@ export function NowRail({
             {formalTopic.text}
           </button>
         ) : (
-          <p className="rail-empty">等待讨论形成清晰议题</p>
+          <p className="rail-empty">尚未形成明确议题</p>
         )}
       </section>
 
@@ -377,7 +477,7 @@ export function NowRail({
             </div>
           </div>
         ) : (
-          <p className="rail-empty">AI 正在结合最新会议文字分析</p>
+          <p className="rail-empty">暂无实时建议</p>
         )}
       </section>
 
@@ -392,12 +492,47 @@ export function NowRail({
             {questions.map((question) => (
               <li key={question.id}>
                 <button
+                  className="question-evidence"
                   type="button"
                   onClick={() => question.evidenceSegmentIds[0] && onEvidence(question.evidenceSegmentIds[0])}
                   disabled={!question.evidenceSegmentIds.length}
                 >
                   {question.text}
                 </button>
+                <div className="question-actions">
+                  <button
+                    className="icon-button icon-button--small"
+                    type="button"
+                    title="标记已闭环"
+                    aria-label={`标记问题“${question.text}”已闭环`}
+                    disabled={savingQuestionId === question.id}
+                    onClick={() => {
+                      setSavingQuestionId(question.id);
+                      void onFactStatus("open_question", question.id, "confirmed")
+                        .then(() => onMessage("问题已标记为闭环"))
+                        .catch((error) => onMessage(error instanceof Error ? error.message : "问题状态保存失败"))
+                        .finally(() => setSavingQuestionId(null));
+                    }}
+                  >
+                    <Check size={13} />
+                  </button>
+                  <button
+                    className="icon-button icon-button--small"
+                    type="button"
+                    title="忽略问题"
+                    aria-label={`忽略问题“${question.text}”`}
+                    disabled={savingQuestionId === question.id}
+                    onClick={() => {
+                      setSavingQuestionId(question.id);
+                      void onFactStatus("open_question", question.id, "dismissed")
+                        .then(() => onMessage("问题已忽略"))
+                        .catch((error) => onMessage(error instanceof Error ? error.message : "问题状态保存失败"))
+                        .finally(() => setSavingQuestionId(null));
+                    }}
+                  >
+                    <EyeOff size={13} />
+                  </button>
+                </div>
               </li>
             ))}
           </ol>
@@ -411,6 +546,11 @@ export function NowRail({
           <CircleAlert size={15} />
           <h2 id="facts-title">会议事实</h2>
         </header>
+        <div className="fact-view-tabs" role="tablist" aria-label="会议事实视图">
+          <button type="button" role="tab" aria-selected={factView === "active"} className={factView === "active" ? "is-selected" : ""} onClick={() => setFactView("active")}>当前活跃</button>
+          <button type="button" role="tab" aria-selected={factView === "changed"} className={factView === "changed" ? "is-selected" : ""} onClick={() => setFactView("changed")}>刚刚变化</button>
+          <button type="button" role="tab" aria-selected={factView === "resolved"} className={factView === "resolved" ? "is-selected" : ""} onClick={() => setFactView("resolved")}>已解决</button>
+        </div>
         <div className="fact-groups">
           <FactGroup
             icon={ListChecks}
@@ -420,6 +560,9 @@ export function NowRail({
             dismissedFactIds={dismissedFactIds}
             onEvidence={onEvidence}
             onStatus={saveFactStatus}
+            view={factView}
+            onEdit={onFactEdit}
+            onMerge={onFactMerge}
           />
           <FactGroup
             icon={ListChecks}
@@ -429,6 +572,9 @@ export function NowRail({
             dismissedFactIds={dismissedFactIds}
             onEvidence={onEvidence}
             onStatus={saveFactStatus}
+            view={factView}
+            onEdit={onFactEdit}
+            onMerge={onFactMerge}
           />
           <FactGroup
             icon={ShieldAlert}
@@ -438,6 +584,9 @@ export function NowRail({
             dismissedFactIds={dismissedFactIds}
             onEvidence={onEvidence}
             onStatus={saveFactStatus}
+            view={factView}
+            onEdit={onFactEdit}
+            onMerge={onFactMerge}
           />
         </div>
       </section>

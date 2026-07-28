@@ -156,4 +156,4 @@ def test_native_v2_duplicate_sequence_fails_closed_and_preserves_first_audio(mon
     assert len(recordings) == 1
     assert recordings[0]["track"] == "microphone"
     assert recordings[0]["epoch"] == 2
-    assert recordings[0]["status"] in {"interrupted", "ready", "exporting"}
+    assert recordings[0]["status"] in {"interrupted", "sealed", "ready", "exporting"}

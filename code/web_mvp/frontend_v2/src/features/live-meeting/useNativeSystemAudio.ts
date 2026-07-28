@@ -12,6 +12,7 @@ import { resolveTauriInvoke } from "../../desktop/tauri";
 import type {
   BrowserMicrophoneController,
   BrowserMicrophoneState,
+  MeetingCaptureStartOptions,
 } from "./useBrowserMicrophone";
 
 interface SystemAudioCommandResponse extends NativeCaptureHealthFields {
@@ -175,6 +176,25 @@ export function useNativeSystemAudio(): NativeSystemAudioController {
             updatedAtMs: Date.now(),
           };
           eventStatusMessage = eventType === "final" ? "文字已确认，正在整理" : "正在实时识别";
+        } else if (eventType === "capture_recovery") {
+          const recoveryState = String(event.state ?? "");
+          const bufferedFrames = Math.max(0, Number(event.buffered_frame_count) || 0);
+          if (recoveryState === "reconnecting") {
+            runtime.health = { ...runtime.health, transportReady: false, asrReady: false };
+            eventPatch.phase = "reconnecting";
+            eventPatch.error = null;
+            eventStatusMessage = `录音正常，系统音频识别正在重连（本地已缓冲 ${bufferedFrames} 帧）`;
+          } else if (recoveryState === "backfilling") {
+            runtime.health = { ...runtime.health, transportReady: true };
+            eventPatch.phase = "reconnecting";
+            eventPatch.error = null;
+            eventStatusMessage = "录音正常，正在补齐中断期间的系统音频文字";
+          } else if (recoveryState === "recovered") {
+            runtime.health = { ...runtime.health, transportReady: true, asrReady: true };
+            eventPatch.phase = "recording";
+            eventPatch.error = null;
+            eventStatusMessage = "系统音频识别恢复完成，录音和文字已续接";
+          }
         } else if (eventType === "error" || eventType === "provider_error") {
           await failRuntime(
             runtime,
@@ -213,7 +233,10 @@ export function useNativeSystemAudio(): NativeSystemAudioController {
     }
   }, [failRuntime, updateState]);
 
-  const start = useCallback(async (meetingId: string) => {
+  const start = useCallback(async (
+    meetingId: string,
+    startOptions: MeetingCaptureStartOptions = {},
+  ) => {
     const normalizedMeetingId = meetingId.trim();
     if (!SESSION_ID_PATTERN.test(normalizedMeetingId)) throw new Error("会议 ID 格式无效");
     const invoke = resolveTauriInvoke();
@@ -238,6 +261,9 @@ export function useNativeSystemAudio(): NativeSystemAudioController {
       const response = await invoke<SystemAudioCommandResponse>("system_audio_adapter_start", {
         sessionId: normalizedMeetingId,
         requestPermission: true,
+        ...(startOptions.inputDeviceId?.trim()
+          ? { deviceId: startOptions.inputDeviceId.trim() }
+          : {}),
       });
       startReturned = true;
       if (response.command_status !== "ok"
@@ -315,7 +341,7 @@ export function useNativeSystemAudio(): NativeSystemAudioController {
   }, [stopRuntime, updateState]);
 
   useEffect(() => {
-    if (!runtimeRef.current || state.phase !== "recording") return;
+    if (!runtimeRef.current || !["recording", "reconnecting"].includes(state.phase)) return;
     void collectEvents();
     const eventTimer = window.setInterval(() => void collectEvents(), 300);
     const elapsedTimer = window.setInterval(() => {

@@ -7,15 +7,18 @@ vi.mock("../features/live-meeting/LiveMeetingWorkbench", () => ({
   LiveMeetingWorkbench: ({
     meetingId,
     onBackToMeetings,
+    onCreateMeeting,
     onOpenMeeting,
   }: {
     meetingId: string | null;
     onBackToMeetings?: () => void;
+    onCreateMeeting?: () => string;
     onOpenMeeting?: (meetingId: string) => void;
   }) => (
     <main>
       <output data-testid="meeting-route">{meetingId ?? "list"}</output>
       <button type="button" onClick={onBackToMeetings}>返回会议列表</button>
+      <button type="button" onClick={() => onCreateMeeting?.()}>预留会议编号</button>
       <button type="button" onClick={() => onOpenMeeting?.("meeting-next")}>打开会议</button>
     </main>
   ),
@@ -27,6 +30,17 @@ afterEach(() => {
 });
 
 describe("App route state", () => {
+  it("does not expose a new meeting route before the backend creates it", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState(null, "", "/");
+    render(<App />);
+
+    await user.click(screen.getByRole("button", { name: "预留会议编号" }));
+
+    expect(screen.getByTestId("meeting-route")).toHaveTextContent("list");
+    expect(window.location.search).toBe("");
+  });
+
   it("clears every meeting query alias when returning to the meeting list", async () => {
     const user = userEvent.setup();
     window.history.replaceState(

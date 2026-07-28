@@ -102,6 +102,35 @@ def test_meeting_preparation_persists_packaged_dual_track_identity(tmp_path) -> 
     assert reloaded.json()["input_source"] == "dual_track"
 
 
+def test_meeting_preparation_api_exposes_focus_point_versions(tmp_path) -> None:
+    app = create_app(data_dir=tmp_path)
+    base_payload = {
+        "hotwords": ["FunASR"],
+        "input_source": "microphone",
+        "notice_acknowledged": True,
+        "meeting_goal": "验收中文实时会议",
+    }
+    with TestClient(app) as client:
+        first = client.put(
+            "/v2/meetings/meeting-focus-version/preparation",
+            json={**base_payload, "focus_points": ["断句", "术语"]},
+        )
+        second = client.put(
+            "/v2/meetings/meeting-focus-version/preparation",
+            json={**base_payload, "focus_points": ["断句", "断线恢复"]},
+        )
+        versions = client.get(
+            "/v2/meetings/meeting-focus-version/preparation/versions"
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json()["version"] == 2
+    assert versions.status_code == 200
+    assert [item["version"] for item in versions.json()["versions"]] == [1, 2]
+    assert versions.json()["versions"][0]["focus_points"] == ["断句", "术语"]
+
+
 @pytest.mark.parametrize("saved_acknowledgement", [None, False])
 def test_existing_v2_meeting_stream_requires_recording_notice_acknowledgement(
     tmp_path,

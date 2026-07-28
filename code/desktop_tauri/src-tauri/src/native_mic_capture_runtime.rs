@@ -1,7 +1,5 @@
 use crate::desktop_backend_supervisor::{BackendSupervisor, BackendWebSocketConnection};
-use crate::private_storage::{
-    ensure_private_directory, harden_private_file, open_private_file,
-};
+use crate::private_storage::{ensure_private_directory, harden_private_file, open_private_file};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -828,6 +826,7 @@ impl NativeMicCaptureSupervisor {
         )
     }
 
+    #[cfg(unix)]
     fn signal(
         &self,
         command_id: &'static str,
@@ -980,11 +979,8 @@ impl NativeMicCaptureSupervisor {
         errors: Vec<String>,
     ) -> NativeMicCaptureResponse {
         let writes_local_files = ready_file.is_some();
-        let readiness = readiness_from_file(
-            ready_file.as_deref(),
-            session_id.as_deref(),
-            capture_epoch,
-        );
+        let readiness =
+            readiness_from_file(ready_file.as_deref(), session_id.as_deref(), capture_epoch);
         let captures_audio = captures_audio && readiness.transport_ready && readiness.pcm_seen;
         NativeMicCaptureResponse {
             command_id,
@@ -1296,7 +1292,7 @@ fn helper_exit_error(path: &Path, status: std::process::ExitStatus) -> String {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

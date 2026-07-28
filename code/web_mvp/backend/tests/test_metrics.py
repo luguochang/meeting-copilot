@@ -41,6 +41,17 @@ def test_validate_config_detects_missing_llm_env(monkeypatch):
     assert any("LLM_GATEWAY_API_KEY" in i for i in issues)
 
 
+def test_validate_config_accepts_manifest_resolved_realtime_runtime(monkeypatch):
+    from meeting_copilot_web_mvp import asr_stream
+
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gateway.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "configured")
+    monkeypatch.setattr(asr_stream, "funasr_realtime_available", lambda: True)
+    monkeypatch.setattr(metrics_mod, "REPO_ENV_FILE", "missing.env")
+
+    assert metrics_mod.validate_config() == []
+
+
 def test_metrics_incremented_on_llm_execution(monkeypatch):
     from meeting_copilot_web_mvp import llm_service
     from fastapi.testclient import TestClient

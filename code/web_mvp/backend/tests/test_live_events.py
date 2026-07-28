@@ -2220,3 +2220,37 @@ def test_build_mock_live_events_rejects_state_event_without_renderable_state_ite
 
     with pytest.raises(ValueError, match="event_001 references unknown state item"):
         build_mock_live_events(snapshot)
+
+
+def test_non_authoritative_final_is_exposed_only_as_partial_without_llm_candidates():
+    events = build_asr_live_events(
+        session_id="degraded_online_snapshot",
+        provider="funasr_realtime",
+        streaming_events=[
+            {
+                "event_type": "final",
+                "segment_id": "online_snapshot_001",
+                "text": "接口先恢度百分之五，谁负责回滚？",
+                "start_ms": 0,
+                "end_ms": 1_200,
+                "received_at_ms": 1_250,
+                "confidence": 0.93,
+                "authoritative": False,
+                "final_source": "online_terminal_snapshot",
+                "refinement_status": "unavailable",
+                "refinement_reason": "offline_refinement_components_missing",
+            }
+        ],
+        is_mock=False,
+    )
+
+    event_types = [event["event_type"] for event in events]
+    assert "transcript_partial" in event_types
+    assert "transcript_final" not in event_types
+    assert "state_event" not in event_types
+    assert "suggestion_candidate_event" not in event_types
+    assert "llm_request_draft_event" not in event_types
+    partial = next(event for event in events if event["event_type"] == "transcript_partial")
+    assert partial["payload"]["authoritative"] is False
+    assert partial["payload"]["refinement_status"] == "unavailable"
+    assert partial["payload"]["refinement_reason"] == "offline_refinement_components_missing"

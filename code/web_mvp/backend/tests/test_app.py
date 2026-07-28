@@ -18,6 +18,7 @@ from meeting_copilot_web_mvp.asr_live_repository import JsonFileAsrLiveSessionRe
 from meeting_copilot_web_mvp.degradation_controller import get_degradation_controller
 from meeting_copilot_web_mvp.repository import JsonFileSessionRepository
 from meeting_copilot_web_mvp.sqlite_repository import SqliteAsrLiveSessionRepository, SqliteSessionRepository
+from meeting_copilot_web_mvp.v2_persistence import V2Persistence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -31,6 +32,66 @@ def test_dedupe_strings_handles_empty_values_and_preserves_order():
         "second",
         "third",
     ]
+
+
+def test_v2_intelligence_batch_reads_only_the_next_bounded_increment(tmp_path):
+    persistence = V2Persistence(
+        tmp_path / "intelligence-batch.db",
+        semantic_projection_mode="llm_first",
+    )
+    try:
+        for index in range(1, 11):
+            persistence.commit_final_and_enqueue(
+                meeting_id="meeting-1",
+                final_id=f"final-{index}",
+                segment_id=f"segment-{index}",
+                text=f"Paragraph {index}.",
+                normalized_text=f"Paragraph {index}.",
+                started_at_ms=index * 5_000,
+                ended_at_ms=index * 5_000 + 1_000,
+                evidence_hash=f"hash-{index}",
+                now_ms=1_000 + index,
+            )
+        jobs = [
+            job
+            for job in persistence.list_jobs(meeting_id="meeting-1")
+            if job["kind"] == "intelligence"
+        ]
+
+        first_segments, first_context = app_module._v2_intelligence_batch_segments(
+            persistence,
+            jobs[0],
+        )
+        claimed = persistence.claim_next_job(
+            worker_id="worker-1",
+            lane="intelligence",
+            now_ms=10_000,
+            lease_ms=5_000,
+        )
+        assert claimed is not None
+        assert persistence.complete_job(
+            job_id=claimed["id"],
+            worker_id="worker-1",
+            now_ms=10_100,
+            output={"applied": True},
+        ) is not None
+        second_segments, second_context = app_module._v2_intelligence_batch_segments(
+            persistence,
+            jobs[1],
+        )
+
+        assert [item["segment_id"] for item in first_segments] == [
+            f"segment-{index}" for index in range(1, 9)
+        ]
+        assert first_context == []
+        assert [item["segment_id"] for item in second_segments] == ["segment-9", "segment-10"]
+        assert [item["segment_id"] for item in second_context] == [
+            "segment-6",
+            "segment-7",
+            "segment-8",
+        ]
+    finally:
+        persistence.close()
 
 
 def test_create_app_rejects_multi_worker_llm_runtime(monkeypatch):
@@ -79,6 +140,29 @@ def test_runtime_app_prewarms_resident_funasr_during_startup(monkeypatch, tmp_pa
         assert client.get("/health").status_code == 200
 
     assert lifecycle_calls == ["prewarm", "shutdown"]
+
+
+def test_base_runtime_starts_without_prewarming_optional_funasr(monkeypatch, tmp_path):
+    manifest_path = tmp_path / "runtime-bundle-manifest.json"
+    manifest_path.write_text(
+        json.dumps({"distribution_profile": "base"}),
+        encoding="utf-8",
+    )
+    lifecycle_calls = []
+    monkeypatch.setenv("MEETING_COPILOT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MEETING_COPILOT_DESKTOP_RUNTIME", "1")
+    monkeypatch.setenv("MEETING_COPILOT_RUNTIME_MANIFEST", str(manifest_path))
+    monkeypatch.setattr(
+        app_module.asr_stream,
+        "prewarm_funasr_resident_manager",
+        lambda: lifecycle_calls.append("prewarm") or False,
+    )
+
+    with TestClient(app_module.create_runtime_app()) as client:
+        assert client.get("/health").status_code == 200
+        assert client.app.state.distribution_profile == "base"
+
+    assert lifecycle_calls == []
 
 
 def test_packaged_runtime_fails_startup_when_resident_funasr_is_not_ready(monkeypatch, tmp_path):
@@ -1183,15 +1267,19 @@ def test_backend_allows_tauri_packaged_origin_for_local_api_probe():
     assert response.headers["access-control-allow-origin"] == "tauri://localhost"
 
 
-def test_provider_health_endpoint_masks_llm_secret_and_disables_remote_asr_by_default(monkeypatch):
+def test_provider_health_endpoint_masks_llm_secret_and_disables_remote_asr_by_default(
+    monkeypatch,
+    tmp_path,
+):
     monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
     monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-provider-health-secret")
     monkeypatch.setenv("LLM_GATEWAY_MODEL", "gpt-provider-health")
     monkeypatch.delenv("LLM_GATEWAY_IS_MOCK", raising=False)
     monkeypatch.setattr(app_module.batch_transcribe, "is_available", lambda: True)
     monkeypatch.setattr(app_module, "_realtime_asr_providers", lambda: ["sherpa_onnx_realtime"])
+    app_module.llm_service.clear_runtime_config()
 
-    response = TestClient(create_app()).get("/providers/health")
+    response = TestClient(create_app(data_dir=tmp_path)).get("/providers/health")
 
     assert response.status_code == 200
     body = response.json()
@@ -1216,6 +1304,21 @@ def test_provider_health_endpoint_masks_llm_secret_and_disables_remote_asr_by_de
     serialized = json.dumps(body, ensure_ascii=False)
     assert "sk-provider-health-secret" not in serialized
     assert "api_key" not in serialized
+
+
+def test_provider_health_reports_resident_file_asr_fallback(monkeypatch, tmp_path):
+    monkeypatch.setattr(app_module.batch_transcribe, "is_available", lambda: False)
+    monkeypatch.setattr(
+        app_module.asr_refiner,
+        "refinement_capability",
+        lambda: {"status": "ready"},
+    )
+
+    response = TestClient(create_app(data_dir=tmp_path)).get("/providers/health")
+
+    assert response.status_code == 200
+    assert response.json()["asr"]["file_provider"] == "local_funasr_resident_file"
+    assert response.json()["asr"]["file_asr_available"] is True
 
 
 def test_asr_live_sessions_list_endpoint_hides_mock_sessions_by_default(tmp_path):
@@ -1857,7 +1960,12 @@ def test_create_asr_live_session_from_local_event_file_rejects_symlink_to_forbid
         encoding="utf-8",
     )
     link = visible_root / "linked.events.json"
-    link.symlink_to(target)
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symlink privilege is unavailable")
+        raise
     client = TestClient(create_app())
 
     response = client.post(
@@ -2974,6 +3082,33 @@ def test_asr_live_llm_execution_runs_enabled_rejects_mock_session_without_explic
     assert response.status_code == 409
     assert "not eligible for enabled LLM execution" in response.text
     assert "mock_or_demo_session" in response.text
+
+
+def test_enabled_llm_allows_persisted_finals_with_recoverable_refinement_interruption(monkeypatch):
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-test")
+    record = {
+        "session_id": "recoverable_refinement_interruption",
+        "source": "live_asr_stream",
+        "provider": "funasr_realtime",
+        "provider_mode": "real",
+        "is_mock": False,
+        "input_source": "browser_live_mic",
+        "degradation_reasons": [
+            "stream_interrupted",
+            "offline_refinement_unavailable",
+            "offline_refinement_text_too_short",
+        ],
+        "events": [
+            {
+                "event_type": "transcript_final",
+                "payload": {"segment_id": "segment-1", "text": "已有可用的会议正文。"},
+            }
+        ],
+    }
+
+    app_module._ensure_enabled_llm_allowed(record, allow_non_acceptance_execution=False)
+    assert app_module._realtime_correction_blockers(record) == []
 
 
 def test_asr_live_enabled_approach_and_minutes_reject_mock_session_without_explicit_demo_allowance(monkeypatch):
@@ -5036,8 +5171,8 @@ def test_application_schema_diagnostic_is_safe_and_startup_bootstrap_is_idempote
         "status": "ready",
         "storage": "sqlite",
         "source_version": 0,
-        "final_version": 3,
-        "applied_versions": [1, 2, 3],
+        "final_version": 6,
+        "applied_versions": [1, 2, 3, 4, 5, 6],
         "migrated": True,
         "backup_created": False,
     }
@@ -5046,8 +5181,8 @@ def test_application_schema_diagnostic_is_safe_and_startup_bootstrap_is_idempote
         "schema_version": "application-schema-migration-report.v1",
         "status": "ready",
         "storage": "sqlite",
-        "source_version": 3,
-        "final_version": 3,
+        "source_version": 6,
+        "final_version": 6,
         "applied_versions": [],
         "migrated": False,
         "backup_created": False,

@@ -2,10 +2,12 @@
 import hashlib
 import json
 from io import BytesIO
+import os
 from pathlib import Path
 import subprocess
 import shutil
 import sys
+import pytest
 from fastapi.testclient import TestClient
 from meeting_copilot_web_mvp import asr_correct, batch_transcribe, llm_service
 from meeting_copilot_web_mvp.app import create_app
@@ -60,8 +62,12 @@ def _file_asr_bundle(tmp_path: Path, *, include_models: bool) -> tuple[Path, dic
     manifest_path = bundle / "runtime-bundle-manifest.json"
     manifest_path.parent.mkdir(parents=True)
     launcher_relative = "bin/meeting-copilot-file-asr-python"
+    python_home_relative = "runtime/funasr-python"
     manifest["runtimes"]["funasr"]["venv_executable"] = launcher_relative
     manifest["file_asr"]["runtime"]["executable"] = launcher_relative
+    manifest["packaged_python"] = {
+        "funasr": {"path": python_home_relative}
+    }
     for relative in (
         manifest["runtimes"]["funasr"]["executable"],
         manifest["runtimes"]["funasr"]["venv_executable"],
@@ -73,6 +79,12 @@ def _file_asr_bundle(tmp_path: Path, *, include_models: bool) -> tuple[Path, dic
     runtime_root = bundle / manifest["runtimes"]["funasr"]["root"]
     runtime_root.mkdir(parents=True, exist_ok=True)
     (runtime_root / "fixture-runtime.py").write_text("fixture", encoding="utf-8")
+    site_packages = bundle / manifest["runtimes"]["funasr"]["site_packages"]
+    site_packages.mkdir(parents=True, exist_ok=True)
+    (site_packages / "fixture-package.py").write_text("fixture", encoding="utf-8")
+    python_home = bundle / python_home_relative
+    python_home.mkdir(parents=True, exist_ok=True)
+    (python_home / "fixture-python.txt").write_text("fixture", encoding="utf-8")
     converter = manifest["file_asr"]["converter"]
     converter_path = bundle / converter["path"]
     converter_path.parent.mkdir(parents=True, exist_ok=True)
@@ -92,6 +104,7 @@ def _file_asr_bundle(tmp_path: Path, *, include_models: bool) -> tuple[Path, dic
         manifest["runtimes"]["funasr"]["root"],
         kind="directory",
     )
+    python_home_record = _component_record(bundle, python_home_relative, kind="directory")
     launcher_record = _component_record(bundle, launcher_relative, kind="file")
     worker_relative = manifest["workers"]["file_asr"]
     worker_record = _component_record(bundle, worker_relative, kind="file")
@@ -120,6 +133,7 @@ def _file_asr_bundle(tmp_path: Path, *, include_models: bool) -> tuple[Path, dic
     })
     components = {
         "shared_asr.runtime": runtime_record,
+        "shared_asr.python_runtime": python_home_record,
         "file_asr.python_launcher": launcher_record,
         "file_asr.worker": worker_record,
         "file_asr.converter": converter_record,
@@ -494,8 +508,11 @@ def test_batch_transcribe_file_report_runs_offline_batch_cli(monkeypatch, tmp_pa
     assert cmd[cmd.index("--model") + 1] == str(fake_model)
     assert cmd[cmd.index("--vad-model") + 1] == str(fake_vad)
     assert cmd[cmd.index("--punc-model") + 1] == str(fake_punc)
-    assert "PYTHONHOME" not in child_environments[0]
-    assert "PYTHONPATH" not in child_environments[0]
+    assert child_environments[0]["PYTHONHOME"] == str(
+        bundle / manifest["packaged_python"]["funasr"]["path"]
+    )
+    assert str(bundle / manifest["runtimes"]["funasr"]["site_packages"]) in child_environments[0]["PYTHONPATH"]
+    assert "/backend/site-packages" not in child_environments[0]["PYTHONPATH"]
     assert all(name not in child_environments[0] for name in packaged_override_names)
     assert child_environments[0]["HF_HUB_OFFLINE"] == "1"
     assert child_environments[0]["TRANSFORMERS_OFFLINE"] == "1"
@@ -595,7 +612,12 @@ def test_batch_runtime_preserves_the_funasr_venv_symlink_for_execution(tmp_path)
     base_python = bundle / manifest["runtimes"]["funasr"]["executable"]
     venv_python = bundle / manifest["runtimes"]["funasr"]["venv_executable"]
     venv_python.unlink()
-    venv_python.symlink_to(Path("..") / base_python.relative_to(bundle))
+    try:
+        venv_python.symlink_to(Path("..") / base_python.relative_to(bundle))
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symlink privilege is unavailable")
+        raise
 
     runtime = batch_transcribe._resolve_runtime_components(
         {"MEETING_COPILOT_RUNTIME_MANIFEST": str(manifest_path)}

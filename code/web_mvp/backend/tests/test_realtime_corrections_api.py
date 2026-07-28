@@ -55,7 +55,7 @@ class _TwoSegmentCorrectionRecognizer(_CorrectionRecognizer):
             {
                 "event_type": "final",
                 "segment_id": "corr_seg_2",
-                "text": "错误率超过百分之零点一就回滚。",
+                "text": "第二个接口先恢度百分之五。",
                 "start_ms": 300,
                 "end_ms": 600,
                 "confidence": 0.92,

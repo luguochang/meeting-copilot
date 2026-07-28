@@ -96,6 +96,7 @@ class RealtimeIntelligenceRequest:
     rolling_state: Mapping[str, Any]
     glossary: tuple[str, ...]
     meeting_goal: str | None
+    allow_paragraph_revisions: bool
 
     @classmethod
     def from_payload(
@@ -108,6 +109,7 @@ class RealtimeIntelligenceRequest:
         rolling_state: Mapping[str, Any],
         glossary: Sequence[Any] | None = None,
         meeting_goal: Any = None,
+        allow_paragraph_revisions: bool = True,
     ) -> "RealtimeIntelligenceRequest":
         normalized_meeting_id = _required_text(meeting_id, "meeting_id", maximum=240)
         normalized_revision = _positive_integer(state_revision, "state_revision")
@@ -121,6 +123,8 @@ class RealtimeIntelligenceRequest:
             raise ValueError(f"context_paragraphs must contain at most {MAX_CONTEXT_PARAGRAPHS} items")
         if not isinstance(rolling_state, Mapping):
             raise ValueError("rolling_state must be an object")
+        if not isinstance(allow_paragraph_revisions, bool):
+            raise ValueError("allow_paragraph_revisions must be a boolean")
 
         new_items = tuple(
             IntelligenceParagraph.from_payload(item, field=f"new_paragraphs[{index}]")
@@ -162,6 +166,7 @@ class RealtimeIntelligenceRequest:
             rolling_state=bounded_state,
             glossary=tuple(glossary_items),
             meeting_goal=_optional_text(meeting_goal, maximum=2_000),
+            allow_paragraph_revisions=allow_paragraph_revisions,
         )
 
     @property
@@ -255,19 +260,26 @@ def build_realtime_intelligence_messages(
 
     if not isinstance(request, RealtimeIntelligenceRequest):
         raise TypeError("request must be a RealtimeIntelligenceRequest")
-    system = (
-        "你是中文会议实时理解引擎。只依据输入中的会议原话返回一个 JSON 对象，不要输出 Markdown。"
-        "不得用关键词匹配、常识补全或猜测生成决定、待办、风险、问题或追问；没有充分证据时返回空数组或 null。"
+    revision_rule = (
         "paragraph_revisions 只能修改 new_paragraphs 中的目标，context_paragraphs 只读；修正不得改变事实。"
-        "state_changes.operation 只能是 add、update、resolve、noop，正式变更必须携带可逐字核验的证据 ID 和原话。"
-        "输出字段固定且必须全部存在：paragraph_revisions、topic_update、state_changes、follow_up。"
-        "无段落修正时 paragraph_revisions 必须是 []；无状态变更时 state_changes 必须是 []。"
-        "无主题变更时 topic_update 必须是 null，不得返回 noop 对象。"
-        "无值得追问的问题时 follow_up 必须是 null，不得返回 [] 或空对象。"
-        "follow_up.urgency 必须是 low、medium、high 之一，不得为 null。"
-        "state_changes.type 必须是 decision、action_item、risk、open_question 之一；"
-        "topic_update.operation 只能是 add 或 update。"
-        "所有证据 ID 和修正 target_id 必须从输入 paragraph id 原样复制。"
+        if request.allow_paragraph_revisions
+        else "正文校对由独立任务处理；paragraph_revisions 必须返回空数组，不得尝试修正文段。"
+    )
+    system = "".join(
+        (
+            "你是中文会议实时理解引擎。只依据输入中的会议原话返回一个 JSON 对象，不要输出 Markdown。",
+            "不得用关键词匹配、常识补全或猜测生成决定、待办、风险、问题或追问；没有充分证据时返回空数组或 null。",
+            revision_rule,
+            "state_changes.operation 只能是 add、update、resolve、noop，正式变更必须携带可逐字核验的证据 ID 和原话。",
+            "输出字段固定且必须全部存在：paragraph_revisions、topic_update、state_changes、follow_up。",
+            "无段落修正时 paragraph_revisions 必须是 []；无状态变更时 state_changes 必须是 []。",
+            "无主题变更时 topic_update 必须是 null，不得返回 noop 对象。",
+            "无值得追问的问题时 follow_up 必须是 null，不得返回 [] 或空对象。",
+            "follow_up.urgency 必须是 low、medium、high 之一，不得为 null。",
+            "state_changes.type 必须是 decision、action_item、risk、open_question 之一；",
+            "topic_update.operation 只能是 add 或 update。",
+            "所有证据 ID 和修正 target_id 必须从输入 paragraph id 原样复制。",
+        )
     )
     payload = {
         "state_revision": request.state_revision,
@@ -276,6 +288,7 @@ def build_realtime_intelligence_messages(
         "rolling_state": request.rolling_state,
         "glossary": list(request.glossary),
         "meeting_goal": request.meeting_goal,
+        "allow_paragraph_revisions": request.allow_paragraph_revisions,
         "output_contract": {
             "empty_result": {
                 "paragraph_revisions": [],
@@ -352,6 +365,10 @@ def parse_realtime_intelligence_response(
 
     raw_revisions = _required_array(payload.get("paragraph_revisions"), "paragraph_revisions")
     raw_changes = _required_array(payload.get("state_changes"), "state_changes")
+    if raw_revisions and not request.allow_paragraph_revisions:
+        raise IntelligenceResponseValidationError(
+            "paragraph_revisions must be empty because transcript correction is handled independently"
+        )
     revisions = tuple(
         _parse_paragraph_revision(value, request=request, index=index)
         for index, value in enumerate(raw_revisions)
@@ -385,6 +402,7 @@ def realtime_intelligence_idempotency_key(request: RealtimeIntelligenceRequest) 
         "rolling_state": request.rolling_state,
         "glossary": list(request.glossary),
         "meeting_goal": request.meeting_goal,
+        "allow_paragraph_revisions": request.allow_paragraph_revisions,
     }
     private_identity = json.dumps(
         {"meeting_id": request.meeting_id, **canonical},
@@ -539,7 +557,7 @@ async def run_realtime_intelligence(
     try:
         response = parse_realtime_intelligence_response(result.content, request=request)
     except IntelligenceResponseValidationError as exc:
-        if exc.category not in {"structural", "truncated"}:
+        if exc.category not in {"structural", "truncated", "evidence"}:
             raise
         first_validation_error = exc
         await _notify_callback(before_attempt, 2)

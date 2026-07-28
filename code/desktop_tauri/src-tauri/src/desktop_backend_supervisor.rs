@@ -22,6 +22,8 @@ const BACKEND_RESTART_MAX_BACKOFF: Duration = Duration::from_secs(2);
 const MAX_BACKEND_RESTARTS: u32 = 5;
 const RUNTIME_MANIFEST_SCHEMA: &str = "meeting_copilot.runtime_bundle.v1";
 const COMPONENT_INVENTORY_SCHEMA: &str = "meeting_copilot.runtime_component_inventory.v1";
+const ACTIVE_RUNTIME_SCHEMA: &str = "meeting_copilot.active_runtime.v1";
+const CAPABILITY_STATE_SCHEMA: &str = "meeting_copilot.local_capability_state.v1";
 const RUNTIME_MANIFEST_ENV: &str = "MEETING_COPILOT_RUNTIME_MANIFEST";
 const LOCAL_API_TOKEN_ENV: &str = "MEETING_COPILOT_LOCAL_API_TOKEN";
 const TEST_TOKEN_OVERRIDE_ENV: &str = "MEETING_COPILOT_LOCAL_API_TOKEN_OVERRIDE";
@@ -194,7 +196,7 @@ impl BackendSupervisor {
 
         let port = reserve_loopback_port()?;
         let launch_config = BackendLaunchConfig {
-            launcher: runtime_bundle.join("bin/meeting-copilot-backend"),
+            launcher: resolve_backend_launcher(runtime_bundle)?,
             runtime_bundle: runtime_bundle.to_path_buf(),
             data_dir: data_dir.to_path_buf(),
             log_dir: log_dir.to_path_buf(),
@@ -521,6 +523,71 @@ pub fn resolve_runtime_bundle(resource_dir: &Path, override_path: Option<&Path>)
         .unwrap_or_else(|| resource_dir.join("MeetingCopilotRuntime.bundle"))
 }
 
+pub fn resolve_capability_aware_runtime_bundle(
+    resource_dir: &Path,
+    app_data_dir: &Path,
+    override_path: Option<&Path>,
+) -> PathBuf {
+    if let Some(override_path) = override_path {
+        return override_path.to_path_buf();
+    }
+    let bundled_runtime = resolve_runtime_bundle(resource_dir, None);
+    let capability_root = app_data_dir.join("capability-packs");
+    let pointer_text = match fs::read_to_string(capability_root.join("active.json")) {
+        Ok(value) => value,
+        Err(_) => return bundled_runtime,
+    };
+    let pointer: serde_json::Value = match serde_json::from_str(&pointer_text) {
+        Ok(value) => value,
+        Err(_) => return bundled_runtime,
+    };
+    if pointer
+        .get("schema_version")
+        .and_then(|value| value.as_str())
+        != Some(ACTIVE_RUNTIME_SCHEMA)
+    {
+        return bundled_runtime;
+    }
+    let Some(relative) = pointer.get("runtime_path").and_then(|value| value.as_str()) else {
+        return bundled_runtime;
+    };
+    if validate_bundle_relative_path(relative).is_err()
+        || Path::new(relative)
+            .components()
+            .next()
+            .map(|part| part.as_os_str())
+            != Some(std::ffi::OsStr::new("runtimes"))
+    {
+        return bundled_runtime;
+    }
+    let canonical_root = match fs::canonicalize(&capability_root) {
+        Ok(value) => value,
+        Err(_) => return bundled_runtime,
+    };
+    let candidate = match fs::canonicalize(capability_root.join(relative)) {
+        Ok(value) => value,
+        Err(_) => return bundled_runtime,
+    };
+    if !candidate.starts_with(&canonical_root) || !candidate.is_dir() {
+        return bundled_runtime;
+    }
+    let state_text =
+        match fs::read_to_string(candidate.join(".meeting-copilot-capability-state.json")) {
+            Ok(value) => value,
+            Err(_) => return bundled_runtime,
+        };
+    let state: serde_json::Value = match serde_json::from_str(&state_text) {
+        Ok(value) => value,
+        Err(_) => return bundled_runtime,
+    };
+    if state.get("schema_version").and_then(|value| value.as_str()) != Some(CAPABILITY_STATE_SCHEMA)
+        || !candidate.join("runtime-bundle-manifest.json").is_file()
+    {
+        return bundled_runtime;
+    }
+    candidate
+}
+
 pub fn validate_runtime_bundle(runtime_bundle: &Path) -> Result<(), String> {
     validate_runtime_bundle_and_inspect_file_asr(runtime_bundle).map(|_| ())
 }
@@ -560,6 +627,27 @@ fn validate_runtime_bundle_and_inspect_file_asr(
     } else {
         inspect_file_asr_capability(runtime_bundle)
     }
+}
+
+fn resolve_backend_launcher(runtime_bundle: &Path) -> Result<PathBuf, String> {
+    let manifest_path = runtime_bundle.join("runtime-bundle-manifest.json");
+    let manifest_text = fs::read_to_string(&manifest_path).map_err(|error| {
+        format!("bundled runtime is incomplete: runtime-bundle-manifest.json ({error})")
+    })?;
+    let manifest: serde_json::Value = serde_json::from_str(&manifest_text)
+        .map_err(|error| format!("bundled runtime manifest is invalid: {error}"))?;
+    let relative = manifest
+        .pointer("/launchers/backend")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "bundled runtime backend launcher is missing".to_string())?;
+    validate_bundle_relative_path(relative)?;
+    let launcher = runtime_bundle.join(relative);
+    if !launcher.is_file() {
+        return Err(format!(
+            "bundled runtime backend launcher is missing: {relative}"
+        ));
+    }
+    Ok(launcher)
 }
 
 fn sha256_file(path: &Path) -> Result<String, String> {
@@ -1105,6 +1193,13 @@ fn validate_sealed_file_asr_inventory(
     let Some(components) = sealed_component_inventory_components(manifest)? else {
         return Ok(());
     };
+    if manifest
+        .get("distribution_profile")
+        .and_then(|value| value.as_str())
+        == Some("base")
+    {
+        return Ok(());
+    }
     let allowed_root = fs::canonicalize(runtime_bundle).map_err(|error| {
         format!(
             "runtime bundle root is missing or unreadable: {} ({error})",
@@ -1431,9 +1526,8 @@ fn spawn_backend(config: &BackendLaunchConfig) -> Result<Child, String> {
     let stderr = open_private_file(&config.log_dir.join("backend.stderr.log"), true)
         .map_err(|error| format!("failed to open backend stderr log: {error}"))?;
 
-    let mut command = Command::new("/bin/sh");
+    let mut command = Command::new(&config.launcher);
     command
-        .arg(&config.launcher)
         .current_dir(&config.runtime_bundle)
         .env("MEETING_COPILOT_PORT", config.port.to_string())
         .env("MEETING_COPILOT_DATA_DIR", &config.data_dir)
@@ -1858,6 +1952,7 @@ fn stop_child_process_group(child: &mut Child, timeout: Duration) {
     }
     #[cfg(not(unix))]
     {
+        let _ = timeout;
         if child.try_wait().ok().flatten().is_some() {
             return;
         }
@@ -1991,6 +2086,151 @@ mod tests {
     }
 
     #[test]
+    fn capability_aware_runtime_bundle_selects_valid_active_and_falls_back_safely() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "meeting-copilot-capability-runtime-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let resource_dir = root.join("resources");
+        let app_data_dir = root.join("app-data");
+        let capability_root = app_data_dir.join("capability-packs");
+        let active_runtime = capability_root.join("runtimes/full-v1");
+        fs::create_dir_all(&active_runtime).unwrap();
+        fs::write(
+            active_runtime.join("runtime-bundle-manifest.json"),
+            br#"{"schema_version":"meeting_copilot.runtime_bundle.v1"}"#,
+        )
+        .unwrap();
+        fs::write(
+            active_runtime.join(".meeting-copilot-capability-state.json"),
+            br#"{"schema_version":"meeting_copilot.local_capability_state.v1"}"#,
+        )
+        .unwrap();
+        fs::write(
+            capability_root.join("active.json"),
+            br#"{"schema_version":"meeting_copilot.active_runtime.v1","runtime_path":"runtimes/full-v1"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_capability_aware_runtime_bundle(&resource_dir, &app_data_dir, None),
+            fs::canonicalize(&active_runtime).unwrap()
+        );
+        let explicit_override = root.join("explicit-runtime");
+        assert_eq!(
+            resolve_capability_aware_runtime_bundle(
+                &resource_dir,
+                &app_data_dir,
+                Some(&explicit_override),
+            ),
+            explicit_override
+        );
+
+        fs::write(
+            capability_root.join("active.json"),
+            br#"{"schema_version":"meeting_copilot.active_runtime.v1","runtime_path":"../outside"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_capability_aware_runtime_bundle(&resource_dir, &app_data_dir, None),
+            resource_dir.join("MeetingCopilotRuntime.bundle")
+        );
+
+        fs::write(
+            capability_root.join("active.json"),
+            br#"{"schema_version":"meeting_copilot.active_runtime.v1","runtime_path":"runtimes/full-v1"}"#,
+        )
+        .unwrap();
+        fs::write(
+            active_runtime.join(".meeting-copilot-capability-state.json"),
+            br#"{"schema_version":"wrong"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_capability_aware_runtime_bundle(&resource_dir, &app_data_dir, None),
+            resource_dir.join("MeetingCopilotRuntime.bundle")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn backend_launcher_comes_from_the_runtime_manifest() {
+        let root = std::env::temp_dir().join(format!(
+            "meeting-copilot-runtime-launcher-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("bin")).unwrap();
+        let relative = if cfg!(windows) {
+            "bin/meeting-copilot-backend.cmd"
+        } else {
+            "bin/meeting-copilot-backend"
+        };
+        fs::write(root.join(relative), b"fixture").unwrap();
+        fs::write(
+            root.join("runtime-bundle-manifest.json"),
+            format!(r#"{{"launchers":{{"backend":"{relative}"}}}}"#),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_backend_launcher(&root).unwrap(),
+            root.join(relative)
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn backend_launcher_rejects_manifest_path_escape_and_missing_file() {
+        let root = std::env::temp_dir().join(format!(
+            "meeting-copilot-runtime-launcher-reject-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("runtime-bundle-manifest.json"),
+            br#"{"launchers":{"backend":"../outside"}}"#,
+        )
+        .unwrap();
+        assert!(resolve_backend_launcher(&root)
+            .unwrap_err()
+            .contains("unsafe path"));
+
+        fs::write(
+            root.join("runtime-bundle-manifest.json"),
+            br#"{"launchers":{"backend":"bin/missing"}}"#,
+        )
+        .unwrap();
+        assert!(resolve_backend_launcher(&root)
+            .unwrap_err()
+            .contains("backend launcher is missing"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_batch_backend_launcher_is_directly_spawnable() {
+        let root = std::env::temp_dir().join(format!(
+            "meeting-copilot-runtime-cmd-launcher-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let launcher = root.join("meeting-copilot-backend.cmd");
+        fs::write(&launcher, b"@echo off\r\nexit /b 0\r\n").unwrap();
+
+        let status = Command::new(&launcher).status().unwrap();
+
+        assert!(status.success());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn runtime_inventory_fails_closed_when_required_files_are_missing() {
         let root = std::env::temp_dir().join(format!(
             "meeting-copilot-runtime-test-{}",
@@ -2104,6 +2344,50 @@ mod tests {
             capability.missing_components,
             vec!["offline_model", "vad_model", "punc_model"]
         );
+        assert!(validate_runtime_bundle(&root).is_ok());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sealed_base_distribution_starts_without_optional_asr_components() {
+        let root = std::env::temp_dir().join(format!(
+            "meeting-copilot-base-runtime-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("base-required"), b"ready").unwrap();
+        fs::write(
+            root.join("runtime-bundle-manifest.json"),
+            br#"{
+              "schema_version": "meeting_copilot.runtime_bundle.v1",
+              "distribution_profile": "base",
+              "workers": {"file_asr": "app/asr/transcribe.py"},
+              "file_asr": {
+                "runtime": {"root": "runtime/funasr", "executable": "runtime/python"},
+                "worker": {"path": "app/asr/transcribe.py"},
+                "models": {
+                  "offline": {"root": "models/offline", "required_files": ["model.pt"]},
+                  "vad": {"root": "models/vad", "required_files": ["model.pt"]},
+                  "punc": {"root": "models/punc", "required_files": ["model.pt"]}
+                },
+                "package": {"install_status": "not_bundled"},
+                "redistribution": {"status": "public_redistribution_unresolved"}
+              },
+              "runtimes": {"funasr": {"root": "runtime/funasr"}},
+              "component_inventory": {
+                "schema_version": "meeting_copilot.runtime_component_inventory.v1",
+                "status": "sealed",
+                "components": {"backend": {"path": "base-required"}}
+              },
+              "required_files": ["base-required"]
+            }"#,
+        )
+        .unwrap();
+
+        let capability = inspect_file_asr_capability(&root).unwrap();
+        assert_eq!(capability.status, "file_asr_runtime_not_installed");
+        assert!(!capability.available);
         assert!(validate_runtime_bundle(&root).is_ok());
         let _ = fs::remove_dir_all(&root);
     }

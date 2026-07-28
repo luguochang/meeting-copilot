@@ -54,7 +54,8 @@ def test_web_provider_config_is_local_persistent_and_secret_free_in_response(mon
 
         config_path = data_dir / "settings" / "provider.json"
         assert config_path.is_file()
-        assert stat_mode(config_path) == 0o600
+        if os.name != "nt":
+            assert stat_mode(config_path) == 0o600
         assert json.loads(config_path.read_text(encoding="utf-8"))["api_key"] == secret
 
     llm_service.clear_runtime_config()

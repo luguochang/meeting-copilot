@@ -8,6 +8,7 @@ export type MicrophonePhase =
   | "idle"
   | "requesting"
   | "connecting"
+  | "reconnecting"
   | "starting"
   | "recording"
   | "paused"
@@ -71,13 +72,19 @@ interface MicrophoneRuntime {
   resolveTerminal: () => void;
   openPromise: Promise<void>;
   resolveOpen: () => void;
+  reconnectAttempts: number;
+  captureEpoch: number;
+  reconnectTimer: number | null;
+  stableConnectionTimer: number | null;
 }
 
 const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
-const MAX_QUEUED_FRAMES = 150;
+const MAX_QUEUED_FRAMES = 450;
 const MAX_SOCKET_BUFFER_BYTES = 2 * 1024 * 1024;
 const DEFAULT_PERMISSION_TIMEOUT_MS = 15_000;
 const DEFAULT_END_TIMEOUT_MS = 12_000;
+const MAX_RECONNECT_ATTEMPTS = 3;
+const STABLE_CONNECTION_RESET_MS = 30_000;
 
 const initialState: BrowserMicrophoneState = {
   phase: "idle",
@@ -110,12 +117,15 @@ function errorMessage(error: unknown): string {
   return "麦克风启动失败";
 }
 
-function buildWebSocketUrl(meetingId: string, baseUrl = ""): string {
+function buildWebSocketUrl(meetingId: string, captureEpoch: number, baseUrl = ""): string {
   const url = new URL(resolveLocalWebSocketUrl(
     `/live/asr/stream/ws/${encodeURIComponent(meetingId)}`,
     baseUrl,
   ));
-  url.search = new URLSearchParams({ audio_source: "browser_live_mic" }).toString();
+  url.search = new URLSearchParams({
+    audio_source: "browser_live_mic",
+    capture_epoch: String(captureEpoch),
+  }).toString();
   return url.toString();
 }
 
@@ -193,6 +203,8 @@ export function useBrowserMicrophone(
   const dispose = useCallback((runtime: MicrophoneRuntime, closeSocket = true) => {
     if (runtime.disposed) return;
     runtime.disposed = true;
+    if (runtime.reconnectTimer !== null) window.clearTimeout(runtime.reconnectTimer);
+    if (runtime.stableConnectionTimer !== null) window.clearTimeout(runtime.stableConnectionTimer);
     closeAudio(runtime);
     if (closeSocket && runtime.socket && runtime.socket.readyState < WebSocket.CLOSING) {
       try { runtime.socket.close(1000, "client_cleanup"); } catch { /* already closed */ }
@@ -245,7 +257,8 @@ export function useBrowserMicrophone(
   ) => {
     const normalizedMeetingId = meetingId.trim();
     if (!SESSION_ID_PATTERN.test(normalizedMeetingId)) throw new Error("会议 ID 格式无效");
-    const socketUrl = buildWebSocketUrl(normalizedMeetingId, optionsRef.current.asrBaseUrl);
+    const asrBaseUrl = optionsRef.current.asrBaseUrl;
+    buildWebSocketUrl(normalizedMeetingId, 1, asrBaseUrl);
     if (runtimeRef.current && !runtimeRef.current.disposed) dispose(runtimeRef.current);
 
     updateState({
@@ -278,6 +291,10 @@ export function useBrowserMicrophone(
       resolveTerminal: terminal.resolve,
       openPromise: opened.promise,
       resolveOpen: opened.resolve,
+      reconnectAttempts: 0,
+      captureEpoch: 1,
+      reconnectTimer: null,
+      stableConnectionTimer: null,
     };
     runtimeRef.current = runtime;
 
@@ -293,7 +310,10 @@ export function useBrowserMicrophone(
 
       const AudioContextConstructor = window.AudioContext;
       if (!AudioContextConstructor) throw new Error("当前浏览器不支持 AudioContext");
-      runtime.context = new AudioContextConstructor({ latencyHint: "interactive" });
+      runtime.context = new AudioContextConstructor({
+        latencyHint: "interactive",
+        sampleRate: 16_000,
+      });
       await runtime.context.resume();
       runtime.framer = new StreamingPcmFramer(runtime.context.sampleRate);
       runtime.source = runtime.context.createMediaStreamSource(runtime.stream);
@@ -331,19 +351,31 @@ export function useBrowserMicrophone(
       processor.connect(runtime.monitor);
       runtime.monitor.connect(runtime.context.destination);
 
-      const socket = new WebSocket(socketUrl);
-      runtime.socket = socket;
-      socket.binaryType = "arraybuffer";
-      socket.onopen = () => {
-        if (runtime.disposed) return;
-        runtime.resolveOpen();
-        flushQueue(runtime);
-        updateState({
-          phase: runtime.paused ? "paused" : "starting",
-          statusMessage: "麦克风已连接，正在准备实时识别",
-        });
-      };
-      socket.onmessage = (message) => {
+      const connectSocket = (): void => {
+        if (runtime.disposed || runtime.stopping) return;
+        const socket = new WebSocket(buildWebSocketUrl(
+          normalizedMeetingId,
+          runtime.captureEpoch,
+          asrBaseUrl,
+        ));
+        runtime.socket = socket;
+        socket.binaryType = "arraybuffer";
+        socket.onopen = () => {
+          if (runtime.disposed || runtime.socket !== socket) return;
+          runtime.resolveOpen();
+          flushQueue(runtime);
+          if (runtime.stableConnectionTimer !== null) window.clearTimeout(runtime.stableConnectionTimer);
+          runtime.stableConnectionTimer = window.setTimeout(() => {
+            runtime.reconnectAttempts = 0;
+            runtime.stableConnectionTimer = null;
+          }, STABLE_CONNECTION_RESET_MS);
+          updateState({
+            phase: runtime.paused ? "paused" : "starting",
+            error: null,
+            statusMessage: runtime.reconnectAttempts ? "录音已恢复，正在续接实时识别" : "麦克风已连接，正在准备实时识别",
+          });
+        };
+        socket.onmessage = (message) => {
         if (runtime.disposed || typeof message.data !== "string") return;
         let event: Record<string, unknown>;
         try {
@@ -389,25 +421,48 @@ export function useBrowserMicrophone(
           const messageText = String(event.message ?? event.detail ?? "实时识别服务异常");
           updateState({ phase: "error", error: messageText, statusMessage: messageText });
         }
+        };
+        socket.onerror = () => {
+          if (!runtime.stopping && !runtime.disposed && runtime.socket === socket) {
+            updateState({ statusMessage: "录音连接异常，正在尝试恢复" });
+          }
+        };
+        socket.onclose = () => {
+          runtime.resolveOpen();
+          if (runtime.stopping || runtime.disposed || runtime.socket !== socket) return;
+          if (runtime.stableConnectionTimer !== null) {
+            window.clearTimeout(runtime.stableConnectionTimer);
+            runtime.stableConnectionTimer = null;
+          }
+          runtime.reconnectAttempts += 1;
+          if (runtime.reconnectAttempts <= MAX_RECONNECT_ATTEMPTS) {
+            runtime.captureEpoch += 1;
+            const delayMs = Math.min(4_000, 500 * (2 ** (runtime.reconnectAttempts - 1)));
+            updateState({
+              phase: "reconnecting",
+              asrReady: false,
+              error: null,
+              statusMessage: `连接已中断，正在自动恢复（${runtime.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}）`,
+            });
+            runtime.reconnectTimer = window.setTimeout(() => {
+              runtime.reconnectTimer = null;
+              connectSocket();
+            }, delayMs);
+            return;
+          }
+          runtime.resolveTerminal();
+          closeAudio(runtime);
+          updateState({
+            phase: "error",
+            asrReady: false,
+            inputLevel: 0,
+            error: "自动恢复未成功，录音已保留，可继续本场会议",
+            statusMessage: "录音连接等待手动继续",
+          });
+        };
       };
-      socket.onerror = () => {
-        if (!runtime.stopping && !runtime.disposed) {
-          updateState({ statusMessage: "录音连接异常，正在等待连接关闭" });
-        }
-      };
-      socket.onclose = () => {
-        runtime.resolveOpen();
-        runtime.resolveTerminal();
-        if (runtime.stopping || runtime.disposed) return;
-        closeAudio(runtime);
-        updateState({
-          phase: "error",
-          asrReady: false,
-          inputLevel: 0,
-          error: "录音连接已中断，请重新开始",
-          statusMessage: "录音连接已中断",
-        });
-      };
+
+      connectSocket();
 
       updateState({ phase: "connecting", elapsedMs: 0, statusMessage: "正在连接录音服务" });
     } catch (error) {
@@ -494,7 +549,7 @@ export function useBrowserMicrophone(
   }, []);
 
   useEffect(() => {
-    if (!runtimeRef.current || !["recording", "paused", "starting", "connecting"].includes(state.phase)) return;
+    if (!runtimeRef.current || !["recording", "paused", "starting", "connecting", "reconnecting"].includes(state.phase)) return;
     const timer = window.setInterval(() => {
       const runtime = runtimeRef.current;
       if (runtime && !runtime.disposed) updateState({ elapsedMs: elapsed(runtime) });

@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import sqlite3
+import time
 
 from .sqlite_schema import (
     MIGRATION_HISTORY_TABLE,
@@ -25,11 +26,12 @@ from .sqlite_schema import (
 )
 
 
-APPLICATION_SCHEMA_VERSION = 3
+APPLICATION_SCHEMA_VERSION = 6
 APPLICATION_MAX_SUPPORTED_SCHEMA_VERSION = APPLICATION_SCHEMA_VERSION
 
 _SHANGHAI_TIMEZONE = timezone(timedelta(hours=8))
 _FALLBACK_MEETING_TITLE_FORMAT = "%Y年%m月%d日 %H:%M 的会议"
+_POST_CRASH_SQLITE_RETRY_DELAYS_SECONDS = (0.01, 0.02, 0.04, 0.08, 0.16, 0.32)
 
 
 def fallback_meeting_title(now_ms: int) -> str:
@@ -990,6 +992,60 @@ APPLICATION_SCHEMA_MIGRATIONS = (
             "ALTER TABLE audio_chunks ADD COLUMN source_timestamp_end_ms INTEGER",
         ),
     ),
+    sql_migration(
+        4,
+        "add_meeting_ask_ai_workspace",
+        (
+            "CREATE TABLE ask_threads ("
+            "thread_id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL, title TEXT NOT NULL, "
+            "created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL, "
+            "FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE)",
+            "CREATE INDEX idx_ask_threads_meeting ON ask_threads(meeting_id, updated_at_ms DESC)",
+            "CREATE TABLE ask_messages ("
+            "message_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, meeting_id TEXT NOT NULL, "
+            "role TEXT NOT NULL CHECK (role IN ('user', 'assistant')), content TEXT NOT NULL, "
+            "scope TEXT NOT NULL, evidence_json TEXT NOT NULL DEFAULT '[]', "
+            "status TEXT NOT NULL CHECK (status IN ('pending', 'completed', 'failed')), "
+            "error_class TEXT, pinned_kind TEXT CHECK (pinned_kind IS NULL OR "
+            "pinned_kind IN ('note', 'fact', 'action_item')), created_at_ms INTEGER NOT NULL, "
+            "updated_at_ms INTEGER NOT NULL, FOREIGN KEY (thread_id) REFERENCES ask_threads(thread_id) "
+            "ON DELETE CASCADE, FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE)",
+            "CREATE INDEX idx_ask_messages_thread ON ask_messages(thread_id, created_at_ms, message_id)",
+            "CREATE INDEX idx_ask_messages_meeting ON ask_messages(meeting_id, created_at_ms DESC)",
+        ),
+    ),
+    sql_migration(
+        5,
+        "add_meeting_notes",
+        (
+            "CREATE TABLE meeting_notes ("
+            "note_id TEXT PRIMARY KEY, meeting_id TEXT, title TEXT NOT NULL, body TEXT NOT NULL, "
+            "source_kind TEXT NOT NULL CHECK (source_kind IN ('selection', 'ask_ai', 'manual')), "
+            "source_message_id TEXT, version INTEGER NOT NULL CHECK (version > 0), "
+            "status TEXT NOT NULL CHECK (status IN ('active', 'archived', 'deleted')), "
+            "created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL, "
+            "FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE SET NULL)",
+            "CREATE UNIQUE INDEX idx_meeting_notes_source_message ON meeting_notes(source_message_id) "
+            "WHERE source_message_id IS NOT NULL",
+            "CREATE INDEX idx_meeting_notes_updated ON meeting_notes(status, updated_at_ms DESC, note_id)",
+            "CREATE INDEX idx_meeting_notes_meeting ON meeting_notes(meeting_id, status, updated_at_ms DESC)",
+            "CREATE TABLE meeting_note_evidence ("
+            "note_id TEXT NOT NULL, ordinal INTEGER NOT NULL CHECK (ordinal >= 0), "
+            "source_meeting_id TEXT, segment_id TEXT NOT NULL, transcript_seq INTEGER, "
+            "start_ms INTEGER, end_ms INTEGER, quote TEXT NOT NULL, "
+            "PRIMARY KEY (note_id, ordinal), "
+            "FOREIGN KEY (note_id) REFERENCES meeting_notes(note_id) ON DELETE CASCADE)",
+            "CREATE INDEX idx_meeting_note_evidence_segment ON meeting_note_evidence(source_meeting_id, segment_id)",
+        ),
+    ),
+    sql_migration(
+        6,
+        "version_semantic_reading_blocks",
+        (
+            "ALTER TABLE semantic_paragraphs ADD COLUMN projection_version INTEGER NOT NULL "
+            "DEFAULT 1 CHECK (projection_version > 0)",
+        ),
+    ),
 )
 
 
@@ -1121,50 +1177,72 @@ def _promote_known_prerelease_v2_fingerprint(
         lock_path=lock_path,
         timeout_seconds=timeout_seconds,
     ):
-        connection = sqlite3.connect(
-            database,
-            isolation_level=None,
-            timeout=timeout_seconds,
-        )
-        try:
-            connection.execute(f"PRAGMA busy_timeout={max(1, int(timeout_seconds * 1_000))}")
-            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version not in {2, APPLICATION_SCHEMA_VERSION}:
-                return
+        retry_index = 0
+        while True:
+            connection: sqlite3.Connection | None = None
             try:
-                row = connection.execute(
-                    f"SELECT name, fingerprint FROM {MIGRATION_HISTORY_TABLE} WHERE version = 2"
-                ).fetchone()
-            except sqlite3.OperationalError:
-                return
-            if row != (
-                "create_v2_application_schema",
-                _LEGACY_V2_INCOMPLETE_FINGERPRINT,
-            ):
-                return
-            if not _known_prerelease_v2_schema_is_complete(connection):
-                return
-
-            connection.execute("BEGIN IMMEDIATE")
-            try:
-                cursor = connection.execute(
-                    f"UPDATE {MIGRATION_HISTORY_TABLE} SET fingerprint = ? "
-                    "WHERE version = 2 AND name = ? AND fingerprint = ?",
-                    (
-                        _V2_FINGERPRINT,
-                        "create_v2_application_schema",
-                        _LEGACY_V2_INCOMPLETE_FINGERPRINT,
-                    ),
+                connection = sqlite3.connect(
+                    database,
+                    isolation_level=None,
+                    timeout=timeout_seconds,
                 )
-                if cursor.rowcount != 1:
-                    raise RuntimeError("V2 migration fingerprint changed during promotion")
-                connection.execute("COMMIT")
-            except BaseException:
-                if connection.in_transaction:
-                    connection.execute("ROLLBACK")
-                raise
-        finally:
-            connection.close()
+                connection.execute(f"PRAGMA busy_timeout={max(1, int(timeout_seconds * 1_000))}")
+                version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+                if version not in {2, APPLICATION_SCHEMA_VERSION}:
+                    return
+                try:
+                    row = connection.execute(
+                        f"SELECT name, fingerprint FROM {MIGRATION_HISTORY_TABLE} WHERE version = 2"
+                    ).fetchone()
+                except sqlite3.OperationalError as exc:
+                    if _is_transient_post_crash_sqlite_error(exc):
+                        raise
+                    return
+                if row != (
+                    "create_v2_application_schema",
+                    _LEGACY_V2_INCOMPLETE_FINGERPRINT,
+                ):
+                    return
+                if not _known_prerelease_v2_schema_is_complete(connection):
+                    return
+
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    cursor = connection.execute(
+                        f"UPDATE {MIGRATION_HISTORY_TABLE} SET fingerprint = ? "
+                        "WHERE version = 2 AND name = ? AND fingerprint = ?",
+                        (
+                            _V2_FINGERPRINT,
+                            "create_v2_application_schema",
+                            _LEGACY_V2_INCOMPLETE_FINGERPRINT,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise RuntimeError("V2 migration fingerprint changed during promotion")
+                    connection.execute("COMMIT")
+                except BaseException:
+                    if connection.in_transaction:
+                        connection.execute("ROLLBACK")
+                    raise
+                return
+            except sqlite3.OperationalError as exc:
+                if (
+                    not _is_transient_post_crash_sqlite_error(exc)
+                    or retry_index >= len(_POST_CRASH_SQLITE_RETRY_DELAYS_SECONDS)
+                ):
+                    raise
+                retry_delay = _POST_CRASH_SQLITE_RETRY_DELAYS_SECONDS[retry_index]
+                retry_index += 1
+            finally:
+                if connection is not None:
+                    connection.close()
+            time.sleep(retry_delay)
+
+
+def _is_transient_post_crash_sqlite_error(exc: sqlite3.OperationalError) -> bool:
+    """Recognize the short Windows WAL handoff race after a killed writer."""
+
+    return str(exc).strip().casefold() == "disk i/o error"
 
 
 def bootstrap_application_schema(

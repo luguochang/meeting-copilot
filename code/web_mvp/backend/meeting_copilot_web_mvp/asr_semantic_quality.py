@@ -38,6 +38,7 @@ MIN_TECHNICAL_GROUP_HITS = 2
 MIN_FRAGMENTED_LATIN_TOKENS = 8
 MIN_UNKNOWN_LATIN_TOKENS = 5
 MIN_UNKNOWN_LATIN_RATIO = 0.45
+MIN_UNKNOWN_LATIN_CHARACTER_RATIO = 0.15
 FOCUSED_TECHNICAL_GROUPS = {
     "release_control",
     "reliability",
@@ -65,7 +66,10 @@ KNOWN_LATIN_TOKENS = {
     "sql", "sse", "state", "stream", "streaming", "system", "tauri", "tdd",
     "test", "timeout", "token", "tool", "toolkit", "transcript", "typescript",
     "ui", "url", "ux", "version", "web", "websocket", "windows", "worker",
-    "checkout", "error", "rate", "order", "lag",
+    "checkout", "error", "rate", "order", "orders", "lag", "get", "total",
+    "amount", "mobile", "bi", "job",
+    "chatgpt", "claude", "cloudflare", "commit", "dns", "domain", "ip",
+    "vercel",
     "workbench",
     # Common function words are expected when a Chinese meeting quotes an API
     # or reads an English identifier aloud.
@@ -122,6 +126,14 @@ def evaluate_semantic_quality(text: str) -> dict[str, Any]:
         blocker = BLOCKER
         reason = quality_failure_reasons[0]
         quality_warning = None
+    elif fragmentation["warning"]:
+        # A few unfamiliar product names or acronyms in a long Chinese meeting
+        # must not suppress useful minutes. Keep the signal for diagnostics and
+        # allow downstream jobs to produce a visibly degraded result.
+        status = "warning"
+        blocker = None
+        reason = "mixed_language_fragmentation"
+        quality_warning = "mixed_language_fragmentation"
     elif technical_context_detected:
         status = "passed"
         blocker = None
@@ -156,6 +168,7 @@ def evaluate_semantic_quality(text: str) -> dict[str, Any]:
         "unknown_latin_token_count": fragmentation["unknown_latin_token_count"],
         "unknown_latin_tokens": fragmentation["unknown_latin_tokens"],
         "mixed_language_fragmentation_score": fragmentation["score"],
+        "mixed_language_fragmentation_density": fragmentation["density"],
         "quality_failure_reasons": quality_failure_reasons,
         "reason": reason,
         "quality_warning": quality_warning,
@@ -215,24 +228,47 @@ def _likely_non_speech(text: str, *, gibberish_score: float) -> bool:
 
 
 def _mixed_language_fragmentation(text: str) -> dict[str, Any]:
-    tokens = [
-        token.lower()
+    raw_tokens = [
+        token
         for token in LATIN_TOKEN_RE.findall(str(text or ""))
         if len(token) > 1
     ]
-    unknown_tokens = [token for token in tokens if token not in KNOWN_LATIN_TOKENS]
+    tokens = [token.lower() for token in raw_tokens]
+    unknown_tokens = [
+        token.lower()
+        for token in raw_tokens
+        if not _expected_latin_token(token)
+    ]
     token_count = len(tokens)
     unknown_count = len(unknown_tokens)
     unknown_ratio = unknown_count / token_count if token_count else 0.0
-    blocked = (
+    compact_length = len("".join(str(text or "").split()))
+    unknown_character_count = sum(len(token) for token in unknown_tokens)
+    unknown_character_ratio = unknown_character_count / compact_length if compact_length else 0.0
+    warning = (
         token_count >= MIN_FRAGMENTED_LATIN_TOKENS
         and unknown_count >= MIN_UNKNOWN_LATIN_TOKENS
         and unknown_ratio >= MIN_UNKNOWN_LATIN_RATIO
     )
+    # Unknown English tokens are common product names in technical Chinese.
+    # Treat them as blocking only when they occupy a substantial part of the
+    # entire transcript, which is the shape of phonetic ASR fragmentation.
+    blocked = warning and unknown_character_ratio >= MIN_UNKNOWN_LATIN_CHARACTER_RATIO
     return {
         "blocked": blocked,
+        "warning": warning,
         "latin_token_count": token_count,
         "unknown_latin_token_count": unknown_count,
         "unknown_latin_tokens": _dedupe_preserving_order(unknown_tokens)[:24],
         "score": round(unknown_ratio, 3),
+        "density": round(unknown_character_ratio, 3),
     }
+
+
+def _expected_latin_token(token: str) -> bool:
+    normalized = str(token or "").lower()
+    if normalized in KNOWN_LATIN_TOKENS:
+        return True
+    # Initialisms such as DFC, DNS and UI are valid meeting vocabulary even
+    # when a project-specific acronym is not in the static word list.
+    return bool(re.fullmatch(r"[A-Z]{2,8}", str(token or "")))

@@ -37,6 +37,12 @@ artifacts/
 code/artifacts/
 code/web_mvp/backend/artifacts/
 .superpowers/
+/d-*audit*/
+/t-*audit*/
+
+# Extracted UI assets are committed; duplicate delivery archives stay local.
+docs/produi/*.zip
+docs/ui-redesign/*.zip
 
 # === ASR runtime heavy / regenerable dirs ===
 # (also covered by code/asr_runtime/.gitignore; repeated for root-level safety)

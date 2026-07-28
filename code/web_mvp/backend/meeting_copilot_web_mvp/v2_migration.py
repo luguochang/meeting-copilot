@@ -504,8 +504,9 @@ def _create_sqlite_backup(
     finally:
         if destination is not None:
             destination.close()
-    os.chmod(destination_path, 0o600)
-    with destination_path.open("rb") as backup_file:
+    if os.name != "nt":
+        os.chmod(destination_path, 0o600)
+    with destination_path.open("r+b") as backup_file:
         os.fsync(backup_file.fileno())
 
 
@@ -849,6 +850,8 @@ def _safe_error(error: BaseException) -> str:
 
 
 def _fsync_directory(directory: Path) -> None:
+    if os.name == "nt":
+        return
     descriptor = os.open(directory, os.O_RDONLY)
     try:
         os.fsync(descriptor)

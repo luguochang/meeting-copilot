@@ -32,7 +32,7 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Mapping, Protocol
 
 from meeting_copilot_web_mvp.logging_config import get_logger
 from meeting_copilot_web_mvp.meeting_preparation import (
@@ -74,9 +74,22 @@ from meeting_copilot_web_mvp.native_pcm_protocol import (
 from meeting_copilot_web_mvp.realtime_transcript_correction import POLICY_VERSION as REALTIME_CORRECTION_POLICY_VERSION
 from meeting_copilot_web_mvp.degradation_controller import get_degradation_controller, LEVEL_HEAVY
 from meeting_copilot_web_mvp.diarization_runtime import DiarizationRuntime
+from meeting_copilot_web_mvp.local_runtime_paths import (
+    RuntimeManifest,
+    manifest_value,
+    packaged_funasr_environment,
+    read_runtime_manifest,
+    resolve_manifest_component,
+    venv_python_path,
+)
+from meeting_copilot_web_mvp.asr_refiner import refine_pcm_f32
 
 _log = get_logger("meeting_copilot_web_mvp.asr_stream")
-VAD_SILENCE_RMS_THRESHOLD = 0.003
+# Real Windows microphone captures keep a low room-noise floor around -45 dB.
+# A -50.5 dB threshold misses natural one-second pauses and defers every final
+# to the 15-second hard boundary. -44.4 dB preserves quiet speech while
+# allowing those measured pauses to close the current ASR checkpoint.
+VAD_SILENCE_RMS_THRESHOLD = 0.006
 VAD_ENDPOINT_SILENCE_MS = 900
 # Long uninterrupted speech must still produce bounded confirmed segments so
 # downstream correction and suggestion work can run while the meeting is live.
@@ -101,6 +114,12 @@ MAX_SESSION_HOTWORD_REGISTRATIONS = 128
 
 _SESSION_HOTWORDS: dict[str, tuple[str, ...]] = {}
 _SESSION_HOTWORDS_LOCK = threading.RLock()
+
+
+def _is_meaningful_authoritative_final(text: str) -> bool:
+    """Reject single-character endpoint hallucinations without dropping short replies."""
+
+    return sum(character.isalnum() for character in str(text or "")) >= 2
 
 
 def _exception_origin(error: BaseException) -> str:
@@ -304,7 +323,7 @@ def get_recognizer(session_id: str) -> StreamRecognizer:
 
 # Paths resolved relative to this package (code/web_mvp/backend/meeting_copilot_web_mvp).
 _REPO_ROOT = Path(__file__).resolve().parents[4]
-_SHERPA_VENV_PY = _REPO_ROOT / "code" / "asr_runtime" / ".venv-sherpa" / "bin" / "python"
+_SHERPA_VENV_PY = venv_python_path(_REPO_ROOT / "code" / "asr_runtime" / ".venv-sherpa")
 _SHERPA_WORKER = _REPO_ROOT / "code" / "asr_runtime" / "scripts" / "sherpa_stream_worker.py"
 _SHERPA_MODEL = _REPO_ROOT / "code" / "asr_runtime" / "models" / "sherpa-onnx"
 
@@ -856,9 +875,112 @@ def _configured_local_path(env_name: str, default: Path) -> Path:
     return Path(configured).expanduser() if configured else default
 
 
-def _funasr_process_environment() -> dict[str, str]:
+@dataclass(frozen=True)
+class _FunasrRuntimeConfig:
+    python: Path | None
+    worker: Path | None
+    model: Path | None
+    engine: str
+    manifest: RuntimeManifest
+    errors: tuple[str, ...] = ()
+
+
+def _resolve_funasr_runtime(
+    environ: Mapping[str, str] | None = None,
+) -> _FunasrRuntimeConfig:
+    effective_env = os.environ if environ is None else environ
+    manifest = read_runtime_manifest(effective_env)
+    errors: list[str] = list(manifest.errors)
+
+    def component_path(
+        env_name: str,
+        default: Path,
+        *,
+        component_name: str,
+        expected_kind: str,
+        mirrored_fields: tuple[tuple[str, ...], ...],
+    ) -> Path | None:
+        configured = str(effective_env.get(env_name) or "").strip()
+        if configured:
+            return Path(configured).expanduser().resolve(strict=False)
+        if not manifest.configured:
+            return default
+        result = resolve_manifest_component(
+            manifest,
+            component_name=component_name,
+            expected_kind=expected_kind,
+            mirrored_fields=mirrored_fields,
+        )
+        errors.extend(error for error in result.errors if error not in errors)
+        return result.path
+
+    python = component_path(
+        "MEETING_COPILOT_FUNASR_PYTHON",
+        _FUNASR_VENV_PY,
+        component_name="file_asr.python_launcher",
+        expected_kind="file",
+        mirrored_fields=(
+            ("runtimes", "funasr", "venv_executable"),
+            ("file_asr", "runtime", "executable"),
+        ),
+    )
+    worker = component_path(
+        "MEETING_COPILOT_FUNASR_WORKER",
+        _FUNASR_WORKER,
+        component_name="realtime_asr.worker",
+        expected_kind="file",
+        mirrored_fields=(
+            ("workers", "realtime"),
+            ("worker_inventory", "realtime", "path"),
+        ),
+    )
+    model = component_path(
+        "MEETING_COPILOT_FUNASR_MODEL_DIR",
+        _FUNASR_MODEL_DIR,
+        component_name="realtime_asr.model",
+        expected_kind="directory",
+        mirrored_fields=(("realtime_model", "root"),),
+    )
+
+    configured_engine = str(effective_env.get("MEETING_COPILOT_FUNASR_ENGINE") or "").strip().lower()
+    if configured_engine:
+        engine = configured_engine
+    elif manifest.configured:
+        declared_engines = {
+            str(manifest_value(manifest.payload, "realtime_model", "engine") or "").strip().lower(),
+            str(manifest_value(manifest.payload, "realtime_runtime", "engine") or "").strip().lower(),
+        }
+        declared_engines.discard("")
+        if len(declared_engines) == 1:
+            engine = next(iter(declared_engines))
+        else:
+            engine = "pytorch"
+            errors.append("realtime_engine_manifest_mismatch")
+    else:
+        engine = _FUNASR_ENGINE
+    if engine not in {"pytorch", "onnx"}:
+        errors.append("realtime_engine_invalid")
+        engine = "pytorch"
+
+    return _FunasrRuntimeConfig(
+        python=python,
+        worker=worker,
+        model=model,
+        engine=engine,
+        manifest=manifest,
+        errors=tuple(dict.fromkeys(errors)),
+    )
+
+
+def _funasr_process_environment(
+    runtime: _FunasrRuntimeConfig | None = None,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, str]:
     """Use the bundled FunASR runtime instead of the backend's Python home."""
-    environment = os.environ.copy()
+    effective_env = os.environ if environ is None else environ
+    runtime = runtime or _resolve_funasr_runtime(effective_env)
+    environment = dict(effective_env)
     for key in list(environment):
         upper = key.upper()
         if upper.endswith("_API_KEY") or upper in {
@@ -866,18 +988,48 @@ def _funasr_process_environment() -> dict[str, str]:
             "MEETING_COPILOT_LOCAL_API_TOKEN",
         }:
             environment.pop(key, None)
-    python_home = os.environ.get("MEETING_COPILOT_FUNASR_PYTHON_HOME", "").strip()
-    python_path = os.environ.get("MEETING_COPILOT_FUNASR_PYTHONPATH", "").strip()
+    environment.pop("PYTHONHOME", None)
+    environment.pop("PYTHONPATH", None)
+    python_home = str(effective_env.get("MEETING_COPILOT_FUNASR_PYTHON_HOME") or "").strip()
+    python_path = str(effective_env.get("MEETING_COPILOT_FUNASR_PYTHONPATH") or "").strip()
+    site_packages = str(effective_env.get("MEETING_COPILOT_FUNASR_SITE_PACKAGES") or "").strip()
+    packaged_environment = packaged_funasr_environment(
+        runtime.manifest,
+        worker_path=runtime.worker,
+        include_realtime_runtime=runtime.engine == "onnx",
+    )
+    if packaged_environment.errors:
+        _log.warning(
+            "asr.sidecar.funasr.packaged_environment_invalid",
+            errors=list(packaged_environment.errors),
+        )
+    else:
+        python_home = python_home or packaged_environment.values.get("PYTHONHOME", "")
+        python_path = python_path or packaged_environment.values.get("PYTHONPATH", "")
+        site_packages = site_packages or packaged_environment.values.get(
+            "MEETING_COPILOT_FUNASR_SITE_PACKAGES", ""
+        )
     if python_home:
         environment["PYTHONHOME"] = python_home
     if python_path:
         environment["PYTHONPATH"] = python_path
+    if site_packages:
+        environment["MEETING_COPILOT_FUNASR_SITE_PACKAGES"] = site_packages
+    # The resident JSONL protocol is UTF-8. Windows otherwise inherits the
+    # active ANSI code page for redirected stdout and corrupts Chinese text.
+    environment["PYTHONIOENCODING"] = "utf-8"
+    environment["PYTHONUTF8"] = "1"
+    environment["PYTHONNOUSERSITE"] = "1"
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment["MODELSCOPE_OFFLINE"] = "1"
+    environment["HF_HUB_OFFLINE"] = "1"
+    environment["TRANSFORMERS_OFFLINE"] = "1"
     return environment
 
 
 _FUNASR_VENV_PY = _configured_local_path(
     "MEETING_COPILOT_FUNASR_PYTHON",
-    _REPO_ROOT / "code" / "asr_runtime" / ".venv-funasr" / "bin" / "python",
+    venv_python_path(_REPO_ROOT / "code" / "asr_runtime" / ".venv-funasr"),
 )
 _FUNASR_WORKER = _configured_local_path(
     "MEETING_COPILOT_FUNASR_WORKER",
@@ -893,8 +1045,16 @@ _FUNASR_MODEL_DIR = _configured_local_path(
     / "iic"
     / "speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online",
 )
-FUNASR_REALTIME_PROFILE = "balanced_chinese_meeting"
-FUNASR_REALTIME_CHUNK_SIZE = [0, 30, 15]
+_FUNASR_ENGINE = os.environ.get("MEETING_COPILOT_FUNASR_ENGINE", "pytorch").strip().lower()
+if _FUNASR_ENGINE not in {"pytorch", "onnx"}:
+    _FUNASR_ENGINE = "pytorch"
+# The streaming model owns replaceable preview text only. A 960 ms stride leaves
+# room for CPU inference and transport inside the 1.2 s visible-preview target,
+# while increasing inference frequency by only 25% over the stable 1.2 s
+# profile. The independent offline refiner still owns every authoritative final
+# and therefore the quality/accuracy contract.
+FUNASR_REALTIME_PROFILE = "responsive_preview_authoritative_refiner"
+FUNASR_REALTIME_CHUNK_SIZE = [0, 16, 8]
 FUNASR_REALTIME_ENCODER_CHUNK_LOOK_BACK = 4
 FUNASR_REALTIME_DECODER_CHUNK_LOOK_BACK = 1
 
@@ -903,12 +1063,16 @@ def _funasr_worker_command(
     venv_python: Path | None = None,
     *,
     session_hotword_values: tuple[str, ...] = (),
+    runtime: _FunasrRuntimeConfig | None = None,
 ) -> list[str]:
+    runtime = runtime or _resolve_funasr_runtime()
     command = [
-        str(venv_python or _FUNASR_VENV_PY),
-        str(_FUNASR_WORKER),
+        str(venv_python or runtime.python),
+        str(runtime.worker),
         "--model",
-        str(_FUNASR_MODEL_DIR),
+        str(runtime.model),
+        "--engine",
+        runtime.engine,
         "--chunk-size",
         ",".join(str(value) for value in FUNASR_REALTIME_CHUNK_SIZE),
         "--encoder-chunk-look-back",
@@ -944,6 +1108,7 @@ class FunasrSidecarRecognizer:
     degradation_reasons: list[str] = []
     asr_profile = FUNASR_REALTIME_PROFILE
     chunk_size = FUNASR_REALTIME_CHUNK_SIZE
+    inference_engine = _FUNASR_ENGINE
 
     def __init__(
         self,
@@ -953,12 +1118,16 @@ class FunasrSidecarRecognizer:
         session_hotword_values: tuple[str, ...] = (),
     ):
         self.session_id = session_id
+        runtime = _resolve_funasr_runtime()
         self.asr_profile = FUNASR_REALTIME_PROFILE
         self.chunk_size = list(FUNASR_REALTIME_CHUNK_SIZE)
+        self.inference_engine = runtime.engine
         self._cmd = _funasr_worker_command(
             venv_python,
             session_hotword_values=session_hotword_values,
+            runtime=runtime,
         )
+        self._environment = _funasr_process_environment(runtime)
         self._q: "queue.Queue[dict[str, Any]]" = queue.Queue()
         self._seq = 0
         self._state_lock = threading.Lock()
@@ -979,7 +1148,7 @@ class FunasrSidecarRecognizer:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env=_funasr_process_environment(),
+            env=self._environment,
         )
         return _SidecarGeneration(
             number=number,
@@ -1236,9 +1405,10 @@ def _get_funasr_resident_manager() -> FunasrResidentWorkerManager:
     global _FUNASR_RESIDENT_MANAGER
     with _FUNASR_RESIDENT_MANAGER_LOCK:
         if _FUNASR_RESIDENT_MANAGER is None:
+            runtime = _resolve_funasr_runtime()
             _FUNASR_RESIDENT_MANAGER = FunasrResidentWorkerManager(
-                _funasr_worker_command(),
-                environment=_funasr_process_environment(),
+                _funasr_worker_command(runtime=runtime),
+                environment=_funasr_process_environment(runtime),
             )
         return _FUNASR_RESIDENT_MANAGER
 
@@ -1313,6 +1483,7 @@ def _maybe_funasr_sidecar(
             )
             recognizer.asr_profile = FUNASR_REALTIME_PROFILE
             recognizer.chunk_size = list(FUNASR_REALTIME_CHUNK_SIZE)
+            recognizer.inference_engine = _resolve_funasr_runtime().engine
             _log.info("asr.sidecar.funasr.resident_session_start", session_id=session_id)
             return recognizer
         except FunasrResidentBusyError:
@@ -1330,19 +1501,30 @@ def _maybe_funasr_sidecar(
         return None
 
 
-def funasr_realtime_available() -> bool:
+def funasr_realtime_available(
+    environ: Mapping[str, str] | None = None,
+) -> bool:
     """Return true only when the local runtime and model files are ready.
 
     Passing a model name to FunASR allows ModelScope to download at runtime. The
     meeting product must fail closed instead of downloading an 840MB model during
     a live meeting, so the local model directory is part of readiness.
     """
+    runtime = _resolve_funasr_runtime(environ)
+    if runtime.errors or runtime.python is None or runtime.worker is None or runtime.model is None:
+        return False
+    model_ready = (
+        (runtime.model / "model.onnx").is_file()
+        and (runtime.model / "decoder.onnx").is_file()
+        if runtime.engine == "onnx"
+        else (runtime.model / "model.pt").is_file()
+    )
     return (
-        _FUNASR_VENV_PY.is_file()
-        and _FUNASR_WORKER.is_file()
-        and _FUNASR_MODEL_DIR.is_dir()
-        and (_FUNASR_MODEL_DIR / "model.pt").is_file()
-        and (_FUNASR_MODEL_DIR / "config.yaml").is_file()
+        runtime.python.is_file()
+        and runtime.worker.is_file()
+        and runtime.model.is_dir()
+        and model_ready
+        and (runtime.model / "config.yaml").is_file()
     )
 
 
@@ -1775,6 +1957,26 @@ async def handle_stream(
         return
     recognizer = get_recognizer(session_id)
     provider_metadata = _recognizer_provider_metadata(recognizer, configured_provider=provider)
+
+    def _normalize_capture_event(event: dict[str, Any]) -> dict[str, Any]:
+        normalized = _normalize_client_stream_event(
+            event,
+            l3_normalize_enabled=l3_normalize_enabled,
+        )
+        capture_epoch = max(0, int(native_capture_epoch or 0))
+        capture_track = str(native_track_id or "").strip()
+        segment_id = str(normalized.get("segment_id") or "").strip()
+        if capture_epoch > 0 and capture_track in {"microphone", "system_audio"} and segment_id:
+            prefix = f"{capture_track}:e{capture_epoch}:"
+            if not segment_id.startswith(prefix):
+                normalized["segment_id"] = f"{prefix}{segment_id}"
+            normalized["source_track"] = capture_track
+            normalized["capture_epoch"] = capture_epoch
+        return normalized
+    is_funasr_realtime = (
+        str(getattr(recognizer, "provider", "")) == "funasr_realtime"
+        or provider_metadata["provider"] == "funasr_realtime"
+    )
     if _should_block_recognizer(provider_metadata, allow_fake_fallback=allow_fake_fallback):
         await websocket.send_text(json.dumps(_blocked_recognizer_event(provider_metadata), ensure_ascii=False))
         await websocket.close()
@@ -1822,6 +2024,7 @@ async def handle_stream(
             existing_record = asr_live_repo.get(session_id)
         except KeyError:
             existing_record = {}
+    interrupted_backfill_state = dict(existing_record.get("transcript_backfill") or {})
 
     def _stream_normalized_text(
         text: str,
@@ -1857,10 +2060,15 @@ async def handle_stream(
             segment_id = str(payload.get("segment_id") or "").strip()
             if not text or not segment_id:
                 continue
+            authoritative = payload.get("authoritative") is not False
             normalized_text = _normalize_text(raw_source_text) if l3_normalize_enabled else raw_source_text
             restored.append(
                 {
-                    "event_type": "final" if event_type == "transcript_final" else "partial",
+                    "event_type": (
+                        "final"
+                        if event_type == "transcript_final" and authoritative
+                        else "partial"
+                    ),
                     "segment_id": segment_id,
                     "text": text,
                     "normalized_text": normalized_text,
@@ -1874,7 +2082,29 @@ async def handle_stream(
                         else {}
                     ),
                     **({"source_snapshot_text": raw_source_text} if raw_source_text else {}),
+                    **({"source_track": str(payload["source_track"])} if payload.get("source_track") else {}),
+                    **(
+                        {"capture_epoch": int(payload["capture_epoch"])}
+                        if payload.get("capture_epoch") is not None
+                        else {}
+                    ),
                     **({"projection_reconciled": True} if payload.get("projection_reconciled") else {}),
+                    **(
+                        {"authoritative": bool(payload["authoritative"])}
+                        if "authoritative" in payload
+                        else {}
+                    ),
+                    **({"final_source": str(payload["final_source"])} if payload.get("final_source") else {}),
+                    **(
+                        {"refinement_status": str(payload["refinement_status"])}
+                        if payload.get("refinement_status")
+                        else {}
+                    ),
+                    **(
+                        {"refinement_reason": str(payload["refinement_reason"])}
+                        if payload.get("refinement_reason")
+                        else {}
+                    ),
                 }
             )
         return restored
@@ -1899,7 +2129,8 @@ async def handle_stream(
     audio_active_reported = False
 
     def _observe_audio_activity(payload: bytes) -> dict[str, Any] | None:
-        nonlocal audio_active_streak_ms, audio_active_reported
+        nonlocal audio_active_streak_ms, audio_active_reported, chunk_ms
+        chunk_ms = _float32_pcm_duration_ms(payload)
         if audio_active_reported:
             return None
         if _float32_pcm_rms(payload) > VAD_SILENCE_RMS_THRESHOLD:
@@ -1920,6 +2151,11 @@ async def handle_stream(
         int((existing_record.get("live_projection") or {}).get("total_final_count") or 0),
     )
     endpoint_candidate: dict[str, Any] = {}
+    # Raw PCM for the current VAD segment. This is the only input accepted by
+    # the post-endpoint refiner; online partial text is never used as audio
+    # evidence and is never concatenated into a final.
+    segment_pcm_buffer = bytearray()
+    segment_has_speech = False
     endpoint_committed_source_text = str(
         accumulated_finals[-1].get("source_snapshot_text") if accumulated_finals else ""
     )
@@ -1927,6 +2163,11 @@ async def handle_stream(
         [int(event.get("end_ms") or 0) for event in accumulated_finals],
         default=0,
     )
+    stream_elapsed_ms = float(endpoint_committed_end_ms)
+
+    def _current_stream_end_ms() -> int:
+        return int(round(stream_elapsed_ms))
+
     audio_asset: dict[str, Any] | None = dict(existing_record.get("audio") or {}) or None
     audio_writer: RealtimeWavAssetWriter | None = None
     if audio_asset_data_dir is not None:
@@ -2038,7 +2279,25 @@ async def handle_stream(
             ),
             **({"source_segment_id": str(ev["source_segment_id"])} if ev.get("source_segment_id") else {}),
             **({"source_snapshot_text": str(ev["source_snapshot_text"])} if ev.get("source_snapshot_text") else {}),
+            **({"source_track": str(ev["source_track"])} if ev.get("source_track") else {}),
+            **({"capture_epoch": int(ev["capture_epoch"])} if ev.get("capture_epoch") is not None else {}),
             **({"projection_reconciled": True} if ev.get("projection_reconciled") else {}),
+            **(
+                {"authoritative": bool(ev["authoritative"])}
+                if "authoritative" in ev
+                else {}
+            ),
+            **({"final_source": str(ev["final_source"])} if ev.get("final_source") else {}),
+            **(
+                {"refinement_status": str(ev["refinement_status"])}
+                if ev.get("refinement_status")
+                else {}
+            ),
+            **(
+                {"refinement_reason": str(ev["refinement_reason"])}
+                if ev.get("refinement_reason")
+                else {}
+            ),
             "start_ms": int(ev.get("start_ms") if ev.get("start_ms") is not None else idx * chunk_ms),
             "end_ms": int(ev.get("end_ms") if ev.get("end_ms") is not None else (idx + 1) * chunk_ms),
             "received_at_ms": int(
@@ -2052,18 +2311,57 @@ async def handle_stream(
         }
 
     def _append_accumulated_final(ev: dict[str, Any], idx: int) -> bool:
+        if ev.get("authoritative") is False:
+            return False
         text = str(ev.get("text") or "").strip()
         if not text:
             return False
+        segment_id = str(ev.get("segment_id") or "").strip()
+        source_segment_id = str(ev.get("source_segment_id") or "").strip()
+        source_snapshot = str(ev.get("source_snapshot_text") or "").strip()
+        capture_epoch = max(0, int(ev.get("capture_epoch") or 0))
+        if is_funasr_realtime:
+            for partial_segment_id, partial in list(latest_partials.items()):
+                partial_source_segment_id = str(partial.get("source_segment_id") or "").strip()
+                partial_source_snapshot = str(
+                    partial.get("source_snapshot_text") or partial.get("text") or ""
+                ).strip()
+                if (
+                    (segment_id and partial_segment_id == segment_id)
+                    or (
+                        source_segment_id
+                        and partial_source_segment_id
+                        and source_segment_id == partial_source_segment_id
+                    )
+                    or (
+                        source_snapshot
+                        and partial_source_snapshot
+                        and source_snapshot == partial_source_snapshot
+                    )
+                ):
+                    latest_partials.pop(partial_segment_id, None)
+        for existing_index, existing in enumerate(accumulated_finals):
+            existing_source = str(existing.get("source_snapshot_text") or "").strip()
+            same_epoch = max(0, int(existing.get("capture_epoch") or 0)) == capture_epoch
+            if same_epoch and (
+                (source_snapshot and existing_source == source_snapshot)
+                or (not source_snapshot and str(existing.get("text") or "").strip() == text)
+            ):
+                accumulated_finals[existing_index] = _to_streaming_final(ev, idx)
+                return False
         if accumulated_finals:
             previous_text = str(accumulated_finals[-1].get("text") or "").strip()
             previous_segment_id = str(accumulated_finals[-1].get("segment_id") or "")
+            previous_capture_epoch = max(
+                0,
+                int(accumulated_finals[-1].get("capture_epoch") or 0),
+            )
             segment_id = str(ev.get("segment_id") or "")
-            if text == previous_text:
+            if text == previous_text and capture_epoch == previous_capture_epoch:
                 return False
             if segment_id and segment_id == previous_segment_id:
                 accumulated_finals[-1] = _to_streaming_final(ev, idx)
-                return True
+                return False
         accumulated_finals.append(_to_streaming_final(ev, idx))
         if len(accumulated_finals) > LIVE_PROJECTION_MAX_FINALS:
             del accumulated_finals[:-LIVE_PROJECTION_MAX_FINALS]
@@ -2134,14 +2432,46 @@ async def handle_stream(
             **({"source_segment_id": ev["source_segment_id"]} if ev.get("source_segment_id") else {}),
             **({"source_snapshot_text": ev["source_snapshot_text"]} if ev.get("source_snapshot_text") else {}),
             **({"projection_reconciled": True} if ev.get("projection_reconciled") else {}),
+            **(
+                {"authoritative": bool(ev["authoritative"])}
+                if "authoritative" in ev
+                else {}
+            ),
+            **({"final_source": str(ev["final_source"])} if ev.get("final_source") else {}),
+            **(
+                {"refinement_status": str(ev["refinement_status"])}
+                if ev.get("refinement_status")
+                else {}
+            ),
+            **(
+                {"refinement_reason": str(ev["refinement_reason"])}
+                if ev.get("refinement_reason")
+                else {}
+            ),
+            **(
+                {"authoritative": bool(ev["authoritative"])}
+                if "authoritative" in ev
+                else {}
+            ),
+            **({"final_source": str(ev["final_source"])} if ev.get("final_source") else {}),
+            **(
+                {"refinement_status": str(ev["refinement_status"])}
+                if ev.get("refinement_status")
+                else {}
+            ),
+            **(
+                {"refinement_reason": str(ev["refinement_reason"])}
+                if ev.get("refinement_reason")
+                else {}
+            ),
             "start_ms": int(ev.get("start_ms") or 0),
-            "end_ms": int(ev.get("end_ms") or getattr(recognizer, "_seq", 0) * chunk_ms),
+            "end_ms": int(ev.get("end_ms") or _current_stream_end_ms()),
             "received_at_ms": int(
                 ev.get("received_at_ms")
                 if ev.get("received_at_ms") is not None
                 else ev.get("end_ms")
                 if ev.get("end_ms") is not None
-                else getattr(recognizer, "_seq", 0) * chunk_ms
+                else _current_stream_end_ms()
             ),
             "confidence": ev.get("confidence", 0.8),
             **({"candidate_eligible": True, "candidate_source": "stable_partial"} if candidate_eligible else {}),
@@ -2183,11 +2513,11 @@ async def handle_stream(
             "source_text": str(source_ev.get("text") or "").strip(),
             "segment_id": (
                 str(display_ev.get("segment_id") or _next_endpoint_segment_id())
-                if provider_metadata["provider"] == "funasr_realtime"
+                if is_funasr_realtime
                 else _next_endpoint_segment_id()
             ),
             "start_ms": int(display_ev.get("start_ms") or endpoint_committed_end_ms),
-            "end_ms": int(display_ev.get("end_ms") or getattr(recognizer, "_seq", 0) * chunk_ms),
+            "end_ms": int(display_ev.get("end_ms") or _current_stream_end_ms()),
             "confidence": display_ev.get("confidence", 0.8),
             **({"source_segment_id": display_ev["source_segment_id"]} if display_ev.get("source_segment_id") else {}),
             "projection_reconciled": bool(display_ev.get("projection_reconciled")),
@@ -2198,39 +2528,234 @@ async def handle_stream(
         endpoint_candidate = {}
         endpoint_silence_ms = 0
 
-    def _maybe_vad_endpoint_final() -> dict[str, Any] | None:
-        nonlocal endpoint_final_count, endpoint_committed_source_text, endpoint_committed_end_ms
+    async def _maybe_vad_endpoint_event() -> dict[str, Any] | None:
+        nonlocal endpoint_final_count, endpoint_committed_source_text, endpoint_committed_end_ms, segment_pcm_buffer
+        # The online worker can emit a delayed partial after the preceding
+        # authoritative final. Do not refine that stale text over a buffer
+        # containing only room noise or silence.
+        if not segment_has_speech:
+            return None
         text = str(endpoint_candidate.get("text") or "").strip()
-        candidate_end_ms = int(endpoint_candidate.get("end_ms") or getattr(recognizer, "_seq", 0) * chunk_ms)
-        candidate_duration_ms = max(0, candidate_end_ms - endpoint_committed_end_ms)
+        current_end_ms = _current_stream_end_ms()
+        candidate_duration_ms = max(0, current_end_ms - endpoint_committed_end_ms)
         reached_natural_endpoint = endpoint_silence_ms >= VAD_ENDPOINT_SILENCE_MS
         reached_bounded_endpoint = candidate_duration_ms >= VAD_MAX_SEGMENT_MS
-        if not (reached_natural_endpoint or reached_bounded_endpoint) or len(text) < VAD_MIN_FINAL_TEXT_CHARS:
+        if not (reached_natural_endpoint or reached_bounded_endpoint):
             return None
-        endpoint_final_count += 1
-        end_ms = candidate_end_ms
-        segment_id = str(endpoint_candidate.get("segment_id") or f"vad_endpoint_{endpoint_final_count:03d}")
+        # A delayed or overloaded online preview must not block sentence
+        # closure. Raw PCM plus VAD is sufficient input for the authoritative
+        # offline refiner; online text is only a fallback when it exists.
+        if text and len(text) < VAD_MIN_FINAL_TEXT_CHARS:
+            return None
+        segment_start_ms = endpoint_committed_end_ms
+        end_ms = max(
+            segment_start_ms,
+            current_end_ms - endpoint_silence_ms if reached_natural_endpoint else current_end_ms,
+        )
+        segment_id = str(endpoint_candidate.get("segment_id") or _next_endpoint_segment_id())
         endpoint_committed_source_text = str(endpoint_candidate.get("source_text") or text).strip()
         endpoint_committed_end_ms = end_ms
-        latest_partials.pop(segment_id, None)
+        refinement = await _run_blocking(refine_pcm_f32, bytes(segment_pcm_buffer))
+        refined_text = refinement.text.strip()
+        rejected_short_text = bool(
+            refinement.authoritative
+            and refined_text
+            and not _is_meaningful_authoritative_final(refined_text)
+        )
+        authoritative = refinement.authoritative and not rejected_short_text
+        refinement_status = "rejected_short_text" if rejected_short_text else refinement.status
+        refinement_reason = "offline_refinement_text_too_short" if rejected_short_text else refinement.reason
+        if authoritative:
+            endpoint_final_count += 1
+            latest_partials.pop(segment_id, None)
+        else:
+            provider_metadata["degradation_reasons"].append(
+                "offline_refinement_unavailable"
+                if not refinement.authoritative
+                else "offline_refinement_text_too_short"
+            )
+        final_text = (refined_text or text) if authoritative else text
+        if not final_text:
+            return None
         return {
-            "event_type": "final",
+            "event_type": "final" if authoritative else "partial",
             "segment_id": segment_id,
-            "text": text,
-            "start_ms": int(endpoint_candidate.get("start_ms") or max(0, end_ms - VAD_ENDPOINT_SILENCE_MS)),
+            "text": final_text,
+            "start_ms": segment_start_ms,
             "end_ms": end_ms,
             "received_at_ms": end_ms,
-            "confidence": endpoint_candidate.get("confidence", 0.8),
-            "endpoint_source": ("server_vad_stable_partial" if reached_natural_endpoint else "server_vad_max_segment"),
+            "confidence": 0.92 if authoritative else endpoint_candidate.get("confidence", 0.8),
+            "authoritative": authoritative,
+            "final_source": "local_offline_refinement" if authoritative else "online_terminal_partial",
+            "refinement_status": refinement_status,
+            **({"refinement_model_id": refinement.model_id} if refinement.model_id else {}),
+            **({"refinement_reason": refinement_reason} if refinement_reason else {}),
+            "endpoint_source": ("server_vad_offline_refined" if authoritative else "server_vad_refinement_unavailable"),
+            **(
+                {"partial_semantics": "terminal_snapshot"}
+                if not authoritative
+                else {}
+            ),
             "source_snapshot_text": endpoint_committed_source_text,
             **(
                 {"source_segment_id": endpoint_candidate["source_segment_id"]}
                 if endpoint_candidate.get("source_segment_id")
                 else {}
             ),
-            "normalized_text": _stream_normalized_text(text),
-            "projection_reconciled": bool(endpoint_candidate.get("projection_reconciled")),
+            "normalized_text": _stream_normalized_text(final_text),
+            # An authoritative offline refinement is a complete sentence. It
+            # must not inherit the online cumulative-partial projection
+            # boundary, otherwise canonical projection can replace the full
+            # refined text with a short partial prefix.
+            "projection_reconciled": bool(
+                endpoint_candidate.get("projection_reconciled")
+                and not authoritative
+            ),
         }
+
+    def _backfill_interrupted_tail_once() -> bool:
+        nonlocal endpoint_final_count, endpoint_committed_source_text, endpoint_committed_end_ms
+        nonlocal interrupted_backfill_state, segment_pcm_buffer, segment_has_speech
+        if not is_funasr_realtime or not segment_has_speech or not segment_pcm_buffer:
+            return False
+        segment_start_ms = endpoint_committed_end_ms
+        segment_end_ms = max(
+            segment_start_ms,
+            _current_stream_end_ms() - endpoint_silence_ms,
+        )
+        interrupted_backfill_state = {
+            "schema_version": "transcript_backfill.v1",
+            "status": "running",
+            "capture_epoch": max(0, int(native_capture_epoch or 0)),
+            "start_ms": segment_start_ms,
+            "end_ms": segment_end_ms,
+            "attempt": int(interrupted_backfill_state.get("attempt") or 0) + 1,
+            "updated_at_ms": time.time_ns() // 1_000_000,
+        }
+        _upsert_live_session(
+            _current_session_streaming_events(),
+            [*_current_degradation_reasons(), "stream_interrupted"],
+        )
+        refinement = refine_pcm_f32(bytes(segment_pcm_buffer))
+        refined_text = refinement.text.strip()
+        rejected_short_text = bool(
+            refinement.authoritative
+            and refined_text
+            and not _is_meaningful_authoritative_final(refined_text)
+        )
+        if not refinement.authoritative or rejected_short_text or not refined_text:
+            interrupted_backfill_state = {
+                **interrupted_backfill_state,
+                "status": "failed",
+                "error_class": (
+                    "offline_refinement_unavailable"
+                    if not refinement.authoritative
+                    else "offline_refinement_text_too_short"
+                ),
+                "updated_at_ms": time.time_ns() // 1_000_000,
+            }
+            provider_metadata["degradation_reasons"].append(
+                "offline_refinement_unavailable"
+                if not refinement.authoritative
+                else "offline_refinement_text_too_short"
+            )
+            _upsert_live_session(
+                _current_session_streaming_events(),
+                [*_current_degradation_reasons(), "stream_interrupted"],
+            )
+            return False
+
+        segment_id = _next_endpoint_segment_id()
+        endpoint_final_count += 1
+        endpoint_committed_source_text = str(
+            endpoint_candidate.get("source_text") or endpoint_candidate.get("text") or ""
+        ).strip()
+        endpoint_committed_end_ms = segment_end_ms
+        backfilled_event = _normalize_capture_event(
+            {
+                "event_type": "final",
+                "segment_id": segment_id,
+                "text": refined_text,
+                "normalized_text": _stream_normalized_text(refined_text),
+                "start_ms": segment_start_ms,
+                "end_ms": segment_end_ms,
+                "received_at_ms": segment_end_ms,
+                "confidence": 0.92,
+                "authoritative": True,
+                "final_source": "local_offline_disconnect_backfill",
+                "refinement_status": "backfilled",
+                **({"refinement_model_id": refinement.model_id} if refinement.model_id else {}),
+                "endpoint_source": "stream_interrupted_offline_refined",
+                "source_snapshot_text": endpoint_committed_source_text,
+                **(
+                    {"source_segment_id": endpoint_candidate["source_segment_id"]}
+                    if endpoint_candidate.get("source_segment_id")
+                    else {}
+                ),
+                "projection_reconciled": False,
+            }
+        )
+        backfilled_event.update(_native_pcm_event_identity(last_native_frame))
+        latest_partials.clear()
+        segment_pcm_buffer.clear()
+        segment_has_speech = False
+        appended = _append_accumulated_final(
+            backfilled_event,
+            getattr(recognizer, "_seq", len(accumulated_finals) + 1),
+        )
+        interrupted_backfill_state = {
+            **interrupted_backfill_state,
+            "status": "completed",
+            "segment_id": str(backfilled_event["segment_id"]),
+            "final_source": str(backfilled_event["final_source"]),
+            "updated_at_ms": time.time_ns() // 1_000_000,
+        }
+        if not appended:
+            _upsert_live_session(
+                _current_session_streaming_events(),
+                [*_current_degradation_reasons(), "stream_interrupted"],
+            )
+            return True
+        _upsert_and_commit_final(
+            _current_session_streaming_events(),
+            [*_current_degradation_reasons(), "stream_interrupted"],
+            backfilled_event,
+        )
+        _log.info(
+            "asr.stream.interrupted_tail_backfilled",
+            session_id=session_id,
+            segment_id=backfilled_event["segment_id"],
+            start_ms=segment_start_ms,
+            end_ms=segment_end_ms,
+        )
+        return True
+
+    def _backfill_interrupted_tail() -> bool:
+        nonlocal interrupted_backfill_state
+        try:
+            return _backfill_interrupted_tail_once()
+        except Exception as exc:
+            interrupted_backfill_state = {
+                **interrupted_backfill_state,
+                "schema_version": "transcript_backfill.v1",
+                "status": "failed",
+                "error_class": type(exc).__name__,
+                "updated_at_ms": time.time_ns() // 1_000_000,
+            }
+            provider_metadata["degradation_reasons"].append("offline_refinement_unavailable")
+            try:
+                _upsert_live_session(
+                    _current_session_streaming_events(),
+                    [*_current_degradation_reasons(), "stream_interrupted"],
+                )
+            except Exception:
+                pass
+            _log.warning(
+                "asr.stream.interrupted_tail_backfill_failed",
+                session_id=session_id,
+                error_class=type(exc).__name__,
+            )
+            raise
 
     def _upsert_live_session(
         streaming_events: list[dict[str, Any]], degradation_reasons: list[str]
@@ -2287,6 +2812,11 @@ async def handle_stream(
                 "asr": {"l3_normalize_enabled": bool(l3_normalize_enabled)},
                 "scope": "websocket_connection_start",
             },
+            **(
+                {"transcript_backfill": dict(interrupted_backfill_state)}
+                if interrupted_backfill_state
+                else {}
+            ),
             "live_projection": {
                 "policy_version": "recent-canonical-window.v1",
                 "complete_transcript_source": "v2_normalized_tables",
@@ -2442,6 +2972,26 @@ async def handle_stream(
                 *readiness_degradation_reasons,
             ]
         )
+
+    def _clear_resolved_refinement_degradation() -> None:
+        if not accumulated_finals:
+            return
+        unresolved_refinement = any(
+            str(partial.get("text") or "").strip()
+            and str(partial.get("refinement_status") or "") != "refined"
+            and (
+                partial.get("final_source") == "online_terminal_partial"
+                or bool(partial.get("refinement_status"))
+            )
+            for partial in latest_partials.values()
+        )
+        if unresolved_refinement:
+            return
+        provider_metadata["degradation_reasons"] = [
+            reason
+            for reason in provider_metadata["degradation_reasons"]
+            if reason != "offline_refinement_unavailable"
+        ]
 
     def _close_audio_writer(*, interrupted: bool = False) -> None:
         nonlocal audio_asset, audio_writer
@@ -2857,10 +3407,16 @@ async def handle_stream(
             if msg.get("bytes") is not None:
                 pcm_payload = msg["bytes"]
                 try:
+                    chunk_ms = _float32_pcm_duration_ms(pcm_payload)
+                    pcm_rms = _float32_pcm_rms(pcm_payload)
                     audio_activity = _observe_audio_activity(pcm_payload)
                 except Float32PcmPayloadError as exc:
                     await _finish_invalid_audio_payload(exc)
                     return
+                stream_elapsed_ms += chunk_ms
+                segment_pcm_buffer.extend(pcm_payload)
+                if pcm_rms > VAD_SILENCE_RMS_THRESHOLD:
+                    segment_has_speech = True
                 if audio_activity is not None:
                     audio_activity.update(
                         _native_pcm_event_identity(msg.get("_native_pcm_frame"))
@@ -2874,17 +3430,14 @@ async def handle_stream(
                     native_frame=msg.get("_native_pcm_frame"),
                 )
                 for ev in events:
-                    source_ev = _normalize_client_stream_event(
-                        ev,
-                        l3_normalize_enabled=l3_normalize_enabled,
-                    )
+                    source_ev = _normalize_capture_event(ev)
                     source_ev.update(
                         _native_pcm_event_identity(msg.get("_native_pcm_frame"))
                     )
                     ev = (
                         _to_endpoint_partial(source_ev)
                         if source_ev.get("event_type") == "partial"
-                        and provider_metadata["provider"] == "funasr_realtime"
+                        and is_funasr_realtime
                         else source_ev
                     )
                     partial_hint = build_partial_hint_event(ev)
@@ -2895,16 +3448,39 @@ async def handle_stream(
                         sent_partial_hint_keys.add(partial_hint_key)
                         outgoing_events.append(partial_hint)
                     if ev.get("event_type") == "final" and ev.get("text"):
-                        if _append_accumulated_final(ev, getattr(recognizer, "_seq", len(accumulated_finals) + 1)):
-                            live_events = await _run_blocking(
-                                _upsert_and_commit_final,
-                                _current_session_streaming_events(),
-                                _current_degradation_reasons(),
+                        if is_funasr_realtime:
+                            # FunASR's terminal event is a model snapshot, not
+                            # a committed product final. Keep it visible only
+                            # as a replaceable partial until VAD refinement.
+                            ev = {
+                                **ev,
+                                "event_type": "partial",
+                                "authoritative": False,
+                                "partial_semantics": "terminal_snapshot",
+                                "final_source": "online_terminal_snapshot",
+                            }
+                            outgoing_events = [ev]
+                        else:
+                            appended_final = _append_accumulated_final(
                                 ev,
+                                getattr(recognizer, "_seq", len(accumulated_finals) + 1),
                             )
-                            outgoing_events.extend(_unsent_realtime_candidate_events(live_events))
-                        _clear_endpoint_candidate()
-                    else:
+                            if appended_final:
+                                live_events = await _run_blocking(
+                                    _upsert_and_commit_final,
+                                    _current_session_streaming_events(),
+                                    _current_degradation_reasons(),
+                                    ev,
+                                )
+                                outgoing_events.extend(_unsent_realtime_candidate_events(live_events))
+                            else:
+                                await _run_blocking(
+                                    _upsert_live_session,
+                                    _current_session_streaming_events(),
+                                    _current_degradation_reasons(),
+                                )
+                            _clear_endpoint_candidate()
+                    if ev.get("event_type") != "final":
                         if _remember_live_partial(ev):
                             live_events = await _run_blocking(
                                 _upsert_live_session,
@@ -2912,62 +3488,139 @@ async def handle_stream(
                                 _current_degradation_reasons(),
                             )
                             outgoing_events.extend(_unsent_realtime_candidate_events(live_events))
-                        _track_endpoint_candidate(source_ev, ev)
+                        _track_endpoint_candidate(
+                            ({**source_ev, "event_type": "partial"} if is_funasr_realtime else source_ev),
+                            ev,
+                        )
+                    elif is_funasr_realtime:
+                        # The terminal snapshot was converted to a partial for
+                        # transport. It is still a valid endpoint candidate,
+                        # but it must not be committed until refinement.
+                        _track_endpoint_candidate(
+                            {**source_ev, "event_type": "partial"},
+                            ev,
+                        )
                     for outgoing_event in outgoing_events:
                         await websocket.send_text(json.dumps(outgoing_event, ensure_ascii=False))
-                if _float32_pcm_rms(pcm_payload) <= VAD_SILENCE_RMS_THRESHOLD:
+                if pcm_rms <= VAD_SILENCE_RMS_THRESHOLD:
                     endpoint_silence_ms += chunk_ms
                 else:
                     endpoint_silence_ms = 0
-                endpoint_final = _maybe_vad_endpoint_final()
-                if endpoint_final is not None:
-                    endpoint_final = _normalize_client_stream_event(
-                        endpoint_final,
-                        l3_normalize_enabled=l3_normalize_enabled,
-                    )
-                    endpoint_final.update(_native_pcm_event_identity(last_native_frame))
-                    endpoint_outgoing_events = [endpoint_final]
-                    if _append_accumulated_final(
-                        endpoint_final, getattr(recognizer, "_seq", len(accumulated_finals) + 1)
-                    ):
-                        live_events = await _run_blocking(
-                            _upsert_and_commit_final,
+                endpoint_event = await _maybe_vad_endpoint_event()
+                if endpoint_event is not None:
+                    endpoint_event = _normalize_capture_event(endpoint_event)
+                    endpoint_event.update(_native_pcm_event_identity(last_native_frame))
+                    endpoint_outgoing_events = [endpoint_event]
+                    if endpoint_event.get("event_type") == "final":
+                        appended_final = _append_accumulated_final(
+                            endpoint_event,
+                            getattr(recognizer, "_seq", len(accumulated_finals) + 1),
+                        )
+                        if appended_final:
+                            live_events = await _run_blocking(
+                                _upsert_and_commit_final,
+                                _current_session_streaming_events(),
+                                _current_degradation_reasons(),
+                                endpoint_event,
+                            )
+                            endpoint_outgoing_events.extend(_unsent_realtime_candidate_events(live_events))
+                        else:
+                            await _run_blocking(
+                                _upsert_live_session,
+                                _current_session_streaming_events(),
+                                _current_degradation_reasons(),
+                            )
+                    elif endpoint_event.get("event_type") == "partial" and _remember_live_partial(endpoint_event):
+                        await _run_blocking(
+                            _upsert_live_session,
                             _current_session_streaming_events(),
                             _current_degradation_reasons(),
-                            endpoint_final,
                         )
-                        endpoint_outgoing_events.extend(_unsent_realtime_candidate_events(live_events))
                     for outgoing_event in endpoint_outgoing_events:
                         await websocket.send_text(json.dumps(outgoing_event, ensure_ascii=False))
                     _clear_endpoint_candidate()
+                    segment_pcm_buffer.clear()
+                    segment_has_speech = False
             elif msg.get("text") == "END":
                 await _run_blocking(_close_audio_writer)
                 final_events = await _run_blocking(recognizer.finalize)
                 finalization_started = True
+                pending_refinement_audio = segment_has_speech or (
+                    bool(segment_pcm_buffer) and not accumulated_finals
+                )
                 normalized_final_events: list[dict[str, Any]] = []
                 newly_appended_finals: list[dict[str, Any]] = []
                 for ev in final_events:
-                    ev = _normalize_client_stream_event(
-                        ev,
-                        l3_normalize_enabled=l3_normalize_enabled,
-                    )
+                    ev = _normalize_capture_event(ev)
                     ev.update(_native_pcm_event_identity(last_native_frame))
-                    if ev.get("event_type") == "final" and provider_metadata["provider"] == "funasr_realtime":
-                        source_text = str(ev.get("text") or "").strip()
+                    if is_funasr_realtime and ev.get("event_type") == "final":
+                        # FunASR may emit a terminal snapshot even after a VAD
+                        # endpoint already consumed and cleared the PCM. Do
+                        # not run the offline worker on an empty buffer and do
+                        # not turn that stale snapshot into a new partial.
+                        if not pending_refinement_audio:
+                            continue
+                        # END is a VAD boundary when the client stops without a
+                        # silence tail. Refine the remaining raw segment once,
+                        # then expose the terminal model snapshot only as a
+                        # non-authoritative partial if refinement is missing.
+                        refinement = await _run_blocking(refine_pcm_f32, bytes(segment_pcm_buffer))
+                        fallback_text = str(ev.get("text") or "").strip()
+                        candidate_refined_text = refinement.text.strip()
+                        rejected_short_text = bool(
+                            refinement.authoritative
+                            and candidate_refined_text
+                            and not _is_meaningful_authoritative_final(candidate_refined_text)
+                        )
+                        authoritative = refinement.authoritative and not rejected_short_text
+                        refined_text = (candidate_refined_text or fallback_text) if authoritative else fallback_text
+                        refinement_status = "rejected_short_text" if rejected_short_text else refinement.status
+                        refinement_reason = (
+                            "offline_refinement_text_too_short" if rejected_short_text else refinement.reason
+                        )
+                        ev = {
+                            **ev,
+                            "event_type": "final" if authoritative else "partial",
+                            "text": refined_text,
+                            "source_snapshot_text": fallback_text,
+                            "authoritative": authoritative,
+                            "final_source": "local_offline_refinement" if authoritative else "online_terminal_partial",
+                            "refinement_status": refinement_status,
+                            **({"refinement_model_id": refinement.model_id} if refinement.model_id else {}),
+                            **({"refinement_reason": refinement_reason} if refinement_reason else {}),
+                            **(
+                                {"partial_semantics": "terminal_snapshot"}
+                                if not authoritative
+                                else {}
+                            ),
+                        }
+                        if not authoritative:
+                            provider_metadata["degradation_reasons"].append(
+                                "offline_refinement_unavailable"
+                                if not refinement.authoritative
+                                else "offline_refinement_text_too_short"
+                            )
+                        segment_pcm_buffer.clear()
+                    if ev.get("event_type") == "final" and is_funasr_realtime:
+                        source_text = str(ev.get("source_snapshot_text") or ev.get("text") or "").strip()
+                        refined_text = str(ev.get("text") or "").strip()
                         source_segment_id = _funasr_source_segment_id(session_id, ev)
-                        incremental_text, projection_reconciled = _incremental_endpoint_projection(source_text)
-                        if not incremental_text:
+                        if not refined_text:
                             continue
                         endpoint_final_count += 1
-                        end_ms = int(ev.get("end_ms") or getattr(recognizer, "_seq", 0) * chunk_ms)
+                        end_ms = max(
+                            endpoint_committed_end_ms,
+                            int(ev.get("end_ms") or 0),
+                            _current_stream_end_ms(),
+                        )
                         ev = {
                             **ev,
                             "segment_id": f"vad_endpoint_{endpoint_final_count:03d}",
                             **({"source_segment_id": source_segment_id} if source_segment_id else {}),
                             "source_snapshot_text": source_text,
-                            "text": incremental_text,
-                            "normalized_text": _stream_normalized_text(incremental_text),
-                            "projection_reconciled": projection_reconciled,
+                            "text": refined_text,
+                            "normalized_text": _stream_normalized_text(refined_text),
+                            "projection_reconciled": False,
                             "start_ms": endpoint_committed_end_ms,
                             "end_ms": end_ms,
                         }
@@ -2982,6 +3635,147 @@ async def handle_stream(
                             saw_empty_final = True
                     elif ev.get("event_type") == "partial":
                         _remember_live_partial(ev)
+                if is_funasr_realtime and not endpoint_candidate:
+                    # A reconnect may carry only the persisted online snapshot;
+                    # restore it as a replaceable endpoint candidate so END can
+                    # still run offline refinement over the recorded PCM.
+                    restored_partial = (
+                        next(reversed(latest_partials.values()), None)
+                        if latest_partials
+                        else None
+                    )
+                    if restored_partial is None:
+                        for persisted_event in reversed(list(existing_record.get("events") or [])):
+                            if persisted_event.get("event_type") not in {"transcript_partial", "transcript_final"}:
+                                continue
+                            payload = dict(persisted_event.get("payload") or {})
+                            if str(payload.get("text") or payload.get("source_snapshot_text") or "").strip():
+                                restored_partial = payload
+                                restored_partial.setdefault("event_type", "partial")
+                                break
+                    if restored_partial is None:
+                        restored_partial = {}
+                    restored_text = str(restored_partial.get("text") or "").strip()
+                    restored_source_text = str(
+                        restored_partial.get("source_snapshot_text") or restored_text
+                    ).strip()
+                    if restored_text:
+                        endpoint_candidate = {
+                            "text": restored_text,
+                            "source_text": restored_source_text,
+                            "segment_id": str(restored_partial.get("segment_id") or _next_endpoint_segment_id()),
+                            "start_ms": int(restored_partial.get("start_ms") or endpoint_committed_end_ms),
+                            "end_ms": int(restored_partial.get("end_ms") or _current_stream_end_ms()),
+                            "confidence": restored_partial.get("confidence", 0.8),
+                            **(
+                                {"source_segment_id": restored_partial["source_segment_id"]}
+                                if restored_partial.get("source_segment_id")
+                                else {}
+                            ),
+                            "projection_reconciled": bool(restored_partial.get("projection_reconciled")),
+                        }
+                if (
+                    is_funasr_realtime
+                    and pending_refinement_audio
+                    and not normalized_final_events
+                    and endpoint_candidate.get("text")
+                ):
+                    # The resident worker deliberately emits no authoritative
+                    # terminal event. END is therefore the final boundary for
+                    # any speech not already closed by VAD silence.
+                    refinement = await _run_blocking(refine_pcm_f32, bytes(segment_pcm_buffer))
+                    fallback_text = str(endpoint_candidate.get("text") or "").strip()
+                    candidate_refined_text = refinement.text.strip()
+                    rejected_short_text = bool(
+                        refinement.authoritative
+                        and candidate_refined_text
+                        and not _is_meaningful_authoritative_final(candidate_refined_text)
+                    )
+                    authoritative = refinement.authoritative and not rejected_short_text
+                    final_text = (candidate_refined_text or fallback_text) if authoritative else fallback_text
+                    refinement_status = "rejected_short_text" if rejected_short_text else refinement.status
+                    refinement_reason = (
+                        "offline_refinement_text_too_short" if rejected_short_text else refinement.reason
+                    )
+                    if authoritative:
+                        endpoint_final_count += 1
+                    end_ms = max(
+                        endpoint_committed_end_ms,
+                        int(endpoint_candidate.get("end_ms") or 0),
+                        _current_stream_end_ms(),
+                    )
+                    terminal_event = {
+                        "event_type": "final" if authoritative else "partial",
+                        "segment_id": str(
+                            endpoint_candidate.get("segment_id")
+                            or _next_endpoint_segment_id()
+                        ),
+                        "text": final_text,
+                        "normalized_text": _stream_normalized_text(final_text),
+                        "start_ms": int(endpoint_candidate.get("start_ms") or endpoint_committed_end_ms),
+                        "end_ms": end_ms,
+                        "received_at_ms": end_ms,
+                        "confidence": 0.92 if authoritative else endpoint_candidate.get("confidence", 0.8),
+                        "authoritative": authoritative,
+                        "final_source": "local_offline_refinement" if authoritative else "online_terminal_partial",
+                        "refinement_status": refinement_status,
+                        **({"refinement_model_id": refinement.model_id} if refinement.model_id else {}),
+                        **({"refinement_reason": refinement_reason} if refinement_reason else {}),
+                        "endpoint_source": "end_of_stream_offline_refined" if authoritative else "end_of_stream_refinement_unavailable",
+                        **(
+                            {"partial_semantics": "terminal_snapshot"}
+                            if not authoritative
+                            else {}
+                        ),
+                        "source_snapshot_text": str(endpoint_candidate.get("source_text") or fallback_text),
+                        **(
+                            {"source_segment_id": endpoint_candidate["source_segment_id"]}
+                            if endpoint_candidate.get("source_segment_id")
+                            else {}
+                        ),
+                    }
+                    normalized_final_events.append(terminal_event)
+                    if authoritative:
+                        source_snapshot = str(terminal_event.get("source_snapshot_text") or "").strip()
+                        replaced_existing = False
+                        if source_snapshot:
+                            for index, existing_final in enumerate(accumulated_finals):
+                                existing_source = str(existing_final.get("source_snapshot_text") or "").strip()
+                                if existing_source and existing_source == source_snapshot:
+                                    terminal_event = {
+                                        **terminal_event,
+                                        "segment_id": str(
+                                            existing_final.get("segment_id")
+                                            or terminal_event["segment_id"]
+                                        ),
+                                    }
+                                    accumulated_finals[index] = _to_streaming_final(
+                                        terminal_event,
+                                        getattr(recognizer, "_seq", 0) + 1,
+                                    )
+                                    replaced_existing = True
+                                    break
+                        if not replaced_existing and _append_accumulated_final(
+                            terminal_event,
+                            getattr(recognizer, "_seq", 0) + 1,
+                        ):
+                            newly_appended_finals.append(terminal_event)
+                    else:
+                        _remember_live_partial(terminal_event)
+                    endpoint_candidate = {}
+                    if not authoritative:
+                        provider_metadata["degradation_reasons"].append(
+                            "offline_refinement_unavailable"
+                            if not refinement.authoritative
+                            else "offline_refinement_text_too_short"
+                        )
+                    segment_pcm_buffer.clear()
+                if is_funasr_realtime and not pending_refinement_audio and accumulated_finals:
+                    # Any remaining online partial is a terminal snapshot for
+                    # audio already committed by the authoritative endpoint.
+                    # Keeping it would surface a duplicate active tail.
+                    latest_partials.clear()
+                _clear_resolved_refinement_degradation()
                 finalize_candidate_events: list[dict[str, Any]] = []
                 if asr_live_repo is not None and accumulated_finals:
                     try:
@@ -3007,8 +3801,8 @@ async def handle_stream(
                             degradation_reasons.append("asr_no_final")
                     end_of_stream = {
                         "event_type": "end_of_stream",
-                        "end_ms": getattr(recognizer, "_seq", 0) * chunk_ms,
-                        "received_at_ms": getattr(recognizer, "_seq", 0) * chunk_ms,
+                        "end_ms": _current_stream_end_ms(),
+                        "received_at_ms": _current_stream_end_ms(),
                         **_native_pcm_event_identity(last_native_frame),
                     }
                     streaming_events = [*_current_session_streaming_events(), end_of_stream]
@@ -3031,12 +3825,6 @@ async def handle_stream(
                 return
     except (Exception, AsyncCancelledError) as exc:
         await _abort_diarization()
-        abort = getattr(recognizer, "abort", None)
-        if callable(abort):
-            try:
-                await _run_blocking(abort)
-            except Exception as abort_exc:
-                _log.warning("asr.stream.abort_failed", session_id=session_id, error=str(abort_exc))
         if audio_writer is not None:
             try:
                 await _run_blocking(_close_audio_writer, interrupted=True)
@@ -3046,13 +3834,36 @@ async def handle_stream(
                     session_id=session_id,
                     error=str(audio_exc),
                 )
+        if not finalization_started:
+            try:
+                await _run_blocking(_backfill_interrupted_tail)
+            except Exception as backfill_exc:
+                provider_metadata["degradation_reasons"].append("offline_refinement_unavailable")
+                interrupted_backfill_state = {
+                    **interrupted_backfill_state,
+                    "schema_version": "transcript_backfill.v1",
+                    "status": "failed",
+                    "error_class": type(backfill_exc).__name__,
+                    "updated_at_ms": time.time_ns() // 1_000_000,
+                }
+                _log.warning(
+                    "asr.stream.interrupted_tail_backfill_failed",
+                    session_id=session_id,
+                    error_class=type(backfill_exc).__name__,
+                )
+        abort = getattr(recognizer, "abort", None)
+        if callable(abort):
+            try:
+                await _run_blocking(abort)
+            except Exception as abort_exc:
+                _log.warning("asr.stream.abort_failed", session_id=session_id, error=str(abort_exc))
         if asr_live_repo is not None:
             try:
                 if finalization_started:
                     end_of_stream = {
                         "event_type": "end_of_stream",
-                        "end_ms": getattr(recognizer, "_seq", 0) * chunk_ms,
-                        "received_at_ms": getattr(recognizer, "_seq", 0) * chunk_ms,
+                        "end_ms": _current_stream_end_ms(),
+                        "received_at_ms": _current_stream_end_ms(),
                     }
                     await _run_blocking(
                         _upsert_live_session,
@@ -3125,6 +3936,7 @@ def _recognizer_provider_metadata(recognizer: StreamRecognizer, *, configured_pr
         provider_mode = "unknown"
     runtime_profile = {
         "profile": str(getattr(recognizer, "asr_profile", "") or ""),
+        "inference_engine": str(getattr(recognizer, "inference_engine", "") or ""),
         "chunk_size": list(getattr(recognizer, "chunk_size", []) or []),
     }
     runtime_profile = {key: value for key, value in runtime_profile.items() if value}
@@ -3152,7 +3964,14 @@ def _float32_pcm_rms(payload: bytes) -> float:
     return (total / count) ** 0.5
 
 
+def _float32_pcm_duration_ms(payload: bytes) -> float:
+    usable = validate_float32_pcm_payload(payload)
+    return (len(usable) / 4) * 1_000 / 16_000
+
+
 def _should_queue_stable_partial_candidate(text: str, ev: dict[str, Any]) -> bool:
+    if ev.get("authoritative") is False:
+        return False
     compact_text = _compact_text(text)
     if len(compact_text) < STABLE_PARTIAL_CANDIDATE_MIN_CHARS:
         return False

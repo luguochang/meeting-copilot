@@ -1,7 +1,7 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, within, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
-import type { SemanticParagraph, TranscriptSegment } from "../../domain/events";
+import type { MeetingSpeaker, SemanticParagraph, TranscriptSegment } from "../../domain/events";
 import { TranscriptPane } from "./TranscriptPane";
 
 function segment(
@@ -34,7 +34,63 @@ const baseProps = {
   connection: "live",
 };
 
+function meetingSpeaker(
+  speakerId: string,
+  speakerLabel: string,
+  labelSource: "auto" | "user" = "auto",
+): MeetingSpeaker {
+  return {
+    meetingId: "meeting-transcript",
+    speakerId,
+    speakerLabel,
+    labelSource,
+    labelLocked: labelSource === "user",
+    ordinal: 1,
+    createdAtMs: 1,
+    updatedAtMs: 1,
+  };
+}
+
 describe("TranscriptPane", () => {
+  it("shows a floating selection toolbar and preserves the selected evidence scope", async () => {
+    const onSelectionChange = vi.fn();
+    const onAskSelection = vi.fn();
+    const onSaveSelection = vi.fn();
+    render(
+      <TranscriptPane
+        {...baseProps}
+        onSelectionChange={onSelectionChange}
+        onAskSelection={onAskSelection}
+        onSaveSelection={onSaveSelection}
+        segments={[segment("s1", 1, "先确认发布窗口和负责人。", 0, 2_000)]}
+      />,
+    );
+
+    const paragraph = screen.getByText("先确认发布窗口和负责人。", { selector: "p" });
+    const textNode = paragraph.firstChild;
+    expect(textNode).toBeTruthy();
+    const range = document.createRange();
+    range.setStart(textNode!, 0);
+    range.setEnd(textNode!, 7);
+    const browserSelection = window.getSelection();
+    browserSelection?.removeAllRanges();
+    browserSelection?.addRange(range);
+    fireEvent.pointerUp(screen.getByTestId("transcript-scroll"));
+
+    expect(await screen.findByRole("toolbar", { name: "选中文字操作" })).toBeVisible();
+    expect(onSelectionChange).toHaveBeenCalledWith({
+      text: "先确认发布窗口",
+      segmentIds: ["s1"],
+    });
+    fireEvent.click(screen.getByRole("button", { name: "保存到笔记" }));
+    expect(onSaveSelection).toHaveBeenCalledWith({ text: "先确认发布窗口", segmentIds: ["s1"] });
+    fireEvent.click(screen.getByRole("button", { name: "提炼行动项" }));
+    await waitFor(() => expect(onAskSelection).toHaveBeenCalledWith(
+      { text: "先确认发布窗口", segmentIds: ["s1"] },
+      "extract_action_items",
+    ));
+  });
+
   it("assembles adjacent ASR checkpoints into readable natural paragraphs without repeating text", () => {
     render(
       <TranscriptPane
@@ -42,7 +98,7 @@ describe("TranscriptPane", () => {
         segments={[
           segment("s1", 1, "我们先确认发布范围，", 0, 2_000),
           segment("s2", 2, "然后安排灰度和回滚负责人。", 2_500, 5_000),
-          segment("s3", 3, "第二个议题是数据库迁移。", 8_000, 10_000),
+          segment("s3", 3, "第二个议题是数据库迁移。", 9_000, 11_000),
         ]}
       />,
     );
@@ -52,6 +108,62 @@ describe("TranscriptPane", () => {
     expect(paragraphs[0]).toHaveTextContent("我们先确认发布范围，然后安排灰度和回滚负责人。");
     expect(screen.getAllByText(/灰度和回滚负责人/)).toHaveLength(1);
     expect(paragraphs[1]).toHaveTextContent("第二个议题是数据库迁移。");
+  });
+
+  it("groups thirty seconds of uninterrupted speech in the only reading projection", () => {
+    render(
+      <TranscriptPane
+        {...baseProps}
+        segments={[
+          segment("s1", 1, "我们先确认本次发布范围和主要负责人。", 0, 15_000),
+          segment("s2", 2, "接下来讨论灰度指标以及异常时的回滚动作。", 15_000, 30_000),
+        ]}
+      />,
+    );
+
+    expect(document.querySelectorAll(".transcript-segment")).toHaveLength(1);
+    expect(screen.getByText(/我们先确认本次发布范围.*接下来讨论灰度指标/)).toBeVisible();
+    expect(screen.queryByRole("button", { name: "逐句" })).not.toBeInTheDocument();
+  });
+
+  it("does not turn dense fifteen second checkpoints into singleton reading blocks", () => {
+    render(
+      <TranscriptPane
+        {...baseProps}
+        segments={[
+          segment("s1", 1, "先说明当前问题。接着补充原因。最后说明影响。", 0, 15_000),
+          segment("s2", 2, "继续讨论解决路径。然后确认约束。最后给出下一步。", 15_000, 30_000),
+          segment("s3", 3, "第二个议题先说明背景。接着讨论风险。最后等待确认。", 30_000, 45_000),
+        ]}
+      />,
+    );
+
+    const paragraphs = document.querySelectorAll(".transcript-segment");
+    expect(paragraphs).toHaveLength(2);
+    expect(paragraphs[0]).toHaveTextContent("先说明当前问题");
+    expect(paragraphs[0]).toHaveTextContent("继续讨论解决路径");
+    expect(paragraphs[1]).toHaveTextContent("第二个议题先说明背景");
+  });
+
+  it("states that pending correction is showing raw recognition when AI is unavailable", () => {
+    render(
+      <TranscriptPane
+        {...baseProps}
+        segments={[{
+          ...segment("s1", 1, "原始识别文字", 0, 2_000),
+          correctionStatus: "pending",
+        }]}
+        aiIndicator={{
+          state: "paused",
+          label: "AI 已暂停",
+          level: null,
+          detail: "LLM Provider 不可用，实时理解已暂停",
+        }}
+      />,
+    );
+
+    expect(screen.getByText("识别原文")).toBeVisible();
+    expect(screen.queryByText("等待校对")).not.toBeInTheDocument();
   });
 
   it("uses durable semantic paragraphs as the single visible transcript projection", () => {
@@ -77,7 +189,7 @@ describe("TranscriptPane", () => {
     expect(document.querySelectorAll(".transcript-segment")).toHaveLength(1);
     expect(screen.getByText("先灰度百分之五，再观察错误率。")).toBeVisible();
     expect(screen.queryByText("原始第一段")).not.toBeInTheDocument();
-    expect(screen.getByText("AI 已校正")).toBeVisible();
+    expect(screen.getByText("已校对")).toBeVisible();
   });
 
   it("does not repeat an active partial already covered by a 45 second durable paragraph", () => {
@@ -119,7 +231,8 @@ describe("TranscriptPane", () => {
     expect(document.querySelector(".active-partial")).not.toBeInTheDocument();
   });
 
-  it("keeps different speakers in separate paragraphs and only hints at low confidence", () => {
+  it("keeps automatic speaker labels hidden until the user enables the experimental view", async () => {
+    const user = userEvent.setup();
     render(
       <TranscriptPane
         {...baseProps}
@@ -137,13 +250,21 @@ describe("TranscriptPane", () => {
             speakerConfidence: 0.52,
           },
         ]}
+        speakers={[
+          meetingSpeaker("cluster-a", "Speaker 1"),
+          { ...meetingSpeaker("cluster-b", "Speaker 2"), ordinal: 2 },
+        ]}
       />,
     );
 
-    expect(document.querySelectorAll(".transcript-segment")).toHaveLength(2);
+    expect(document.querySelectorAll(".transcript-segment")).toHaveLength(1);
+    expect(screen.queryByText("Speaker 1")).not.toBeInTheDocument();
+    expect(screen.queryByText("Speaker 2")).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("checkbox", { name: "实验说话人" }));
     expect(screen.getByText("Speaker 1")).toBeVisible();
     expect(screen.getByText("Speaker 2")).toBeVisible();
-    expect(screen.getByLabelText("说话人区分置信度较低")).toBeVisible();
+    expect(screen.getByLabelText("自动说话人置信度较低")).toBeVisible();
     expect(screen.queryByText(/张工|李工|真实姓名/)).not.toBeInTheDocument();
   });
 
@@ -171,7 +292,12 @@ describe("TranscriptPane", () => {
       updatedAtMs: 2_000,
     }];
     const { rerender } = render(
-      <TranscriptPane {...baseProps} segments={[original]} semanticParagraphs={paragraphs} />,
+      <TranscriptPane
+        {...baseProps}
+        segments={[original]}
+        semanticParagraphs={paragraphs}
+        speakers={[meetingSpeaker("speaker-a", "发言人 1", "user")]}
+      />,
     );
 
     rerender(
@@ -185,6 +311,7 @@ describe("TranscriptPane", () => {
           speakerAttributionRevision: 2,
         }]}
         semanticParagraphs={paragraphs}
+        speakers={[meetingSpeaker("speaker-b", "发言人 2", "user")]}
       />,
     );
 
@@ -249,11 +376,13 @@ describe("TranscriptPane", () => {
           speakerLabel: "Speaker 1",
           speakerConfidence: 0.9,
         }]}
+        speakers={[meetingSpeaker("cluster-a", "Speaker 1")]}
         onRenameSpeaker={onRenameSpeaker}
         onSeekAudio={onSeekAudio}
       />,
     );
 
+    await user.click(screen.getByRole("checkbox", { name: "实验说话人" }));
     await user.click(screen.getByRole("button", { name: "Speaker 1" }));
     const input = screen.getByRole("textbox", { name: "重命名 Speaker 1" });
     await user.clear(input);
@@ -269,7 +398,7 @@ describe("TranscriptPane", () => {
     const user = userEvent.setup();
     const initial = [
       segment("s1", 1, "第一段", 0, 1_000),
-      segment("s2", 2, "第二段", 4_000, 5_000),
+      segment("s2", 2, "第二段", 5_000, 6_000),
     ];
     const { rerender } = render(<TranscriptPane {...baseProps} segments={initial} />);
     const scroll = screen.getByTestId("transcript-scroll");
@@ -283,7 +412,7 @@ describe("TranscriptPane", () => {
     rerender(
       <TranscriptPane
         {...baseProps}
-        segments={[...initial, segment("s3", 3, "第三段新内容", 8_000, 9_000)]}
+        segments={[...initial, segment("s3", 3, "第三段新内容", 10_000, 11_000)]}
       />,
     );
 
@@ -294,5 +423,25 @@ describe("TranscriptPane", () => {
     await user.click(notice);
     expect(scroll.scrollTop).toBe(1_000);
     expect(within(scroll).queryByTestId("transcript-new-content")).not.toBeInTheDocument();
+  });
+
+  it("bounds a simulated one-hour meeting while search still finds an older loaded segment", () => {
+    const segments = Array.from({ length: 1_200 }, (_, index) => segment(
+      `long-${index + 1}`,
+      index + 1,
+      index === 20 ? "需要回看较早的容量结论" : `会议记录 ${index + 1}`,
+      index * 3_000,
+      index * 3_000 + 1_000,
+    ));
+    render(<TranscriptPane {...baseProps} segments={segments} mergeSegments={false} />);
+
+    expect(document.querySelectorAll(".transcript-segment")).toHaveLength(500);
+    expect(screen.getByText(/较早的 700 段已折叠/)).toBeVisible();
+
+    fireEvent.change(screen.getByRole("textbox", { name: "搜索会议文字" }), {
+      target: { value: "容量结论" },
+    });
+    expect(screen.getByText("需要回看较早的容量结论")).toBeVisible();
+    expect(document.querySelectorAll(".transcript-segment")).toHaveLength(1);
   });
 });

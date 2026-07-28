@@ -823,6 +823,8 @@ def build_approach_cards(
             {"role": "user", "content": transcript_text},
         ],
         "temperature": 0,
+        "reasoning_effort": "low",
+        "max_completion_tokens": 768,
     }
     headers = {
         "Authorization": f"Bearer {config.api_key}",
@@ -891,7 +893,10 @@ _MINUTES_SYSTEM_PROMPT = (
     "你是中文技术会议纪要生成器。基于转写，输出结构化纪要 JSON："
     "{\"background\": str, \"decisions\": [str], \"action_items\": [{\"item\":str,\"owner\":str,\"deadline\":str}], "
     "\"risks\": [str], \"open_questions\": [str], \"evidence_quotes\": [str]}。"
-    "evidence_quotes 必须来自转写原文。未确认的标'待确认'。禁止编造。无内容时返回空数组。"
+    "evidence_quotes 必须来自转写原文。输入可能包含 ASR 错字、同音字和断句错误；"
+    "如果负责人姓名只以孤立短句出现，或与相邻句语义断裂，不要猜测或直接确认为真实姓名，"
+    "owner 填'待确认'，并在 open_questions 中说明需要核对原音。"
+    "其他未确认信息也标'待确认'。禁止编造。无内容时返回空数组。"
 )
 
 
@@ -999,6 +1004,8 @@ def build_minutes_json(
             {"role": "user", "content": transcript_text},
         ],
         "temperature": 0,
+        "reasoning_effort": "low",
+        "max_completion_tokens": 1_024,
     }
     headers = {"Authorization": f"Bearer {config.api_key}", "Content-Type": "application/json"}
     url = f"{config.base_url}/v1/chat/completions"

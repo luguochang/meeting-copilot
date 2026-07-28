@@ -1,7 +1,5 @@
 use crate::desktop_backend_supervisor::{BackendSupervisor, BackendWebSocketConnection};
-use crate::private_storage::{
-    ensure_private_directory, harden_private_file, open_private_file,
-};
+use crate::private_storage::{ensure_private_directory, harden_private_file, open_private_file};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -1090,9 +1088,8 @@ impl SystemAudioCaptureSupervisor {
         errors: Vec<String>,
     ) -> SystemAudioCaptureResponse {
         let writes_local_metadata = ready_file.is_some();
-        let captures_audio = process_captures_audio
-            && readiness.transport_ready
-            && readiness.pcm_seen;
+        let captures_audio =
+            process_captures_audio && readiness.transport_ready && readiness.pcm_seen;
         SystemAudioCaptureResponse {
             command_id,
             command_status,
@@ -1282,10 +1279,8 @@ fn collect_stdout_events(
                 }
                 "asr_starting" => current.asr_ready = false,
                 "asr_ready" => {
-                    current.asr_ready = object
-                        .get("ready")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(true);
+                    current.asr_ready =
+                        object.get("ready").and_then(Value::as_bool).unwrap_or(true);
                 }
                 "end_of_stream" => current.asr_ready = false,
                 _ => {}
@@ -1342,11 +1337,7 @@ fn unix_timestamp_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn health_status(
-    status: &str,
-    running: bool,
-    readiness: CaptureReadiness,
-) -> &'static str {
+fn health_status(status: &str, running: bool, readiness: CaptureReadiness) -> &'static str {
     if running && matches!(status, "recording" | "paused") {
         if !readiness.transport_ready || !readiness.pcm_seen {
             "starting"
@@ -1557,18 +1548,16 @@ while :; do sleep 1; done
 
     #[test]
     fn connection_is_rewritten_to_named_loopback_system_audio_source() {
-        let connection = system_audio_connection(
-            &backend("http://127.0.0.1:8765"),
-            "meeting_01",
-            7,
-        )
-        .unwrap();
+        let connection =
+            system_audio_connection(&backend("http://127.0.0.1:8765"), "meeting_01", 7).unwrap();
         assert_eq!(
             connection.url,
             "ws://127.0.0.1:8765/live/asr/stream/ws/meeting_01?audio_source=tauri_system_audio&pcm_protocol=native_pcm_v2&capture_epoch=7"
         );
         assert!(system_audio_connection(&backend("https://example.com"), "meeting_01", 7).is_err());
-        assert!(system_audio_connection(&backend("http://127.0.0.1:8765"), "meeting_01", 0).is_err());
+        assert!(
+            system_audio_connection(&backend("http://127.0.0.1:8765"), "meeting_01", 0).is_err()
+        );
     }
 
     #[test]

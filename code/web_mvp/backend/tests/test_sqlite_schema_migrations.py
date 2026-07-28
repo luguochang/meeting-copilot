@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 import stat
 import subprocess
@@ -134,7 +135,8 @@ def test_sequential_migrations_create_verified_backup_history_and_are_idempotent
     backup_path = result.backup_path
     backup_stat = backup_path.lstat()
     assert stat.S_ISREG(backup_stat.st_mode)
-    assert stat.S_IMODE(backup_stat.st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(backup_stat.st_mode) == 0o600
     with sqlite3.connect(backup_path) as backup:
         assert backup.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
         assert int(backup.execute("PRAGMA user_version").fetchone()[0]) == 0
@@ -237,7 +239,8 @@ def test_failpoint_rolls_back_all_steps_and_keeps_complete_backup(tmp_path: Path
     assert len(backups) == 1
     backup_stat = backups[0].lstat()
     assert stat.S_ISREG(backup_stat.st_mode)
-    assert stat.S_IMODE(backup_stat.st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(backup_stat.st_mode) == 0o600
     with sqlite3.connect(backups[0]) as backup:
         assert backup.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
         assert int(backup.execute("PRAGMA user_version").fetchone()[0]) == 0
@@ -261,7 +264,8 @@ def test_public_migration_lock_is_reentrant_and_owner_only(tmp_path: Path) -> No
         ):
             lock_stat = lock_path.lstat()
             assert stat.S_ISREG(lock_stat.st_mode)
-            assert stat.S_IMODE(lock_stat.st_mode) == 0o600
+            if os.name != "nt":
+                assert stat.S_IMODE(lock_stat.st_mode) == 0o600
         child = subprocess.run(
             [
                 sys.executable,

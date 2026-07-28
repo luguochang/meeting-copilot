@@ -307,6 +307,24 @@ function microphoneController(
 }
 
 describe("LiveMeetingWorkbench", () => {
+  it("shows recording, ASR, refinement, speaker, LLM and task states independently", async () => {
+    const { api, transport } = dependencies();
+    render(
+      <LiveMeetingWorkbench
+        meetingId="meeting-1"
+        api={api}
+        transport={transport}
+        microphoneController={microphoneController()}
+      />,
+    );
+
+    const statuses = await screen.findByLabelText("会议运行状态");
+    for (const label of ["录音", "声音", "ASR", "精修", "说话人", "LLM", "任务"]) {
+      expect(within(statuses).getByText(label)).toBeVisible();
+    }
+    expect(within(statuses).queryByText("AI")).not.toBeInTheDocument();
+  });
+
   it("loads, renames, and refreshes a stable speaker through the shared live transcript", async () => {
     const user = userEvent.setup();
     const { api, transport } = dependencies();
@@ -316,6 +334,8 @@ describe("LiveMeetingWorkbench", () => {
         ...segment,
         speakerId: "cluster-a",
         speakerLabel: "Speaker 1",
+        labelSource: "auto" as const,
+        labelLocked: false,
         speakerConfidence: 0.91,
       })),
     };
@@ -326,6 +346,8 @@ describe("LiveMeetingWorkbench", () => {
         meetingId: "meeting-1",
         speakerId: "cluster-a",
         speakerLabel: "Speaker 1",
+        labelSource: "auto" as const,
+        labelLocked: false,
         ordinal: 1,
         createdAtMs: 1_000,
         updatedAtMs: 1_000,
@@ -334,6 +356,8 @@ describe("LiveMeetingWorkbench", () => {
         meetingId: "meeting-1",
         speakerId: "cluster-a",
         speakerLabel: "张工",
+        labelSource: "user" as const,
+        labelLocked: true,
         ordinal: 1,
         createdAtMs: 1_000,
         updatedAtMs: 2_000,
@@ -341,7 +365,8 @@ describe("LiveMeetingWorkbench", () => {
 
     render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} />);
 
-    await user.click(await screen.findByRole("button", { name: "Speaker 1" }));
+    await user.click(await screen.findByRole("checkbox", { name: "实验说话人" }));
+    await user.click(screen.getByRole("button", { name: "Speaker 1" }));
     const input = screen.getByRole("textbox", { name: "重命名 Speaker 1" });
     await user.clear(input);
     await user.type(input, "张工");
@@ -408,10 +433,14 @@ describe("LiveMeetingWorkbench", () => {
     const user = userEvent.setup();
     const { api, transport } = dependencies();
     const microphone = microphoneController();
-    const onCreateMeeting = vi.fn(() => "rec_new_meeting");
     const order: string[] = [];
+    const onCreateMeeting = vi.fn(() => "rec_new_meeting");
+    const onOpenMeeting = vi.fn(() => order.push("meeting-opened"));
     vi.mocked(api.createMeeting).mockImplementation(async () => {
       order.push("meeting-created");
+    });
+    vi.mocked(api.saveMeetingPreparation).mockImplementation(async () => {
+      order.push("preparation-saved");
     });
     vi.mocked(microphone.start).mockImplementation(async () => {
       order.push("microphone-started");
@@ -424,6 +453,7 @@ describe("LiveMeetingWorkbench", () => {
         transport={transport}
         microphoneController={microphone}
         onCreateMeeting={onCreateMeeting}
+        onOpenMeeting={onOpenMeeting}
       />,
     );
 
@@ -443,7 +473,8 @@ describe("LiveMeetingWorkbench", () => {
       inputDeviceId: "mic-1",
       inputSource: "microphone",
     });
-    expect(order).toEqual(["meeting-created", "microphone-started"]);
+    expect(onOpenMeeting).toHaveBeenCalledWith("rec_new_meeting");
+    expect(order).toEqual(["meeting-created", "preparation-saved", "meeting-opened", "microphone-started"]);
   });
 
   it("passes the packaged system-audio selection to the single capture owner", async () => {
@@ -642,14 +673,23 @@ describe("LiveMeetingWorkbench", () => {
 
   it("shows the complete live projection and exactly one end-meeting command", async () => {
     const { api, transport } = dependencies();
-    render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} />);
+    const onBackToMeetings = vi.fn();
+    render(
+      <LiveMeetingWorkbench
+        meetingId="meeting-1"
+        api={api}
+        transport={transport}
+        onBackToMeetings={onBackToMeetings}
+      />,
+    );
 
     expect(await screen.findByText("支付服务周五上线，但是负责人还没确定。")).toBeVisible();
     expect(screen.getByText("回滚窗口我们还需要再确认")).toBeVisible();
     expect(screen.getByText("支付服务上线安排")).toBeVisible();
     expect(screen.getByText("谁负责本次上线，并在什么条件下执行回滚？")).toBeVisible();
     expect(screen.getByText("上线负责人是谁？")).toBeVisible();
-    expect(screen.getByText("AI 已校正")).toBeVisible();
+    expect(screen.getByText("已校对")).toBeVisible();
+    expect(screen.getByRole("button", { name: "返回会议列表" })).toBeVisible();
     expect(screen.getAllByRole("button", { name: "结束并整理" })).toHaveLength(1);
   });
 
@@ -684,7 +724,7 @@ describe("LiveMeetingWorkbench", () => {
     render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} />);
 
     expect(await screen.findByText("支付服务周五上线，但是负责人还没确定。")).toBeVisible();
-    expect(screen.queryByText("AI 已校正")).not.toBeInTheDocument();
+    expect(screen.queryByText("已校对")).not.toBeInTheDocument();
   });
 
   it("uses correction status instead of semantic paragraph revision for AI labels", async () => {
@@ -713,11 +753,11 @@ describe("LiveMeetingWorkbench", () => {
 
     render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} />);
 
-    expect(await screen.findByText("已检查，无需修改")).toBeVisible();
-    expect(screen.queryByText("AI 已校正")).not.toBeInTheDocument();
+    expect(await screen.findByText("无需校对")).toBeVisible();
+    expect(screen.queryByText("已校对")).not.toBeInTheDocument();
   });
 
-  it("shows a real correction before/after comparison", async () => {
+  it("shows one compact corrected paragraph without repeating the raw recognition", async () => {
     const user = userEvent.setup();
     const { api, transport } = dependencies();
     const snapshot = realSnapshot();
@@ -733,13 +773,14 @@ describe("LiveMeetingWorkbench", () => {
 
     render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} />);
 
-    await user.click(await screen.findByText("查看修正对照"));
-    const details = screen.getByText("查看修正对照").closest("details");
+    await user.click(await screen.findByText("查看校对稿"));
+    const details = screen.getByText("查看校对稿").closest("details");
     expect(details).not.toBeNull();
     if (details) {
-      expect(within(details).getByText("识别")).toBeVisible();
-      expect(within(details).getByText("AI")).toBeVisible();
-      expect(within(details).getByText("支付服务周五上线但是负责人还没定")).toBeVisible();
+      expect(details.parentElement).toHaveClass("segment-content");
+      expect(within(details).getByText("校对稿")).toBeVisible();
+      expect(within(details).getByText("支付服务周五上线，但是负责人还没确定。")).toBeVisible();
+      expect(within(details).queryByText("支付服务周五上线但是负责人还没定")).not.toBeInTheDocument();
     }
   });
 
@@ -1178,6 +1219,67 @@ describe("LiveMeetingWorkbench", () => {
     expect(screen.queryByRole("button", { name: "结束并整理" })).not.toBeInTheDocument();
   });
 
+  it("shows the interrupted transcript range while local backfill is running", async () => {
+    const { api, transport } = dependencies();
+    vi.mocked(api.getSnapshot).mockResolvedValue({
+      ...realSnapshot(),
+      diagnostics: {
+        transcript_backfill: {
+          schema_version: "transcript_backfill.v1",
+          status: "running",
+          capture_epoch: 1,
+          start_ms: 300,
+          end_ms: 1_800,
+        },
+      },
+    });
+
+    render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} />);
+
+    expect(await screen.findByText("正在补齐中断处文字")).toBeVisible();
+    expect(screen.getByText("00:00–00:01 · 录音仍在继续保存")).toBeVisible();
+    const statuses = screen.getByLabelText("会议运行状态");
+    expect(within(statuses).getByText("正在补齐")).toBeVisible();
+  });
+
+  it("keeps completed and failed transcript backfill states explicit", async () => {
+    const { api, transport } = dependencies();
+    vi.mocked(api.getSnapshot).mockResolvedValue({
+      ...realSnapshot(),
+      diagnostics: {
+        transcript_backfill: {
+          schema_version: "transcript_backfill.v1",
+          status: "completed",
+          capture_epoch: 1,
+          start_ms: 0,
+          end_ms: 2_000,
+        },
+      },
+    });
+    const view = render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} />);
+
+    expect(await screen.findByText("中断处文字已补齐")).toBeVisible();
+    expect(screen.getByText("00:00–00:02 · 已合并到同一会议正文")).toBeVisible();
+
+    vi.mocked(api.getSnapshot).mockResolvedValue({
+      ...realSnapshot(),
+      diagnostics: {
+        transcript_backfill: {
+          schema_version: "transcript_backfill.v1",
+          status: "failed",
+          capture_epoch: 1,
+          start_ms: 0,
+          end_ms: 2_000,
+        },
+      },
+    });
+    view.unmount();
+    render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} />);
+
+    expect(await screen.findByText("中断处文字暂未补齐")).toBeVisible();
+    expect(screen.getByText("00:00–00:02 · 录音已保存，这一小段文字可能缺失")).toBeVisible();
+  });
+
   it("does not enter review until the backend confirms that the meeting ended", async () => {
     const { api, transport } = dependencies();
     const microphone = microphoneController({
@@ -1226,7 +1328,7 @@ describe("LiveMeetingWorkbench", () => {
       />,
     );
 
-    expect(await screen.findByRole("button", { name: "重新开始录音" })).toBeVisible();
+    expect(await screen.findByRole("button", { name: "继续录音" })).toBeVisible();
     expect(screen.getAllByRole("button", { name: "结束并整理" })).toHaveLength(1);
   });
 

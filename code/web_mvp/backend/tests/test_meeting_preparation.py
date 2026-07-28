@@ -26,10 +26,35 @@ def test_store_round_trip_is_meeting_scoped_and_non_sensitive(tmp_path) -> None:
     )
 
     assert saved.hotwords == ("P99", "checkout-service")
+    assert saved.version == 1
     assert store.get("meeting-1") == saved
     serialized = (tmp_path / "meeting-preparation" / "meeting-1.json").read_text(encoding="utf-8")
     assert "api_key" not in serialized
     assert "audio" not in json.loads(serialized)
+
+
+def test_store_preserves_bounded_meeting_context_versions(tmp_path) -> None:
+    store = MeetingPreparationStore(tmp_path / "meeting-preparation")
+
+    first = store.save(
+        "meeting-versioned",
+        meeting_goal="确认中文识别质量",
+        focus_points=["断句", "术语"],
+        updated_at_ms=10,
+    )
+    second = store.save(
+        "meeting-versioned",
+        meeting_goal="确认中文识别质量和恢复能力",
+        focus_points=["断句", "断线恢复"],
+        updated_at_ms=20,
+    )
+
+    versions = store.list_versions("meeting-versioned")
+    assert first.version == 1
+    assert second.version == 2
+    assert [version.version for version in versions] == [1, 2]
+    assert versions[0].focus_points == ("断句", "术语")
+    assert versions[1].focus_points == ("断句", "断线恢复")
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Windows uses inherited per-user ACLs")

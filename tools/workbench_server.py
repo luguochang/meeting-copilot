@@ -24,6 +24,7 @@ CORE_ROOT = REPO_ROOT / "code" / "core"
 DEFAULT_PORT = 8765
 GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS = 8
 STOP_TIMEOUT_SECONDS = GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS + 4
+STARTUP_HEALTH_TIMEOUT_SECONDS = 60
 DEFAULT_RUN_ROOT = REPO_ROOT / "artifacts" / "tmp" / "workbench_server"
 DEFAULT_DATA_DIR = REPO_ROOT / "artifacts" / "tmp" / "web_mvp_data"
 DEFAULT_PID_FILE = DEFAULT_RUN_ROOT / "workbench_server.pid"
@@ -52,8 +53,8 @@ SECRET_PROVIDER_ENV_KEYS = {
 
 
 def build_uvicorn_command(*, port: int) -> list[str]:
-    return [
-        "uvicorn",
+    launcher = [sys._base_executable, "-m", "uvicorn"] if os.name == "nt" else ["uvicorn"]
+    return launcher + [
         "meeting_copilot_web_mvp.app:app",
         "--host",
         "127.0.0.1",
@@ -76,6 +77,10 @@ def build_child_env(*, data_dir: Path, provider_mode: str = "safe") -> dict[str,
 
     existing_pythonpath = env.get("PYTHONPATH", "")
     pythonpath_parts = [str(WEB_BACKEND_ROOT), str(CORE_ROOT)]
+    if os.name == "nt":
+        venv_site_packages = Path(sys.prefix) / "Lib" / "site-packages"
+        if venv_site_packages.is_dir():
+            pythonpath_parts.append(str(venv_site_packages))
     if existing_pythonpath:
         pythonpath_parts.append(existing_pythonpath)
     env["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
@@ -83,7 +88,58 @@ def build_child_env(*, data_dir: Path, provider_mode: str = "safe") -> dict[str,
         data_dir if data_dir.is_absolute() else REPO_ROOT / data_dir
     ).resolve()
     env["MEETING_COPILOT_DATA_DIR"] = str(resolved_data_dir)
+    # Keep the local two-pass ASR lane self-contained for the managed
+    # Workbench process. Explicit deployment paths still win, while this
+    # development bundle uses the verified, hash-checked models downloaded
+    # under artifacts/tmp/asr_chinese_repair.
+    model_root = REPO_ROOT / "artifacts" / "tmp" / "asr_chinese_repair" / "models"
+    onnx_preview_root = REPO_ROOT / "artifacts" / "tmp" / "asr_preview_bakeoff"
+    onnx_preview_model = onnx_preview_root / "onnx-online"
+    onnx_preview_runtime = onnx_preview_root / "runtime"
+    refiner_python = REPO_ROOT / "code" / "asr_runtime" / ".venv-funasr" / (
+        "Scripts/python.exe" if os.name == "nt" else "bin/python"
+    )
+    refiner_worker = REPO_ROOT / "code" / "asr_runtime" / "scripts" / "funasr_offline_refiner_worker.py"
+    hotword_manifest = REPO_ROOT / "configs" / "asr_hotwords.json"
+    if (
+        refiner_python.is_file()
+        and refiner_worker.is_file()
+        and (model_root / "offline").is_dir()
+        and (model_root / "vad").is_dir()
+        and (model_root / "punc").is_dir()
+    ):
+        env.setdefault("MEETING_COPILOT_REALTIME_REFINER_PYTHON", str(refiner_python))
+        env.setdefault("MEETING_COPILOT_REALTIME_REFINER_WORKER", str(refiner_worker))
+        env.setdefault("MEETING_COPILOT_REALTIME_REFINER_MODEL", str(model_root / "offline"))
+        env.setdefault("MEETING_COPILOT_REALTIME_REFINER_VAD_MODEL", str(model_root / "vad"))
+        env.setdefault("MEETING_COPILOT_REALTIME_REFINER_PUNC_MODEL", str(model_root / "punc"))
+        if hotword_manifest.is_file():
+            env.setdefault("MEETING_COPILOT_REALTIME_REFINER_HOTWORDS", str(hotword_manifest))
+        env.setdefault("MEETING_COPILOT_REALTIME_REFINER_PREWARM_TIMEOUT_SECONDS", "60")
+    onnx_preview_ready = (
+        (onnx_preview_model / "model.onnx").is_file()
+        and (onnx_preview_model / "decoder.onnx").is_file()
+        and (onnx_preview_model / "config.yaml").is_file()
+        and (onnx_preview_model / "am.mvn").is_file()
+        and (onnx_preview_model / "tokens.json").is_file()
+        and (onnx_preview_runtime / "funasr_onnx").is_dir()
+        and (onnx_preview_runtime / "onnxruntime").is_dir()
+    )
+    if onnx_preview_ready:
+        env.setdefault("MEETING_COPILOT_FUNASR_ENGINE", "onnx")
+        if env.get("MEETING_COPILOT_FUNASR_ENGINE", "").strip().lower() == "onnx":
+            env.setdefault("MEETING_COPILOT_FUNASR_MODEL_DIR", str(onnx_preview_model))
+            env.setdefault("MEETING_COPILOT_FUNASR_PYTHONPATH", str(onnx_preview_runtime))
     return env
+
+
+def popen_platform_options() -> dict[str, Any]:
+    if os.name == "nt":
+        return {
+            "creationflags": subprocess.CREATE_NO_WINDOW
+            | subprocess.CREATE_NEW_PROCESS_GROUP,
+        }
+    return {"start_new_session": True}
 
 
 def read_pid(pid_file: Path) -> int | None:
@@ -100,6 +156,8 @@ def read_pid(pid_file: Path) -> int | None:
 
 
 def pid_running(pid: int) -> bool:
+    if os.name == "nt":
+        return process_start_marker(pid) is not None
     try:
         os.kill(pid, 0)
         return True
@@ -107,6 +165,8 @@ def pid_running(pid: int) -> bool:
         return False
     except PermissionError:
         return True
+    except OSError:
+        raise
 
 
 def is_port_open(port: int) -> bool:
@@ -148,6 +208,56 @@ def runtime_source_fingerprint() -> str:
 
 
 def process_start_marker(pid: int) -> str | None:
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.windll.kernel32
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.GetProcessTimes.argtypes = [
+                wintypes.HANDLE,
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+            ]
+            kernel32.GetProcessTimes.restype = wintypes.BOOL
+            kernel32.GetExitCodeProcess.argtypes = [
+                wintypes.HANDLE,
+                ctypes.POINTER(wintypes.DWORD),
+            ]
+            kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            process = kernel32.OpenProcess(0x1000, False, pid)
+            if not process:
+                return None
+            creation = wintypes.FILETIME()
+            exit_time = wintypes.FILETIME()
+            kernel = wintypes.FILETIME()
+            user = wintypes.FILETIME()
+            exit_code = wintypes.DWORD()
+            try:
+                if not kernel32.GetProcessTimes(
+                    process,
+                    ctypes.byref(creation),
+                    ctypes.byref(exit_time),
+                    ctypes.byref(kernel),
+                    ctypes.byref(user),
+                ):
+                    return None
+                if not kernel32.GetExitCodeProcess(process, ctypes.byref(exit_code)):
+                    return None
+                if exit_code.value != 259:  # STILL_ACTIVE
+                    return None
+            finally:
+                kernel32.CloseHandle(process)
+            created_at = (int(creation.dwHighDateTime) << 32) | int(creation.dwLowDateTime)
+            return hashlib.sha256(f"windows:{created_at}".encode("ascii")).hexdigest()
+        except (AttributeError, OSError, ValueError):
+            return None
     proc_stat = Path(f"/proc/{pid}/stat")
     try:
         raw_stat = proc_stat.read_text(encoding="utf-8")
@@ -595,7 +705,7 @@ def start_server(
             stdin=subprocess.DEVNULL,
             stdout=log_handle,
             stderr=subprocess.STDOUT,
-            start_new_session=True,
+            **popen_platform_options(),
         )
     finally:
         log_handle.close()
@@ -617,7 +727,7 @@ def start_server(
             "safe_to_force_kill": False,
         }
 
-    deadline = time.time() + 20
+    deadline = time.time() + STARTUP_HEALTH_TIMEOUT_SECONDS
     health = {"ok": False, "error": "not checked"}
     while time.time() < deadline:
         health = _bind_health_to_managed_runtime(

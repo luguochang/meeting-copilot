@@ -1,4 +1,5 @@
 """Tests for FunasrSidecarRecognizer (G2, mocked subprocess)."""
+import json
 import threading
 import time
 import queue
@@ -7,6 +8,75 @@ from types import SimpleNamespace
 
 import pytest
 from meeting_copilot_web_mvp import asr_stream
+
+
+def _write_packaged_realtime_runtime(tmp_path: Path) -> Path:
+    paths = {
+        "python": "runtime/funasr-python/python.exe",
+        "worker": "app/code/asr_runtime/scripts/funasr_stream_worker.py",
+        "model": "models/funasr-online-onnx",
+        "onnx_runtime": "runtime/funasr-onnx",
+        "shared_runtime": "runtime/funasr-venv",
+        "site_packages": "runtime/funasr-venv/Lib/site-packages",
+        "python_home": "runtime/funasr-python",
+    }
+    for relative in (
+        paths["python"],
+        paths["worker"],
+        f'{paths["model"]}/model.onnx',
+        f'{paths["model"]}/decoder.onnx',
+        f'{paths["model"]}/config.yaml',
+        f'{paths["onnx_runtime"]}/funasr_onnx/__init__.py',
+        f'{paths["site_packages"]}/funasr/__init__.py',
+    ):
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("fixture", encoding="utf-8")
+    manifest = {
+        "schema_version": "meeting_copilot.runtime_bundle.v1",
+        "packaged_python": {"funasr": {"path": paths["python_home"]}},
+        "runtimes": {
+            "funasr": {
+                "venv_executable": paths["python"],
+                "root": paths["shared_runtime"],
+                "site_packages": paths["site_packages"],
+            }
+        },
+        "file_asr": {
+            "runtime": {
+                "executable": paths["python"],
+                "root": paths["shared_runtime"],
+            }
+        },
+        "workers": {"realtime": paths["worker"]},
+        "worker_inventory": {"realtime": {"path": paths["worker"]}},
+        "realtime_model": {"engine": "onnx", "root": paths["model"]},
+        "realtime_runtime": {"engine": "onnx", "root": paths["onnx_runtime"]},
+        "component_inventory": {
+            "schema_version": "meeting_copilot.runtime_component_inventory.v1",
+            "status": "sealed",
+            "components": {
+                "file_asr.python_launcher": {"kind": "file", "path": paths["python"]},
+                "shared_asr.python_runtime": {
+                    "kind": "directory",
+                    "path": paths["python_home"],
+                },
+                "shared_asr.runtime": {
+                    "kind": "directory",
+                    "path": paths["shared_runtime"],
+                },
+                "realtime_asr.worker": {"kind": "file", "path": paths["worker"]},
+                "realtime_asr.model": {"kind": "directory", "path": paths["model"]},
+                "realtime_asr.onnx_runtime": {
+                    "kind": "directory",
+                    "path": paths["onnx_runtime"],
+                },
+            },
+        },
+    }
+    manifest_path = tmp_path / "runtime-bundle-manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    return manifest_path
 
 
 class _FakeStdin:
@@ -277,9 +347,10 @@ def test_funasr_sidecar_feeds_chunks_and_reads_final(monkeypatch):
     assert final["text"] == "灰度 5%"
     assert len(fake.stdin.written) == 2
     cmd = popen_calls[0][0][0]
+    assert cmd[cmd.index("--engine") + 1] == "pytorch"
     assert "--chunk-size" in cmd
-    assert cmd[cmd.index("--chunk-size") + 1] == "0,30,15"
-    assert rec.asr_profile == "balanced_chinese_meeting"
+    assert cmd[cmd.index("--chunk-size") + 1] == "0,16,8"
+    assert rec.asr_profile == "responsive_preview_authoritative_refiner"
 
 
 def test_funasr_graceful_drain_timeout_scales_with_burst_audio():
@@ -363,6 +434,88 @@ def test_funasr_bundle_paths_can_be_injected_without_changing_default_layout(mon
     assert asr_stream._configured_local_path("MEETING_COPILOT_FUNASR_MODEL_DIR", Path("fallback")) == Path("fallback")
 
 
+def test_packaged_realtime_runtime_resolves_from_active_manifest(monkeypatch, tmp_path):
+    manifest_path = _write_packaged_realtime_runtime(tmp_path)
+    monkeypatch.setenv("MEETING_COPILOT_RUNTIME_MANIFEST", str(manifest_path))
+    monkeypatch.setenv("PYTHONHOME", str(tmp_path / "backend-python"))
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path / "backend-site-packages"))
+    for name in (
+        "MEETING_COPILOT_FUNASR_PYTHON",
+        "MEETING_COPILOT_FUNASR_WORKER",
+        "MEETING_COPILOT_FUNASR_MODEL_DIR",
+        "MEETING_COPILOT_FUNASR_ENGINE",
+        "MEETING_COPILOT_FUNASR_PYTHON_HOME",
+        "MEETING_COPILOT_FUNASR_PYTHONPATH",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    runtime = asr_stream._resolve_funasr_runtime()
+    command = asr_stream._funasr_worker_command(runtime=runtime)
+    environment = asr_stream._funasr_process_environment(runtime)
+
+    assert runtime.errors == ()
+    assert runtime.engine == "onnx"
+    assert runtime.python == tmp_path / "runtime" / "funasr-python" / "python.exe"
+    assert runtime.worker == tmp_path / "app" / "code" / "asr_runtime" / "scripts" / "funasr_stream_worker.py"
+    assert runtime.model == tmp_path / "models" / "funasr-online-onnx"
+    assert asr_stream.funasr_realtime_available() is True
+    assert command[command.index("--engine") + 1] == "onnx"
+    assert environment["PYTHONHOME"] == str(tmp_path / "runtime" / "funasr-python")
+    assert str(tmp_path / "runtime" / "funasr-onnx") in environment["PYTHONPATH"]
+    assert str(tmp_path / "backend-site-packages") not in environment["PYTHONPATH"]
+
+
+def test_explicit_realtime_component_overrides_take_priority_over_manifest(tmp_path):
+    manifest_path = _write_packaged_realtime_runtime(tmp_path / "bundle")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["component_inventory"]["components"]["realtime_asr.worker"]["path"] = "../outside.py"
+    manifest["workers"]["realtime"] = "../outside.py"
+    manifest["worker_inventory"]["realtime"]["path"] = "../outside.py"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    external = tmp_path / "external"
+    python = external / "python.exe"
+    worker = external / "worker.py"
+    model = external / "model"
+    python.parent.mkdir(parents=True)
+    python.write_text("fixture", encoding="utf-8")
+    worker.write_text("fixture", encoding="utf-8")
+    model.mkdir()
+    for filename in ("model.onnx", "decoder.onnx", "config.yaml"):
+        (model / filename).write_text("fixture", encoding="utf-8")
+    environ = {
+        "MEETING_COPILOT_RUNTIME_MANIFEST": str(manifest_path),
+        "MEETING_COPILOT_FUNASR_PYTHON": str(python),
+        "MEETING_COPILOT_FUNASR_WORKER": str(worker),
+        "MEETING_COPILOT_FUNASR_MODEL_DIR": str(model),
+        "MEETING_COPILOT_FUNASR_ENGINE": "onnx",
+    }
+
+    runtime = asr_stream._resolve_funasr_runtime(environ)
+
+    assert runtime.errors == ()
+    assert runtime.worker == worker
+    assert asr_stream.funasr_realtime_available(environ) is True
+
+
+def test_packaged_realtime_runtime_reports_unavailable_when_required_file_is_missing(
+    monkeypatch,
+    tmp_path,
+):
+    manifest_path = _write_packaged_realtime_runtime(tmp_path)
+    (tmp_path / "models" / "funasr-online-onnx" / "decoder.onnx").unlink()
+    monkeypatch.setenv("MEETING_COPILOT_RUNTIME_MANIFEST", str(manifest_path))
+    for name in (
+        "MEETING_COPILOT_FUNASR_PYTHON",
+        "MEETING_COPILOT_FUNASR_WORKER",
+        "MEETING_COPILOT_FUNASR_MODEL_DIR",
+        "MEETING_COPILOT_FUNASR_ENGINE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    assert asr_stream.funasr_realtime_available() is False
+
+
 def test_funasr_child_environment_switches_python_home_and_path(monkeypatch):
     monkeypatch.setenv("PYTHONHOME", "/bundle/runtime/backend-python")
     monkeypatch.setenv("PYTHONPATH", "/bundle/backend")
@@ -375,6 +528,8 @@ def test_funasr_child_environment_switches_python_home_and_path(monkeypatch):
 
     assert environment["PYTHONHOME"] == "/bundle/runtime/funasr-python"
     assert environment["PYTHONPATH"] == "/bundle/runtime/funasr-site:/bundle/asr"
+    assert environment["PYTHONIOENCODING"] == "utf-8"
+    assert environment["PYTHONUTF8"] == "1"
     assert "LLM_GATEWAY_API_KEY" not in environment
     assert "MEETING_COPILOT_LOCAL_API_TOKEN" not in environment
 
@@ -402,6 +557,23 @@ def test_funasr_sidecar_uses_local_model_and_exposes_worker_ready(monkeypatch, t
     command = popen_calls[0][0][0]
     assert command[command.index("--model") + 1] == str(model_dir)
     rec.abort()
+
+
+def test_funasr_readiness_accepts_complete_onnx_online_model(monkeypatch, tmp_path):
+    model_dir = tmp_path / "funasr-onnx-online"
+    model_dir.mkdir()
+    for filename in ("model.onnx", "decoder.onnx", "config.yaml"):
+        (model_dir / filename).write_bytes(b"ready")
+    runtime_python = tmp_path / "python.exe"
+    runtime_python.write_bytes(b"python")
+    worker = tmp_path / "worker.py"
+    worker.write_text("# worker\n", encoding="utf-8")
+    monkeypatch.setattr(asr_stream, "_FUNASR_ENGINE", "onnx")
+    monkeypatch.setattr(asr_stream, "_FUNASR_MODEL_DIR", model_dir)
+    monkeypatch.setattr(asr_stream, "_FUNASR_VENV_PY", runtime_python)
+    monkeypatch.setattr(asr_stream, "_FUNASR_WORKER", worker)
+
+    assert asr_stream.funasr_realtime_available() is True
 
 
 def test_funasr_sidecar_does_not_treat_asr_event_as_worker_ready(monkeypatch):

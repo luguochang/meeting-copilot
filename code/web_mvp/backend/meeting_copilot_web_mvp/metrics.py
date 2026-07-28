@@ -9,7 +9,9 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+from meeting_copilot_web_mvp import asr_stream
 from meeting_copilot_web_mvp.logging_config import get_logger
+from meeting_copilot_web_mvp.local_runtime_paths import venv_python_path
 
 _log = get_logger("meeting_copilot_web_mvp.metrics")
 REPO_ENV_FILE = Path(__file__).resolve().parents[4] / ".env"
@@ -59,9 +61,11 @@ def validate_config() -> list[str]:
     if not os.environ.get("LLM_GATEWAY_API_KEY"):
         issues.append("LLM_GATEWAY_API_KEY not set — LLM features disabled")
     repo_root = Path(__file__).resolve().parents[4]
-    sherpa_venv = repo_root / "code" / "asr_runtime" / ".venv-sherpa" / "bin" / "python"
-    if not sherpa_venv.is_file():
-        issues.append(f"sherpa venv python not found at {sherpa_venv} — real ASR sidecar unavailable (falls back to Fake)")
+    sherpa_venv = venv_python_path(repo_root / "code" / "asr_runtime" / ".venv-sherpa")
+    if not asr_stream.funasr_realtime_available() and not sherpa_venv.is_file():
+        issues.append(
+            "local realtime ASR runtime not found — install the Windows FunASR or sherpa sidecar environment"
+        )
     return issues
 
 

@@ -24,6 +24,7 @@ from typing import Any, Callable, Protocol
 from meeting_copilot_web_mvp.audio_assets import validate_float32_pcm_payload
 from meeting_copilot_web_mvp.diarization import SpeakerTurn, attribute_segment
 from meeting_copilot_web_mvp.logging_config import get_logger
+from meeting_copilot_web_mvp.local_runtime_paths import venv_python_path
 
 
 SAMPLE_RATE = 16_000
@@ -65,8 +66,8 @@ def default_worker_command() -> list[str] | None:
     if not worker.is_file() or not worker.is_absolute():
         return None
     configured_python = str(os.environ.get("MEETING_COPILOT_FUNASR_PYTHON") or "").strip()
-    funasr_python = (
-        Path(configured_python) if configured_python else _REPO_ROOT / "code/asr_runtime/.venv-funasr/bin/python"
+    funasr_python = Path(configured_python) if configured_python else venv_python_path(
+        _REPO_ROOT / "code" / "asr_runtime" / ".venv-funasr"
     )
     interpreter = str(funasr_python) if funasr_python.is_file() else sys.executable
     command = [interpreter, str(worker)]

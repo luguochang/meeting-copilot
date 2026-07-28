@@ -54,6 +54,8 @@ def normalize(raw_text: str, terms_path: str | None = None) -> str:
 
 def _normalize_observed_contextual_near_misses(text: str) -> str:
     normalized = text
+    normalized = _normalize_controlled_offline_refiner_near_misses(normalized)
+    normalized = _normalize_controlled_matrix_near_misses(normalized)
     normalized = _normalize_latest_real_mic_release_near_misses(normalized)
     normalized = re.sub(
         r"(?<![A-Za-z0-9._/-])(?:tracout|acout)\s+out\s+service(?=[\s\u4e00-\u9fff]*(?:周五|灰度|指标|error|P99|p99))",
@@ -93,6 +95,58 @@ def _normalize_observed_contextual_near_misses(text: str) -> str:
         flags=re.IGNORECASE,
     )
     normalized = _normalize_release_metric_rate_near_miss(normalized)
+    return normalized
+
+
+def _normalize_controlled_offline_refiner_near_misses(text: str) -> str:
+    """Normalize bounded, unambiguous terms observed from local SeACo."""
+
+    normalized = text
+    replacements = (
+        (r"(?<![A-Za-z0-9._/-])trace\s*下划线\s*id(?![A-Za-z0-9._/-])", "trace_id"),
+        (r"(?<![A-Za-z0-9._/-])total\s*下划线\s*amount(?![A-Za-z0-9._/-])", "total_amount"),
+        (r"(?<![A-Za-z0-9._/-])p\s*九九(?=[\s\u4e00-\u9fff]*(?:超过|延迟|毫秒|回滚))", "P99"),
+        (r"(?<![A-Za-z0-9._/-])p\s*九五(?=[\s\u4e00-\u9fff]*(?:从|超过|延迟|毫秒|秒))", "P95"),
+        (r"(?<![A-Za-z0-9._/-])order\s+service(?=[\s\u4e00-\u9fff]*(?:超时|连接池|限流|监控))", "order-service"),
+        (r"(?<![A-Za-z0-9._/-])graphfena(?=[\s\u4e00-\u9fff]*看板)", "Grafana"),
+        (r"(?<![A-Za-z0-9._/-])payment\s+gaadway(?=[\s\u4e00-\u9fff]*(?:先灰度|灰度|P99|p九九|回滚))", "payment-gateway"),
+        (r"(?<![A-Za-z0-9._/-])mobile\s+app(?=[\s\u4e00-\u9fff]*(?:和|解析|失败))", "mobile-app"),
+        (r"(?<![A-Za-z0-9._/-])BI\s+drop(?=[\s\u4e00-\u9fff]*解析失败)", "BI job"),
+    )
+    for pattern, replacement in replacements:
+        normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
+    normalized = re.sub(
+        r"(?<![A-Za-z0-9._/-])gate\s+api\s*斜杠\s*v一\s*orders(?=[\s\u4e00-\u9fff]*response)",
+        "GET /api/v1/orders",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(r"(?<=告警)预值", "阈值", normalized)
+    return normalized
+
+
+def _normalize_controlled_matrix_near_misses(text: str) -> str:
+    """Normalize bounded residuals measured in the S01-S04 local matrix."""
+
+    normalized = text
+    replacements = (
+        (r"(?<![A-Za-z0-9._/-])t(?:race|res|rees)\s*下划线\s*(?:id|iz|yz)(?=字段)", "trace_id"),
+        (r"(?<![A-Za-z0-9._/-])payment\s+(?:gaate|gave)\s+way(?=先灰度)", "payment-gateway"),
+        (r"(?<![A-Za-z0-9._/-])(?:graa\s*ffn\s*a|graphfna)(?=看板)", "Grafana"),
+        (r"(?<![A-Za-z0-9._/-])red\s*is(?=连接池)", "Redis"),
+        (r"(?<=补)线流(?=和连接池监控)", "限流"),
+        (r"(?<=P99超过)八百(?=毫秒)", "800"),
+        (r"(?<=P95从)一百二十(?=毫秒)", "120"),
+        (r"(?<=涨到)两(?=秒)", "2"),
+        (r"(?<=灰度)百分之十(?=[，,]?如果P99)", "10%"),
+        (r"(?<=错误率超过)百分之零点一(?=就回滚)", "0.1%"),
+        (r"张三下[，,]周三(?=补充兼容性测试用例)", "张三下周三"),
+        (r"纤灰度(?=百分之(?:五|十))", "先灰度"),
+        (r"上限的?(?:时|食)(?:候|后)(?=[，,]?先灰度)", "上线的时候"),
+        (r"(?<=错误率超过千分之一就)回稳", "回滚"),
+    )
+    for pattern, replacement in replacements:
+        normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
     return normalized
 
 

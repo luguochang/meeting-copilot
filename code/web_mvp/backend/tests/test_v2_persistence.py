@@ -174,6 +174,61 @@ def test_new_fact_projection_events_and_confirmation_are_durable(persistence):
     assert retained["status"] == "confirmed"
 
 
+def test_user_can_version_edit_and_merge_same_kind_entities_without_deleting_history(persistence):
+    _commit_final(
+        persistence,
+        final_id="editable-fact-1",
+        segment_id="editable-segment-1",
+        text="由李明负责在周五前完成接口联调。",
+        now_ms=1_000,
+    )
+    _commit_final(
+        persistence,
+        final_id="editable-fact-2",
+        segment_id="editable-segment-2",
+        text="由王芳负责在周四前完成回归测试。",
+        now_ms=2_000,
+    )
+    actions = persistence.get_snapshot("meeting-1")["action_items"]
+    assert len(actions) == 2
+    target, source = actions
+
+    edited = persistence.update_entity_fields(
+        meeting_id="meeting-1",
+        entity_id=target["id"],
+        fields={"text": "完成接口联调和异常路径验证", "owner": "李明、王芳"},
+        expected_version=target["version"],
+        now_ms=3_000,
+    )
+    assert edited["version"] == target["version"] + 1
+    assert edited["owner"] == "李明、王芳"
+
+    merged = persistence.merge_entities(
+        meeting_id="meeting-1",
+        target_entity_id=target["id"],
+        source_entity_id=source["id"],
+        expected_target_version=edited["version"],
+        expected_source_version=source["version"],
+        now_ms=4_000,
+    )
+    assert merged["source"]["status"] == "dismissed"
+    assert set(merged["target"]["evidence_segment_ids"]) == {
+        "editable-segment-1",
+        "editable-segment-2",
+    }
+    event_types = [event["type"] for event in persistence.list_events("meeting-1")]
+    assert "meeting.entity.merged" in event_types
+
+    with pytest.raises(RuntimeError, match="version conflict"):
+        persistence.update_entity_fields(
+            meeting_id="meeting-1",
+            entity_id=target["id"],
+            fields={"text": "过期客户端修改"},
+            expected_version=target["version"],
+            now_ms=5_000,
+        )
+
+
 def test_llm_first_mode_does_not_project_keywords_and_applies_structured_response_once(tmp_path):
     persistence = V2Persistence(
         tmp_path / "llm-first.db",
@@ -196,15 +251,7 @@ def test_llm_first_mode_does_not_project_keywords_and_applies_structured_respons
         assert "intelligence" in committed["job_ids"]
 
         response = {
-            "paragraph_revisions": [
-                {
-                    "target_id": "llm-first-segment",
-                    "expected_revision": 1,
-                    "corrected_text": "结论是采用蓝绿发布方案。由李明负责在周五前完成迁移。",
-                    "change_count": 0,
-                    "changed": False,
-                }
-            ],
+                "paragraph_revisions": [],
             "topic_update": {
                 "operation": "update",
                 "title": "蓝绿发布",
@@ -242,7 +289,7 @@ def test_llm_first_mode_does_not_project_keywords_and_applies_structured_respons
         assert persistence.get_snapshot("meeting-1")["decision_candidates"][0]["id"] == "decision:blue-green"
         assert persistence.get_snapshot("meeting-1")["current_topic"]["text"] == "蓝绿发布"
         assert persistence.get_snapshot("meeting-1")["follow_up"] == response["follow_up"]
-        assert persistence.get_snapshot("meeting-1")["segments"][0]["correction_status"] == "no_change"
+        assert persistence.get_snapshot("meeting-1")["segments"][0]["correction_status"] == "pending"
         second = persistence.apply_intelligence_response(
             meeting_id="meeting-1",
             job_id=committed["job_ids"]["intelligence"],
@@ -428,8 +475,8 @@ def test_semantic_paragraph_projection_merges_checkpoints_and_is_idempotent(pers
         segment_id="paragraph-segment-3",
         text="下一段讨论监控告警。",
         normalized_text="下一段讨论监控告警。",
-        started_at_ms=4_000,
-        ended_at_ms=4_700,
+        started_at_ms=5_300,
+        ended_at_ms=6_000,
         evidence_hash="paragraph-hash-3",
         now_ms=5_000,
     )
@@ -448,13 +495,171 @@ def test_semantic_paragraph_projection_merges_checkpoints_and_is_idempotent(pers
         segment_id="paragraph-segment-3",
         text="下一段讨论监控告警。",
         normalized_text="下一段讨论监控告警。",
-        started_at_ms=4_000,
-        ended_at_ms=4_700,
+        started_at_ms=5_300,
+        ended_at_ms=6_000,
         evidence_hash="paragraph-hash-3",
         now_ms=6_000,
     )
     assert duplicate["created"] is False
     assert len(persistence.get_snapshot("meeting-1")["semantic_paragraphs"]) == 2
+
+
+def test_continuous_speech_groups_multiple_sentences_before_stabilizing(persistence):
+    persistence.commit_final_and_enqueue(
+        meeting_id="meeting-1",
+        final_id="continuous-final-1",
+        segment_id="continuous-segment-1",
+        text="我们先确认本次发布范围和主要负责人。",
+        normalized_text="我们先确认本次发布范围和主要负责人。",
+        started_at_ms=0,
+        ended_at_ms=15_000,
+        evidence_hash="continuous-hash-1",
+        now_ms=15_000,
+    )
+    persistence.commit_final_and_enqueue(
+        meeting_id="meeting-1",
+        final_id="continuous-final-2",
+        segment_id="continuous-segment-2",
+        text="接下来讨论灰度指标以及异常时的回滚动作。",
+        normalized_text="接下来讨论灰度指标以及异常时的回滚动作。",
+        started_at_ms=15_000,
+        ended_at_ms=30_000,
+        evidence_hash="continuous-hash-2",
+        now_ms=30_000,
+    )
+    persistence.commit_final_and_enqueue(
+        meeting_id="meeting-1",
+        final_id="continuous-final-3",
+        segment_id="continuous-segment-3",
+        text="最后确认观察窗口结束后的复盘时间。",
+        normalized_text="最后确认观察窗口结束后的复盘时间。",
+        started_at_ms=30_000,
+        ended_at_ms=45_000,
+        evidence_hash="continuous-hash-3",
+        now_ms=45_000,
+    )
+
+    paragraphs = persistence.get_snapshot("meeting-1")["semantic_paragraphs"]
+
+    assert len(paragraphs) == 2
+    assert paragraphs[0]["status"] == "stable"
+    assert paragraphs[0]["checkpoint_ids"] == ["continuous-segment-1", "continuous-segment-2"]
+    assert paragraphs[0]["text"] == (
+        "我们先确认本次发布范围和主要负责人。"
+        "接下来讨论灰度指标以及异常时的回滚动作。"
+    )
+    assert paragraphs[1]["checkpoint_ids"] == ["continuous-segment-3"]
+
+
+def test_dense_fifteen_second_checkpoints_form_reading_blocks_instead_of_singletons(persistence):
+    for index in range(1, 7):
+        text = f"第{index}片先说明当前问题。接着补充原因和影响。最后说明下一步处理方向。"
+        persistence.commit_final_and_enqueue(
+            meeting_id="meeting-1",
+            final_id=f"dense-final-{index}",
+            segment_id=f"dense-segment-{index}",
+            text=text,
+            normalized_text=text,
+            started_at_ms=(index - 1) * 15_000,
+            ended_at_ms=index * 15_000,
+            evidence_hash=f"dense-hash-{index}",
+            now_ms=index * 15_000,
+        )
+
+    paragraphs = persistence.get_snapshot("meeting-1")["semantic_paragraphs"]
+
+    assert len(paragraphs) == 3
+    assert [len(paragraph["checkpoint_ids"]) for paragraph in paragraphs] == [2, 2, 2]
+    assert all(paragraph["projection_version"] == 2 for paragraph in paragraphs)
+
+
+def test_legacy_singleton_semantic_paragraphs_are_reprojected_once(tmp_path):
+    database_path = tmp_path / "legacy-reading-blocks.db"
+    persistence = V2Persistence(database_path)
+    for index in range(1, 5):
+        text = f"第{index}片先说明问题。然后补充讨论依据。"
+        persistence.commit_final_and_enqueue(
+            meeting_id="meeting-1",
+            final_id=f"legacy-reading-final-{index}",
+            segment_id=f"legacy-reading-segment-{index}",
+            text=text,
+            normalized_text=text,
+            started_at_ms=(index - 1) * 15_000,
+            ended_at_ms=index * 15_000,
+            evidence_hash=f"legacy-reading-hash-{index}",
+            now_ms=index * 15_000,
+        )
+    persistence.close()
+
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("DELETE FROM semantic_paragraph_checkpoints WHERE meeting_id = 'meeting-1'")
+        connection.execute("DELETE FROM semantic_paragraphs WHERE meeting_id = 'meeting-1'")
+        for index in range(1, 5):
+            segment_id = f"legacy-reading-segment-{index}"
+            paragraph_id = f"legacy-singleton-{index}"
+            checkpoint = connection.execute(
+                "SELECT normalized_text, started_at_ms, ended_at_ms, created_at_ms, updated_at_ms "
+                "FROM asr_checkpoints WHERE meeting_id = 'meeting-1' AND checkpoint_id = ?",
+                (segment_id,),
+            ).fetchone()
+            connection.execute(
+                "INSERT INTO semantic_paragraphs ("
+                "meeting_id, paragraph_id, revision, text, start_ms, end_ms, status, "
+                "created_at_ms, updated_at_ms, projection_version"
+                ") VALUES ('meeting-1', ?, 1, ?, ?, ?, 'stable', ?, ?, 1)",
+                (paragraph_id, *checkpoint),
+            )
+            connection.execute(
+                "INSERT INTO semantic_paragraph_checkpoints "
+                "(meeting_id, paragraph_id, checkpoint_id, ordinal) VALUES ('meeting-1', ?, ?, 0)",
+                (paragraph_id, segment_id),
+            )
+
+    migrated = V2Persistence(database_path)
+    first_snapshot = migrated.get_snapshot("meeting-1")
+    migrated.close()
+
+    reopened = V2Persistence(database_path)
+    second_snapshot = reopened.get_snapshot("meeting-1")
+    reopened.close()
+
+    assert [len(paragraph["checkpoint_ids"]) for paragraph in first_snapshot["semantic_paragraphs"]] == [2, 2]
+    assert first_snapshot["semantic_paragraphs"] == second_snapshot["semantic_paragraphs"]
+    assert all(paragraph["projection_version"] == 2 for paragraph in first_snapshot["semantic_paragraphs"])
+
+
+def test_short_back_and_forth_speaker_turns_remain_one_reading_block(persistence):
+    for index, (speaker_id, text) in enumerate(
+        [
+            ("speaker-1", "先把灰度比例定下来。"),
+            ("speaker-2", "我建议从百分之十开始。"),
+            ("speaker-1", "可以，同时补上回滚阈值。"),
+        ],
+        start=1,
+    ):
+        persistence.commit_final_and_enqueue(
+            meeting_id="meeting-1",
+            final_id=f"dialogue-final-{index}",
+            segment_id=f"dialogue-segment-{index}",
+            text=text,
+            normalized_text=text,
+            started_at_ms=(index - 1) * 4_000,
+            ended_at_ms=index * 4_000,
+            evidence_hash=f"dialogue-hash-{index}",
+            now_ms=index * 4_000,
+            speaker_id=speaker_id,
+            speaker_confidence=0.95,
+        )
+
+    paragraphs = persistence.get_snapshot("meeting-1")["semantic_paragraphs"]
+
+    assert len(paragraphs) == 1
+    assert paragraphs[0]["checkpoint_ids"] == [
+        "dialogue-segment-1",
+        "dialogue-segment-2",
+        "dialogue-segment-3",
+    ]
+    assert paragraphs[0]["speaker_id"] is None
 
 
 def test_llm_first_coalesces_finals_into_one_debounced_paragraph_job(tmp_path):
@@ -494,7 +699,7 @@ def test_llm_first_coalesces_finals_into_one_debounced_paragraph_job(tmp_path):
         assert second["job_ids"]["intelligence"] == first["job_ids"]["intelligence"]
         assert intelligence_jobs[0]["evidence_segment_id"] == "batch-segment-2"
         assert intelligence_jobs[0]["input_version"] == 2
-        assert intelligence_jobs[0]["deadline_at_ms"] == 9_000
+        assert intelligence_jobs[0]["deadline_at_ms"] is None
         assert persistence.claim_next_job(
             worker_id="worker-1",
             lane="intelligence",
@@ -513,7 +718,7 @@ def test_llm_first_coalesces_finals_into_one_debounced_paragraph_job(tmp_path):
         persistence.close()
 
 
-def test_llm_first_debounce_never_moves_past_the_first_enqueue_max_wait(tmp_path):
+def test_llm_first_debounce_coalesces_without_expiring_before_provider_can_respond(tmp_path):
     persistence = V2Persistence(
         tmp_path / "llm-first-max-wait.db",
         semantic_projection_mode="llm_first",
@@ -538,22 +743,93 @@ def test_llm_first_debounce_never_moves_past_the_first_enqueue_max_wait(tmp_path
         intelligence_job = persistence.get_job(str(intelligence_job_id))
         assert intelligence_job["input_transcript_seq"] == 6
         assert intelligence_job["input_version"] == 6
-        assert intelligence_job["deadline_at_ms"] == 9_000
-        assert intelligence_job["next_attempt_at_ms"] == 9_000
+        assert intelligence_job["deadline_at_ms"] is None
+        assert intelligence_job["next_attempt_at_ms"] == 10_500
         assert persistence.claim_next_job(
             worker_id="max-wait-worker",
             lane="intelligence",
-            now_ms=8_999,
+            now_ms=10_499,
             lease_ms=5_000,
         ) is None
         claimed = persistence.claim_next_job(
             worker_id="max-wait-worker",
             lane="intelligence",
-            now_ms=9_000,
+            now_ms=10_500,
             lease_ms=5_000,
         )
         assert claimed is not None
         assert claimed["id"] == intelligence_job_id
+    finally:
+        persistence.close()
+
+
+def test_llm_first_keeps_intelligence_job_claimable_after_old_eight_second_window(tmp_path):
+    persistence = V2Persistence(
+        tmp_path / "llm-first-expired.db",
+        semantic_projection_mode="llm_first",
+    )
+    try:
+        committed = persistence.commit_final_and_enqueue(
+            meeting_id="meeting-1",
+            final_id="expired-final-1",
+            segment_id="expired-segment-1",
+            text="确认回滚负责人。",
+            normalized_text="确认回滚负责人。",
+            started_at_ms=100,
+            ended_at_ms=900,
+            evidence_hash="expired-hash-1",
+            now_ms=1_000,
+        )
+        job_id = committed["job_ids"]["intelligence"]
+        assert persistence.get_job(job_id)["deadline_at_ms"] is None
+
+        claimed = persistence.claim_next_job(
+            worker_id="expired-worker",
+            lane="intelligence",
+            now_ms=60_000,
+            lease_ms=5_000,
+        )
+
+        assert claimed is not None
+        assert claimed["id"] == job_id
+        assert claimed["status"] == "running"
+    finally:
+        persistence.close()
+
+
+def test_llm_first_coalesces_distinct_paragraphs_into_bounded_batches(tmp_path):
+    persistence = V2Persistence(
+        tmp_path / "llm-first-distinct-paragraph-batches.db",
+        semantic_projection_mode="llm_first",
+    )
+    try:
+        for index in range(1, 19):
+            persistence.commit_final_and_enqueue(
+                meeting_id="meeting-1",
+                final_id=f"distinct-final-{index}",
+                segment_id=f"distinct-segment-{index}",
+                text=f"Distinct paragraph {index}.",
+                normalized_text=f"Distinct paragraph {index}.",
+                started_at_ms=index * 5_000,
+                ended_at_ms=index * 5_000 + 1_000,
+                evidence_hash=f"distinct-hash-{index}",
+                now_ms=1_000 + index,
+            )
+
+        jobs = [
+            job
+            for job in persistence.list_jobs(meeting_id="meeting-1")
+            if job["kind"] == "intelligence"
+        ]
+
+        assert len(persistence.list_semantic_paragraphs("meeting-1")["paragraphs"]) == 18
+        assert [job["input_transcript_seq"] for job in jobs] == [8, 16, 18]
+        assert [job["input_version"] for job in jobs] == [1, 1, 1]
+        assert [job["evidence_segment_id"] for job in jobs] == [
+            "distinct-segment-8",
+            "distinct-segment-16",
+            "distinct-segment-18",
+        ]
     finally:
         persistence.close()
 
@@ -662,13 +938,13 @@ def test_llm_first_creates_pending_successor_when_previous_batch_is_running(tmp_
         persistence.close()
 
 
-def test_intelligence_job_status_preserves_original_text_on_terminal_failure(tmp_path):
+def test_intelligence_failure_does_not_mark_transcript_correction_failed(tmp_path):
     persistence = V2Persistence(
         tmp_path / "intelligence-failure.db",
         semantic_projection_mode="llm_first",
     )
     try:
-        persistence.commit_final_and_enqueue(
+        committed = persistence.commit_final_and_enqueue(
             meeting_id="meeting-1",
             final_id="failure-final",
             segment_id="failure-segment",
@@ -686,7 +962,7 @@ def test_intelligence_job_status_preserves_original_text_on_terminal_failure(tmp
             lease_ms=5_000,
         )
         assert claimed is not None
-        assert persistence.get_snapshot("meeting-1")["segments"][0]["correction_status"] == "processing"
+        assert persistence.get_snapshot("meeting-1")["segments"][0]["correction_status"] == "pending"
 
         failed = persistence.fail_job(
             job_id=claimed["id"],
@@ -697,8 +973,26 @@ def test_intelligence_job_status_preserves_original_text_on_terminal_failure(tmp
         segment = persistence.get_snapshot("meeting-1")["segments"][0]
         assert failed is not None
         assert segment["normalized_text"] == "保留这段原始文字。"
-        assert segment["correction_status"] == "failed_preserved_original"
-        assert segment["correction_error_class"] == "TimeoutError"
+        assert segment["correction_status"] == "pending"
+        assert segment["correction_error_class"] is None
+
+        correction_claim = persistence.claim_next_job(
+            worker_id="correction-worker",
+            lane="correction",
+            now_ms=3_200,
+            lease_ms=5_000,
+        )
+        assert correction_claim is not None
+        assert correction_claim["id"] == committed["job_ids"]["correction"]
+        persistence.fail_job(
+            job_id=correction_claim["id"],
+            worker_id="correction-worker",
+            now_ms=3_300,
+            error_class="TimeoutError",
+        )
+        failed_segment = persistence.get_snapshot("meeting-1")["segments"][0]
+        assert failed_segment["correction_status"] == "failed_preserved_original"
+        assert failed_segment["correction_error_class"] == "TimeoutError"
     finally:
         persistence.close()
 
@@ -742,7 +1036,7 @@ def test_llm_first_status_tracks_every_checkpoint_in_the_active_paragraph(tmp_pa
         assert {
             segment["correction_status"]
             for segment in persistence.get_snapshot("meeting-1")["segments"]
-        } == {"processing"}
+        } == {"pending"}
 
         failed = persistence.fail_job(
             job_id=claimed["id"],
@@ -754,12 +1048,12 @@ def test_llm_first_status_tracks_every_checkpoint_in_the_active_paragraph(tmp_pa
         assert {
             segment["correction_status"]
             for segment in persistence.get_snapshot("meeting-1")["segments"]
-        } == {"failed_preserved_original"}
+        } == {"pending"}
     finally:
         persistence.close()
 
 
-def test_intelligence_success_marks_every_covered_checkpoint_terminal(tmp_path):
+def test_intelligence_success_leaves_transcript_correction_to_independent_lane(tmp_path):
     persistence = V2Persistence(
         tmp_path / "intelligence-success-status.db",
         semantic_projection_mode="llm_first",
@@ -799,15 +1093,7 @@ def test_intelligence_success_marks_every_covered_checkpoint_terminal(tmp_path):
             meeting_id="meeting-1",
             job_id=second["job_ids"]["intelligence"],
             response={
-                "paragraph_revisions": [
-                    {
-                        "target_id": "success-status-segment-1",
-                        "expected_revision": 1,
-                        "corrected_text": "先灰度百分之五。",
-                        "change_count": 1,
-                        "changed": True,
-                    }
-                ],
+                "paragraph_revisions": [],
                 "topic_update": None,
                 "state_changes": [],
                 "follow_up": None,
@@ -824,12 +1110,12 @@ def test_intelligence_success_marks_every_covered_checkpoint_terminal(tmp_path):
         assert completed is not None
         assert completed["status"] == "succeeded"
         segments = persistence.get_snapshot("meeting-1")["segments"]
-        assert [segment["correction_status"] for segment in segments] == ["changed", "no_change"]
+        assert [segment["correction_status"] for segment in segments] == ["pending", "pending"]
     finally:
         persistence.close()
 
 
-def test_llm_first_compatibility_correction_job_cannot_clobber_intelligence_status(tmp_path):
+def test_llm_first_correction_job_is_independent_from_intelligence_status(tmp_path):
     persistence = V2Persistence(
         tmp_path / "intelligence-correction-lane-status.db",
         semantic_projection_mode="llm_first",
@@ -862,17 +1148,10 @@ def test_llm_first_compatibility_correction_job_cannot_clobber_intelligence_stat
         assert intelligence_claim is not None
         assert correction_claim is not None
 
-        persistence.complete_job(
-            job_id=correction_claim["id"],
-            worker_id="lane-status-correction-worker",
-            now_ms=4_100,
-            output={"skipped": True, "reason": "llm_first_intelligence_lane"},
-        )
-
         assert {
             segment["correction_status"]
             for segment in persistence.get_snapshot("meeting-1")["segments"]
-        } == {"processing"}
+        } == {"pending", "processing"}
         persistence.complete_job(
             job_id=intelligence_claim["id"],
             worker_id="lane-status-intelligence-worker",
@@ -882,7 +1161,7 @@ def test_llm_first_compatibility_correction_job_cannot_clobber_intelligence_stat
         assert {
             segment["correction_status"]
             for segment in persistence.get_snapshot("meeting-1")["segments"]
-        } == {"no_change"}
+        } == {"pending", "processing"}
     finally:
         persistence.close()
 
@@ -916,15 +1195,7 @@ def test_intelligence_idempotent_completion_restores_status_after_expired_lease(
             now_ms=2_000,
         )
         response = {
-            "paragraph_revisions": [
-                {
-                    "target_id": "expired-status-segment-1",
-                    "expected_revision": 1,
-                    "corrected_text": "先灰度百分之五。",
-                    "change_count": 1,
-                    "changed": True,
-                }
-            ],
+            "paragraph_revisions": [],
             "topic_update": None,
             "state_changes": [],
             "follow_up": None,
@@ -961,7 +1232,7 @@ def test_intelligence_idempotent_completion_restores_status_after_expired_lease(
         assert {
             segment["correction_status"]
             for segment in persistence.get_snapshot("meeting-1")["segments"]
-        } == {"processing"}
+        } == {"pending"}
         repeated = persistence.apply_intelligence_response(
             meeting_id="meeting-1",
             job_id=second["job_ids"]["intelligence"],
@@ -979,12 +1250,12 @@ def test_intelligence_idempotent_completion_restores_status_after_expired_lease(
         assert completed is not None
         assert completed["status"] == "succeeded"
         segments = persistence.get_snapshot("meeting-1")["segments"]
-        assert [segment["correction_status"] for segment in segments] == ["changed", "no_change"]
+        assert [segment["correction_status"] for segment in segments] == ["pending", "pending"]
     finally:
         persistence.close()
 
 
-def test_intelligence_retry_accepts_its_own_revision_before_applied_event(tmp_path):
+def test_intelligence_rejects_transcript_revision_and_preserves_correction_lane(tmp_path):
     persistence = V2Persistence(
         tmp_path / "intelligence-partial-commit-retry.db",
         semantic_projection_mode="llm_first",
@@ -1008,7 +1279,7 @@ def test_intelligence_retry_accepts_its_own_revision_before_applied_event(tmp_pa
             "change_count": 1,
             "changed": True,
         }
-        with pytest.raises(IntelligenceProjectionError, match="evidence quote is not present"):
+        with pytest.raises(IntelligenceProjectionError, match="independent correction lane"):
             persistence.apply_intelligence_response(
                 meeting_id="meeting-1",
                 job_id=committed["job_ids"]["intelligence"],
@@ -1034,8 +1305,8 @@ def test_intelligence_retry_accepts_its_own_revision_before_applied_event(tmp_pa
                 now_ms=3_100,
             )
         segment_after_failure = persistence.get_snapshot("meeting-1")["segments"][0]
-        assert segment_after_failure["revision"] == 2
-        assert segment_after_failure["correction_status"] == "changed"
+        assert segment_after_failure["revision"] == 1
+        assert segment_after_failure["correction_status"] == "pending"
         assert "meeting.intelligence.applied" not in {
             event["type"] for event in persistence.list_events("meeting-1")
         }
@@ -1044,7 +1315,7 @@ def test_intelligence_retry_accepts_its_own_revision_before_applied_event(tmp_pa
             meeting_id="meeting-1",
             job_id=committed["job_ids"]["intelligence"],
             response={
-                "paragraph_revisions": [revision],
+                "paragraph_revisions": [],
                 "topic_update": None,
                 "state_changes": [],
                 "follow_up": None,
@@ -1053,12 +1324,12 @@ def test_intelligence_retry_accepts_its_own_revision_before_applied_event(tmp_pa
         )
 
         assert applied["idempotent"] is False
-        assert applied["revision_count"] == 1
+        assert applied["revision_count"] == 0
         segment_after_retry = persistence.get_snapshot("meeting-1")["segments"][0]
-        assert segment_after_retry["revision"] == 2
+        assert segment_after_retry["revision"] == 1
         assert [
             event["type"] for event in persistence.list_events("meeting-1")
-        ].count("transcript.segment.revised") == 1
+        ].count("transcript.segment.revised") == 0
     finally:
         persistence.close()
 
@@ -1095,10 +1366,8 @@ def test_intelligence_expired_final_lease_fails_every_covered_checkpoint(tmp_pat
         assert failed["status"] == "failed"
         assert failed["error_class"] == "lease_expired"
         segments = persistence.get_snapshot("meeting-1")["segments"]
-        assert {segment["correction_status"] for segment in segments} == {
-            "failed_preserved_original"
-        }
-        assert {segment["correction_error_class"] for segment in segments} == {"lease_expired"}
+        assert {segment["correction_status"] for segment in segments} == {"pending"}
+        assert {segment["correction_error_class"] for segment in segments} == {None}
     finally:
         persistence.close()
 
@@ -1448,7 +1717,7 @@ def test_snapshot_jobs_are_strictly_redacted_status_summaries(persistence):
         ("suggestion", "PrivateProviderError: sk-sensitive", "job_failed"),
     ],
 )
-def test_runtime_ai_fails_closed_after_generation_job_terminal_failure(
+def test_runtime_ai_keeps_feature_failure_separate_from_global_status(
     persistence,
     failed_lane,
     stored_error_class,
@@ -1490,9 +1759,9 @@ def test_runtime_ai_fails_closed_after_generation_job_terminal_failure(
 
     snapshot = persistence.get_snapshot("meeting-1")
     assert snapshot["runtime"]["ai"] == {
-        "state": "error",
-        "label": "AI 处理失败",
-        "error_class": public_error_class,
+        "state": "idle",
+        "label": "AI 已同步",
+        "error_class": None,
     }
     failed_summary = next(job for job in snapshot["jobs"] if job["id"] == claimed["id"])
     assert failed_summary["error_class"] == public_error_class
@@ -1500,6 +1769,233 @@ def test_runtime_ai_fails_closed_after_generation_job_terminal_failure(
         stored_error_class == public_error_class
     )
     assert persistence.get_job(claimed["id"])["error_class"] == stored_error_class
+
+
+def test_chapters_and_ask_ai_workspace_are_durable_and_searchable(tmp_path):
+    database_path = tmp_path / "ask-ai-workspace.db"
+    persistence = V2Persistence(database_path, semantic_projection_mode="llm_first")
+    try:
+        persistence.create_meeting(meeting_id="ask-meeting", title="发布评审", now_ms=100)
+        for index, text in enumerate(("先确认发布窗口。", "负责人是张工。", "回滚条件需要补充。"), start=1):
+            persistence.commit_final_and_enqueue(
+                meeting_id="ask-meeting",
+                final_id=f"ask-final-{index}",
+                segment_id=f"ask-segment-{index}",
+                text=text,
+                normalized_text=text,
+                started_at_ms=index * 3_000,
+                ended_at_ms=index * 3_000 + 800,
+                evidence_hash=f"ask-hash-{index}",
+                now_ms=index * 1_000,
+            )
+        chapters = persistence.list_chapters("ask-meeting")["chapters"]
+        assert chapters
+        assert chapters[0]["evidence_segment_ids"]
+        assert persistence.list_chapters("ask-meeting", query="回滚")["chapters"]
+        assert persistence.list_chapters("ask-meeting", query="不存在的词")["chapters"] == []
+
+        evidence = [{"segment_id": "ask-segment-1", "quote": "先确认发布窗口。"}]
+        persistence.create_ask_turn(
+            meeting_id="ask-meeting",
+            thread_id="thread-1",
+            user_message_id="message-user-1",
+            assistant_message_id="message-assistant-1",
+            question="发布窗口是什么？",
+            scope="selection",
+            evidence=evidence,
+            now_ms=10_000,
+        )
+        completed = persistence.finish_ask_message(
+            meeting_id="ask-meeting",
+            message_id="message-assistant-1",
+            content="发布窗口尚未给出具体时间，需要确认。",
+            now_ms=11_000,
+        )
+        assert completed["status"] == "completed"
+        assert persistence.pin_ask_message(
+            "ask-meeting",
+            "message-assistant-1",
+            "note",
+            now_ms=12_000,
+        )["pinned_kind"] == "note"
+    finally:
+        persistence.close()
+
+    reopened = V2Persistence(database_path, semantic_projection_mode="llm_first")
+    try:
+        threads = reopened.list_ask_threads("ask-meeting")["threads"]
+        assert len(threads) == 1
+        assert [message["role"] for message in threads[0]["messages"]] == ["user", "assistant"]
+        assert threads[0]["messages"][1]["pinned_kind"] == "note"
+        migrated_notes = reopened.list_notes(meeting_id="ask-meeting")["notes"]
+        assert len(migrated_notes) == 1
+        assert migrated_notes[0]["source_kind"] == "ask_ai"
+        assert migrated_notes[0]["source_message_id"] == "message-assistant-1"
+        assert migrated_notes[0]["body"] == "发布窗口尚未给出具体时间，需要确认。"
+        assert migrated_notes[0]["evidence"] == [
+            {
+                "ordinal": 0,
+                "meeting_id": "ask-meeting",
+                "segment_id": "ask-segment-1",
+                "transcript_seq": None,
+                "start_ms": None,
+                "end_ms": None,
+                "quote": "先确认发布窗口。",
+            }
+        ]
+    finally:
+        reopened.close()
+
+
+def test_formal_notes_support_search_edit_evidence_and_meeting_deletion(persistence):
+    persistence.create_meeting(meeting_id="notes-meeting", title="发布复盘", now_ms=100)
+    created = persistence.create_note(
+        note_id="note-1",
+        meeting_id="notes-meeting",
+        title="",
+        body="先确认回滚窗口。然后补齐值班负责人。",
+        source_kind="selection",
+        source_message_id=None,
+        evidence=[
+            {
+                "segment_id": "segment-1",
+                "transcript_seq": 1,
+                "start_ms": 1_000,
+                "end_ms": 2_500,
+                "quote": "先确认回滚窗口。",
+            }
+        ],
+        now_ms=1_000,
+    )
+
+    assert created["title"] == "先确认回滚窗口"
+    assert created["version"] == 1
+    assert created["evidence"][0]["meeting_id"] == "notes-meeting"
+    assert persistence.list_notes(query="值班")["notes"] == [created]
+
+    with pytest.raises(ValueError, match="version conflict"):
+        persistence.update_note(
+            "note-1",
+            expected_version=2,
+            body="冲突更新",
+            now_ms=1_100,
+        )
+
+    edited = persistence.update_note(
+        "note-1",
+        expected_version=1,
+        title="发布待办",
+        body="确认回滚窗口，并补齐值班负责人。",
+        now_ms=1_200,
+    )
+    assert edited["version"] == 2
+    assert edited["title"] == "发布待办"
+
+    with_more_evidence = persistence.add_note_evidence(
+        "note-1",
+        [
+            {
+                "segment_id": "segment-2",
+                "transcript_seq": 2,
+                "start_ms": 2_600,
+                "end_ms": 4_000,
+                "quote": "值班负责人由张工承担。",
+            }
+        ],
+        now_ms=1_300,
+    )
+    assert with_more_evidence["version"] == 3
+    assert [item["ordinal"] for item in with_more_evidence["evidence"]] == [0, 1]
+
+    after_delete = persistence.delete_note_evidence("note-1", 0, now_ms=1_400)
+    assert after_delete["version"] == 4
+    assert after_delete["evidence"] == [
+        {
+            "ordinal": 0,
+            "meeting_id": "notes-meeting",
+            "segment_id": "segment-2",
+            "transcript_seq": 2,
+            "start_ms": 2_600,
+            "end_ms": 4_000,
+            "quote": "值班负责人由张工承担。",
+        }
+    ]
+
+    archived = persistence.update_note(
+        "note-1",
+        expected_version=4,
+        status="archived",
+        now_ms=1_500,
+    )
+    assert persistence.list_notes()["notes"] == []
+    assert persistence.list_notes(status="archived")["notes"] == [archived]
+
+    deletion = persistence.create_deletion_job(
+        meeting_id="notes-meeting",
+        managed_paths=[],
+        now_ms=1_600,
+    )
+    persistence.mark_deletion_running(job_id=deletion["id"], now_ms=1_700)
+    persistence.complete_deletion_and_purge(job_id=deletion["id"], now_ms=1_800)
+
+    preserved = persistence.get_note("note-1")
+    assert preserved["meeting_id"] is None
+    assert preserved["evidence"][0]["meeting_id"] == "notes-meeting"
+    assert preserved["evidence"][0]["quote"] == "值班负责人由张工承担。"
+
+
+def test_retry_after_committed_revision_never_downgrades_changed_segment_to_pending(
+    tmp_path,
+):
+    persistence = V2Persistence(
+        tmp_path / "correction-retry-after-revision.db",
+        semantic_projection_mode="llm_first",
+    )
+    try:
+        committed = persistence.commit_final_and_enqueue(
+            meeting_id="meeting-1",
+            final_id="retry-after-revision-final",
+            segment_id="retry-after-revision-segment",
+            text="上线时先灰度百分之无。",
+            normalized_text="上线时先灰度百分之无。",
+            started_at_ms=100,
+            ended_at_ms=900,
+            evidence_hash="retry-after-revision-hash",
+            now_ms=1_000,
+        )
+        claimed = persistence.claim_next_job(
+            worker_id="correction-worker",
+            lane="correction",
+            now_ms=3_100,
+            lease_ms=5_000,
+        )
+        assert claimed is not None
+        assert claimed["id"] == committed["job_ids"]["correction"]
+        revised = persistence.commit_transcript_revision(
+            meeting_id="meeting-1",
+            segment_id="retry-after-revision-segment",
+            expected_evidence_hash="retry-after-revision-hash",
+            corrected_text="上线时先灰度百分之五。",
+            revision_id="retry-after-revision:1",
+            now_ms=3_200,
+        )
+        assert revised is not None
+        assert revised["correction_status"] == "changed"
+
+        retried = persistence.retry_job(
+            job_id=claimed["id"],
+            worker_id="correction-worker",
+            now_ms=3_300,
+            next_attempt_at_ms=3_500,
+            error_class="LlmProviderTransportError",
+        )
+        assert retried is not None
+        segment = persistence.get_snapshot("meeting-1")["segments"][0]
+        assert segment["revision"] == 2
+        assert segment["correction_status"] == "changed"
+        assert segment["correction_error_class"] is None
+    finally:
+        persistence.close()
 
 
 def test_suggestion_retry_wait_keeps_draft_and_terminal_failure_rejects_with_event(persistence):

@@ -9,6 +9,7 @@ use tauri::Manager;
 pub mod app_command_manifest;
 pub mod asr_worker_mic_source_runtime;
 pub mod desktop_asr_worker_lifecycle_runtime;
+pub mod desktop_audio_adapter_runtime;
 pub mod desktop_backend_supervisor;
 pub mod desktop_frontend_probe_runtime;
 pub mod mic_adapter_runtime;
@@ -16,6 +17,24 @@ pub mod native_mic_capture_runtime;
 pub mod native_system_audio_capture_runtime;
 pub mod private_storage;
 pub mod provider_config_runtime;
+#[cfg(windows)]
+pub mod windows_audio_capture_runtime;
+
+#[tauri::command]
+fn windows_audio_devices(flow: String) -> Result<serde_json::Value, String> {
+    #[cfg(windows)]
+    {
+        let parsed = windows_audio_capture_runtime::parse_flow(&flow)?;
+        let response = windows_audio_capture_runtime::enumerate_devices(parsed)?;
+        return serde_json::to_value(response)
+            .map_err(|error| format!("Windows audio device response encoding failed: {error}"));
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = flow;
+        Err("Windows audio device enumeration is unavailable on this platform".to_string())
+    }
+}
 
 pub const BRIDGE_COMMAND_IDS: &[&str] = &[
     "runtime.get_status",
@@ -36,6 +55,7 @@ pub const BRIDGE_COMMAND_IDS: &[&str] = &[
     "mic_adapter.resume",
     "mic_adapter.stop",
     "mic_adapter.cleanup",
+    "windows.audio_devices",
     "system_audio_adapter.prepare",
     "system_audio_adapter.status",
     "system_audio_adapter.collect_events",
@@ -272,14 +292,13 @@ fn release_system_audio_lease(
 
 fn reconcile_capture_coordinator(
     coordinator: &native_system_audio_capture_runtime::DualTrackCaptureCoordinator,
-    microphone: &native_mic_capture_runtime::NativeMicCaptureSupervisor,
-    system_audio: &native_system_audio_capture_runtime::SystemAudioCaptureSupervisor,
+    audio: &desktop_audio_adapter_runtime::DesktopAudioCaptureAdapters,
 ) {
-    let microphone_status = microphone.status();
+    let microphone_status = audio.microphone_status();
     if !matches!(microphone_status.status, "recording" | "paused") {
         release_microphone_lease(coordinator, &microphone_status);
     }
-    let system_audio_status = system_audio.status();
+    let system_audio_status = audio.system_audio_status();
     if system_audio_status.status != "recording" {
         release_system_audio_lease(coordinator, &system_audio_status);
     }
@@ -341,25 +360,24 @@ fn dual_track_capture_response(
 
 #[tauri::command]
 fn mic_adapter_prepare(
-    microphone: tauri::State<'_, native_mic_capture_runtime::NativeMicCaptureSupervisor>,
+    audio: tauri::State<'_, desktop_audio_adapter_runtime::DesktopAudioCaptureAdapters>,
 ) -> native_mic_capture_runtime::NativeMicCaptureResponse {
-    microphone.prepare()
+    audio.microphone_prepare()
 }
 
 #[tauri::command]
 async fn mic_adapter_probe(
     app: tauri::AppHandle,
+    device_id: Option<String>,
 ) -> Result<native_mic_capture_runtime::NativeMicProbeResponse, String> {
     // The explicit preflight click owns the permission request and 2.5-second sample.
     tauri::async_runtime::spawn_blocking(move || {
         let coordinator =
             app.state::<native_system_audio_capture_runtime::DualTrackCaptureCoordinator>();
-        let microphone = app.state::<native_mic_capture_runtime::NativeMicCaptureSupervisor>();
-        let system_audio =
-            app.state::<native_system_audio_capture_runtime::SystemAudioCaptureSupervisor>();
-        reconcile_capture_coordinator(&coordinator, &microphone, &system_audio);
+        let audio = app.state::<desktop_audio_adapter_runtime::DesktopAudioCaptureAdapters>();
+        reconcile_capture_coordinator(&coordinator, &audio);
         coordinator.claim_microphone_probe()?;
-        let response = microphone.probe();
+        let response = audio.microphone_probe(device_id.as_deref());
         coordinator.release_microphone_probe();
         Ok(response)
     })
@@ -369,13 +387,13 @@ async fn mic_adapter_probe(
 
 #[tauri::command]
 fn mic_adapter_status(
-    microphone: tauri::State<'_, native_mic_capture_runtime::NativeMicCaptureSupervisor>,
+    audio: tauri::State<'_, desktop_audio_adapter_runtime::DesktopAudioCaptureAdapters>,
     capture_coordinator: tauri::State<
         '_,
         native_system_audio_capture_runtime::DualTrackCaptureCoordinator,
     >,
 ) -> native_mic_capture_runtime::NativeMicCaptureResponse {
-    let response = microphone.status();
+    let response = audio.microphone_status();
     if !matches!(response.status, "recording" | "paused") {
         release_microphone_lease(&capture_coordinator, &response);
     }
@@ -385,15 +403,16 @@ fn mic_adapter_status(
 #[tauri::command]
 fn mic_adapter_collect_events(
     session_id: Option<String>,
-    microphone: tauri::State<'_, native_mic_capture_runtime::NativeMicCaptureSupervisor>,
+    audio: tauri::State<'_, desktop_audio_adapter_runtime::DesktopAudioCaptureAdapters>,
 ) -> native_mic_capture_runtime::NativeMicEventsResponse {
-    microphone.collect_events(session_id)
+    audio.microphone_events(session_id)
 }
 
 #[tauri::command]
 async fn mic_adapter_start(
     app: tauri::AppHandle,
     session_id: Option<String>,
+    device_id: Option<String>,
 ) -> Result<native_mic_capture_runtime::NativeMicCaptureResponse, String> {
     // The helper startup waits for macOS permission, WebSocket readiness, and audio setup.
     // Keep that blocking work off the Tauri UI command path so the window remains responsive.
@@ -401,16 +420,15 @@ async fn mic_adapter_start(
         let requested_session = session_id.clone().unwrap_or_default();
         let coordinator =
             app.state::<native_system_audio_capture_runtime::DualTrackCaptureCoordinator>();
-        let microphone = app.state::<native_mic_capture_runtime::NativeMicCaptureSupervisor>();
-        let system_audio =
-            app.state::<native_system_audio_capture_runtime::SystemAudioCaptureSupervisor>();
-        reconcile_capture_coordinator(&coordinator, &microphone, &system_audio);
+        let audio = app.state::<desktop_audio_adapter_runtime::DesktopAudioCaptureAdapters>();
+        reconcile_capture_coordinator(&coordinator, &audio);
         let lease = coordinator.claim_track(
             native_system_audio_capture_runtime::CaptureTrack::Microphone,
             &requested_session,
         )?;
         let backend = app.state::<desktop_backend_supervisor::BackendSupervisor>();
-        let response = microphone.start_with_epoch(session_id, Some(lease.capture_epoch), &backend);
+        let response =
+            audio.microphone_start(session_id, Some(lease.capture_epoch), device_id, &backend);
         if response.command_status != "ok" {
             coordinator.release_track(
                 native_system_audio_capture_runtime::CaptureTrack::Microphone,
@@ -426,28 +444,28 @@ async fn mic_adapter_start(
 
 #[tauri::command]
 fn mic_adapter_pause(
-    microphone: tauri::State<'_, native_mic_capture_runtime::NativeMicCaptureSupervisor>,
+    audio: tauri::State<'_, desktop_audio_adapter_runtime::DesktopAudioCaptureAdapters>,
 ) -> native_mic_capture_runtime::NativeMicCaptureResponse {
-    microphone.pause()
+    audio.microphone_pause()
 }
 
 #[tauri::command]
 fn mic_adapter_resume(
-    microphone: tauri::State<'_, native_mic_capture_runtime::NativeMicCaptureSupervisor>,
+    audio: tauri::State<'_, desktop_audio_adapter_runtime::DesktopAudioCaptureAdapters>,
 ) -> native_mic_capture_runtime::NativeMicCaptureResponse {
-    microphone.resume()
+    audio.microphone_resume()
 }
 
 #[tauri::command]
 fn mic_adapter_stop(
     session_id: Option<String>,
-    microphone: tauri::State<'_, native_mic_capture_runtime::NativeMicCaptureSupervisor>,
+    audio: tauri::State<'_, desktop_audio_adapter_runtime::DesktopAudioCaptureAdapters>,
     capture_coordinator: tauri::State<
         '_,
         native_system_audio_capture_runtime::DualTrackCaptureCoordinator,
     >,
 ) -> native_mic_capture_runtime::NativeMicCaptureResponse {
-    let response = microphone.stop_for_session(session_id.as_deref());
+    let response = audio.microphone_stop(session_id.as_deref());
     if response.command_status == "ok" && !matches!(response.status, "recording" | "paused") {
         release_microphone_lease(&capture_coordinator, &response);
     }
@@ -457,13 +475,13 @@ fn mic_adapter_stop(
 #[tauri::command]
 fn mic_adapter_cleanup(
     session_id: Option<String>,
-    microphone: tauri::State<'_, native_mic_capture_runtime::NativeMicCaptureSupervisor>,
+    audio: tauri::State<'_, desktop_audio_adapter_runtime::DesktopAudioCaptureAdapters>,
     capture_coordinator: tauri::State<
         '_,
         native_system_audio_capture_runtime::DualTrackCaptureCoordinator,
     >,
 ) -> native_mic_capture_runtime::NativeMicCaptureResponse {
-    let response = microphone.cleanup_for_session(session_id.as_deref());
+    let response = audio.microphone_cleanup(session_id.as_deref());
     if response.command_status == "ok" {
         release_microphone_lease(&capture_coordinator, &response);
     }
@@ -472,27 +490,21 @@ fn mic_adapter_cleanup(
 
 #[tauri::command]
 fn system_audio_adapter_prepare(
-    system_audio: tauri::State<
-        '_,
-        native_system_audio_capture_runtime::SystemAudioCaptureSupervisor,
-    >,
+    audio: tauri::State<'_, desktop_audio_adapter_runtime::DesktopAudioCaptureAdapters>,
 ) -> native_system_audio_capture_runtime::SystemAudioCaptureResponse {
-    system_audio.prepare()
+    audio.system_audio_prepare()
 }
 
 #[tauri::command]
 fn system_audio_adapter_status(
-    system_audio: tauri::State<
-        '_,
-        native_system_audio_capture_runtime::SystemAudioCaptureSupervisor,
-    >,
+    audio: tauri::State<'_, desktop_audio_adapter_runtime::DesktopAudioCaptureAdapters>,
     capture_coordinator: tauri::State<
         '_,
         native_system_audio_capture_runtime::DualTrackCaptureCoordinator,
     >,
 ) -> native_system_audio_capture_runtime::SystemAudioCaptureResponse {
-    let response = system_audio.status();
-    if !system_audio.is_active() {
+    let response = audio.system_audio_status();
+    if !audio.system_audio_is_active() {
         release_system_audio_lease(&capture_coordinator, &response);
     }
     response
@@ -501,12 +513,9 @@ fn system_audio_adapter_status(
 #[tauri::command]
 fn system_audio_adapter_collect_events(
     session_id: Option<String>,
-    system_audio: tauri::State<
-        '_,
-        native_system_audio_capture_runtime::SystemAudioCaptureSupervisor,
-    >,
+    audio: tauri::State<'_, desktop_audio_adapter_runtime::DesktopAudioCaptureAdapters>,
 ) -> native_system_audio_capture_runtime::SystemAudioEventsResponse {
-    system_audio.collect_events(session_id)
+    audio.system_audio_events(session_id)
 }
 
 #[tauri::command]
@@ -515,25 +524,25 @@ async fn system_audio_adapter_start(
     session_id: Option<String>,
     display_id: Option<u32>,
     request_permission: Option<bool>,
+    device_id: Option<String>,
 ) -> Result<native_system_audio_capture_runtime::SystemAudioCaptureResponse, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let requested_session = session_id.clone().unwrap_or_default();
-        let microphone = app.state::<native_mic_capture_runtime::NativeMicCaptureSupervisor>();
-        let system_audio =
-            app.state::<native_system_audio_capture_runtime::SystemAudioCaptureSupervisor>();
+        let audio = app.state::<desktop_audio_adapter_runtime::DesktopAudioCaptureAdapters>();
         let coordinator =
             app.state::<native_system_audio_capture_runtime::DualTrackCaptureCoordinator>();
-        reconcile_capture_coordinator(&coordinator, &microphone, &system_audio);
+        reconcile_capture_coordinator(&coordinator, &audio);
         let lease = coordinator.claim_track(
             native_system_audio_capture_runtime::CaptureTrack::SystemAudio,
             &requested_session,
         )?;
         let backend = app.state::<desktop_backend_supervisor::BackendSupervisor>();
-        let response = system_audio.start_with_epoch(
+        let response = audio.system_audio_start(
             session_id,
             display_id,
             request_permission.unwrap_or(false),
             Some(lease.capture_epoch),
+            device_id,
             &backend,
         );
         if response.command_status != "ok" {
@@ -552,17 +561,14 @@ async fn system_audio_adapter_start(
 #[tauri::command]
 fn system_audio_adapter_stop(
     session_id: Option<String>,
-    system_audio: tauri::State<
-        '_,
-        native_system_audio_capture_runtime::SystemAudioCaptureSupervisor,
-    >,
+    audio: tauri::State<'_, desktop_audio_adapter_runtime::DesktopAudioCaptureAdapters>,
     capture_coordinator: tauri::State<
         '_,
         native_system_audio_capture_runtime::DualTrackCaptureCoordinator,
     >,
 ) -> native_system_audio_capture_runtime::SystemAudioCaptureResponse {
-    let response = system_audio.stop_for_session(session_id.as_deref());
-    if response.command_status == "ok" && !system_audio.is_active() {
+    let response = audio.system_audio_stop(session_id.as_deref());
+    if response.command_status == "ok" && !audio.system_audio_is_active() {
         release_system_audio_lease(&capture_coordinator, &response);
     }
     response
@@ -571,16 +577,13 @@ fn system_audio_adapter_stop(
 #[tauri::command]
 fn system_audio_adapter_cleanup(
     session_id: Option<String>,
-    system_audio: tauri::State<
-        '_,
-        native_system_audio_capture_runtime::SystemAudioCaptureSupervisor,
-    >,
+    audio: tauri::State<'_, desktop_audio_adapter_runtime::DesktopAudioCaptureAdapters>,
     capture_coordinator: tauri::State<
         '_,
         native_system_audio_capture_runtime::DualTrackCaptureCoordinator,
     >,
 ) -> native_system_audio_capture_runtime::SystemAudioCaptureResponse {
-    let response = system_audio.cleanup_for_session(session_id.as_deref());
+    let response = audio.system_audio_cleanup(session_id.as_deref());
     if response.command_status == "ok" {
         release_system_audio_lease(&capture_coordinator, &response);
     }
@@ -593,27 +596,29 @@ async fn dual_track_adapter_start(
     session_id: String,
     display_id: Option<u32>,
     request_system_audio_permission: bool,
+    microphone_device_id: Option<String>,
+    system_audio_device_id: Option<String>,
 ) -> Result<DualTrackCaptureResponse, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let microphone = app.state::<native_mic_capture_runtime::NativeMicCaptureSupervisor>();
-        let system_audio =
-            app.state::<native_system_audio_capture_runtime::SystemAudioCaptureSupervisor>();
+        let audio = app.state::<desktop_audio_adapter_runtime::DesktopAudioCaptureAdapters>();
         let coordinator =
             app.state::<native_system_audio_capture_runtime::DualTrackCaptureCoordinator>();
-        reconcile_capture_coordinator(&coordinator, &microphone, &system_audio);
+        reconcile_capture_coordinator(&coordinator, &audio);
         let leases = coordinator.claim_dual_track(&session_id)?;
         let backend = app.state::<desktop_backend_supervisor::BackendSupervisor>();
 
-        let microphone_response = microphone.start_with_epoch(
+        let microphone_response = audio.microphone_start(
             Some(session_id.clone()),
             Some(leases.microphone.capture_epoch),
+            microphone_device_id,
             &backend,
         );
-        let system_audio_response = system_audio.start_with_epoch(
+        let system_audio_response = audio.system_audio_start(
             Some(session_id.clone()),
             display_id,
             request_system_audio_permission,
             Some(leases.system_audio.capture_epoch),
+            system_audio_device_id,
             &backend,
         );
         if microphone_response.command_status != "ok" {
@@ -644,23 +649,19 @@ async fn dual_track_adapter_start(
 
 #[tauri::command]
 fn dual_track_adapter_status(
-    microphone: tauri::State<'_, native_mic_capture_runtime::NativeMicCaptureSupervisor>,
-    system_audio: tauri::State<
-        '_,
-        native_system_audio_capture_runtime::SystemAudioCaptureSupervisor,
-    >,
+    audio: tauri::State<'_, desktop_audio_adapter_runtime::DesktopAudioCaptureAdapters>,
     capture_coordinator: tauri::State<
         '_,
         native_system_audio_capture_runtime::DualTrackCaptureCoordinator,
     >,
 ) -> DualTrackCaptureResponse {
-    reconcile_capture_coordinator(&capture_coordinator, &microphone, &system_audio);
+    reconcile_capture_coordinator(&capture_coordinator, &audio);
     let coordinator = capture_coordinator.snapshot();
     dual_track_capture_response(
         "dual_track_adapter.status",
         coordinator.session_id.clone(),
-        microphone.status(),
-        system_audio.status(),
+        audio.microphone_status(),
+        audio.system_audio_status(),
         coordinator,
     )
 }
@@ -668,14 +669,10 @@ fn dual_track_adapter_status(
 #[tauri::command]
 fn dual_track_adapter_collect_events(
     session_id: String,
-    microphone: tauri::State<'_, native_mic_capture_runtime::NativeMicCaptureSupervisor>,
-    system_audio: tauri::State<
-        '_,
-        native_system_audio_capture_runtime::SystemAudioCaptureSupervisor,
-    >,
+    audio: tauri::State<'_, desktop_audio_adapter_runtime::DesktopAudioCaptureAdapters>,
 ) -> DualTrackEventsResponse {
-    let microphone = microphone.collect_events(Some(session_id.clone()));
-    let system_audio = system_audio.collect_events(Some(session_id.clone()));
+    let microphone = audio.microphone_events(Some(session_id.clone()));
+    let system_audio = audio.system_audio_events(Some(session_id.clone()));
     let successful_commands =
         u8::from(microphone.command_status == "ok") + u8::from(system_audio.command_status == "ok");
     DualTrackEventsResponse {
@@ -697,18 +694,14 @@ fn dual_track_adapter_collect_events(
 #[tauri::command]
 fn dual_track_adapter_stop(
     session_id: String,
-    microphone: tauri::State<'_, native_mic_capture_runtime::NativeMicCaptureSupervisor>,
-    system_audio: tauri::State<
-        '_,
-        native_system_audio_capture_runtime::SystemAudioCaptureSupervisor,
-    >,
+    audio: tauri::State<'_, desktop_audio_adapter_runtime::DesktopAudioCaptureAdapters>,
     capture_coordinator: tauri::State<
         '_,
         native_system_audio_capture_runtime::DualTrackCaptureCoordinator,
     >,
 ) -> DualTrackCaptureResponse {
-    let microphone_response = microphone.stop_for_session(Some(&session_id));
-    let system_audio_response = system_audio.stop_for_session(Some(&session_id));
+    let microphone_response = audio.microphone_stop(Some(&session_id));
+    let system_audio_response = audio.system_audio_stop(Some(&session_id));
     if microphone_response.command_status == "ok" {
         release_microphone_lease(&capture_coordinator, &microphone_response);
     }
@@ -727,18 +720,14 @@ fn dual_track_adapter_stop(
 #[tauri::command]
 fn dual_track_adapter_cleanup(
     session_id: String,
-    microphone: tauri::State<'_, native_mic_capture_runtime::NativeMicCaptureSupervisor>,
-    system_audio: tauri::State<
-        '_,
-        native_system_audio_capture_runtime::SystemAudioCaptureSupervisor,
-    >,
+    audio: tauri::State<'_, desktop_audio_adapter_runtime::DesktopAudioCaptureAdapters>,
     capture_coordinator: tauri::State<
         '_,
         native_system_audio_capture_runtime::DualTrackCaptureCoordinator,
     >,
 ) -> DualTrackCaptureResponse {
-    let microphone_response = microphone.cleanup_for_session(Some(&session_id));
-    let system_audio_response = system_audio.cleanup_for_session(Some(&session_id));
+    let microphone_response = audio.microphone_cleanup(Some(&session_id));
+    let system_audio_response = audio.system_audio_cleanup(Some(&session_id));
     if microphone_response.command_status == "ok" {
         release_microphone_lease(&capture_coordinator, &microphone_response);
     }
@@ -831,18 +820,41 @@ pub fn run() {
                     .as_deref(),
             );
             let runtime_override = env::var_os("MEETING_COPILOT_RUNTIME_BUNDLE").map(PathBuf::from);
-            let runtime_bundle = desktop_backend_supervisor::resolve_runtime_bundle(
+            let mut runtime_bundle = desktop_backend_supervisor::resolve_capability_aware_runtime_bundle(
                 &resource_dir,
+                &app_data_dir,
                 runtime_override.as_deref(),
             );
             if runtime_bundle.is_dir() {
-                supervisor
-                    .start_packaged(
-                        &runtime_bundle,
-                        &app_data_dir.join("runtime-data"),
-                        &app_log_dir,
-                    )
-                    .map_err(std::io::Error::other)?;
+                let start_result = supervisor.start_packaged(
+                    &runtime_bundle,
+                    &app_data_dir.join("runtime-data"),
+                    &app_log_dir,
+                );
+                if let Err(active_error) = start_result {
+                    let bundled_runtime = desktop_backend_supervisor::resolve_runtime_bundle(
+                        &resource_dir,
+                        None,
+                    );
+                    let can_fallback = runtime_override.is_none()
+                        && runtime_bundle != bundled_runtime
+                        && bundled_runtime.is_dir();
+                    if !can_fallback {
+                        return Err(std::io::Error::other(active_error).into());
+                    }
+                    supervisor
+                        .start_packaged(
+                            &bundled_runtime,
+                            &app_data_dir.join("runtime-data"),
+                            &app_log_dir,
+                        )
+                        .map_err(|fallback_error| {
+                            std::io::Error::other(format!(
+                                "active capability runtime failed: {active_error}; bundled runtime fallback failed: {fallback_error}"
+                            ))
+                        })?;
+                    runtime_bundle = bundled_runtime;
+                }
             } else if cfg!(debug_assertions) {
                 let base_url = env::var("MEETING_COPILOT_DESKTOP_API_BASE_URL")
                     .unwrap_or_else(|_| "http://127.0.0.1:8765".to_string());
@@ -857,17 +869,13 @@ pub fn run() {
                 )
                 .into());
             }
-            let native_mic = native_mic_capture_runtime::NativeMicCaptureSupervisor::new(
+            let audio_adapters = desktop_audio_adapter_runtime::DesktopAudioCaptureAdapters::new(
                 runtime_bundle.join("bin/meeting-copilot-native-mic"),
                 app_data_dir.join("native-mic"),
-                app_log_dir.clone(),
+                runtime_bundle.join("bin/meeting-copilot-native-system-audio"),
+                app_data_dir.join("native-system-audio"),
+                app_log_dir,
             );
-            let native_system_audio =
-                native_system_audio_capture_runtime::SystemAudioCaptureSupervisor::new(
-                    runtime_bundle.join("bin/meeting-copilot-native-system-audio"),
-                    app_data_dir.join("native-system-audio"),
-                    app_log_dir,
-                );
             let capture_coordinator =
                 native_system_audio_capture_runtime::DualTrackCaptureCoordinator::default();
             let workbench_url = supervisor.workbench_url().map_err(std::io::Error::other)?;
@@ -875,8 +883,7 @@ pub fn run() {
                 packaged_remote_pattern(&workbench_url).map_err(std::io::Error::other)?;
             app.add_capability(packaged_remote_capability(remote_pattern))?;
             app.manage(supervisor);
-            app.manage(native_mic);
-            app.manage(native_system_audio);
+            app.manage(audio_adapters);
             app.manage(capture_coordinator);
             app.manage(provider_config);
             let window = app
@@ -925,6 +932,7 @@ pub fn run() {
             mic_adapter_resume,
             mic_adapter_stop,
             mic_adapter_cleanup,
+            windows_audio_devices,
             system_audio_adapter_prepare,
             system_audio_adapter_status,
             system_audio_adapter_collect_events,
@@ -945,17 +953,11 @@ pub fn run() {
         .expect("error while building Meeting Copilot desktop shell");
     app.run(|app_handle, event| {
         if matches!(event, tauri::RunEvent::Exit) {
-            if let Some(system_audio) =
-                app_handle
-                    .try_state::<native_system_audio_capture_runtime::SystemAudioCaptureSupervisor>(
-                    )
+            if let Some(audio) =
+                app_handle.try_state::<desktop_audio_adapter_runtime::DesktopAudioCaptureAdapters>()
             {
-                system_audio.stop();
-            }
-            if let Some(microphone) =
-                app_handle.try_state::<native_mic_capture_runtime::NativeMicCaptureSupervisor>()
-            {
-                microphone.stop();
+                audio.system_audio_stop(None);
+                audio.microphone_stop(None);
             }
             if let Some(supervisor) =
                 app_handle.try_state::<desktop_backend_supervisor::BackendSupervisor>()

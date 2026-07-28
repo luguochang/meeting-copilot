@@ -4,6 +4,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TOOL_PATH = REPO_ROOT / "tools" / "long_meeting_soak_runner.py"
@@ -77,6 +79,31 @@ def test_soak_runner_writes_go_report_for_20_minute_simulated_plan(tmp_path):
     assert report_path.exists()
     persisted = json.loads(report_path.read_text(encoding="utf-8"))
     assert persisted == report
+
+
+@pytest.mark.parametrize("duration_minutes", [30, 60, 120])
+def test_soak_runner_builds_required_imported_audio_duration_matrix(tmp_path, duration_minutes):
+    tool = load_tool_module()
+    metrics = fake_go_metrics(
+        asr_elapsed_seconds=duration_minutes * 6,
+        card_count=duration_minutes // 5,
+    )
+
+    result = tool.run_long_meeting_soak(
+        run_id=f"imported-audio-{duration_minutes}m",
+        artifact_root=tmp_path / "soak",
+        duration_minutes=duration_minutes,
+        metrics=metrics,
+    )
+
+    report = result["report"]
+    assert report["duration_minutes"] == duration_minutes
+    assert report["expected_audio_seconds"] == duration_minutes * 60
+    assert report["chunk_count"] == duration_minutes * 30
+    assert report["input_plan"]["kind"] == "deterministic_simulated_realtime_meeting"
+    assert report["privacy_cost_flags"]["real_microphone_started"] is False
+    assert report["privacy_cost_flags"]["raw_audio_uploaded"] is False
+    assert report["verdict"] == "go"
 
 
 def test_soak_runner_suppresses_or_blocks_when_cards_exceed_frequency_cap(tmp_path):

@@ -375,3 +375,98 @@ def test_normalize_recovers_ten_minute_v5_real_mic_remaining_variants():
     assert tn.normalize("picture er 是普通图片练习") == "picture er 是普通图片练习"
     assert tn.normalize("havect 是无上下文拼写") == "havect 是无上下文拼写"
     assert tn.normalize("那or 是聊天口误") == "那or 是聊天口误"
+
+
+def test_normalize_recovers_controlled_offline_refiner_technical_terms_without_guessing():
+    tn.load_terms.cache_clear()
+
+    api = tn.normalize("接口新增trace下划线id字段，老版本调用方要兼容")
+    release = tn.normalize(
+        "payment gaadway先灰度，如果p九九超过八百毫秒就回滚，补充graphfena看板和告警预值"
+    )
+    incident = tn.normalize("REDIS连接池耗尽导致order service超时，p九五从一百二十毫秒涨到两秒")
+    mixed = tn.normalize(
+        "PR把gate api斜杠v一orders的response增加total下划线amount字段，避免mobile app和BI drop解析失败"
+    )
+
+    assert "trace_id字段" in api
+    assert "payment-gateway先灰度" in release
+    assert "P99超过800毫秒" in release
+    assert "Grafana看板和告警阈值" in release
+    assert "order-service超时" in incident
+    assert "P95从120毫秒涨到2秒" in incident
+    assert "GET /api/v1/orders的response" in mixed
+    assert "total_amount字段" in mixed
+    assert "mobile-app和BI job解析失败" in mixed
+
+    assert tn.normalize("payment gaadway 是无上下文拼写练习") == "payment gaadway 是无上下文拼写练习"
+    assert tn.normalize("graphfena 是一个用户名") == "graphfena 是一个用户名"
+    assert tn.normalize("mobile app 是普通应用描述") == "mobile app 是普通应用描述"
+    assert tn.normalize("BI drop 是普通英文短语") == "BI drop 是普通英文短语"
+
+
+def test_normalize_recovers_measured_controlled_matrix_residuals_with_negative_controls():
+    tn.load_terms.cache_clear()
+
+    api = tn.normalize(
+        "接口新增tres下划线id字段，张三下，周三补充兼容性测试用例。"
+        "上限的时候，先灰度百分之十"
+    )
+    release = tn.normalize(
+        "payment gaate way先灰度百分之十，如果p九九超过八百毫秒，"
+        "或者错误率超过百分之零点一就回滚。补充graa ffn a看板"
+    )
+    incident = tn.normalize(
+        "red IS连接池耗尽导致order service超时p九五从一百二十毫秒涨到两秒，"
+        "王五负责补线流和连接池监控"
+    )
+
+    assert "trace_id字段" in api
+    assert "张三下周三补充兼容性测试用例" in api
+    assert "上线的时候" in api
+    assert "灰度10%，如果P99超过800毫秒" in release
+    assert "错误率超过0.1%就回滚" in release
+    assert "Grafana看板" in release
+    assert "Redis连接池" in incident
+    assert "order-service超时P95从120毫秒涨到2秒" in incident
+    assert "补限流和连接池监控" in incident
+    assert "payment-gateway先灰度" in tn.normalize("payment gave way先灰度百分之十")
+    assert "Grafana看板" in tn.normalize("补充graphfna看板")
+
+    assert tn.normalize("tres下划线id 是一段拼写练习") == "tres下划线id 是一段拼写练习"
+    assert tn.normalize("graa ffn a 是用户名") == "graa ffn a 是用户名"
+    assert tn.normalize("payment gaate way 是拼写练习") == "payment gaate way 是拼写练习"
+    assert tn.normalize("payment gave way 是普通英文句子") == "payment gave way 是普通英文句子"
+    assert tn.normalize("graphfna 是用户名") == "graphfna 是用户名"
+    assert tn.normalize("red IS 是颜色短语") == "red IS 是颜色短语"
+    assert tn.normalize("灰度百分之十用于普通描述") == "灰度百分之十用于普通描述"
+    assert tn.normalize("孩子两秒后到达") == "孩子两秒后到达"
+
+
+def test_normalize_recovers_post_vad_real_acoustic_variants_without_broad_rewrites():
+    tn.load_terms.cache_clear()
+
+    normalized = tn.normalize(
+        "我们这次接口新增trees下划线IZ字段，但是老版本调用方要兼容两。"
+        "上限的时候，纤灰度百分之十，如果错误率超过千分之一就回稳。"
+    )
+
+    assert "trace_id字段" in normalized
+    assert "上线的时候，先灰度百分之十" in normalized
+    assert "错误率超过千分之一就回滚" in normalized
+    assert tn.normalize("trees下划线IZ是一段拼写练习") == "trees下划线IZ是一段拼写练习"
+    assert tn.normalize("纤灰度是颜色描述") == "纤灰度是颜色描述"
+    assert tn.normalize("湖面逐渐回稳") == "湖面逐渐回稳"
+
+
+def test_normalize_recovers_latest_acoustic_variants_only_in_release_context():
+    tn.load_terms.cache_clear()
+
+    normalized = tn.normalize(
+        "接口新增tres下划线YZ字段。上限的食后，纤灰度百分之十。"
+    )
+
+    assert normalized == "接口新增trace_id字段。上线的时候，先灰度百分之十。"
+    assert tn.normalize("tres下划线YZ是一段拼写练习") == "tres下划线YZ是一段拼写练习"
+    assert tn.normalize("上限的时后需要复核") == "上限的时后需要复核"
+    assert tn.normalize("上限的食后需要复核") == "上限的食后需要复核"

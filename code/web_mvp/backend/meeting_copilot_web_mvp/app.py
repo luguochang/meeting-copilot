@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import re
 import sqlite3
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 import unicodedata
 from urllib.parse import quote, urlsplit
 
@@ -34,6 +34,7 @@ from meeting_copilot_web_mvp.logging_config import (
 )
 from meeting_copilot_web_mvp.meeting_preparation import MeetingPreparationStore
 from meeting_copilot_web_mvp import llm_service
+from meeting_copilot_web_mvp import asr_refiner
 from meeting_copilot_web_mvp import asr_stream
 from meeting_copilot_web_mvp import batch_transcribe
 from meeting_copilot_web_mvp import diagnostic_bundle
@@ -50,6 +51,10 @@ from meeting_copilot_web_mvp import audio_assets
 from meeting_copilot_web_mvp import desktop_parent_watchdog
 from meeting_copilot_web_mvp import realtime_transcript_correction
 from meeting_copilot_web_mvp.canonical_transcript import project_canonical_transcript
+from meeting_copilot_web_mvp.capability_pack_manager import (
+    CapabilityPackError,
+    CapabilityPackManager,
+)
 from meeting_copilot_web_mvp.llm_lane_locks import LaneLockRegistry
 from meeting_copilot_web_mvp.pipeline_trace import PipelineTraceCollector
 from meeting_copilot_web_mvp.realtime_slo import RealtimeSLOStore
@@ -59,6 +64,7 @@ from meeting_copilot_web_mvp.application_schema import (
 )
 from meeting_copilot_web_mvp.v2_persistence import (
     DEFAULT_EVENT_PAGE_LIMIT,
+    INTELLIGENCE_MAX_BATCH_SEGMENTS,
     MAX_EVENT_PAGE_LIMIT,
     ReviewDocumentConflict,
     REVIEW_DOCUMENT_KINDS,
@@ -448,6 +454,41 @@ def _v2_complete_transcript(persistence: V2Persistence, meeting_id: str) -> list
         if next_seq <= after_seq:
             raise RuntimeError("meeting export transcript cursor did not advance")
         after_seq = next_seq
+
+
+def _v2_intelligence_batch_segments(
+    persistence: V2Persistence,
+    job: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    meeting_id = str(job["meeting_id"])
+    target_seq = int(job.get("input_transcript_seq") or 0)
+    terminal_statuses = {"succeeded", "failed", "cancelled"}
+    previous_batch_end = max(
+        (
+            int(candidate.get("input_transcript_seq") or 0)
+            for candidate in persistence.list_jobs(meeting_id=meeting_id)
+            if candidate.get("kind") == "intelligence"
+            and candidate.get("id") != job.get("id")
+            and candidate.get("status") in terminal_statuses
+            and int(candidate.get("input_transcript_seq") or 0) < target_seq
+        ),
+        default=0,
+    )
+    all_segments = _v2_complete_transcript(persistence, meeting_id)
+    new_segments = [
+        segment
+        for segment in all_segments
+        if previous_batch_end < int(segment.get("transcript_seq") or 0) <= target_seq
+    ][-INTELLIGENCE_MAX_BATCH_SEGMENTS:]
+    if not new_segments:
+        return [], []
+    first_seq = int(new_segments[0].get("transcript_seq") or 0)
+    context = [
+        segment
+        for segment in all_segments
+        if int(segment.get("transcript_seq") or 0) < first_seq
+    ][-3:]
+    return new_segments, context
 
 
 def _v2_export_payload(persistence: V2Persistence, meeting_id: str) -> dict[str, Any]:
@@ -1035,6 +1076,27 @@ def create_app(
     else:
         repo = InMemorySessionRepository()
         asr_live_repo = InMemoryAsrLiveSessionRepository()
+    capability_manager: CapabilityPackManager | None = None
+    if data_dir_path is not None:
+        desktop_runtime = os.environ.get("MEETING_COPILOT_DESKTOP_RUNTIME") == "1"
+        capability_root = (
+            data_dir_path.parent / "capability-packs"
+            if desktop_runtime
+            else data_dir_path / "capability-packs"
+        )
+        runtime_manifest_value = os.environ.get("MEETING_COPILOT_RUNTIME_MANIFEST", "").strip()
+        source_runtime_bundle = (
+            Path(runtime_manifest_value).expanduser().resolve(strict=False).parent
+            if runtime_manifest_value
+            else None
+        )
+        capability_manager = CapabilityPackManager(
+            capability_root,
+            source_runtime_bundle=source_runtime_bundle,
+            app_version=os.environ.get("MEETING_COPILOT_APP_VERSION", "0.1.0"),
+            download_page_url=os.environ.get("MEETING_COPILOT_ASR_OFFLINE_DOWNLOAD_URL"),
+        )
+    app.state.capability_manager = capability_manager
     default_settings = SettingsPayload().model_dump(mode="json")
     if data_dir_path is not None:
         settings_usage_repo = SqliteSettingsUsageRepository(data_dir_path, default_settings)
@@ -1324,26 +1386,79 @@ def create_app(
             (job for job in reversed(active_jobs) if job.get("error_class") == "ProviderRuntimeNotConfiguredDeferred"),
             None,
         )
-        failed = next((job for job in reversed(intelligence_jobs) if job.get("status") == "failed"), None)
+        latest_job = max(
+            intelligence_jobs,
+            key=lambda job: (int(job.get("updated_at_ms") or 0), str(job.get("id") or "")),
+            default=None,
+        )
+        provider_config = llm_service.LlmConfig.from_env()
         runtime = dict(projected.get("runtime") or {})
-        if deferred is not None:
+        if provider_config is None or deferred is not None:
             runtime["ai"] = {
                 "state": "paused",
-                "label": "AI 已暂停",
+                "label": "AI 未连接",
                 "level": None,
-                "detail": "LLM Provider 不可用，实时理解已暂停",
+                "detail": "录音和转写可继续，连接模型后恢复 AI 功能",
                 "error_class": "ProviderRuntimeNotConfiguredDeferred",
             }
-        elif failed is not None:
-            runtime["ai"] = {
-                "state": "error",
-                "label": "AI 处理失败",
-                "level": None,
-                "detail": "实时理解未生成正式结果",
-                "error_class": failed.get("error_class"),
-            }
         elif active_jobs:
-            runtime["ai"] = {"state": "busy", "label": "AI 正在处理", "level": None, "detail": None}
+            runtime["ai"] = {"state": "busy", "label": "AI 正在理解", "level": None, "detail": None}
+        elif latest_job is not None and latest_job.get("status") == "failed":
+            runtime["ai"] = {
+                "state": "paused",
+                "label": "实时理解待重试",
+                "level": None,
+                "detail": "模型仍已连接，本轮实时理解失败，不影响录音和会后整理",
+                "error_class": latest_job.get("error_class"),
+            }
+        else:
+            runtime["ai"] = {"state": "active", "label": "AI 已连接", "level": None, "detail": None}
+        correction_statuses = [str(segment.get("correction_status") or "pending") for segment in projected.get("segments") or []]
+        review = dict(projected.get("review") or {})
+        preparation = meeting_preparation_store.get(meeting_id) if meeting_preparation_store is not None else None
+        if preparation is not None and preparation.proactive_suggestion_policy == "off":
+            projected["follow_up"] = None
+        runtime["ai"]["capabilities"] = {
+            "provider": {
+                "state": "active" if provider_config is not None else "offline",
+                "label": "模型已连接" if provider_config is not None else "模型未连接",
+                "detail": provider_config.model if provider_config is not None else None,
+            },
+            "transcript": {
+                "state": (
+                    "busy" if any(status in {"pending", "processing"} for status in correction_statuses)
+                    else "paused" if any(status == "failed_preserved_original" for status in correction_statuses)
+                    else "active"
+                ),
+                "label": (
+                    "精修处理中" if any(status in {"pending", "processing"} for status in correction_statuses)
+                    else "部分保留识别原文" if any(status == "failed_preserved_original" for status in correction_statuses)
+                    else "精修已稳定"
+                ),
+            },
+            "intelligence": {
+                "state": runtime["ai"]["state"],
+                "label": runtime["ai"]["label"],
+                "error_class": runtime["ai"].get("error_class"),
+            },
+            "proactive_suggestions": {
+                "state": "paused" if preparation is not None and preparation.proactive_suggestion_policy == "off" else "idle",
+                "label": (
+                    "主动建议已关闭"
+                    if preparation is not None and preparation.proactive_suggestion_policy == "off"
+                    else "低频建议"
+                ),
+            },
+            "review": {
+                "state": "error" if review.get("status") == "failed" else "busy" if review.get("status") == "processing" else "idle",
+                "label": (
+                    "会后整理失败" if review.get("status") == "failed"
+                    else "会后整理中" if review.get("status") == "processing"
+                    else "会后整理就绪" if review.get("status") == "ready"
+                    else "会后整理待开始"
+                ),
+            },
+        }
         projected["runtime"] = runtime
         diagnostics = dict(projected.get("diagnostics") or {})
         diagnostics["formal_ai_projection"] = "llm_first_only"
@@ -1541,6 +1656,58 @@ def create_app(
             "macos_system_audio",
         }
 
+    def _recording_timeline_offset_ms(
+        meeting_id: str,
+        *,
+        track: str | None,
+        epoch: int,
+    ) -> int:
+        if v2_persistence is None or track not in {"microphone", "system_audio"} or epoch <= 0:
+            return 0
+        deadline = time.monotonic() + 0.75
+        while True:
+            previous = [
+                recording
+                for recording in v2_persistence.list_recording_sessions(meeting_id)
+                if str(recording.get("track") or "") == track
+                and int(recording.get("epoch") or 0) < epoch
+            ]
+            if not any(str(recording.get("status") or "") == "active" for recording in previous):
+                return sum(max(0, int(recording.get("duration_ms") or 0)) for recording in previous)
+            if time.monotonic() >= deadline:
+                return sum(max(0, int(recording.get("duration_ms") or 0)) for recording in previous)
+            time.sleep(0.01)
+
+    def _latest_track_transcript_end_ms(meeting_id: str, track: str | None) -> int | None:
+        if v2_persistence is None or track not in {"microphone", "system_audio"}:
+            return None
+        segments = v2_persistence.get_snapshot(meeting_id, segment_limit=1_000).get("segments") or []
+        ends = [
+            int(segment.get("ended_at_ms") or 0)
+            for segment in segments
+            if str(segment.get("source_track") or "") == track
+        ]
+        return max(ends) if ends else None
+
+    def _capture_event_timeline_adjustment_ms(
+        event: Mapping[str, Any],
+        recording: Mapping[str, Any] | None,
+    ) -> int:
+        if recording is None:
+            return 0
+        recording_offset_ms = max(0, int(recording.get("timeline_offset_ms") or 0))
+        previous_end_ms = recording.get("previous_transcript_end_ms")
+        if recording_offset_ms <= 0 or previous_end_ms is None:
+            return recording_offset_ms
+        previous_end_ms = max(0, int(previous_end_ms))
+        raw_start_ms = max(0, int(event.get("start_ms") or 0))
+        # Resident ASR may resume its clock from the last final while a fresh
+        # recognizer starts again at zero. Only add the missing delta in the
+        # former case; adding the whole recording offset duplicates time.
+        if raw_start_ms >= max(0, previous_end_ms - 250):
+            return max(0, recording_offset_ms - previous_end_ms)
+        return recording_offset_ms
+
     def _commit_v2_final(session_id: str, event: dict[str, Any]) -> dict[str, Any] | None:
         if v2_persistence is None:
             return None
@@ -1557,23 +1724,32 @@ def create_app(
                 source_track in {"microphone", "system_audio"},
             )
         )
+        capture_epoch = max(0, int(event.get("capture_epoch") or 0))
+        namespace_prefix = (
+            f"{source_track}:e{capture_epoch}:"
+            if source_track in {"microphone", "system_audio"} and capture_epoch > 0
+            else f"{source_track}:"
+        )
         segment_id = (
-            f"{source_track}:{raw_segment_id}"
+            f"{namespace_prefix}{raw_segment_id}"
             if use_source_namespace
             and source_track in {"microphone", "system_audio"}
-            and not raw_segment_id.startswith(f"{source_track}:")
+            and not raw_segment_id.startswith(namespace_prefix)
             else raw_segment_id
         )
         normalized_text = str(event.get("normalized_text") or text).strip()
         evidence_hash = transcript_evidence_hash(segment_id, normalized_text)
+        timeline_offset_ms = max(0, int(event.get("timeline_offset_ms") or 0))
         committed = v2_persistence.commit_final_and_enqueue(
             meeting_id=session_id,
             final_id=f"final:{session_id}:{segment_id}",
             segment_id=segment_id,
             text=text,
             normalized_text=normalized_text,
-            started_at_ms=int(event.get("start_ms") or 0),
-            ended_at_ms=int(event.get("end_ms") or event.get("received_at_ms") or 0),
+            started_at_ms=timeline_offset_ms + int(event.get("start_ms") or 0),
+            ended_at_ms=timeline_offset_ms + int(
+                event.get("end_ms") or event.get("received_at_ms") or 0
+            ),
             evidence_hash=evidence_hash,
             now_ms=time.time_ns() // 1_000_000,
             speaker_id=(str(event["speaker_id"]) if event.get("speaker_id") is not None else None),
@@ -1711,31 +1887,85 @@ def create_app(
             await asyncio.gather(operation, return_exceptions=True)
             raise
 
+    def _split_import_transcript_segments(
+        text: str,
+        *,
+        duration_ms: int,
+        max_characters: int = 120,
+    ) -> list[dict[str, Any]]:
+        normalized = " ".join(str(text or "").split()).strip()
+        if not normalized:
+            return []
+        sentence_parts = [
+            part.strip()
+            for part in re.findall(r"[^。！？!?；;\n]+[。！？!?；;]?", normalized)
+            if part.strip()
+        ]
+        chunks: list[str] = []
+        for part in sentence_parts or [normalized]:
+            remaining = part
+            while len(remaining) > max_characters:
+                split_at = max(
+                    remaining.rfind("，", 0, max_characters + 1),
+                    remaining.rfind(",", 0, max_characters + 1),
+                    remaining.rfind(" ", 0, max_characters + 1),
+                )
+                if split_at < max_characters // 2:
+                    split_at = max_characters
+                includes_delimiter = remaining[split_at : split_at + 1] in {"，", ","}
+                chunks.append(remaining[: split_at + int(includes_delimiter)].strip())
+                remaining = remaining[split_at + int(includes_delimiter) :].strip()
+            if remaining:
+                chunks.append(remaining)
+
+        total_weight = max(1, sum(len(chunk) for chunk in chunks))
+        total_duration = max(0, int(duration_ms))
+        consumed_weight = 0
+        started_at_ms = 0
+        segments: list[dict[str, Any]] = []
+        for index, chunk in enumerate(chunks, start=1):
+            consumed_weight += len(chunk)
+            ended_at_ms = (
+                total_duration
+                if index == len(chunks)
+                else max(started_at_ms, round(total_duration * consumed_weight / total_weight))
+            )
+            segments.append(
+                {
+                    "segment_id": f"import_seg_{index:04d}",
+                    "text": chunk,
+                    "normalized_text": chunk,
+                    "start_ms": started_at_ms,
+                    "end_ms": ended_at_ms,
+                }
+            )
+            started_at_ms = ended_at_ms
+        return segments
+
     def _upsert_import_asr_live_record(
         *,
         meeting_id: str,
-        normalized_text: str,
+        transcript_segments: list[dict[str, Any]],
         asr_report: dict[str, Any],
         audio_asset: dict[str, Any],
     ) -> None:
-        streaming_events = (
-            [
-                {
-                    "event_type": "final",
-                    "segment_id": "import_seg_0001",
-                    "text": normalized_text,
-                    "start_ms": 0,
-                    "end_ms": int(audio_asset.get("duration_ms") or 0),
-                    "received_at_ms": 0,
-                    "confidence": 0.9,
-                }
-            ]
-            if normalized_text
-            else []
-        )
+        streaming_events = [
+            {
+                "event_type": "final",
+                "segment_id": segment["segment_id"],
+                "text": segment["normalized_text"],
+                "start_ms": segment["start_ms"],
+                "end_ms": segment["end_ms"],
+                "received_at_ms": 0,
+                "confidence": 0.9,
+            }
+            for segment in transcript_segments
+        ]
+        normalized_text = "".join(str(segment["normalized_text"]) for segment in transcript_segments)
+        provider = str((asr_report.get("raw") or {}).get("provider") or "local_funasr_batch")
         live_events = build_asr_live_events(
             session_id=meeting_id,
-            provider="local_funasr_batch",
+            provider=provider,
             streaming_events=streaming_events,
             is_mock=False,
         )
@@ -1750,7 +1980,7 @@ def create_app(
         )
         record = {
             "session_id": meeting_id,
-            "provider": "local_funasr_batch",
+            "provider": provider,
             "provider_mode": "real",
             "is_mock": False,
             "asr_fallback_used": False,
@@ -1794,7 +2024,9 @@ def create_app(
             source_size = await asyncio.to_thread(lambda: source_path.stat().st_size)
             if source_size <= 0 or source_size != int(job["file_size_bytes"]):
                 raise ValueError("managed import source is missing, empty, or incomplete")
-            if not batch_transcribe.is_available():
+            batch_available = batch_transcribe.is_available()
+            refiner_available = asr_refiner.refinement_capability().get("status") == "ready"
+            if not batch_available and not refiner_available:
                 raise _FileAsrComponentMissing("local file ASR component is unavailable")
 
             await _update_recording_import_stage(
@@ -1802,14 +2034,50 @@ def create_app(
                 stage="normalizing",
                 progress=20,
             )
-            asr_report = await _run_import_blocking_stage(
-                job_id=job_id,
-                stage="transcribing",
-                progress=40,
-                function=batch_transcribe.transcribe_file_report,
-                args=(source_path,),
-                kwargs={"preserve_preprocessed": True},
-            )
+            if batch_available:
+                asr_report = await _run_import_blocking_stage(
+                    job_id=job_id,
+                    stage="transcribing",
+                    progress=40,
+                    function=batch_transcribe.transcribe_file_report,
+                    args=(source_path,),
+                    kwargs={"preserve_preprocessed": True},
+                )
+            else:
+                canonical_path = await _run_import_blocking_stage(
+                    job_id=job_id,
+                    stage="normalizing",
+                    progress=20,
+                    function=batch_transcribe.ensure_wav_16k_mono,
+                    args=(source_path,),
+                )
+                refinement = await _run_import_blocking_stage(
+                    job_id=job_id,
+                    stage="transcribing",
+                    progress=40,
+                    function=asr_refiner.refine_wav_file,
+                    args=(canonical_path,),
+                    kwargs={"timeout_s": 180.0},
+                )
+                if not refinement.authoritative:
+                    raise RuntimeError(
+                        f"local offline file refinement failed: {refinement.status}:{refinement.reason or ''}"
+                    )
+                asr_report = {
+                    "text": refinement.text,
+                    "normalized_audio_path": str(canonical_path),
+                    "raw": {
+                        "provider": "local_funasr_offline",
+                        "mode": "resident_file_fallback",
+                        "model_id": refinement.model_id,
+                    },
+                    "batch": {
+                        "batch_mode": "resident_file_fallback",
+                        "safe_to_download_models": False,
+                        "safe_to_call_remote_asr": False,
+                        "safe_to_call_llm": False,
+                    },
+                }
             raw_text = str(asr_report.get("text") or "").strip()
             normalized_text = _normalize_text(raw_text)
             canonical_path = Path(str(asr_report.get("normalized_audio_path") or source_path))
@@ -1854,7 +2122,10 @@ def create_app(
             await asyncio.to_thread(
                 _upsert_import_asr_live_record,
                 meeting_id=meeting_id,
-                normalized_text=normalized_text,
+                transcript_segments=_split_import_transcript_segments(
+                    normalized_text,
+                    duration_ms=int(audio_asset["duration_ms"] or 0),
+                ),
                 asr_report=asr_report,
                 audio_asset=audio_asset,
             )
@@ -1864,15 +2135,15 @@ def create_app(
                 stage="correcting",
                 progress=70,
             )
-            if normalized_text:
+            transcript_segments = _split_import_transcript_segments(
+                normalized_text,
+                duration_ms=int(audio_asset["duration_ms"] or 0),
+            )
+            for transcript_segment in transcript_segments:
                 _commit_v2_final(
                     meeting_id,
                     {
-                        "segment_id": "import_seg_0001",
-                        "text": raw_text,
-                        "normalized_text": normalized_text,
-                        "start_ms": 0,
-                        "end_ms": int(audio_asset["duration_ms"] or 0),
+                        **transcript_segment,
                         "received_at_ms": time.time_ns() // 1_000_000,
                         "source_track": "uploaded_file",
                     },
@@ -2525,6 +2796,62 @@ def create_app(
     def application_schema_diagnostics() -> dict[str, object]:
         return dict(application_schema_migration_report)
 
+    @app.get("/v2/local-capabilities")
+    async def v2_local_capability_status() -> dict[str, Any]:
+        if capability_manager is None:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "capability_storage_unavailable",
+                    "message": "本地能力包存储不可用",
+                },
+            )
+        return capability_manager.status()
+
+    @app.post("/v2/local-capabilities/import")
+    async def v2_import_local_capability_package(
+        file: UploadFile = File(...),
+    ) -> dict[str, Any]:
+        if capability_manager is None:
+            await file.close()
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "capability_storage_unavailable",
+                    "message": "本地能力包存储不可用",
+                },
+            )
+        try:
+            return await asyncio.to_thread(
+                capability_manager.install_file,
+                file.file,
+                filename=file.filename or "",
+            )
+        except CapabilityPackError as exc:
+            status_code = 422
+            if exc.code == "base_runtime_unavailable":
+                status_code = 503
+            elif exc.code == "insufficient_disk_space":
+                status_code = 507
+            raise HTTPException(
+                status_code=status_code,
+                detail={"code": exc.code, "message": exc.public_message},
+            ) from exc
+        except OSError as exc:
+            _log.error(
+                "meeting.capability_package.import_failed",
+                error_class=type(exc).__name__,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "capability_import_io_error",
+                    "message": "离线能力包导入失败，请检查磁盘空间后重试",
+                },
+            ) from exc
+        finally:
+            await file.close()
+
     def _require_v2_persistence() -> V2Persistence:
         if v2_persistence is None:
             raise HTTPException(
@@ -2642,9 +2969,28 @@ def create_app(
                 "input_device_id": None,
                 "input_device_name": None,
                 "notice_acknowledged": False,
+                "preset_id": "general",
+                "meeting_goal": None,
+                "participant_role": None,
+                "focus_points": [],
+                "output_format": "standard",
+                "proactive_suggestion_policy": "low_frequency",
+                "version": 0,
                 "updated_at_ms": 0,
             }
         return preparation.to_dict()
+
+    @app.get("/v2/meetings/{meeting_id}/preparation/versions")
+    def get_v2_meeting_preparation_versions(meeting_id: str) -> dict[str, Any]:
+        store = _require_meeting_preparation_store()
+        try:
+            versions = store.list_versions(meeting_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {
+            "meeting_id": meeting_id,
+            "versions": [version.to_dict() for version in versions],
+        }
 
     @app.put("/v2/meetings/{meeting_id}/preparation")
     def put_v2_meeting_preparation(
@@ -2660,6 +3006,14 @@ def create_app(
                 input_device_id=payload.get("input_device_id"),
                 input_device_name=payload.get("input_device_name"),
                 notice_acknowledged=bool(payload.get("notice_acknowledged", False)),
+                preset_id=str(payload.get("preset_id") or "general"),
+                meeting_goal=payload.get("meeting_goal"),
+                participant_role=payload.get("participant_role"),
+                focus_points=payload.get("focus_points") or [],
+                output_format=str(payload.get("output_format") or "standard"),
+                proactive_suggestion_policy=str(
+                    payload.get("proactive_suggestion_policy") or "low_frequency"
+                ),
                 updated_at_ms=time.time_ns() // 1_000_000,
             )
             asr_stream.set_session_hotwords(meeting_id, list(preparation.hotwords))
@@ -2933,9 +3287,16 @@ def create_app(
             live_record = asr_live_repo.get(meeting_id)
         except KeyError:
             return snapshot
+        event_source = _asr_live_event_source_metadata(live_record)
+        has_effective_transcript = bool(event_source.get("non_empty_transcript"))
+        reason_source = (
+            list(event_source.get("degradation_reasons") or [])
+            if has_effective_transcript
+            else _effective_asr_degradation_reasons(live_record)
+        )
         degradation_reasons = [
             str(reason)
-            for reason in live_record.get("degradation_reasons") or []
+            for reason in reason_source
             if str(reason)
             in {
                 "asr_semantic_quality_blocked",
@@ -2944,16 +3305,25 @@ def create_app(
                 "stream_interrupted",
             }
         ]
-        formal_status = str(live_record.get("formal_derivation_status") or "").strip()
-        if not formal_status:
+        if has_effective_transcript:
             formal_status = (
                 "suppressed_by_asr_semantic_quality"
-                if "asr_semantic_quality_blocked" in degradation_reasons
+                if (event_source.get("asr_semantic_quality") or {}).get("blocker")
+                == ASR_SEMANTIC_QUALITY_BLOCKER
                 else "available"
             )
+        else:
+            formal_status = str(live_record.get("formal_derivation_status") or "").strip()
+            if not formal_status:
+                formal_status = (
+                    "suppressed_by_asr_semantic_quality"
+                    if "asr_semantic_quality_blocked" in degradation_reasons
+                    else "available"
+                )
         diagnostics = dict(snapshot.get("diagnostics") or {})
         diagnostics["formal_derivation_status"] = formal_status
         diagnostics["degradation_reasons"] = degradation_reasons
+        diagnostics["transcript_backfill"] = dict(live_record.get("transcript_backfill") or {}) or None
         return {**snapshot, "diagnostics": diagnostics}
 
     @app.get("/v2/meetings/{meeting_id}/transcript")
@@ -2981,6 +3351,436 @@ def create_app(
             raise HTTPException(status_code=404, detail="meeting not found") from None
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/v2/meetings/{meeting_id}/chapters")
+    def get_v2_meeting_chapters(meeting_id: str, query: str = "") -> dict[str, Any]:
+        try:
+            return _require_v2_persistence().list_chapters(meeting_id, query=query)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="meeting not found") from None
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/v2/notes")
+    def get_v2_notes(
+        meeting_id: str | None = None,
+        status: str = "active",
+        query: str = "",
+        before_updated_at_ms: int | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        try:
+            return _require_v2_persistence().list_notes(
+                meeting_id=meeting_id,
+                status=status,
+                query=query,
+                before_updated_at_ms=before_updated_at_ms,
+                limit=limit,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/v2/meetings/{meeting_id}/notes", status_code=201)
+    def post_v2_note(meeting_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            note = _require_v2_persistence().create_note(
+                note_id=f"note_{uuid.uuid4().hex}",
+                meeting_id=meeting_id,
+                title=str(payload.get("title") or ""),
+                body=str(payload.get("body") or ""),
+                source_kind=str(payload.get("source_kind") or "manual"),
+                source_message_id=payload.get("source_message_id"),
+                evidence=payload.get("evidence") or [],
+                now_ms=time.time_ns() // 1_000_000,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"note": note}
+
+    @app.get("/v2/notes/{note_id}")
+    def get_v2_note(note_id: str) -> dict[str, Any]:
+        try:
+            return {"note": _require_v2_persistence().get_note(note_id)}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.patch("/v2/notes/{note_id}")
+    def patch_v2_note(note_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            note = _require_v2_persistence().update_note(
+                note_id,
+                expected_version=payload.get("expected_version"),
+                title=payload.get("title"),
+                body=payload.get("body"),
+                status=payload.get("status"),
+                now_ms=time.time_ns() // 1_000_000,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            status_code = 409 if "version conflict" in str(exc) else 422
+            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+        return {"note": note}
+
+    @app.delete("/v2/notes/{note_id}")
+    def delete_v2_note(note_id: str, expected_version: int = Query(..., ge=1)) -> dict[str, Any]:
+        try:
+            note = _require_v2_persistence().update_note(
+                note_id,
+                expected_version=expected_version,
+                status="deleted",
+                now_ms=time.time_ns() // 1_000_000,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            status_code = 409 if "version conflict" in str(exc) else 422
+            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+        return {"note": note}
+
+    @app.post("/v2/notes/{note_id}/evidence")
+    def post_v2_note_evidence(note_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            note = _require_v2_persistence().add_note_evidence(
+                note_id,
+                payload.get("evidence") or [],
+                now_ms=time.time_ns() // 1_000_000,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"note": note}
+
+    @app.delete("/v2/notes/{note_id}/evidence/{ordinal}")
+    def delete_v2_note_evidence(note_id: str, ordinal: int) -> dict[str, Any]:
+        try:
+            note = _require_v2_persistence().delete_note_evidence(
+                note_id,
+                ordinal,
+                now_ms=time.time_ns() // 1_000_000,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"note": note}
+
+    @app.post("/v2/meetings/{meeting_id}/entities", status_code=201)
+    def post_v2_user_entity(meeting_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        kind = str(payload.get("kind") or "").strip()
+        source_message_id = str(payload.get("source_message_id") or "").strip()
+        if source_message_id:
+            entity_id = f"user_{kind}_{uuid.uuid5(uuid.NAMESPACE_URL, f'{meeting_id}:{source_message_id}:{kind}').hex}"
+        else:
+            entity_id = f"user_{kind}_{uuid.uuid4().hex}"
+        try:
+            entity = _require_v2_persistence().create_user_entity(
+                meeting_id=meeting_id,
+                entity_id=entity_id,
+                kind=kind,
+                text=str(payload.get("text") or ""),
+                evidence=payload.get("evidence") or [],
+                now_ms=time.time_ns() // 1_000_000,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"entity": entity}
+
+    def _ask_ai_evidence(meeting_id: str, payload: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+        scope = str(payload.get("scope") or "recent").strip().lower()
+        if scope not in {"selection", "recent", "chapter", "meeting"}:
+            raise HTTPException(status_code=422, detail="unsupported Ask AI scope")
+        segments = _v2_complete_transcript(_require_v2_persistence(), meeting_id)
+        selected: list[dict[str, Any]]
+        if scope == "selection":
+            raw_ids = payload.get("segment_ids") or []
+            if not isinstance(raw_ids, list):
+                raise HTTPException(status_code=422, detail="segment_ids must be an array")
+            selected_ids = {str(value).strip() for value in raw_ids if str(value).strip()}
+            selected = [segment for segment in segments if str(segment.get("segment_id") or "") in selected_ids]
+        elif scope == "chapter":
+            chapter_id = str(payload.get("chapter_id") or "").strip()
+            chapters = _require_v2_persistence().list_chapters(meeting_id)["chapters"]
+            chapter = next((item for item in chapters if item["chapter_id"] == chapter_id), None)
+            if chapter is None:
+                raise HTTPException(status_code=422, detail="chapter_id is required for chapter scope")
+            selected_ids = set(chapter["evidence_segment_ids"])
+            selected = [segment for segment in segments if str(segment.get("segment_id") or "") in selected_ids]
+        elif scope == "recent":
+            try:
+                recent_minutes = int(payload.get("recent_minutes") or 3)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=422, detail="recent_minutes must be 1, 3, 5, or 10") from exc
+            if recent_minutes not in {1, 3, 5, 10}:
+                raise HTTPException(status_code=422, detail="recent_minutes must be 1, 3, 5, or 10")
+            latest_end_ms = max(
+                (int(segment.get("ended_at_ms") or segment.get("started_at_ms") or 0) for segment in segments),
+                default=0,
+            )
+            selected = [
+                segment
+                for segment in segments
+                if int(segment.get("ended_at_ms") or segment.get("started_at_ms") or 0)
+                >= max(0, latest_end_ms - recent_minutes * 60_000)
+            ]
+        else:
+            selected = segments
+        bounded: list[dict[str, Any]] = []
+        character_count = 0
+        for segment in reversed(selected):
+            text = str(segment.get("normalized_text") or segment.get("text") or "").strip()
+            if not text:
+                continue
+            if bounded and character_count + len(text) > 24_000:
+                break
+            bounded.append(segment)
+            character_count += len(text)
+        bounded.reverse()
+        evidence = [
+            {
+                "segment_id": str(segment.get("segment_id") or ""),
+                "transcript_seq": int(segment.get("transcript_seq") or 0),
+                "start_ms": segment.get("started_at_ms"),
+                "end_ms": segment.get("ended_at_ms"),
+                "quote": str(segment.get("normalized_text") or segment.get("text") or "").strip(),
+            }
+            for segment in bounded
+        ]
+        if not evidence:
+            raise HTTPException(status_code=409, detail="当前作用域还没有可提问的会议文字")
+        return scope, evidence
+
+    @app.get("/v2/meetings/{meeting_id}/ask/threads")
+    def get_v2_ask_threads(meeting_id: str) -> dict[str, Any]:
+        try:
+            return _require_v2_persistence().list_ask_threads(meeting_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="meeting not found") from None
+
+    @app.patch("/v2/meetings/{meeting_id}/ask/messages/{message_id}")
+    def patch_v2_ask_message(meeting_id: str, message_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            message = _require_v2_persistence().pin_ask_message(
+                meeting_id,
+                message_id,
+                payload.get("pinned_kind"),
+                now_ms=time.time_ns() // 1_000_000,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"message": message}
+
+    @app.post("/v2/meetings/{meeting_id}/ask/stream")
+    async def stream_v2_ask_ai(meeting_id: str, payload: dict[str, Any]) -> StreamingResponse:
+        persistence = _require_v2_persistence()
+        question = " ".join(str(payload.get("question") or "").split())
+        if not question:
+            raise HTTPException(status_code=422, detail="question must not be empty")
+        if len(question) > 4_000:
+            raise HTTPException(status_code=422, detail="question must not exceed 4000 characters")
+        config = llm_service.LlmConfig.from_env()
+        if config is None:
+            raise HTTPException(status_code=409, detail="AI 尚未连接，请先完成模型配置")
+        _ensure_llm_provider_allowed_for_derivation(config, allow_non_acceptance_execution=False)
+        scope, evidence = _ask_ai_evidence(meeting_id, payload)
+        existing = persistence.list_ask_threads(meeting_id)
+        requested_thread_id = str(payload.get("thread_id") or "").strip()
+        thread = next(
+            (item for item in existing["threads"] if item["thread_id"] == requested_thread_id),
+            None,
+        )
+        if requested_thread_id and thread is None:
+            raise HTTPException(status_code=404, detail="Ask AI thread not found")
+        thread_id = requested_thread_id or f"ask_thread_{uuid.uuid4().hex}"
+        user_message_id = f"ask_message_{uuid.uuid4().hex}"
+        assistant_message_id = f"ask_message_{uuid.uuid4().hex}"
+        now_ms = time.time_ns() // 1_000_000
+        try:
+            persistence.create_ask_turn(
+                meeting_id=meeting_id,
+                thread_id=thread_id,
+                user_message_id=user_message_id,
+                assistant_message_id=assistant_message_id,
+                question=question,
+                scope=scope,
+                evidence=evidence,
+                now_ms=now_ms,
+            )
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        preparation = meeting_preparation_store.get(meeting_id) if meeting_preparation_store is not None else None
+        meeting_context = persistence.get_snapshot(meeting_id)
+        history = [
+            {"role": message["role"], "content": message["content"]}
+            for message in (thread or {}).get("messages", [])[-8:]
+            if message.get("status") == "completed" and message.get("content")
+        ]
+        evidence_text = "\n".join(
+            f"[{item['segment_id']} {int(item.get('start_ms') or 0) // 1000}s] {item['quote']}"
+            for item in evidence
+        )
+        context_lines = []
+        if preparation is not None:
+            if preparation.meeting_goal:
+                context_lines.append(f"会议目标：{preparation.meeting_goal}")
+            if preparation.participant_role:
+                context_lines.append(f"用户角色：{preparation.participant_role}")
+            if preparation.focus_points:
+                context_lines.append(f"关注点：{'、'.join(preparation.focus_points)}")
+        current_topic = meeting_context.get("current_topic")
+        if isinstance(current_topic, Mapping) and str(current_topic.get("text") or "").strip():
+            context_lines.append(f"当前议题：{str(current_topic['text']).strip()}")
+        confirmed_decisions = [
+            str(item.get("text") or "").strip()
+            for item in meeting_context.get("decision_candidates") or []
+            if isinstance(item, Mapping) and item.get("status") == "confirmed" and str(item.get("text") or "").strip()
+        ]
+        if confirmed_decisions:
+            context_lines.append(f"已确认决定：{'；'.join(confirmed_decisions[:5])}")
+        open_questions = [
+            str(item.get("text") or "").strip()
+            for item in meeting_context.get("open_questions") or []
+            if isinstance(item, Mapping) and item.get("status") in {"open", "carried_over", "unknown"}
+            and str(item.get("text") or "").strip()
+        ]
+        if open_questions:
+            context_lines.append(f"未闭环问题：{'；'.join(open_questions[:5])}")
+        catch_up = str(payload.get("intent") or "").strip().lower() == "catch_up"
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "你是会议中的私人 AI 助手。只根据提供的会议证据回答中文问题；先直接给结论，"
+                    "再列必要依据。无法从证据确认时明确说待确认，不编造姓名、数字或决策。"
+                    "引用依据时使用 [秒数]，不要声称修改了会议正文。"
+                    + ("本次是错过内容恢复：用 3 至 6 条简洁要点说明刚才讨论、已形成结论和仍待确认事项。" if catch_up else "")
+                ),
+            },
+            *history,
+            {
+                "role": "user",
+                "content": "\n".join([*context_lines, f"问题：{question}", "会议证据：", evidence_text]),
+            },
+        ]
+
+        async def stream_answer():
+            queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+
+            async def on_delta(delta: Any) -> None:
+                await queue.put({"type": "delta", "text": str(delta.text), "sequence": int(delta.sequence)})
+
+            async def run_provider() -> None:
+                provider = OpenAICompatibleStreamingProvider(
+                    base_url=config.base_url,
+                    api_key=config.api_key,
+                    model=config.model,
+                    client=app.state.streaming_llm_client,
+                    timeout_seconds=config.timeout_seconds,
+                    api_style=config.api_style,
+                )
+                try:
+                    _enforce_llm_budget(meeting_id, purpose="ask_ai", config=config)
+                    result = await provider.complete(
+                        messages,
+                        on_delta=on_delta,
+                        idempotency_key=assistant_message_id,
+                        temperature=0,
+                        reasoning_effort="low",
+                        max_completion_tokens=1_400,
+                    )
+                    _record_llm_usage(
+                        meeting_id,
+                        purpose="ask_ai",
+                        config=config,
+                        usage=(
+                            {
+                                "prompt_tokens": result.usage.prompt_tokens,
+                                "completion_tokens": result.usage.completion_tokens,
+                                "total_tokens": result.usage.total_tokens,
+                            }
+                            if result.usage is not None
+                            else None
+                        ),
+                    )
+                    completed = persistence.finish_ask_message(
+                        meeting_id=meeting_id,
+                        message_id=assistant_message_id,
+                        content=result.content,
+                        now_ms=time.time_ns() // 1_000_000,
+                    )
+                    await queue.put(
+                        {
+                            "type": "done",
+                            "thread_id": thread_id,
+                            "message": completed,
+                            "transport_mode": result.transport_mode.value,
+                        }
+                    )
+                except asyncio.CancelledError:
+                    try:
+                        persistence.finish_ask_message(
+                            meeting_id=meeting_id,
+                            message_id=assistant_message_id,
+                            content="",
+                            error_class="ClientDisconnected",
+                            now_ms=time.time_ns() // 1_000_000,
+                        )
+                    except KeyError:
+                        pass
+                    raise
+                except Exception as exc:
+                    try:
+                        persistence.finish_ask_message(
+                            meeting_id=meeting_id,
+                            message_id=assistant_message_id,
+                            content="",
+                            error_class=type(exc).__name__,
+                            now_ms=time.time_ns() // 1_000_000,
+                        )
+                    except KeyError:
+                        pass
+                    await queue.put(
+                        {
+                            "type": "error",
+                            "error": "AI 回答暂时失败，请重试",
+                            "error_class": type(exc).__name__,
+                        }
+                    )
+                finally:
+                    await queue.put(None)
+
+            task = asyncio.create_task(run_provider(), name=f"ask-ai-{assistant_message_id}")
+            yield json.dumps(
+                {
+                    "type": "started",
+                    "thread_id": thread_id,
+                    "user_message_id": user_message_id,
+                    "assistant_message_id": assistant_message_id,
+                    "scope": scope,
+                    "recent_minutes": int(payload.get("recent_minutes") or 3) if scope == "recent" else None,
+                    "evidence": evidence,
+                },
+                ensure_ascii=False,
+            ) + "\n"
+            try:
+                while True:
+                    item = await queue.get()
+                    if item is None:
+                        break
+                    yield json.dumps(item, ensure_ascii=False) + "\n"
+            finally:
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+        return StreamingResponse(stream_answer(), media_type="application/x-ndjson")
 
     @app.get("/v2/meetings/{meeting_id}/speakers")
     def get_v2_meeting_speakers(meeting_id: str) -> dict[str, Any]:
@@ -3230,6 +4030,15 @@ def create_app(
         if live_record is not None and live_record.get("source") == "live_asr_stream":
             deadline = time.monotonic() + V2_END_ASR_FINALIZATION_TIMEOUT_S
             while True:
+                backfill_status = str(
+                    (live_record.get("transcript_backfill") or {}).get("status") or ""
+                )
+                if backfill_status == "running":
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(V2_END_ASR_FINALIZATION_POLL_S)
+                    live_record = asr_live_repo.get(meeting_id)
+                    continue
                 if _live_asr_record_is_finalized(live_record):
                     break
                 if "stream_interrupted" in set(live_record.get("degradation_reasons") or []):
@@ -3323,11 +4132,68 @@ def create_app(
         entity_id: str,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
+        editable_fields = {
+            field: payload[field]
+            for field in ("text", "owner", "deadline", "mitigation")
+            if field in payload
+        }
+        if editable_fields:
+            try:
+                entity = _require_v2_persistence().update_entity_fields(
+                    meeting_id=meeting_id,
+                    entity_id=entity_id,
+                    fields=editable_fields,
+                    expected_version=(
+                        int(payload["expected_version"])
+                        if payload.get("expected_version") is not None
+                        else None
+                    ),
+                    now_ms=time.time_ns() // 1_000_000,
+                    correlation_id=meeting_id,
+                )
+            except KeyError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except RuntimeError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            return {"entity": entity}
         return _set_v2_entity_status(
             meeting_id,
             entity_id,
             str(payload.get("status") or payload.get("action") or "").strip().lower(),
         )
+
+    @app.post("/v2/meetings/{meeting_id}/entities/{target_entity_id}/merge")
+    def merge_v2_entities(
+        meeting_id: str,
+        target_entity_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            return _require_v2_persistence().merge_entities(
+                meeting_id=meeting_id,
+                target_entity_id=target_entity_id,
+                source_entity_id=str(payload.get("source_entity_id") or ""),
+                expected_target_version=(
+                    int(payload["expected_target_version"])
+                    if payload.get("expected_target_version") is not None
+                    else None
+                ),
+                expected_source_version=(
+                    int(payload["expected_source_version"])
+                    if payload.get("expected_source_version") is not None
+                    else None
+                ),
+                now_ms=time.time_ns() // 1_000_000,
+                correlation_id=meeting_id,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.delete("/v2/meetings/{meeting_id}")
     async def delete_v2_meeting(
@@ -3469,6 +4335,82 @@ def create_app(
         traces = [trace.to_dict() for trace in pipeline_traces.find(meeting_id=meeting_id)]
         return {"meeting_id": meeting_id, "traces": traces}
 
+    def _default_meeting_audio_sources(recordings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        ready = [recording for recording in recordings if recording["status"] == "ready"]
+        if not ready:
+            return []
+        default_track = "microphone" if any(
+            recording["track_id"] == "microphone" for recording in ready
+        ) else str(ready[0]["track_id"])
+        return sorted(
+            (recording for recording in ready if recording["track_id"] == default_track),
+            key=lambda recording: int(recording["epoch"]),
+        )
+
+    def _expected_meeting_audio_tracks(
+        meeting_id: str,
+        recordings: list[dict[str, Any]],
+    ) -> list[str]:
+        preparation = meeting_preparation_store.get(meeting_id) if meeting_preparation_store is not None else None
+        expected = {
+            "microphone": ["microphone"],
+            "system_audio": ["system_audio"],
+            "dual_track": ["microphone", "system_audio"],
+        }.get(str(getattr(preparation, "input_source", "") or ""))
+        if expected is not None:
+            return expected
+        return sorted(
+            {
+                str(recording["track_id"])
+                for recording in recordings
+                if str(recording.get("track_id") or "") in {"microphone", "system_audio"}
+            }
+        )
+
+    def _resolve_meeting_audio_asset(
+        meeting_id: str,
+        recordings: list[dict[str, Any]],
+    ) -> tuple[Path, dict[str, Any] | None]:
+        if data_dir_path is None:
+            raise ValueError("meeting audio storage is unavailable")
+        sources = _default_meeting_audio_sources(recordings)
+        if not sources:
+            return audio_assets.safe_audio_path(
+                data_dir_path,
+                f"audio_assets/{meeting_id}/audio.wav",
+            ), None
+        if len(sources) == 1:
+            return audio_assets.safe_audio_path(
+                data_dir_path,
+                str(sources[0]["output_relative_path"]),
+            ), None
+        with _recording_asset_lock(meeting_id):
+            continuous = audio_assets.derive_local_continuous_wav_asset(
+                data_dir=data_dir_path,
+                meeting_id=meeting_id,
+                track_id=str(sources[0]["track_id"]),
+                sources=sources,
+            )
+        return audio_assets.safe_audio_path(
+            data_dir_path,
+            str(continuous["relative_path"]),
+        ), continuous
+
+    def _meeting_audio_duration_ms(
+        recordings: list[dict[str, Any]],
+        chunks: list[dict[str, Any]],
+    ) -> int:
+        if not recordings:
+            return sum(int(chunk["duration_ms"]) for chunk in chunks)
+        duration_by_track: dict[str, int] = {}
+        for recording in recordings:
+            track_id = str(recording["track_id"])
+            duration_by_track[track_id] = duration_by_track.get(track_id, 0) + max(
+                0,
+                int(recording.get("duration_ms") or 0),
+            )
+        return max(duration_by_track.values(), default=0)
+
     @app.get("/v2/meetings/{meeting_id}/audio")
     def get_v2_meeting_audio(meeting_id: str) -> dict[str, Any]:
         persistence = _require_v2_persistence()
@@ -3504,26 +4446,20 @@ def create_app(
                     ),
                 }
             )
-        ready_recordings = sorted(
-            (recording for recording in recordings if recording["status"] == "ready"),
-            key=lambda recording: (
-                recording["track_id"] != "microphone",
-                -int(recording["epoch"]),
-            ),
-        )
-        default_recording = ready_recordings[0] if ready_recordings else None
-        relative_path = (
-            str(default_recording["output_relative_path"])
-            if default_recording is not None and default_recording.get("output_relative_path")
-            else f"audio_assets/{meeting_id}/audio.wav"
-        )
-        path = audio_assets.safe_audio_path(data_dir_path, relative_path) if data_dir_path is not None else None
+        continuation_error_class = None
+        try:
+            path, continuous_asset = _resolve_meeting_audio_asset(meeting_id, recordings)
+        except (OSError, RuntimeError, ValueError) as exc:
+            path = None
+            continuous_asset = None
+            continuation_error_class = type(exc).__name__
         recording_statuses = {str(recording["status"]) for recording in recordings}
         assembled_file = bool(path is not None and path.is_file() and not path.is_symlink())
-        assembled = assembled_file and (not recordings or default_recording is not None)
+        assembled = assembled_file and (not recordings or bool(_default_meeting_audio_sources(recordings)))
         status = (
             "partial_failure"
-            if "failed" in recording_statuses and recording_statuses != {"failed"}
+            if continuation_error_class is not None
+            or ("failed" in recording_statuses and recording_statuses != {"failed"})
             else "failed"
             if recording_statuses == {"failed"}
             else "recording"
@@ -3542,13 +4478,13 @@ def create_app(
             "format": "wav" if assembled else None,
             "file_size_bytes": path.stat().st_size if assembled and path is not None else 0,
             "chunk_count": len(chunks),
-            "duration_ms": max(
-                [int(recording["duration_ms"]) for recording in recordings]
-                or [sum(int(chunk["duration_ms"]) for chunk in chunks)]
-            ),
+            "duration_ms": _meeting_audio_duration_ms(recordings, chunks),
             "tracks": sorted(
                 {str(chunk["track_id"]) for chunk in chunks} | {str(recording["track_id"]) for recording in recordings}
             ),
+            "expected_tracks": _expected_meeting_audio_tracks(meeting_id, recordings),
+            "continuous_asset": continuous_asset,
+            "continuation_error_class": continuation_error_class,
             "track_states": track_states,
             "chunks": chunks,
             "recordings": recordings,
@@ -3565,21 +4501,15 @@ def create_app(
         if data_dir_path is None:
             raise HTTPException(status_code=404, detail="meeting audio is unavailable")
         recordings = persistence.list_recording_sessions(meeting_id)
-        ready_recordings = sorted(
-            (recording for recording in recordings if recording["status"] == "ready"),
-            key=lambda recording: (
-                recording["track_id"] != "microphone",
-                -int(recording["epoch"]),
-            ),
-        )
-        if recordings and not ready_recordings:
+        if recordings and not _default_meeting_audio_sources(recordings):
             raise HTTPException(status_code=409, detail="meeting audio is still being assembled")
-        relative_path = (
-            str(ready_recordings[0]["output_relative_path"])
-            if ready_recordings and ready_recordings[0].get("output_relative_path")
-            else f"audio_assets/{meeting_id}/audio.wav"
-        )
-        path = audio_assets.safe_audio_path(data_dir_path, relative_path)
+        try:
+            path, _continuous_asset = _resolve_meeting_audio_asset(meeting_id, recordings)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "continuous_audio_derivation_failed"},
+            ) from exc
         if not path.is_file() or path.is_symlink():
             raise HTTPException(status_code=404, detail="meeting audio is not assembled yet")
         return FileResponse(
@@ -3969,7 +4899,9 @@ def create_app(
         llm_config = llm_service.LlmConfig.from_env()
         llm_meta = llm_service.provider_metadata(llm_config)
         realtime_asr_providers = _realtime_asr_providers()
-        file_asr_available = batch_transcribe.is_available()
+        batch_file_asr_available = batch_transcribe.is_available()
+        resident_file_asr_available = asr_refiner.refinement_capability().get("status") == "ready"
+        file_asr_available = batch_file_asr_available or resident_file_asr_available
         return {
             "schema_version": "provider_health.v1",
             "llm": {
@@ -3982,7 +4914,13 @@ def create_app(
                 "credential_configured": llm_config is not None,
             },
             "asr": {
-                "file_provider": "local_funasr_batch",
+                "file_provider": (
+                    "local_funasr_batch"
+                    if batch_file_asr_available
+                    else "local_funasr_resident_file"
+                    if resident_file_asr_available
+                    else "unavailable"
+                ),
                 "file_asr_available": file_asr_available,
                 "realtime_providers": realtime_asr_providers,
                 "realtime_asr_available": bool(realtime_asr_providers),
@@ -4117,6 +5055,10 @@ def create_app(
             "realtime_available": asr_stream.funasr_realtime_available(),
             "resident_enabled": asr_stream._funasr_resident_enabled(),
             "resident": asr_stream.funasr_resident_status(),
+            "offline_refinement": {
+                "capability": asr_refiner.refinement_capability(),
+                "worker": asr_refiner.refiner_worker_status(),
+            },
         }
 
     @app.get("/degradation/status")
@@ -4421,7 +5363,10 @@ def create_app(
         audio_source = str(websocket.query_params.get("audio_source") or "").strip() or None
         pcm_protocol = str(websocket.query_params.get("pcm_protocol") or "").strip() or None
         native_track_id = _transcript_source_track(audio_source)
-        native_capture_epoch: int | None = None
+        try:
+            native_capture_epoch = int(websocket.query_params.get("capture_epoch") or 0)
+        except (TypeError, ValueError):
+            native_capture_epoch = -1
         native_source = str(audio_source or "").strip().lower() in {
             "tauri_native_mic",
             "native_microphone_streaming",
@@ -4429,10 +5374,6 @@ def create_app(
             "macos_system_audio",
         }
         if native_source:
-            try:
-                native_capture_epoch = int(websocket.query_params.get("capture_epoch") or 0)
-            except (TypeError, ValueError):
-                native_capture_epoch = 0
             if (
                 pcm_protocol != asr_stream.NATIVE_PCM_PROTOCOL_NAME
                 or native_track_id not in {"microphone", "system_audio"}
@@ -4512,6 +5453,16 @@ def create_app(
                 metadata,
                 lease_owner=capture_lease_owner,
             )
+            if capture_recording is not None:
+                capture_recording["timeline_offset_ms"] = _recording_timeline_offset_ms(
+                    session_id,
+                    track=str(capture_recording.get("track") or ""),
+                    epoch=int(capture_recording.get("epoch") or 0),
+                )
+                capture_recording["previous_transcript_end_ms"] = _latest_track_transcript_end_ms(
+                    session_id,
+                    str(capture_recording.get("track") or ""),
+                )
             capture_started = True
 
         def abort_capture_setup() -> None:
@@ -4593,7 +5544,7 @@ def create_app(
                     audio_asset_data_dir=data_dir_path,
                     degradation_reason="degradation_level_3_recording_only",
                     pcm_protocol=pcm_protocol,
-                    native_track_id=native_track_id if native_source else None,
+                    native_track_id=native_track_id,
                     native_capture_epoch=native_capture_epoch,
                     **common_recording_callbacks,
                 )
@@ -4611,7 +5562,20 @@ def create_app(
                     {
                         **event,
                         "source_track": _transcript_source_track(audio_source),
-                        "use_source_segment_namespace": _uses_source_segment_namespace(audio_source),
+                        "capture_epoch": int(
+                            (capture_recording or {}).get("epoch") or native_capture_epoch or 0
+                        ),
+                        "timeline_offset_ms": int(
+                            _capture_event_timeline_adjustment_ms(event, capture_recording)
+                        ),
+                        "use_source_segment_namespace": (
+                            _uses_source_segment_namespace(audio_source)
+                            or int(
+                                (capture_recording or {}).get("epoch")
+                                or native_capture_epoch
+                                or 0
+                            ) > 0
+                        ),
                     },
                 ),
                 on_audio_active=lambda observation: _record_audio_active(
@@ -4621,7 +5585,7 @@ def create_app(
                 diarization_persistence=v2_persistence,
                 diarization_enabled=v2_persistence is not None,
                 pcm_protocol=pcm_protocol,
-                native_track_id=native_track_id if native_source else None,
+                native_track_id=native_track_id,
                 native_capture_epoch=native_capture_epoch,
                 **common_recording_callbacks,
             )
@@ -5222,6 +6186,7 @@ def create_app(
             **derivation_projection,
             "auto_suggestion": auto_suggestion_orchestrator.status_from_record(record),
             "realtime_transcript_correction": dict(record.get("realtime_transcript_correction") or {}),
+            "transcript_backfill": dict(record.get("transcript_backfill") or {}) or None,
             "settings_snapshot": dict(record.get("settings_snapshot") or {}),
             "llm_evidence": _llm_session_evidence(session_id),
             "audio": audio,
@@ -6785,11 +7750,7 @@ def create_app(
             config,
             allow_non_acceptance_execution=allow_non_acceptance_execution,
         )
-        transcript_text = " ".join(
-            str((e.get("payload") or {}).get("text", ""))
-            for e in record.get("events") or []
-            if e.get("event_type") == "transcript_final"
-        )
+        transcript_text = _transcript_text_from_record(record)
         _enforce_llm_budget(session_id, purpose="approach_cards", config=config)
         cards, usage, degraded = llm_service.build_approach_cards(transcript_text, config)
         _record_llm_usage(
@@ -7837,39 +8798,18 @@ def create_app(
             allow_non_acceptance_execution=False,
         )
         meeting_id = str(job["meeting_id"])
-        all_segments = _v2_complete_transcript(v2_persistence, meeting_id)
         target_id = str(job.get("evidence_segment_id") or "")
+        new_segments, context = _v2_intelligence_batch_segments(v2_persistence, job)
         target = next(
-            (segment for segment in all_segments if str(segment.get("segment_id") or "") == target_id),
-            None,
-        )
-        if target is None:
-            raise RuntimeError("intelligence evidence segment no longer exists")
-        semantic_paragraphs = v2_persistence.list_semantic_paragraphs(meeting_id).get("paragraphs") or []
-        target_paragraph = next(
-            (paragraph for paragraph in semantic_paragraphs if target_id in set(paragraph.get("checkpoint_ids") or [])),
-            None,
-        )
-        if target_paragraph is not None:
-            paragraph_ids = set(target_paragraph.get("checkpoint_ids") or [])
-            new_segments = [
-                segment for segment in all_segments if str(segment.get("segment_id") or "") in paragraph_ids
-            ]
-            first_paragraph_seq = (
-                min(int(segment.get("transcript_seq") or 0) for segment in new_segments)
-                if new_segments
-                else int(target.get("transcript_seq") or 0)
-            )
-            context = [
-                segment for segment in all_segments if int(segment.get("transcript_seq") or 0) < first_paragraph_seq
-            ][-3:]
-        else:
-            new_segments = [target]
-            context = [
+            (
                 segment
-                for segment in all_segments
-                if int(segment.get("transcript_seq") or 0) < int(target.get("transcript_seq") or 0)
-            ][-3:]
+                for segment in new_segments
+                if str(segment.get("segment_id") or "") == target_id
+            ),
+            None,
+        )
+        if not new_segments or target is None:
+            raise RuntimeError("intelligence evidence segment no longer exists")
         snapshot = v2_persistence.get_snapshot(meeting_id, segment_limit=100)
         topic = snapshot.get("current_topic") or {}
         rolling_state = {
@@ -7894,12 +8834,12 @@ def create_app(
                 )
                 for item in items[-24:]
             ],
-            "version": int(job.get("input_version") or 1),
+            "version": int(job.get("input_transcript_seq") or job.get("input_version") or 1),
         }
         preparation = meeting_preparation_store.get(meeting_id) if meeting_preparation_store is not None else None
         request = RealtimeIntelligenceRequest.from_payload(
             meeting_id=meeting_id,
-            state_revision=int(job.get("input_version") or 1),
+            state_revision=int(job.get("input_transcript_seq") or job.get("input_version") or 1),
             new_paragraphs=[
                 {
                     "id": str(segment.get("segment_id") or ""),
@@ -7924,6 +8864,21 @@ def create_app(
             ],
             rolling_state=rolling_state,
             glossary=list(preparation.hotwords) if preparation is not None else [],
+            meeting_goal=(
+                "；".join(
+                    value
+                    for value in (
+                        preparation.meeting_goal,
+                        f"参会角色：{preparation.participant_role}" if preparation.participant_role else None,
+                        f"重点关注：{'、'.join(preparation.focus_points)}" if preparation.focus_points else None,
+                        f"输出格式：{preparation.output_format}",
+                    )
+                    if value
+                )
+                if preparation is not None
+                else None
+            ),
+            allow_paragraph_revisions=False,
         )
         provider = OpenAICompatibleStreamingProvider(
             base_url=config.base_url,
@@ -8025,12 +8980,6 @@ def create_app(
         }
 
     def _default_v2_correction_job_handler(job: dict[str, Any]) -> dict[str, Any]:
-        if v2_persistence is not None and v2_persistence.semantic_projection_mode == "llm_first":
-            return {
-                "schema_version": "v2_correction_job_output.v2",
-                "skipped": True,
-                "reason": "llm_first_intelligence_lane",
-            }
         if llm_service.LlmConfig.from_env() is None:
             raise ProviderRuntimeNotConfiguredDeferred()
         force = str(job.get("idempotency_key") or "").endswith("meeting.ended") or int(job.get("attempts") or 0) > 1
@@ -8064,11 +9013,22 @@ def create_app(
             else {"revision_count": 0, "event_count": 0, "segment_ids": []}
         )
         gate = dict(result.get("gate") or {})
+        no_change_segment_ids = (
+            v2_persistence.mark_correction_segments_no_change(
+                meeting_id=str(job["meeting_id"]),
+                segment_ids=[
+                    str(segment_id)
+                    for segment_id in result.get("no_revision_segment_ids") or []
+                ],
+                max_input_transcript_seq=int(job["input_transcript_seq"]),
+                now_ms=time.time_ns() // 1_000_000,
+            )
+            if v2_persistence is not None
+            else []
+        )
         satisfied_segment_ids = sorted(
             set(reconciliation["segment_ids"]).union(
-                str(segment_id).strip()
-                for segment_id in result.get("no_revision_segment_ids") or []
-                if str(segment_id).strip()
+                no_change_segment_ids
             )
         )
         superseded_job_count = (
@@ -8375,6 +9335,39 @@ def create_app(
     app.state.v2_correction_job_handler_impl = _default_v2_correction_job_handler
     app.state.v2_suggestion_job_handler_impl = _default_v2_suggestion_job_handler
 
+    def _completed_realtime_correction_covers_jobs(
+        meeting_id: str,
+        correction_jobs: list[dict[str, Any]],
+    ) -> bool:
+        expected_segment_ids = {
+            str(job.get("evidence_segment_id") or "").strip()
+            for job in correction_jobs
+            if str(job.get("evidence_segment_id") or "").strip()
+        }
+        if not expected_segment_ids:
+            return False
+        try:
+            live_record = asr_live_repo.get(meeting_id)
+        except KeyError:
+            return False
+        projection = dict(live_record.get("realtime_transcript_correction") or {})
+        if projection.get("status") != "completed":
+            return False
+        processed_segment_ids = {
+            str(segment_id)
+            for segment_id in projection.get("processed_segment_ids") or []
+            if str(segment_id)
+        }
+        terminal_failed_segment_ids = {
+            str(segment_id)
+            for segment_id in projection.get("terminal_failed_segment_ids") or []
+            if str(segment_id)
+        }
+        return (
+            expected_segment_ids <= processed_segment_ids
+            and not expected_segment_ids.intersection(terminal_failed_segment_ids)
+        )
+
     def _wait_for_v2_correction_jobs(
         meeting_id: str,
         *,
@@ -8382,7 +9375,7 @@ def create_app(
     ) -> dict[str, Any]:
         if v2_persistence is None:
             return {"correction_degraded": True, "reason": "v2_persistence_unavailable"}
-        lane = "intelligence" if v2_persistence.semantic_projection_mode == "llm_first" else "correction"
+        lane = "correction"
         deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < deadline:
             correction_jobs = v2_persistence.list_jobs(
@@ -8402,12 +9395,16 @@ def create_app(
                 }
             if not active:
                 succeeded = [item for item in correction_jobs if item["status"] == "succeeded"]
-                degraded = not correction_jobs or not succeeded
+                completed_projection = _completed_realtime_correction_covers_jobs(
+                    meeting_id,
+                    correction_jobs,
+                )
+                degraded = not correction_jobs or (not succeeded and not completed_projection)
                 reason = (
                     f"{lane}_jobs_missing"
                     if not correction_jobs
                     else f"{lane}_has_no_successful_job"
-                    if not succeeded
+                    if not succeeded and not completed_projection
                     else None
                 )
                 if degraded:
@@ -8422,6 +9419,7 @@ def create_app(
                     "reason": reason,
                     "lane": lane,
                     "job_count": len(correction_jobs),
+                    "quality_source": "realtime_correction_projection" if completed_projection else "durable_jobs",
                 }
             time.sleep(0.1)
         _log.warning(
@@ -8637,10 +9635,8 @@ def create_app(
             cancellation_observer=pipeline_traces.record_cancelled,
         )
     app.state.v2_executor = v2_executor
-    app.state.streaming_llm_client = None
-
     async def _start_v2_executor() -> None:
-        if app.state.streaming_llm_client is None:
+        if getattr(app.state, "streaming_llm_client", None) is None:
             app.state.streaming_llm_client = httpx.AsyncClient(
                 timeout=60.0,
                 trust_env=False,
@@ -8717,9 +9713,13 @@ def create_app(
 
     async def _start_funasr_resident_worker() -> None:
         if prewarm_funasr:
-            ready = await asyncio.to_thread(asr_stream.prewarm_funasr_resident_manager)
-            app.state.funasr_resident_prewarm_ready = ready
-            if os.environ.get("MEETING_COPILOT_DESKTOP_RUNTIME") == "1" and not ready:
+            realtime_ready, refiner_ready = await asyncio.gather(
+                asyncio.to_thread(asr_stream.prewarm_funasr_resident_manager),
+                asyncio.to_thread(asr_refiner.prewarm_refiner_worker),
+            )
+            app.state.funasr_resident_prewarm_ready = realtime_ready
+            app.state.funasr_refiner_prewarm_ready = refiner_ready
+            if os.environ.get("MEETING_COPILOT_DESKTOP_RUNTIME") == "1" and not realtime_ready:
                 raise RuntimeError("packaged desktop FunASR resident worker failed to become ready")
 
     async def _recover_abandoned_desktop_recordings() -> None:
@@ -8782,7 +9782,10 @@ def create_app(
         )
 
     async def _stop_funasr_resident_worker() -> None:
-        await asyncio.to_thread(asr_stream.shutdown_funasr_resident_manager)
+        await asyncio.gather(
+            asyncio.to_thread(asr_stream.shutdown_funasr_resident_manager),
+            asyncio.to_thread(asr_refiner.shutdown_refiner_worker),
+        )
 
     app.router.add_event_handler("startup", _recover_abandoned_desktop_recordings)
     app.router.add_event_handler("startup", _start_funasr_resident_worker)
@@ -9236,6 +10239,14 @@ def _realtime_asr_providers() -> list[str]:
     return providers
 
 
+def _effective_asr_degradation_reasons(record: dict[str, Any]) -> list[str]:
+    reasons = [str(reason) for reason in record.get("degradation_reasons") or [] if str(reason)]
+    backfill = dict(record.get("transcript_backfill") or {})
+    if backfill.get("status") == "completed":
+        reasons = [reason for reason in reasons if reason != "stream_interrupted"]
+    return list(dict.fromkeys(reasons))
+
+
 def _asr_live_event_source_metadata(record: dict[str, Any]) -> dict[str, Any]:
     provider = str(record.get("provider") or "")
     is_mock_value = record.get("is_mock")
@@ -9251,7 +10262,7 @@ def _asr_live_event_source_metadata(record: dict[str, Any]) -> dict[str, Any]:
         metadata["ingest_mode"] = ingest_mode
     metadata["asr_fallback_used"] = bool(record.get("asr_fallback_used", False))
     degradation_reasons = [
-        reason for reason in list(record.get("degradation_reasons") or []) if reason != ASR_SEMANTIC_QUALITY_BLOCKER
+        reason for reason in _effective_asr_degradation_reasons(record) if reason != ASR_SEMANTIC_QUALITY_BLOCKER
     ]
     stored_quality = dict(
         record.get("asr_semantic_quality")
@@ -9431,6 +10442,13 @@ def _dedupe_strings(values: list[str]) -> list[str]:
     return result
 
 
+_RECOVERABLE_TRANSCRIPT_DEGRADATION_REASONS = {
+    "stream_interrupted",
+    "offline_refinement_unavailable",
+    "offline_refinement_text_too_short",
+}
+
+
 def _realtime_correction_blockers(record: dict[str, Any]) -> list[str]:
     """Allow correction of persisted finals across recoverable quality tails."""
     blockers = _enabled_llm_execution_blockers(record)
@@ -9443,7 +10461,11 @@ def _realtime_correction_blockers(record: dict[str, Any]) -> list[str]:
     allowed: set[str] = set()
     if _has_recoverable_semantic_quality_failure(record):
         allowed.update({ASR_SEMANTIC_QUALITY_BLOCKER, "degraded_asr_session"})
-    if persisted_final_available and degradation_reasons and degradation_reasons <= {"stream_interrupted"}:
+    if (
+        persisted_final_available
+        and degradation_reasons
+        and degradation_reasons <= _RECOVERABLE_TRANSCRIPT_DEGRADATION_REASONS
+    ):
         allowed.add("degraded_asr_session")
     return [blocker for blocker in blockers if blocker not in allowed]
 
@@ -9499,6 +10521,18 @@ def _ensure_enabled_llm_allowed(
     if allow_non_acceptance_execution:
         return
     blockers = _enabled_llm_execution_blockers(record)
+    degradation_reasons = {str(reason) for reason in record.get("degradation_reasons") or []}
+    persisted_final_available = any(
+        event.get("event_type") in {"final", "transcript_final"}
+        and str((event.get("payload") or {}).get("text") or event.get("text") or "").strip()
+        for event in record.get("events") or []
+    )
+    if (
+        persisted_final_available
+        and degradation_reasons
+        and degradation_reasons <= _RECOVERABLE_TRANSCRIPT_DEGRADATION_REASONS
+    ):
+        blockers = [blocker for blocker in blockers if blocker != "degraded_asr_session"]
     if blockers:
         session_id = str(record.get("session_id") or "")
         raise HTTPException(
@@ -9736,16 +10770,30 @@ def _runtime_data_dir() -> Path:
     return DEFAULT_RUNTIME_DATA_DIR
 
 
+def _runtime_distribution_profile() -> str:
+    manifest_path = os.environ.get("MEETING_COPILOT_RUNTIME_MANIFEST", "").strip()
+    if not manifest_path:
+        return "full"
+    try:
+        manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "full"
+    profile = str(manifest.get("distribution_profile") or "full").strip().lower()
+    return profile if profile in {"base", "full"} else "full"
+
+
 def create_runtime_app() -> FastAPI:
     """Build the process-level app with durable local session storage."""
     runtime_data_dir = _runtime_data_dir()
     managed_log_stream = ManagedRotatingLogStream(data_dir=runtime_data_dir)
     configure_logging(stream=managed_log_stream)
+    distribution_profile = _runtime_distribution_profile()
     runtime_app = create_app(
         data_dir=runtime_data_dir,
-        prewarm_funasr=True,
+        prewarm_funasr=distribution_profile != "base",
         semantic_projection_mode="llm_first",
     )
+    runtime_app.state.distribution_profile = distribution_profile
     runtime_app.state.managed_log_path = str(managed_log_stream.rotator.path)
     runtime_app.state.managed_log_stream = managed_log_stream
     return runtime_app

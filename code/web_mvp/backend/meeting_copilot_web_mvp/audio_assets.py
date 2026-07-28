@@ -222,7 +222,7 @@ class RealtimeWavAssetWriter:
             "track_id": self._public_track_id,
             "epoch": self._epoch,
             "started_at_ms": self._started_at_ms,
-            "relative_path": str(self._relative_path),
+            "relative_path": self._relative_path.as_posix(),
             "format": "pcm_s16le_chunk_journal",
             "sample_rate_hz": self._sample_rate_hz,
             "channel_count": CHANNEL_COUNT,
@@ -456,7 +456,7 @@ class RealtimeWavAssetWriter:
             "duration_ms": round(sample_count / self._sample_rate_hz * 1_000),
             "file_size_bytes": len(pcm16),
             "sha256": hashlib.sha256(pcm16).hexdigest(),
-            "relative_path": str(self._relative_chunks_dir / name),
+            "relative_path": (self._relative_chunks_dir / name).as_posix(),
             **source_range,
         }
         if self._authorize_chunk_commit is not None and not self._authorize_chunk_commit(dict(proposed_chunk)):
@@ -508,7 +508,7 @@ class RealtimeWavAssetWriter:
                 "sample_rate_hz": self._sample_rate_hz,
                 "chunk_index": chunk_index,
                 "duration_ms": round(int(chunk["sample_count"]) / self._sample_rate_hz * 1_000),
-                "relative_path": str(self._relative_chunks_dir / str(chunk["name"])),
+                "relative_path": (self._relative_chunks_dir / str(chunk["name"])).as_posix(),
             }
         )
 
@@ -560,7 +560,7 @@ class RealtimeWavAssetWriter:
                     with path.open("rb") as chunk_file:
                         while data := chunk_file.read(_HASH_BUFFER_BYTES):
                             assembled.writeframesraw(data)
-            with self._assembly_temp_path.open("rb") as assembled_file:
+            with self._assembly_temp_path.open("r+b") as assembled_file:
                 os.fsync(assembled_file.fileno())
             harden_private_file(self._assembly_temp_path)
             os.replace(self._assembly_temp_path, self._path)
@@ -716,7 +716,7 @@ def derive_local_mixed_wav_asset(
                     mixed.byteswap()
                 output.writeframesraw(mixed.tobytes())
                 cursor += requested
-        with temp_path.open("rb") as output_file:
+        with temp_path.open("r+b") as output_file:
             os.fsync(output_file.fileno())
         harden_private_file(temp_path)
         os.replace(temp_path, output_path)
@@ -743,6 +743,141 @@ def derive_local_mixed_wav_asset(
         "kind": "mixed",
         "derivation": "local_pcm16_timeline_mix",
         "timeline_start_ms": timeline_start_ms,
+        "remote_upload_used": False,
+    }
+
+
+def derive_local_continuous_wav_asset(
+    *,
+    data_dir: str | Path,
+    meeting_id: str,
+    track_id: str,
+    sources: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Concatenate successive epochs from one track into a cached meeting replay."""
+
+    if not SESSION_ID_PATTERN.fullmatch(meeting_id):
+        raise ValueError(f"unsafe session_id: {meeting_id}")
+    if track_id not in DUAL_TRACK_IDS:
+        raise ValueError("continuous audio requires a known meeting track")
+    ordered_sources = sorted(sources, key=lambda source: int(source.get("epoch") or 0))
+    if len(ordered_sources) < 2:
+        raise ValueError("continuous audio requires at least two recording epochs")
+    if any(str(source.get("track_id") or source.get("track") or "") != track_id for source in ordered_sources):
+        raise ValueError("continuous audio sources must belong to one track")
+    epochs = [int(source.get("epoch") or 0) for source in ordered_sources]
+    if len(set(epochs)) != len(epochs):
+        raise ValueError("continuous audio source epochs must be unique")
+
+    identity_material = [
+        {
+            "track_id": track_id,
+            "epoch": int(source["epoch"]),
+            "output_relative_path": str(source.get("output_relative_path") or ""),
+            "output_sha256": str(source.get("output_sha256") or ""),
+        }
+        for source in ordered_sources
+    ]
+    fingerprint = hashlib.sha256(
+        json.dumps(identity_material, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    asset_id = f"continuous_{fingerprint[:24]}"
+    output_relative_path = (
+        Path("audio_assets") / meeting_id / "derived" / "continuous" / track_id / f"{asset_id}.wav"
+    )
+    output_path = safe_audio_path(data_dir, output_relative_path)
+    ensure_private_directory(output_path.parent)
+    if output_path.parent.is_symlink():
+        raise ValueError("continuous audio output directory must not be a symlink")
+
+    readers: list[wave.Wave_read] = []
+    sample_rate_hz: int | None = None
+    total_frames = 0
+    try:
+        for source in ordered_sources:
+            relative_path = str(source.get("output_relative_path") or "")
+            _require_meeting_owned_audio_path(meeting_id, relative_path)
+            source_path = safe_audio_path(data_dir, relative_path)
+            if not source_path.is_file() or source_path.is_symlink():
+                raise ValueError(f"source recording epoch is unavailable: {source.get('epoch')}")
+            _size, source_sha256 = _file_size_and_sha256(source_path)
+            if source_sha256 != str(source.get("output_sha256") or ""):
+                raise ValueError(f"source recording changed before concatenation: {source.get('epoch')}")
+            try:
+                reader = wave.open(str(source_path), "rb")
+            except (OSError, wave.Error) as exc:
+                raise ValueError(f"source recording is not a readable WAV: {source.get('epoch')}") from exc
+            if (
+                reader.getnchannels() != CHANNEL_COUNT
+                or reader.getsampwidth() != PCM_SAMPLE_WIDTH_BYTES
+                or reader.getcomptype() != "NONE"
+            ):
+                reader.close()
+                raise ValueError("continuous audio sources must be mono PCM16 WAV")
+            if sample_rate_hz is None:
+                sample_rate_hz = int(reader.getframerate())
+            elif reader.getframerate() != sample_rate_hz:
+                reader.close()
+                raise ValueError("continuous audio sources must use the same sample rate")
+            total_frames += int(reader.getnframes())
+            readers.append(reader)
+
+        assert sample_rate_hz is not None
+        cache_valid = False
+        if output_path.is_file() and not output_path.is_symlink():
+            try:
+                with wave.open(str(output_path), "rb") as cached:
+                    cache_valid = (
+                        cached.getnchannels() == CHANNEL_COUNT
+                        and cached.getsampwidth() == PCM_SAMPLE_WIDTH_BYTES
+                        and cached.getcomptype() == "NONE"
+                        and cached.getframerate() == sample_rate_hz
+                        and cached.getnframes() == total_frames
+                    )
+            except (OSError, wave.Error):
+                cache_valid = False
+
+        if not cache_valid:
+            temp_path = output_path.with_suffix(".wav.tmp")
+            try:
+                with wave.open(str(temp_path), "wb") as output:
+                    output.setnchannels(CHANNEL_COUNT)
+                    output.setsampwidth(PCM_SAMPLE_WIDTH_BYTES)
+                    output.setframerate(sample_rate_hz)
+                    for reader in readers:
+                        while True:
+                            frames = reader.readframes(sample_rate_hz)
+                            if not frames:
+                                break
+                            output.writeframesraw(frames)
+                with temp_path.open("r+b") as output_file:
+                    os.fsync(output_file.fileno())
+                harden_private_file(temp_path)
+                os.replace(temp_path, output_path)
+                harden_private_file(output_path)
+                _fsync_directory(output_path.parent)
+            except BaseException:
+                temp_path.unlink(missing_ok=True)
+                raise
+    finally:
+        for reader in readers:
+            reader.close()
+
+    metadata = audio_metadata_for_file(
+        data_dir=data_dir,
+        session_id=meeting_id,
+        relative_path=output_relative_path,
+        source_type="local_derived_continuous",
+        sample_rate_hz=sample_rate_hz,
+        sample_count=total_frames,
+    )
+    return {
+        **metadata,
+        "asset_id": asset_id,
+        "kind": "continuous",
+        "derivation": "local_pcm16_epoch_concatenation",
+        "track_id": track_id,
+        "epochs": epochs,
         "remote_upload_used": False,
     }
 
@@ -826,7 +961,7 @@ def inspect_realtime_audio_journal(
             {
                 "chunk_seq": chunk_seq,
                 "name": path.name,
-                "relative_path": str(Path("audio_assets") / session_id / "chunks" / path.name),
+                "relative_path": (Path("audio_assets") / session_id / "chunks" / path.name).as_posix(),
                 "sample_rate_hz": sample_rate_hz,
                 "sample_count": sample_count,
                 "duration_ms": round(sample_count / sample_rate_hz * 1_000),
@@ -996,7 +1131,7 @@ def audio_metadata_for_file(
     return {
         "saved": True,
         "audio_asset_id": f"audio_{session_id}",
-        "relative_path": str(Path(relative_path)),
+        "relative_path": Path(relative_path).as_posix(),
         "format": path.suffix.lower().lstrip(".") or "audio",
         "sample_rate_hz": sample_rate_hz,
         "channel_count": CHANNEL_COUNT if sample_rate_hz else None,
@@ -1071,6 +1206,8 @@ def _file_size_and_sha256(path: Path) -> tuple[int, str]:
 
 
 def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
     descriptor = os.open(path, os.O_RDONLY)
     try:
         os.fsync(descriptor)

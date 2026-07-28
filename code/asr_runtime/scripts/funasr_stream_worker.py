@@ -20,6 +20,9 @@ DEFAULT_CHUNK_SIZE = [0, 10, 5]
 RESIDENT_PROTOCOL = "funasr-resident-jsonl.v1"
 MAX_RESIDENT_PCM_BYTES = 4 * 1024 * 1024
 MAX_RESIDENT_COMMAND_LINE_BYTES = 6 * 1024 * 1024
+PREVIEW_VAD_FRAME_SAMPLES = 160
+PREVIEW_VAD_RMS_THRESHOLD = 0.006
+PREVIEW_VAD_PREROLL_SAMPLES = 1_280
 _SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _RESIDENT_COMMAND_FIELDS = {
     "start_session": frozenset({"command", "session_id"}),
@@ -43,6 +46,31 @@ class ResidentInferenceError(RuntimeError):
         self.session_id = session_id
 
 
+class OnnxStreamingModelAdapter:
+    """Expose funasr-onnx online inference through the worker model contract."""
+
+    def __init__(self, model):
+        self._model = model
+
+    def generate(self, *, input, cache: dict, is_final: bool, **_kwargs) -> list[dict[str, str]]:
+        result = self._model(
+            input,
+            param_dict={"cache": cache, "is_final": is_final},
+        )
+        texts: list[str] = []
+        if isinstance(result, list):
+            for item in result:
+                if not isinstance(item, dict):
+                    continue
+                value = item.get("preds")
+                if isinstance(value, (list, tuple)):
+                    value = value[0] if value else ""
+                text = str(value or "").strip()
+                if text:
+                    texts.append(text)
+        return [{"text": "".join(texts)}]
+
+
 @dataclass(frozen=True)
 class ResidentCommandHeader:
     command: str
@@ -64,12 +92,13 @@ class SessionState:
     cache: dict = field(default_factory=dict)
     audio_buffer: bytearray = field(default_factory=bytearray)
     last_text: str = ""
-    merged_text: str = ""
+    latest_partial_text: str = ""
     input_samples: int = 0
     inference_calls: int = 0
     inference_total_s: float = 0.0
     inference_max_s: float = 0.0
     hotwords: tuple[str, ...] = ()
+    preview_speech_started: bool = False
 
 
 def encode_resident_command(
@@ -282,6 +311,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="FunASR streaming ASR sidecar.")
     ap.add_argument("--resident", action="store_true", help="reuse one model across JSONL-framed sessions")
     ap.add_argument("--model", default="paraformer-zh-streaming")
+    ap.add_argument("--engine", choices=("pytorch", "onnx"), default="pytorch")
+    ap.add_argument("--onnx-device-id", default="-1")
+    ap.add_argument("--onnx-intra-op-threads", type=int, default=4)
     ap.add_argument("--hotwords", default="")
     ap.add_argument("--chunk-size", type=_parse_chunk_size, default=DEFAULT_CHUNK_SIZE)
     ap.add_argument("--encoder-chunk-look-back", type=int, default=4)
@@ -297,6 +329,8 @@ def _write_event(payload: dict) -> None:
 
 
 def _emit(event_type: str, text: str, idx: int, *, session_id: str | None = None) -> None:
+    is_partial = event_type == "partial"
+    is_terminal_snapshot = event_type == "final"
     _write_event(
         {
             "event_type": event_type,
@@ -304,16 +338,25 @@ def _emit(event_type: str, text: str, idx: int, *, session_id: str | None = None
             "segment_id": f"funasr_sc_{idx:03d}",
             "text": text,
             "sample_rate": 16000,
+            # A worker `final` is only the model's terminal snapshot. Product
+            # code must run segment refinement before treating any text as an
+            # authoritative transcript final.
+            "authoritative": False if (is_partial or is_terminal_snapshot) else None,
+            "partial_semantics": (
+                "incremental_chunk" if is_partial else "terminal_snapshot" if is_terminal_snapshot else None
+            ),
+            "final_source": "online_terminal_snapshot" if is_terminal_snapshot else None,
         }
     )
 
 
-def _emit_ready(*, resident: bool) -> None:
+def _emit_ready(*, resident: bool, engine: str = "pytorch") -> None:
     payload = {
         "event_type": "ready",
         "session_id": None,
         "scope": "process",
         "provider": "funasr_realtime",
+        "inference_engine": engine,
         "model_resolution": "local_model_dir",
         "sample_rate": 16000,
     }
@@ -429,8 +472,11 @@ def _generate_chunk(
     state.inference_max_s = max(state.inference_max_s, inference_elapsed_s)
     text = "".join(item.get("text", "") for item in res).strip()
     if text and text != state.last_text:
-        state.merged_text = merge_partial_hypothesis(state.merged_text, text)
-        _emit("partial", state.merged_text, 1, session_id=state.session_id)
+        # Paraformer streaming returns the newly decoded chunk, not a stable
+        # cumulative transcript. Keep it replaceable and never synthesize a
+        # final by concatenating these snapshots.
+        state.latest_partial_text = text
+        _emit("partial", text, 1, session_id=state.session_id)
         state.last_text = text
 
 
@@ -470,9 +516,8 @@ def _run_legacy_mode(
             pcm_bytes=data,
             dtype="float32",
         )
-    # FunASR's is_final call is unreliable on long audio; finalize from merged partials.
-    if state.merged_text:
-        _emit("final", state.merged_text, 1, session_id=None)
+    if state.latest_partial_text:
+        _emit("final", state.latest_partial_text, 1, session_id=None)
     _emit_state_telemetry(state, elapsed_s=time.monotonic() - worker_started_at)
 
 
@@ -486,9 +531,10 @@ def _process_resident_audio(
     flush: bool,
 ) -> None:
     chunk_stride_bytes = chunk_stride_samples(args.chunk_size) * 4
-    # Keep one stride pending so END can mark the true final audio as is_final.
-    # The 300 ms transport cadence bounds the added streaming delay.
-    while len(state.audio_buffer) > chunk_stride_bytes:
+    # Emit preview inference as soon as one complete stride is available.
+    # Authoritative finals come from the independent offline refiner, so holding
+    # a full stride for END only adds one transport cycle to visible latency.
+    while len(state.audio_buffer) >= chunk_stride_bytes:
         chunk_bytes = bytes(state.audio_buffer[:chunk_stride_bytes])
         del state.audio_buffer[:chunk_stride_bytes]
         _generate_chunk(
@@ -513,6 +559,23 @@ def _process_resident_audio(
             dtype="<f4",
             is_final=True,
         )
+
+
+def _trim_preview_leading_silence(*, np_module, state: SessionState, pcm_bytes: bytes) -> bytes:
+    if state.preview_speech_started or not pcm_bytes:
+        return pcm_bytes
+    samples = np_module.frombuffer(pcm_bytes, dtype="<f4")
+    complete_frames = len(samples) // PREVIEW_VAD_FRAME_SAMPLES
+    for frame_index in range(complete_frames):
+        frame_start = frame_index * PREVIEW_VAD_FRAME_SAMPLES
+        frame = samples[frame_start : frame_start + PREVIEW_VAD_FRAME_SAMPLES]
+        rms = float(np_module.sqrt(np_module.mean(frame * frame)))
+        if rms <= PREVIEW_VAD_RMS_THRESHOLD:
+            continue
+        state.preview_speech_started = True
+        preview_start = max(0, frame_start - PREVIEW_VAD_PREROLL_SAMPLES)
+        return pcm_bytes[preview_start * 4 :]
+    return b""
 
 
 def _run_resident_mode(
@@ -548,8 +611,14 @@ def _run_resident_mode(
         if command.session_id != state.session_id:
             raise ResidentProtocolError("session_mismatch", session_id=command.session_id)
         if command.command == "audio":
-            state.audio_buffer.extend(command.pcm_bytes)
             state.input_samples += len(command.pcm_bytes) // 4
+            state.audio_buffer.extend(
+                _trim_preview_leading_silence(
+                    np_module=np_module,
+                    state=state,
+                    pcm_bytes=command.pcm_bytes,
+                )
+            )
             _process_resident_audio(
                 model=model,
                 np_module=np_module,
@@ -568,9 +637,12 @@ def _run_resident_mode(
                 state=state,
                 flush=True,
             )
-            final_emitted = bool(state.merged_text)
+            # This is a terminal model snapshot for protocol compatibility,
+            # not an authoritative product final. The backend refines it over
+            # raw segment PCM before persistence.
+            final_emitted = bool(state.latest_partial_text)
             if final_emitted:
-                _emit("final", state.merged_text, 1, session_id=state.session_id)
+                _emit("final", state.latest_partial_text, 1, session_id=state.session_id)
             _emit_state_telemetry(state, elapsed_s=time.monotonic() - state.started_at)
             _emit_session_terminal(
                 "session_ended",
@@ -600,17 +672,30 @@ def main(argv: list[str] | None = None) -> None:
     worker_started_at = time.monotonic()
     with contextlib.redirect_stdout(sys.stderr):
         import numpy as np
-        from funasr import AutoModel
 
-        model = AutoModel(
-            model=args.model,
-            device="cpu",
-            disable_update=True,
-            chunk_size=args.chunk_size,
-            encoder_chunk_look_back=args.encoder_chunk_look_back,
-            decoder_chunk_look_back=args.decoder_chunk_look_back,
-        )
-        _emit_ready(resident=args.resident)
+        if args.engine == "onnx":
+            from funasr_onnx.paraformer_online_bin import Paraformer
+
+            model = OnnxStreamingModelAdapter(
+                Paraformer(
+                    args.model,
+                    chunk_size=args.chunk_size,
+                    device_id=args.onnx_device_id,
+                    intra_op_num_threads=args.onnx_intra_op_threads,
+                )
+            )
+        else:
+            from funasr import AutoModel
+
+            model = AutoModel(
+                model=args.model,
+                device="cpu",
+                disable_update=True,
+                chunk_size=args.chunk_size,
+                encoder_chunk_look_back=args.encoder_chunk_look_back,
+                decoder_chunk_look_back=args.decoder_chunk_look_back,
+            )
+        _emit_ready(resident=args.resident, engine=args.engine)
         hotwords = [word for word in args.hotwords.split() if word]
         if not args.resident:
             _run_legacy_mode(

@@ -178,14 +178,14 @@ describe("MeetingHistory", () => {
     render(<MeetingHistory api={api} onOpenMeeting={vi.fn()} />);
 
     await user.click(await screen.findByRole("button", { name: "本地数据" }));
-    const policy = await screen.findByRole("combobox", { name: "会议数据保留时间" });
-    expect(policy).toHaveValue("local_until_user_deletes");
-    await user.selectOptions(policy, "90_days");
+    const policy = await screen.findByRole("radio", { name: /手动删除/ });
+    expect(policy).toBeChecked();
+    await user.click(screen.getByRole("radio", { name: /90 天/ }));
     await user.click(screen.getByRole("button", { name: "保存设置" }));
 
     await waitFor(() => expect(updateDataGovernanceSettings).toHaveBeenCalledWith("90_days"));
     expect(await screen.findByText("保留策略已保存")).toBeVisible();
-    expect(policy).toHaveValue("90_days");
+    expect(screen.getByRole("radio", { name: /90 天/ })).toBeChecked();
   });
 
   it("can retry a failed retention-policy load before enabling save", async () => {
@@ -208,8 +208,8 @@ describe("MeetingHistory", () => {
     expect(screen.getByRole("button", { name: "保存设置" })).toBeDisabled();
     await user.click(screen.getByRole("button", { name: "重试" }));
 
-    const policy = await screen.findByRole("combobox", { name: "会议数据保留时间" });
-    await waitFor(() => expect(policy).toHaveValue("30_days"));
+    const policy = await screen.findByRole("radio", { name: /30 天/ });
+    await waitFor(() => expect(policy).toBeChecked());
     expect(screen.getByRole("button", { name: "保存设置" })).toBeEnabled();
   });
 });

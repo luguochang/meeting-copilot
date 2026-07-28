@@ -201,7 +201,15 @@ describe("MeetingPreflightDialog", () => {
   it("checks packaged system audio availability and saves the selected source", async () => {
     const onStart = vi.fn().mockResolvedValue(undefined);
     const invokeMock = vi.fn(async (command: string, args?: Record<string, unknown>) => {
-      void args;
+      if (command === "windows_audio_devices") {
+        return {
+          devices: [{
+            endpoint_id: args?.flow === "render_loopback" ? "wasapi-render-1" : "wasapi-mic-1",
+            display_name: args?.flow === "render_loopback" ? "Speakers (USB)" : "Microphone (USB)",
+            is_default: true,
+          }],
+        };
+      }
       if (command === "system_audio_adapter_prepare") {
         return {
           command_status: "ok",
@@ -232,6 +240,8 @@ describe("MeetingPreflightDialog", () => {
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("system_audio_adapter_prepare", undefined));
     expect(screen.getByRole("radio", { name: "系统音频" })).toHaveAttribute("aria-checked", "true");
     expect(screen.getByText("将采集本机播放的会议声音，不会同时启动麦克风。")).toBeVisible();
+    expect(screen.getByRole("combobox", { name: "系统音频设备" })).toHaveValue("wasapi-render-1");
+    expect(screen.getByText("Windows 将从所选播放设备的 WASAPI loopback 采集声音。")).toBeVisible();
     expect(screen.getByLabelText("系统音频启动检查项")).toHaveTextContent("传输开始时验证PCM开始时验证声音启动后检测识别独立就绪");
 
     fireEvent.click(screen.getByLabelText("我已告知参会者并确认可以录音"));
@@ -240,12 +250,14 @@ describe("MeetingPreflightDialog", () => {
     await waitFor(() => expect(onStart).toHaveBeenCalledWith({
       hotwords: [],
       inputSource: "system_audio",
-      inputDeviceId: null,
-      inputDeviceName: "系统音频",
+      inputDeviceId: "wasapi-render-1",
+      inputDeviceName: "Speakers (USB)",
       noticeAcknowledged: true,
     }));
     expect(invokeMock.mock.calls.map(([command]) => command)).toEqual([
       "provider_config_status",
+      "windows_audio_devices",
+      "windows_audio_devices",
       "dual_track_adapter_status",
       "system_audio_adapter_prepare",
     ]);
@@ -392,7 +404,7 @@ describe("MeetingPreflightDialog", () => {
     };
     render(<MeetingPreflightDialog open busy={false} onCancel={vi.fn()} onStart={vi.fn()} />);
     await screen.findByText("本地中文实时识别可用");
-    expect(invokeMock).toHaveBeenCalledTimes(2);
+    expect(invokeMock).toHaveBeenCalledTimes(4);
     expect(invokeMock).toHaveBeenCalledWith("provider_config_status", undefined);
     expect(invokeMock).toHaveBeenCalledWith("dual_track_adapter_status", undefined);
 
@@ -564,7 +576,7 @@ describe("MeetingPreflightDialog", () => {
     expect(await screen.findByText("AI 未配置，会议仍可录音和转写")).toBeVisible();
     fireEvent.click(screen.getByLabelText("我已告知参会者并确认可以录音"));
     expect(screen.getByRole("button", { name: "开始会议" })).toBeEnabled();
-    expect(invokeMock).toHaveBeenCalledTimes(2);
+    expect(invokeMock).toHaveBeenCalledTimes(4);
     expect(invokeMock).toHaveBeenCalledWith("provider_config_status", undefined);
     expect(invokeMock).toHaveBeenCalledWith("dual_track_adapter_status", undefined);
     expect(invokeMock).not.toHaveBeenCalledWith("provider_config_sync", undefined);

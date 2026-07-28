@@ -61,7 +61,9 @@ def test_speaker_api_lists_and_renames_durable_meeting_scoped_labels(speaker_api
     assert renamed.json()["speaker"]["speaker_label"] == "张工"
     refreshed = client.get("/v2/meetings/meeting-one/snapshot").json()
     assert refreshed["segments"][0]["speaker_label"] == "张工"
-    assert refreshed["semantic_paragraphs"][0]["speaker_label"] == "张工"
+    assert refreshed["segments"][1]["speaker_label"] == "Speaker 2"
+    assert refreshed["semantic_paragraphs"][0]["speaker_label"] is None
+    assert refreshed["semantic_paragraphs"][0]["checkpoint_ids"] == ["segment-1", "segment-2"]
     other_meeting = client.get("/v2/meetings/meeting-two/speakers").json()
     assert other_meeting["speakers"][0]["speaker_label"] == "Speaker 1"
 

@@ -196,3 +196,25 @@ def test_project_canonical_transcript_keeps_projection_namespace_separate_from_s
         "revision-supplement:transcript_revision:r1:2000",
     ]
     assert len({segment["projection_key"] for segment in snapshot["segments"]}) == 2
+
+
+def test_non_authoritative_final_remains_active_tail_and_is_not_committed():
+    result = project_canonical_transcript(
+        session_id="non_authoritative_snapshot",
+        events=[
+            _event(
+                "transcript_final",
+                "online_snapshot_001",
+                "接口先恢度百分之五。",
+                at_ms=1_000,
+                end_ms=900,
+                authoritative=False,
+                final_source="online_terminal_snapshot",
+            )
+        ],
+    )
+
+    assert result["committed_text"] == ""
+    assert result["segments"] == []
+    assert result["full_text"] == "接口先恢度百分之五。"
+    assert result["active_tail"]["status"] == "partial"

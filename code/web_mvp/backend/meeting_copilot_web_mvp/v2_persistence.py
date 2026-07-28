@@ -9,6 +9,7 @@ from pathlib import Path, PurePosixPath
 import re
 import sqlite3
 from threading import RLock
+import time
 from typing import Any, Iterator, Mapping
 import unicodedata
 
@@ -35,10 +36,24 @@ JOB_STATUSES = (
 DEFAULT_EVENT_PAGE_LIMIT = 200
 MAX_EVENT_PAGE_LIMIT = 1_000
 MAX_REVIEW_DOCUMENT_BYTES = 2 * 1024 * 1024
+MAX_NOTE_TITLE_CHARACTERS = 200
+MAX_NOTE_BODY_BYTES = 256 * 1024
+MAX_NOTE_EVIDENCE_ITEMS = 64
+MAX_NOTE_EVIDENCE_QUOTE_CHARACTERS = 4_000
 REVIEW_JOB_KINDS = frozenset({"minutes", "approach", "index"})
 REVIEW_DOCUMENT_KINDS = frozenset({"minutes", "decisions", "action_items", "risks", "transcript"})
 INTELLIGENCE_DEBOUNCE_MS = 2_000
-INTELLIGENCE_MAX_WAIT_MS = 8_000
+INTELLIGENCE_MAX_BATCH_SEGMENTS = 8
+SEMANTIC_PARAGRAPH_PROJECTION_VERSION = 2
+SEMANTIC_PARAGRAPH_GAP_MS = 3_500
+SEMANTIC_PARAGRAPH_MIN_DURATION_MS = 15_000
+SEMANTIC_PARAGRAPH_TARGET_MAX_DURATION_MS = 45_000
+SEMANTIC_PARAGRAPH_HARD_MAX_DURATION_MS = 60_000
+SEMANTIC_PARAGRAPH_TARGET_MAX_CHARACTERS = 220
+SEMANTIC_PARAGRAPH_HARD_MAX_CHARACTERS = 280
+SEMANTIC_PARAGRAPH_MIN_SENTENCES = 2
+SEMANTIC_PARAGRAPH_TARGET_MAX_SENTENCES = 5
+_SEMANTIC_SENTENCE_END_RE = re.compile(r"[。！？!?；;：:]+(?:[”’\"']+)?")
 IMPORT_JOB_STAGES = (
     "reading",
     "normalizing",
@@ -309,6 +324,24 @@ def _public_job_error_class(value: Any) -> str | None:
     return normalized if normalized in PUBLIC_JOB_ERROR_CLASSES else "job_failed"
 
 
+def _public_job_error_message(value: Any) -> str | None:
+    error_class = _public_job_error_class(value)
+    if error_class is None:
+        return None
+    messages = {
+        "ProviderRuntimeNotConfiguredDeferred": "AI 模型尚未连接，连接后可重试。",
+        "provider_not_synced": "AI 配置尚未同步到本地运行时。",
+        "provider_429": "AI 服务当前限流，请稍后重试。",
+        "ConnectionError": "无法连接 AI 服务，请检查网络后重试。",
+        "TimeoutError": "AI 服务响应超时，请重试。",
+        "deadline_exceeded": "任务等待时间过长，已停止本轮处理。",
+        "job_failed": "本轮 AI 处理失败，原始录音和文字已保留。",
+    }
+    if error_class.startswith("intelligence_validation_"):
+        return "AI 返回内容未通过证据校验，未写入会议事实。"
+    return messages.get(error_class, "本轮 AI 处理失败，可重试。")
+
+
 def _json_dump(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -348,6 +381,10 @@ def _merge_semantic_checkpoint_text(existing: str, incoming: str) -> str:
             return f"{left}{right[size:]}"
     separator = " " if left[-1].isascii() and right[0].isascii() and left[-1].isalnum() and right[0].isalnum() else ""
     return f"{left}{separator}{right}"
+
+
+def _semantic_sentence_count(text: str) -> int:
+    return len(_SEMANTIC_SENTENCE_END_RE.findall(str(text or "")))
 
 
 def _bounded_confidence(value: Any) -> float:
@@ -479,6 +516,9 @@ class V2Persistence:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
             harden_sqlite_files(self.database_path)
+            self._migrate_pinned_ask_notes()
+            self._migrate_source_less_replay_duplicates()
+            self._migrate_semantic_paragraph_projection()
         except BaseException:
             self._conn.close()
             self._closed = True
@@ -838,6 +878,101 @@ class V2Persistence:
         ).fetchone()
         return self._entity_dict(row)
 
+    def create_user_entity(
+        self,
+        *,
+        meeting_id: str,
+        entity_id: str,
+        kind: str,
+        text: str,
+        evidence: Any,
+        now_ms: int,
+    ) -> dict[str, Any]:
+        meeting_id = _required(meeting_id, "meeting_id")
+        entity_id = _required(entity_id, "entity_id")
+        normalized_kind = str(kind or "").strip()
+        event_types = {
+            "decision_candidate": "meeting.decision.updated",
+            "action_item": "meeting.action_item.updated",
+            "risk": "meeting.risk.updated",
+            "open_question": "meeting.open_question.updated",
+        }
+        if normalized_kind not in event_types:
+            raise ValueError("unsupported meeting entity kind")
+        normalized_text = " ".join(str(text or "").split())
+        if not normalized_text or len(normalized_text) > 4_000:
+            raise ValueError("entity text must contain 1 to 4000 characters")
+        if evidence is None:
+            evidence = []
+        if not isinstance(evidence, list) or len(evidence) > 64:
+            raise ValueError("entity evidence must contain at most 64 items")
+        normalized_evidence: list[dict[str, Any]] = []
+        for index, item in enumerate(evidence):
+            if not isinstance(item, Mapping):
+                raise ValueError(f"evidence[{index}] must be an object")
+            segment_id = _required(str(item.get("segment_id") or ""), f"evidence[{index}].segment_id")
+            quote = _required(str(item.get("quote") or ""), f"evidence[{index}].quote")
+            normalized_evidence.append(
+                {
+                    "segment_id": segment_id,
+                    "transcript_seq": item.get("transcript_seq"),
+                    "start_ms": item.get("start_ms"),
+                    "end_ms": item.get("end_ms"),
+                    "quote": quote[:4_000],
+                }
+            )
+        now_ms = max(0, int(now_ms))
+        with self._write_transaction():
+            self._raise_if_tombstoned_locked(meeting_id)
+            if self._conn.execute("SELECT 1 FROM meetings WHERE id = ?", (meeting_id,)).fetchone() is None:
+                raise KeyError(f"meeting not found: {meeting_id}")
+            existing = self._conn.execute(
+                "SELECT * FROM meeting_entities WHERE meeting_id = ? AND entity_id = ?",
+                (meeting_id, entity_id),
+            ).fetchone()
+            if existing is not None:
+                return self._entity_dict(existing)
+            current_transcript_seq = int(
+                self._conn.execute(
+                    "SELECT COALESCE(MAX(transcript_seq), 0) FROM transcript_segments WHERE meeting_id = ?",
+                    (meeting_id,),
+                ).fetchone()[0]
+            )
+            entity = self._upsert_entity_locked(
+                meeting_id,
+                normalized_kind,
+                {
+                    "id": entity_id,
+                    "status": "candidate" if normalized_kind != "open_question" else "open",
+                    "text": normalized_text,
+                    "confidence": 1.0,
+                    "evidence_segment_ids": [item["segment_id"] for item in normalized_evidence],
+                    "evidence": normalized_evidence[-1] if normalized_evidence else {},
+                    "evidence_items": normalized_evidence,
+                    "owner": None,
+                    "deadline": None,
+                    "mitigation": None,
+                    "updated_at_ms": now_ms,
+                },
+                current_transcript_seq=current_transcript_seq,
+            )
+            self._append_event_locked(
+                meeting_id=meeting_id,
+                event_type=event_types[normalized_kind],
+                aggregate_type="meeting_entity",
+                aggregate_id=entity_id,
+                occurred_at_ms=now_ms,
+                idempotency_key=f"meeting.entity.user_create:{entity_id}",
+                payload={"entity": entity, "operation": "user_create", "source": "user"},
+                correlation_id=meeting_id,
+                causation_id=entity_id,
+            )
+            row = self._conn.execute(
+                "SELECT * FROM meeting_entities WHERE meeting_id = ? AND entity_id = ?",
+                (meeting_id, entity_id),
+            ).fetchone()
+        return self._entity_dict(row)
+
     def set_entity_status(
         self,
         *,
@@ -894,6 +1029,200 @@ class V2Persistence:
                 causation_id=entity_id,
             )
             return entity
+
+    def update_entity_fields(
+        self,
+        *,
+        meeting_id: str,
+        entity_id: str,
+        fields: Mapping[str, Any],
+        expected_version: int | None,
+        now_ms: int,
+        correlation_id: str | None = None,
+    ) -> dict[str, Any]:
+        meeting_id = _required(meeting_id, "meeting_id")
+        entity_id = _required(entity_id, "entity_id")
+        allowed_fields = {"text", "owner", "deadline", "mitigation"}
+        unsupported = set(fields) - allowed_fields
+        if unsupported:
+            raise ValueError(f"unsupported entity fields: {', '.join(sorted(unsupported))}")
+        if not fields:
+            raise ValueError("entity update requires at least one editable field")
+        now_ms = max(0, int(now_ms))
+        with self._write_transaction():
+            self._raise_if_tombstoned_locked(meeting_id)
+            row = self._conn.execute(
+                "SELECT * FROM meeting_entities WHERE meeting_id = ? AND entity_id = ?",
+                (meeting_id, entity_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"meeting entity not found: {entity_id}")
+            if expected_version is not None and int(row["version"]) != int(expected_version):
+                raise RuntimeError("meeting entity version conflict")
+            values = {
+                "text": str(row["text"]),
+                "owner": row["owner"],
+                "deadline": row["deadline"],
+                "mitigation": row["mitigation"],
+            }
+            for field in allowed_fields.intersection(fields):
+                value = fields[field]
+                if field == "text":
+                    normalized = " ".join(str(value or "").split())
+                    if not normalized or len(normalized) > 4_000:
+                        raise ValueError("entity text must contain 1 to 4000 characters")
+                    values[field] = normalized
+                else:
+                    normalized = " ".join(str(value or "").split()) or None
+                    if normalized is not None and len(normalized) > 500:
+                        raise ValueError(f"entity {field} must not exceed 500 characters")
+                    values[field] = normalized
+            changed = any(values[field] != row[field] for field in allowed_fields)
+            if not changed:
+                return self._entity_dict(row)
+            self._conn.execute(
+                "UPDATE meeting_entities SET text = ?, owner = ?, deadline = ?, mitigation = ?, "
+                "version = version + 1, updated_at_ms = ? WHERE meeting_id = ? AND entity_id = ?",
+                (
+                    values["text"],
+                    values["owner"],
+                    values["deadline"],
+                    values["mitigation"],
+                    now_ms,
+                    meeting_id,
+                    entity_id,
+                ),
+            )
+            updated = self._conn.execute(
+                "SELECT * FROM meeting_entities WHERE meeting_id = ? AND entity_id = ?",
+                (meeting_id, entity_id),
+            ).fetchone()
+            entity = self._entity_dict(updated)
+            event_type = {
+                "current_topic": "meeting.topic.updated",
+                "open_question": "meeting.open_question.updated",
+                "decision_candidate": "meeting.decision.updated",
+                "action_item": "meeting.action_item.updated",
+                "risk": "meeting.risk.updated",
+            }[str(updated["kind"])]
+            event_seq = self._append_event_locked(
+                meeting_id=meeting_id,
+                event_type=event_type,
+                aggregate_type="meeting_entity",
+                aggregate_id=entity_id,
+                occurred_at_ms=now_ms,
+                idempotency_key=f"meeting.entity.user_edit:{entity_id}:{int(updated['version'])}",
+                payload={"entity": entity, "operation": "user_edit", "source": "user"},
+                correlation_id=correlation_id or meeting_id,
+                causation_id=entity_id,
+            )
+            self._conn.execute(
+                "UPDATE meeting_entities SET last_updated_seq = ? WHERE meeting_id = ? AND entity_id = ?",
+                (event_seq, meeting_id, entity_id),
+            )
+            updated = self._conn.execute(
+                "SELECT * FROM meeting_entities WHERE meeting_id = ? AND entity_id = ?",
+                (meeting_id, entity_id),
+            ).fetchone()
+            return self._entity_dict(updated)
+
+    def merge_entities(
+        self,
+        *,
+        meeting_id: str,
+        target_entity_id: str,
+        source_entity_id: str,
+        expected_target_version: int | None,
+        expected_source_version: int | None,
+        now_ms: int,
+        correlation_id: str | None = None,
+    ) -> dict[str, Any]:
+        meeting_id = _required(meeting_id, "meeting_id")
+        target_entity_id = _required(target_entity_id, "target_entity_id")
+        source_entity_id = _required(source_entity_id, "source_entity_id")
+        if target_entity_id == source_entity_id:
+            raise ValueError("an entity cannot be merged into itself")
+        now_ms = max(0, int(now_ms))
+        with self._write_transaction():
+            self._raise_if_tombstoned_locked(meeting_id)
+            target = self._conn.execute(
+                "SELECT * FROM meeting_entities WHERE meeting_id = ? AND entity_id = ?",
+                (meeting_id, target_entity_id),
+            ).fetchone()
+            source = self._conn.execute(
+                "SELECT * FROM meeting_entities WHERE meeting_id = ? AND entity_id = ?",
+                (meeting_id, source_entity_id),
+            ).fetchone()
+            if target is None or source is None:
+                raise KeyError("meeting entity merge target or source was not found")
+            if str(target["kind"]) != str(source["kind"]):
+                raise ValueError("only entities of the same kind can be merged")
+            if expected_target_version is not None and int(target["version"]) != int(expected_target_version):
+                raise RuntimeError("meeting entity target version conflict")
+            if expected_source_version is not None and int(source["version"]) != int(expected_source_version):
+                raise RuntimeError("meeting entity source version conflict")
+            evidence_ids = list(
+                dict.fromkeys(
+                    [
+                        *json.loads(target["evidence_segment_ids_json"]),
+                        *json.loads(source["evidence_segment_ids_json"]),
+                    ]
+                )
+            )
+            self._conn.execute(
+                "UPDATE meeting_entities SET evidence_segment_ids_json = ?, version = version + 1, "
+                "updated_at_ms = ? WHERE meeting_id = ? AND entity_id = ?",
+                (_json_dump(evidence_ids), now_ms, meeting_id, target_entity_id),
+            )
+            self._conn.execute(
+                "UPDATE meeting_entities SET status = 'dismissed', version = version + 1, "
+                "updated_at_ms = ? WHERE meeting_id = ? AND entity_id = ?",
+                (now_ms, meeting_id, source_entity_id),
+            )
+            merged_target = self._conn.execute(
+                "SELECT * FROM meeting_entities WHERE meeting_id = ? AND entity_id = ?",
+                (meeting_id, target_entity_id),
+            ).fetchone()
+            merged_source = self._conn.execute(
+                "SELECT * FROM meeting_entities WHERE meeting_id = ? AND entity_id = ?",
+                (meeting_id, source_entity_id),
+            ).fetchone()
+            event_seq = self._append_event_locked(
+                meeting_id=meeting_id,
+                event_type="meeting.entity.merged",
+                aggregate_type="meeting_entity",
+                aggregate_id=target_entity_id,
+                occurred_at_ms=now_ms,
+                idempotency_key=(
+                    f"meeting.entity.merge:{target_entity_id}:{source_entity_id}:"
+                    f"{int(merged_target['version'])}:{int(merged_source['version'])}"
+                ),
+                payload={
+                    "target": self._entity_dict(merged_target),
+                    "source": self._entity_dict(merged_source),
+                    "operation": "user_merge",
+                    "source_entity_id": source_entity_id,
+                    "source_type": "user",
+                },
+                correlation_id=correlation_id or meeting_id,
+                causation_id=source_entity_id,
+            )
+            self._conn.execute(
+                "UPDATE meeting_entities SET last_updated_seq = ? WHERE meeting_id = ? AND entity_id IN (?, ?)",
+                (event_seq, meeting_id, target_entity_id, source_entity_id),
+            )
+            target_result = self._conn.execute(
+                "SELECT * FROM meeting_entities WHERE meeting_id = ? AND entity_id = ?",
+                (meeting_id, target_entity_id),
+            ).fetchone()
+            source_result = self._conn.execute(
+                "SELECT * FROM meeting_entities WHERE meeting_id = ? AND entity_id = ?",
+                (meeting_id, source_entity_id),
+            ).fetchone()
+            return {
+                "target": self._entity_dict(target_result),
+                "source": self._entity_dict(source_result),
+            }
 
     def confirm_entity(
         self,
@@ -1654,6 +1983,136 @@ class V2Persistence:
         ).fetchone()
         return self._semantic_paragraph_dict(row, checkpoint_ids=[str(item["checkpoint_id"]) for item in checkpoints])
 
+    def _migrate_semantic_paragraph_projection(self) -> None:
+        """Rebuild derived reading blocks when deterministic grouping rules change."""
+
+        with self._write_transaction():
+            meeting_rows = self._conn.execute(
+                "SELECT DISTINCT meeting_id FROM semantic_paragraphs "
+                "WHERE projection_version < ? ORDER BY meeting_id",
+                (SEMANTIC_PARAGRAPH_PROJECTION_VERSION,),
+            ).fetchall()
+            for meeting_row in meeting_rows:
+                meeting_id = str(meeting_row["meeting_id"])
+                checkpoints = self._conn.execute(
+                    "SELECT checkpoint.*, segment.segment_id AS segment_id, "
+                    "segment.source_track AS source_track, segment.speaker_id AS speaker_id, "
+                    "segment.speaker_label AS speaker_label, "
+                    "segment.speaker_confidence AS speaker_confidence "
+                    "FROM asr_checkpoints checkpoint "
+                    "JOIN transcript_segments segment ON segment.meeting_id = checkpoint.meeting_id "
+                    "AND segment.segment_id = checkpoint.checkpoint_id "
+                    "WHERE checkpoint.meeting_id = ? AND segment.duplicate_of_segment_id IS NULL "
+                    "ORDER BY checkpoint.transcript_seq",
+                    (meeting_id,),
+                ).fetchall()
+                if not checkpoints:
+                    continue
+                self._conn.execute(
+                    "DELETE FROM semantic_paragraph_checkpoints WHERE meeting_id = ?",
+                    (meeting_id,),
+                )
+                self._conn.execute(
+                    "DELETE FROM semantic_paragraphs WHERE meeting_id = ?",
+                    (meeting_id,),
+                )
+                for checkpoint in checkpoints:
+                    self._project_semantic_paragraph_locked(
+                        meeting_id=meeting_id,
+                        checkpoint=dict(checkpoint),
+                        now_ms=int(checkpoint["updated_at_ms"] or checkpoint["created_at_ms"] or 0),
+                    )
+                meeting = self._conn.execute(
+                    "SELECT state, updated_at_ms FROM meetings WHERE id = ?",
+                    (meeting_id,),
+                ).fetchone()
+                if meeting is not None and str(meeting["state"]) != "live":
+                    self._conn.execute(
+                        "UPDATE semantic_paragraphs SET status = 'stable', updated_at_ms = MAX(updated_at_ms, ?) "
+                        "WHERE meeting_id = ? AND status = 'active'",
+                        (int(meeting["updated_at_ms"] or 0), meeting_id),
+                    )
+
+    def _migrate_source_less_replay_duplicates(self) -> None:
+        """Repair legacy finals replayed without their original source track."""
+
+        now_ms = int(time.time() * 1_000)
+        with self._write_transaction():
+            replay_rows = self._conn.execute(
+                "SELECT * FROM transcript_segments WHERE source_track IS NULL "
+                "AND duplicate_of_segment_id IS NULL AND started_at_ms IS NOT NULL "
+                "AND ended_at_ms IS NOT NULL ORDER BY meeting_id, transcript_seq"
+            ).fetchall()
+            for replay in replay_rows:
+                duplicate_match = self._find_source_duplicate_locked(
+                    meeting_id=str(replay["meeting_id"]),
+                    source_track=None,
+                    normalized_text=str(replay["normalized_text"]),
+                    started_at_ms=int(replay["started_at_ms"]),
+                    ended_at_ms=int(replay["ended_at_ms"]),
+                    before_transcript_seq=int(replay["transcript_seq"]),
+                )
+                if duplicate_match is None:
+                    continue
+
+                meeting_id = str(replay["meeting_id"])
+                segment_id = str(replay["segment_id"])
+                duplicate_of_segment_id = str(duplicate_match[0]["segment_id"])
+                similarity = float(duplicate_match[1])
+                paragraph_rows = self._conn.execute(
+                    "SELECT paragraph_id FROM semantic_paragraph_checkpoints "
+                    "WHERE meeting_id = ? AND checkpoint_id = ?",
+                    (meeting_id, segment_id),
+                ).fetchall()
+
+                self._conn.execute(
+                    "UPDATE transcript_segments SET duplicate_of_segment_id = ?, "
+                    "source_duplicate_similarity = ?, correction_status = 'no_change', "
+                    "correction_error_class = NULL, updated_at_ms = MAX(updated_at_ms, ?) "
+                    "WHERE meeting_id = ? AND segment_id = ?",
+                    (duplicate_of_segment_id, similarity, now_ms, meeting_id, segment_id),
+                )
+                self._conn.execute(
+                    "UPDATE jobs SET status = 'cancelled', lease_owner = NULL, lease_until_ms = NULL, "
+                    "error_class = 'evidence_superseded', completed_at_ms = COALESCE(completed_at_ms, ?), "
+                    "updated_at_ms = MAX(updated_at_ms, ?) WHERE meeting_id = ? "
+                    "AND evidence_segment_id = ? "
+                    "AND status IN ('pending', 'running', 'retry_wait', 'succeeded', 'failed')",
+                    (now_ms, now_ms, meeting_id, segment_id),
+                )
+                self._conn.execute(
+                    "UPDATE suggestions SET status = 'superseded', updated_at_ms = MAX(updated_at_ms, ?) "
+                    "WHERE meeting_id = ? AND evidence_segment_id = ? "
+                    "AND status IN ('draft', 'committed')",
+                    (now_ms, meeting_id, segment_id),
+                )
+                self._conn.execute(
+                    "DELETE FROM semantic_paragraph_checkpoints "
+                    "WHERE meeting_id = ? AND checkpoint_id = ?",
+                    (meeting_id, segment_id),
+                )
+                for paragraph_row in paragraph_rows:
+                    paragraph_id = str(paragraph_row["paragraph_id"])
+                    checkpoint_count = int(
+                        self._conn.execute(
+                            "SELECT COUNT(*) FROM semantic_paragraph_checkpoints "
+                            "WHERE meeting_id = ? AND paragraph_id = ?",
+                            (meeting_id, paragraph_id),
+                        ).fetchone()[0]
+                    )
+                    if checkpoint_count == 0:
+                        self._conn.execute(
+                            "DELETE FROM semantic_paragraphs "
+                            "WHERE meeting_id = ? AND paragraph_id = ?",
+                            (meeting_id, paragraph_id),
+                        )
+                    else:
+                        self._rebuild_semantic_paragraph_locked(
+                            meeting_id=meeting_id,
+                            paragraph_id=paragraph_id,
+                            now_ms=now_ms,
+                        )
+
     def _project_semantic_paragraph_locked(
         self,
         *,
@@ -1674,6 +2133,7 @@ class V2Persistence:
         speaker_id = checkpoint.get("speaker_id")
         speaker_label = checkpoint.get("speaker_label")
         speaker_confidence = checkpoint.get("speaker_confidence")
+        source_track = _validated_transcript_source_track(checkpoint.get("source_track"))
         self._conn.execute(
             "INSERT INTO asr_checkpoints ("
             "meeting_id, checkpoint_id, final_id, transcript_seq, text, normalized_text, "
@@ -1714,10 +2174,20 @@ class V2Persistence:
         ).fetchone()
         should_stabilize = False
         if active is not None:
+            checkpoint_count = int(
+                self._conn.execute(
+                    "SELECT COUNT(*) FROM semantic_paragraph_checkpoints "
+                    "WHERE meeting_id = ? AND paragraph_id = ?",
+                    (meeting_id, active["paragraph_id"]),
+                ).fetchone()[0]
+            )
             last_checkpoint = self._conn.execute(
-                "SELECT c.* FROM asr_checkpoints c "
+                "SELECT c.*, segment.source_track AS source_track, segment.speaker_id AS speaker_id "
+                "FROM asr_checkpoints c "
                 "JOIN semantic_paragraph_checkpoints pc ON pc.meeting_id = c.meeting_id "
                 "AND pc.checkpoint_id = c.checkpoint_id "
+                "JOIN transcript_segments segment ON segment.meeting_id = c.meeting_id "
+                "AND segment.segment_id = c.checkpoint_id "
                 "WHERE pc.meeting_id = ? AND pc.paragraph_id = ? "
                 "ORDER BY pc.ordinal DESC LIMIT 1",
                 (meeting_id, active["paragraph_id"]),
@@ -1729,8 +2199,52 @@ class V2Persistence:
                 and last_checkpoint["ended_at_ms"] is not None
                 else 0
             )
-            duration_ms = int(ended_at_ms or started_at_ms or 0) - int(active["start_ms"] or 0)
-            should_stabilize = gap_ms >= 1_800 or duration_ms > 60_000 or active["speaker_id"] != speaker_id
+            active_duration_ms = int(active["end_ms"] or active["start_ms"] or 0) - int(
+                active["start_ms"] or 0
+            )
+            active_text = str(active["text"] or "").strip()
+            sentence_count = _semantic_sentence_count(active_text)
+            has_readable_body = (
+                checkpoint_count >= 2
+                and active_duration_ms >= SEMANTIC_PARAGRAPH_MIN_DURATION_MS
+                and sentence_count >= SEMANTIC_PARAGRAPH_MIN_SENTENCES
+            )
+            reached_target = (
+                checkpoint_count >= 2
+                and (
+                    active_duration_ms >= SEMANTIC_PARAGRAPH_TARGET_MAX_DURATION_MS
+                    or len(active_text) >= SEMANTIC_PARAGRAPH_TARGET_MAX_CHARACTERS
+                    or sentence_count >= SEMANTIC_PARAGRAPH_TARGET_MAX_SENTENCES
+                )
+            )
+            reached_hard_limit = (
+                checkpoint_count >= 2
+                and (
+                    active_duration_ms >= SEMANTIC_PARAGRAPH_HARD_MAX_DURATION_MS
+                    or len(active_text) >= SEMANTIC_PARAGRAPH_HARD_MAX_CHARACTERS
+                )
+            )
+            source_track_changed = bool(
+                last_checkpoint is not None
+                and source_track in DUAL_RECORDING_TRACKS
+                and str(last_checkpoint["source_track"] or "") in DUAL_RECORDING_TRACKS
+                and source_track != str(last_checkpoint["source_track"])
+            )
+            should_stabilize = (
+                gap_ms >= SEMANTIC_PARAGRAPH_GAP_MS
+                or reached_hard_limit
+                or has_readable_body
+                or (
+                    active_duration_ms >= SEMANTIC_PARAGRAPH_MIN_DURATION_MS
+                    and sentence_count > 0
+                    and reached_target
+                )
+                # A microphone and system-audio track can contain two different
+                # speakers at the same time. Keep those evidence streams in
+                # separate paragraphs; exact cross-track duplicates are removed
+                # earlier by _find_source_duplicate_locked.
+                or source_track_changed
+            )
             if should_stabilize:
                 self._conn.execute(
                     "UPDATE semantic_paragraphs SET status = 'stable', updated_at_ms = ? "
@@ -1743,8 +2257,8 @@ class V2Persistence:
             self._conn.execute(
                 "INSERT INTO semantic_paragraphs ("
                 "meeting_id, paragraph_id, revision, text, start_ms, end_ms, speaker_id, "
-                "speaker_label, speaker_confidence, status, created_at_ms, updated_at_ms) "
-                "VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, 'active', ?, ?)",
+                "speaker_label, speaker_confidence, status, created_at_ms, updated_at_ms, projection_version) "
+                "VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)",
                 (
                     meeting_id,
                     paragraph_id,
@@ -1756,6 +2270,7 @@ class V2Persistence:
                     speaker_confidence,
                     now_ms,
                     now_ms,
+                    SEMANTIC_PARAGRAPH_PROJECTION_VERSION,
                 ),
             )
         else:
@@ -1786,14 +2301,32 @@ class V2Persistence:
         normalized_text: str,
         started_at_ms: int | None,
         ended_at_ms: int | None,
+        before_transcript_seq: int | None = None,
     ) -> tuple[sqlite3.Row, float] | None:
-        if source_track not in DUAL_RECORDING_TRACKS:
+        parameters: list[Any]
+        if source_track in DUAL_RECORDING_TRACKS:
+            candidate_clause = (
+                "source_track IN ('microphone', 'system_audio') AND source_track != ?"
+            )
+            parameters = [meeting_id, source_track]
+        elif source_track is None and started_at_ms is not None and ended_at_ms is not None:
+            # Recovery replay may lose its source prefix. Exact timing keeps
+            # this path narrow enough to preserve legitimate repeated speech.
+            candidate_clause = (
+                "source_track IN ('microphone', 'system_audio') "
+                "AND started_at_ms = ? AND ended_at_ms = ?"
+            )
+            parameters = [meeting_id, int(started_at_ms), int(ended_at_ms)]
+        else:
             return None
+        if before_transcript_seq is not None:
+            candidate_clause += " AND transcript_seq < ?"
+            parameters.append(int(before_transcript_seq))
         candidates = self._conn.execute(
             "SELECT * FROM transcript_segments WHERE meeting_id = ? "
-            "AND source_track IN ('microphone', 'system_audio') AND source_track != ? "
-            "AND duplicate_of_segment_id IS NULL ORDER BY transcript_seq DESC LIMIT 24",
-            (meeting_id, source_track),
+            f"AND {candidate_clause} AND duplicate_of_segment_id IS NULL "
+            "ORDER BY transcript_seq DESC LIMIT 24",
+            parameters,
         ).fetchall()
         best: tuple[sqlite3.Row, float] | None = None
         for candidate in candidates:
@@ -1804,9 +2337,15 @@ class V2Persistence:
                 candidate_ended_at_ms=candidate["ended_at_ms"],
             ):
                 continue
-            similarity = _source_duplicate_similarity(
-                normalized_text,
-                str(candidate["normalized_text"]),
+            candidate_text = str(candidate["normalized_text"])
+            replay_text = _source_duplicate_text(normalized_text)
+            candidate_replay_text = _source_duplicate_text(candidate_text)
+            similarity = (
+                1.0
+                if source_track is None
+                and replay_text
+                and replay_text == candidate_replay_text
+                else _source_duplicate_similarity(normalized_text, candidate_text)
             )
             if similarity < SOURCE_DUPLICATE_MIN_SIMILARITY:
                 continue
@@ -1834,7 +2373,7 @@ class V2Persistence:
         enqueue_jobs: bool = True,
         source_track: str | None = None,
     ) -> dict[str, Any]:
-        """Commit one final and its two AI jobs as a single durable unit."""
+        """Commit one final and its derived jobs as a single durable unit."""
 
         meeting_id = _required(meeting_id, "meeting_id")
         final_id = _required(final_id, "final_id")
@@ -2036,32 +2575,48 @@ class V2Persistence:
                         "speaker_id": checkpoint_row["speaker_id"],
                         "speaker_label": checkpoint_row["speaker_label"],
                         "speaker_confidence": checkpoint_row["speaker_confidence"],
+                        "source_track": checkpoint_row["source_track"],
                     },
                     now_ms=now_ms,
                 )
 
             effective_enqueue_jobs = enqueue_jobs and duplicate_of_segment_id is None
             if effective_enqueue_jobs:
-                job_specs: list[tuple[str, str, int, str | None, int]] = [
-                    ("correction", correction_job_id, 100, None, transcript_seq),
-                    ("suggestion", suggestion_job_id, 90, generation_id, transcript_seq),
-                ]
+                job_specs: list[tuple[str, str, int, str | None, int]] = []
                 if self.semantic_projection_mode == "llm_first":
                     if paragraph_projection is None:
                         raise RuntimeError("LLM-first intelligence requires a semantic paragraph")
                     paragraph_id = str(paragraph_projection["paragraph_id"])
                     paragraph_revision = int(paragraph_projection["revision"])
-                    coalescible_job = self._conn.execute(
-                        "SELECT job.id FROM jobs job "
-                        "JOIN semantic_paragraph_checkpoints checkpoint "
-                        "ON checkpoint.meeting_id = job.meeting_id "
-                        "AND checkpoint.checkpoint_id = job.evidence_segment_id "
-                        "WHERE job.meeting_id = ? AND job.kind = 'intelligence' "
-                        "AND job.status IN ('pending', 'retry_wait') "
-                        "AND checkpoint.paragraph_id = ? "
-                        "ORDER BY job.created_at_ms DESC, job.id DESC LIMIT 1",
-                        (meeting_id, paragraph_id),
-                    ).fetchone()
+                    recent_jobs = self._conn.execute(
+                        "SELECT id, status, input_transcript_seq FROM jobs "
+                        "WHERE meeting_id = ? AND kind = 'intelligence' "
+                        "ORDER BY input_transcript_seq DESC, created_at_ms DESC, id DESC LIMIT 2",
+                        (meeting_id,),
+                    ).fetchall()
+                    latest_job = recent_jobs[0] if recent_jobs else None
+                    previous_batch_end = (
+                        int(recent_jobs[1]["input_transcript_seq"] or 0)
+                        if len(recent_jobs) > 1
+                        else 0
+                    )
+                    latest_has_applied_event = (
+                        latest_job is not None
+                        and self._conn.execute(
+                            "SELECT 1 FROM meeting_events WHERE meeting_id = ? "
+                            "AND idempotency_key = ? LIMIT 1",
+                            (meeting_id, f"meeting.intelligence.applied:{latest_job['id']}"),
+                        ).fetchone()
+                        is not None
+                    )
+                    coalescible_job = (
+                        latest_job
+                        if latest_job is not None
+                        and not latest_has_applied_event
+                        and str(latest_job["status"]) in {"pending", "retry_wait"}
+                        and transcript_seq - previous_batch_end <= INTELLIGENCE_MAX_BATCH_SEGMENTS
+                        else None
+                    )
                     intelligence_job_id = (
                         str(coalescible_job["id"])
                         if coalescible_job is not None
@@ -2082,9 +2637,17 @@ class V2Persistence:
                             paragraph_revision,
                         )
                     )
+                    job_specs.append(("correction", correction_job_id, 120, None, transcript_seq))
+                else:
+                    job_specs.extend(
+                        (
+                            ("correction", correction_job_id, 100, None, transcript_seq),
+                            ("suggestion", suggestion_job_id, 90, generation_id, transcript_seq),
+                        )
+                    )
                 for kind, job_id, priority, job_generation_id, input_version in job_specs:
                     next_attempt_at_ms = now_ms + INTELLIGENCE_DEBOUNCE_MS if kind == "intelligence" else now_ms
-                    deadline_at_ms = now_ms + INTELLIGENCE_MAX_WAIT_MS if kind == "intelligence" else None
+                    deadline_at_ms = None
                     self._conn.execute(
                         "INSERT OR IGNORE INTO jobs ("
                         "id, meeting_id, kind, status, priority, input_transcript_seq, "
@@ -2114,8 +2677,7 @@ class V2Persistence:
                         self._conn.execute(
                             "UPDATE jobs SET input_transcript_seq = ?, input_version = ?, "
                             "evidence_segment_id = ?, evidence_hash = ?, generation_id = ?, "
-                            "next_attempt_at_ms = MIN(?, COALESCE(deadline_at_ms, created_at_ms + ?)), "
-                            "deadline_at_ms = COALESCE(deadline_at_ms, created_at_ms + ?), updated_at_ms = ? "
+                            "next_attempt_at_ms = ?, deadline_at_ms = NULL, updated_at_ms = ? "
                             "WHERE id = ? AND status IN ('pending', 'retry_wait')",
                             (
                                 transcript_seq,
@@ -2124,8 +2686,6 @@ class V2Persistence:
                                 evidence_hash,
                                 job_generation_id,
                                 next_attempt_at_ms,
-                                INTELLIGENCE_MAX_WAIT_MS,
-                                INTELLIGENCE_MAX_WAIT_MS,
                                 now_ms,
                                 job_id,
                             ),
@@ -2144,15 +2704,11 @@ class V2Persistence:
             "duplicate_of_segment_id": duplicate_of_segment_id,
             "source_duplicate_similarity": source_duplicate_similarity,
             "job_ids": (
-                {
-                    "correction": correction_job_id,
-                    "suggestion": suggestion_job_id,
-                    **(
-                        {"intelligence": intelligence_job_id}
-                        if self.semantic_projection_mode == "llm_first" and intelligence_job_id is not None
-                        else {}
-                    ),
-                }
+                (
+                    {"correction": correction_job_id, "intelligence": intelligence_job_id}
+                    if self.semantic_projection_mode == "llm_first" and intelligence_job_id is not None
+                    else {"correction": correction_job_id, "suggestion": suggestion_job_id}
+                )
                 if effective_enqueue_jobs
                 else {}
             ),
@@ -2194,9 +2750,7 @@ class V2Persistence:
         error_class: str | None = None,
     ) -> None:
         job_kind = str(job_row["kind"])
-        if job_kind not in {"correction", "intelligence"}:
-            return
-        if job_kind == "correction" and self.semantic_projection_mode == "llm_first":
+        if job_kind != "correction":
             return
         normalized_status = {
             "pending": "pending",
@@ -2221,9 +2775,17 @@ class V2Persistence:
                 (now_ms, job_row["meeting_id"], *segment_ids),
             )
             return
+        terminal_guard = (
+            " AND correction_status NOT IN ('changed', 'no_change')"
+            if normalized_status in {"pending", "processing", "failed_preserved_original"}
+            else ""
+        )
         self._conn.execute(
             "UPDATE transcript_segments SET correction_status = ?, correction_error_class = ?, "
-            "correction_updated_at_ms = ? WHERE meeting_id = ? AND segment_id IN (" + placeholders + ")",
+            "correction_updated_at_ms = ? WHERE meeting_id = ? AND segment_id IN ("
+            + placeholders
+            + ")"
+            + terminal_guard,
             (
                 normalized_status,
                 _public_job_error_class(error_class) if normalized_status == "failed_preserved_original" else None,
@@ -2250,6 +2812,19 @@ class V2Persistence:
 
         with self._write_transaction():
             self._recover_expired_leases_locked(now_ms)
+            if lane == "intelligence":
+                # Intelligence work is useful only inside its bounded realtime
+                # window. Do not replay an old backlog when a Provider is
+                # configured hours later.
+                self._conn.execute(
+                    "UPDATE jobs SET status = 'cancelled', lease_owner = NULL, "
+                    "lease_until_ms = NULL, error_class = 'deadline_exceeded', "
+                    "completed_at_ms = COALESCE(completed_at_ms, ?), updated_at_ms = ? "
+                    "WHERE kind = 'intelligence' "
+                    "AND status IN ('pending', 'retry_wait') "
+                    "AND deadline_at_ms IS NOT NULL AND deadline_at_ms < ?",
+                    (now_ms, now_ms, now_ms),
+                )
             candidate = self._conn.execute(
                 "SELECT id FROM jobs "
                 "WHERE kind = ? "
@@ -2803,6 +3378,10 @@ class V2Persistence:
         raw_follow_up = response.get("follow_up")
         if not isinstance(raw_revisions, list) or not isinstance(raw_changes, list):
             raise IntelligenceProjectionError("intelligence response arrays are invalid")
+        if self.semantic_projection_mode == "llm_first" and raw_revisions:
+            raise IntelligenceProjectionError(
+                "transcript revisions must be applied by the independent correction lane"
+            )
 
         def idempotent_result(event_row: sqlite3.Row) -> dict[str, Any]:
             payload = json.loads(event_row["payload_json"] or "{}")
@@ -3318,12 +3897,13 @@ class V2Persistence:
                             str(latest_segment["evidence_hash"]),
                         ),
                     ).fetchone()
-                    for kind, priority in (
-                        ("correction", 120),
+                    end_job_specs = [
                         ("minutes", 60),
                         ("approach", 50),
                         ("index", 40),
-                    ):
+                    ]
+                    end_job_specs.insert(0, ("correction", 120))
+                    for kind, priority in end_job_specs:
                         if kind == "correction" and existing_correction is not None:
                             continue
                         job_id = _stable_id("job", meeting_id, "meeting.ended", kind)
@@ -6491,17 +7071,6 @@ class V2Persistence:
             else {"state": "unknown", "label": "等待录音"}
         )
         ai_busy = any(job["status"] in {"pending", "running", "retry_wait"} for job in jobs)
-        failed_generation_jobs = [
-            job for job in jobs if job["kind"] in {"correction", "suggestion"} and job["status"] == "failed"
-        ]
-        latest_failed_generation_job = (
-            max(
-                failed_generation_jobs,
-                key=lambda job: (int(job["updated_at_ms"]), str(job["id"])),
-            )
-            if failed_generation_jobs
-            else None
-        )
         review_jobs: dict[str, dict[str, Any]] = {}
         for job in jobs:
             kind = str(job["kind"])
@@ -6517,6 +7086,8 @@ class V2Persistence:
                 "attempts": job["attempts"],
                 "max_attempts": job["max_attempts"],
                 "error_class": _public_job_error_class(job["error_class"]),
+                "error_message": _public_job_error_message(job["error_class"]),
+                "retryable": job["status"] == "failed",
                 "created_at_ms": job["created_at_ms"],
                 "updated_at_ms": job["updated_at_ms"],
                 "completed_at_ms": job["completed_at_ms"],
@@ -6581,15 +7152,9 @@ class V2Persistence:
                 "recording": recording_indicator,
                 "input": {"state": "unknown", "label": "等待输入状态"},
                 "ai": {
-                    "state": "busy" if ai_busy else "error" if latest_failed_generation_job else "idle",
-                    "label": (
-                        "AI 正在处理" if ai_busy else "AI 处理失败" if latest_failed_generation_job else "AI 已同步"
-                    ),
-                    "error_class": (
-                        _public_job_error_class(latest_failed_generation_job["error_class"])
-                        if not ai_busy and latest_failed_generation_job is not None
-                        else None
-                    ),
+                    "state": "busy" if ai_busy else "idle",
+                    "label": "AI 正在处理" if ai_busy else "AI 已同步",
+                    "error_class": None,
                 },
                 "elapsed_ms": (
                     max(
@@ -7097,6 +7662,558 @@ class V2Persistence:
             "next_after_seq": next_after_seq,
         }
 
+    def list_chapters(self, meeting_id: str, *, query: str = "") -> dict[str, Any]:
+        meeting_id = _required(meeting_id, "meeting_id")
+        normalized_query = " ".join(str(query or "").split()).casefold()
+        with self._lock:
+            if self._conn.execute("SELECT 1 FROM meetings WHERE id = ?", (meeting_id,)).fetchone() is None:
+                raise KeyError(f"meeting not found: {meeting_id}")
+            rows = self._conn.execute(
+                "SELECT paragraph.*, GROUP_CONCAT(mapping.checkpoint_id, char(31)) AS checkpoint_ids "
+                "FROM semantic_paragraphs paragraph LEFT JOIN semantic_paragraph_checkpoints mapping "
+                "ON mapping.meeting_id = paragraph.meeting_id AND mapping.paragraph_id = paragraph.paragraph_id "
+                "WHERE paragraph.meeting_id = ? GROUP BY paragraph.meeting_id, paragraph.paragraph_id "
+                "ORDER BY paragraph.start_ms, paragraph.paragraph_id",
+                (meeting_id,),
+            ).fetchall()
+        groups: list[list[sqlite3.Row]] = []
+        for row in rows:
+            current = groups[-1] if groups else None
+            current_start = int(current[0]["start_ms"] or 0) if current else 0
+            row_start = int(row["start_ms"] or current_start)
+            if current is None or len(current) >= 6 or row_start - current_start >= 5 * 60_000:
+                groups.append([row])
+            else:
+                current.append(row)
+        chapters: list[dict[str, Any]] = []
+        for index, group in enumerate(groups, start=1):
+            text = "\n".join(str(row["text"] or "").strip() for row in group if str(row["text"] or "").strip())
+            if normalized_query and normalized_query not in text.casefold():
+                continue
+            checkpoint_ids = [
+                checkpoint_id
+                for row in group
+                for checkpoint_id in str(row["checkpoint_ids"] or "").split(chr(31))
+                if checkpoint_id
+            ]
+            first = group[0]
+            title_source = re.split(r"[。！？!?；;\n]", text, maxsplit=1)[0].strip()
+            chapters.append(
+                {
+                    "chapter_id": _stable_id("chapter", meeting_id, str(first["paragraph_id"])),
+                    "index": index,
+                    "title": title_source[:36] or f"第 {index} 章",
+                    "text": text,
+                    "start_ms": first["start_ms"],
+                    "end_ms": group[-1]["end_ms"],
+                    "paragraph_ids": [str(row["paragraph_id"]) for row in group],
+                    "evidence_segment_ids": checkpoint_ids,
+                }
+            )
+        return {"meeting_id": meeting_id, "query": query, "chapters": chapters}
+
+    def create_ask_turn(
+        self,
+        *,
+        meeting_id: str,
+        thread_id: str,
+        user_message_id: str,
+        assistant_message_id: str,
+        question: str,
+        scope: str,
+        evidence: list[dict[str, Any]],
+        now_ms: int,
+    ) -> dict[str, Any]:
+        meeting_id = _required(meeting_id, "meeting_id")
+        thread_id = _required(thread_id, "thread_id")
+        user_message_id = _required(user_message_id, "user_message_id")
+        assistant_message_id = _required(assistant_message_id, "assistant_message_id")
+        question = _required(question, "question")
+        if len(question) > 4_000:
+            raise ValueError("question must not exceed 4000 characters")
+        scope = _required(scope, "scope")
+        if scope not in {"selection", "recent", "chapter", "meeting"}:
+            raise ValueError("unsupported Ask AI scope")
+        evidence_json = json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))
+        if len(evidence_json.encode("utf-8")) > 256 * 1024:
+            raise ValueError("Ask AI evidence is too large")
+        now_ms = max(0, int(now_ms))
+        with self._write_transaction():
+            if self._conn.execute("SELECT 1 FROM meetings WHERE id = ?", (meeting_id,)).fetchone() is None:
+                raise KeyError(f"meeting not found: {meeting_id}")
+            existing_thread = self._conn.execute(
+                "SELECT meeting_id FROM ask_threads WHERE thread_id = ?",
+                (thread_id,),
+            ).fetchone()
+            if existing_thread is not None and str(existing_thread["meeting_id"]) != meeting_id:
+                raise ValueError("Ask AI thread belongs to a different meeting")
+            self._conn.execute(
+                "INSERT INTO ask_threads (thread_id, meeting_id, title, created_at_ms, updated_at_ms) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(thread_id) DO UPDATE SET updated_at_ms = excluded.updated_at_ms",
+                (thread_id, meeting_id, question[:80], now_ms, now_ms),
+            )
+            self._conn.execute(
+                "INSERT INTO ask_messages (message_id, thread_id, meeting_id, role, content, scope, "
+                "evidence_json, status, created_at_ms, updated_at_ms) VALUES (?, ?, ?, 'user', ?, ?, ?, "
+                "'completed', ?, ?)",
+                (user_message_id, thread_id, meeting_id, question, scope, evidence_json, now_ms, now_ms),
+            )
+            self._conn.execute(
+                "INSERT INTO ask_messages (message_id, thread_id, meeting_id, role, content, scope, "
+                "evidence_json, status, created_at_ms, updated_at_ms) VALUES (?, ?, ?, 'assistant', '', ?, ?, "
+                "'pending', ?, ?)",
+                (assistant_message_id, thread_id, meeting_id, scope, evidence_json, now_ms + 1, now_ms + 1),
+            )
+            rows = self._conn.execute(
+                "SELECT * FROM ask_messages WHERE message_id IN (?, ?) ORDER BY created_at_ms, role DESC",
+                (user_message_id, assistant_message_id),
+            ).fetchall()
+        return {"thread_id": thread_id, "messages": [self._ask_message_dict(row) for row in rows]}
+
+    def finish_ask_message(
+        self,
+        *,
+        meeting_id: str,
+        message_id: str,
+        content: str,
+        now_ms: int,
+        error_class: str | None = None,
+    ) -> dict[str, Any]:
+        meeting_id = _required(meeting_id, "meeting_id")
+        message_id = _required(message_id, "message_id")
+        normalized_content = str(content or "").strip()
+        status = "failed" if error_class else "completed"
+        if status == "completed" and not normalized_content:
+            raise ValueError("assistant response must not be empty")
+        with self._write_transaction():
+            result = self._conn.execute(
+                "UPDATE ask_messages SET content = ?, status = ?, error_class = ?, updated_at_ms = ? "
+                "WHERE meeting_id = ? AND message_id = ? AND role = 'assistant' AND status = 'pending'",
+                (normalized_content, status, str(error_class or "") or None, max(0, int(now_ms)), meeting_id, message_id),
+            )
+            if result.rowcount != 1:
+                raise KeyError(f"pending Ask AI message not found: {message_id}")
+            row = self._conn.execute("SELECT * FROM ask_messages WHERE message_id = ?", (message_id,)).fetchone()
+            self._conn.execute(
+                "UPDATE ask_threads SET updated_at_ms = ? WHERE thread_id = ?",
+                (max(0, int(now_ms)), row["thread_id"]),
+            )
+        return self._ask_message_dict(row)
+
+    def list_ask_threads(self, meeting_id: str) -> dict[str, Any]:
+        meeting_id = _required(meeting_id, "meeting_id")
+        with self._lock:
+            if self._conn.execute("SELECT 1 FROM meetings WHERE id = ?", (meeting_id,)).fetchone() is None:
+                raise KeyError(f"meeting not found: {meeting_id}")
+            thread_rows = self._conn.execute(
+                "SELECT * FROM ask_threads WHERE meeting_id = ? ORDER BY updated_at_ms, thread_id",
+                (meeting_id,),
+            ).fetchall()
+            message_rows = self._conn.execute(
+                "SELECT * FROM ask_messages WHERE meeting_id = ? ORDER BY created_at_ms, message_id",
+                (meeting_id,),
+            ).fetchall()
+        by_thread: dict[str, list[dict[str, Any]]] = {}
+        for row in message_rows:
+            by_thread.setdefault(str(row["thread_id"]), []).append(self._ask_message_dict(row))
+        return {
+            "meeting_id": meeting_id,
+            "threads": [
+                {
+                    "thread_id": row["thread_id"],
+                    "title": row["title"],
+                    "created_at_ms": int(row["created_at_ms"]),
+                    "updated_at_ms": int(row["updated_at_ms"]),
+                    "messages": by_thread.get(str(row["thread_id"]), []),
+                }
+                for row in thread_rows
+            ],
+        }
+
+    def pin_ask_message(self, meeting_id: str, message_id: str, pinned_kind: str | None, *, now_ms: int) -> dict[str, Any]:
+        meeting_id = _required(meeting_id, "meeting_id")
+        message_id = _required(message_id, "message_id")
+        normalized_kind = str(pinned_kind or "").strip() or None
+        if normalized_kind not in {None, "note", "fact", "action_item"}:
+            raise ValueError("unsupported pinned_kind")
+        with self._write_transaction():
+            result = self._conn.execute(
+                "UPDATE ask_messages SET pinned_kind = ?, updated_at_ms = ? WHERE meeting_id = ? "
+                "AND message_id = ? AND role = 'assistant' AND status = 'completed'",
+                (normalized_kind, max(0, int(now_ms)), meeting_id, message_id),
+            )
+            if result.rowcount != 1:
+                raise KeyError(f"completed Ask AI message not found: {message_id}")
+            row = self._conn.execute("SELECT * FROM ask_messages WHERE message_id = ?", (message_id,)).fetchone()
+        return self._ask_message_dict(row)
+
+    def _migrate_pinned_ask_notes(self) -> None:
+        with self._write_transaction():
+            rows = self._conn.execute(
+                "SELECT * FROM ask_messages WHERE role = 'assistant' AND status = 'completed' "
+                "AND pinned_kind = 'note' ORDER BY created_at_ms, message_id"
+            ).fetchall()
+            for row in rows:
+                note_id = _stable_id("note", "ask", str(row["message_id"]))
+                body = str(row["content"] or "").strip()
+                if not body:
+                    continue
+                title = re.split(r"[。！？!?\n]", body, maxsplit=1)[0].strip()[:MAX_NOTE_TITLE_CHARACTERS]
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO meeting_notes ("
+                    "note_id, meeting_id, title, body, source_kind, source_message_id, version, status, "
+                    "created_at_ms, updated_at_ms) VALUES (?, ?, ?, ?, 'ask_ai', ?, 1, 'active', ?, ?)",
+                    (
+                        note_id,
+                        row["meeting_id"],
+                        title or "AI 会议笔记",
+                        body,
+                        row["message_id"],
+                        int(row["created_at_ms"]),
+                        int(row["updated_at_ms"]),
+                    ),
+                )
+                try:
+                    evidence = json.loads(row["evidence_json"] or "[]")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    evidence = []
+                if not isinstance(evidence, list):
+                    evidence = []
+                for ordinal, item in enumerate(evidence[:MAX_NOTE_EVIDENCE_ITEMS]):
+                    if not isinstance(item, Mapping):
+                        continue
+                    segment_id = str(item.get("segment_id") or "").strip()
+                    quote = str(item.get("quote") or "").strip()
+                    if not segment_id or not quote:
+                        continue
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO meeting_note_evidence ("
+                        "note_id, ordinal, source_meeting_id, segment_id, transcript_seq, start_ms, end_ms, quote"
+                        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            note_id,
+                            ordinal,
+                            row["meeting_id"],
+                            segment_id,
+                            item.get("transcript_seq"),
+                            item.get("start_ms"),
+                            item.get("end_ms"),
+                            quote[:MAX_NOTE_EVIDENCE_QUOTE_CHARACTERS],
+                        ),
+                    )
+
+    @staticmethod
+    def _normalize_note_evidence(
+        evidence: Any,
+        *,
+        default_meeting_id: str | None,
+    ) -> list[dict[str, Any]]:
+        if evidence is None:
+            return []
+        if not isinstance(evidence, list) or len(evidence) > MAX_NOTE_EVIDENCE_ITEMS:
+            raise ValueError(f"evidence must contain at most {MAX_NOTE_EVIDENCE_ITEMS} items")
+        normalized: list[dict[str, Any]] = []
+        for index, item in enumerate(evidence):
+            if not isinstance(item, Mapping):
+                raise ValueError(f"evidence[{index}] must be an object")
+            segment_id = _required(str(item.get("segment_id") or ""), f"evidence[{index}].segment_id")
+            quote = _required(str(item.get("quote") or ""), f"evidence[{index}].quote")
+            if len(quote) > MAX_NOTE_EVIDENCE_QUOTE_CHARACTERS:
+                raise ValueError(f"evidence[{index}].quote is too long")
+            transcript_seq = item.get("transcript_seq")
+            if transcript_seq is not None:
+                transcript_seq = _positive_int_or_error(transcript_seq, f"evidence[{index}].transcript_seq")
+            start_ms = item.get("start_ms")
+            end_ms = item.get("end_ms")
+            start_ms = None if start_ms is None else max(0, int(start_ms))
+            end_ms = None if end_ms is None else max(0, int(end_ms))
+            if start_ms is not None and end_ms is not None and end_ms < start_ms:
+                raise ValueError(f"evidence[{index}] has an invalid time range")
+            source_meeting_id = str(item.get("meeting_id") or default_meeting_id or "").strip() or None
+            normalized.append(
+                {
+                    "source_meeting_id": source_meeting_id,
+                    "segment_id": segment_id,
+                    "transcript_seq": transcript_seq,
+                    "start_ms": start_ms,
+                    "end_ms": end_ms,
+                    "quote": quote,
+                }
+            )
+        return normalized
+
+    def create_note(
+        self,
+        *,
+        note_id: str,
+        meeting_id: str | None,
+        title: str,
+        body: str,
+        source_kind: str,
+        source_message_id: str | None,
+        evidence: Any,
+        now_ms: int,
+    ) -> dict[str, Any]:
+        note_id = _required(note_id, "note_id")
+        normalized_meeting_id = str(meeting_id or "").strip() or None
+        normalized_body = _required(body, "body")
+        if len(normalized_body.encode("utf-8")) > MAX_NOTE_BODY_BYTES:
+            raise ValueError("note body is too large")
+        normalized_title = " ".join(str(title or "").split()).strip()
+        if not normalized_title:
+            normalized_title = re.split(r"[。！？!?\n]", normalized_body, maxsplit=1)[0].strip()
+        if not normalized_title:
+            normalized_title = "未命名笔记"
+        if len(normalized_title) > MAX_NOTE_TITLE_CHARACTERS:
+            raise ValueError(f"title must not exceed {MAX_NOTE_TITLE_CHARACTERS} characters")
+        normalized_source_kind = str(source_kind or "").strip()
+        if normalized_source_kind not in {"selection", "ask_ai", "manual"}:
+            raise ValueError("unsupported note source_kind")
+        normalized_source_message_id = str(source_message_id or "").strip() or None
+        normalized_evidence = self._normalize_note_evidence(
+            evidence,
+            default_meeting_id=normalized_meeting_id,
+        )
+        now_ms = max(0, int(now_ms))
+        with self._write_transaction():
+            if normalized_source_message_id:
+                existing = self._conn.execute(
+                    "SELECT * FROM meeting_notes WHERE source_message_id = ?",
+                    (normalized_source_message_id,),
+                ).fetchone()
+                if existing is not None:
+                    evidence_rows = self._conn.execute(
+                        "SELECT * FROM meeting_note_evidence WHERE note_id = ? ORDER BY ordinal",
+                        (existing["note_id"],),
+                    ).fetchall()
+                    return self._note_dict(existing, evidence_rows=evidence_rows)
+            if normalized_meeting_id and self._conn.execute(
+                "SELECT 1 FROM meetings WHERE id = ?", (normalized_meeting_id,)
+            ).fetchone() is None:
+                raise KeyError(f"meeting not found: {normalized_meeting_id}")
+            if normalized_source_message_id:
+                message = self._conn.execute(
+                    "SELECT meeting_id, role, status FROM ask_messages WHERE message_id = ?",
+                    (normalized_source_message_id,),
+                ).fetchone()
+                if message is None or message["role"] != "assistant" or message["status"] != "completed":
+                    raise KeyError(f"completed Ask AI message not found: {normalized_source_message_id}")
+                if normalized_meeting_id and str(message["meeting_id"]) != normalized_meeting_id:
+                    raise ValueError("Ask AI message belongs to a different meeting")
+            self._conn.execute(
+                "INSERT INTO meeting_notes ("
+                "note_id, meeting_id, title, body, source_kind, source_message_id, version, status, "
+                "created_at_ms, updated_at_ms) VALUES (?, ?, ?, ?, ?, ?, 1, 'active', ?, ?)",
+                (
+                    note_id,
+                    normalized_meeting_id,
+                    normalized_title,
+                    normalized_body,
+                    normalized_source_kind,
+                    normalized_source_message_id,
+                    now_ms,
+                    now_ms,
+                ),
+            )
+            for ordinal, item in enumerate(normalized_evidence):
+                self._conn.execute(
+                    "INSERT INTO meeting_note_evidence ("
+                    "note_id, ordinal, source_meeting_id, segment_id, transcript_seq, start_ms, end_ms, quote"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        note_id,
+                        ordinal,
+                        item["source_meeting_id"],
+                        item["segment_id"],
+                        item["transcript_seq"],
+                        item["start_ms"],
+                        item["end_ms"],
+                        item["quote"],
+                    ),
+                )
+            row = self._conn.execute("SELECT * FROM meeting_notes WHERE note_id = ?", (note_id,)).fetchone()
+            evidence_rows = self._conn.execute(
+                "SELECT * FROM meeting_note_evidence WHERE note_id = ? ORDER BY ordinal",
+                (note_id,),
+            ).fetchall()
+        return self._note_dict(row, evidence_rows=evidence_rows)
+
+    def get_note(self, note_id: str) -> dict[str, Any]:
+        note_id = _required(note_id, "note_id")
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM meeting_notes WHERE note_id = ?", (note_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"note not found: {note_id}")
+            evidence_rows = self._conn.execute(
+                "SELECT * FROM meeting_note_evidence WHERE note_id = ? ORDER BY ordinal",
+                (note_id,),
+            ).fetchall()
+        return self._note_dict(row, evidence_rows=evidence_rows)
+
+    def list_notes(
+        self,
+        *,
+        meeting_id: str | None = None,
+        status: str = "active",
+        query: str = "",
+        before_updated_at_ms: int | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        normalized_meeting_id = str(meeting_id or "").strip() or None
+        normalized_status = str(status or "active").strip()
+        if normalized_status not in {"active", "archived", "deleted", "all"}:
+            raise ValueError("unsupported note status")
+        normalized_query = " ".join(str(query or "").split()).casefold()
+        limit = int(limit)
+        if not 1 <= limit <= 500:
+            raise ValueError("limit must be between 1 and 500")
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if normalized_meeting_id:
+            clauses.append("meeting_id = ?")
+            parameters.append(normalized_meeting_id)
+        if normalized_status != "all":
+            clauses.append("status = ?")
+            parameters.append(normalized_status)
+        if normalized_query:
+            clauses.append("(LOWER(title) LIKE ? OR LOWER(body) LIKE ?)")
+            like = f"%{normalized_query}%"
+            parameters.extend((like, like))
+        if before_updated_at_ms is not None:
+            clauses.append("updated_at_ms < ?")
+            parameters.append(max(0, int(before_updated_at_ms)))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM meeting_notes" + where + " ORDER BY updated_at_ms DESC, note_id LIMIT ?",
+                (*parameters, limit),
+            ).fetchall()
+            note_ids = [str(row["note_id"]) for row in rows]
+            evidence_rows = self._conn.execute(
+                f"SELECT * FROM meeting_note_evidence WHERE note_id IN ({','.join('?' for _ in note_ids)}) "
+                "ORDER BY note_id, ordinal",
+                note_ids,
+            ).fetchall() if note_ids else []
+        evidence_by_note: dict[str, list[sqlite3.Row]] = {}
+        for evidence_row in evidence_rows:
+            evidence_by_note.setdefault(str(evidence_row["note_id"]), []).append(evidence_row)
+        return {
+            "notes": [
+                self._note_dict(row, evidence_rows=evidence_by_note.get(str(row["note_id"]), []))
+                for row in rows
+            ],
+            "limit": limit,
+        }
+
+    def update_note(
+        self,
+        note_id: str,
+        *,
+        expected_version: int,
+        title: Any = None,
+        body: Any = None,
+        status: Any = None,
+        now_ms: int,
+    ) -> dict[str, Any]:
+        note_id = _required(note_id, "note_id")
+        expected_version = _positive_int_or_error(expected_version, "expected_version")
+        with self._write_transaction():
+            row = self._conn.execute("SELECT * FROM meeting_notes WHERE note_id = ?", (note_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"note not found: {note_id}")
+            if int(row["version"]) != expected_version:
+                raise ValueError("note version conflict")
+            next_title = str(row["title"]) if title is None else " ".join(str(title).split()).strip()
+            next_body = str(row["body"]) if body is None else str(body).strip()
+            next_status = str(row["status"]) if status is None else str(status).strip()
+            if not next_title or len(next_title) > MAX_NOTE_TITLE_CHARACTERS:
+                raise ValueError("note title is invalid")
+            if not next_body or len(next_body.encode("utf-8")) > MAX_NOTE_BODY_BYTES:
+                raise ValueError("note body is invalid")
+            if next_status not in {"active", "archived", "deleted"}:
+                raise ValueError("unsupported note status")
+            self._conn.execute(
+                "UPDATE meeting_notes SET title = ?, body = ?, status = ?, version = version + 1, "
+                "updated_at_ms = ? WHERE note_id = ?",
+                (next_title, next_body, next_status, max(0, int(now_ms)), note_id),
+            )
+            updated = self._conn.execute("SELECT * FROM meeting_notes WHERE note_id = ?", (note_id,)).fetchone()
+            evidence_rows = self._conn.execute(
+                "SELECT * FROM meeting_note_evidence WHERE note_id = ? ORDER BY ordinal",
+                (note_id,),
+            ).fetchall()
+        return self._note_dict(updated, evidence_rows=evidence_rows)
+
+    def add_note_evidence(self, note_id: str, evidence: Any, *, now_ms: int) -> dict[str, Any]:
+        note_id = _required(note_id, "note_id")
+        with self._write_transaction():
+            note = self._conn.execute("SELECT * FROM meeting_notes WHERE note_id = ?", (note_id,)).fetchone()
+            if note is None:
+                raise KeyError(f"note not found: {note_id}")
+            normalized = self._normalize_note_evidence(evidence, default_meeting_id=note["meeting_id"])
+            existing_count = int(
+                self._conn.execute(
+                    "SELECT COUNT(*) FROM meeting_note_evidence WHERE note_id = ?",
+                    (note_id,),
+                ).fetchone()[0]
+            )
+            if existing_count + len(normalized) > MAX_NOTE_EVIDENCE_ITEMS:
+                raise ValueError(f"a note may contain at most {MAX_NOTE_EVIDENCE_ITEMS} evidence items")
+            ordinal = int(
+                self._conn.execute(
+                    "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM meeting_note_evidence WHERE note_id = ?",
+                    (note_id,),
+                ).fetchone()[0]
+            )
+            for item in normalized:
+                self._conn.execute(
+                    "INSERT INTO meeting_note_evidence ("
+                    "note_id, ordinal, source_meeting_id, segment_id, transcript_seq, start_ms, end_ms, quote"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        note_id,
+                        ordinal,
+                        item["source_meeting_id"],
+                        item["segment_id"],
+                        item["transcript_seq"],
+                        item["start_ms"],
+                        item["end_ms"],
+                        item["quote"],
+                    ),
+                )
+                ordinal += 1
+            self._conn.execute(
+                "UPDATE meeting_notes SET version = version + 1, updated_at_ms = ? WHERE note_id = ?",
+                (max(0, int(now_ms)), note_id),
+            )
+        return self.get_note(note_id)
+
+    def delete_note_evidence(self, note_id: str, ordinal: int, *, now_ms: int) -> dict[str, Any]:
+        note_id = _required(note_id, "note_id")
+        ordinal = int(ordinal)
+        with self._write_transaction():
+            result = self._conn.execute(
+                "DELETE FROM meeting_note_evidence WHERE note_id = ? AND ordinal = ?",
+                (note_id, ordinal),
+            )
+            if result.rowcount != 1:
+                raise KeyError(f"note evidence not found: {note_id}/{ordinal}")
+            remaining = self._conn.execute(
+                "SELECT * FROM meeting_note_evidence WHERE note_id = ? ORDER BY ordinal",
+                (note_id,),
+            ).fetchall()
+            for next_ordinal, row in enumerate(remaining):
+                if int(row["ordinal"]) != next_ordinal:
+                    self._conn.execute(
+                        "UPDATE meeting_note_evidence SET ordinal = ? WHERE note_id = ? AND ordinal = ?",
+                        (next_ordinal, note_id, int(row["ordinal"])),
+                    )
+            self._conn.execute(
+                "UPDATE meeting_notes SET version = version + 1, updated_at_ms = ? WHERE note_id = ?",
+                (max(0, int(now_ms)), note_id),
+            )
+        return self.get_note(note_id)
+
     def list_jobs(
         self,
         *,
@@ -7153,6 +8270,50 @@ class V2Persistence:
                 ),
             )
         return int(result.rowcount)
+
+    def mark_correction_segments_no_change(
+        self,
+        *,
+        meeting_id: str,
+        segment_ids: list[str],
+        max_input_transcript_seq: int,
+        now_ms: int,
+    ) -> list[str]:
+        """Commit unchanged correction results without overwriting newer revisions."""
+
+        meeting_id = _required(meeting_id, "meeting_id")
+        normalized_segment_ids = sorted(
+            {
+                _required(segment_id, "segment_id")
+                for segment_id in segment_ids
+                if str(segment_id or "").strip()
+            }
+        )
+        if not normalized_segment_ids:
+            return []
+        placeholders = ",".join("?" for _ in normalized_segment_ids)
+        updated_at_ms = max(0, int(now_ms))
+        max_transcript_seq = max(0, int(max_input_transcript_seq))
+        with self._write_transaction():
+            rows = self._conn.execute(
+                "SELECT segment_id FROM transcript_segments WHERE meeting_id = ? "
+                f"AND segment_id IN ({placeholders}) AND transcript_seq <= ? "
+                "AND revision = 1 AND correction_status IN ('pending', 'processing', 'no_change')",
+                (meeting_id, *normalized_segment_ids, max_transcript_seq),
+            ).fetchall()
+            committed_segment_ids = sorted(str(row["segment_id"]) for row in rows)
+            if not committed_segment_ids:
+                return []
+            committed_placeholders = ",".join("?" for _ in committed_segment_ids)
+            self._conn.execute(
+                "UPDATE transcript_segments SET correction_status = 'no_change', "
+                "correction_before_text = normalized_text, correction_after_text = normalized_text, "
+                "correction_error_class = NULL, correction_updated_at_ms = ? "
+                "WHERE meeting_id = ? "
+                f"AND segment_id IN ({committed_placeholders})",
+                (updated_at_ms, meeting_id, *committed_segment_ids),
+            )
+        return committed_segment_ids
 
     def get_job(self, job_id: str) -> dict[str, Any]:
         job_id = _required(job_id, "job_id")
@@ -7421,6 +8582,8 @@ class V2Persistence:
         return {
             "speaker_id": row["speaker_id"],
             "speaker_label": row["speaker_label"],
+            "label_source": row["label_source"],
+            "label_locked": bool(row["label_locked"]),
             "ordinal": int(row["ordinal"]),
             "created_at_ms": int(row["created_at_ms"]),
             "updated_at_ms": int(row["updated_at_ms"]),
@@ -7488,6 +8651,7 @@ class V2Persistence:
             "speaker_label": row["speaker_label"],
             "speaker_confidence": row["speaker_confidence"],
             "status": row["status"],
+            "projection_version": int(row["projection_version"]),
             "checkpoint_ids": list(checkpoint_ids),
             "created_at_ms": int(row["created_at_ms"]),
             "updated_at_ms": int(row["updated_at_ms"]),
@@ -7580,6 +8744,54 @@ class V2Persistence:
             "created_at_ms": job["created_at_ms"],
             "updated_at_ms": job["updated_at_ms"],
             "completed_at_ms": job["completed_at_ms"],
+        }
+
+    @staticmethod
+    def _ask_message_dict(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "message_id": row["message_id"],
+            "thread_id": row["thread_id"],
+            "meeting_id": row["meeting_id"],
+            "role": row["role"],
+            "content": row["content"],
+            "scope": row["scope"],
+            "evidence": json.loads(row["evidence_json"] or "[]"),
+            "status": row["status"],
+            "error_class": row["error_class"],
+            "pinned_kind": row["pinned_kind"],
+            "created_at_ms": int(row["created_at_ms"]),
+            "updated_at_ms": int(row["updated_at_ms"]),
+        }
+
+    @staticmethod
+    def _note_dict(
+        row: sqlite3.Row,
+        *,
+        evidence_rows: list[sqlite3.Row],
+    ) -> dict[str, Any]:
+        return {
+            "note_id": row["note_id"],
+            "meeting_id": row["meeting_id"],
+            "title": row["title"],
+            "body": row["body"],
+            "source_kind": row["source_kind"],
+            "source_message_id": row["source_message_id"],
+            "version": int(row["version"]),
+            "status": row["status"],
+            "created_at_ms": int(row["created_at_ms"]),
+            "updated_at_ms": int(row["updated_at_ms"]),
+            "evidence": [
+                {
+                    "ordinal": int(evidence_row["ordinal"]),
+                    "meeting_id": evidence_row["source_meeting_id"],
+                    "segment_id": evidence_row["segment_id"],
+                    "transcript_seq": evidence_row["transcript_seq"],
+                    "start_ms": evidence_row["start_ms"],
+                    "end_ms": evidence_row["end_ms"],
+                    "quote": evidence_row["quote"],
+                }
+                for evidence_row in evidence_rows
+            ],
         }
 
     @staticmethod

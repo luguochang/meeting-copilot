@@ -64,11 +64,14 @@ describe("useMeetingMicrophone", () => {
     });
 
     const { result } = renderHook(() => useMeetingMicrophone());
-    await act(async () => result.current.start("meeting_native"));
+    await act(async () => result.current.start("meeting_native", { inputDeviceId: "wasapi-mic-1" }));
 
     expect(getUserMedia).not.toHaveBeenCalled();
     expect(invokeMock).toHaveBeenCalledWith("mic_adapter_prepare", undefined);
-    expect(invokeMock).toHaveBeenCalledWith("mic_adapter_start", { sessionId: "meeting_native" });
+    expect(invokeMock).toHaveBeenCalledWith("mic_adapter_start", {
+      sessionId: "meeting_native",
+      deviceId: "wasapi-mic-1",
+    });
     expect(result.current.state.phase).toBe("recording");
     expect(result.current.state.inputLevelAvailable).toBe(false);
 
@@ -151,11 +154,15 @@ describe("useMeetingMicrophone", () => {
     });
     const { result } = renderHook(() => useMeetingMicrophone());
 
-    await act(async () => result.current.start("meeting_system", { inputSource: "system_audio" }));
+    await act(async () => result.current.start("meeting_system", {
+      inputSource: "system_audio",
+      inputDeviceId: "wasapi-render-1",
+    }));
 
     expect(invokeMock).toHaveBeenCalledWith("system_audio_adapter_start", {
       sessionId: "meeting_system",
       requestPermission: true,
+      deviceId: "wasapi-render-1",
     });
     expect(invokeMock.mock.calls.some(([command]) => String(command).startsWith("mic_adapter_"))).toBe(false);
     expect(getUserMedia).not.toHaveBeenCalled();

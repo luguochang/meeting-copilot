@@ -1,6 +1,7 @@
 import importlib.util
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -20,6 +21,28 @@ def load_tool_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended path regression")
+def test_directory_inventory_reads_files_beyond_legacy_max_path(tmp_path):
+    tool = load_tool_module()
+    bundle = tmp_path / "bundle"
+    deep = bundle
+    for index in range(8):
+        deep /= f"long-runtime-directory-{index:02d}"
+    file_path = deep / "fixture.txt"
+    io_file = tool._extended_windows_path(file_path)
+    try:
+        io_file.parent.mkdir(parents=True)
+        io_file.write_text("fixture", encoding="utf-8")
+        assert len(str(file_path)) > 260
+
+        inventory = tool._directory_inventory(bundle, allowed_root=bundle)
+
+        assert inventory["file_count"] == 1
+        assert inventory["size_bytes"] == len("fixture")
+    finally:
+        shutil.rmtree(tool._extended_windows_path(bundle), ignore_errors=True)
 
 
 def _manifest() -> dict:
@@ -67,13 +90,19 @@ def _sealed_tree_sha256(files: dict[str, bytes]) -> tuple[int, str]:
 
 
 def _write_controlled_model_pack(
-    tmp_path: Path, *, tamper: bool = False
+    tmp_path: Path,
+    *,
+    tamper: bool = False,
+    license_newline: str = "\n",
 ) -> tuple[Path, Path]:
     pack_root = tmp_path / "controlled-model-pack"
     policy_root = tmp_path / "policy"
     license_path = policy_root / "licenses/Apache-2.0.txt"
     license_path.parent.mkdir(parents=True)
-    license_path.write_text("Apache License 2.0 fixture\n", encoding="utf-8")
+    canonical_license = "Apache License 2.0 fixture\n"
+    license_path.write_bytes(
+        canonical_license.replace("\n", license_newline).encode("utf-8")
+    )
     models: dict[str, dict] = {}
     model_ids = {
         "offline": "iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
@@ -124,7 +153,7 @@ def _write_controlled_model_pack(
             "status": "public_redistribution_unresolved",
             "license_id": "Apache-2.0",
             "license_text": "licenses/Apache-2.0.txt",
-            "license_sha256": _sha256(license_path.read_bytes()),
+            "license_sha256": _sha256(canonical_license.encode("utf-8")),
             "notice_destination": "licenses/models/fixture-pack-v1",
             "public_redistribution_approved": False,
         },
@@ -830,6 +859,34 @@ def test_controlled_model_pack_fails_closed_on_hash_mismatch(tmp_path):
         tool.prepare_runtime_bundle_for_packaging(
             source_bundle=bundle,
             destination_bundle=tmp_path / "prepared/MeetingCopilotRuntime.bundle",
+            model_pack_root=pack_root,
+            model_pack_manifest=policy_path,
+        )
+
+
+def test_controlled_model_pack_license_hash_is_stable_across_crlf_checkout(tmp_path):
+    tool = load_tool_module()
+    pack_root, policy_path = _write_controlled_model_pack(
+        tmp_path,
+        license_newline="\r\n",
+    )
+
+    verified = tool.validate_controlled_model_pack(
+        model_pack_root=pack_root,
+        model_pack_manifest=policy_path,
+    )
+
+    assert verified["version"] == "fixture-pack-v1"
+
+
+def test_controlled_model_pack_license_hash_still_rejects_content_tampering(tmp_path):
+    tool = load_tool_module()
+    pack_root, policy_path = _write_controlled_model_pack(tmp_path)
+    license_path = policy_path.parent / "licenses/Apache-2.0.txt"
+    license_path.write_text("Apache License 2.0 tampered\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="controlled model pack license hash mismatch"):
+        tool.validate_controlled_model_pack(
             model_pack_root=pack_root,
             model_pack_manifest=policy_path,
         )

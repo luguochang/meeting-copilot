@@ -17,6 +17,7 @@ pub const APP_COMMAND_NAMES: &[&str] = &[
     "mic_adapter_resume",
     "mic_adapter_stop",
     "mic_adapter_cleanup",
+    "windows_audio_devices",
     "system_audio_adapter_prepare",
     "system_audio_adapter_status",
     "system_audio_adapter_collect_events",

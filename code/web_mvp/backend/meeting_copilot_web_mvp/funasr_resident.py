@@ -488,7 +488,7 @@ class _FunasrResidentWorkerSlot:
         try:
             for raw_line in process.stdout:
                 if isinstance(raw_line, bytes):
-                    raw_line = raw_line.decode("utf-8", errors="replace")
+                    raw_line = raw_line.decode("utf-8")
                 try:
                     event = json.loads(raw_line)
                 except (TypeError, json.JSONDecodeError):
@@ -508,7 +508,7 @@ class _FunasrResidentWorkerSlot:
         try:
             for raw_line in generation.process.stderr:
                 if isinstance(raw_line, bytes):
-                    line = raw_line.decode("utf-8", errors="replace").rstrip()
+                    line = raw_line.decode("utf-8").rstrip()
                 else:
                     line = str(raw_line).rstrip()
                 if line:

@@ -93,7 +93,18 @@ def test_current_clean_workbench_runtime_identity_is_accepted(tmp_path, monkeypa
     assert report["health"]["runtime_identity"]["verified"] is True
     assert report["health"]["runtime_identity"]["reason"] == "verified"
     assert requests == ["/health", "/v2/diagnostics/application-schema", "/workbench"]
-    assert tool.runtime_identity_file(pid_file).stat().st_mode & 0o777 == 0o600
+    if os.name != "nt":
+        assert tool.runtime_identity_file(pid_file).stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows process marker contract")
+def test_windows_process_start_marker_uses_process_creation_time():
+    tool = _load_tool()
+
+    marker = tool.process_start_marker(os.getpid())
+
+    assert marker is not None
+    assert len(marker) == 64
 
 
 def test_old_meeting_copilot_health_is_rejected_without_termination(
@@ -219,7 +230,10 @@ def test_stop_rejects_foreign_pid_record_without_sending_termination_signal(
         report["runtime_identity"]["reason"]
         == "managed_launch_record_missing_or_invalid"
     )
-    assert observed_signals and set(observed_signals) == {0}
+    if os.name == "nt":
+        assert observed_signals == []
+    else:
+        assert observed_signals and set(observed_signals) == {0}
     assert pid_file.exists()
 
 
@@ -253,7 +267,7 @@ def test_start_failure_terminates_owned_child_and_removes_its_records(
     monkeypatch.setattr(tool, "check_health", lambda *args, **kwargs: {"ok": False})
     monkeypatch.setattr(tool, "is_port_open", lambda port: False)
     monkeypatch.setattr(tool, "process_start_marker", lambda pid: "a" * 64)
-    timestamps = iter((0, 21))
+    timestamps = iter((0, tool.STARTUP_HEALTH_TIMEOUT_SECONDS + 1))
     monkeypatch.setattr(tool.time, "time", lambda: next(timestamps))
 
     report = tool.start_server(
@@ -275,11 +289,16 @@ def test_stop_allows_owned_process_after_current_source_changes(tmp_path, monkey
     pid = os.getpid()
     pid_file = tmp_path / "source-stale.pid"
     pid_file.write_text(str(pid), encoding="utf-8")
-    monkeypatch.setattr(tool, "process_start_marker", lambda candidate_pid: "a" * 64)
-    tool.write_runtime_identity(pid_file=pid_file, pid=pid, port=18769)
-    monkeypatch.setattr(tool, "runtime_source_fingerprint", lambda: "b" * 64)
     terminated = False
     observed_signals: list[int] = []
+
+    def process_marker(candidate_pid: int):
+        assert candidate_pid == pid
+        return None if terminated else "a" * 64
+
+    monkeypatch.setattr(tool, "process_start_marker", process_marker)
+    tool.write_runtime_identity(pid_file=pid_file, pid=pid, port=18769)
+    monkeypatch.setattr(tool, "runtime_source_fingerprint", lambda: "b" * 64)
 
     def owned_kill(candidate_pid: int, sent_signal: int):
         nonlocal terminated

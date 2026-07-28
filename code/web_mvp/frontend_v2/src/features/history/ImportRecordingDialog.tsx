@@ -168,6 +168,19 @@ export function ImportRecordingDialog({
             <p>录音只在本机读取、转换和转写，不新增远程 ASR 费用。AI 会后整理继续遵循当前 Provider 设置。</p>
           </div>
 
+          <ol className="import-stage-list" aria-label="录音导入步骤">
+            {stages.map(({ stage, label }, index) => (
+              <li
+                key={stage}
+                className={result?.job
+                  ? index < currentStage ? "is-complete" : index === currentStage ? "is-active" : ""
+                  : busy && index === 0 ? "is-active" : ""}
+              >
+                <span>{index + 1}</span>{label}
+              </li>
+            ))}
+          </ol>
+
           <button
             className="import-drop-zone"
             type="button"
@@ -206,19 +219,6 @@ export function ImportRecordingDialog({
               <input value={title} onChange={(event) => setTitle(event.target.value)} maxLength={200} disabled={busy} />
             </label>
           ) : null}
-
-          <ol className="import-stage-list" aria-label="录音导入步骤">
-            {stages.map(({ stage, label }, index) => (
-              <li
-                key={stage}
-                className={result?.job
-                  ? index < currentStage ? "is-complete" : index === currentStage ? "is-active" : ""
-                  : busy && index === 0 ? "is-active" : ""}
-              >
-                <span>{index + 1}</span>{label}
-              </li>
-            ))}
-          </ol>
 
           {busy ? (
             <div className="import-progress" role="status">

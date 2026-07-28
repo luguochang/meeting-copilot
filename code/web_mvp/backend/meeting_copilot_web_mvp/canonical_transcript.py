@@ -42,7 +42,12 @@ def project_canonical_transcript(*, session_id: str, events: list[dict[str, Any]
         text = _display_candidate(event, payload)
         if not text:
             continue
-        rank = _AUTHORITY[event_type]
+        rank = (
+            0
+            if event_type in {"transcript_final", "final"}
+            and payload.get("authoritative") is False
+            else _AUTHORITY[event_type]
+        )
         previous = projected.get(projection_key)
         if previous and rank < previous["rank"]:
             continue

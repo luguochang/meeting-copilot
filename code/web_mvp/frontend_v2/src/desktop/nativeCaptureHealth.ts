@@ -1,4 +1,5 @@
 export interface NativeCaptureHealthFields {
+  health_status?: string;
   transport_ready?: boolean;
   pcm_seen?: boolean;
   audible_pcm_seen?: boolean;
@@ -56,6 +57,7 @@ export function nativeCaptureRuntimeFailure(
   source: NativeCaptureHealthFields,
   label = "系统音频",
 ): string | null {
+  if (source.health_status === "recovering" || source.health_status === "backfilling") return null;
   if (source.transport_ready === false) return `${label}传输已中断`;
   if (source.pcm_seen === false) return `${label}PCM 数据流已中断`;
   return null;

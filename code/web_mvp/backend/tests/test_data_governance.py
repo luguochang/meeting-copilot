@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 
 import pytest
@@ -496,7 +497,12 @@ def test_retention_run_retries_a_failed_tombstoned_job_on_the_next_real_interval
     (external_dir / "must-remain.txt").write_text("outside", encoding="utf-8")
     audio_root = tmp_path / "audio_assets"
     audio_root.mkdir()
-    (audio_root / "retention-retry").symlink_to(external_dir, target_is_directory=True)
+    try:
+        (audio_root / "retention-retry").symlink_to(external_dir, target_is_directory=True)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symlink privilege is unavailable")
+        raise
     governance.set_retention_policy(30, now_ms=now_ms)
 
     failed = governance.run_retention_if_due(now_ms=now_ms + 1)

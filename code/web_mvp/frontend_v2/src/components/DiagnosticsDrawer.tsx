@@ -1,4 +1,4 @@
-import { Activity, Download, LoaderCircle, RefreshCw, X } from "lucide-react";
+import { Activity, CircleCheckBig, Download, LoaderCircle, RefreshCw, TriangleAlert, X } from "lucide-react";
 import { useState } from "react";
 import type { MeetingViewState } from "../domain/events";
 
@@ -32,6 +32,7 @@ export function DiagnosticsDrawer({ open, onClose, onRefresh, onExport, state, t
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState("");
   if (!open) return null;
+  const healthy = state.connection === "live" && !state.transportError;
 
   const exportBundle = async () => {
     if (exporting) return;
@@ -59,6 +60,14 @@ export function DiagnosticsDrawer({ open, onClose, onRefresh, onExport, state, t
             <X size={18} />
           </button>
         </header>
+
+        <div className={`diagnostics-health-summary diagnostics-health-summary--${healthy ? "healthy" : "attention"}`} role="status">
+          {healthy ? <CircleCheckBig size={22} /> : <TriangleAlert size={22} />}
+          <div>
+            <strong>{healthy ? "连接一切正常，会议服务工作状态良好。" : "连接需要关注，请检查下面的运行详情。"}</strong>
+            <span>{healthy ? "本地服务与事件通道均正常，暂未发现异常。" : connectionLabels[state.connection]}</span>
+          </div>
+        </div>
 
         <dl className="diagnostics-list">
           <div><dt>会议编号</dt><dd>{state.meetingId || "未提供"}</dd></div>

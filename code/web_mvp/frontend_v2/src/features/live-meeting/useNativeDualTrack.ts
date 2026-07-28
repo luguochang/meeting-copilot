@@ -189,6 +189,32 @@ export function useNativeDualTrack(): NativeDualTrackController {
           },
           statusMessage: eventType === "final" ? "双轨文字已确认，正在整理" : "正在汇入双轨实时文字",
         });
+      } else if (eventType === "capture_recovery") {
+        const recoveryState = String(event.state ?? "");
+        const label = trackLabel(trackName);
+        if (recoveryState === "reconnecting") {
+          runtime.asrReady[trackName] = false;
+          updateState({
+            phase: "reconnecting",
+            asrReady: false,
+            error: null,
+            statusMessage: `${label}录音正常，识别正在重连`,
+          });
+        } else if (recoveryState === "backfilling") {
+          updateState({
+            phase: "reconnecting",
+            error: null,
+            statusMessage: `${label}录音正常，正在补齐中断期间的文字`,
+          });
+        } else if (recoveryState === "recovered") {
+          runtime.asrReady[trackName] = true;
+          updateState({
+            phase: "recording",
+            asrReady: runtime.asrReady.microphone && runtime.asrReady.system_audio,
+            error: null,
+            statusMessage: `${label}识别恢复完成，双轨录音已续接`,
+          });
+        }
       } else if (eventType === "error" || eventType === "provider_error") {
         return `${trackLabel(trackName)}失败：${String(event.message ?? event.detail ?? "实时识别异常")}`;
       }
@@ -317,7 +343,7 @@ export function useNativeDualTrack(): NativeDualTrackController {
   const acknowledgeCommitted = useCallback(() => undefined, []);
 
   useEffect(() => {
-    if (!runtimeRef.current || state.phase !== "recording") return;
+    if (!runtimeRef.current || !["recording", "reconnecting"].includes(state.phase)) return;
     void collectEvents();
     const eventTimer = window.setInterval(() => void collectEvents(), 300);
     const elapsedTimer = window.setInterval(() => {

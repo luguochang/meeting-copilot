@@ -34,6 +34,15 @@ def _disk_with_free(free_bytes: int) -> DiskUsage:
     return DiskUsage(total=total, used=total - free_bytes, free=free_bytes)
 
 
+def _symlink_or_skip(link, target, *, target_is_directory=False):
+    try:
+        link.symlink_to(target, target_is_directory=target_is_directory)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symlink privilege is unavailable")
+        raise
+
+
 def test_pcm16_budget_is_exact_for_duration_and_tracks():
     assert estimate_pcm16_storage_bytes(duration_seconds=3_600, track_count=1) == 115_200_000
     assert estimate_pcm16_storage_bytes(duration_seconds=3_600, track_count=2) == 230_400_000
@@ -78,7 +87,7 @@ def test_scan_rejects_symlink_instead_of_following_it(tmp_path):
     data_dir.mkdir()
     outside.mkdir()
     (outside / "meeting.wav").write_bytes(b"must-not-be-counted")
-    (data_dir / "escaped").symlink_to(outside, target_is_directory=True)
+    _symlink_or_skip(data_dir / "escaped", outside, target_is_directory=True)
 
     with pytest.raises(UnsafeManagedPathError, match="symbolic link"):
         scan_managed_storage(data_dir)
@@ -88,7 +97,7 @@ def test_scan_rejects_symlink_as_managed_root(tmp_path):
     real_data = tmp_path / "real-data"
     real_data.mkdir()
     linked_data = tmp_path / "linked-data"
-    linked_data.symlink_to(real_data, target_is_directory=True)
+    _symlink_or_skip(linked_data, real_data, target_is_directory=True)
 
     with pytest.raises(UnsafeManagedPathError, match="root"):
         scan_managed_storage(linked_data)
@@ -303,7 +312,7 @@ def test_log_rotator_rejects_symlinked_log_file(tmp_path):
     logs_dir.mkdir()
     outside = tmp_path / "outside.log"
     outside.write_text("outside")
-    (logs_dir / "backend.log").symlink_to(outside)
+    _symlink_or_skip(logs_dir / "backend.log", outside)
     rotator = ManagedLogRotator(data_dir=tmp_path, log_name="backend.log")
 
     with pytest.raises(UnsafeManagedPathError, match="symbolic link"):

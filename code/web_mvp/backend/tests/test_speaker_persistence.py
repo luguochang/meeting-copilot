@@ -106,7 +106,7 @@ def test_legacy_transcript_and_paragraph_tables_gain_nullable_speaker_columns(tm
         ).fetchone() == (4, 10, 20, None, None, None)
 
 
-def test_first_seen_speakers_receive_stable_non_personal_labels_and_split_paragraphs(tmp_path):
+def test_first_seen_speakers_receive_stable_non_personal_labels_without_forcing_short_paragraphs(tmp_path):
     persistence = V2Persistence(tmp_path / "speakers.db")
     try:
         for number, speaker_id in enumerate(("cluster-a", "cluster-b", "cluster-c"), start=1):
@@ -124,6 +124,8 @@ def test_first_seen_speakers_receive_stable_non_personal_labels_and_split_paragr
                 {
                     "speaker_id": "cluster-a",
                     "speaker_label": "Speaker 1",
+                    "label_source": "auto",
+                    "label_locked": False,
                     "ordinal": 1,
                     "created_at_ms": 1_700,
                     "updated_at_ms": 1_700,
@@ -131,6 +133,8 @@ def test_first_seen_speakers_receive_stable_non_personal_labels_and_split_paragr
                 {
                     "speaker_id": "cluster-b",
                     "speaker_label": "Speaker 2",
+                    "label_source": "auto",
+                    "label_locked": False,
                     "ordinal": 2,
                     "created_at_ms": 2_700,
                     "updated_at_ms": 2_700,
@@ -138,6 +142,8 @@ def test_first_seen_speakers_receive_stable_non_personal_labels_and_split_paragr
                 {
                     "speaker_id": "cluster-c",
                     "speaker_label": "Speaker 3",
+                    "label_source": "auto",
+                    "label_locked": False,
                     "ordinal": 3,
                     "created_at_ms": 3_700,
                     "updated_at_ms": 3_700,
@@ -150,16 +156,18 @@ def test_first_seen_speakers_receive_stable_non_personal_labels_and_split_paragr
             "Speaker 2",
             "Speaker 3",
         ]
-        assert [paragraph["speaker_id"] for paragraph in snapshot["semantic_paragraphs"]] == [
-            "cluster-a",
-            "cluster-b",
-            "cluster-c",
+        assert len(snapshot["semantic_paragraphs"]) == 1
+        paragraph = snapshot["semantic_paragraphs"][0]
+        assert paragraph["checkpoint_ids"] == [
+            "meeting-1-segment-1",
+            "meeting-1-segment-2",
+            "meeting-1-segment-3",
         ]
-        assert [paragraph["speaker_confidence"] for paragraph in snapshot["semantic_paragraphs"]] == [
-            0.9,
-            0.9,
-            0.9,
-        ]
+        assert (paragraph["speaker_id"], paragraph["speaker_label"], paragraph["speaker_confidence"]) == (
+            None,
+            None,
+            None,
+        )
     finally:
         persistence.close()
 
@@ -194,11 +202,11 @@ def test_unknown_or_low_confidence_speaker_can_remain_unattributed(tmp_path):
             segments[1]["speaker_label"],
             segments[1]["speaker_confidence"],
         ) == ("low-confidence-cluster", "Speaker 1", None)
-        assert (
-            paragraphs[1]["speaker_id"],
-            paragraphs[1]["speaker_label"],
-            paragraphs[1]["speaker_confidence"],
-        ) == ("low-confidence-cluster", "Speaker 1", None)
+        assert len(paragraphs) == 1
+        assert paragraphs[0]["checkpoint_ids"] == [
+            "meeting-1-segment-1",
+            "meeting-1-segment-2",
+        ]
     finally:
         persistence.close()
 

@@ -115,7 +115,10 @@ export function dualTrackCaptureFailure(
   const systemAudioHealthFailure = systemAudioBaseReady
     ? stage === "runtime"
       ? nativeCaptureRuntimeFailure(response.system_audio ?? {}, "系统音频轨道")
-        ?? (response.system_audio?.transport_ready !== true
+        ?? ((response.system_audio?.health_status === "recovering"
+          || response.system_audio?.health_status === "backfilling")
+          ? null
+          : response.system_audio?.transport_ready !== true
           ? "系统音频轨道传输状态缺失"
           : response.system_audio?.pcm_seen !== true ? "系统音频轨道 PCM 接收状态缺失" : null)
       : nativeCaptureStartupFailure(response.system_audio ?? {}, "系统音频轨道")
