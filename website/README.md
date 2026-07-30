@@ -27,7 +27,7 @@ VITE_DEMO_URL=/#product-preview
 
 `VITE_*` 会进入浏览器可见的 JavaScript，只能填写公开 URL，不能填写 API Key、数据库口令或其他密钥。
 
-下载按钮由 `public/releases/latest.json` 控制。安装包应托管在独立的 HTTPS 下载目录或对象存储，不应复制到官网源码与 `dist/`。
+下载按钮由 `public/releases/latest.json` 控制。当前公开文件托管在项目 GitHub Release，不复制到官网源码与 `dist/`。完整离线能力包在再分发许可确认前不得加入清单。
 
 ## 内容位置
 

@@ -22,9 +22,9 @@ export const site = {
   description:
     'Meeting Copilot 是本地优先的中文会议助手，把连续转写整理成可阅读上下文，并在会中维护当前议题、建议和未闭环问题。',
   windowsDownloadUrl:
-    '/downloads/meeting-copilot/windows/0.1.0/Meeting-Copilot-0.1.0-windows-x64-base-unsigned.exe',
+    'https://github.com/luguochang/meeting-copilot/releases/download/v0.1.0/Meeting-Copilot-0.1.0-windows-x64-base-unsigned.exe',
   windowsChecksumUrl:
-    '/downloads/meeting-copilot/windows/0.1.0/Meeting-Copilot-0.1.0-windows-x64-base-unsigned.exe.sha256',
+    'https://github.com/luguochang/meeting-copilot/releases/download/v0.1.0/Meeting-Copilot-0.1.0-windows-x64-base-unsigned.exe.sha256',
   trialUrl: configuredTrialUrl || '/docs#release',
   trialLabel: configuredTrialUrl ? '提交反馈' : '查看发布说明',
   demoUrl: import.meta.env.VITE_DEMO_URL || '/#product-preview',

@@ -1,15 +1,15 @@
 {
   "version": "0.1.0",
   "status": "public",
-  "updatedAt": "2026-07-27",
-  "note": "Windows 0.1.0 公开预览版提供轻量基础安装包；完整离线 ASR 能力包可在客户端中另行导入。当前安装包未签名，Windows SmartScreen 可能显示提示。",
+  "updatedAt": "2026-07-30",
+  "note": "Windows 0.1.0 公开预览版提供基础客户端；完整离线 ASR 能力包尚未公开分发。当前安装包未签名，Windows SmartScreen 可能显示提示。",
   "platforms": [
     {
       "id": "windows-x64",
       "label": "Windows 版",
       "availability": "public",
-      "url": "/downloads/meeting-copilot/windows/0.1.0/Meeting-Copilot-0.1.0-windows-x64-base-unsigned.exe",
-      "sha256Url": "/downloads/meeting-copilot/windows/0.1.0/Meeting-Copilot-0.1.0-windows-x64-base-unsigned.exe.sha256",
+      "url": "https://github.com/luguochang/meeting-copilot/releases/download/v0.1.0/Meeting-Copilot-0.1.0-windows-x64-base-unsigned.exe",
+      "sha256Url": "https://github.com/luguochang/meeting-copilot/releases/download/v0.1.0/Meeting-Copilot-0.1.0-windows-x64-base-unsigned.exe.sha256",
       "minimumOs": "Windows 10/11",
       "architecture": "x64",
       "signatureStatus": "unsigned"

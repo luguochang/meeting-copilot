@@ -43,12 +43,13 @@ server {
 
 `public/releases/latest.json` 是官网展示下载按钮的唯一来源。只有 `status` 和平台 `availability` 均为 `public` 且 URL 非空时才应提供下载。
 
-安装包和大型离线能力包应独立托管。更新清单前应确认：
+基础安装资产托管在项目 GitHub Release。大型离线能力包必须先确认全部组件的公开再分发许可，并使用适合大文件的独立托管；不得直接提交到 Git，超过 GitHub Release 单文件限制的资产也不得写入清单。更新清单前应确认：
 
 - 文件名、版本和平台正确
 - HTTPS 地址可访问
 - SHA-256 文件与安装包一致
 - 安装包已经过预期平台的安装验证
+- GitHub Release 已创建且公开 URL 可实际下载
 - 未发布平台保持不可用状态
 
 ## 上线检查

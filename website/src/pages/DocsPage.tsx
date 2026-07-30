@@ -202,16 +202,16 @@ LLM_GATEWAY_IS_MOCK=false`}</code>
 
           <section id="offline" data-reveal>
             <span className="docs-kicker">05</span>
-            <h2>导入完整离线 ASR 能力包</h2>
+            <h2>启用本地 ASR 能力</h2>
             <p>
-              基础安装包保持轻量，约 3.05 GiB 的完整离线 ASR 能力包单独分发。下载后不要解压或重命名，在客户端“本地能力”页面直接导入 <code>.mcpkg</code> 文件。
+              基础客户端不包含 ASR 模型。完整离线能力包约 3.05 GiB，激活时需要约 9 GB 可用空间；由于模型和二进制组件的公开再分发条件仍在核验，当前 GitHub Release 暂不提供该文件。
             </p>
             <ol className="docs-steps">
               <li>
                 <span>1</span>
                 <div>
-                  <strong>下载完整能力包</strong>
-                  <p>从发布方提供的百度网盘或受控下载地址获取原始 <code>.mcpkg</code> 文件。</p>
+                  <strong>准备兼容能力包</strong>
+                  <p>仅使用来源合法、适用于 Windows x64 的原始 <code>.mcpkg</code> 文件，不要解压、重命名或修改内容。</p>
                 </div>
               </li>
               <li>
@@ -241,11 +241,11 @@ LLM_GATEWAY_IS_MOCK=false`}</code>
           <section id="release" data-reveal>
             <span className="docs-kicker">06</span>
             <h2>发布与下载边界</h2>
-            <p>官网的下载按钮由独立发布清单驱动。当前只开放 Windows x64 基础安装包；macOS 尚需独立构建、Developer ID 签名与 Apple 公证，Web 应用尚未建立多用户隔离和公网安全边界。</p>
+            <p>官网下载按钮指向 GitHub Release。当前只开放 Windows x64 基础安装包和便携包；macOS 尚需独立构建、Developer ID 签名与 Apple 公证，Web 应用尚未建立多用户隔离和公网安全边界。</p>
             <ul className="release-checklist">
               <li>
                 <Icon name="circle-check" size={18} />
-                <span>已开放：Windows 10/11 x64 基础安装包与 SHA-256 校验文件。</span>
+                <span>已开放：Windows 10/11 x64 基础安装包、便携包与 SHA-256 校验文件。</span>
               </li>
               <li>
                 <Icon name="clock-3" size={18} />
@@ -253,14 +253,14 @@ LLM_GATEWAY_IS_MOCK=false`}</code>
               </li>
               <li>
                 <Icon name="circle-alert" size={18} />
-                <span>尚未开放：公网 Web 应用、macOS 安装包、企业级生产 SLA。</span>
+                <span>尚未开放：完整离线 ASR 能力包、公网 Web 应用、macOS 安装包和企业级生产 SLA。</span>
               </li>
             </ul>
             <div className="docs-callout docs-callout--warning">
               <Icon name="circle-alert" size={20} />
               <p>
                 <strong>当前 Windows 安装包未签名</strong>
-                SmartScreen 可能显示提示。请只从官网下载安装包，并核对随版本发布的 SHA-256 校验文件。
+                SmartScreen 可能显示提示。请只从项目 GitHub Release 下载安装包，并核对随版本发布的 SHA-256 校验文件。
               </p>
             </div>
           </section>
@@ -271,7 +271,7 @@ LLM_GATEWAY_IS_MOCK=false`}</code>
             <div className="faq-list">
               <details>
                 <summary>为什么基础安装包不直接包含完整 ASR 模型？</summary>
-                <p>完整能力包约 3.05 GiB。拆分后，客户端升级不需要重复下载模型；需要本地转写时，在客户端导入一次即可。</p>
+                <p>完整能力包约 3.05 GiB，且模型和二进制组件需要分别确认再分发许可。基础客户端与模型拆分后，客户端升级也不需要重复下载模型。</p>
               </details>
               <details>
                 <summary>产品是不是完全离线？</summary>
@@ -282,12 +282,8 @@ LLM_GATEWAY_IS_MOCK=false`}</code>
                 <p>macOS 需要在 Mac 上完成构建、Developer ID 签名、公证与安装验收。Web 版需要先增加账户、数据隔离、配额和公网安全设计，因此首发只提供 Windows 桌面版。</p>
               </details>
               <details>
-                <summary>能否直接把模型中转地址写进官网？</summary>
-                <p>公开地址可以，但密钥绝对不可以。浏览器端密钥无法保密，未来真实在线演示必须增加受控服务端代理。</p>
-              </details>
-              <details>
-                <summary>什么时候需要给官网加后端和数据库？</summary>
-                <p>只有开始保存内测线索、做账号、授权下载、支付或精确统计时才需要。当前内容使用 TypeScript 与 JSON 更轻、更易部署。</p>
+                <summary>没有能力包可以使用客户端吗？</summary>
+                <p>可以启动客户端并使用会议管理、笔记、设置和能力包管理；实时本地转写及录音文件转写需要先导入兼容能力包。</p>
               </details>
             </div>
           </section>

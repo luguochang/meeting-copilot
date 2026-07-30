@@ -21,14 +21,14 @@ export const changelog: ChangeLogEntry[] = [
     ],
   },
   {
-    date: '2026-07-27',
+    date: '2026-07-30',
     version: 'Meeting Copilot 0.1.0',
     status: '公开预览',
     title: 'Windows 基础安装包进入公开预览',
-    summary: '首版采用轻量客户端与完整离线能力包分离交付，官网、下载清单、品牌图标和用户文档同步更新。',
+    summary: '首版采用基础客户端与离线能力包分离交付，官网、下载清单、品牌图标和用户文档同步更新。',
     items: [
-      'Windows 10/11 x64 基础安装包与 SHA-256 校验文件由官网提供',
-      '完整离线 ASR 能力包通过 .mcpkg 文件在客户端内校验、导入和激活',
+      'Windows 10/11 x64 基础安装包、便携包与 SHA-256 校验文件通过 GitHub Release 提供',
+      '客户端支持校验、导入和激活 .mcpkg 能力包，完整能力包当前尚未公开分发',
       'macOS 标记为准备中，公网 Web 应用暂不开放',
       '当前安装包未签名，仍属于公开预览版而非生产稳定版',
     ],
