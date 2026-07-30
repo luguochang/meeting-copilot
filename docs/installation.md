@@ -10,13 +10,13 @@
 安装程序 SHA-256：
 
 ```text
-0c42fc2fe06f920fbed5eb2dbb003533a3c4dc9d1fe27e34eb963e17e68b80be
+346ff63b5ccdb234e57fcf074b211517f80a46bf19de364382eebfc2f480e8d4
 ```
 
 便携包 SHA-256：
 
 ```text
-9ed6f93528c377f70a9d4147b681e78ac07b1265210d6b14ddf6567a371feded
+d90ceb3dcafbe833b219a463fecb9e8a8430775bcc004d1e1238684c234db6be
 ```
 
 在 PowerShell 中校验下载文件：

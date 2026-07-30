@@ -35,8 +35,8 @@
 
 | 文件 | 用途 | SHA-256 |
 | --- | --- | --- |
-| [Windows x64 安装程序](https://github.com/luguochang/meeting-copilot/releases/download/v0.1.0/Meeting-Copilot-0.1.0-windows-x64-base-unsigned.exe) | 标准安装与卸载 | `0c42fc2fe06f920fbed5eb2dbb003533a3c4dc9d1fe27e34eb963e17e68b80be` |
-| [Windows x64 便携 ZIP](https://github.com/luguochang/meeting-copilot/releases/download/v0.1.0/Meeting-Copilot-0.1.0-windows-x64-base.zip) | 解压后直接运行 | `9ed6f93528c377f70a9d4147b681e78ac07b1265210d6b14ddf6567a371feded` |
+| [Windows x64 安装程序](https://github.com/luguochang/meeting-copilot/releases/download/v0.1.0/Meeting-Copilot-0.1.0-windows-x64-base-unsigned.exe) | 标准安装与卸载 | `346ff63b5ccdb234e57fcf074b211517f80a46bf19de364382eebfc2f480e8d4` |
+| [Windows x64 便携 ZIP](https://github.com/luguochang/meeting-copilot/releases/download/v0.1.0/Meeting-Copilot-0.1.0-windows-x64-base.zip) | 解压后直接运行 | `d90ceb3dcafbe833b219a463fecb9e8a8430775bcc004d1e1238684c234db6be` |
 
 基础客户端包含桌面应用和本地服务，可以启动工作台、管理会议与笔记、配置 AI 分析服务并导入离线能力包。仓库和基础客户端不包含 ASR 模型；实时本地转写和录音文件转写需要另行取得许可明确、与平台匹配的 `.mcpkg` 能力包。当前完整能力包尚未公开分发。
 
