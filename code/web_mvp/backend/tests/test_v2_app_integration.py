@@ -1078,7 +1078,7 @@ def test_v2_snapshot_rechecks_stale_semantic_pause_when_transcript_is_usable(tmp
     persistence = app.state.v2_persistence
     persistence.create_meeting(meeting_id="meeting-quality-recovered", title=None, now_ms=1_000)
     text = (
-        "官网代码用 ChatGPT 和 Claude 检查，Cloudflare 配 DNS，Vercel 负责部署，"
+        "官网代码用 TypeScript 和 React 构建，Cloudflare 配 DNS，Vercel 负责部署，"
         "DFC 今天提交 commit。"
     )
     app.state.asr_live_repository.create(
@@ -1618,17 +1618,13 @@ def test_backend_serves_built_v2_workbench_and_hashed_assets(tmp_path):
 
     with TestClient(app) as client:
         page = client.get("/workbench")
-        alias = client.get("/workbench-v2")
-        legacy = client.get("/workbench-legacy")
         script_path = re.search(r'<script[^>]+src="([^"]+\.js)"', page.text)
         assert script_path is not None
         script = client.get(script_path.group(1))
 
     assert page.status_code == 200
-    assert '<div id="root"></div>' in page.text
+    assert '<div id="root"' in page.text
     assert "/workbench-assets/" in page.text
-    assert alias.text == page.text
-    assert "/static/workbench.js" in legacy.text
     assert script.status_code == 200
     assert "javascript" in script.headers["content-type"]
 

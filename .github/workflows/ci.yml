@@ -2,39 +2,36 @@ name: CI
 
 on:
   push:
-    branches: [main, "phase-0-engineering-baseline"]
+    branches: [main]
   pull_request:
     branches: [main]
 
 jobs:
-  backend-tests:
-    name: Backend tests (web_mvp + core)
+  frontend:
+    name: Frontend
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: code/web_mvp/frontend_v2
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-node@v4
         with:
-          python-version: "3.12"
-      - uses: astral-sh/setup-uv@v6
-        with:
-          version: "0.11.28"
-          enable-cache: true
-          cache-dependency-glob: code/web_mvp/backend/uv.lock
-      - name: Sync locked backend environment
-        working-directory: code/web_mvp/backend
-        run: |
-          uv lock --check
-          uv sync --frozen --group dev
-      - name: web_mvp tests
-        working-directory: code/web_mvp/backend
-        run: uv run --frozen pytest -q
-      - name: core tests
-        working-directory: code/web_mvp/backend
-        run: uv run --frozen pytest -q ../../core
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: code/web_mvp/frontend_v2/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
 
-  mainline-tests:
-    name: Mainline + workbench + approach tests
+  backend:
+    name: Backend
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: code/web_mvp/backend
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -45,64 +42,32 @@ jobs:
           version: "0.11.28"
           enable-cache: true
           cache-dependency-glob: code/web_mvp/backend/uv.lock
-      - name: Sync locked backend environment
-        working-directory: code/web_mvp/backend
-        run: |
-          uv lock --check
-          uv sync --frozen --group dev
-      - name: mainline + frontend + approach + stream + llm tests
-        working-directory: code/web_mvp/backend
-        run: uv run --frozen pytest tests/test_e2e_mainline.py tests/test_workbench.py tests/test_approach_cards.py tests/test_asr_stream.py tests/test_llm_service.py -q
+      - run: uv lock --check
+      - run: uv sync --frozen --group dev
+      - run: uv run --frozen ruff check meeting_copilot_web_mvp
+      - run: uv run --frozen pytest -q
+      - run: uv run --frozen pytest -q ../../core
 
-  lint:
-    name: Ruff lint
+  website:
+    name: Website
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: website
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-node@v4
         with:
-          python-version: "3.12"
-      - uses: astral-sh/setup-uv@v6
-        with:
-          version: "0.11.28"
-          enable-cache: true
-          cache-dependency-glob: code/web_mvp/backend/uv.lock
-      - name: Sync locked backend environment
-        working-directory: code/web_mvp/backend
-        run: |
-          uv lock --check
-          uv sync --frozen --group dev
-      - name: Ruff lint
-        working-directory: code/web_mvp/backend
-        run: uv run --frozen ruff check meeting_copilot_web_mvp/
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+      - run: npm ci
+      - run: npm run check
 
-  workbench-smoke:
-    name: Workbench UI smoke (Chrome)
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - uses: astral-sh/setup-uv@v6
-        with:
-          version: "0.11.28"
-          enable-cache: true
-          cache-dependency-glob: code/web_mvp/backend/uv.lock
-      - name: Sync locked backend environment
-        working-directory: code/web_mvp/backend
-        run: |
-          uv lock --check
-          uv sync --frozen --group dev
-      - name: Run browser smoke with locked backend
-        working-directory: code/web_mvp/backend
-        run: uv run --frozen node ../../e2e/workbench_smoke.mjs
-
-  rust-check:
-    name: Tauri desktop cargo check
+  desktop:
+    name: Desktop
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: cargo check
-        run: cargo check --locked --manifest-path code/desktop_tauri/src-tauri/Cargo.toml
+      - run: cargo check --locked --manifest-path code/desktop_tauri/src-tauri/Cargo.toml

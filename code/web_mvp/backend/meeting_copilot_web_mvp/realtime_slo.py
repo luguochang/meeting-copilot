@@ -30,7 +30,7 @@ METRIC_STAGE_PAIRS = {
     "event_to_ui_ms": ("event_emitted", "ui_rendered"),
 }
 
-# P95 targets follow the accepted task-005 product windows. Component targets
+# P95 targets follow the accepted product latency windows. Component targets
 # make a failed end-to-end verdict diagnosable without redefining the product SLO.
 DEFAULT_REALTIME_SLO_THRESHOLDS_MS: dict[str, dict[str, float]] = {
     "correction": {

@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 
 import pytest
 
@@ -12,6 +13,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TOOL_PATH = REPO_ROOT / "tools" / "package_tauri_runtime_app.py"
 MANIFEST_PATH = REPO_ROOT / "code/desktop_tauri/runtime-bundle-manifest.json"
+pytestmark = pytest.mark.skipif(sys.platform != "darwin", reason="macOS packaging contract")
 
 
 def load_tool_module():

@@ -610,10 +610,7 @@ export function MeetingPreflightDialog({
       <button className="drawer-scrim" aria-label="关闭会前检查" onClick={onCancel} disabled={busy} />
       <section className="meeting-preflight-dialog" role="dialog" aria-modal="true" aria-labelledby="meeting-preflight-title">
         <header className="drawer-header">
-          <div>
-            <span className="eyebrow">会前检查</span>
-            <h2 id="meeting-preflight-title">准备开始会议</h2>
-          </div>
+          <h2 id="meeting-preflight-title">准备开始会议</h2>
           <button className="icon-button" type="button" onClick={onCancel} disabled={busy} aria-label="关闭会前检查" title="关闭">
             <X size={18} />
           </button>
@@ -734,9 +731,9 @@ export function MeetingPreflightDialog({
               <div
                 className="preflight-input-meter"
                 data-probe-status={inputCheck}
-                aria-label={inputLevelAvailable ? `RMS 输入电平 ${(inputRms * 100).toFixed(1)}%` : "检查后显示 RMS 输入电平"}
+                aria-label={inputLevelAvailable ? `输入音量 ${(inputRms * 100).toFixed(1)}%` : "检查后显示输入音量"}
               >
-                <span>RMS 电平</span>
+                <span>输入音量</span>
                 <span className="preflight-input-meter-track"><span style={{ transform: `scaleX(${inputLevel})` }} /></span>
                 <small>{inputLevelAvailable ? `${(inputRms * 100).toFixed(1)}%` : inputCheck === "checking" ? "采样中" : "尚未检查"}</small>
               </div>
@@ -772,12 +769,6 @@ export function MeetingPreflightDialog({
                     ? "Windows 将从所选播放设备的 WASAPI loopback 采集声音。"
                     : "开始会议时 macOS 会请求“屏幕与系统音频录制”权限。"}
                 </small>
-                <div className="preflight-native-health" aria-label="系统音频启动检查项">
-                  <span><small>传输</small><strong>开始时验证</strong></span>
-                  <span><small>PCM</small><strong>开始时验证</strong></span>
-                  <span><small>声音</small><strong>启动后检测</strong></span>
-                  <span><small>识别</small><strong>独立就绪</strong></span>
-                </div>
               </div>
             </div>
           )}

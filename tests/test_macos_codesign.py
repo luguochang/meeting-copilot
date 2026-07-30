@@ -10,6 +10,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TOOL_PATH = REPO_ROOT / "tools" / "macos_codesign.py"
+pytestmark = pytest.mark.skipif(sys.platform != "darwin", reason="macOS-only signing contract")
 MAIN_ENTITLEMENTS = REPO_ROOT / "code/desktop_tauri/src-tauri/Entitlements.plist"
 NATIVE_MIC_ENTITLEMENTS = REPO_ROOT / "code/desktop_tauri/native_mic/Entitlements.plist"
 TAURI_CONFIG = REPO_ROOT / "code/desktop_tauri/src-tauri/tauri.conf.json"

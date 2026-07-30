@@ -52,10 +52,7 @@ export function DiagnosticsDrawer({ open, onClose, onRefresh, onExport, state, t
       <button className="drawer-scrim" aria-label="关闭运行诊断" onClick={onClose} />
       <aside className="diagnostics-drawer" role="dialog" aria-modal="true" aria-labelledby="diagnostics-title">
         <header className="drawer-header">
-          <div>
-            <span className="eyebrow">运行诊断</span>
-            <h2 id="diagnostics-title">会议连接详情</h2>
-          </div>
+          <h2 id="diagnostics-title">会议连接详情</h2>
           <button className="icon-button" type="button" onClick={onClose} aria-label="关闭运行诊断" title="关闭">
             <X size={18} />
           </button>
@@ -64,8 +61,8 @@ export function DiagnosticsDrawer({ open, onClose, onRefresh, onExport, state, t
         <div className={`diagnostics-health-summary diagnostics-health-summary--${healthy ? "healthy" : "attention"}`} role="status">
           {healthy ? <CircleCheckBig size={22} /> : <TriangleAlert size={22} />}
           <div>
-            <strong>{healthy ? "连接一切正常，会议服务工作状态良好。" : "连接需要关注，请检查下面的运行详情。"}</strong>
-            <span>{healthy ? "本地服务与事件通道均正常，暂未发现异常。" : connectionLabels[state.connection]}</span>
+            <strong>{healthy ? "运行正常" : "连接异常"}</strong>
+            <span>{healthy ? "本地服务已连接" : connectionLabels[state.connection]}</span>
           </div>
         </div>
 
@@ -93,10 +90,10 @@ export function DiagnosticsDrawer({ open, onClose, onRefresh, onExport, state, t
           </div>
         ) : null}
 
-        <section className="diagnostics-raw" aria-labelledby="diagnostics-raw-title">
-          <h3 id="diagnostics-raw-title">内部运行字段</h3>
+        <details className="diagnostics-raw">
+          <summary>技术详情</summary>
           <pre>{JSON.stringify(state.diagnostics, null, 2)}</pre>
-        </section>
+        </details>
 
         <div className="drawer-actions">
           <button

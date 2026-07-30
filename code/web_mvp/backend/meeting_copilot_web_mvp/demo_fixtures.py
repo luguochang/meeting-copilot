@@ -52,7 +52,6 @@ def _metadata(fixture: dict[str, Any]) -> dict[str, Any]:
         "scenario_type": str(fixture.get("scenario_type", "unknown")),
         "is_engineering_meeting": _is_engineering_fixture(fixture),
         "expected_gap_rule_count": int(fixture.get("expected_gap_rule_count", 2)),
-        "expected_gate_tags": list(fixture.get("expected_gate_tags", [])),
     }
 
 

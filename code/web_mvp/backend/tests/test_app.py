@@ -250,52 +250,6 @@ def test_execution_preview_uses_locally_normalized_final_as_llm_evidence():
     assert "ment gate" not in preview["evidence_context"]
 
 
-TAURI_NOOP_COMMANDS = [
-    ("runtime.get_status", "runtime_get_status"),
-    ("session.prepare", "session_prepare"),
-    ("asr_worker.health", "asr_worker_health"),
-    ("mic_adapter.prepare", "mic_adapter_prepare"),
-    ("mic_adapter.status", "mic_adapter_status"),
-    ("mic_adapter.start", "mic_adapter_start"),
-    ("mic_adapter.pause", "mic_adapter_pause"),
-    ("mic_adapter.resume", "mic_adapter_resume"),
-    ("mic_adapter.stop", "mic_adapter_stop"),
-    ("mic_adapter.delete_audio_chunks", "mic_adapter_delete_audio_chunks"),
-]
-
-
-def _valid_tauri_noop_run_result() -> dict[str, object]:
-    return {
-        "run_result_version": "desktop_tauri_noop_run_result.v1",
-        "run_id": "workbench-tauri-noop-review",
-        "run_environment": "tauri_webview",
-        "explicit_tauri_run_approval_recorded": True,
-        "web_app_url_status": "local_dev_url_loaded",
-        "ipc_transport_status": "tauri_ipc_available",
-        "command_results": [
-            {
-                "command_id": command_id,
-                "command_name": command_name,
-                "invoke_status": "returned",
-                "result": {
-                    "command_id": command_id,
-                    "command_status": "noop_bound",
-                    "implementation_status": "noop_only",
-                    "transport_status": "tauri_ipc_bound",
-                    "side_effect_status": "none",
-                    "safe_to_invoke_noop": True,
-                    "safe_to_execute_real_action": False,
-                    "captures_audio": False,
-                    "spawns_process": False,
-                    "calls_remote_provider": False,
-                    "writes_local_files": False,
-                },
-            }
-            for command_id, command_name in TAURI_NOOP_COMMANDS
-        ],
-    }
-
-
 def _expected_suggestion_card_schema_outline_preview():
     return {
         "name": "SuggestionCardV1",
@@ -502,136 +456,6 @@ def test_audio_check_distinguishes_file_asr_and_realtime_asr(monkeypatch, tmp_pa
     assert body["realtime_asr_providers"] == ["funasr_realtime"]
     assert body["asr_readiness_summary"] == "realtime_ready"
     assert body["funasr_available"] is True
-
-
-def _shadow_candidate_report_for_feedback_ingestion(audio_written=True):
-    return {
-        "schema_version": "real_mic_shadow_test_report.v1",
-        "session_id": "shadow-test-api-review-038",
-        "meeting_profile": {
-            "meeting_type": "chinese_technical_review",
-            "duration_minutes": 24,
-            "participant_count": 4,
-            "language": "zh-CN",
-            "domain_tags": ["api", "release"],
-        },
-        "transcript": {
-            "segment_count": 2,
-            "segments": [
-                {
-                    "segment_id": "seg-001",
-                    "speaker_label": "speaker_1",
-                    "start_ms": 0,
-                    "end_ms": 4200,
-                    "text": "这个接口的 request_id 和 rollback owner 还没定。",
-                    "source_event_id": "event-final-001",
-                },
-                {
-                    "segment_id": "seg-002",
-                    "speaker_label": "speaker_2",
-                    "start_ms": 4300,
-                    "end_ms": 7600,
-                    "text": "P99 和 40012 的监控也要补。",
-                    "source_event_id": "event-final-002",
-                },
-            ],
-        },
-        "asr_metrics": {
-            "duration_seconds": 1440,
-            "first_partial_latency_ms": 420,
-            "final_latency_p95_ms": 1800,
-            "rtf": 0.18,
-            "raw_cer": 0.12,
-            "normalized_cer": 0.08,
-            "raw_technical_entity_recall": 0.72,
-            "normalized_technical_entity_recall": 0.84,
-            "technical_entity_precision": 0.9,
-            "error_event_count": 0,
-            "end_of_stream_event_count": 1,
-        },
-        "evidence_span_timeline": [
-            {
-                "evidence_id": "ev-001",
-                "segment_id": "seg-001",
-                "start_ms": 0,
-                "end_ms": 4200,
-                "text": "request_id 和 rollback owner 还没定",
-                "supports_candidate_id": "cand-001",
-            },
-            {
-                "evidence_id": "ev-002",
-                "segment_id": "seg-002",
-                "start_ms": 4300,
-                "end_ms": 7600,
-                "text": "P99 和 40012 的监控也要补",
-                "supports_candidate_id": "cand-002",
-            },
-        ],
-        "state_timeline": [
-            {
-                "state_id": "state-001",
-                "state_type": "open_question",
-                "at_ms": 4300,
-                "evidence_id": "ev-001",
-            },
-            {
-                "state_id": "state-002",
-                "state_type": "risk",
-                "at_ms": 7600,
-                "evidence_id": "ev-002",
-            },
-        ],
-        "candidate_card_timeline": [
-            {
-                "candidate_id": "cand-001",
-                "card_type": "engineering_gap",
-                "created_at_ms": 6200,
-                "latency_ms": 2000,
-                "evidence_ids": ["ev-001"],
-                "text": "确认 rollback owner 和 request_id 监控负责人。",
-            },
-            {
-                "candidate_id": "cand-002",
-                "card_type": "engineering_gap",
-                "created_at_ms": 9200,
-                "latency_ms": 1600,
-                "evidence_ids": ["ev-002"],
-                "text": "补齐 P99 和 40012 的监控阈值。",
-            },
-        ],
-        "feedback_summary": {
-            "labels": {
-                "useful": 0,
-                "would_have_asked": 0,
-                "wrong": 0,
-                "too_late": 0,
-                "too_intrusive": 0,
-                "dismissed": 0,
-            },
-            "useful_or_would_have_asked_count": 0,
-            "negative_feedback_count": 0,
-        },
-        "final_decision": {
-            "decision": "inconclusive_requires_more_shadow_tests",
-            "reason": "Feedback has not been collected yet.",
-        },
-        "privacy_cost_flags": {
-            "raw_audio_uploaded": False,
-            "remote_asr_called": False,
-            "llm_called": False,
-            "configs_local_read": False,
-            "user_audio_committed_to_repo": False,
-        },
-        "audio_retention": {
-            "audio_chunk_root": "artifacts/tmp/desktop_mic_adapter_runtime/audio_chunks",
-            "audio_chunk_write_status": "written_by_user_approved_shadow_test" if audio_written else "not_written",
-            "audio_delete_status": "deleted_after_review" if audio_written else "not_applicable_no_audio_written",
-            "retention_policy": "delete_audio_chunks_before_session_discard",
-        },
-        "known_limitations": [
-            "single shadow test cannot prove product-market fit",
-        ],
-    }
 
 
 def _asr_live_payload(session_id: str = "local_asr_stream_review"):
@@ -4270,19 +4094,16 @@ def test_list_demo_fixtures_exposes_engineering_and_boundary_metadata():
     assert release["scenario_type"] == "release_review"
     assert release["is_engineering_meeting"] is True
     assert release["expected_gap_rule_count"] == 2
-    assert "AC-task-009" in release["expected_gate_tags"]
 
     mixed = next(fixture for fixture in response.json()["fixtures"] if fixture["id"] == "mixed-terms-sync")
     assert mixed["is_engineering_meeting"] is False
     assert mixed["expected_gap_rule_count"] == 0
-    assert "AC-task-014" in mixed["expected_gate_tags"]
 
     degradation = next(
         fixture for fixture in response.json()["fixtures"] if fixture["id"] == "schema-degradation-review"
     )
     assert degradation["is_engineering_meeting"] is True
     assert degradation["expected_gap_rule_count"] == 1
-    assert "AC-task-019" in degradation["expected_gate_tags"]
 
 
 def test_create_session_from_demo_fixture_returns_evaluation_summary():
@@ -4905,52 +4726,6 @@ def test_update_card_status_rejects_unknown_card_id_without_mutating_record():
     assert "card not found" in rejected.text
     assert fetched.status_code == 200
     assert fetched.json()["suggestion_cards"][0]["status"] == "new"
-
-
-def test_shadow_report_feedback_ingestion_api_updates_report_readiness():
-    client = TestClient(create_app())
-
-    response = client.post(
-        "/shadow-reports/feedback-ingestions",
-        json={
-            "candidate_report": _shadow_candidate_report_for_feedback_ingestion(),
-            "feedback_entries": [
-                {"candidate_id": "cand-001", "label": "useful"},
-                {"candidate_id": "cand-002", "label": "would_have_asked"},
-            ],
-        },
-    )
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["drv_id"] == "task-038"
-    assert payload["feedback_ingestion_status"] == "shadow_report_feedback_ingested"
-    assert payload["updated_candidate_report"]["feedback_summary"]["useful_or_would_have_asked_count"] == 2
-    assert payload["updated_candidate_report"]["final_decision"]["decision"] == "go"
-    assert payload["readiness_report"]["final_decision_readiness_status"] == "go_supported_by_feedback"
-    assert payload["readiness_report"]["export_readiness_status"] == "ready_for_shadow_test_export"
-    assert payload["safe_to_access_microphone_now"] is False
-    assert payload["safe_to_call_remote_asr_now"] is False
-    assert payload["safe_to_call_llm_now"] is False
-
-
-def test_shadow_report_feedback_ingestion_api_blocks_forbidden_report_path():
-    client = TestClient(create_app())
-
-    response = client.post(
-        "/shadow-reports/feedback-ingestions",
-        json={
-            "candidate_report_path": "configs/local/shadow-report.json",
-            "feedback_entries": [
-                {"candidate_id": "cand-001", "label": "useful"},
-            ],
-        },
-    )
-
-    assert response.status_code == 422
-    payload = response.json()
-    assert payload["detail"]["feedback_ingestion_status"] == "blocked_by_path_guard"
-    assert "candidate_report_path is blocked: configs/local" in payload["detail"]["validation_errors"]
 
 
 def test_export_markdown_report():

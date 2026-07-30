@@ -12,7 +12,6 @@ if str(TOOLS_ROOT) not in sys.path:
 PACKAGED_RUNNERS = (
     "packaged_runtime_supervisor_smoke.py",
     "packaged_ai_mainline_smoke.py",
-    "full_roadmap_packaged_acceptance.py",
     "packaged_native_mic_smoke.py",
     "packaged_tauri_ipc_smoke.py",
     "macos_dmg_install_smoke.py",

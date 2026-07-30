@@ -153,10 +153,7 @@ export function ImportRecordingDialog({
       <button className="drawer-scrim" type="button" aria-label="关闭录音导入" onClick={onClose} />
       <section className="import-recording-dialog" role="dialog" aria-modal="true" aria-labelledby="import-recording-title">
         <header className="drawer-header">
-          <div>
-            <span className="eyebrow">本地处理</span>
-            <h2 id="import-recording-title">导入录音</h2>
-          </div>
+          <h2 id="import-recording-title">导入录音</h2>
           <button className="icon-button" type="button" onClick={onClose} aria-label="关闭录音导入" title="关闭">
             <X size={18} />
           </button>
@@ -165,21 +162,23 @@ export function ImportRecordingDialog({
         <div className="import-recording-body">
           <div className="import-boundary-note">
             <HardDrive size={18} />
-            <p>录音只在本机读取、转换和转写，不新增远程 ASR 费用。AI 会后整理继续遵循当前 Provider 设置。</p>
+            <p>录音仅在本机转写，不上传音频。</p>
           </div>
 
-          <ol className="import-stage-list" aria-label="录音导入步骤">
-            {stages.map(({ stage, label }, index) => (
-              <li
-                key={stage}
-                className={result?.job
-                  ? index < currentStage ? "is-complete" : index === currentStage ? "is-active" : ""
-                  : busy && index === 0 ? "is-active" : ""}
-              >
-                <span>{index + 1}</span>{label}
-              </li>
-            ))}
-          </ol>
+          {busy || result?.job ? (
+            <ol className="import-stage-list" aria-label="录音导入进度">
+              {stages.map(({ stage, label }, index) => (
+                <li
+                  key={stage}
+                  className={result?.job
+                    ? index < currentStage ? "is-complete" : index === currentStage ? "is-active" : ""
+                    : index === 0 ? "is-active" : ""}
+                >
+                  <span>{index + 1}</span>{label}
+                </li>
+              ))}
+            </ol>
+          ) : null}
 
           <button
             className="import-drop-zone"
@@ -223,7 +222,7 @@ export function ImportRecordingDialog({
           {busy ? (
             <div className="import-progress" role="status">
               <LoaderCircle className="spin" size={17} />
-              <div><strong>正在读取文件并启动本地任务</strong><span>窗口可关闭，已提交的后台任务会继续处理。</span></div>
+              <div><strong>正在提交录音</strong><span>提交后可关闭窗口，处理会继续进行。</span></div>
             </div>
           ) : null}
           {result?.job ? (
@@ -242,7 +241,7 @@ export function ImportRecordingDialog({
                 <span>
                   {result.job.errorMessage
                     || (result.job.status === "succeeded"
-                      ? "录音、文字和会后内容已经保存。"
+                      ? "会议内容已保存。"
                       : "后台任务会继续运行，关闭窗口不会中断处理。")}
                 </span>
               </div>

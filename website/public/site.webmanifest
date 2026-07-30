@@ -1,0 +1,16 @@
+{
+  "name": "Meeting Copilot 会议助手",
+  "short_name": "Meeting Copilot",
+  "description": "中文技术会议的实时副驾驶",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#F7F8FA",
+  "theme_color": "#FFFFFF",
+  "icons": [
+    {
+      "src": "/brand/app-icon.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

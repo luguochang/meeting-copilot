@@ -1,0 +1,34 @@
+{
+  "version": "0.1.0",
+  "status": "public",
+  "updatedAt": "2026-07-27",
+  "note": "Windows 0.1.0 公开预览版提供轻量基础安装包；完整离线 ASR 能力包可在客户端中另行导入。当前安装包未签名，Windows SmartScreen 可能显示提示。",
+  "platforms": [
+    {
+      "id": "windows-x64",
+      "label": "Windows 版",
+      "availability": "public",
+      "url": "/downloads/meeting-copilot/windows/0.1.0/Meeting-Copilot-0.1.0-windows-x64-base-unsigned.exe",
+      "sha256Url": "/downloads/meeting-copilot/windows/0.1.0/Meeting-Copilot-0.1.0-windows-x64-base-unsigned.exe.sha256",
+      "minimumOs": "Windows 10/11",
+      "architecture": "x64",
+      "signatureStatus": "unsigned"
+    },
+    {
+      "id": "macos-arm64",
+      "label": "macOS (Apple Silicon)",
+      "availability": "planned",
+      "url": null,
+      "minimumOs": "macOS 13 或更高版本（待最终确认）",
+      "architecture": "arm64"
+    },
+    {
+      "id": "macos-x64",
+      "label": "macOS (Intel)",
+      "availability": "planned",
+      "url": null,
+      "minimumOs": "待规划",
+      "architecture": "x64"
+    }
+  ]
+}

@@ -1,7 +1,6 @@
 pub const APP_COMMAND_NAMES: &[&str] = &[
     "runtime_get_status",
     "runtime_write_frontend_probe",
-    "session_prepare",
     "asr_worker_prepare",
     "asr_worker_start",
     "asr_worker_health",

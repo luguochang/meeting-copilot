@@ -1,16 +1,23 @@
-Meeting Copilot Internal Evaluation License
+Meeting Copilot Source License
 
-Copyright (c) 2026 Meeting Copilot project contributors.
+Copyright (c) 2026 luguochang. All rights reserved.
 
-Permission is granted to use, copy, and modify the first-party source code in
-this repository for personal development, testing, and internal evaluation.
+Permission is granted to view, use, copy, and modify the first-party source
+code in this repository for personal development, testing, education, and
+internal evaluation.
 
-Redistribution, sublicensing, public hosting, commercial distribution, or
-inclusion of this first-party source code in another product is not permitted
-without prior written permission from the copyright holder.
+Redistribution, sublicensing, public hosting of a modified or unmodified
+version, commercial distribution, or inclusion of this first-party source
+code in another product is not permitted without prior written permission
+from the copyright holder.
 
-This permission does not grant rights to any third-party dependency, model
-weight, dataset, binary, font, icon, or other asset. Those materials remain
-subject to their own licenses and distribution terms, which are listed in
-NOTICE and the generated SBOM where known. The software is provided "as is",
-without warranty of any kind, express or implied.
+This permission does not grant rights to third-party dependencies, model
+weights, datasets, binaries, fonts, icons, or other assets. Those materials
+remain subject to their own licenses and distribution terms, as described in
+NOTICE and the generated SBOM where known.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING
+FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OF THE SOFTWARE.

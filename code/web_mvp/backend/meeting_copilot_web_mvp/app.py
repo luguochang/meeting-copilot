@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 import asyncio
 import hmac
 import json
@@ -128,10 +127,6 @@ from meeting_copilot_web_mvp.local_api_auth import (
     session_cookie_value,
     token_status,
 )
-from meeting_copilot_web_mvp.task006_failpoints import (
-    InjectedStorageWriteError,
-    storage_write_failpoint,
-)
 
 configure_logging()
 _log = get_logger("meeting_copilot_web_mvp.app")
@@ -200,8 +195,6 @@ from meeting_copilot_web_mvp.repository import (
 )
 
 
-STATIC_DIR = Path(__file__).resolve().parent / "frontend_static"
-WORKBENCH_HTML = (STATIC_DIR / "workbench.html").read_text(encoding="utf-8")
 FRONTEND_V2_DIST_DIR = Path(__file__).resolve().parents[2] / "frontend_v2" / "dist"
 SOURCE_REPO_ROOT = Path(__file__).resolve().parents[4]
 REPO_ROOT = SOURCE_REPO_ROOT
@@ -945,28 +938,6 @@ class WebProviderConfigRequest(BaseModel):
     )
 
 
-class task006StorageFailpointRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    scope: Literal["sqlite_transaction", "meeting_title_transaction", "audio_chunk"]
-    failure: Literal["enospc", "eio", "erofs"]
-    count: int = Field(default=1, ge=1, le=10)
-
-
-class ShadowReportFeedbackIngestionRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    candidate_report: dict[str, Any] | None = None
-    candidate_report_path: str | None = None
-    feedback_entries: list[dict[str, Any]]
-
-
-class DesktopTauriNoopRunResultValidationRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    run_result: dict[str, Any]
-
-
 def create_app(
     repository: InMemorySessionRepository | JsonFileSessionRepository | SqliteSessionRepository | None = None,
     data_dir: str | Path | None = None,
@@ -986,23 +957,6 @@ def create_app(
     if degradation.reason.startswith(("asr_sidecar_crashed:", "asr_sidecar_restart_failed:")):
         degradation.reset()
     app = FastAPI(title="Meeting Copilot Local Web MVP")
-
-    @app.exception_handler(InjectedStorageWriteError)
-    async def task006_storage_write_failure_handler(
-        _request: Request,
-        error: InjectedStorageWriteError,
-    ) -> JSONResponse:
-        return JSONResponse(
-            status_code=507,
-            content={
-                "detail": {
-                    "error": "storage_write_failed",
-                    "failure": error.failure,
-                    "scope": error.scope,
-                    "retryable": True,
-                }
-            },
-        )
 
     local_api_token = os.environ.get(LOCAL_API_TOKEN_ENV, "").strip()
     app.state.local_api_auth = token_status(local_api_token)
@@ -2736,7 +2690,6 @@ def create_app(
             "purposes": purposes,
         }
 
-    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     if FRONTEND_V2_DIST_DIR.joinpath("assets").is_dir():
         app.mount(
             "/workbench-assets",
@@ -4691,14 +4644,6 @@ def create_app(
     def workbench() -> Response:
         return _workbench_v2_response()
 
-    @app.get("/workbench-legacy")
-    def workbench_legacy() -> Response:
-        return Response(WORKBENCH_HTML, media_type="text/html; charset=utf-8")
-
-    @app.get("/workbench-v2")
-    def workbench_v2() -> Response:
-        return _workbench_v2_response()
-
     def _workbench_v2_response() -> Response:
         index_path = FRONTEND_V2_DIST_DIR / "index.html"
         if not index_path.is_file():
@@ -5237,38 +5182,6 @@ def create_app(
             **llm_service.provider_metadata(config),
         }
 
-    def _require_task006_failpoints_enabled() -> None:
-        _require_authenticated_desktop_runtime()
-        if os.environ.get("MEETING_COPILOT_ENABLE_task006_FAILPOINTS") != "1":
-            raise HTTPException(
-                status_code=403,
-                detail={
-                    "error": "task006_failpoints_disabled",
-                    "message": "task-006 test failpoints are disabled",
-                },
-            )
-
-    @app.get("/desktop/test/failpoints/storage-write")
-    def get_task006_storage_failpoint() -> dict[str, Any]:
-        _require_task006_failpoints_enabled()
-        return storage_write_failpoint.snapshot()
-
-    @app.put("/desktop/test/failpoints/storage-write")
-    def put_task006_storage_failpoint(
-        payload: task006StorageFailpointRequest,
-    ) -> dict[str, Any]:
-        _require_task006_failpoints_enabled()
-        return storage_write_failpoint.arm(
-            scope=payload.scope,
-            failure=payload.failure,
-            count=payload.count,
-        )
-
-    @app.delete("/desktop/test/failpoints/storage-write")
-    def delete_task006_storage_failpoint() -> dict[str, Any]:
-        _require_task006_failpoints_enabled()
-        return storage_write_failpoint.reset()
-
     @app.post("/degradation/reset")
     def degradation_reset() -> dict[str, Any]:
         get_degradation_controller().reset()
@@ -5753,20 +5666,6 @@ def create_app(
             "event_count": len(live_events),
         }
 
-    @app.post("/shadow-reports/feedback-ingestions")
-    def create_shadow_report_feedback_ingestion(
-        payload: ShadowReportFeedbackIngestionRequest,
-    ) -> dict[str, Any]:
-        feedback_tool = _load_shadow_report_feedback_ingestion_module()
-        report = feedback_tool.build_shadow_report_feedback_ingestion(
-            candidate_report=payload.candidate_report,
-            candidate_report_path=payload.candidate_report_path,
-            feedback_entries=payload.feedback_entries,
-        )
-        if str(report.get("feedback_ingestion_status", "")).startswith("blocked_"):
-            raise HTTPException(status_code=422, detail=report)
-        return report
-
     @app.get("/")
     def root_index() -> Response:
         # Redirect to V2 workbench by default
@@ -5774,11 +5673,6 @@ def create_app(
             status_code=302,
             headers={"Location": "/workbench"},
         )
-
-    @app.get("/v1")
-    def v1_workbench() -> Response:
-        """Legacy V1 workbench (vanilla JS)"""
-        return Response(WORKBENCH_HTML, media_type="text/html; charset=utf-8")
 
     @app.get("/demo/fixtures")
     def demo_fixtures() -> dict[str, Any]:
@@ -10556,19 +10450,6 @@ def _ensure_llm_provider_allowed_for_derivation(
             status_code=409,
             detail="mock LLM provider cannot create production derivations",
         )
-
-
-def _load_shadow_report_feedback_ingestion_module() -> Any:
-    tool_path = SOURCE_REPO_ROOT / "tools" / "shadow_report_feedback_ingestion.py"
-    spec = importlib.util.spec_from_file_location(
-        "meeting_copilot_shadow_report_feedback_ingestion",
-        tool_path,
-    )
-    if spec is None or spec.loader is None:
-        raise RuntimeError("shadow report feedback ingestion tool is unavailable")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def _path_has_suffix_parts(path: Path, suffix_parts: tuple[str, ...]) -> bool:

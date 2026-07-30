@@ -133,11 +133,11 @@ def test_report_contains_only_allowlisted_diagnostic_aggregates():
 
 
 def test_deliberate_secret_transcript_audio_database_and_path_injection_never_leaks(tmp_path):
-    secret = "sk-task007-ultra-private-key"
-    authorization = "Bearer task007-authorization-secret"
-    transcript = "task007_PRIVATE_TRANSCRIPT_客户明天签约_不可泄露"
-    audio_marker = "task007_PRIVATE_AUDIO_BYTES"
-    database_marker = "task007_PRIVATE_SQLITE_DATABASE"
+    secret = "sk-test-ultra-private-key"
+    authorization = "Bearer test-authorization-secret"
+    transcript = "PRIVATE_TRANSCRIPT_客户明天签约_不可泄露"
+    audio_marker = "PRIVATE_AUDIO_BYTES"
+    database_marker = "PRIVATE_SQLITE_DATABASE"
     private_path = "/Users/private-person/Library/Application Support/MeetingCopilot/private.db"
     snapshot = _representative_snapshot()
     snapshot.update(
@@ -166,7 +166,7 @@ def test_deliberate_secret_transcript_audio_database_and_path_injection_never_le
             "raw_prompt": transcript,
             "raw_response": transcript,
             "authorization": authorization,
-            "status": "task007-authorization-secret",
+            "status": "test-authorization-secret",
         }
     )
     snapshot["stage_metrics"]["asr"].update(
@@ -193,7 +193,7 @@ def test_deliberate_secret_transcript_audio_database_and_path_injection_never_le
     for forbidden in (
         secret,
         authorization,
-        "task007-authorization-secret",
+        "test-authorization-secret",
         transcript,
         audio_marker,
         database_marker,

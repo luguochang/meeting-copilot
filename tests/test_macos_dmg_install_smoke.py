@@ -7,6 +7,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TOOL_PATH = REPO_ROOT / "tools" / "macos_dmg_install_smoke.py"
+pytestmark = pytest.mark.skipif(sys.platform != "darwin", reason="macOS-only installer contract")
 if str(TOOL_PATH.parent) not in sys.path:
     sys.path.insert(0, str(TOOL_PATH.parent))
 

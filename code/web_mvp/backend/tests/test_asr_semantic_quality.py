@@ -152,7 +152,7 @@ def test_asr_semantic_quality_warns_but_does_not_block_sparse_unknown_product_na
 
 def test_asr_semantic_quality_accepts_common_cloud_products_and_initialisms():
     result = evaluate_semantic_quality(
-        "官网代码用 ChatGPT 和 Claude 检查，Cloudflare 配 DNS，Vercel 负责部署，DFC 今天提交 commit。"
+        "官网代码用 TypeScript 和 React 构建，Cloudflare 配 DNS，Vercel 负责部署，DFC 今天提交 commit。"
     )
 
     assert result["status"] == "passed"

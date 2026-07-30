@@ -40,7 +40,6 @@ UNTRACKED_SOURCE_ROOTS = {
     "docs",
     "tests",
     "tools",
-    "设计稿",
 }
 UNTRACKED_SOURCE_SUFFIXES = {
     ".c",

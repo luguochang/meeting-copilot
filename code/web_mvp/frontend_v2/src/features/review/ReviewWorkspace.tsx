@@ -1127,7 +1127,7 @@ export function ReviewWorkspace({
     <main className="review-workspace">
       <section className="review-progress" aria-label="会议整理进度">
         <div className="review-progress-summary">
-          <span className="review-progress-ring">{reviewCompletionPercent}%</span>
+          <span className={`review-progress-ring${reviewCompletionPercent === 100 ? " is-complete" : ""}`}>{reviewCompletionPercent}%</span>
           <span>
             <strong>纪要完成度</strong>
             <small>基于文字、录音与 AI 整理任务</small>

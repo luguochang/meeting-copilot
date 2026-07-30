@@ -67,13 +67,13 @@ const deletionOptions: Array<{ scope: DataDeletionScope; label: string; descript
 const retentionOptions: Array<{ policy: DataRetentionPolicy; label: string; description: string; badge?: string }> = [
   {
     policy: "local_until_user_deletes",
-    label: "手动删除（永久保留）",
-    description: "不会自动删除任何数据，适合长期归档和合规留存。",
+    label: "手动删除",
+    description: "不自动删除。",
     badge: "无限制",
   },
-  { policy: "30_days", label: "30 天", description: "会议结束 30 天后自动清理，适合短期项目。", badge: "推荐" },
-  { policy: "90_days", label: "90 天", description: "会议结束 90 天后自动清理，兼顾回溯和空间。" },
-  { policy: "365_days", label: "365 天", description: "会议结束一年后自动清理，适合年度项目。" },
+  { policy: "30_days", label: "30 天", description: "会议结束 30 天后自动删除。", badge: "推荐" },
+  { policy: "90_days", label: "90 天", description: "会议结束 90 天后自动删除。" },
+  { policy: "365_days", label: "365 天", description: "会议结束一年后自动删除。" },
 ];
 
 function formatDate(timestamp: number): string {
@@ -320,19 +320,19 @@ export function MeetingHistory({ api, onOpenMeeting }: MeetingHistoryProps) {
       <div className="history-overview" aria-label="会议记录统计">
         <article>
           <span className="history-overview-icon history-overview-icon--live"><Radio size={20} /></span>
-          <div><span>进行中</span><strong>{historyStats.live}</strong><small>正在实时转写</small></div>
+          <div><span>进行中</span><strong>{historyStats.live}</strong><small>实时转写</small></div>
         </article>
         <article>
           <span className="history-overview-icon history-overview-icon--processing"><RefreshCw size={20} /></span>
-          <div><span>处理中</span><strong>{historyStats.processing}</strong><small>转写与整理中</small></div>
+          <div><span>处理中</span><strong>{historyStats.processing}</strong><small>转写 / AI 整理</small></div>
         </article>
         <article>
           <span className="history-overview-icon history-overview-icon--ready"><CircleCheck size={20} /></span>
-          <div><span>已完成</span><strong>{historyStats.ready}</strong><small>可随时查看</small></div>
+          <div><span>已完成</span><strong>{historyStats.ready}</strong><small>复盘就绪</small></div>
         </article>
         <article>
           <span className="history-overview-icon history-overview-icon--segments"><FileText size={20} /></span>
-          <div><span>本地文字</span><strong>{historyStats.segments}</strong><small>识别片段已保存</small></div>
+          <div><span>本地文字</span><strong>{historyStats.segments}</strong><small>已保存片段</small></div>
         </article>
       </div>
 
@@ -457,10 +457,7 @@ export function MeetingHistory({ api, onOpenMeeting }: MeetingHistoryProps) {
             aria-labelledby="delete-local-data-title"
           >
             <header className="drawer-header">
-              <div>
-                <span className="eyebrow">本地数据</span>
-                <h2 id="delete-local-data-title">删除会议数据</h2>
-              </div>
+              <h2 id="delete-local-data-title">删除会议数据</h2>
               <button
                 className="icon-button"
                 type="button"
@@ -546,10 +543,7 @@ export function MeetingHistory({ api, onOpenMeeting }: MeetingHistoryProps) {
             aria-labelledby="data-retention-title"
           >
             <header className="drawer-header">
-              <div>
-                <span className="eyebrow">本地数据</span>
-                <h2 id="data-retention-title">数据保留策略</h2>
-              </div>
+              <h2 id="data-retention-title">数据保留策略</h2>
               <button
                 className="icon-button"
                 type="button"
@@ -563,7 +557,7 @@ export function MeetingHistory({ api, onOpenMeeting }: MeetingHistoryProps) {
             </header>
             <div className="data-governance-body">
               <p className="data-governance-intro">
-                录音、文字和 AI 整理保存在这台电脑上。默认不会自动删除。
+                会议数据默认保存在这台电脑上。
               </p>
               {settingsLoading ? (
                 <p className="data-governance-loading" role="status">

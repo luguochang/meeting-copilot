@@ -13,7 +13,7 @@ def test_diagnostic_bundle_endpoint_downloads_allowlist_only_runtime_evidence(
     tmp_path,
     monkeypatch,
 ):
-    secret = "sk-task007-api-secret"
+    secret = "sk-test-api-secret"
     monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gateway.example/v1?token=private")
     monkeypatch.setenv("LLM_GATEWAY_API_KEY", secret)
     monkeypatch.setenv("LLM_GATEWAY_MODEL", "test-model")

@@ -700,7 +700,7 @@ def _import_and_wait(
     fixture: Path,
     timeout: float,
 ) -> dict[str, Any]:
-    body, content_type = _multipart_audio(fixture, title=f"task-022 {extension.upper()} smoke")
+    body, content_type = _multipart_audio(fixture, title=f"Packaged {extension.upper()} smoke")
     submitted = _request(
         port,
         "POST",

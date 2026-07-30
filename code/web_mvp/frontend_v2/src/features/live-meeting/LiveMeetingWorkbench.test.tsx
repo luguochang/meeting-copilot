@@ -794,6 +794,7 @@ describe("LiveMeetingWorkbench", () => {
     expect(screen.queryByText("acceptance_gate")).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "打开运行诊断" }));
     const drawer = screen.getByRole("dialog", { name: "会议连接详情" });
+    await user.click(within(drawer).getByText("技术详情"));
     expect(within(drawer).getByText(/provider_mode/)).toBeVisible();
     expect(within(drawer).getByText(/acceptance_gate/)).toBeVisible();
   });

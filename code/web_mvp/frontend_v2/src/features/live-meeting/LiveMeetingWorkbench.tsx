@@ -313,7 +313,7 @@ export function LiveMeetingWorkbench({
             <div className="start-command-copy">
               <span className="section-kicker">会议工作台</span>
               <h1>会议记录</h1>
-              <p>查看和管理会议记录，从完整文字、录音与 AI 整理中快速回到讨论现场。</p>
+              <p>管理本机会议、录音、文字与 AI 整理结果。</p>
             </div>
             <div className="start-command-actions">
               <ProviderSettingsControl />
@@ -546,7 +546,7 @@ export function LiveMeetingWorkbench({
                 <span><CalendarDays size={12} />{formatMeetingDate(state.updatedAtMs)}</span>
                 <span><Clock3 size={12} />{formatElapsed(elapsedMs)}</span>
                 <span><FileText size={12} />{state.archivedSegmentCount + state.segments.length} 段文字</span>
-                <span><Users size={12} />{state.speakers.length || 1} 位参与者</span>
+                <span><Users size={12} />{state.speakers.length || 1} 个说话人</span>
               </div>
           </div>
         </div>
@@ -567,9 +567,15 @@ export function LiveMeetingWorkbench({
         <div className="header-actions">
           <ProviderSettingsControl />
           {canStartCapture ? (
-            <button className="start-recording-button" type="button" onClick={() => setPreflightOpen(true)}>
+            <button
+              className="start-recording-button"
+              type="button"
+              aria-label={microphone.state.phase === "error" ? "继续录音" : "开始录音"}
+              title={microphone.state.phase === "error" ? "继续录音" : "开始录音"}
+              onClick={() => setPreflightOpen(true)}
+            >
               <Mic size={16} />
-              {microphone.state.phase === "error" ? "继续录音" : "开始录音"}
+              <span className="meeting-command-label">{microphone.state.phase === "error" ? "继续录音" : "开始录音"}</span>
             </button>
           ) : null}
           {localCaptureActive
@@ -586,7 +592,7 @@ export function LiveMeetingWorkbench({
             </button>
           ) : null}
           <button
-            className="icon-button"
+            className="icon-button runtime-diagnostics-button"
             type="button"
             onClick={() => setDiagnosticsOpen(true)}
             title="运行诊断"
@@ -604,7 +610,7 @@ export function LiveMeetingWorkbench({
               aria-label="结束并整理"
             >
               {state.ending || microphone.state.phase === "stopping" ? <LoaderCircle className="spin" size={16} /> : <Square size={14} fill="currentColor" />}
-              {state.ending || microphone.state.phase === "stopping" ? "正在结束" : "结束并整理"}
+              <span className="meeting-command-label">{state.ending || microphone.state.phase === "stopping" ? "正在结束" : "结束并整理"}</span>
             </button>
           ) : null}
         </div>

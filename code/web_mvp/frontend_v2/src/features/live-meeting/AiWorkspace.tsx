@@ -250,6 +250,12 @@ export function AiWorkspace({
     }
   };
 
+  const recentTopic = railProps.currentTopic?.text ?? null;
+  const recentDecision = railProps.decisionCandidates.find((item) => item.status === "confirmed")?.text ?? null;
+  const recentQuestion = railProps.openQuestions.find((item) =>
+    ["open", "carried_over", "unknown"].includes(item.status))?.text ?? railProps.followUp?.question ?? null;
+  const hasRecentContext = Boolean(recentTopic || recentDecision || recentQuestion);
+
   return (
     <aside className="ai-workspace" aria-label="会议 AI 工作区">
       <div className="ai-workspace-tabs" role="tablist" aria-label="AI 工作区视图">
@@ -310,19 +316,17 @@ export function AiWorkspace({
               {recentContextOpen ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
             </button>
             {recentContextOpen ? (
-              <div>
-                <p><strong>主题</strong>{railProps.currentTopic?.text || "等待形成稳定议题"}</p>
-                <p><strong>结论</strong>{railProps.decisionCandidates.find((item) => item.status === "confirmed")?.text || "尚未形成结论"}</p>
-                <p><strong>待确认</strong>{railProps.openQuestions.find((item) => ["open", "carried_over", "unknown"].includes(item.status))?.text || railProps.followUp?.question || "暂无未闭环问题"}</p>
+              <div className={hasRecentContext ? undefined : "recent-context-strip__empty"}>
+                {recentTopic ? <p><strong>主题</strong>{recentTopic}</p> : null}
+                {recentDecision ? <p><strong>结论</strong>{recentDecision}</p> : null}
+                {recentQuestion ? <p><strong>待确认</strong>{recentQuestion}</p> : null}
+                {!hasRecentContext ? <span>暂无可用上下文</span> : null}
               </div>
             ) : null}
           </section>
 
           <div className="ask-ai-conversation" aria-live="polite">
             {loading ? <p className="ask-ai-empty"><LoaderCircle className="spin" size={18} />正在加载对话</p> : null}
-            {!loading && !currentThread?.messages.length && !asking ? (
-              <p className="ask-ai-empty">直接询问当前会议</p>
-            ) : null}
             {currentThread?.messages.map((message) => (
               <article className={`ask-ai-message ask-ai-message--${message.role}`} key={message.messageId}>
                 <span>{message.role === "user" ? "你" : "AI"}</span>

@@ -1,8 +1,11 @@
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
+
+import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -240,6 +243,7 @@ def test_repository_scope_rejects_unapproved_paths_and_runtime_scope_is_explicit
     assert accepted["artifact"]["scope"] == "runtime"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="requires symlink privileges")
 def test_symlink_inputs_are_rejected_without_hashing_target(tmp_path):
     tool = load_tool_module()
     repo = init_release_repo(tmp_path)

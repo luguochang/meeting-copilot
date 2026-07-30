@@ -10,6 +10,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TOOLS = REPO_ROOT / "tools"
+pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="requires POSIX file permissions")
 if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
@@ -137,7 +138,7 @@ def test_evidence_redaction_rejects_secret_url_absolute_path_and_private_audio()
         "api_key": "sk-never-write",
         "authorization": "Bearer sk-never-write",
         "base_url": "https://relay.example/private/v1",
-        "path": "/Users/chase/private.wav",
+        "path": "/Users/example/private.wav",
         "audio_text": "受控公开音频文本可以保留",
         "audio_bytes": "raw-private-audio",
     }
@@ -147,7 +148,7 @@ def test_evidence_redaction_rejects_secret_url_absolute_path_and_private_audio()
     assert "sk-never-write" not in encoded
     assert "Bearer" not in encoded
     assert "https://relay.example/private/v1" not in encoded
-    assert "/Users/chase/private.wav" not in encoded
+    assert "/Users/example/private.wav" not in encoded
     assert "raw-private-audio" not in encoded
     assert redacted["audio_text"] == "受控公开音频文本可以保留"
     assert "audio_bytes" not in redacted
@@ -416,7 +417,7 @@ def test_require_changed_correction_cli_is_explicit_and_defaults_off():
         "--config",
         "provider.local.json",
         "--run-id",
-        "task-016",
+        "next-016",
     ]
 
     assert smoke.parse_args(required).require_changed_correction is False
@@ -445,7 +446,7 @@ def test_main_forwards_require_changed_correction_to_runner(monkeypatch, capsys)
             "--config",
             "provider.local.json",
             "--run-id",
-            "task-016",
+            "next-016",
             "--require-changed-correction",
         ]
     )

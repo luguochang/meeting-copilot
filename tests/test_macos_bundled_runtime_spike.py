@@ -1,12 +1,14 @@
 import importlib.util
 import json
 from pathlib import Path
+import sys
 
 import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TOOL_PATH = REPO_ROOT / "tools" / "macos_bundled_runtime_spike.py"
+pytestmark = pytest.mark.skipif(sys.platform != "darwin", reason="macOS-only packaging contract")
 
 
 def load_tool_module():

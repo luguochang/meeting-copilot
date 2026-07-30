@@ -56,7 +56,7 @@ describe("ImportRecordingDialog", () => {
     await user.click(screen.getByRole("button", { name: "开始导入" }));
 
     await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("本地中文转写 · 62%"));
-    expect(within(screen.getByLabelText("录音导入步骤")).getByText("本地中文转写").closest("li"))
+    expect(within(screen.getByLabelText("录音导入进度")).getByText("本地中文转写").closest("li"))
       .toHaveClass("is-active");
 
     await act(async () => vi.advanceTimersByTimeAsync(2_000));

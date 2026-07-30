@@ -158,8 +158,9 @@ export function NotesCenter({
       <div className="notes-shell">
         <header className="notes-header">
           <div>
-            <span className="eyebrow">私人工作区</span>
+            <span className="eyebrow">会议笔记</span>
             <h1>笔记</h1>
+            <p>编辑会议笔记并核对关联原文。</p>
           </div>
           <ProviderSettingsControl />
         </header>

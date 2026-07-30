@@ -242,7 +242,7 @@ describe("MeetingPreflightDialog", () => {
     expect(screen.getByText("将采集本机播放的会议声音，不会同时启动麦克风。")).toBeVisible();
     expect(screen.getByRole("combobox", { name: "系统音频设备" })).toHaveValue("wasapi-render-1");
     expect(screen.getByText("Windows 将从所选播放设备的 WASAPI loopback 采集声音。")).toBeVisible();
-    expect(screen.getByLabelText("系统音频启动检查项")).toHaveTextContent("传输开始时验证PCM开始时验证声音启动后检测识别独立就绪");
+    expect(screen.queryByLabelText("系统音频启动检查项")).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByLabelText("我已告知参会者并确认可以录音"));
     fireEvent.click(screen.getByRole("button", { name: "开始会议" }));
@@ -318,11 +318,11 @@ describe("MeetingPreflightDialog", () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(150);
     });
-    expect(screen.getByLabelText("RMS 输入电平 5.0%")).toHaveAttribute("data-probe-status", "checking");
+    expect(screen.getByLabelText("输入音量 5.0%")).toHaveAttribute("data-probe-status", "checking");
     await finishBrowserProbe();
 
     expect(screen.getByText("正常收到声音，麦克风可用")).toBeVisible();
-    expect(screen.getByLabelText("RMS 输入电平 5.0%")).toHaveAttribute("data-probe-status", "receiving_audio");
+    expect(screen.getByLabelText("输入音量 5.0%")).toHaveAttribute("data-probe-status", "receiving_audio");
     expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalledWith({
       audio: { deviceId: { exact: "mic-1" } },
       video: false,
@@ -339,7 +339,7 @@ describe("MeetingPreflightDialog", () => {
     fireEvent.click(screen.getByRole("button", { name: "检查麦克风" }));
     await finishBrowserProbe();
 
-    expect(screen.getByLabelText("RMS 输入电平 0.0%")).toHaveAttribute("data-probe-status", "silent");
+    expect(screen.getByLabelText("输入音量 0.0%")).toHaveAttribute("data-probe-status", "silent");
     expect(screen.getByRole("alert")).toHaveTextContent("未检测到声音，请检查麦克风是否静音");
     expect(stopTrack).toHaveBeenCalledOnce();
   });
@@ -356,7 +356,7 @@ describe("MeetingPreflightDialog", () => {
     fireEvent.click(screen.getByRole("button", { name: "检查麦克风" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent(expectedMessage);
-    expect(screen.getByLabelText("检查后显示 RMS 输入电平")).toHaveAttribute("data-probe-status", probeStatus);
+    expect(screen.getByLabelText("检查后显示输入音量")).toHaveAttribute("data-probe-status", probeStatus);
   });
 
   it("treats a stream without a live audio track as no_device", async () => {
@@ -370,7 +370,7 @@ describe("MeetingPreflightDialog", () => {
     fireEvent.click(screen.getByRole("button", { name: "检查麦克风" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent("没有可用的麦克风设备");
-    expect(screen.getByLabelText("检查后显示 RMS 输入电平")).toHaveAttribute("data-probe-status", "no_device");
+    expect(screen.getByLabelText("检查后显示输入音量")).toHaveAttribute("data-probe-status", "no_device");
     expect(stopTrack).toHaveBeenCalledOnce();
   });
 
@@ -411,7 +411,7 @@ describe("MeetingPreflightDialog", () => {
     fireEvent.click(screen.getByRole("button", { name: "检查麦克风" }));
 
     expect(await screen.findByText("正常收到声音，麦克风可用")).toBeVisible();
-    expect(screen.getByLabelText("RMS 输入电平 4.0%")).toHaveAttribute("data-probe-status", "receiving_audio");
+    expect(screen.getByLabelText("输入音量 4.0%")).toHaveAttribute("data-probe-status", "receiving_audio");
     expect(invokeMock).toHaveBeenCalledWith("mic_adapter_probe", undefined);
     expect(invokeMock).not.toHaveBeenCalledWith("mic_adapter_prepare", undefined);
     expect(navigator.mediaDevices.getUserMedia).not.toHaveBeenCalled();
@@ -464,9 +464,9 @@ describe("MeetingPreflightDialog", () => {
 
     expect(await screen.findByRole("alert")).toHaveTextContent(expectedMessage);
     if (probeStatus === "silent") {
-      expect(screen.getByLabelText("RMS 输入电平 0.0%")).toHaveAttribute("data-probe-status", "silent");
+      expect(screen.getByLabelText("输入音量 0.0%")).toHaveAttribute("data-probe-status", "silent");
     } else {
-      expect(screen.getByLabelText("检查后显示 RMS 输入电平")).toHaveAttribute("data-probe-status", probeStatus);
+      expect(screen.getByLabelText("检查后显示输入音量")).toHaveAttribute("data-probe-status", probeStatus);
     }
   });
 

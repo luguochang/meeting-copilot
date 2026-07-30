@@ -7,7 +7,7 @@
     "beforeDevCommand": "",
     "beforeBuildCommand": "",
     "devUrl": "http://127.0.0.1:8765/",
-    "frontendDist": "../../web_mvp/backend/meeting_copilot_web_mvp/frontend_static"
+    "frontendDist": "../../web_mvp/frontend_v2/dist"
   },
   "app": {
     "withGlobalTauri": true,

@@ -1,4 +1,4 @@
-import { AlertTriangle, Check, KeyRound, LoaderCircle, Settings, Trash2, X } from "lucide-react";
+import { Check, CheckCircle2, ExternalLink, KeyRound, LoaderCircle, Settings, Trash2, X } from "lucide-react";
 import { type FormEvent, useCallback, useEffect, useState } from "react";
 import { fetchProviderStatus } from "../../api/client";
 import {
@@ -24,24 +24,6 @@ interface ProviderConfigResponse {
   errors: string[];
 }
 
-interface ProviderHealthResponse {
-  llm?: {
-    configured?: boolean;
-    provider?: string;
-    model?: string;
-    api_style?: ProviderApiStyle;
-  };
-  asr?: {
-    file_asr_available?: boolean;
-  };
-  remote_asr?: {
-    default_enabled?: boolean;
-  };
-  cost_policy?: {
-    remote_asr_default_enabled?: boolean;
-  };
-}
-
 interface CostBreakdown {
   tokens?: number;
   total_tokens?: number;
@@ -62,7 +44,10 @@ interface CostStatsResponse {
 }
 
 type ProviderPhase = "loading" | "unavailable" | "unconfigured" | "saved" | "configured" | "error";
-type ProviderSettingsSection = "status" | "config" | "usage";
+
+const DEFAULT_BASE_URL = "https://codexai.club";
+const DEFAULT_MODEL = "gpt-5.5";
+const SPONSOR_URL = "https://codexai.club/";
 
 const emptyResponse: ProviderConfigResponse = {
   command_status: "ok",
@@ -181,24 +166,33 @@ function costDisplay(
   return `${label}暂无记录`;
 }
 
+function hasUsageData(stats: CostStatsResponse | null): boolean {
+  if (!stats) return false;
+  return [
+    stats.currentSession,
+    stats.today,
+    periodTokenCount(stats, "currentSession"),
+    periodTokenCount(stats, "today"),
+    monthlyTokenCount(stats),
+  ].some((value) => typeof value === "number" && Number.isFinite(value) && value > 0);
+}
+
 export function ProviderSettingsControl() {
   const [open, setOpen] = useState(false);
-  const [activeSection, setActiveSection] = useState<ProviderSettingsSection>("status");
   const [phase, setPhase] = useState<ProviderPhase>("loading");
   const [config, setConfig] = useState<ProviderConfigResponse>(emptyResponse);
   const [providerStatus, setProviderStatus] = useState<ProviderStatus>(emptyProviderStatus);
-  const [baseUrl, setBaseUrl] = useState("");
-  const [model, setModel] = useState("gpt-5.5");
+  const [baseUrl, setBaseUrl] = useState(DEFAULT_BASE_URL);
+  const [model, setModel] = useState(DEFAULT_MODEL);
   const [realtimeModel, setRealtimeModel] = useState("");
   const [apiStyle, setApiStyle] = useState<ProviderApiStyle>("chat_completions");
   const [apiKey, setApiKey] = useState("");
   const [busy, setBusy] = useState<"save" | "probe" | "clear" | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [providerHealth, setProviderHealth] = useState<ProviderHealthResponse | null>(null);
   const [costStats, setCostStats] = useState<CostStatsResponse | null>(null);
-  const [detailsLoading, setDetailsLoading] = useState(false);
-  const [detailsError, setDetailsError] = useState<string | null>(null);
+  const [confirmingClear, setConfirmingClear] = useState(false);
+  const [dirty, setDirty] = useState(false);
 
   const refresh = useCallback(async () => {
     const invoke = resolveTauriInvoke();
@@ -215,12 +209,13 @@ export function ProviderSettingsControl() {
       const status = reconcileProviderStatus(response, runtimeStatus);
       setConfig(response);
       setProviderStatus(status);
-      setBaseUrl(response.base_url ?? "");
-      setModel(response.model ?? "gpt-5.5");
+      setBaseUrl(response.base_url ?? DEFAULT_BASE_URL);
+      setModel(response.model ?? DEFAULT_MODEL);
       setRealtimeModel(response.realtime_model ?? response.model ?? "");
       setApiStyle(response.api_style ?? "chat_completions");
       setPhase(phaseFor(response, status));
       setError(response.command_status === "ok" ? null : response.errors.join("；"));
+      setDirty(false);
     } catch (statusError) {
       setPhase("error");
       setError(statusError instanceof Error ? statusError.message : "AI 配置状态读取失败");
@@ -231,25 +226,17 @@ export function ProviderSettingsControl() {
     void refresh();
   }, [refresh]);
 
-  const loadDetails = useCallback(async () => {
-    setDetailsLoading(true);
-    setDetailsError(null);
-    const [healthResult, costResult] = await Promise.allSettled([
-      getJson<ProviderHealthResponse>("/providers/health"),
-      getJson<CostStatsResponse>("/settings/cost-stats"),
-    ]);
-    const errors: string[] = [];
-    if (healthResult.status === "fulfilled") setProviderHealth(healthResult.value);
-    else errors.push(healthResult.reason instanceof Error ? healthResult.reason.message : "Provider 健康状态读取失败");
-    if (costResult.status === "fulfilled") setCostStats(costResult.value);
-    else errors.push(costResult.reason instanceof Error ? costResult.reason.message : "成本统计读取失败");
-    setDetailsError(errors.length ? errors.join("；") : null);
-    setDetailsLoading(false);
+  const loadUsage = useCallback(async () => {
+    try {
+      setCostStats(await getJson<CostStatsResponse>("/settings/cost-stats"));
+    } catch {
+      setCostStats(null);
+    }
   }, []);
 
   useEffect(() => {
-    if (open) void loadDetails();
-  }, [loadDetails, open]);
+    if (open) void loadUsage();
+  }, [loadUsage, open]);
 
   const save = async (event: FormEvent) => {
     event.preventDefault();
@@ -295,9 +282,10 @@ export function ProviderSettingsControl() {
       setProviderStatus(connectedStatus);
       setPhase("configured");
       setApiKey("");
-      setMessage("AI 已连接");
-      await loadDetails();
-      setOpen(false);
+      setMessage("连接正常，配置已保存");
+      setConfirmingClear(false);
+      setDirty(false);
+      await loadUsage();
     } catch (saveError) {
       setPhase("error");
       setError(saveError instanceof Error ? saveError.message : "AI 配置保存失败");
@@ -342,8 +330,8 @@ export function ProviderSettingsControl() {
         realtime_model: config.realtime_model ?? activeModel,
       });
       setPhase("configured");
-      setMessage("AI 已连接");
-      await loadDetails();
+      setMessage("连接正常");
+      await loadUsage();
     } catch (probeError) {
       setProviderStatus((current) => current.runtime_synced
         ? { ...current, probe_status: "failed" }
@@ -356,7 +344,7 @@ export function ProviderSettingsControl() {
 
   const clear = async () => {
     const invoke = resolveTauriInvoke();
-    if (busy || !window.confirm("移除已保存的 AI 中转站配置？")) return;
+    if (busy) return;
     setBusy("clear");
     setError(null);
     setMessage(null);
@@ -368,12 +356,14 @@ export function ProviderSettingsControl() {
       setConfig(response);
       setProviderStatus(emptyProviderStatus);
       setPhase("unconfigured");
-      setBaseUrl("");
-      setModel("gpt-5.5");
+      setBaseUrl(DEFAULT_BASE_URL);
+      setModel(DEFAULT_MODEL);
       setRealtimeModel("");
       setApiStyle("chat_completions");
       setApiKey("");
       setMessage("AI 配置已移除");
+      setConfirmingClear(false);
+      setDirty(false);
     } catch (clearError) {
       setError(clearError instanceof Error ? clearError.message : "AI 配置移除失败");
     } finally {
@@ -383,23 +373,45 @@ export function ProviderSettingsControl() {
 
   const triggerLabel = phase === "configured"
     ? (providerStatus.probe_status === "succeeded"
-      ? `AI 已连接 · ${providerStatus.model ?? config.model ?? model} / ${providerStatus.realtime_model ?? config.realtime_model ?? model}`
+      ? `AI 已连接 · ${providerStatus.model ?? config.model ?? model}`
       : providerStatus.probe_status === "failed"
-        ? `AI 连接失败 · ${providerStatus.model ?? config.model ?? model} / ${providerStatus.realtime_model ?? config.realtime_model ?? model}`
-      : "AI 已配置")
+        ? `AI 连接失败 · ${providerStatus.model ?? config.model ?? model}`
+        : "AI 已配置")
     : phase === "saved"
       ? "AI 待连接"
-    : phase === "error"
-      ? "AI 配置异常"
-      : phase === "loading"
-        ? "读取 AI 配置"
-        : "配置 AI";
+      : phase === "error"
+        ? "AI 配置异常"
+        : phase === "loading"
+          ? "读取 AI 配置"
+          : "配置 AI";
 
-  const focusSection = (section: ProviderSettingsSection) => {
-    setActiveSection(section);
-    window.requestAnimationFrame(() => {
-      document.getElementById(`provider-${section}-panel`)?.scrollIntoView({ behavior: "smooth", block: "start" });
-    });
+  const connectionState = busy === "save" || busy === "probe"
+    ? "testing"
+    : providerStatus.probe_status === "succeeded"
+      ? "connected"
+      : providerStatus.probe_status === "failed" || phase === "error"
+        ? "failed"
+        : config.configured
+          ? "untested"
+          : "unconfigured";
+
+  const connectionLabel = connectionState === "testing"
+    ? "正在测试连接"
+    : connectionState === "connected"
+      ? "连接正常"
+      : connectionState === "failed"
+        ? "连接失败"
+        : connectionState === "untested"
+          ? "待测试"
+          : "尚未配置";
+
+  const markConfigChanged = () => {
+    setDirty(true);
+    setMessage(null);
+    setError(null);
+    setProviderStatus((current) => current.probe_status === "succeeded"
+      ? { ...current, probe_status: "not_run" }
+      : current);
   };
 
   return (
@@ -408,7 +420,7 @@ export function ProviderSettingsControl() {
         className={`provider-settings-trigger provider-settings-trigger--${phase}`}
         type="button"
         onClick={() => {
-          setActiveSection("status");
+          setConfirmingClear(false);
           setOpen(true);
         }}
         aria-label="打开 AI 设置"
@@ -423,195 +435,182 @@ export function ProviderSettingsControl() {
           <button className="drawer-scrim" aria-label="关闭 AI 设置" onClick={() => setOpen(false)} />
           <section className="provider-settings-dialog" role="dialog" aria-modal="true" aria-labelledby="provider-settings-title">
             <header className="drawer-header">
-              <div>
-                <span className="eyebrow">AI 设置</span>
-                <div className="provider-title-line">
-                  <h2 id="provider-settings-title">OpenAI 兼容中转站</h2>
-                  <span className={`provider-dialog-status provider-dialog-status--${phase}`}>
-                    {phase === "configured" ? "已启用" : phase === "saved" ? "待连接" : phase === "error" ? "异常" : "未启用"}
-                  </span>
-                </div>
-              </div>
+              <h2 id="provider-settings-title">AI 设置</h2>
               <button className="icon-button" type="button" onClick={() => setOpen(false)} aria-label="关闭 AI 设置" title="关闭">
                 <X size={18} />
               </button>
             </header>
 
-            <nav className="provider-settings-tabs" aria-label="AI 设置分区">
-              <button type="button" aria-pressed={activeSection === "status"} onClick={() => focusSection("status")}>状态</button>
-              <button type="button" aria-pressed={activeSection === "config"} onClick={() => focusSection("config")}>配置</button>
-              <button type="button" aria-pressed={activeSection === "usage"} onClick={() => focusSection("usage")}>用量</button>
-            </nav>
-
-            <section className="provider-settings-form" id="provider-status-panel" aria-labelledby="provider-health-title">
-              <span className="eyebrow" id="provider-health-title">Provider 健康与使用边界</span>
-              {detailsLoading && !providerHealth && !costStats ? <p className="rail-empty">正在读取 Provider 健康和成本...</p> : null}
-              {detailsError ? <p className="inline-error" role="alert">{detailsError}</p> : null}
-              {providerHealth ? (
-                <dl className="diagnostics-list">
-                  <div><dt>LLM Provider</dt><dd>{providerHealth.llm?.provider ?? config.provider_label}</dd></div>
-                  <div><dt>通用 / 会后模型</dt><dd>{config.model ?? providerHealth.llm?.model ?? "未配置"}</dd></div>
-                  <div><dt>实时模型</dt><dd>{config.realtime_model ?? config.model ?? providerHealth.llm?.model ?? "未配置"}</dd></div>
-                  <div>
-                    <dt>接口协议</dt>
-                    <dd>
-                      {(providerHealth.llm?.api_style ?? config.api_style) === "responses"
-                        ? "Responses"
-                        : "Chat Completions"}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>连接状态</dt>
-                    <dd>
-                      {providerStatus.probe_status === "succeeded"
-                        ? "连接正常（刚刚测试）"
-                        : providerStatus.probe_status === "failed"
-                          ? "最近一次连接测试失败"
-                        : providerStatus.runtime_synced
-                          ? "已配置，尚未测试"
-                          : "未配置"}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>本地 ASR</dt>
-                    <dd>
-                      默认免费
-                      {providerHealth.asr?.file_asr_available === false ? "（当前不可用）" : "（本机处理）"}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>远程 ASR</dt>
-                    <dd>
-                      {(providerHealth.remote_asr?.default_enabled
-                        ?? providerHealth.cost_policy?.remote_asr_default_enabled
-                        ?? false)
-                        ? "默认开启"
-                        : "默认关闭"}
-                    </dd>
-                  </div>
-                </dl>
-              ) : null}
-              <p className="rail-empty">原始音频默认不上传；只有稳定文字发送到 LLM。</p>
-              <div className="provider-usage-block" id="provider-usage-panel">
-                {costStats ? (
-                  <>
-                  <span className="eyebrow">Token 与估算费用</span>
-                  <dl className="diagnostics-list">
-                    <div><dt>本次</dt><dd>{costDisplay(costStats, "currentSession", "本次")}</dd></div>
-                    <div><dt>今日</dt><dd>{costDisplay(costStats, "today", "今日")}</dd></div>
-                    <div>
-                      <dt>本月 token</dt>
-                      <dd>
-                        {monthlyTokenCount(costStats) === null
-                          ? "暂无记录"
-                          : `本月已记录 ${formatTokenCount(monthlyTokenCount(costStats) ?? 0)} token`}
-                      </dd>
-                    </div>
-                  </dl>
-                  </>
-                ) : <p className="rail-empty">暂无用量记录</p>}
-              </div>
-            </section>
-
-            {phase === "unavailable" ? (
-              <div className="provider-desktop-only" role="status">
-                <Settings size={20} />
-                <p>请在 Meeting Copilot 桌面客户端中配置 AI。</p>
-              </div>
-            ) : (
-              <form className="provider-settings-form" id="provider-config-panel" onSubmit={(event) => void save(event)}>
-                <label>
-                  <span>中转站地址</span>
-                  <input
-                    type="url"
-                    value={baseUrl}
-                    onChange={(event) => setBaseUrl(event.target.value)}
-                    placeholder="https://example.com"
-                    autoComplete="url"
-                    required
-                    disabled={Boolean(busy)}
-                  />
-                </label>
-                <label>
-                  <span>模型</span>
-                  <input
-                    aria-label="模型"
-                    value={model}
-                    onChange={(event) => setModel(event.target.value)}
-                    placeholder="gpt-5.5"
-                    autoComplete="off"
-                    required
-                    disabled={Boolean(busy)}
-                  />
-                </label>
-                <label>
-                  <span>实时模型（可选）</span>
-                  <input
-                    value={realtimeModel}
-                    onChange={(event) => setRealtimeModel(event.target.value)}
-                    placeholder="留空则使用通用 / 会后模型"
-                    autoComplete="off"
-                    disabled={Boolean(busy)}
-                  />
-                </label>
-                <label>
-                  <span>接口协议</span>
-                  <select
-                    value={apiStyle}
-                    onChange={(event) => setApiStyle(event.target.value as ProviderApiStyle)}
-                    disabled={Boolean(busy)}
-                  >
-                    <option value="responses">Responses（GPT-5 / Codex）</option>
-                    <option value="chat_completions">Chat Completions（通用兼容）</option>
-                  </select>
-                </label>
-                <label>
-                  <span>API Key</span>
-                  <input
-                    type="password"
-                    value={apiKey}
-                    onChange={(event) => setApiKey(event.target.value)}
-                    placeholder={config.api_key_present ? "留空以继续使用已保存密钥" : "输入 API Key"}
-                    autoComplete="new-password"
-                    required={!config.api_key_present}
-                    disabled={Boolean(busy)}
-                  />
-                </label>
-
-                <div className="credential-status">
-                  {config.api_key_present ? <Check size={15} /> : <KeyRound size={15} />}
+            <div className="provider-settings-body">
+              <section className={`provider-connection provider-connection--${connectionState}`} aria-label="AI 连接状态">
+                <span className="provider-connection-icon" aria-hidden="true">
+                  {connectionState === "testing"
+                    ? <LoaderCircle className="spin" size={18} />
+                    : connectionState === "connected"
+                      ? <CheckCircle2 size={18} />
+                      : <Settings size={18} />}
+                </span>
+                <div>
+                  <strong>{connectionLabel}</strong>
                   <span>
-                    {config.api_key_present
-                      ? (resolveTauriInvoke() ? "密钥已保存在系统凭据库" : "密钥已保存在本机数据目录")
-                      : "密钥尚未保存"}
+                    {config.configured
+                      ? `${config.model ?? model}${dirty ? " · 配置有修改" : ""}`
+                      : "填写配置后保存并测试"}
                   </span>
                 </div>
-                {error ? <p className="inline-error" role="alert">{error}</p> : null}
-                {message ? <p className="inline-success" role="status">{message}</p> : null}
-                <div className="diagnostic-alert" role="note">
-                  <AlertTriangle size={16} />
-                  <span>“保存并连接”和“测试连接”会产生一次真实中转站调用，并可能产生费用。</span>
-                </div>
+                {config.configured ? (
+                  <button
+                    className={`provider-test-button provider-test-button--${connectionState}`}
+                    type="button"
+                    onClick={() => void probe()}
+                    disabled={Boolean(busy) || dirty}
+                  >
+                    {connectionState === "connected" ? <Check size={15} /> : null}
+                    {busy === "probe" ? "测试中" : dirty ? "先保存修改" : "测试连接"}
+                  </button>
+                ) : null}
+              </section>
 
-                <footer className="provider-settings-actions">
-                  {config.configured ? (
-                    <button className="danger-text-button" type="button" onClick={() => void clear()} disabled={Boolean(busy)}>
-                      <Trash2 size={15} />移除
-                    </button>
-                  ) : <span />}
-                  <div>
-                    <button className="secondary-button" type="button" onClick={() => void probe()} disabled={Boolean(busy) || !config.configured}>
-                      {busy === "probe" ? <LoaderCircle className="spin" size={15} /> : null}
-                      {providerStatus.runtime_synced ? "测试连接" : "连接并测试"}
-                    </button>
+              {phase === "unavailable" ? (
+                <div className="provider-desktop-only" role="status">
+                  <Settings size={20} />
+                  <p>请在桌面客户端中配置 AI。</p>
+                </div>
+              ) : (
+                <form className="provider-settings-form" id="provider-config-panel" onSubmit={(event) => void save(event)}>
+                  <label>
+                    <span>服务地址（Base URL）</span>
+                    <input
+                      type="url"
+                      value={baseUrl}
+                      onChange={(event) => {
+                        setBaseUrl(event.target.value);
+                        markConfigChanged();
+                      }}
+                      placeholder={DEFAULT_BASE_URL}
+                      autoComplete="url"
+                      required
+                      disabled={Boolean(busy)}
+                    />
+                  </label>
+                  <div className="provider-sponsor">
+                    <span>AI 赞助商</span>
+                    <a href={SPONSOR_URL} target="_blank" rel="noreferrer">
+                      codexai.club · 获取配置 <ExternalLink size={12} />
+                    </a>
+                  </div>
+
+                  <label>
+                    <span>模型</span>
+                    <input
+                      aria-label="模型"
+                      value={model}
+                      onChange={(event) => {
+                        setModel(event.target.value);
+                        markConfigChanged();
+                      }}
+                      placeholder={DEFAULT_MODEL}
+                      autoComplete="off"
+                      required
+                      disabled={Boolean(busy)}
+                    />
+                  </label>
+
+                  <label>
+                    <span>API Key</span>
+                    <input
+                      type="password"
+                      value={apiKey}
+                      onChange={(event) => {
+                        setApiKey(event.target.value);
+                        markConfigChanged();
+                      }}
+                      placeholder={config.api_key_present ? "留空以继续使用已保存密钥" : "输入 API Key"}
+                      autoComplete="new-password"
+                      required={!config.api_key_present}
+                      disabled={Boolean(busy)}
+                    />
+                  </label>
+                  <div className="credential-status">
+                    {config.api_key_present ? <Check size={15} /> : <KeyRound size={15} />}
+                    <span>{config.api_key_present ? "API Key 已安全保存" : "API Key 尚未保存"}</span>
+                  </div>
+
+                  <details className="provider-advanced">
+                    <summary>高级设置</summary>
+                    <div className="provider-advanced-fields">
+                      <label>
+                        <span>接口协议</span>
+                        <select
+                          value={apiStyle}
+                          onChange={(event) => {
+                            setApiStyle(event.target.value as ProviderApiStyle);
+                            markConfigChanged();
+                          }}
+                          disabled={Boolean(busy)}
+                        >
+                          <option value="chat_completions">Chat Completions</option>
+                          <option value="responses">Responses</option>
+                        </select>
+                      </label>
+                      <label>
+                        <span>实时模型（可选）</span>
+                        <input
+                          value={realtimeModel}
+                          onChange={(event) => {
+                            setRealtimeModel(event.target.value);
+                            markConfigChanged();
+                          }}
+                          placeholder="留空则使用上方模型"
+                          autoComplete="off"
+                          disabled={Boolean(busy)}
+                        />
+                      </label>
+                    </div>
+                  </details>
+
+                  <p className="provider-settings-note">AI 仅接收会议文字，不上传录音。测试连接会发送一次最小请求，可能产生少量费用。</p>
+                  {error ? <p className="inline-error" role="alert">{error}</p> : null}
+                  {message ? <p className="inline-success" role="status">{message}</p> : null}
+
+                  {hasUsageData(costStats) ? (
+                    <div className="provider-usage-summary" aria-label="AI 用量">
+                      <strong>用量</strong>
+                      {periodTokenCount(costStats, "currentSession") !== null || typeof costStats?.currentSession === "number"
+                        ? <span>{costDisplay(costStats, "currentSession", "本次")}</span>
+                        : null}
+                      {periodTokenCount(costStats, "today") !== null || typeof costStats?.today === "number"
+                        ? <span>{costDisplay(costStats, "today", "今日")}</span>
+                        : null}
+                      {monthlyTokenCount(costStats) ? <span>本月 {formatTokenCount(monthlyTokenCount(costStats) ?? 0)} token</span> : null}
+                    </div>
+                  ) : null}
+
+                  {confirmingClear ? (
+                    <div className="provider-clear-confirm" role="alert">
+                      <span>确定移除已保存的 AI 配置？</span>
+                      <button type="button" onClick={() => setConfirmingClear(false)} disabled={Boolean(busy)}>取消</button>
+                      <button className="is-danger" type="button" onClick={() => void clear()} disabled={Boolean(busy)}>
+                        {busy === "clear" ? <LoaderCircle className="spin" size={14} /> : null}
+                        确认移除
+                      </button>
+                    </div>
+                  ) : null}
+
+                  <footer className="provider-settings-actions">
+                    {config.configured ? (
+                      <button className="danger-text-button" type="button" onClick={() => setConfirmingClear(true)} disabled={Boolean(busy) || confirmingClear}>
+                        <Trash2 size={15} />移除配置
+                      </button>
+                    ) : <span />}
                     <button className="primary-button" type="submit" disabled={Boolean(busy)}>
                       {busy === "save" ? <LoaderCircle className="spin" size={15} /> : null}
-                      保存并连接
+                      {busy === "save" ? "正在测试" : "保存并测试"}
                     </button>
-                  </div>
-                </footer>
-              </form>
-            )}
+                  </footer>
+                </form>
+              )}
+            </div>
           </section>
         </div>
       ) : null}

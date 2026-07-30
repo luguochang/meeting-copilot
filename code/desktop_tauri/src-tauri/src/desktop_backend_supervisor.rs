@@ -2816,11 +2816,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires MEETING_COPILOT_task022_RUNTIME_BUNDLE pointing at the real packaged runtime"]
+    #[ignore = "requires MEETING_COPILOT_TEST_RUNTIME_BUNDLE pointing at the real packaged runtime"]
     fn file_asr_real_packaged_shape_preflight_completes_under_ten_seconds() {
         let runtime_bundle = PathBuf::from(
-            env::var_os("MEETING_COPILOT_task022_RUNTIME_BUNDLE")
-                .expect("MEETING_COPILOT_task022_RUNTIME_BUNDLE is required"),
+            env::var_os("MEETING_COPILOT_TEST_RUNTIME_BUNDLE")
+                .expect("MEETING_COPILOT_TEST_RUNTIME_BUNDLE is required"),
         );
         let started = Instant::now();
         let manifest_text =

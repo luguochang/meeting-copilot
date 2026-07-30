@@ -21,7 +21,6 @@ from .storage_governance import (
     harden_private_file,
     harden_sqlite_files,
 )
-from .task006_failpoints import storage_write_failpoint
 
 
 JOB_STATUSES = (
@@ -537,11 +536,10 @@ class V2Persistence:
             self._closed = True
 
     @contextmanager
-    def _write_transaction(self, *, task006_scope: str = "sqlite_transaction") -> Iterator[None]:
+    def _write_transaction(self) -> Iterator[None]:
         with self._lock:
             if self._closed:
                 raise RuntimeError("V2Persistence is closed")
-            storage_write_failpoint.maybe_raise(task006_scope)
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 yield
@@ -1359,7 +1357,7 @@ class V2Persistence:
         normalized_title = _validated_title(title)
         normalized_source = _validated_title_source(title_source)
         now_ms = max(0, int(now_ms))
-        with self._write_transaction(task006_scope="meeting_title_transaction"):
+        with self._write_transaction():
             row = self._conn.execute("SELECT * FROM meetings WHERE id = ?", (meeting_id,)).fetchone()
             if row is None:
                 raise KeyError(f"meeting not found: {meeting_id}")

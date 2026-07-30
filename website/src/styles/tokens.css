@@ -1,0 +1,42 @@
+@font-face {
+  font-family: 'Meeting Copilot Sans';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 400 750;
+  src: url('/fonts/meeting-copilot-sans-sc.woff2') format('woff2-variations');
+}
+
+:root {
+  --color-primary: #284dff;
+  --color-primary-strong: #1737c9;
+  --color-primary-soft: #eef1ff;
+  --color-primary-line: #cfd6ff;
+  --color-navy: #0f172a;
+  --color-navy-raised: #16213b;
+  --color-background: #f7f8fa;
+  --color-surface: #ffffff;
+  --color-surface-subtle: #f3f5f8;
+  --color-text: #111b34;
+  --color-text-secondary: #536079;
+  --color-text-muted: #626d82;
+  --color-border: #dfe4ee;
+  --color-border-strong: #cbd3e1;
+  --color-success: #087a55;
+  --color-success-soft: #eaf8f2;
+  --color-warning: #925600;
+  --color-warning-soft: #fff5df;
+  --color-danger: #cc2936;
+  --color-focus: #284dff;
+
+  --font-sans: 'Meeting Copilot Sans', 'Noto Sans SC', 'Source Han Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  --font-mono: 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
+
+  --container: 1320px;
+  --container-narrow: 1080px;
+  --header-height: 72px;
+  --radius-sm: 4px;
+  --radius-md: 8px;
+
+  --shadow-product: 0 20px 48px rgba(23, 44, 105, 0.12), 0 4px 12px rgba(23, 44, 105, 0.07);
+  --shadow-menu: 0 18px 40px rgba(15, 23, 42, 0.16);
+}

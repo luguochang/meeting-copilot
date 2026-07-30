@@ -39,7 +39,6 @@ fn windows_audio_devices(flow: String) -> Result<serde_json::Value, String> {
 pub const BRIDGE_COMMAND_IDS: &[&str] = &[
     "runtime.get_status",
     "runtime.write_frontend_probe",
-    "session.prepare",
     "worker.prepare",
     "worker.start",
     "worker.health",
@@ -96,17 +95,11 @@ fn packaged_remote_capability(remote_pattern: String) -> CapabilityBuilder {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct NoopBridgeResponse {
+pub struct RuntimeStatusResponse {
     pub command_id: &'static str,
     pub command_status: &'static str,
     pub implementation_status: &'static str,
-    pub transport_status: &'static str,
-    pub side_effect_status: &'static str,
-    pub safe_to_invoke_noop: bool,
-    pub safe_to_execute_real_action: bool,
-    pub captures_audio: bool,
     pub spawns_process: bool,
-    pub calls_remote_provider: bool,
     pub writes_local_files: bool,
     pub desktop_api_base_url: Option<String>,
     pub backend_runtime_status: String,
@@ -119,62 +112,34 @@ pub struct NoopBridgeResponse {
     pub packaged_same_chain_probe_enabled: bool,
 }
 
-impl NoopBridgeResponse {
-    fn for_command(command_id: &'static str) -> Self {
-        Self {
-            command_id,
-            command_status: "noop_bound",
-            implementation_status: "noop_only",
-            transport_status: "tauri_ipc_bound",
-            side_effect_status: "none",
-            safe_to_invoke_noop: true,
-            safe_to_execute_real_action: false,
-            captures_audio: false,
-            spawns_process: false,
-            calls_remote_provider: false,
-            writes_local_files: false,
-            desktop_api_base_url: None,
-            backend_runtime_status: "not_started".to_string(),
-            backend_runtime_mode: "unconfigured".to_string(),
-            backend_pid: None,
-            backend_port: None,
-            file_asr_status: "not_configured".to_string(),
-            file_asr_available: false,
-            file_asr_missing_components: Vec::new(),
-            packaged_same_chain_probe_enabled: false,
-        }
-    }
-}
-
 #[tauri::command]
 fn runtime_get_status(
     supervisor: tauri::State<'_, desktop_backend_supervisor::BackendSupervisor>,
-) -> NoopBridgeResponse {
-    // Real status (not noop): reports the desktop shell is live.
-    let mut r = NoopBridgeResponse::for_command("runtime.get_status");
-    r.command_status = "ok";
-    r.implementation_status = "real";
-    r.safe_to_invoke_noop = true;
+) -> RuntimeStatusResponse {
     let backend = supervisor.snapshot();
-    r.desktop_api_base_url = backend.base_url;
-    r.backend_runtime_status = backend.status;
-    r.backend_runtime_mode = backend.mode;
-    r.backend_pid = backend.pid;
-    r.backend_port = backend.port;
-    r.file_asr_status = backend.file_asr_status;
-    r.file_asr_available = backend.file_asr_available;
-    r.file_asr_missing_components = backend.file_asr_missing_components;
-    r.spawns_process = backend.spawns_process;
-    r.writes_local_files = backend.spawns_process;
-    r.packaged_same_chain_probe_enabled = env::var("MEETING_COPILOT_PACKAGED_SAME_CHAIN_PROBE")
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false);
-    r
+    RuntimeStatusResponse {
+        command_id: "runtime.get_status",
+        command_status: "ok",
+        implementation_status: "real",
+        spawns_process: backend.spawns_process,
+        writes_local_files: backend.spawns_process,
+        desktop_api_base_url: backend.base_url,
+        backend_runtime_status: backend.status,
+        backend_runtime_mode: backend.mode,
+        backend_pid: backend.pid,
+        backend_port: backend.port,
+        file_asr_status: backend.file_asr_status,
+        file_asr_available: backend.file_asr_available,
+        file_asr_missing_components: backend.file_asr_missing_components,
+        packaged_same_chain_probe_enabled: env::var("MEETING_COPILOT_PACKAGED_SAME_CHAIN_PROBE")
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false),
+    }
 }
 
 #[tauri::command]
@@ -182,14 +147,6 @@ fn runtime_write_frontend_probe(
     payload: serde_json::Value,
 ) -> desktop_frontend_probe_runtime::FrontendProbeResponse {
     desktop_frontend_probe_runtime::write_frontend_probe(payload)
-}
-
-#[tauri::command]
-fn session_prepare() -> NoopBridgeResponse {
-    let mut r = NoopBridgeResponse::for_command("session.prepare");
-    r.command_status = "ok";
-    r.implementation_status = "real";
-    r
 }
 
 #[tauri::command]
@@ -916,7 +873,6 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             runtime_get_status,
             runtime_write_frontend_probe,
-            session_prepare,
             asr_worker_prepare,
             asr_worker_start,
             asr_worker_health,
@@ -1013,7 +969,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "meeting-copilot-task002-partial-{}-{nonce}",
+            "meeting-copilot-dual-track-partial-{}-{nonce}",
             std::process::id()
         ));
         fs::create_dir_all(&root).unwrap();

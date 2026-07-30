@@ -16,7 +16,6 @@ import wave
 from typing import Any, Callable, Mapping
 
 from meeting_copilot_web_mvp.repository import SESSION_ID_PATTERN
-from meeting_copilot_web_mvp.task006_failpoints import storage_write_failpoint
 from meeting_copilot_web_mvp.storage_governance import (
     ensure_private_directory,
     harden_private_file,
@@ -438,7 +437,6 @@ class RealtimeWavAssetWriter:
     def _commit_chunk(self, pcm16: bytes) -> None:
         if not pcm16 or len(pcm16) % PCM_SAMPLE_WIDTH_BYTES:
             raise ValueError("PCM16 chunk must contain complete samples")
-        storage_write_failpoint.maybe_raise("audio_chunk")
         name = f"chunk-{self._next_chunk_index:08d}.pcm"
         sample_count = len(pcm16) // PCM_SAMPLE_WIDTH_BYTES
         source_range = self._consume_source_range(sample_count)

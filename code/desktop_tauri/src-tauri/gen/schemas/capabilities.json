@@ -1,1 +1,1 @@
-{"default":{"identifier":"default","description":"Default capability for Meeting Copilot desktop shell no-op scaffold.","local":true,"windows":["main"],"permissions":["core:default"]}}
+{"default":{"identifier":"default","description":"Default capability for the Meeting Copilot desktop shell.","local":true,"windows":["main"],"permissions":["core:default"]}}

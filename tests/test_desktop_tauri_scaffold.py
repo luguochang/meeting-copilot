@@ -9,14 +9,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DESKTOP_ROOT = REPO_ROOT / "code" / "desktop_tauri"
 TAURI_ROOT = DESKTOP_ROOT / "src-tauri"
-WEB_STATIC_ROOT = (
-    REPO_ROOT
-    / "code"
-    / "web_mvp"
-    / "backend"
-    / "meeting_copilot_web_mvp"
-    / "frontend_static"
-)
+FRONTEND_ROOT = REPO_ROOT / "code" / "web_mvp" / "frontend_v2"
 
 
 REQUIRED_SCAFFOLD_FILES = (
@@ -58,7 +51,6 @@ FORBIDDEN_GENERATED_SUFFIXES = (
 EXPECTED_BRIDGE_COMMANDS = {
     "runtime_get_status": "runtime.get_status",
     "runtime_write_frontend_probe": "runtime.write_frontend_probe",
-    "session_prepare": "session.prepare",
     "asr_worker_prepare": "worker.prepare",
     "asr_worker_start": "worker.start",
     "asr_worker_health": "worker.health",
@@ -163,8 +155,8 @@ def test_tauri_config_points_to_existing_web_mvp_and_declares_mac_dev_bundle_tar
     assert build["devUrl"] == "http://127.0.0.1:8765/"
     assert build["beforeDevCommand"] == ""
     assert build["beforeBuildCommand"] == ""
-    assert (TAURI_ROOT / build["frontendDist"]).resolve() == WEB_STATIC_ROOT
-    assert WEB_STATIC_ROOT.is_dir()
+    assert (TAURI_ROOT / build["frontendDist"]).resolve() == FRONTEND_ROOT / "dist"
+    assert (FRONTEND_ROOT / "src").is_dir()
 
     app = config["app"]
     assert app["withGlobalTauri"] is True
@@ -339,42 +331,24 @@ def test_tauri_runtime_status_exposes_packaged_same_chain_probe_flag():
     assert "MEETING_COPILOT_PACKAGED_SAME_CHAIN_PROBE" in lib_rs
 
 
-def test_noop_bridge_response_contract_declares_no_side_effects():
+def test_runtime_status_response_reports_real_backend_state():
     lib_rs = _read("src-tauri/src/lib.rs")
 
     expected_fields = [
         "command_id",
         "command_status",
         "implementation_status",
-        "transport_status",
-        "side_effect_status",
-        "safe_to_invoke_noop",
-        "safe_to_execute_real_action",
-        "captures_audio",
         "spawns_process",
-        "calls_remote_provider",
         "writes_local_files",
+        "backend_runtime_status",
+        "backend_runtime_mode",
+        "file_asr_status",
     ]
     for field in expected_fields:
         assert field in lib_rs
-    assert "pub message:" not in lib_rs
-    assert "message:" not in lib_rs
-
-    for expected_value in [
-        "noop_bound",
-        "noop_only",
-        "tauri_ipc_bound",
-        "none",
-    ]:
-        assert f'"{expected_value}"' in lib_rs
-    assert "No real desktop action is implemented in task-082." not in lib_rs
-
-    assert "safe_to_invoke_noop: true" in lib_rs
-    assert "safe_to_execute_real_action: false" in lib_rs
-    assert "captures_audio: false" in lib_rs
-    assert "spawns_process: false" in lib_rs
-    assert "calls_remote_provider: false" in lib_rs
-    assert "writes_local_files: false" in lib_rs
+    assert "RuntimeStatusResponse" in lib_rs
+    assert 'command_status: "ok"' in lib_rs
+    assert 'implementation_status: "real"' in lib_rs
 
 
 def test_desktop_frontend_probe_command_is_bound_to_safe_artifact_runtime():

@@ -89,7 +89,6 @@ def test_tauri_asr_worker_commands_delegate_to_lifecycle_runtime():
     ]:
         body = _command_body(lib_source, fn_name)
         assert runtime_call in body
-        assert f'NoopBridgeResponse::for_command("{command_id}")' not in body
 
 
 def test_asr_worker_lifecycle_response_contract_proves_executable_local_boundary():
