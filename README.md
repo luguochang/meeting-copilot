@@ -4,7 +4,7 @@
 
 [官网](https://codexai.club/) · [GitHub](https://github.com/luguochang/meeting-copilot) · [CSDN 博客](https://blog.csdn.net/luguochang) · [AI 赞助商](https://codexai.club/)
 
-> 当前版本：Windows `0.1.0` 公开预览。项目采用单用户、本地运行模式；远程 AI 分析仅在用户主动配置 OpenAI-compatible 服务后启用。
+> 当前版本：Windows `0.1.0` 公开预览。项目采用单用户、本地运行模式；远程 AI 分析仅在用户主动配置 OpenAI-compatible 服务后启用。Windows 安装包尚未进行代码签名。
 
 ![Meeting Copilot 界面预览](docs/assets/meeting-copilot-tour.gif)
 
@@ -29,7 +29,20 @@
 
 ![会后复盘](docs/assets/workbench-review.png)
 
-## 快速开始
+## 下载 Windows 版
+
+[GitHub Release v0.1.0](https://github.com/luguochang/meeting-copilot/releases/tag/v0.1.0) 提供两种基础客户端：
+
+| 文件 | 用途 | SHA-256 |
+| --- | --- | --- |
+| [Windows x64 安装程序](https://github.com/luguochang/meeting-copilot/releases/download/v0.1.0/Meeting-Copilot-0.1.0-windows-x64-base-unsigned.exe) | 标准安装与卸载 | `0c42fc2fe06f920fbed5eb2dbb003533a3c4dc9d1fe27e34eb963e17e68b80be` |
+| [Windows x64 便携 ZIP](https://github.com/luguochang/meeting-copilot/releases/download/v0.1.0/Meeting-Copilot-0.1.0-windows-x64-base.zip) | 解压后直接运行 | `9ed6f93528c377f70a9d4147b681e78ac07b1265210d6b14ddf6567a371feded` |
+
+基础客户端包含桌面应用和本地服务，可以启动工作台、管理会议与笔记、配置 AI 分析服务并导入离线能力包。仓库和基础客户端不包含 ASR 模型；实时本地转写和录音文件转写需要另行取得许可明确、与平台匹配的 `.mcpkg` 能力包。当前完整能力包尚未公开分发。
+
+安装程序未签名，Windows SmartScreen 可能显示提示。请只使用 GitHub Release 中的文件，并在安装前核对 SHA-256。完整步骤见 [安装指南](docs/installation.md)。
+
+## 从源码运行
 
 环境要求：Windows 10/11、Python 3.11-3.13、Node.js 22，以及 [uv](https://docs.astral.sh/uv/)。
 
@@ -50,7 +63,7 @@ uv run python ..\..\..\tools\workbench_server.py start
 uv run python ..\..\..\tools\workbench_server.py stop
 ```
 
-完整安装、开发模式和桌面构建说明见 [安装指南](docs/installation.md) 与 [开发指南](docs/development.md)。
+安装程序、源码模式和桌面构建说明见 [安装指南](docs/installation.md) 与 [开发指南](docs/development.md)。
 
 ## 文档
 
@@ -73,8 +86,7 @@ meeting-copilot/
 │  │  ├─ backend/           # FastAPI 本地服务与 SQLite 持久化
 │  │  └─ frontend_v2/       # React + TypeScript 工作台
 │  ├─ desktop_tauri/        # Tauri 桌面壳与原生音频桥接
-│  ├─ asr_runtime/          # 本地 ASR 运行时和文件转写
-│  └─ asr_bakeoff/          # ASR 评测工具
+│  └─ asr_runtime/          # 本地 ASR 运行时和文件转写
 ├─ configs/                 # 可公开的配置模板与术语表
 ├─ data/                    # 脱敏演示数据和评测词表
 ├─ docs/                    # 用户与技术文档
