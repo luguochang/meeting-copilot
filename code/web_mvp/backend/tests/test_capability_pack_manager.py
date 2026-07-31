@@ -222,6 +222,14 @@ def test_local_capability_api_imports_package_and_reports_status(tmp_path, monke
         "MEETING_COPILOT_ASR_OFFLINE_DOWNLOAD_URL",
         "https://example.invalid/meeting-copilot-asr",
     )
+    monkeypatch.setattr(
+        "meeting_copilot_web_mvp.app.CapabilityPackManager",
+        lambda capability_root, **kwargs: CapabilityPackManager(
+            capability_root,
+            platform_name="windows-x86_64",
+            **kwargs,
+        ),
+    )
 
     with TestClient(create_app(data_dir=data_dir)) as client:
         initial = client.get("/v2/local-capabilities")
