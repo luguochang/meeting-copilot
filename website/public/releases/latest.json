@@ -1,8 +1,8 @@
 {
   "version": "0.1.0",
   "status": "public",
-  "updatedAt": "2026-07-30",
-  "note": "Windows 0.1.0 公开预览版提供基础客户端；完整离线 ASR 能力包尚未公开分发。当前安装包未签名，Windows SmartScreen 可能显示提示。",
+  "updatedAt": "2026-07-31",
+  "note": "Windows 0.1.0 公开预览版按当前用户安装；完整离线 ASR 能力包尚未公开分发。当前安装包未签名，Windows SmartScreen 可能显示提示。",
   "platforms": [
     {
       "id": "windows-x64",

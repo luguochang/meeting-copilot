@@ -9,6 +9,19 @@ export type ChangeLogEntry = {
 
 export const changelog: ChangeLogEntry[] = [
   {
+    date: '2026-07-31',
+    version: 'Windows Installer Update',
+    status: '产品',
+    title: '安装权限、后台进程与数据路径收紧',
+    summary: 'Windows 客户端改为当前用户安装，隐藏本地后台控制台，并支持把数据与能力包整体放到其他磁盘。',
+    items: [
+      '安装器不再要求管理员权限，也不注册系统服务、开机启动项或防火墙规则',
+      '本地后台不再通过命令脚本中转，并随桌面客户端退出',
+      '新增 MEETING_COPILOT_STORAGE_DIR，用于指定数据库、录音、日志和能力包目录',
+      '公开下载只保留完成安装回归的标准安装程序与校验文件',
+    ],
+  },
+  {
     date: '2026-07-30',
     version: 'Workbench UI Update',
     status: '产品',
@@ -27,7 +40,7 @@ export const changelog: ChangeLogEntry[] = [
     title: 'Windows 基础安装包进入公开预览',
     summary: '首版采用基础客户端与离线能力包分离交付，官网、下载清单、品牌图标和用户文档同步更新。',
     items: [
-      'Windows 10/11 x64 基础安装包、便携包与 SHA-256 校验文件通过 GitHub Release 提供',
+      'Windows 10/11 x64 基础安装包与 SHA-256 校验文件通过 GitHub Release 提供',
       '客户端支持校验、导入和激活 .mcpkg 能力包，完整能力包当前尚未公开分发',
       'macOS 标记为准备中，公网 Web 应用暂不开放',
       '当前安装包未签名，仍属于公开预览版而非生产稳定版',

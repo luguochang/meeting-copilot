@@ -11,13 +11,19 @@ Meeting Copilot 当前采用单用户、本地运行架构。本文说明默认�
 - 个人笔记
 - 本地能力包状态、后台任务和诊断日志
 
-这些数据保存在应用数据目录。开发模式默认使用 `artifacts/tmp/web_mvp_data/`，也可通过 `MEETING_COPILOT_DATA_DIR` 修改。
+桌面版新安装默认保存在 `%LOCALAPPDATA%\com.meetingcopilot.desktop`。从旧版本升级时，客户端会在必要时继续使用已有的 `%APPDATA%\com.meetingcopilot.desktop`。用户可在启动前通过 `MEETING_COPILOT_STORAGE_DIR` 指定其他磁盘上的绝对路径；数据库、录音、日志和能力包会使用同一个存储根目录。开发模式默认使用 `artifacts/tmp/web_mvp_data/`，也可通过 `MEETING_COPILOT_DATA_DIR` 修改。
+
+程序安装目录和用户数据目录相互独立。WebView2 浏览器内核会按 Windows 约定在 `%LOCALAPPDATA%` 保留运行缓存；该缓存不用于保存离线能力包。
 
 ## 远程 AI 调用
 
 远程 AI 默认未配置。用户在设置中保存 OpenAI-compatible 服务后，后端会把生成建议、摘要或文档所需的会议文本发送到该服务。具体留存、训练和地域规则由用户选择的服务提供方决定。
 
 应用不会因为打开官网或启动本地服务而自动上传会议录音。当前远程分析路径以文本为主，不应把 API Key 写入官网、前端代码或 Git。
+
+## Windows 权限与本地进程
+
+安装器按当前用户安装，不要求管理员权限。应用不注册 Windows 服务，不添加开机启动项或防火墙规则，也不监听局域网地址。桌面端启动的本地后台进程只监听随机回环端口，并在桌面端退出时结束。麦克风权限仅在用户主动开始会议时使用；文件读取范围来自用户主动选择的录音或能力包。
 
 ## 密钥
 

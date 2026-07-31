@@ -18,7 +18,7 @@ flowchart LR
 
 ### React 工作台
 
-`code/web_mvp/frontend_v2/` 包含会议历史、会中工作台、会后复盘、笔记、本地能力和设置。前端不直接访问数据库或保存服务密钥。
+`code/web_mvp/frontend_v2/` 包含会议历史、会中工作台、会后复盘、笔记、离线能力和设置。前端不直接访问数据库或保存服务密钥。
 
 ### FastAPI 本地服务
 

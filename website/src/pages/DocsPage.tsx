@@ -217,7 +217,7 @@ LLM_GATEWAY_IS_MOCK=false`}</code>
               <li>
                 <span>2</span>
                 <div>
-                  <strong>打开“本地能力”</strong>
+                  <strong>打开“离线能力”</strong>
                   <p>选择“导入离线包”，也可以把文件拖入导入区域。</p>
                 </div>
               </li>
@@ -241,11 +241,11 @@ LLM_GATEWAY_IS_MOCK=false`}</code>
           <section id="release" data-reveal>
             <span className="docs-kicker">06</span>
             <h2>发布与下载边界</h2>
-            <p>官网下载按钮指向 GitHub Release。当前只开放 Windows x64 基础安装包和便携包；macOS 尚需独立构建、Developer ID 签名与 Apple 公证，Web 应用尚未建立多用户隔离和公网安全边界。</p>
+            <p>官网下载按钮指向 GitHub Release。当前只开放 Windows x64 当前用户安装包；macOS 尚需独立构建、Developer ID 签名与 Apple 公证，Web 应用尚未建立多用户隔离和公网安全边界。</p>
             <ul className="release-checklist">
               <li>
                 <Icon name="circle-check" size={18} />
-                <span>已开放：Windows 10/11 x64 基础安装包、便携包与 SHA-256 校验文件。</span>
+                <span>已开放：Windows 10/11 x64 基础安装包与 SHA-256 校验文件。</span>
               </li>
               <li>
                 <Icon name="clock-3" size={18} />
@@ -261,6 +261,13 @@ LLM_GATEWAY_IS_MOCK=false`}</code>
               <p>
                 <strong>当前 Windows 安装包未签名</strong>
                 SmartScreen 可能显示提示。请只从项目 GitHub Release 下载安装包，并核对随版本发布的 SHA-256 校验文件。
+              </p>
+            </div>
+            <div className="docs-callout docs-callout--info">
+              <Icon name="shield-check" size={20} />
+              <p>
+                <strong>按当前用户安装</strong>
+                安装器不要求管理员权限，不注册系统服务、开机启动项或防火墙规则。本地后台只监听随机回环端口，并随客户端退出。
               </p>
             </div>
           </section>
@@ -284,6 +291,10 @@ LLM_GATEWAY_IS_MOCK=false`}</code>
               <details>
                 <summary>没有能力包可以使用客户端吗？</summary>
                 <p>可以启动客户端并使用会议管理、笔记、设置和能力包管理；实时本地转写及录音文件转写需要先导入兼容能力包。</p>
+              </details>
+              <details>
+                <summary>可以把会议数据和能力包放到其他磁盘吗？</summary>
+                <p>可以。在启动客户端前用 MEETING_COPILOT_STORAGE_DIR 指定绝对路径，数据库、录音、日志和能力包会整体使用该目录。程序安装目录与用户数据目录相互独立。</p>
               </details>
             </div>
           </section>

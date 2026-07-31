@@ -16,7 +16,7 @@
 - **会议历史**：搜索、筛选、重命名、删除和重新打开历史会议。
 - **录音导入**：导入已有音频并跟踪转写和分析进度。
 - **个人笔记**：记录、搜索和整理会议之外的个人内容。
-- **本地能力**：管理离线 ASR 能力包与运行状态。
+- **离线能力**：管理本地 ASR 能力包与运行状态。
 - **服务配置**：在桌面端保存并检测 OpenAI-compatible 分析服务。
 
 ![会议历史](docs/assets/workbench-history.png)
@@ -31,16 +31,17 @@
 
 ## 下载 Windows 版
 
-[GitHub Release v0.1.0](https://github.com/luguochang/meeting-copilot/releases/tag/v0.1.0) 提供两种基础客户端：
+[GitHub Release v0.1.0](https://github.com/luguochang/meeting-copilot/releases/tag/v0.1.0) 提供 Windows x64 基础客户端：
 
 | 文件 | 用途 | SHA-256 |
 | --- | --- | --- |
-| [Windows x64 安装程序](https://github.com/luguochang/meeting-copilot/releases/download/v0.1.0/Meeting-Copilot-0.1.0-windows-x64-base-unsigned.exe) | 标准安装与卸载 | `346ff63b5ccdb234e57fcf074b211517f80a46bf19de364382eebfc2f480e8d4` |
-| [Windows x64 便携 ZIP](https://github.com/luguochang/meeting-copilot/releases/download/v0.1.0/Meeting-Copilot-0.1.0-windows-x64-base.zip) | 解压后直接运行 | `d90ceb3dcafbe833b219a463fecb9e8a8430775bcc004d1e1238684c234db6be` |
+| [Windows x64 安装程序](https://github.com/luguochang/meeting-copilot/releases/download/v0.1.0/Meeting-Copilot-0.1.0-windows-x64-base-unsigned.exe) | 当前用户安装与卸载 | `a1f89e1252c031320701953c53b58a29ea29463ef905ee5e9074eb12db207dec` |
 
 基础客户端包含桌面应用和本地服务，可以启动工作台、管理会议与笔记、配置 AI 分析服务并导入离线能力包。仓库和基础客户端不包含 ASR 模型；实时本地转写和录音文件转写需要另行取得许可明确、与平台匹配的 `.mcpkg` 能力包。当前完整能力包尚未公开分发。
 
 安装程序未签名，Windows SmartScreen 可能显示提示。请只使用 GitHub Release 中的文件，并在安装前核对 SHA-256。完整步骤见 [安装指南](docs/installation.md)。
+
+安装器不要求管理员权限，不注册 Windows 服务，不添加开机启动项或防火墙规则。桌面端后台只监听随机的本机回环端口，并在客户端退出时一并结束。会议数据和能力包默认保存在当前用户的应用数据目录，也可通过 `MEETING_COPILOT_STORAGE_DIR` 整体迁移到其他磁盘；它们不会写进程序安装目录。
 
 ## 从源码运行
 
@@ -70,7 +71,7 @@ uv run python ..\..\..\tools\workbench_server.py stop
 | 文档 | 内容 |
 | --- | --- |
 | [安装指南](docs/installation.md) | 安装、源码运行、AI 服务配置 |
-| [使用指南](docs/user-guide.md) | 会议、导入、复盘、笔记和本地能力 |
+| [使用指南](docs/user-guide.md) | 会议、导入、复盘、笔记和离线能力 |
 | [架构说明](docs/architecture.md) | 前端、后端、桌面壳、ASR 与数据流 |
 | [开发指南](docs/development.md) | 目录、命令、测试和贡献约定 |
 | [隐私说明](docs/privacy.md) | 本地数据、远程调用和删除边界 |

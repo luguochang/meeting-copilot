@@ -2,35 +2,49 @@
 
 ## Windows 安装程序
 
-在 [GitHub Release v0.1.0](https://github.com/luguochang/meeting-copilot/releases/tag/v0.1.0) 下载以下任一文件：
-
-- `Meeting-Copilot-0.1.0-windows-x64-base-unsigned.exe`：标准安装程序。
-- `Meeting-Copilot-0.1.0-windows-x64-base.zip`：便携包，解压后直接运行。
+在 [GitHub Release v0.1.0](https://github.com/luguochang/meeting-copilot/releases/tag/v0.1.0) 下载 `Meeting-Copilot-0.1.0-windows-x64-base-unsigned.exe`。
 
 安装程序 SHA-256：
 
 ```text
-346ff63b5ccdb234e57fcf074b211517f80a46bf19de364382eebfc2f480e8d4
-```
-
-便携包 SHA-256：
-
-```text
-d90ceb3dcafbe833b219a463fecb9e8a8430775bcc004d1e1238684c234db6be
+a1f89e1252c031320701953c53b58a29ea29463ef905ee5e9074eb12db207dec
 ```
 
 在 PowerShell 中校验下载文件：
 
 ```powershell
 Get-FileHash .\Meeting-Copilot-0.1.0-windows-x64-base-unsigned.exe -Algorithm SHA256
-Get-FileHash .\Meeting-Copilot-0.1.0-windows-x64-base.zip -Algorithm SHA256
 ```
 
 当前安装程序尚未进行 Authenticode 代码签名，Windows SmartScreen 可能显示提示。请先确认下载来源和哈希，不要使用第三方重新打包的文件。
 
 安装后从开始菜单启动 Meeting Copilot。卸载时打开 Windows“设置 > 应用 > 已安装的应用”，找到 Meeting Copilot 并选择“卸载”。卸载应用不会代替用户的数据备份流程；需要保留的会议内容应先在应用中导出。
 
+该安装包按当前用户安装，不要求管理员权限，也不会注册 Windows 服务、开机启动项或防火墙规则。首次启动时若系统缺少 Microsoft Edge WebView2 Runtime，安装器可能联网下载该系统组件。麦克风权限只在用户开始会议并选择音频输入时由 Windows 请求；导入录音和能力包时只读取用户主动选择的文件。
+
+客户端会启动一个无控制台窗口的本地后台进程。它只监听 `127.0.0.1` 上的随机端口，使用本次启动生成的本地令牌，并在桌面客户端退出时结束。任务管理器中看到随应用启动的打包 `python.exe` 属于本地服务，不是常驻系统服务。
+
 基础客户端包含桌面应用和本地服务，但不包含 ASR 模型。没有离线能力包时，应用仍可启动并使用会议管理、笔记、设置和能力包管理；实时本地转写及录音文件转写不可用。
+
+## 安装目录与数据目录
+
+程序文件保存在安装时选择的目录。会议数据库、录音、日志、设置和能力包属于可变用户数据，不写入安装目录，以免升级或卸载时误删，也避免普通用户目录需要管理员写权限。
+
+新安装默认使用：
+
+```text
+%LOCALAPPDATA%\com.meetingcopilot.desktop
+```
+
+从旧版本升级时，如果 `%APPDATA%\com.meetingcopilot.desktop` 已存在且新目录尚不存在，客户端会继续使用旧目录，避免历史会议突然不可见。WebView2 自身的浏览器缓存仍由 Windows 保存在 `%LOCALAPPDATA%\com.meetingcopilot.desktop\EBWebView`，不包含能力包。
+
+需要把数据库、录音、日志和能力包整体放到 D/E 盘时，在启动客户端前设置绝对路径。例如：
+
+```powershell
+setx MEETING_COPILOT_STORAGE_DIR "D:\MeetingCopilotData"
+```
+
+完全退出客户端后重新启动，设置才会生效。不要把新目录放在安装目录内部，也不要在客户端运行时手动移动其中的文件。若要恢复默认路径，可执行 `reg delete HKCU\Environment /v MEETING_COPILOT_STORAGE_DIR /f` 后重新登录 Windows，或在“系统属性 > 环境变量”中删除同名用户变量。
 
 ## 源码运行环境
 
@@ -110,7 +124,7 @@ $env:LLM_GATEWAY_API_STYLE = "chat_completions"
 
 当前完整能力包约 3.05 GiB，解包和激活需要约 9 GB 可用磁盘空间。其模型和二进制组件的公开再分发条件仍在核验，因此本仓库和 GitHub Release 暂不提供下载。取得来源合法的兼容能力包后：
 
-1. 打开左侧“本地能力”。
+1. 打开左侧“离线能力”。
 2. 选择“导入离线包”。
 3. 选择原始 `.mcpkg` 文件，不要预先解压或修改内容。
 4. 等待平台、空间、清单和哈希校验完成。
