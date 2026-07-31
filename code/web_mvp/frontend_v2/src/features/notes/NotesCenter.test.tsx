@@ -64,7 +64,9 @@ it("searches, autosaves and jumps from a note to transcript evidence without pla
   );
 
   expect(await screen.findByRole("button", { name: /发布风险/ })).toBeVisible();
-  fireEvent.change(screen.getByRole("textbox", { name: "笔记正文" }), {
+  const bodyInput = screen.getByRole("textbox", { name: "笔记正文" });
+  await waitFor(() => expect(bodyInput).toHaveValue("周五前关闭风险项。"));
+  fireEvent.change(bodyInput, {
     target: { value: "周五前关闭风险项，负责人待确认。" },
   });
   await waitFor(() => expect(api.updateNote).toHaveBeenCalledWith(
