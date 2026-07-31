@@ -687,7 +687,7 @@ fn sha256_file(path: &Path) -> Result<String, String> {
         )
     })?;
     let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 1024 * 1024];
+    let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
         let count = file.read(&mut buffer).map_err(|error| {
             format!(
@@ -749,80 +749,88 @@ fn collect_directory_shape(
     allowed_root: &Path,
     shape: &mut DirectoryComponentShape,
 ) -> Result<(), String> {
-    let read_dir = fs::read_dir(current).map_err(|error| {
-        format!(
-            "failed to inspect runtime component directory {}: {error}",
-            current.display()
-        )
-    })?;
-    for entry in read_dir {
-        let entry = entry.map_err(|error| {
+    let mut pending = vec![current.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let read_dir = fs::read_dir(&directory).map_err(|error| {
             format!(
                 "failed to inspect runtime component directory {}: {error}",
-                current.display()
+                directory.display()
             )
         })?;
-        let candidate = entry.path();
-        let metadata = fs::symlink_metadata(&candidate).map_err(|error| {
-            format!(
-                "failed to inspect runtime component entry {}: {error}",
-                candidate.display()
-            )
-        })?;
-        if metadata.file_type().is_symlink() {
-            let resolved = fs::canonicalize(&candidate).map_err(|error| {
+        for entry in read_dir {
+            let entry = entry.map_err(|error| {
                 format!(
-                    "runtime component contains an unreadable symlink: {} ({error})",
+                    "failed to inspect runtime component directory {}: {error}",
+                    directory.display()
+                )
+            })?;
+            let candidate = entry.path();
+            let metadata = fs::symlink_metadata(&candidate).map_err(|error| {
+                format!(
+                    "failed to inspect runtime component entry {}: {error}",
                     candidate.display()
                 )
             })?;
-            if resolved.strip_prefix(allowed_root).is_err() {
-                return Err(format!(
-                    "runtime component contains external symlink: {}",
-                    candidate.display()
-                ));
+            if metadata.file_type().is_symlink() {
+                let resolved = fs::canonicalize(&candidate).map_err(|error| {
+                    format!(
+                        "runtime component contains an unreadable symlink: {} ({error})",
+                        candidate.display()
+                    )
+                })?;
+                if resolved.strip_prefix(allowed_root).is_err() {
+                    return Err(format!(
+                        "runtime component contains external symlink: {}",
+                        candidate.display()
+                    ));
+                }
+                let target_metadata = fs::metadata(&candidate).map_err(|error| {
+                    format!(
+                        "runtime component symlink target is unreadable: {} ({error})",
+                        candidate.display()
+                    )
+                })?;
+                if !target_metadata.is_file() {
+                    return Err(format!(
+                        "runtime component symlink target is not a file: {}",
+                        candidate.display()
+                    ));
+                }
+                shape.size_bytes = shape
+                    .size_bytes
+                    .checked_add(target_metadata.len())
+                    .ok_or_else(|| {
+                        format!("runtime component size overflow: {}", directory.display())
+                    })?;
+                shape.file_count = shape.file_count.checked_add(1).ok_or_else(|| {
+                    format!(
+                        "runtime component file count overflow: {}",
+                        directory.display()
+                    )
+                })?;
+                shape.symlink_count = shape.symlink_count.checked_add(1).ok_or_else(|| {
+                    format!(
+                        "runtime component symlink count overflow: {}",
+                        directory.display()
+                    )
+                })?;
+            } else if metadata.is_file() {
+                shape.size_bytes =
+                    shape
+                        .size_bytes
+                        .checked_add(metadata.len())
+                        .ok_or_else(|| {
+                            format!("runtime component size overflow: {}", directory.display())
+                        })?;
+                shape.file_count = shape.file_count.checked_add(1).ok_or_else(|| {
+                    format!(
+                        "runtime component file count overflow: {}",
+                        directory.display()
+                    )
+                })?;
+            } else if metadata.is_dir() {
+                pending.push(candidate);
             }
-            let target_metadata = fs::metadata(&candidate).map_err(|error| {
-                format!(
-                    "runtime component symlink target is unreadable: {} ({error})",
-                    candidate.display()
-                )
-            })?;
-            if !target_metadata.is_file() {
-                return Err(format!(
-                    "runtime component symlink target is not a file: {}",
-                    candidate.display()
-                ));
-            }
-            shape.size_bytes = shape
-                .size_bytes
-                .checked_add(target_metadata.len())
-                .ok_or_else(|| format!("runtime component size overflow: {}", current.display()))?;
-            shape.file_count = shape.file_count.checked_add(1).ok_or_else(|| {
-                format!(
-                    "runtime component file count overflow: {}",
-                    current.display()
-                )
-            })?;
-            shape.symlink_count = shape.symlink_count.checked_add(1).ok_or_else(|| {
-                format!(
-                    "runtime component symlink count overflow: {}",
-                    current.display()
-                )
-            })?;
-        } else if metadata.is_file() {
-            shape.size_bytes = shape
-                .size_bytes
-                .checked_add(metadata.len())
-                .ok_or_else(|| format!("runtime component size overflow: {}", current.display()))?;
-            shape.file_count = shape.file_count.checked_add(1).ok_or_else(|| {
-                format!(
-                    "runtime component file count overflow: {}",
-                    current.display()
-                )
-            })?;
-        } else if metadata.is_dir() {
-            collect_directory_shape(&candidate, allowed_root, shape)?;
         }
     }
     Ok(())
@@ -2861,6 +2869,47 @@ mod tests {
         assert_eq!(shape.size_bytes, 27);
         assert_eq!(shape.file_count, 2);
         assert_eq!(shape.symlink_count, 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_asr_directory_shape_handles_deep_directory_trees() {
+        let root = sealed_file_asr_fixture_root("deep-directory-shape");
+        let mut nested = root.join("models/offline");
+        for _ in 0..48 {
+            nested.push("d");
+            fs::create_dir(&nested).unwrap();
+        }
+        fs::write(nested.join("payload.bin"), b"nested").unwrap();
+
+        let shape = directory_component_shape(
+            &root.join("models/offline"),
+            &fs::canonicalize(&root).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(shape.size_bytes, 33);
+        assert_eq!(shape.file_count, 3);
+        assert_eq!(shape.symlink_count, 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_file_hashing_does_not_require_a_large_thread_stack() {
+        let root = sealed_file_asr_fixture_root("small-stack-hash");
+        let path = root.join("small-stack-hash.bin");
+        fs::write(&path, b"meeting-copilot").unwrap();
+
+        let digest = thread::Builder::new()
+            .name("small-stack-runtime-hash".to_string())
+            .stack_size(256 * 1024)
+            .spawn(move || sha256_file(&path))
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap();
+
+        assert!(is_sha256_hex(&digest));
         let _ = fs::remove_dir_all(root);
     }
 

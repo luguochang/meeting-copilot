@@ -313,9 +313,17 @@ class CapabilityPackManager:
         active = self._active_runtime()
         capabilities = set(active.state.get("capabilities") or []) if active else set()
         current_runtime = self.source_runtime_bundle
+        current_runtime_is_active = False
+        if active is not None and current_runtime is not None:
+            try:
+                current_runtime_is_active = current_runtime.samefile(active.absolute_path)
+            except OSError:
+                current_runtime_is_active = (
+                    current_runtime.resolve() == active.absolute_path.resolve()
+                )
         restart_required = bool(
             active is not None
-            and (current_runtime is None or current_runtime.resolve() != active.absolute_path.resolve())
+            and (current_runtime is None or not current_runtime_is_active)
         )
         return {
             "schema_version": STATUS_SCHEMA,

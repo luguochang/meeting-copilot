@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import zipfile
 
@@ -175,6 +176,30 @@ def test_installs_verified_offline_package_and_activates_runtime(tmp_path):
     assert installed_state["source_runtime_manifest_sha256"] != installed_state[
         "runtime_manifest_sha256"
     ]
+
+
+def test_active_runtime_does_not_require_restart_for_equivalent_windows_path(tmp_path):
+    package, base = _fixture_package(tmp_path)
+    capability_root = tmp_path / "capabilities"
+    manager = CapabilityPackManager(
+        capability_root,
+        source_runtime_bundle=base,
+        platform_name="windows-x86_64",
+    )
+    manager.install_file(io.BytesIO(package), filename="fixture.mcpkg")
+    active = json.loads((capability_root / "active.json").read_text(encoding="utf-8"))
+    active_runtime = (capability_root / active["runtime_path"]).resolve()
+    current_runtime = (
+        Path("\\\\?\\" + str(active_runtime)) if os.name == "nt" else active_runtime
+    )
+
+    restarted = CapabilityPackManager(
+        capability_root,
+        source_runtime_bundle=current_runtime,
+        platform_name="windows-x86_64",
+    )
+
+    assert restarted.status()["restart_required"] is False
 
 
 def test_rejects_tampered_pack_without_changing_active_pointer(tmp_path):
