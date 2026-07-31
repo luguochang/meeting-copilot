@@ -7,7 +7,7 @@
 安装程序 SHA-256：
 
 ```text
-a1f89e1252c031320701953c53b58a29ea29463ef905ee5e9074eb12db207dec
+421e2bbcfb64a490ea1cadf35c96e642da001028aacc244be26d1e0b7e4a9088
 ```
 
 在 PowerShell 中校验下载文件：
@@ -107,7 +107,7 @@ npm run dev
 
 ## 配置 AI 分析服务
 
-推荐在应用的“设置”中填写服务地址、API Key 和模型，并先执行连接检测。该配置仅用于 OpenAI-compatible 分析能力，本地转写不依赖它。
+推荐在应用的“AI 设置”中填写服务地址、API Key 和模型，并先执行连接检测。新配置会预填 AI 赞助商地址 `https://codexai.club`，用户可以直接删除或替换；预填本身不会发送请求。该配置仅用于 OpenAI-compatible 分析能力，本地转写不依赖它。
 
 服务端开发环境也可以使用环境变量：
 

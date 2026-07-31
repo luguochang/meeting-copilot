@@ -150,6 +150,9 @@ export function DocsPage() {
             <p>
               官网本身不会连接你的中转服务，也不会在浏览器内保存密钥。产品运行环境只有在显式配置后才启用远程分析；密钥必须保留在本地后端或桌面运行时中。
             </p>
+            <p>
+              客户端的新配置页面会预填 AI 赞助商地址 <code>https://codexai.club</code>。该地址可以删除或替换，只有用户保存配置并主动使用 AI 功能时才会发送请求。
+            </p>
             <div className="code-block" aria-label="LLM 环境变量示例">
               <div>
                 <span>环境变量示例</span>
