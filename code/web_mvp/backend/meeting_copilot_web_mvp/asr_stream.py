@@ -2241,11 +2241,11 @@ async def handle_stream(
                 error_class=type(exc).__name__,
                 error_origin=_exception_origin(exc),
             )
+            await _shutdown_session_executor()
             try:
                 await websocket.close()
             except Exception:
                 pass
-            await _shutdown_session_executor()
             return
 
     if diarization_enabled and (
