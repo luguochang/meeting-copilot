@@ -1,5 +1,18 @@
-import { Check, CheckCircle2, ExternalLink, KeyRound, LoaderCircle, Settings, Trash2, X } from "lucide-react";
-import { type FormEvent, useCallback, useEffect, useState } from "react";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import {
+  BookOpenText,
+  Check,
+  CheckCircle2,
+  ExternalLink,
+  Github,
+  HeartHandshake,
+  KeyRound,
+  LoaderCircle,
+  Settings,
+  Trash2,
+  X,
+} from "lucide-react";
+import { type FormEvent, type MouseEvent, useCallback, useEffect, useState } from "react";
 import { fetchProviderStatus } from "../../api/client";
 import {
   reconcileProviderStatus,
@@ -46,8 +59,11 @@ interface CostStatsResponse {
 type ProviderPhase = "loading" | "unavailable" | "unconfigured" | "saved" | "configured" | "error";
 
 const DEFAULT_BASE_URL = "https://codexai.club";
+const BASE_URL_PLACEHOLDER = "https://api.example.com/v1";
 const DEFAULT_MODEL = "gpt-5.5";
 const SPONSOR_URL = "https://codexai.club/";
+const REPOSITORY_URL = "https://github.com/luguochang/meeting-copilot";
+const BLOG_URL = "https://blog.csdn.net/luguochang";
 
 const emptyResponse: ProviderConfigResponse = {
   command_status: "ok",
@@ -414,6 +430,16 @@ export function ProviderSettingsControl() {
       : current);
   };
 
+  const openExternalLink = async (event: MouseEvent<HTMLAnchorElement>, url: string) => {
+    if (!resolveTauriInvoke()) return;
+    event.preventDefault();
+    try {
+      await openUrl(url);
+    } catch {
+      setError(`无法打开链接，请在浏览器访问 ${url}`);
+    }
+  };
+
   return (
     <>
       <button
@@ -455,7 +481,7 @@ export function ProviderSettingsControl() {
                   <span>
                     {config.configured
                       ? `${config.model ?? model}${dirty ? " · 配置有修改" : ""}`
-                      : "填写配置后保存并测试"}
+                      : "未配置，不影响本地转写"}
                   </span>
                 </div>
                 {config.configured ? (
@@ -471,6 +497,25 @@ export function ProviderSettingsControl() {
                 ) : null}
               </section>
 
+              <section className="provider-sponsor-card" aria-label="AI 赞助商 codexai.club">
+                <span className="provider-sponsor-icon" aria-hidden="true">
+                  <HeartHandshake size={18} />
+                </span>
+                <div>
+                  <span>AI 赞助商</span>
+                  <strong>codexai.club</strong>
+                </div>
+                <a
+                  href={SPONSOR_URL}
+                  target="_blank"
+                  rel="noreferrer"
+                  onClick={(event) => void openExternalLink(event, SPONSOR_URL)}
+                  aria-label="访问 AI 赞助商 codexai.club"
+                >
+                  访问服务 <ExternalLink size={13} />
+                </a>
+              </section>
+
               {phase === "unavailable" ? (
                 <div className="provider-desktop-only" role="status">
                   <Settings size={20} />
@@ -478,6 +523,10 @@ export function ProviderSettingsControl() {
                 </div>
               ) : (
                 <form className="provider-settings-form" id="provider-config-panel" onSubmit={(event) => void save(event)}>
+                  <div className="provider-form-heading">
+                    <strong>OpenAI-compatible 服务</strong>
+                    <span>可选</span>
+                  </div>
                   <label>
                     <span>服务地址（Base URL）</span>
                     <input
@@ -487,19 +536,12 @@ export function ProviderSettingsControl() {
                         setBaseUrl(event.target.value);
                         markConfigChanged();
                       }}
-                      placeholder={DEFAULT_BASE_URL}
+                      placeholder={BASE_URL_PLACEHOLDER}
                       autoComplete="url"
                       required
                       disabled={Boolean(busy)}
                     />
                   </label>
-                  <div className="provider-sponsor">
-                    <span>AI 赞助商</span>
-                    <a href={SPONSOR_URL} target="_blank" rel="noreferrer">
-                      codexai.club · 获取配置 <ExternalLink size={12} />
-                    </a>
-                  </div>
-
                   <label>
                     <span>模型</span>
                     <input
@@ -610,6 +652,28 @@ export function ProviderSettingsControl() {
                   </footer>
                 </form>
               )}
+
+              <nav className="provider-project-links" aria-label="项目链接">
+                <span>项目链接</span>
+                <div>
+                  <a
+                    href={REPOSITORY_URL}
+                    target="_blank"
+                    rel="noreferrer"
+                    onClick={(event) => void openExternalLink(event, REPOSITORY_URL)}
+                  >
+                    <Github size={14} /> GitHub 仓库 <ExternalLink size={12} />
+                  </a>
+                  <a
+                    href={BLOG_URL}
+                    target="_blank"
+                    rel="noreferrer"
+                    onClick={(event) => void openExternalLink(event, BLOG_URL)}
+                  >
+                    <BookOpenText size={14} /> CSDN 博客 <ExternalLink size={12} />
+                  </a>
+                </div>
+              </nav>
             </div>
           </section>
         </div>

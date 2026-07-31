@@ -785,6 +785,7 @@ fn provider_startup_sync_policy(
 
 pub fn run() {
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let supervisor = desktop_backend_supervisor::BackendSupervisor::default();
             let resource_dir = app.path().resource_dir()?;

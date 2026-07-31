@@ -108,7 +108,7 @@ describe("ProviderSettingsControl", () => {
     expect(await screen.findByRole("button", { name: "打开 AI 设置" })).toHaveTextContent("AI 连接失败 · gpt-test");
   });
 
-  it("prefills the sponsored gateway for a new user", async () => {
+  it("keeps remote AI optional and shows the sponsor and project links", async () => {
     const user = userEvent.setup();
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
       const path = String(input);
@@ -122,10 +122,26 @@ describe("ProviderSettingsControl", () => {
 
     await user.click(await screen.findByRole("button", { name: "打开 AI 设置" }));
     const dialog = screen.getByRole("dialog", { name: "AI 设置" });
-    expect(within(dialog).getByLabelText("服务地址（Base URL）")).toHaveValue("https://codexai.club");
-    expect(within(dialog).getByRole("link", { name: "codexai.club · 获取配置" })).toHaveAttribute(
+    const baseUrlInput = within(dialog).getByLabelText("服务地址（Base URL）");
+    expect(baseUrlInput).toHaveValue("https://codexai.club");
+    expect(baseUrlInput).toHaveAttribute(
+      "placeholder",
+      "https://api.example.com/v1",
+    );
+    await user.clear(baseUrlInput);
+    expect(baseUrlInput).toHaveValue("");
+    expect(within(dialog).getByText("未配置，不影响本地转写")).toBeVisible();
+    expect(within(dialog).getByRole("link", { name: "访问 AI 赞助商 codexai.club" })).toHaveAttribute(
       "href",
       "https://codexai.club/",
+    );
+    expect(within(dialog).getByRole("link", { name: /GitHub 仓库/ })).toHaveAttribute(
+      "href",
+      "https://github.com/luguochang/meeting-copilot",
+    );
+    expect(within(dialog).getByRole("link", { name: /CSDN 博客/ })).toHaveAttribute(
+      "href",
+      "https://blog.csdn.net/luguochang",
     );
     expect(dialog).not.toHaveTextContent("Provider 健康与使用边界");
     expect(dialog).not.toHaveTextContent("本地 ASR");
