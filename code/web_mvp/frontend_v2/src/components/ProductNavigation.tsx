@@ -169,16 +169,16 @@ export function ProductNavigation({
       <section className="product-nav-security" aria-label="本地数据说明">
         <ShieldCheck size={18} aria-hidden="true" />
         <div>
-          <strong>本地数据 · 安全可控</strong>
-          <p>录音与文字保存在本机，不上传云端。</p>
+          <strong>本地数据 · 由你控制</strong>
+          <p>录音默认留在本机；启用远程 AI 后会发送分析所需文字。</p>
         </div>
       </section>
 
-      <div className="product-nav-user" aria-label="当前用户 Alice，本地优先">
-        <span className="product-nav-avatar" aria-hidden="true">A</span>
+      <div className="product-nav-user" aria-label="本地工作区，单用户模式">
+        <span className="product-nav-avatar" aria-hidden="true">本</span>
         <div>
-          <strong>Alice</strong>
-          <span><i aria-hidden="true" />本地优先</span>
+          <strong>本地工作区</strong>
+          <span><i aria-hidden="true" />单用户模式</span>
         </div>
       </div>
     </aside>

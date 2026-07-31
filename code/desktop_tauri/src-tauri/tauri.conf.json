@@ -32,6 +32,9 @@
     "active": true,
     "targets": ["app", "dmg"],
     "icon": ["icons/icon.png"],
+    "publisher": "luguochang",
+    "homepage": "https://github.com/luguochang/meeting-copilot",
+    "copyright": "Copyright (c) 2026 luguochang",
     "macOS": {
       "minimumSystemVersion": "13.0",
       "infoPlist": "Info.plist",

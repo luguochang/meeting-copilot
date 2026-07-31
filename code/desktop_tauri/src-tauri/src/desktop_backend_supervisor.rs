@@ -135,7 +135,10 @@ impl Default for BackendRuntimeSnapshot {
 
 #[derive(Clone)]
 struct BackendLaunchConfig {
+    #[cfg(not(windows))]
     launcher: PathBuf,
+    #[cfg(windows)]
+    backend_executable: PathBuf,
     runtime_bundle: PathBuf,
     data_dir: PathBuf,
     log_dir: PathBuf,
@@ -196,7 +199,10 @@ impl BackendSupervisor {
 
         let port = reserve_loopback_port()?;
         let launch_config = BackendLaunchConfig {
+            #[cfg(not(windows))]
             launcher: resolve_backend_launcher(runtime_bundle)?,
+            #[cfg(windows)]
+            backend_executable: resolve_backend_executable(runtime_bundle)?,
             runtime_bundle: runtime_bundle.to_path_buf(),
             data_dir: data_dir.to_path_buf(),
             log_dir: log_dir.to_path_buf(),
@@ -629,6 +635,7 @@ fn validate_runtime_bundle_and_inspect_file_asr(
     }
 }
 
+#[cfg(any(not(windows), test))]
 fn resolve_backend_launcher(runtime_bundle: &Path) -> Result<PathBuf, String> {
     let manifest_path = runtime_bundle.join("runtime-bundle-manifest.json");
     let manifest_text = fs::read_to_string(&manifest_path).map_err(|error| {
@@ -648,6 +655,28 @@ fn resolve_backend_launcher(runtime_bundle: &Path) -> Result<PathBuf, String> {
         ));
     }
     Ok(launcher)
+}
+
+#[cfg(windows)]
+fn resolve_backend_executable(runtime_bundle: &Path) -> Result<PathBuf, String> {
+    let manifest_path = runtime_bundle.join("runtime-bundle-manifest.json");
+    let manifest_text = fs::read_to_string(&manifest_path).map_err(|error| {
+        format!("bundled runtime is incomplete: runtime-bundle-manifest.json ({error})")
+    })?;
+    let manifest: serde_json::Value = serde_json::from_str(&manifest_text)
+        .map_err(|error| format!("bundled runtime manifest is invalid: {error}"))?;
+    let relative = manifest
+        .pointer("/runtimes/backend/executable")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "bundled runtime backend executable is missing".to_string())?;
+    validate_bundle_relative_path(relative)?;
+    let executable = runtime_bundle.join(relative);
+    if !executable.is_file() {
+        return Err(format!(
+            "bundled runtime backend executable is missing: {relative}"
+        ));
+    }
+    Ok(executable)
 }
 
 fn sha256_file(path: &Path) -> Result<String, String> {
@@ -1526,7 +1555,10 @@ fn spawn_backend(config: &BackendLaunchConfig) -> Result<Child, String> {
     let stderr = open_private_file(&config.log_dir.join("backend.stderr.log"), true)
         .map_err(|error| format!("failed to open backend stderr log: {error}"))?;
 
+    #[cfg(not(windows))]
     let mut command = Command::new(&config.launcher);
+    #[cfg(windows)]
+    let mut command = Command::new(&config.backend_executable);
     command
         .current_dir(&config.runtime_bundle)
         .env("MEETING_COPILOT_PORT", config.port.to_string())
@@ -1550,6 +1582,38 @@ fn spawn_backend(config: &BackendLaunchConfig) -> Result<Child, String> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
+    #[cfg(windows)]
+    {
+        let python_path = env::join_paths([
+            config
+                .runtime_bundle
+                .join("runtime/backend-venv/Lib/site-packages"),
+            config.runtime_bundle.join("app/code/web_mvp/backend"),
+            config.runtime_bundle.join("app/code/core"),
+        ])
+        .map_err(|error| format!("failed to construct bundled backend PYTHONPATH: {error}"))?;
+        command
+            .arg("-m")
+            .arg("uvicorn")
+            .arg("meeting_copilot_web_mvp.app:app")
+            .arg("--host")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(config.port.to_string())
+            .arg("--log-level")
+            .arg("warning")
+            .arg("--timeout-graceful-shutdown")
+            .arg("8")
+            .env("PYTHONNOUSERSITE", "1")
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .env("PYTHONUTF8", "1")
+            .env("PYTHONIOENCODING", "utf-8")
+            .env(
+                "PYTHONHOME",
+                config.runtime_bundle.join("runtime/backend-python"),
+            )
+            .env("PYTHONPATH", python_path);
+    }
     if let Some(converter_path) = &config.converter_path {
         command.env("IMAGEIO_FFMPEG_EXE", converter_path);
     } else {
@@ -1559,6 +1623,12 @@ fn spawn_backend(config: &BackendLaunchConfig) -> Result<Child, String> {
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
     }
 
     command

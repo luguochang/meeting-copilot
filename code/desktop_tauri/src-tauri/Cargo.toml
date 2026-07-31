@@ -2,6 +2,11 @@
 name = "meeting-copilot-desktop"
 version = "0.1.0"
 edition = "2021"
+authors = ["luguochang"]
+description = "Local-first desktop meeting assistant"
+homepage = "https://github.com/luguochang/meeting-copilot"
+repository = "https://github.com/luguochang/meeting-copilot"
+license-file = "../../../LICENSE"
 
 [lib]
 name = "meeting_copilot_desktop_lib"

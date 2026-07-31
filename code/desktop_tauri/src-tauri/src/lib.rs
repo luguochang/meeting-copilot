@@ -1,7 +1,8 @@
 use serde::Serialize;
 use serde_json::json;
 use std::env;
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use tauri::ipc::CapabilityBuilder;
 use tauri::webview::PageLoadEvent;
 use tauri::Manager;
@@ -19,6 +20,26 @@ pub mod private_storage;
 pub mod provider_config_runtime;
 #[cfg(windows)]
 pub mod windows_audio_capture_runtime;
+
+const STORAGE_DIR_ENV: &str = "MEETING_COPILOT_STORAGE_DIR";
+
+fn resolve_storage_root(
+    configured: Option<OsString>,
+    local_default: &Path,
+    legacy_default: &Path,
+) -> Result<PathBuf, String> {
+    if let Some(value) = configured.filter(|value| !value.is_empty()) {
+        let path = PathBuf::from(value);
+        if !path.is_absolute() {
+            return Err(format!("{STORAGE_DIR_ENV} must be an absolute path"));
+        }
+        return Ok(path);
+    }
+    if local_default != legacy_default && !local_default.exists() && legacy_default.exists() {
+        return Ok(legacy_default.to_path_buf());
+    }
+    Ok(local_default.to_path_buf())
+}
 
 #[tauri::command]
 fn windows_audio_devices(flow: String) -> Result<serde_json::Value, String> {
@@ -767,8 +788,17 @@ pub fn run() {
         .setup(|app| {
             let supervisor = desktop_backend_supervisor::BackendSupervisor::default();
             let resource_dir = app.path().resource_dir()?;
-            let app_data_dir = app.path().app_data_dir()?;
-            let app_log_dir = app.path().app_log_dir()?;
+            let local_app_data_dir = app.path().app_local_data_dir()?;
+            let legacy_app_data_dir = app.path().app_data_dir()?;
+            let app_data_dir = resolve_storage_root(
+                env::var_os(STORAGE_DIR_ENV),
+                &local_app_data_dir,
+                &legacy_app_data_dir,
+            )
+            .map_err(std::io::Error::other)?;
+            private_storage::ensure_private_directory(&app_data_dir)?;
+            let app_log_dir = app_data_dir.join("logs");
+            private_storage::ensure_private_directory(&app_log_dir)?;
             let provider_config =
                 provider_config_runtime::ProviderConfigSupervisor::new(app_data_dir.clone());
             let provider_startup_sync_policy = provider_startup_sync_policy(
@@ -928,12 +958,38 @@ pub fn run() {
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    #[cfg(unix)]
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn storage_root_uses_local_data_supports_override_and_preserves_legacy_installs() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "meeting-copilot-storage-root-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let local = root.join("local");
+        let legacy = root.join("legacy");
+        let custom = root.join("custom");
+
+        assert_eq!(resolve_storage_root(None, &local, &legacy).unwrap(), local);
+        fs::create_dir_all(&legacy).unwrap();
+        assert_eq!(resolve_storage_root(None, &local, &legacy).unwrap(), legacy);
+        fs::create_dir_all(&local).unwrap();
+        assert_eq!(resolve_storage_root(None, &local, &legacy).unwrap(), local);
+        assert_eq!(
+            resolve_storage_root(Some(custom.clone().into_os_string()), &local, &legacy).unwrap(),
+            custom
+        );
+        assert!(resolve_storage_root(Some("relative".into()), &local, &legacy).is_err());
+
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn packaged_capability_is_scoped_to_the_runtime_loopback_port() {
