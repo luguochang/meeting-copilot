@@ -7,7 +7,7 @@
 安装程序 SHA-256：
 
 ```text
-421e2bbcfb64a490ea1cadf35c96e642da001028aacc244be26d1e0b7e4a9088
+499a9fa683deb00a75c1331a5ada3a309927419712c20f0ba0d0ef00a5757726
 ```
 
 在 PowerShell 中校验下载文件：
