@@ -2,7 +2,7 @@
 
 本地优先的中文技术会议助手。Meeting Copilot 将实时转写、议题跟踪、证据化建议、会后复盘和个人笔记放在同一个桌面工作台中。
 
-[官网](https://codexai.club/) · [GitHub](https://github.com/luguochang/meeting-copilot) · [CSDN 博客](https://blog.csdn.net/luguochang) · [AI 赞助商](https://codexai.club/)
+[官网](https://meeting.codexai.club/) · [GitHub](https://github.com/luguochang/meeting-copilot) · [CSDN 博客](https://blog.csdn.net/luguochang) · [AI 赞助商](https://codexai.club/)
 
 > 当前版本：Windows `0.1.0` 公开预览。项目采用单用户、本地运行模式；远程 AI 分析仅在用户主动配置 OpenAI-compatible 服务后启用。Windows 安装包尚未进行代码签名。
 

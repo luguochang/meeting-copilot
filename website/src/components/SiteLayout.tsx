@@ -2,6 +2,7 @@ import { useEffect } from 'react'
 import { Outlet, useLocation } from 'react-router-dom'
 import { SiteFooter } from './SiteFooter'
 import { SiteHeader } from './SiteHeader'
+import { site } from '../content/site'
 
 const pageMetadata: Record<string, { title: string; description: string }> = {
   '/': {
@@ -26,8 +27,16 @@ function PageMetadata() {
       title: '页面未找到 · Meeting Copilot',
       description: 'Meeting Copilot 产品网站。',
     }
+    const canonicalPath = pageMetadata[pathname] ? pathname : '/'
+    const canonicalUrl = new URL(canonicalPath, site.publicUrl).toString()
     document.title = metadata.title
     document.querySelector('meta[name="description"]')?.setAttribute('content', metadata.description)
+    document.querySelector('link[rel="canonical"]')?.setAttribute('href', canonicalUrl)
+    document.querySelector('meta[property="og:url"]')?.setAttribute('content', canonicalUrl)
+    document.querySelector('meta[property="og:title"]')?.setAttribute('content', metadata.title)
+    document.querySelector('meta[property="og:description"]')?.setAttribute('content', metadata.description)
+    document.querySelector('meta[name="twitter:title"]')?.setAttribute('content', metadata.title)
+    document.querySelector('meta[name="twitter:description"]')?.setAttribute('content', metadata.description)
   }, [pathname])
 
   return null
