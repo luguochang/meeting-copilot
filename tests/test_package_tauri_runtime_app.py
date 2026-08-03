@@ -1081,7 +1081,7 @@ def test_fixed_identity_preflight_matches_tauri_and_manifest(tmp_path):
     config_path.write_text(
         json.dumps(
             {
-                "productName": "Meeting Copilot",
+                "productName": "Talktrace",
                 "identifier": "com.meetingcopilot.desktop",
             }
         ),
@@ -1096,7 +1096,7 @@ def test_fixed_identity_preflight_matches_tauri_and_manifest(tmp_path):
 
     config_path.write_text(
         json.dumps(
-            {"productName": "Meeting Copilot Dev", "identifier": "com.example.random"}
+            {"productName": "Talktrace Dev", "identifier": "com.example.random"}
         ),
         encoding="utf-8",
     )
@@ -1185,7 +1185,7 @@ def test_packaged_runtime_bytecode_is_removed_before_signing_and_recorded_in_evi
     output_root = repo_root / "artifacts/tmp/packages"
     runtime_bundle = repo_root / "runtime-source/MeetingCopilotRuntime.bundle"
     runtime_bundle.mkdir(parents=True)
-    built_app = tmp_path / "target/Meeting Copilot.app"
+    built_app = tmp_path / "target/Talktrace.app"
     built_runtime = built_app / "Contents/Resources/MeetingCopilotRuntime.bundle"
     cache = built_runtime / "app/backend/package/__pycache__"
     cache.mkdir(parents=True)
@@ -1346,7 +1346,7 @@ def test_packaged_runtime_bytecode_is_removed_before_signing_and_recorded_in_evi
     assert cleanup["bytecode_remaining"] == 0
     packaged_runtime = (
         output_root
-        / "bytecode-cleanup/Meeting Copilot.app/Contents/Resources/MeetingCopilotRuntime.bundle"
+        / "bytecode-cleanup/Talktrace.app/Contents/Resources/MeetingCopilotRuntime.bundle"
     )
     assert (packaged_runtime / source_relative).is_file()
     assert (packaged_runtime / model_relative).read_bytes() == b"model-weights"

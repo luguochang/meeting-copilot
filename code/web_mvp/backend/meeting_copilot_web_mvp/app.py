@@ -950,13 +950,13 @@ def create_app(
         int(os.environ.get("UVICORN_WORKERS") or 1),
     )
     if configured_workers != 1:
-        raise RuntimeError("Meeting Copilot LLM single-flight requires a single worker runtime")
+        raise RuntimeError("Talktrace LLM single-flight requires a single worker runtime")
     # A sidecar process belongs to one app instance. A newly constructed app
     # must not inherit that older instance's crashed/restart-failed marker.
     degradation = get_degradation_controller()
     if degradation.reason.startswith(("asr_sidecar_crashed:", "asr_sidecar_restart_failed:")):
         degradation.reset()
-    app = FastAPI(title="Meeting Copilot Local Web MVP")
+    app = FastAPI(title="Talktrace Local API")
 
     local_api_token = os.environ.get(LOCAL_API_TOKEN_ENV, "").strip()
     app.state.local_api_auth = token_status(local_api_token)

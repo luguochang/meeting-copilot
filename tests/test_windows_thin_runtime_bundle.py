@@ -98,3 +98,52 @@ def test_base_payload_copy_excludes_models_and_asr_runtimes(tmp_path):
     assert not (destination / "runtime/funasr-venv").exists()
     assert not (destination / "runtime/funasr-onnx").exists()
     assert not (destination / "models").exists()
+
+
+def test_base_manifest_overrides_stale_windows_product_identity(monkeypatch, tmp_path):
+    tool = load_tool_module()
+    components = {
+        "shared_asr.python_runtime": _component("runtime/python", 100),
+        "shared_asr.sitecustomize": {
+            **_component("app/sitecustomize.py", 1),
+            "kind": "file",
+        },
+        "realtime_asr.onnx_runtime": _component("runtime/onnx", 200),
+        "realtime_asr.model": _component("models/realtime", 300),
+        "shared_asr.runtime": _component("runtime/funasr", 400),
+        "file_asr.model.offline": _component("models/offline", 500),
+        "file_asr.model.vad": _component("models/vad", 600),
+        "file_asr.model.punc": _component("models/punc", 700),
+    }
+    source_manifest = {
+        "app_identity": {
+            "product_name": "Legacy Product",
+            "bundle_identifier": "com.meetingcopilot.desktop",
+            "app_bundle_name": "Legacy Product.exe",
+            "executable_name": "meeting-copilot-desktop.exe",
+        },
+        "component_inventory": {"components": components},
+        "realtime_model": {"version": "realtime-v1"},
+        "file_asr": {"package": {"version": "file-v1"}},
+    }
+    monkeypatch.setattr(
+        tool.package_runtime, "_reset_file_asr_package_metadata", lambda manifest: None
+    )
+    monkeypatch.setattr(
+        tool.package_runtime, "reset_diarization_package_metadata", lambda manifest: None
+    )
+    monkeypatch.setattr(
+        tool.package_runtime,
+        "_component_record",
+        lambda _bundle, *, relative, **_kwargs: {"path": relative},
+    )
+
+    manifest = tool._base_manifest(
+        source_manifest=source_manifest,
+        bundle=tmp_path,
+        launcher="bin/meeting-copilot-backend.cmd",
+        base_url=None,
+    )
+
+    assert manifest["app_identity"] == tool.package_runtime.EXPECTED_WINDOWS_APP_IDENTITY
+    assert source_manifest["app_identity"]["product_name"] == "Legacy Product"

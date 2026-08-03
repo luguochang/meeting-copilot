@@ -207,9 +207,9 @@ def windows_manifest(
     manifest["platform"] = "windows"
     manifest["architectures"] = ["x86_64"]
     manifest["app_identity"] = {
-        "product_name": "Meeting Copilot",
+        "product_name": "Talktrace",
         "bundle_identifier": "com.meetingcopilot.desktop",
-        "app_bundle_name": "Meeting Copilot.exe",
+        "app_bundle_name": "Talktrace.exe",
         "executable_name": "meeting-copilot-desktop.exe",
     }
     manifest["runtimes"]["backend"].update(

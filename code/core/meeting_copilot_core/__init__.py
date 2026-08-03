@@ -1,2 +1,2 @@
-"""Platform-neutral Meeting Copilot core."""
+"""Platform-neutral Talktrace core."""
 

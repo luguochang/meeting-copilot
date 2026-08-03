@@ -221,6 +221,9 @@ def _base_manifest(
     base_url: str | None,
 ) -> dict[str, Any]:
     manifest = copy.deepcopy(source_manifest)
+    manifest["app_identity"] = copy.deepcopy(
+        package_runtime.EXPECTED_WINDOWS_APP_IDENTITY
+    )
     manifest["distribution_profile"] = "base"
     manifest["capability_packs"] = build_capability_pack_catalog(
         source_manifest, base_url=base_url

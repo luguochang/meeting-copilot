@@ -393,7 +393,7 @@ export function LiveMeetingWorkbench({
               ) : null}
               <BrandMark />
               <div>
-                <span className="brand-name">Meeting Copilot</span>
+                <span className="brand-name">言迹 Talktrace</span>
                 <h1>会议状态加载中</h1>
               </div>
             </div>
@@ -532,7 +532,7 @@ export function LiveMeetingWorkbench({
           ) : null}
           <BrandMark />
           <div>
-            <span className="brand-name">Meeting Copilot</span>
+            <span className="brand-name">言迹 Talktrace</span>
               <MeetingTitleEditor
                 meetingId={meetingId}
                 title={state.title}

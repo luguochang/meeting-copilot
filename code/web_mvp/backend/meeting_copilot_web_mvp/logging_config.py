@@ -1,4 +1,4 @@
-"""Structured logging configuration for the Meeting Copilot web MVP backend.
+"""Structured logging configuration for the Talktrace local backend.
 
 Configures structlog to emit JSON lines to stdout, and routes stdlib logging
 (uvicorn, fastapi) through the same renderer so all logs share one format.

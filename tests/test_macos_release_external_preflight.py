@@ -62,7 +62,7 @@ def test_release_preflight_blocks_without_external_signing_notary_gatekeeper_and
             {
                 "status": "go_development_dmg_not_public_release",
                 "counts_as_public_release_package": False,
-                "dmg_path": "artifacts/tmp/desktop_dmg_skip_finder_current_20260709/Meeting Copilot.dmg",
+                "dmg_path": "artifacts/tmp/desktop_dmg_skip_finder_current_20260709/Talktrace.dmg",
                 "results": {
                     "spctl_app_exit_code": 3,
                     "spctl_dmg_exit_code": 3,

@@ -112,12 +112,12 @@ export function ProductNavigation({
       data-collapsed={collapsed ? "true" : "false"}
     >
       <div className="product-nav-brand">
-        <BrandMark size="navigation" />
+        <BrandMark size="navigation" tone={theme === "dark" ? "white" : "color"} />
         <div className="product-nav-brand-copy" aria-hidden="true">
-          <strong>Meeting Copilot</strong>
-          <span>本地模式</span>
+          <strong>言迹 <small>Talktrace</small></strong>
+          <span>本地会议工作台</span>
         </div>
-        <span className="sr-only">Meeting Copilot 会议助手</span>
+        <span className="sr-only">言迹 Talktrace 本地会议工作台</span>
       </div>
 
       <nav className="product-nav-primary" aria-label="主要模块">

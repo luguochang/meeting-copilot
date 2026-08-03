@@ -1,4 +1,4 @@
-# Meeting Copilot Core
+# Talktrace Core
 
 Platform-neutral Copilot core for PC Local Web MVP and later desktop shells.
 

@@ -36,11 +36,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 ARTIFACTS_TMP = (REPO_ROOT / "artifacts" / "tmp").resolve()
 DEFAULT_APP = (
     REPO_ROOT
-    / "artifacts/tmp/tauri_runtime_package/phase0-2-mainline-r7-tauri-20260717/Meeting Copilot.app"
+    / "artifacts/tmp/tauri_runtime_package/phase0-2-mainline-r7-tauri-20260717/Talktrace.app"
 )
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "artifacts/tmp/macos_dmg_install_smoke"
-DEFAULT_VOLUME_NAME = "Meeting Copilot"
-DEFAULT_DMG_NAME = "Meeting Copilot_0.1.0_aarch64.install-smoke.dmg"
+DEFAULT_VOLUME_NAME = "Talktrace"
+DEFAULT_DMG_NAME = "Talktrace_0.1.0_aarch64.install-smoke.dmg"
 
 
 def resolve_repo_path(repo_root: Path, path: Path) -> Path:

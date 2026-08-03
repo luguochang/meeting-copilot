@@ -5302,6 +5302,16 @@ body {
   white-space: nowrap;
 }
 
+.product-nav-brand-copy strong small {
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.product-navigation--dark .product-nav-brand-copy strong small {
+  color: #bfcbe7;
+}
+
 .product-nav-brand-copy span {
   flex: 0 0 auto;
   padding: 3px 6px;
@@ -6893,12 +6903,16 @@ button.product-nav-item:focus-visible {
 }
 
 .provider-settings-dialog {
+  display: flex;
+  flex-direction: column;
   width: min(660px, calc(100vw - 48px));
   overflow: hidden;
 }
 
 .provider-settings-body {
-  max-height: calc(100dvh - 141px);
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
   overflow-y: auto;
 }
 
@@ -7230,9 +7244,17 @@ button.product-nav-item:focus-visible {
 }
 
 .provider-settings-actions {
-  padding: 4px 0 0;
-  background: transparent;
-  border-top: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  flex: 0 0 auto;
+  gap: 10px;
+  justify-content: normal;
+  padding: 12px 20px;
+}
+
+.provider-settings-action-row {
+  width: 100%;
+  justify-content: space-between;
 }
 
 .diagnostics-list {
@@ -7781,7 +7803,11 @@ button.product-nav-item:focus-visible {
   }
 
   .provider-settings-body {
-    max-height: calc(92dvh - 93px);
+    max-height: none;
+  }
+
+  .provider-settings-actions {
+    padding: 12px 16px;
   }
 
   .provider-connection {

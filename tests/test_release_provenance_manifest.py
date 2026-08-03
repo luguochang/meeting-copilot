@@ -96,7 +96,7 @@ def build_manifest(tool, repo: Path, **overrides):
         "evidence_run_id": "run-001",
         "artifact_path": repo / "artifacts" / "release" / "MeetingCopilot.app.tar",
         "evidence_manifest_path": repo / "artifacts" / "evidence" / "run-001" / "manifest.json",
-        "app_metadata": {"name": "Meeting Copilot", "version": "0.1.0"},
+        "app_metadata": {"name": "Talktrace", "version": "0.1.0"},
     }
     arguments.update(overrides)
     return tool.generate_release_provenance_manifest(**arguments)
@@ -121,7 +121,7 @@ def test_clean_release_binds_source_artifact_evidence_and_is_deterministic(tmp_p
     assert first["evidence_manifest"]["run_id_matches"] is True
     assert first["evidence_manifest"]["declared_artifact"]["path_matches"] is True
     assert first["evidence_manifest"]["declared_artifact"]["hash_matches"] is True
-    assert first["application"] == {"name": "Meeting Copilot", "version": "0.1.0"}
+    assert first["application"] == {"name": "Talktrace", "version": "0.1.0"}
     assert json.loads((repo / first["manifest_path"]).read_text(encoding="utf-8")) == first | {
         "manifest_path": first["manifest_path"]
     }

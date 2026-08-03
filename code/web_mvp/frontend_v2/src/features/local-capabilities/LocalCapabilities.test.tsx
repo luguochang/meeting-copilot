@@ -56,7 +56,7 @@ it("imports a selected mcpkg and reports that restart is required", async () => 
   } as unknown as MeetingApi;
   render(<LocalCapabilities api={api} onOpenMeetings={vi.fn()} onOpenNotes={vi.fn()} />);
   await screen.findByText("基础版可用");
-  const packageFile = new File(["fixture"], "Meeting-Copilot-ASR-Full.mcpkg", {
+  const packageFile = new File(["fixture"], "Talktrace-ASR-Full.mcpkg", {
     type: "application/octet-stream",
   });
 
@@ -68,4 +68,3 @@ it("imports a selected mcpkg and reports that restart is required", async () => 
   expect(screen.getByText("重启后启用完整能力")).toBeVisible();
   expect(screen.getAllByText("已就绪")).toHaveLength(2);
 });
-

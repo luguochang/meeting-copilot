@@ -126,7 +126,7 @@ export function LocalCapabilities({ api, onOpenMeetings, onOpenNotes }: LocalCap
             <RefreshCw size={19} aria-hidden="true" />
             <div>
               <strong>重启后启用完整能力</strong>
-              <span>请关闭并重新打开 Meeting Copilot。</span>
+              <span>请关闭并重新打开言迹 Talktrace。</span>
             </div>
           </div>
         ) : null}

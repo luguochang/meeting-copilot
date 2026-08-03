@@ -5,12 +5,12 @@
     <key>CFBundleIdentifier</key>
     <string>com.meetingcopilot.native-mic</string>
     <key>CFBundleName</key>
-    <string>Meeting Copilot Native Microphone</string>
+    <string>Talktrace Native Microphone</string>
     <key>CFBundleVersion</key>
     <string>0.1.0</string>
     <key>CFBundleShortVersionString</key>
     <string>0.1.0</string>
     <key>NSMicrophoneUsageDescription</key>
-    <string>Meeting Copilot needs microphone access to transcribe the active meeting locally.</string>
+    <string>Talktrace needs microphone access to transcribe the active meeting locally.</string>
 </dict>
 </plist>

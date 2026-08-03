@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the packaged Meeting Copilot mainline against a real OpenAI-compatible relay.
+"""Run the packaged Talktrace mainline against a real OpenAI-compatible relay.
 
 The runner is intentionally separate from the fake-provider acceptance runners. It
 reads one local, owner-only JSON file, configures the already launched packaged

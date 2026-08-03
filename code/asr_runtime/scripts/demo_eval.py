@@ -120,7 +120,7 @@ def _has_core_state_events(events: list[dict[str, Any]]) -> bool:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate Meeting Copilot demo outputs.")
+    parser = argparse.ArgumentParser(description="Evaluate Talktrace demo outputs.")
     parser.add_argument("--analysis", required=True, type=Path)
     parser.add_argument("--transcript-report", required=True, type=Path)
     parser.add_argument("--golden", type=Path)

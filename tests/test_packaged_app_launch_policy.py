@@ -28,7 +28,7 @@ def _load_tool(name: str):
 
 
 def test_all_packaged_runners_disable_macos_state_restoration_prompts():
-    binary = Path("/Applications/Meeting Copilot.app/Contents/MacOS/meeting-copilot-desktop")
+    binary = Path("/Applications/Talktrace.app/Contents/MacOS/meeting-copilot-desktop")
 
     for runner in PACKAGED_RUNNERS:
         module = _load_tool(runner)

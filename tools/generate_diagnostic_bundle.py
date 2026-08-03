@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate one deterministic, redacted Meeting Copilot diagnostic bundle."""
+"""Generate one deterministic, redacted Talktrace diagnostic bundle."""
 
 from __future__ import annotations
 

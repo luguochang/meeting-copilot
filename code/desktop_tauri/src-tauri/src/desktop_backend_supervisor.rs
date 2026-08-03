@@ -2151,7 +2151,7 @@ mod tests {
 
     #[test]
     fn runtime_bundle_override_does_not_depend_on_compile_time_repo_path() {
-        let resource = Path::new("/Applications/Meeting Copilot.app/Contents/Resources");
+        let resource = Path::new("/Applications/Talktrace.app/Contents/Resources");
         let override_path = Path::new("/tmp/runtime with spaces");
         assert_eq!(
             resolve_runtime_bundle(resource, Some(override_path)),

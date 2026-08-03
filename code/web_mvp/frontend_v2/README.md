@@ -1,4 +1,4 @@
-# Meeting Copilot Frontend
+# Talktrace Frontend
 
 React + TypeScript workbench for meetings, live transcription, AI assistance, notes, review, exports, and local capability management.
 

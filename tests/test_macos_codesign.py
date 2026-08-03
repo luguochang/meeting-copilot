@@ -49,8 +49,8 @@ def write_entitlements(path: Path, payload: dict):
 
 
 def make_app(tmp_path: Path) -> tuple[Path, Path, Path]:
-    app = tmp_path / "Meeting Copilot.app"
-    write_macho(app / "Contents/MacOS/Meeting Copilot")
+    app = tmp_path / "Talktrace.app"
+    write_macho(app / "Contents/MacOS/Talktrace")
     write_macho(app / "Contents/Frameworks/libnative.dylib")
     write_macho(app / "Contents/Resources/runtime/python/lib/extensions/native.so")
     write_macho(app / "Contents/Resources/runtime/python/bin/python3")
@@ -121,7 +121,7 @@ def test_ad_hoc_plan_is_inside_out_runtime_hardened_auditable_and_never_deep(tmp
     assert steps[-1]["role"] == "main-app"
     assert steps[-1]["relative_path"] == "."
     assert all(step["role"] != "main-executable" for step in steps)
-    assert plan["main_executable_relative_path"] == "Contents/MacOS/Meeting Copilot"
+    assert plan["main_executable_relative_path"] == "Contents/MacOS/Talktrace"
     assert [step["order"] for step in steps] == list(range(1, len(steps) + 1))
     assert all("--deep" not in step["command"] for step in steps)
     assert all("--options" in step["command"] for step in steps)

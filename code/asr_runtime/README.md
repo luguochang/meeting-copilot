@@ -1,6 +1,6 @@
 # Local ASR Runtime
 
-Local speech-recognition workers used by Meeting Copilot for realtime transcription, imported recordings, transcript refinement, punctuation, and speaker segmentation.
+Local speech-recognition workers used by Talktrace for realtime transcription, imported recordings, transcript refinement, punctuation, and speaker segmentation.
 
 ## Components
 

@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title">
+  <title id="title">Talktrace app icon</title>
+  <defs>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="24" flood-color="#122b2e" flood-opacity="0.16" stdDeviation="28"/>
+    </filter>
+  </defs>
+  <rect x="54" y="42" width="916" height="916" rx="214" fill="#f8faf9" filter="url(#shadow)"/>
+  <rect x="55" y="43" width="914" height="914" rx="213" fill="none" stroke="#d9e2df" stroke-width="6"/>
+  <g transform="translate(256 256) scale(4)">
+    <path d="M24 31h80M64 31v76" fill="none" stroke="#122b2e" stroke-linecap="round" stroke-linejoin="round" stroke-width="18"/>
+    <circle cx="24" cy="31" r="9" fill="#ef6a5b"/>
+    <circle cx="104" cy="31" r="9" fill="#20a98b"/>
+    <circle cx="64" cy="107" r="9" fill="#f0b84c"/>
+  </g>
+</svg>

@@ -96,7 +96,7 @@ def build_release_evidence(
     output_root = resolve_output_root(output_root)
     source_dir = output_root / "source"
     staged_app = source_dir / (app_path.name if app_path is not None else "app")
-    dmg_path = output_root / "Meeting Copilot_0.1.0_aarch64.public-release.dmg"
+    dmg_path = output_root / "Talktrace_0.1.0_aarch64.public-release.dmg"
 
     command_results: list[dict[str, Any]] = []
     execution_input_blockers = (
@@ -310,7 +310,7 @@ def _execute_release_sequence(
                 str(bundle_dmg_script),
                 "--skip-jenkins",
                 "--volname",
-                "Meeting Copilot",
+                "Talktrace",
                 "--app-drop-link",
                 "360",
                 "170",

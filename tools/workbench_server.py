@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Start, stop, and inspect the local Meeting Copilot Workbench backend."""
+"""Start, stop, and inspect the local Talktrace Workbench backend."""
 
 from __future__ import annotations
 

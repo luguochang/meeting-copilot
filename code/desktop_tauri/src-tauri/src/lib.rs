@@ -937,7 +937,7 @@ pub fn run() {
             provider_config_clear
         ])
         .build(tauri::generate_context!())
-        .expect("error while building Meeting Copilot desktop shell");
+        .expect("error while building Talktrace desktop shell");
     app.run(|app_handle, event| {
         if matches!(event, tauri::RunEvent::Exit) {
             if let Some(audio) =

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title">
+  <title id="title">Talktrace brand mark</title>
+  <path d="M24 31h80M64 31v76" fill="none" stroke="#122b2e" stroke-linecap="round" stroke-linejoin="round" stroke-width="18"/>
+  <circle cx="24" cy="31" r="9" fill="#ef6a5b"/>
+  <circle cx="104" cy="31" r="9" fill="#20a98b"/>
+  <circle cx="64" cy="107" r="9" fill="#f0b84c"/>
+</svg>

@@ -27,7 +27,7 @@ DEFAULT_OUTPUT_ROOT = REPO_ROOT / "artifacts/tmp/packaged_runtime_supervisor_smo
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 PORT_PATTERN = re.compile(r"(?:^|\s)--port\s+(\d+)(?:\s|$)")
 PACKAGED_APP_PROCESS_PATTERN = re.compile(
-    r"^(?P<binary>.+?Meeting Copilot\.app/Contents/MacOS/meeting-copilot-desktop)(?:\s|$)"
+    r"^(?P<binary>.+?Talktrace\.app/Contents/MacOS/meeting-copilot-desktop)(?:\s|$)"
 )
 
 

@@ -86,9 +86,9 @@ def validate_runtime_manifest(payload: Any) -> dict[str, Any]:
     if not isinstance(identity, dict):
         raise ValueError("runtime bundle manifest app_identity is missing")
     expected_identity = {
-        "product_name": "Meeting Copilot",
+        "product_name": "Talktrace",
         "bundle_identifier": "com.meetingcopilot.desktop",
-        "app_bundle_name": "Meeting Copilot.app",
+        "app_bundle_name": "Talktrace.app",
         "executable_name": "meeting-copilot-desktop",
     }
     if identity != expected_identity:

@@ -150,7 +150,7 @@ def test_runtime_manifest_and_tauri_register_one_system_audio_source_runtime():
 
 def test_packaged_gate_rejects_an_executable_script_in_place_of_packaged_macho(tmp_path):
     gate = _load_packaged_gate()
-    app = tmp_path / "Meeting Copilot.app"
+    app = tmp_path / "Talktrace.app"
     contents = app / "Contents"
     helper = contents / "Resources/MeetingCopilotRuntime.bundle/bin/meeting-copilot-native-system-audio"
     helper.parent.mkdir(parents=True)
@@ -160,7 +160,7 @@ def test_packaged_gate_rejects_an_executable_script_in_place_of_packaged_macho(t
         plistlib.dumps(
             {
                 "CFBundleIdentifier": "com.meetingcopilot.desktop",
-                "CFBundleName": "Meeting Copilot",
+                "CFBundleName": "Talktrace",
             }
         )
     )

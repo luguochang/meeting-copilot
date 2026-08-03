@@ -207,5 +207,5 @@ def test_demo_pipeline_cli_runs_as_direct_script():
     )
 
     assert result.returncode == 0
-    assert "Run a local Meeting Copilot demo pipeline" in result.stdout
+    assert "Run a local Talktrace demo pipeline" in result.stdout
     assert "--glossary" in result.stdout

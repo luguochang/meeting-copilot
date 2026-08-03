@@ -24,7 +24,7 @@ def _load_script():
 def _write_package_association_fixture(tmp_path, smoke):
     run_id = "packaged-file-asr"
     run_root = tmp_path / run_id
-    app = run_root / "Meeting Copilot.app"
+    app = run_root / "Talktrace.app"
     runtime = app / "Contents/Resources/MeetingCopilotRuntime.bundle"
     binary = app / "Contents/MacOS/meeting-copilot-desktop"
     component_paths = [
@@ -101,7 +101,7 @@ def _write_package_association_fixture(tmp_path, smoke):
 
 def test_runtime_resolution_is_app_relative_and_never_uses_repository_paths(tmp_path):
     smoke = _load_script()
-    app = tmp_path / "Renamed Delivery/Meeting Copilot.app"
+    app = tmp_path / "Renamed Delivery/Talktrace.app"
     runtime = app / "Contents/Resources/MeetingCopilotRuntime.bundle"
     runtime.mkdir(parents=True)
 
@@ -131,7 +131,7 @@ def test_fixture_hash_verification_fails_closed(tmp_path):
 
 def test_packaged_child_environment_clears_asr_path_hijacks(tmp_path):
     smoke = _load_script()
-    runtime = tmp_path / "Meeting Copilot.app/Contents/Resources/MeetingCopilotRuntime.bundle"
+    runtime = tmp_path / "Talktrace.app/Contents/Resources/MeetingCopilotRuntime.bundle"
     data_dir = tmp_path / "smoke/data"
     runtime.mkdir(parents=True)
     data_dir.mkdir(parents=True)
@@ -208,7 +208,7 @@ def test_packaged_smoke_names_only_resource_bundle_and_direct_backend_api():
 
 def test_usage_flags_are_derived_from_controls_not_claimed_constants(tmp_path):
     smoke = _load_script()
-    runtime = tmp_path / "Meeting Copilot.app/Contents/Resources/MeetingCopilotRuntime.bundle"
+    runtime = tmp_path / "Talktrace.app/Contents/Resources/MeetingCopilotRuntime.bundle"
     runtime.mkdir(parents=True)
     launcher = runtime / "bin/meeting-copilot-backend"
     converter = runtime / "runtime/backend-venv/lib/imageio-ffmpeg"
@@ -373,7 +373,7 @@ def test_cli_accepts_optional_package_evidence():
     smoke = _load_script()
 
     args = smoke.parse_args([
-        "--app", "Meeting Copilot.app",
+        "--app", "Talktrace.app",
         "--package-evidence", "evidence.json",
         "--fixture-manifest", "fixtures.json",
         "--wav", "fixture.wav",
@@ -394,7 +394,7 @@ def test_cli_returns_nonzero_for_package_evidence_no_go(monkeypatch, capsys):
     )
 
     exit_code = smoke.main([
-        "--app", "Meeting Copilot.app",
+        "--app", "Talktrace.app",
         "--fixture-manifest", "fixtures.json",
         "--wav", "fixture.wav",
         "--m4a", "fixture.m4a",
@@ -412,7 +412,7 @@ def test_report_safety_rejects_absolute_paths_and_bearer_secrets():
     smoke = _load_script()
 
     with pytest.raises(ValueError, match="absolute path"):
-        smoke.validate_report_safety({"app_path": "/Users/example/Meeting Copilot.app"})
+        smoke.validate_report_safety({"app_path": "/Users/example/Talktrace.app"})
     with pytest.raises(ValueError, match="absolute path"):
         smoke.validate_report_safety({"message": "launcher is /private/tmp/app/bin/backend"})
     with pytest.raises(ValueError, match="Bearer secret"):

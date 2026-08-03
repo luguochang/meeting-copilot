@@ -88,7 +88,7 @@ def _write_json(path: Path, payload: Any) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run a local Meeting Copilot demo pipeline.")
+    parser = argparse.ArgumentParser(description="Run a local Talktrace demo pipeline.")
     parser.add_argument("--provider-json", required=True, type=Path)
     parser.add_argument("--audio", required=True)
     parser.add_argument("--duration-seconds", required=True, type=float)

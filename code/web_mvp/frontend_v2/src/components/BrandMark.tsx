@@ -1,5 +1,5 @@
-import colorMark from "../assets/meeting-copilot-mark.png";
-import whiteMark from "../assets/meeting-copilot-mark-white.png";
+import colorMark from "../assets/talktrace-mark.svg";
+import whiteMark from "../assets/talktrace-mark-white.svg";
 
 interface BrandMarkProps {
   tone?: "color" | "white";

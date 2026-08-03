@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Meeting Copilot",
+  "productName": "Talktrace",
   "version": "0.1.0",
   "identifier": "com.meetingcopilot.desktop",
   "build": {
@@ -14,7 +14,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Meeting Copilot",
+        "title": "言迹 Talktrace",
         "width": 1280,
         "height": 860,
         "minWidth": 1024,

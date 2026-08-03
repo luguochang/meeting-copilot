@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build retention/delete reports for approved local Meeting Copilot artifacts."""
+"""Build retention/delete reports for approved local Talktrace artifacts."""
 
 from __future__ import annotations
 

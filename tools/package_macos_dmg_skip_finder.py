@@ -16,7 +16,7 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ARTIFACTS_TMP = (REPO_ROOT / "artifacts" / "tmp").resolve()
-DEFAULT_APP = REPO_ROOT / "artifacts/tmp/desktop_tauri_target/release/bundle/macos/Meeting Copilot.app"
+DEFAULT_APP = REPO_ROOT / "artifacts/tmp/desktop_tauri_target/release/bundle/macos/Talktrace.app"
 DEFAULT_BUNDLE_DMG_SCRIPT = REPO_ROOT / "artifacts/tmp/desktop_tauri_target/release/bundle/dmg/bundle_dmg.sh"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "artifacts/tmp/desktop_dmg_skip_finder_current"
 
@@ -258,8 +258,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--app", type=Path, default=DEFAULT_APP)
     parser.add_argument("--bundle-dmg-script", type=Path, default=DEFAULT_BUNDLE_DMG_SCRIPT)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
-    parser.add_argument("--volume-name", default="Meeting Copilot")
-    parser.add_argument("--dmg-name", default="Meeting Copilot_0.1.0_aarch64.skip-finder.signed-local.dmg")
+    parser.add_argument("--volume-name", default="Talktrace")
+    parser.add_argument("--dmg-name", default="Talktrace_0.1.0_aarch64.skip-finder.signed-local.dmg")
     parser.add_argument("--no-adhoc-sign", action="store_true")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args(argv)

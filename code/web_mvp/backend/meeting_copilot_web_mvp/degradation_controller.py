@@ -1,4 +1,4 @@
-"""5-level degradation controller for Meeting Copilot.
+"""5-level degradation controller for Talktrace.
 
 Implements the degradation strategy defined in PRD failure-and-degradation.md.
 Levels:

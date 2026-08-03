@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a single Zip64 Meeting Copilot offline capability package."""
+"""Build a single Zip64 Talktrace offline capability package."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ DEFAULT_RUNTIME_MANIFEST = (
     REPO_ROOT / "artifacts/tmp/wrb/MeetingCopilotRuntime.bundle/runtime-bundle-manifest.json"
 )
 DEFAULT_OUTPUT = REPO_ROOT / "artifacts/offline-release/2026-07-27"
-PACKAGE_NAME = "Meeting-Copilot-ASR-Full-0.1.0-Windows-x86_64.mcpkg"
+PACKAGE_NAME = "Talktrace-ASR-Full-0.1.0-Windows-x86_64.mcpkg"
 OFFLINE_PACKAGE_SCHEMA = "meeting_copilot.offline_capability_bundle.v1"
 PACK_ARCHIVE_SCHEMA = "meeting_copilot.capability_pack_archive.v1"
 
@@ -170,7 +170,7 @@ def build_offline_package(
         },
     }
     notice = (
-        "Meeting Copilot Windows x86_64 offline ASR package.\n"
+        "Talktrace Windows x86_64 offline ASR package.\n"
         "Import this .mcpkg from the Local Capabilities page; do not extract it manually.\n"
         "This build is unsigned and public model redistribution review is unresolved.\n"
     )

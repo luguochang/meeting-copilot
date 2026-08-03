@@ -23,10 +23,10 @@ def test_parse_mount_dir_handles_volume_names_with_spaces():
 
     output = """预计CRC32 $4132D7F0
 /dev/disk5          \tGUID_partition_scheme          \t
-/dev/disk5s1        \tApple_HFS                      \t/Volumes/Meeting Copilot
+/dev/disk5s1        \tApple_HFS                      \t/Volumes/Talktrace
 """
 
-    assert tool.parse_mount_dir(output) == Path("/Volumes/Meeting Copilot")
+    assert tool.parse_mount_dir(output) == Path("/Volumes/Talktrace")
 
 
 def test_bundle_command_uses_skip_jenkins_and_no_internet_enable(tmp_path):
@@ -34,15 +34,15 @@ def test_bundle_command_uses_skip_jenkins_and_no_internet_enable(tmp_path):
 
     command = tool.build_bundle_command(
         script=tmp_path / "bundle_dmg.sh",
-        output_dmg=tmp_path / "Meeting Copilot.dmg",
+        output_dmg=tmp_path / "Talktrace.dmg",
         source_dir=tmp_path / "source",
-        volume_name="Meeting Copilot",
+        volume_name="Talktrace",
     )
 
     assert command[:2] == [str(tmp_path / "bundle_dmg.sh"), "--skip-jenkins"]
     assert "--no-internet-enable" in command
     assert "/usr/bin/osascript" not in " ".join(command)
-    assert str(tmp_path / "Meeting Copilot.dmg") in command
+    assert str(tmp_path / "Talktrace.dmg") in command
     assert str(tmp_path / "source") in command
 
 
@@ -50,9 +50,9 @@ def test_direct_hdiutil_command_keeps_dmg_creation_finder_free(tmp_path):
     tool = load_tool_module()
 
     command = tool.build_direct_hdiutil_command(
-        output_dmg=tmp_path / "Meeting Copilot.dmg",
+        output_dmg=tmp_path / "Talktrace.dmg",
         source_dir=tmp_path / "source",
-        volume_name="Meeting Copilot",
+        volume_name="Talktrace",
     )
 
     assert command[:2] == ["hdiutil", "create"]

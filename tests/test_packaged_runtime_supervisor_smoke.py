@@ -17,7 +17,7 @@ def load_tool_module():
 
 def test_parse_process_table_and_find_backend_child(tmp_path):
     tool = load_tool_module()
-    app_path = tmp_path / "Meeting Copilot.app"
+    app_path = tmp_path / "Talktrace.app"
     runtime = app_path / "Contents/Resources/MeetingCopilotRuntime.bundle"
     runtime.mkdir(parents=True)
     (runtime / "runtime-bundle-manifest.json").write_text(
@@ -26,7 +26,7 @@ def test_parse_process_table_and_find_backend_child(tmp_path):
         encoding="utf-8",
     )
     output = (
-        " 100 1 /tmp/Meeting Copilot.app/Contents/MacOS/meeting-copilot-desktop\n"
+        " 100 1 /tmp/Talktrace.app/Contents/MacOS/meeting-copilot-desktop\n"
         f" 101 100 {runtime}/runtime/backend-python/bin/python3.13 "
         "-m uvicorn meeting_copilot_web_mvp.app:app --host 127.0.0.1 --port 54321\n"
     )
@@ -43,7 +43,7 @@ def test_parse_process_table_and_find_backend_child(tmp_path):
 
 def test_find_backend_rejects_unrelated_or_non_child_process(tmp_path):
     tool = load_tool_module()
-    app_path = tmp_path / "Meeting Copilot.app"
+    app_path = tmp_path / "Talktrace.app"
     runtime = app_path / "Contents/Resources/MeetingCopilotRuntime.bundle"
     runtime.mkdir(parents=True)
     (runtime / "runtime-bundle-manifest.json").write_text(
@@ -63,7 +63,7 @@ def test_find_backend_rejects_unrelated_or_non_child_process(tmp_path):
 
 def test_find_packaged_funasr_worker_requires_backend_parent_and_bundle_path(tmp_path):
     tool = load_tool_module()
-    app_path = tmp_path / "Meeting Copilot.app"
+    app_path = tmp_path / "Talktrace.app"
     runtime = app_path / "Contents/Resources/MeetingCopilotRuntime.bundle"
     command = (
         f"{runtime}/runtime/funasr-python/bin/python3.11 "
@@ -82,8 +82,8 @@ def test_find_packaged_funasr_worker_requires_backend_parent_and_bundle_path(tmp
 
 def test_find_conflicting_packaged_app_instances_reports_only_bounded_identity(tmp_path):
     tool = load_tool_module()
-    candidate = tmp_path / "candidate/Meeting Copilot.app"
-    binary_suffix = "Meeting Copilot.app/Contents/MacOS/meeting-copilot-desktop"
+    candidate = tmp_path / "candidate/Talktrace.app"
+    binary_suffix = "Talktrace.app/Contents/MacOS/meeting-copilot-desktop"
     processes = [
         {"pid": 101, "ppid": 1, "command": f"/Applications/{binary_suffix}"},
         {"pid": 102, "ppid": 1, "command": "/usr/bin/python3 local-server.py"},
@@ -100,7 +100,7 @@ def test_supervisor_smoke_fails_closed_before_launch_when_app_instance_exists(
 ):
     tool = load_tool_module()
     repo_root = tmp_path / "repo"
-    app_path = repo_root / "candidate/Meeting Copilot.app"
+    app_path = repo_root / "candidate/Talktrace.app"
     binary = app_path / "Contents/MacOS/meeting-copilot-desktop"
     binary.parent.mkdir(parents=True)
     binary.write_bytes(b"candidate")
@@ -113,7 +113,7 @@ def test_supervisor_smoke_fails_closed_before_launch_when_app_instance_exists(
                 "pid": 4321,
                 "ppid": 1,
                 "command": (
-                    "/Applications/Meeting Copilot.app/Contents/MacOS/"
+                    "/Applications/Talktrace.app/Contents/MacOS/"
                     "meeting-copilot-desktop"
                 ),
             }

@@ -29,8 +29,8 @@ AUDIBLE_RMS_THRESHOLD = 0.001
 
 def inspect_packaged_helper(app_path: Path) -> dict[str, Any]:
     app = app_path.resolve()
-    if app.name != "Meeting Copilot.app" or not app.is_dir():
-        raise ValueError("packaged gate requires Meeting Copilot.app")
+    if app.name != "Talktrace.app" or not app.is_dir():
+        raise ValueError("packaged gate requires Talktrace.app")
     info_path = app / "Contents/Info.plist"
     try:
         info = plistlib.loads(info_path.read_bytes())

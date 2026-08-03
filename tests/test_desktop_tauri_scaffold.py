@@ -1,9 +1,10 @@
 import json
 import re
 import struct
+import subprocess
 import tomllib
 import zlib
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -125,29 +126,40 @@ def test_required_tauri_scaffold_files_exist_without_generated_artifacts():
     ]
     assert missing == []
 
+    tracked_output = subprocess.run(
+        ["git", "ls-files", "--", "code/desktop_tauri"],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    tracked_files = [
+        PurePosixPath(path).relative_to("code/desktop_tauri")
+        for path in tracked_output
+    ]
     forbidden_files = [
-        path.relative_to(DESKTOP_ROOT).as_posix()
-        for path in DESKTOP_ROOT.rglob("*")
-        if path.is_file()
-        and (
-            path.name in FORBIDDEN_GENERATED_FILE_NAMES
-            or path.suffix in FORBIDDEN_GENERATED_SUFFIXES
-        )
+        path.as_posix()
+        for path in tracked_files
+        if path.name in FORBIDDEN_GENERATED_FILE_NAMES
+        or path.suffix in FORBIDDEN_GENERATED_SUFFIXES
     ]
     assert forbidden_files == []
 
-    forbidden_directories = [
-        path.relative_to(DESKTOP_ROOT).as_posix()
-        for path in DESKTOP_ROOT.rglob("*")
-        if path.is_dir() and path.name in FORBIDDEN_GENERATED_DIRECTORY_NAMES
-    ]
+    forbidden_directories = sorted(
+        {
+            part
+            for path in tracked_files
+            for part in path.parts
+            if part in FORBIDDEN_GENERATED_DIRECTORY_NAMES
+        }
+    )
     assert forbidden_directories == []
 
 
 def test_tauri_config_points_to_existing_web_mvp_and_declares_mac_dev_bundle_targets():
     config = _tauri_config()
 
-    assert config["productName"] == "Meeting Copilot"
+    assert config["productName"] == "Talktrace"
     assert config["version"] == "0.1.0"
     assert re.fullmatch(r"com\.meetingcopilot\.desktop", config["identifier"])
 
@@ -162,7 +174,7 @@ def test_tauri_config_points_to_existing_web_mvp_and_declares_mac_dev_bundle_tar
     assert app["withGlobalTauri"] is True
     assert [window["label"] for window in app["windows"]] == ["main"]
     main_window = app["windows"][0]
-    assert main_window["title"] == "Meeting Copilot"
+    assert main_window["title"] == "言迹 Talktrace"
     assert main_window["resizable"] is True
     assert main_window["visible"] is False
     assert main_window["minWidth"] >= 1024
@@ -190,7 +202,7 @@ def test_windows_tauri_overlay_declares_native_installers_and_webview_bootstrapp
 
     bundle = config["bundle"]
     assert bundle["active"] is True
-    assert set(bundle["targets"]) == {"nsis", "msi"}
+    assert set(bundle["targets"]) == {"nsis"}
     assert bundle["icon"] == ["icons/icon.ico"]
     assert bundle["windows"]["webviewInstallMode"] == {
         "type": "downloadBootstrapper",
@@ -244,11 +256,24 @@ def test_static_tauri_capability_stays_local_and_minimal():
     )
 
     assert capability["windows"] == ["main"]
-    assert capability["permissions"] == ["core:default"]
+    permission_ids = {
+        permission if isinstance(permission, str) else permission["identifier"]
+        for permission in capability["permissions"]
+    }
+    assert permission_ids == {"core:default", "opener:allow-open-url"}
+    opener = next(
+        permission
+        for permission in capability["permissions"]
+        if isinstance(permission, dict) and permission["identifier"] == "opener:allow-open-url"
+    )
+    assert {entry["url"] for entry in opener["allow"]} == {
+        "https://github.com/luguochang/meeting-copilot",
+        "https://blog.csdn.net/luguochang",
+        "https://codexai.club/",
+    }
     forbidden_permissions = {"shell", "fs", "process", "http", "dialog", "clipboard"}
-    permission_text = "\n".join(capability["permissions"]).lower()
     for permission in forbidden_permissions:
-        assert permission not in permission_text
+        assert all(not identifier.startswith(f"{permission}:") for identifier in permission_ids)
 
 
 def test_packaged_workbench_gets_exact_runtime_origin_and_command_permissions():

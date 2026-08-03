@@ -425,7 +425,7 @@ def test_sidecar_shutdown_reuses_one_total_deadline_across_stages(monkeypatch):
 
 
 def test_funasr_bundle_paths_can_be_injected_without_changing_default_layout(monkeypatch, tmp_path):
-    configured = tmp_path / "Meeting Copilot.app" / "Contents" / "Resources" / "models" / "funasr"
+    configured = tmp_path / "Talktrace.app" / "Contents" / "Resources" / "models" / "funasr"
     monkeypatch.setenv("MEETING_COPILOT_FUNASR_MODEL_DIR", str(configured))
 
     assert asr_stream._configured_local_path("MEETING_COPILOT_FUNASR_MODEL_DIR", Path("fallback")) == configured

@@ -628,28 +628,6 @@ export function ProviderSettingsControl() {
                     </div>
                   ) : null}
 
-                  {confirmingClear ? (
-                    <div className="provider-clear-confirm" role="alert">
-                      <span>确定移除已保存的 AI 配置？</span>
-                      <button type="button" onClick={() => setConfirmingClear(false)} disabled={Boolean(busy)}>取消</button>
-                      <button className="is-danger" type="button" onClick={() => void clear()} disabled={Boolean(busy)}>
-                        {busy === "clear" ? <LoaderCircle className="spin" size={14} /> : null}
-                        确认移除
-                      </button>
-                    </div>
-                  ) : null}
-
-                  <footer className="provider-settings-actions">
-                    {config.configured ? (
-                      <button className="danger-text-button" type="button" onClick={() => setConfirmingClear(true)} disabled={Boolean(busy) || confirmingClear}>
-                        <Trash2 size={15} />移除配置
-                      </button>
-                    ) : <span />}
-                    <button className="primary-button" type="submit" disabled={Boolean(busy)}>
-                      {busy === "save" ? <LoaderCircle className="spin" size={15} /> : null}
-                      {busy === "save" ? "正在测试" : "保存并测试"}
-                    </button>
-                  </footer>
                 </form>
               )}
 
@@ -675,6 +653,32 @@ export function ProviderSettingsControl() {
                 </div>
               </nav>
             </div>
+
+            {phase !== "unavailable" ? (
+              <footer className="provider-settings-actions">
+                {confirmingClear ? (
+                  <div className="provider-clear-confirm" role="alert">
+                    <span>确定移除已保存的 AI 配置？</span>
+                    <button type="button" onClick={() => setConfirmingClear(false)} disabled={Boolean(busy)}>取消</button>
+                    <button className="is-danger" type="button" onClick={() => void clear()} disabled={Boolean(busy)}>
+                      {busy === "clear" ? <LoaderCircle className="spin" size={14} /> : null}
+                      确认移除
+                    </button>
+                  </div>
+                ) : null}
+                <div className="provider-settings-action-row">
+                  {config.configured ? (
+                    <button className="danger-text-button" type="button" onClick={() => setConfirmingClear(true)} disabled={Boolean(busy) || confirmingClear}>
+                      <Trash2 size={15} />移除配置
+                    </button>
+                  ) : <span />}
+                  <button className="primary-button" type="submit" form="provider-config-panel" disabled={Boolean(busy)}>
+                    {busy === "save" ? <LoaderCircle className="spin" size={15} /> : null}
+                    {busy === "save" ? "正在测试" : "保存并测试"}
+                  </button>
+                </div>
+              </footer>
+            ) : null}
           </section>
         </div>
       ) : null}

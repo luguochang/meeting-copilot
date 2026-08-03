@@ -26,21 +26,21 @@ def test_parse_attach_plist_returns_mount_point_and_device():
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict><key>system-entities</key><array>
 <dict><key>dev-entry</key><string>/dev/disk9s1</string></dict>
-<dict><key>mount-point</key><string>/Volumes/Meeting Copilot</string><key>dev-entry</key><string>/dev/disk9s1</string></dict>
+<dict><key>mount-point</key><string>/Volumes/Talktrace</string><key>dev-entry</key><string>/dev/disk9s1</string></dict>
 </array></dict></plist>"""
 
-    assert tool.parse_attach_plist(raw) == (Path("/Volumes/Meeting Copilot"), "/dev/disk9s1")
+    assert tool.parse_attach_plist(raw) == (Path("/Volumes/Talktrace"), "/dev/disk9s1")
 
 
 def test_direct_dmg_and_attach_commands_cannot_use_finder_or_privileged_tools(tmp_path):
     tool = load_tool_module()
 
     create = tool.build_direct_hdiutil_command(
-        output_dmg=tmp_path / "Meeting Copilot.dmg",
+        output_dmg=tmp_path / "Talktrace.dmg",
         source_dir=tmp_path / "source",
-        volume_name="Meeting Copilot",
+        volume_name="Talktrace",
     )
-    attach = tool.build_attach_command(tmp_path / "Meeting Copilot.dmg")
+    attach = tool.build_attach_command(tmp_path / "Talktrace.dmg")
     all_commands = " ".join(create + attach)
 
     assert create[:2] == ["hdiutil", "create"]
@@ -53,18 +53,18 @@ def test_direct_dmg_and_attach_commands_cannot_use_finder_or_privileged_tools(tm
 
 def test_detach_command_has_stable_force_argument_layout(tmp_path):
     tool = load_tool_module()
-    mount_dir = Path("/Volumes/Meeting Copilot")
+    mount_dir = Path("/Volumes/Talktrace")
 
     assert tool.build_detach_command(mount_dir) == [
         "hdiutil",
         "detach",
-        "/Volumes/Meeting Copilot",
+        "/Volumes/Talktrace",
     ]
     assert tool.build_detach_command(mount_dir, force=True) == [
         "hdiutil",
         "detach",
         "-force",
-        "/Volumes/Meeting Copilot",
+        "/Volumes/Talktrace",
     ]
 
 

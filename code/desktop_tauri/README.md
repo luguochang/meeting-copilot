@@ -1,6 +1,6 @@
-# Meeting Copilot Desktop
+# Talktrace Desktop
 
-Tauri 2 desktop shell for Meeting Copilot. It owns native audio capture, local backend supervision, private storage, and secure AI provider credentials.
+Tauri 2 desktop shell for Talktrace. It owns native audio capture, local backend supervision, private storage, and secure AI provider credentials.
 
 ## Prerequisites
 

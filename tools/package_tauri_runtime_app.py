@@ -43,15 +43,15 @@ DIARIZATION_LICENSE_EVIDENCE_SCOPE = (
     "upstream_model_metadata_observed_not_public_redistribution_approval"
 )
 EXPECTED_APP_IDENTITY = {
-    "product_name": "Meeting Copilot",
+    "product_name": "Talktrace",
     "bundle_identifier": "com.meetingcopilot.desktop",
-    "app_bundle_name": "Meeting Copilot.app",
+    "app_bundle_name": "Talktrace.app",
     "executable_name": "meeting-copilot-desktop",
 }
 EXPECTED_WINDOWS_APP_IDENTITY = {
-    "product_name": "Meeting Copilot",
+    "product_name": "Talktrace",
     "bundle_identifier": "com.meetingcopilot.desktop",
-    "app_bundle_name": "Meeting Copilot.exe",
+    "app_bundle_name": "Talktrace.exe",
     "executable_name": "meeting-copilot-desktop.exe",
 }
 FILE_ASR_MODEL_NAMES = ("offline", "vad", "punc")
@@ -2089,7 +2089,7 @@ def find_built_app(target_dir: Path) -> Path:
         (
             candidate
             for candidate in candidates
-            if candidate.name == "Meeting Copilot.app"
+            if candidate.name == "Talktrace.app"
         ),
         candidates[0],
     )
@@ -3131,7 +3131,7 @@ def package_runtime_app(
         raise RuntimeError(f"Tauri app build failed with exit {completed.returncode}")
 
     built_app = find_built_app(target_dir)
-    packaged_app = run_root / "Meeting Copilot.app"
+    packaged_app = run_root / "Talktrace.app"
     clone_tree(built_app, packaged_app)
     resource_root = packaged_app / "Contents/Resources/MeetingCopilotRuntime.bundle"
     pre_sign_bytecode_cleanup = remove_python_bytecode(resource_root)

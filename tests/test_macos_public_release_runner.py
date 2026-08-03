@@ -24,7 +24,7 @@ def load_tool_module():
 
 
 def make_inputs(tmp_path):
-    app = tmp_path / "Meeting Copilot.app"
+    app = tmp_path / "Talktrace.app"
     app.mkdir()
     script = tmp_path / "bundle_dmg.sh"
     script.write_text("#!/bin/sh\n", encoding="utf-8")
@@ -226,7 +226,7 @@ def test_public_release_runner_uses_strict_developer_id_signer_before_notarizati
     assert strict_calls == [
         {
             "app_path": REPO_ROOT
-            / "artifacts/tmp/unit-public-release-ready/source/Meeting Copilot.app",
+            / "artifacts/tmp/unit-public-release-ready/source/Talktrace.app",
             "mode": "developer-id",
             "identity": identity,
         }
@@ -343,7 +343,7 @@ def test_public_release_runner_has_no_deep_fallback_when_strict_verification_fai
             str(app),
             str(
                 REPO_ROOT
-                / "artifacts/tmp/unit-public-release-strict-failed/source/Meeting Copilot.app"
+                / "artifacts/tmp/unit-public-release-strict-failed/source/Talktrace.app"
             ),
         ),
     ]
@@ -381,7 +381,7 @@ def test_execute_rejects_stale_inputs_before_preflight_or_mutation(tmp_path):
         raise AssertionError(f"stale inputs must fail before commands: {command}")
 
     evidence = tool.build_release_evidence(
-        app_path=tmp_path / "stale/Meeting Copilot.app",
+        app_path=tmp_path / "stale/Talktrace.app",
         bundle_dmg_script=tmp_path / "stale/bundle_dmg.sh",
         output_root=REPO_ROOT / "artifacts/tmp/unit-public-release-stale-inputs",
         developer_id_application="Developer ID Application: Example (TEAM123456)",

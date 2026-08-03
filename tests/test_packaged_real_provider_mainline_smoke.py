@@ -411,7 +411,7 @@ def test_require_changed_mode_rejects_forged_changed_evidence(
 def test_require_changed_correction_cli_is_explicit_and_defaults_off():
     required = [
         "--app-path",
-        "Meeting Copilot.app",
+        "Talktrace.app",
         "--audio-path",
         "controlled.wav",
         "--config",
@@ -440,7 +440,7 @@ def test_main_forwards_require_changed_correction_to_runner(monkeypatch, capsys)
     exit_code = smoke.main(
         [
             "--app-path",
-            "Meeting Copilot.app",
+            "Talktrace.app",
             "--audio-path",
             "controlled.wav",
             "--config",
@@ -505,7 +505,7 @@ def test_require_changed_poll_waits_for_a_terminal_correction(monkeypatch):
 
 def test_packaged_launch_command_contains_no_provider_secret():
     binary = Path(
-        "/Applications/Meeting Copilot.app/Contents/MacOS/meeting-copilot-desktop"
+        "/Applications/Talktrace.app/Contents/MacOS/meeting-copilot-desktop"
     )
     command = smoke.build_packaged_launch_command(binary, "sk-never-process-arg")
 
