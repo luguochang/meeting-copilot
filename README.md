@@ -1,12 +1,12 @@
-# Meeting Copilot
+# 言迹 Talktrace
 
-本地优先的中文技术会议助手。Meeting Copilot 将实时转写、议题跟踪、证据化建议、会后复盘和个人笔记放在同一个桌面工作台中。
+本地优先的中文技术会议工作台。言迹 Talktrace 将实时转写、议题跟踪、证据化建议、会后复盘和个人笔记放在同一个桌面工作台中。
 
 [官网](https://meeting.codexai.club/) · [GitHub](https://github.com/luguochang/meeting-copilot) · [CSDN 博客](https://blog.csdn.net/luguochang) · [AI 赞助商](https://codexai.club/)
 
 > 当前版本：Windows `0.1.0` 公开预览。项目采用单用户、本地运行模式；远程 AI 分析仅在用户主动配置 OpenAI-compatible 服务后启用。Windows 安装包尚未进行代码签名。
 
-![Meeting Copilot 界面预览](docs/assets/meeting-copilot-tour.gif)
+![言迹 Talktrace 界面预览](docs/assets/talktrace-tour.gif)
 
 ## 主要功能
 
@@ -19,15 +19,15 @@
 - **离线能力**：管理本地 ASR 能力包与运行状态。
 - **服务配置**：在桌面端保存并检测 OpenAI-compatible 分析服务。
 
-![会议历史](docs/assets/workbench-history.png)
+![会议历史](docs/assets/talktrace-workbench-history.png)
 
 ### 实时会议
 
-![实时会议工作台](docs/assets/workbench-live.png)
+![实时会议工作台](docs/assets/talktrace-workbench-live.png)
 
 ### 会后复盘
 
-![会后复盘](docs/assets/workbench-review.png)
+![会后复盘](docs/assets/talktrace-workbench-review.png)
 
 ## 下载 Windows 版
 
@@ -35,7 +35,7 @@
 
 | 文件 | 用途 | SHA-256 |
 | --- | --- | --- |
-| [Windows x64 安装程序](https://github.com/luguochang/meeting-copilot/releases/download/v0.1.0/Meeting-Copilot-0.1.0-windows-x64-base-unsigned.exe) | 当前用户安装与卸载 | `c14a267dcac6fc8641b02bc1e3d14255169a275acc2b697e3fcb0cb7c23e79c4` |
+| [Windows x64 安装程序](https://github.com/luguochang/meeting-copilot/releases/download/v0.1.0/Talktrace-0.1.0-windows-x64-base-unsigned.exe) | 当前用户安装与卸载 | `d0b1b44018ac4d728b91a8381faf6723b1b0c424b9923a5a4e6601dea264d5a5` |
 
 基础客户端包含桌面应用和本地服务，可以启动工作台、管理会议与笔记、配置 AI 分析服务并导入离线能力包。仓库和基础客户端不包含 ASR 模型；实时本地转写和录音文件转写需要另行取得许可明确、与平台匹配的 `.mcpkg` 能力包。当前完整能力包尚未公开分发。
 
@@ -131,6 +131,6 @@ cargo check --locked --manifest-path ..\code\desktop_tauri\src-tauri\Cargo.toml
 
 ## 许可
 
-第一方代码使用仓库中的 [Meeting Copilot Source License](LICENSE)。第三方依赖、模型、字体和二进制文件仍受各自许可约束，详见 [NOTICE](NOTICE) 与 [SBOM](sbom.cdx.json)。
+第一方代码使用仓库中的 [Talktrace Source License](LICENSE)。第三方依赖、模型、字体和二进制文件仍受各自许可约束，详见 [NOTICE](NOTICE) 与 [SBOM](sbom.cdx.json)。
 
 Copyright (c) 2026 [luguochang](https://github.com/luguochang).

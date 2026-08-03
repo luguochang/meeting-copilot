@@ -1,6 +1,6 @@
 # 架构说明
 
-Meeting Copilot 是单用户、本地优先的桌面应用。React 工作台通过回环地址访问 FastAPI 服务；Tauri 提供桌面生命周期、安全配置和原生音频桥接；本地 ASR 运行时负责实时与文件转写。
+言迹 Talktrace 是单用户、本地优先的桌面应用。React 工作台通过回环地址访问 FastAPI 服务；Tauri 提供桌面生命周期、安全配置和原生音频桥接；本地 ASR 运行时负责实时与文件转写。
 
 ```mermaid
 flowchart LR

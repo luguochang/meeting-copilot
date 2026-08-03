@@ -15,7 +15,7 @@
 安装目录只保存程序文件。会议数据库、录音、日志和能力包默认使用当前用户的 `%LOCALAPPDATA%`，以避免升级或卸载误删数据。要整体迁移到其他磁盘，请先完全退出客户端，再设置用户环境变量：
 
 ```powershell
-setx MEETING_COPILOT_STORAGE_DIR "E:\MeetingCopilotData"
+setx MEETING_COPILOT_STORAGE_DIR "E:\TalktraceData"
 ```
 
 重新启动后，新数据和导入的能力包会写入该目录。WebView2 运行缓存仍可能出现在系统盘的 `%LOCALAPPDATA%\com.meetingcopilot.desktop\EBWebView`，它不是模型目录。

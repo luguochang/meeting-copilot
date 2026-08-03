@@ -2,23 +2,23 @@
 
 ## Windows 安装程序
 
-在 [GitHub Release v0.1.0](https://github.com/luguochang/meeting-copilot/releases/tag/v0.1.0) 下载 `Meeting-Copilot-0.1.0-windows-x64-base-unsigned.exe`。
+在 [GitHub Release v0.1.0](https://github.com/luguochang/meeting-copilot/releases/tag/v0.1.0) 下载 `Talktrace-0.1.0-windows-x64-base-unsigned.exe`。
 
 安装程序 SHA-256：
 
 ```text
-c14a267dcac6fc8641b02bc1e3d14255169a275acc2b697e3fcb0cb7c23e79c4
+d0b1b44018ac4d728b91a8381faf6723b1b0c424b9923a5a4e6601dea264d5a5
 ```
 
 在 PowerShell 中校验下载文件：
 
 ```powershell
-Get-FileHash .\Meeting-Copilot-0.1.0-windows-x64-base-unsigned.exe -Algorithm SHA256
+Get-FileHash .\Talktrace-0.1.0-windows-x64-base-unsigned.exe -Algorithm SHA256
 ```
 
 当前安装程序尚未进行 Authenticode 代码签名，Windows SmartScreen 可能显示提示。请先确认下载来源和哈希，不要使用第三方重新打包的文件。
 
-安装后从开始菜单启动 Meeting Copilot。卸载时打开 Windows“设置 > 应用 > 已安装的应用”，找到 Meeting Copilot 并选择“卸载”。卸载应用不会代替用户的数据备份流程；需要保留的会议内容应先在应用中导出。
+安装后从开始菜单启动言迹 Talktrace。卸载时打开 Windows“设置 > 应用 > 已安装的应用”，找到 Talktrace 并选择“卸载”。卸载应用不会代替用户的数据备份流程；需要保留的会议内容应先在应用中导出。
 
 该安装包按当前用户安装，不要求管理员权限，也不会注册 Windows 服务、开机启动项或防火墙规则。首次启动时若系统缺少 Microsoft Edge WebView2 Runtime，安装器可能联网下载该系统组件。麦克风权限只在用户开始会议并选择音频输入时由 Windows 请求；导入录音和能力包时只读取用户主动选择的文件。
 
@@ -41,7 +41,7 @@ Get-FileHash .\Meeting-Copilot-0.1.0-windows-x64-base-unsigned.exe -Algorithm SH
 需要把数据库、录音、日志和能力包整体放到 D/E 盘时，在启动客户端前设置绝对路径。例如：
 
 ```powershell
-setx MEETING_COPILOT_STORAGE_DIR "D:\MeetingCopilotData"
+setx MEETING_COPILOT_STORAGE_DIR "D:\TalktraceData"
 ```
 
 完全退出客户端后重新启动，设置才会生效。不要把新目录放在安装目录内部，也不要在客户端运行时手动移动其中的文件。若要恢复默认路径，可执行 `reg delete HKCU\Environment /v MEETING_COPILOT_STORAGE_DIR /f` 后重新登录 Windows，或在“系统属性 > 环境变量”中删除同名用户变量。
