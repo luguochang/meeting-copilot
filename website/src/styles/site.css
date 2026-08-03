@@ -228,10 +228,20 @@
 }
 
 .hero-copy h1 {
+  display: flex;
   max-width: 600px;
+  flex-direction: column;
+  gap: 3px;
   margin-bottom: 14px;
   font-size: 52px;
   line-height: 1.12;
+}
+
+.hero-copy h1 small {
+  color: var(--color-primary-strong);
+  font-size: 19px;
+  font-weight: 650;
+  line-height: 1.2;
 }
 
 .hero-copy__promise {

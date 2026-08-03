@@ -9,6 +9,18 @@ export type ChangeLogEntry = {
 
 export const changelog: ChangeLogEntry[] = [
   {
+    date: '2026-08-03',
+    version: 'Brand Update',
+    status: '产品',
+    title: '品牌更新为言迹 Talktrace',
+    summary: '统一桌面客户端、官网、安装器和文档中的中英文名称与视觉标识，内部兼容标识保持不变。',
+    items: [
+      '中文名“言迹”对应英文名“Talktrace”，共同表达对话、证据与行动轨迹',
+      '更新应用图标、导航品牌、窗口标题、官网元数据与公开文档',
+      '保留原应用标识符、数据目录和环境变量，避免升级后历史数据不可见',
+    ],
+  },
+  {
     date: '2026-07-31',
     version: 'Windows Installer Update',
     status: '产品',
@@ -36,7 +48,7 @@ export const changelog: ChangeLogEntry[] = [
   },
   {
     date: '2026-07-30',
-    version: 'Meeting Copilot 0.1.0',
+    version: 'Talktrace 0.1.0',
     status: '公开预览',
     title: 'Windows 基础安装包进入公开预览',
     summary: '首版采用基础客户端与离线能力包分离交付，官网、下载清单、品牌图标和用户文档同步更新。',

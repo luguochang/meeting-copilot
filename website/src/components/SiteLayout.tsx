@@ -6,16 +6,16 @@ import { site } from '../content/site'
 
 const pageMetadata: Record<string, { title: string; description: string }> = {
   '/': {
-    title: 'Meeting Copilot · 技术会议的实时副驾驶',
+    title: '言迹 Talktrace · 本地优先的 AI 会议工作台',
     description: '让每一次技术会议，都更接近一个可执行的决定。',
   },
   '/docs': {
-    title: '产品文档 · Meeting Copilot',
-    description: '了解 Meeting Copilot 当前能力、OpenAI-compatible 分析服务、隐私与发布边界。',
+    title: '产品文档 · 言迹 Talktrace',
+    description: '了解言迹 Talktrace 当前能力、OpenAI-compatible 分析服务、隐私与发布边界。',
   },
   '/changelog': {
-    title: '更新日志 · Meeting Copilot',
-    description: '查看 Meeting Copilot 的产品、体验与官网更新。',
+    title: '更新日志 · 言迹 Talktrace',
+    description: '查看言迹 Talktrace 的产品、体验与官网更新。',
   },
 }
 
@@ -24,8 +24,8 @@ function PageMetadata() {
 
   useEffect(() => {
     const metadata = pageMetadata[pathname] || {
-      title: '页面未找到 · Meeting Copilot',
-      description: 'Meeting Copilot 产品网站。',
+      title: '页面未找到 · 言迹 Talktrace',
+      description: '言迹 Talktrace 产品网站。',
     }
     const canonicalPath = pageMetadata[pathname] ? pathname : '/'
     const canonicalUrl = new URL(canonicalPath, site.publicUrl).toString()

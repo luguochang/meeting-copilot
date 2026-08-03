@@ -12,7 +12,7 @@ export function WorkflowOrbit() {
       <div className="workflow-orbit__visual" aria-label="会议闭环五个步骤">
         <div className="workflow-orbit__ring" aria-hidden="true" />
         <div className="workflow-orbit__core" aria-live="polite">
-          <img src="/brand/meeting-copilot-mark.png" width="52" height="52" alt="" />
+          <img src="/brand/talktrace-mark.svg" width="52" height="52" alt="" />
           <span>0{activeIndex + 1} / 05</span>
           <strong>{activeStep.shortLabel}</strong>
         </div>

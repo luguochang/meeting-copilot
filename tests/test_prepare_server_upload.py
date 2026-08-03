@@ -7,7 +7,11 @@ import zipfile
 
 import pytest
 
-from tools.prepare_server_upload import INSTALLER_NAME, build_server_upload
+from tools.prepare_server_upload import (
+    GITHUB_INSTALLER_URL,
+    INSTALLER_NAME,
+    build_server_upload,
+)
 
 
 def _sha256(payload: bytes) -> str:
@@ -20,7 +24,7 @@ def _fixture_inputs(tmp_path: Path) -> tuple[Path, Path]:
     (website / "assets").mkdir(parents=True)
     (website / "releases").mkdir()
     release.mkdir()
-    (website / "index.html").write_text("<main>Meeting Copilot</main>", encoding="utf-8")
+    (website / "index.html").write_text("<main>Talktrace</main>", encoding="utf-8")
     (website / "assets/app.js").write_text("console.log('ok')", encoding="utf-8")
     (website / "releases/latest.json").write_text(
         json.dumps(
@@ -85,6 +89,37 @@ def test_build_server_upload_contains_site_and_download_tree(tmp_path: Path) -> 
         assert "downloads/meeting-copilot/channels/latest-windows-x64.json" in names
         assert "downloads/meeting-copilot/offline-packs/latest-windows-x64.json" in names
         assert "SERVER-UPLOAD-INVENTORY.json" in names
+
+
+def test_build_server_upload_accepts_matching_github_release_url(tmp_path: Path) -> None:
+    website, release = _fixture_inputs(tmp_path)
+    manifest_path = website / "releases/latest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["platforms"][0]["url"] = GITHUB_INSTALLER_URL
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    result = build_server_upload(
+        website_dist=website,
+        release_dir=release,
+        output=tmp_path / "server-upload.zip",
+    )
+
+    assert result["website_download_url"] == GITHUB_INSTALLER_URL
+
+
+def test_build_server_upload_rejects_unrelated_download_url(tmp_path: Path) -> None:
+    website, release = _fixture_inputs(tmp_path)
+    manifest_path = website / "releases/latest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["platforms"][0]["url"] = "https://example.com/other-installer.exe"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="does not point to packaged installer"):
+        build_server_upload(
+            website_dist=website,
+            release_dir=release,
+            output=tmp_path / "server-upload.zip",
+        )
 
 
 def test_build_server_upload_rejects_mismatched_channel_hash(tmp_path: Path) -> None:

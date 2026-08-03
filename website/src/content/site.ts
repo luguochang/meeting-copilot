@@ -16,16 +16,16 @@ export type Scenario = {
 const configuredTrialUrl = import.meta.env.VITE_TRIAL_URL?.trim()
 
 export const site = {
-  name: 'Meeting Copilot',
-  chineseName: '会议助手',
+  name: 'Talktrace',
+  chineseName: '言迹',
   publicUrl: 'https://meeting.codexai.club/',
   stage: 'Windows 0.1.0 · 公开预览',
   description:
-    'Meeting Copilot 是本地优先的中文会议助手，把连续转写整理成可阅读上下文，并在会中维护当前议题、建议和未闭环问题。',
+    '言迹 Talktrace 是本地优先的中文会议记录与知识整理工具，把连续转写整理成可阅读上下文，并在会中维护当前议题、建议和未闭环问题。',
   windowsDownloadUrl:
-    'https://github.com/luguochang/meeting-copilot/releases/download/v0.1.0/Meeting-Copilot-0.1.0-windows-x64-base-unsigned.exe',
+    'https://github.com/luguochang/meeting-copilot/releases/download/v0.1.0/Talktrace-0.1.0-windows-x64-base-unsigned.exe',
   windowsChecksumUrl:
-    'https://github.com/luguochang/meeting-copilot/releases/download/v0.1.0/Meeting-Copilot-0.1.0-windows-x64-base-unsigned.exe.sha256',
+    'https://github.com/luguochang/meeting-copilot/releases/download/v0.1.0/Talktrace-0.1.0-windows-x64-base-unsigned.exe.sha256',
   trialUrl: configuredTrialUrl || '/docs#release',
   trialLabel: configuredTrialUrl ? '提交反馈' : '查看发布说明',
   demoUrl: import.meta.env.VITE_DEMO_URL || '/#product-preview',

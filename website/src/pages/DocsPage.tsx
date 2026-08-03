@@ -57,7 +57,7 @@ export function DocsPage() {
             <span className="docs-kicker">01</span>
             <h2>当前产品是什么</h2>
             <p>
-              Meeting Copilot 是面向中文技术会议的实时副驾驶。它维护当前议题和未闭环问题，在仍来得及追问时给出一条带证据的建议；会后保留连续文字、录音和复盘。
+              言迹 Talktrace 是面向中文技术会议的本地优先工作台。它维护当前议题和未闭环问题，在仍来得及追问时给出一条带证据的建议；会后保留连续文字、录音和复盘。
             </p>
             <div className="docs-callout docs-callout--info">
               <Icon name="info" size={20} />

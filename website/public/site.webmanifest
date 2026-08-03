@@ -1,7 +1,7 @@
 {
-  "name": "Meeting Copilot 会议助手",
-  "short_name": "Meeting Copilot",
-  "description": "中文技术会议的实时副驾驶",
+  "name": "言迹 Talktrace",
+  "short_name": "Talktrace",
+  "description": "本地优先的 AI 会议记录与知识整理工具",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#F7F8FA",

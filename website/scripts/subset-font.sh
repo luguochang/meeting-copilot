@@ -6,7 +6,7 @@ TEMP_DIR="$(mktemp -d)"
 FONT_URL="https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/Variable/TTF/Subset/NotoSansSC-VF.ttf"
 SOURCE_FONT="$TEMP_DIR/NotoSansSC-VF.ttf"
 RANGED_FONT="$TEMP_DIR/NotoSansSC-site-range.ttf"
-OUTPUT_FONT="$ROOT_DIR/public/fonts/meeting-copilot-sans-sc.woff2"
+OUTPUT_FONT="$ROOT_DIR/public/fonts/talktrace-sans-sc.woff2"
 
 cleanup() {
   rm -rf "$TEMP_DIR"

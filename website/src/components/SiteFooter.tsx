@@ -34,7 +34,7 @@ export function SiteFooter() {
       <div className="site-footer__inner">
         <div className="site-footer__brand">
           <Brand inverse />
-          <p>技术会议的实时副驾驶。让重要问题在散会前被看见。</p>
+          <p>本地优先的会议记录与知识整理工具。让重要问题在散会前被看见。</p>
           <span>{site.stage}</span>
         </div>
         <div className="site-footer__links">
@@ -57,7 +57,7 @@ export function SiteFooter() {
         </div>
       </div>
       <div className="site-footer__legal">
-        <p>© 2026 luguochang. Meeting Copilot Windows 0.1.0 公开预览版。</p>
+        <p>© 2026 luguochang. 言迹 Talktrace Windows 0.1.0 公开预览版。</p>
         <p>产品截图使用脱敏演示数据，实际功能以安装包为准。</p>
       </div>
     </footer>

@@ -1,6 +1,6 @@
-# Meeting Copilot Website
+# Talktrace Website
 
-Meeting Copilot 的独立静态官网，使用 Vite、React 和 TypeScript 构建。官网只展示产品信息、截图、文档和发布清单，不连接本地会议数据库，也不保存 AI 服务密钥。
+言迹 Talktrace 的独立静态官网，使用 Vite、React 和 TypeScript 构建。官网只展示产品信息、截图、文档和发布清单，不连接本地会议数据库，也不保存 AI 服务密钥。
 
 ## 本地开发
 

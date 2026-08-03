@@ -1,9 +1,9 @@
 @font-face {
-  font-family: 'Meeting Copilot Sans';
+  font-family: 'Talktrace Sans';
   font-style: normal;
   font-display: swap;
   font-weight: 400 750;
-  src: url('/fonts/meeting-copilot-sans-sc.woff2') format('woff2-variations');
+  src: url('/fonts/talktrace-sans-sc.woff2') format('woff2-variations');
 }
 
 :root {
@@ -28,7 +28,7 @@
   --color-danger: #cc2936;
   --color-focus: #284dff;
 
-  --font-sans: 'Meeting Copilot Sans', 'Noto Sans SC', 'Source Han Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  --font-sans: 'Talktrace Sans', 'Noto Sans SC', 'Source Han Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif;
   --font-mono: 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
 
   --container: 1320px;

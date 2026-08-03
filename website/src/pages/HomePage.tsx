@@ -19,10 +19,13 @@ export function HomePage() {
               {site.stage}
               <a href="/changelog">查看更新</a>
             </div>
-            <h1 id="hero-title">Meeting Copilot</h1>
+            <h1 id="hero-title">
+              <span>言迹</span>
+              <small>Talktrace</small>
+            </h1>
             <p className="hero-copy__promise">让每一次技术会议，都更接近一个可执行的决定。</p>
             <p className="hero-copy__description">
-              Meeting Copilot 把连续发言整理成可阅读的会议上下文，维护当前议题与未闭环问题，并在还来得及追问时给出可以回到原话的建议。
+              言迹把连续发言整理成可阅读的会议上下文，维护当前议题与未闭环问题，并在还来得及追问时给出可以回到原话的建议。
             </p>
             <div className="hero-copy__actions">
               <a className="button button--primary button--large" href={site.windowsDownloadUrl}>
@@ -68,7 +71,7 @@ export function HomePage() {
       <section className="gap-section" id="problem" aria-labelledby="problem-title">
         <div className="container">
           <div className="section-heading section-heading--center" data-reveal>
-            <span className="eyebrow">为什么需要会议副驾驶</span>
+            <span className="eyebrow">在散会之前看见问题</span>
             <h2 id="problem-title">真正让技术会议失效的，往往不是没记录。</h2>
             <p>而是讨论结束后，关键工程条件仍然没有闭环。</p>
           </div>

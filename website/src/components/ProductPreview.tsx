@@ -10,15 +10,15 @@ const previewContent: Record<
   live: {
     label: '会中工作台',
     eyebrow: '连续文字、上下文选择与 Ask AI',
-    image: '/product/meeting-copilot-live-0.1.0-20260730.webp',
-    alt: 'Meeting Copilot 0.1.0 会中工作台，左侧显示连续会议文字，右侧提供上下文范围和 Ask AI 提问区',
+    image: '/product/talktrace-live-0.1.0-20260803.webp',
+    alt: '言迹 Talktrace 0.1.0 会中工作台，左侧显示连续会议文字，右侧提供上下文范围和 Ask AI 提问区',
     caption: '连续发言按时间整理成可回顾的上下文，右侧可按最近内容、当前章节或整场会议继续追问。',
   },
   review: {
     label: '会后复盘',
     eyebrow: '纪要、风险、问题与行动项',
-    image: '/product/meeting-copilot-review-0.1.0-20260730.webp',
-    alt: 'Meeting Copilot 0.1.0 会后复盘界面，展示会议摘要、关键结论、风险、未解问题、AI 建议与证据片段',
+    image: '/product/talktrace-review-0.1.0-20260803.webp',
+    alt: '言迹 Talktrace 0.1.0 会后复盘界面，展示会议摘要、关键结论、风险、未解问题、AI 建议与证据片段',
     caption: '会后在同一页查看摘要、结论、风险、未解问题、下一步与对应证据片段。',
   },
 }

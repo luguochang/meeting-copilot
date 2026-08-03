@@ -7,16 +7,16 @@ type BrandProps = {
 
 export function Brand({ inverse = false, compact = false }: BrandProps) {
   return (
-    <Link className={`brand${inverse ? ' brand--inverse' : ''}`} to="/" aria-label="Meeting Copilot 首页">
+    <Link className={`brand${inverse ? ' brand--inverse' : ''}`} to="/" aria-label="言迹 Talktrace 首页">
       <img
-        src={inverse ? '/brand/meeting-copilot-mark-white.png' : '/brand/meeting-copilot-mark.png'}
+        src={inverse ? '/brand/talktrace-mark-white.svg' : '/brand/talktrace-mark.svg'}
         width="40"
         height="40"
         alt=""
       />
       <span className="brand__text">
-        <strong>Meeting Copilot</strong>
-        {!compact && <small>会议助手</small>}
+        <strong>言迹</strong>
+        {!compact && <small>TALKTRACE</small>}
       </span>
     </Link>
   )

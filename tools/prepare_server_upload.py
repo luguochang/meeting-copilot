@@ -12,9 +12,22 @@ import zipfile
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_WEBSITE_DIST = REPO_ROOT / "website/dist"
-DEFAULT_RELEASE_DIR = REPO_ROOT / "artifacts/release/2026-07-27"
-DEFAULT_OUTPUT = DEFAULT_RELEASE_DIR / "Meeting-Copilot-0.1.0-server-upload.zip"
-INSTALLER_NAME = "Meeting-Copilot-0.1.0-windows-x64-base-unsigned.exe"
+DEFAULT_RELEASE_DIR = REPO_ROOT / "artifacts/release/2026-08-03"
+DEFAULT_OUTPUT = DEFAULT_RELEASE_DIR / "Talktrace-0.1.0-server-upload.zip"
+INSTALLER_NAME = "Talktrace-0.1.0-windows-x64-base-unsigned.exe"
+SELF_HOSTED_INSTALLER_URL = (
+    "/downloads/meeting-copilot/windows/0.1.0/" + INSTALLER_NAME
+)
+GITHUB_INSTALLER_URL = (
+    "https://github.com/luguochang/meeting-copilot/releases/download/v0.1.0/"
+    + INSTALLER_NAME
+)
+ALLOWED_INSTALLER_URLS = frozenset(
+    {
+        SELF_HOSTED_INSTALLER_URL,
+        GITHUB_INSTALLER_URL,
+    }
+)
 REQUIRED_RELEASE_FILES = (
     INSTALLER_NAME,
     f"{INSTALLER_NAME}.sha256",
@@ -70,9 +83,6 @@ def validate_inputs(website_dist: Path, release_dir: Path) -> dict[str, object]:
         raise ValueError("Windows release channel size does not match installer")
 
     website_release = read_json(website_dist / "releases/latest.json")
-    expected_url = (
-        "/downloads/meeting-copilot/windows/0.1.0/" + INSTALLER_NAME
-    )
     platforms = website_release.get("platforms")
     windows = next(
         (
@@ -82,11 +92,12 @@ def validate_inputs(website_dist: Path, release_dir: Path) -> dict[str, object]:
         ),
         None,
     ) if isinstance(platforms, list) else None
-    if not isinstance(windows, dict) or windows.get("url") != expected_url:
+    if not isinstance(windows, dict) or windows.get("url") not in ALLOWED_INSTALLER_URLS:
         raise ValueError("website release manifest does not point to packaged installer")
     return {
         "installer_sha256": observed_sha256,
         "installer_size_bytes": installer.stat().st_size,
+        "website_download_url": windows["url"],
         "website_version": website_release.get("version"),
     }
 
@@ -137,17 +148,18 @@ def build_server_upload(
         "schema_version": SCHEMA_VERSION,
         "website_root": "/",
         "installer_path": (
-            "/downloads/meeting-copilot/windows/0.1.0/" + INSTALLER_NAME
+            SELF_HOSTED_INSTALLER_URL
         ),
         "offline_package_included": False,
         "offline_package_distribution": "external_download_then_local_import",
         "file_count": len(entries) + 2,
         **validation,
     }
-    upload_readme = """Meeting Copilot server upload package
+    upload_readme = """Talktrace server upload package
 
 Extract this archive directly into the HTTPS website document root.
-The website is at the archive root and the Windows installer is under /downloads/.
+The website is at the archive root and a Windows installer mirror is under /downloads/.
+The public website may link to the matching GitHub Release asset instead.
 The multi-gigabyte offline ASR .mcpkg is intentionally not included; distribute it
 through the separately configured large-file download page and import it in the app.
 """

@@ -51,12 +51,12 @@ export function ReleasePanel() {
           height="112"
           loading="lazy"
           decoding="async"
-          alt="Meeting Copilot 应用图标"
+          alt="言迹 Talktrace 应用图标"
         />
       </div>
       <div className="release-panel__copy">
         <span className="eyebrow">{publicRelease ? 'Windows 公开预览' : 'Controlled Preview'}</span>
-        <h2>{publicRelease ? '下载 Meeting Copilot' : '先从一场真实技术会议开始内测。'}</h2>
+        <h2>{publicRelease ? '下载言迹 Talktrace' : '先从一场真实技术会议开始内测。'}</h2>
         <p>
           {manifest?.note ||
             '当前正在补齐桌面原生采集、签名、公证和干净机器安装验证。官网先开放产品演示与内测申请。'}
