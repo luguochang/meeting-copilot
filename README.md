@@ -35,7 +35,7 @@
 
 | 文件 | 用途 | SHA-256 |
 | --- | --- | --- |
-| [Windows x64 安装程序](https://github.com/luguochang/meeting-copilot/releases/download/v0.1.0/Talktrace-0.1.0-windows-x64-base-unsigned.exe) | 当前用户安装与卸载 | `d0b1b44018ac4d728b91a8381faf6723b1b0c424b9923a5a4e6601dea264d5a5` |
+| [Windows x64 安装程序](https://github.com/luguochang/meeting-copilot/releases/download/v0.1.0/Talktrace-0.1.0-windows-x64-base-unsigned.exe) | 当前用户安装与卸载 | `7d077e35f1e67da059a1291865d858f95eaa25c7257387b298b80187cc405463` |
 
 基础客户端包含桌面应用和本地服务，可以启动工作台、管理会议与笔记、配置 AI 分析服务并导入离线能力包。仓库和基础客户端不包含 ASR 模型；实时本地转写和录音文件转写需要另行取得许可明确、与平台匹配的 `.mcpkg` 能力包。当前完整能力包尚未公开分发。
 
