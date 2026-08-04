@@ -18,7 +18,7 @@ const configuredTrialUrl = import.meta.env.VITE_TRIAL_URL?.trim()
 export const site = {
   name: 'Talktrace',
   chineseName: '言迹',
-  publicUrl: 'https://meeting.codexai.club/',
+  publicUrl: 'https://talktrace.codexai.club/',
   stage: 'Windows 0.1.0 · 公开预览',
   description:
     '言迹 Talktrace 是本地优先的中文会议记录与知识整理工具，把连续转写整理成可阅读上下文，并在会中维护当前议题、建议和未闭环问题。',

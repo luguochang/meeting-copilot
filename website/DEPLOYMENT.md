@@ -2,7 +2,7 @@
 
 官网是纯静态 Vite 应用，不需要常驻 Node.js 服务或数据库。
 
-正式域名使用 `https://meeting.codexai.club/`。根域名 `https://codexai.club/` 继续作为 AI 赞助商与中转服务地址，不应被官网静态文件覆盖。
+正式域名使用 `https://talktrace.codexai.club/`。旧域名 `https://meeting.codexai.club/` 仅作为迁移期兼容入口。根域名 `https://codexai.club/` 继续作为 AI 赞助商与中转服务地址，不应被官网静态文件覆盖。
 
 ## 构建
 
@@ -19,7 +19,7 @@ npm run check
 ```nginx
 server {
     listen 80;
-    server_name meeting.codexai.club;
+    server_name talktrace.codexai.club;
     root /var/www/meeting-copilot;
     index index.html;
 

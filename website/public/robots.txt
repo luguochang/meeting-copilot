@@ -1,4 +1,4 @@
 User-agent: *
 Allow: /
 
-Sitemap: https://meeting.codexai.club/sitemap.xml
+Sitemap: https://talktrace.codexai.club/sitemap.xml
