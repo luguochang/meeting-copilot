@@ -205,6 +205,8 @@ npm run check
 | [安装指南](docs/installation.md) | 安装、能力包、源码运行和 AI 服务配置 |
 | [使用指南](docs/user-guide.md) | 会议、导入、复盘、笔记和离线能力 |
 | [架构说明](docs/architecture.md) | 组件职责、数据流和安全边界 |
+| [实时智能质量提升方案](docs/realtime-intelligence-quality-and-agent-decision-plan.md) | 分片诊断、语义窗口、任务拆分、质量评测与 Pi Go / No-Go |
+| [实时对话 Agent 产品与技术方案](docs/pi-agent-product-and-technical-design.md) | 双音轨实时教练、Pi 边界、腾讯会议采集、介入策略与实施路线 |
 | [开发指南](docs/development.md) | 开发环境、命令、测试和贡献约定 |
 | [隐私说明](docs/privacy.md) | 本地数据、远程调用和删除边界 |
 | [故障排查](docs/troubleshooting.md) | 启动、音频、转写与 AI 配置问题 |
