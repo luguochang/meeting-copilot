@@ -21,6 +21,8 @@ from meeting_copilot_web_mvp.realtime_intelligence import (
     build_llm_first_event_context,
     run_realtime_intelligence,
     run_realtime_coach,
+    run_realtime_coach_routed,
+    run_realtime_coach_via_pi,
     should_run_realtime_coach,
 )
 
@@ -612,6 +614,100 @@ async def _test_coach_runner_suppresses_low_confidence_interventions() -> None:
     assert result["intervention"] is None
     assert provider.parameters["max_completion_tokens"] == 768
     assert provider.idempotency_key.endswith(":coach:v1")
+
+
+class _PiRuntime:
+    def __init__(self, response=None, error: Exception | None = None) -> None:
+        self.response = response
+        self.error = error
+        self.payload = None
+
+    async def evaluate(self, payload):
+        self.payload = payload
+        if self.error is not None:
+            raise self.error
+        return self.response
+
+
+def _pi_provider_config() -> dict:
+    return {
+        "base_url": "https://llm.example.test",
+        "api_key": "test-key",
+        "model": "coach-model",
+        "api_style": "chat_completions",
+        "timeout_seconds": 12,
+    }
+
+
+def test_pi_coach_runner_preserves_the_existing_evidence_contract() -> None:
+    asyncio.run(_test_pi_coach_runner_preserves_the_existing_evidence_contract())
+
+
+async def _test_pi_coach_runner_preserves_the_existing_evidence_contract() -> None:
+    request = _coach_request()
+    quote = request.new_paragraphs[0].text
+    pi_runtime = _PiRuntime(
+        {
+            "action": "intervention",
+            "intervention": {
+                "event_type": "question_to_user",
+                "title": "Answer now",
+                "recommendation": "State the dependency before promising a date.",
+                "reason": "The remote party asked for a firm date.",
+                "evidence_segment_ids": ["remote-4"],
+                "evidence_quote": quote,
+                "urgency": "high",
+                "confidence": 0.92,
+            },
+            "metrics": {
+                "elapsed_ms": 840,
+                "turns": 2,
+                "tool_calls": 2,
+                "context_reads": 1,
+                "usage": {"prompt_tokens": 90, "completion_tokens": 20, "total_tokens": 110},
+            },
+        }
+    )
+    usages = []
+
+    result = await run_realtime_coach_via_pi(
+        request=request,
+        pi_runtime=pi_runtime,
+        provider_config=_pi_provider_config(),
+        on_usage=lambda usage, attempt: usages.append((attempt, usage)),
+    )
+
+    assert result["intervention"] is not None
+    assert result["intervention"].evidence_segment_ids == ("remote-4",)
+    assert result["transport_mode"] == "pi_agent_jsonl"
+    assert result["agent_metrics"]["turns"] == 2
+    assert pi_runtime.payload["context"]["new_paragraphs"][0]["source_track"] == "system_audio"
+    assert pi_runtime.payload["provider"]["model"] == "coach-model"
+    assert usages == [(1, {"prompt_tokens": 90, "completion_tokens": 20, "total_tokens": 110})]
+
+
+def test_pi_runtime_failure_falls_back_to_the_direct_coach() -> None:
+    asyncio.run(_test_pi_runtime_failure_falls_back_to_the_direct_coach())
+
+
+async def _test_pi_runtime_failure_falls_back_to_the_direct_coach() -> None:
+    class ExpectedPiError(RuntimeError):
+        code = "pi_unavailable"
+
+    direct_provider = _Provider(json.dumps({"intervention": None}))
+    result = await run_realtime_coach_routed(
+        request=_coach_request(),
+        provider=direct_provider,
+        requested_runtime="pi",
+        pi_runtime=_PiRuntime(error=ExpectedPiError("not installed")),
+        pi_provider_config=_pi_provider_config(),
+    )
+
+    assert result["intervention"] is None
+    assert result["runtime_requested"] == "pi"
+    assert result["runtime_used"] == "direct"
+    assert result["fallback_error_code"] == "pi_unavailable"
+    assert len(direct_provider.calls) == 1
 
 
 def test_runner_validates_one_structured_response_and_returns_latency_usage() -> None:

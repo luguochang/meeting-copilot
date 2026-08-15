@@ -1,0 +1,467 @@
+import { Agent } from "@earendil-works/pi-agent-core";
+import {
+  Type,
+  createModels,
+  createProvider,
+} from "@earendil-works/pi-ai";
+import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
+import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
+
+export const PROTOCOL = "talktrace-pi-coach-jsonl.v1";
+
+const EVENT_TYPES = new Set([
+  "question_to_user",
+  "commitment_risk",
+  "goal_at_risk",
+  "contradiction",
+]);
+const URGENCIES = new Set(["low", "medium", "high"]);
+const MAX_SESSION_USER_TURNS = 4;
+const MAX_AGENT_TURNS_PER_EVALUATION = 4;
+const MAX_SESSIONS = 8;
+
+const SYSTEM_PROMPT = [
+  "You are Talktrace's private realtime conversation coach.",
+  "You assist only the person running Talktrace; this is not a meeting summary task.",
+  "Most moments require no interruption. A useful intervention must still be actionable now, be grounded in quoted evidence, and reduce a concrete loss.",
+  "Allowed events are question_to_user, commitment_risk, goal_at_risk, and contradiction.",
+  "system_audio/remote_mix usually represents the remote computer-audio mix. microphone/self_or_room is not guaranteed to be the local user.",
+  "Use read_realtime_context only when the new utterance alone is insufficient. Never invent a person, number, deadline, position, or goal.",
+  "Match the language of the latest dialogue in the intervention, which will usually be Chinese.",
+  "You must finish by calling exactly one terminal tool: submit_intervention or keep_silent. Do not answer with ordinary text.",
+].join(" ");
+
+const readContextParameters = Type.Object(
+  {
+    scope: Type.Union([
+      Type.Literal("semantic_windows"),
+      Type.Literal("rolling_state"),
+      Type.Literal("meeting_goal"),
+    ]),
+  },
+  { additionalProperties: false },
+);
+
+const interventionParameters = Type.Object(
+  {
+    event_type: Type.Union([
+      Type.Literal("question_to_user"),
+      Type.Literal("commitment_risk"),
+      Type.Literal("goal_at_risk"),
+      Type.Literal("contradiction"),
+    ]),
+    title: Type.String({ minLength: 1, maxLength: 80 }),
+    recommendation: Type.String({ minLength: 8, maxLength: 120 }),
+    reason: Type.String({ minLength: 1, maxLength: 300 }),
+    evidence_segment_ids: Type.Array(Type.String({ minLength: 1, maxLength: 200 }), {
+      minItems: 1,
+      maxItems: 12,
+    }),
+    evidence_quote: Type.String({ minLength: 1, maxLength: 1000 }),
+    urgency: Type.Union([
+      Type.Literal("low"),
+      Type.Literal("medium"),
+      Type.Literal("high"),
+    ]),
+    confidence: Type.Number({ minimum: 0, maximum: 1 }),
+  },
+  { additionalProperties: false },
+);
+
+const silentParameters = Type.Object(
+  {
+    reason: Type.String({ minLength: 1, maxLength: 160 }),
+  },
+  { additionalProperties: false },
+);
+
+export class PiCoachProtocolError extends Error {
+  constructor(message, code = "pi_protocol_error") {
+    super(message);
+    this.name = "PiCoachProtocolError";
+    this.code = code;
+  }
+}
+
+function requiredText(value, field, maximum) {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new PiCoachProtocolError(`${field} must be non-empty text`, "invalid_request");
+  }
+  const normalized = value.trim();
+  if (normalized.length > maximum) {
+    throw new PiCoachProtocolError(`${field} is too long`, "invalid_request");
+  }
+  return normalized;
+}
+
+function optionalText(value, maximum) {
+  if (value === undefined || value === null || String(value).trim() === "") {
+    return null;
+  }
+  const normalized = String(value).trim();
+  if (normalized.length > maximum) {
+    throw new PiCoachProtocolError("optional text is too long", "invalid_request");
+  }
+  return normalized;
+}
+
+function validateParagraphs(value, field, maximumItems) {
+  if (!Array.isArray(value) || value.length > maximumItems) {
+    throw new PiCoachProtocolError(`${field} must be a bounded array`, "invalid_request");
+  }
+  return value.map((item, index) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw new PiCoachProtocolError(`${field}[${index}] must be an object`, "invalid_request");
+    }
+    return {
+      id: requiredText(item.id, `${field}[${index}].id`, 240),
+      text: requiredText(item.text, `${field}[${index}].text`, 16000),
+      revision: Number.isInteger(item.revision) && item.revision > 0 ? item.revision : 1,
+      start_ms: Number.isInteger(item.start_ms) && item.start_ms >= 0 ? item.start_ms : null,
+      end_ms: Number.isInteger(item.end_ms) && item.end_ms >= 0 ? item.end_ms : null,
+      speaker: optionalText(item.speaker, 120),
+      speaker_confidence:
+        typeof item.speaker_confidence === "number" && item.speaker_confidence >= 0 && item.speaker_confidence <= 1
+          ? item.speaker_confidence
+          : null,
+      source_track: ["microphone", "system_audio", "unknown"].includes(item.source_track)
+        ? item.source_track
+        : "unknown",
+      role_hint: ["self_or_room", "remote_mix", "unknown"].includes(item.role_hint)
+        ? item.role_hint
+        : "unknown",
+    };
+  });
+}
+
+function validateContext(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new PiCoachProtocolError("context must be an object", "invalid_request");
+  }
+  const newParagraphs = validateParagraphs(value.new_paragraphs, "context.new_paragraphs", 8);
+  if (newParagraphs.length === 0) {
+    throw new PiCoachProtocolError("context.new_paragraphs must not be empty", "invalid_request");
+  }
+  const contextParagraphs = validateParagraphs(value.context_paragraphs ?? [], "context.context_paragraphs", 3);
+  const semanticWindows = Array.isArray(value.semantic_windows) ? value.semantic_windows.slice(-8) : [];
+  const rollingState = value.rolling_state && typeof value.rolling_state === "object" ? value.rolling_state : {};
+  const serialized = JSON.stringify({ newParagraphs, contextParagraphs, semanticWindows, rollingState });
+  if (serialized.length > 80000) {
+    throw new PiCoachProtocolError("context exceeds the bridge byte budget", "invalid_request");
+  }
+  return {
+    state_revision: Number.isInteger(value.state_revision) && value.state_revision > 0 ? value.state_revision : 1,
+    new_paragraphs: newParagraphs,
+    context_paragraphs: contextParagraphs,
+    semantic_windows: semanticWindows,
+    rolling_state: rollingState,
+    meeting_goal: optionalText(value.meeting_goal, 2000),
+  };
+}
+
+export function validateEvaluationRequest(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new PiCoachProtocolError("request must be an object", "invalid_request");
+  }
+  return {
+    request_id: requiredText(value.request_id, "request_id", 160),
+    session_id: requiredText(value.session_id, "session_id", 160),
+    provider: value.provider,
+    context: validateContext(value.context),
+  };
+}
+
+function normalizeGatewayBaseUrl(value) {
+  const raw = requiredText(value, "provider.base_url", 2048).replace(/\/+$/, "");
+  const parsed = new URL(raw);
+  if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) {
+    throw new PiCoachProtocolError("provider.base_url is not a supported absolute URL", "invalid_provider");
+  }
+  return raw.endsWith("/v1") ? raw : `${raw}/v1`;
+}
+
+export function createOpenAICompatibleBackend(providerInput) {
+  if (!providerInput || typeof providerInput !== "object" || Array.isArray(providerInput)) {
+    throw new PiCoachProtocolError("provider must be an object", "invalid_provider");
+  }
+  const apiKey = requiredText(providerInput.api_key, "provider.api_key", 8192);
+  const modelId = requiredText(providerInput.model, "provider.model", 240);
+  const apiStyle = providerInput.api_style === "responses" ? "responses" : "chat_completions";
+  const api = apiStyle === "responses" ? "openai-responses" : "openai-completions";
+  const baseUrl = normalizeGatewayBaseUrl(providerInput.base_url);
+  const providerId = "talktrace-openai-compatible";
+  const model = {
+    id: modelId,
+    name: modelId,
+    api,
+    provider: providerId,
+    baseUrl,
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 128000,
+    maxTokens: 4096,
+  };
+  const provider = createProvider({
+    id: providerId,
+    name: "Talktrace configured gateway",
+    baseUrl,
+    auth: {
+      apiKey: {
+        name: "Talktrace runtime API key",
+        resolve: async () => ({ auth: { apiKey }, source: "runtime" }),
+      },
+    },
+    models: [model],
+    api: apiStyle === "responses" ? openAIResponsesApi() : openAICompletionsApi(),
+  });
+  const models = createModels();
+  models.setProvider(provider);
+  const configuredModel = models.getModel(providerId, modelId);
+  if (!configuredModel) {
+    throw new PiCoachProtocolError("Pi could not register the configured model", "invalid_provider");
+  }
+  const timeoutMs = Math.max(1000, Math.min(Number(providerInput.timeout_ms) || 25000, 30000));
+  return {
+    identity: `${api}:${baseUrl}:${modelId}`,
+    model: configuredModel,
+    streamFn: (activeModel, context, options) =>
+      models.streamSimple(activeModel, context, {
+        ...options,
+        temperature: 0.1,
+        maxTokens: 768,
+        timeoutMs,
+        maxRetries: 0,
+        cacheRetention: "short",
+      }),
+  };
+}
+
+function pruneContext(messages) {
+  const userIndexes = [];
+  messages.forEach((message, index) => {
+    if (message.role === "user") userIndexes.push(index);
+  });
+  if (userIndexes.length <= MAX_SESSION_USER_TURNS) return messages;
+  return messages.slice(userIndexes[userIndexes.length - MAX_SESSION_USER_TURNS]);
+}
+
+function evidenceTextById(context) {
+  return new Map(
+    [...context.context_paragraphs, ...context.new_paragraphs].map((paragraph) => [paragraph.id, paragraph.text]),
+  );
+}
+
+function validateInterventionEvidence(intervention, context) {
+  if (!EVENT_TYPES.has(intervention.event_type) || !URGENCIES.has(intervention.urgency)) {
+    throw new PiCoachProtocolError("intervention enum is unsupported", "invalid_agent_action");
+  }
+  const evidence = evidenceTextById(context);
+  const uniqueIds = [...new Set(intervention.evidence_segment_ids)];
+  if (uniqueIds.length !== intervention.evidence_segment_ids.length) {
+    throw new PiCoachProtocolError("evidence ids must be unique", "invalid_agent_action");
+  }
+  const texts = uniqueIds.map((id) => {
+    const text = evidence.get(id);
+    if (!text) throw new PiCoachProtocolError("intervention referenced unknown evidence", "invalid_agent_action");
+    return text;
+  });
+  if (!texts.some((text) => text.includes(intervention.evidence_quote)) && !texts.join("\n").includes(intervention.evidence_quote)) {
+    throw new PiCoachProtocolError("evidence quote is not verbatim input", "invalid_agent_action");
+  }
+  return { ...intervention, evidence_segment_ids: uniqueIds };
+}
+
+function selectContext(scope, context) {
+  if (scope === "semantic_windows") return { semantic_windows: context.semantic_windows };
+  if (scope === "rolling_state") return { rolling_state: context.rolling_state };
+  return { meeting_goal: context.meeting_goal };
+}
+
+function setTerminalAction(entry, action) {
+  if (entry.run.terminalAction) {
+    throw new PiCoachProtocolError("the agent selected more than one terminal action", "invalid_agent_action");
+  }
+  entry.run.terminalAction = action;
+}
+
+function createRestrictedTools(entry) {
+  return [
+    {
+      name: "read_realtime_context",
+      label: "Read realtime context",
+      description: "Read one bounded part of the current Talktrace context when necessary for the decision.",
+      parameters: readContextParameters,
+      executionMode: "sequential",
+      execute: async (_toolCallId, params) => {
+        entry.run.contextReads += 1;
+        return {
+          content: [{ type: "text", text: JSON.stringify(selectContext(params.scope, entry.activeContext)) }],
+          details: { scope: params.scope },
+        };
+      },
+    },
+    {
+      name: "submit_intervention",
+      label: "Submit intervention",
+      description: "Submit one evidence-grounded intervention that is still useful right now, then stop.",
+      parameters: interventionParameters,
+      executionMode: "sequential",
+      execute: async (_toolCallId, params) => {
+        const intervention = validateInterventionEvidence(params, entry.activeContext);
+        setTerminalAction(entry, { action: "intervention", intervention });
+        return {
+          content: [{ type: "text", text: "Intervention accepted." }],
+          details: { action: "intervention", event_type: intervention.event_type },
+          terminate: true,
+        };
+      },
+    },
+    {
+      name: "keep_silent",
+      label: "Keep silent",
+      description: "Choose no interruption because there is no sufficiently valuable realtime action, then stop.",
+      parameters: silentParameters,
+      executionMode: "sequential",
+      execute: async (_toolCallId, params) => {
+        setTerminalAction(entry, { action: "silent", reason: params.reason });
+        return {
+          content: [{ type: "text", text: "Silence accepted." }],
+          details: { action: "silent" },
+          terminate: true,
+        };
+      },
+    },
+  ];
+}
+
+function buildPrompt(context) {
+  return JSON.stringify({
+    task: "decide_realtime_coaching_intervention",
+    state_revision: context.state_revision,
+    new_paragraphs: context.new_paragraphs,
+    reminder: "Use exactly one terminal tool. Read additional context only if needed.",
+  });
+}
+
+function createSessionEntry(sessionId, backend) {
+  const entry = {
+    sessionId,
+    backendIdentity: backend.identity,
+    activeContext: null,
+    run: null,
+    agent: null,
+  };
+  const tools = createRestrictedTools(entry);
+  entry.agent = new Agent({
+    initialState: {
+      systemPrompt: SYSTEM_PROMPT,
+      model: backend.model,
+      thinkingLevel: "off",
+      tools,
+      messages: [],
+    },
+    streamFn: backend.streamFn,
+    transformContext: async (messages) => pruneContext(messages),
+    toolExecution: "sequential",
+    sessionId,
+    shouldStopAfterTurn: () => entry.run.turns >= MAX_AGENT_TURNS_PER_EVALUATION,
+    beforeToolCall: async () => {
+      entry.run.toolCalls += 1;
+      if (entry.run.toolCalls > 8) {
+        return { block: true, reason: "Tool-call budget exhausted.", terminate: true };
+      }
+      return undefined;
+    },
+  });
+  entry.agent.subscribe((event) => {
+    if (event.type === "turn_start" && entry.run) entry.run.turns += 1;
+  });
+  return entry;
+}
+
+function usageFromMessages(messages) {
+  return messages.reduce(
+    (total, message) => {
+      if (message.role !== "assistant" || !message.usage) return total;
+      total.prompt_tokens += Number(message.usage.input || 0) + Number(message.usage.cacheRead || 0);
+      total.completion_tokens += Number(message.usage.output || 0);
+      total.total_tokens = total.prompt_tokens + total.completion_tokens;
+      return total;
+    },
+    { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+  );
+}
+
+export class PiCoachRuntime {
+  constructor({ backendFactory = createOpenAICompatibleBackend, clock = () => performance.now() } = {}) {
+    this.backendFactory = backendFactory;
+    this.clock = clock;
+    this.sessions = new Map();
+  }
+
+  get sessionCount() {
+    return this.sessions.size;
+  }
+
+  async evaluate(rawRequest) {
+    const request = validateEvaluationRequest(rawRequest);
+    const backend = this.backendFactory(request.provider);
+    let entry = this.sessions.get(request.session_id);
+    const sessionReused = Boolean(entry && entry.backendIdentity === backend.identity);
+    if (!sessionReused) {
+      entry = createSessionEntry(request.session_id, backend);
+      this.sessions.set(request.session_id, entry);
+      while (this.sessions.size > MAX_SESSIONS) {
+        const oldestSessionId = this.sessions.keys().next().value;
+        const oldest = this.sessions.get(oldestSessionId);
+        oldest?.agent.reset();
+        this.sessions.delete(oldestSessionId);
+      }
+    } else {
+      this.sessions.delete(request.session_id);
+      this.sessions.set(request.session_id, entry);
+      entry.agent.state.model = backend.model;
+      entry.agent.streamFunction = backend.streamFn;
+    }
+    entry.activeContext = request.context;
+    entry.run = { terminalAction: null, turns: 0, toolCalls: 0, contextReads: 0 };
+    const priorMessageCount = entry.agent.state.messages.length;
+    const startedAt = this.clock();
+    try {
+      await entry.agent.prompt(buildPrompt(request.context));
+      if (entry.agent.state.errorMessage) {
+        throw new PiCoachProtocolError(entry.agent.state.errorMessage, "agent_provider_error");
+      }
+      if (!entry.run.terminalAction) {
+        throw new PiCoachProtocolError("Pi agent did not choose a terminal action", "missing_terminal_action");
+      }
+      const elapsedMs = Math.max(0, this.clock() - startedAt);
+      const runUsage = usageFromMessages(entry.agent.state.messages.slice(priorMessageCount));
+      entry.agent.state.messages = pruneContext(entry.agent.state.messages);
+      return {
+        protocol: PROTOCOL,
+        request_id: request.request_id,
+        ok: true,
+        runtime: "pi-agent-core",
+        action: entry.run.terminalAction.action,
+        intervention: entry.run.terminalAction.intervention ?? null,
+        metrics: {
+          elapsed_ms: elapsedMs,
+          turns: entry.run.turns,
+          tool_calls: entry.run.toolCalls,
+          context_reads: entry.run.contextReads,
+          session_reused: sessionReused,
+          usage: runUsage,
+        },
+      };
+    } catch (error) {
+      this.sessions.delete(request.session_id);
+      entry.agent.reset();
+      throw error;
+    } finally {
+      entry.activeContext = null;
+      entry.run = null;
+    }
+  }
+}

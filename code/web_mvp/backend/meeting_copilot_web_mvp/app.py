@@ -96,6 +96,10 @@ from meeting_copilot_web_mvp.recording_recovery import (
 from meeting_copilot_web_mvp.streaming_llm_provider import (
     OpenAICompatibleStreamingProvider,
 )
+from meeting_copilot_web_mvp.pi_coach_runtime import (
+    PiCoachSidecar,
+    configured_coach_runtime,
+)
 from meeting_copilot_web_mvp.v2_streaming_suggestions import (
     build_realtime_suggestion_messages,
     generate_streaming_suggestion,
@@ -105,7 +109,7 @@ from meeting_copilot_web_mvp.realtime_intelligence import (
     apply_coach_intervention,
     build_llm_first_event_context,
     realtime_intelligence_batch_id,
-    run_realtime_coach,
+    run_realtime_coach_routed,
     run_realtime_intelligence,
     should_run_realtime_coach,
 )
@@ -1590,6 +1594,7 @@ def create_app(
     recording_import_stop_event = asyncio.Event()
     app.state.recording_import_worker_task = None
     app.state.desktop_parent_watchdog_task = None
+    app.state.pi_coach_runtime = PiCoachSidecar()
 
     def _recording_asset_lock(meeting_id: str) -> threading.Lock:
         with recording_asset_locks_guard:
@@ -8910,15 +8915,25 @@ def create_app(
         coach_enabled = str(
             os.environ.get("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
         ).strip().lower() not in {"0", "false", "off", "no"}
+        coach_runtime_requested = configured_coach_runtime()
         coach_triggered = coach_enabled and should_run_realtime_coach(request)
         coach_result: dict[str, Any] | None = None
         coach_status = "not_triggered" if coach_enabled else "disabled"
         if coach_triggered:
             intelligence_outcome, coach_outcome = await asyncio.gather(
                 intelligence_call,
-                run_realtime_coach(
+                run_realtime_coach_routed(
                     request=request,
                     provider=provider,
+                    requested_runtime=coach_runtime_requested,
+                    pi_runtime=app.state.pi_coach_runtime,
+                    pi_provider_config={
+                        "base_url": config.base_url,
+                        "api_key": config.api_key,
+                        "model": config.model,
+                        "api_style": config.api_style,
+                        "timeout_seconds": min(config.timeout_seconds, 25.0),
+                    },
                     before_attempt=before_coach_attempt,
                     on_usage=record_coach_attempt_usage,
                 ),
@@ -8939,6 +8954,13 @@ def create_app(
             else:
                 coach_result = coach_outcome
                 coach_status = "intervention" if coach_result.get("intervention") is not None else "silent"
+                if coach_result.get("fallback_error_code"):
+                    _log.warning(
+                        "meeting.v2.realtime_coach_pi_fallback",
+                        meeting_id=meeting_id,
+                        job_id=str(job["id"]),
+                        error_code=str(coach_result["fallback_error_code"]),
+                    )
                 result["response"] = apply_coach_intervention(
                     result["response"],
                     coach_result.get("intervention"),
@@ -9019,6 +9041,14 @@ def create_app(
                 "ttft_ms": coach_result.get("ttft_ms") if coach_result is not None else None,
                 "usage": coach_result.get("usage") if coach_result is not None else None,
                 "model": coach_result.get("model") if coach_result is not None else None,
+                "runtime_requested": (
+                    coach_result.get("runtime_requested") if coach_result is not None else coach_runtime_requested
+                ),
+                "runtime_used": coach_result.get("runtime_used") if coach_result is not None else None,
+                "fallback_error_code": (
+                    coach_result.get("fallback_error_code") if coach_result is not None else None
+                ),
+                "agent_metrics": coach_result.get("agent_metrics") if coach_result is not None else None,
             },
         }
 
@@ -9818,6 +9848,11 @@ def create_app(
         if client is not None and not client.is_closed:
             await client.aclose()
 
+    async def _close_pi_coach_runtime() -> None:
+        runtime = app.state.pi_coach_runtime
+        if runtime is not None:
+            await asyncio.to_thread(runtime.close)
+
     async def _checkpoint_realtime_slo() -> None:
         await asyncio.to_thread(
             realtime_slo.checkpoint,
@@ -9842,6 +9877,7 @@ def create_app(
     app.router.add_event_handler("shutdown", _stop_v2_executor)
     app.router.add_event_handler("shutdown", _stop_recording_export_executor)
     app.router.add_event_handler("shutdown", _checkpoint_realtime_slo)
+    app.router.add_event_handler("shutdown", _close_pi_coach_runtime)
     app.router.add_event_handler("shutdown", _close_streaming_llm_client)
     app.router.add_event_handler("shutdown", _stop_funasr_resident_worker)
     app.router.add_event_handler("shutdown", _close_created_sqlite_repositories)

@@ -14,6 +14,7 @@ import json
 import math
 from typing import Any, Mapping, Sequence
 
+from meeting_copilot_web_mvp.pi_coach_runtime import build_pi_coach_request
 from meeting_copilot_web_mvp.realtime_transcript_correction import correction_is_safe
 
 
@@ -804,6 +805,108 @@ async def run_realtime_coach(
         "model": result.model,
         "response_id": result.response_id,
         "finish_reason": result.finish_reason,
+    }
+
+
+async def run_realtime_coach_via_pi(
+    *,
+    request: RealtimeIntelligenceRequest,
+    pi_runtime: Any,
+    provider_config: Mapping[str, Any],
+    before_attempt: Any = None,
+    on_usage: Any = None,
+) -> dict[str, Any]:
+    """Run the same evidence contract through the restricted Pi sidecar."""
+
+    if not hasattr(pi_runtime, "evaluate"):
+        raise TypeError("pi_runtime must expose an async evaluate method")
+    await _notify_callback(before_attempt, 1)
+    request_id = f"{realtime_intelligence_idempotency_key(request)}:coach:pi:v1"
+    payload = build_pi_coach_request(
+        request,
+        request_id=request_id,
+        base_url=provider_config.get("base_url"),
+        api_key=provider_config.get("api_key"),
+        model=provider_config.get("model"),
+        api_style=provider_config.get("api_style") or "chat_completions",
+        timeout_seconds=float(provider_config.get("timeout_seconds") or 25.0),
+    )
+    result = await pi_runtime.evaluate(payload)
+    metrics = result.get("metrics") if isinstance(result.get("metrics"), Mapping) else {}
+    usage = metrics.get("usage") if isinstance(metrics.get("usage"), Mapping) else None
+    await _notify_callback(on_usage, dict(usage) if usage is not None else None, 1)
+    intervention = parse_realtime_coach_response(
+        json.dumps({"intervention": result.get("intervention")}, ensure_ascii=False),
+        request=request,
+    )
+    if intervention is not None and intervention.confidence < 0.78:
+        intervention = None
+    elapsed_ms = float(metrics.get("elapsed_ms") or 0.0)
+    return {
+        "intervention": intervention,
+        "transport_mode": "pi_agent_jsonl",
+        "ttft_ms": elapsed_ms,
+        "decision_latency_ms": elapsed_ms,
+        "usage": dict(usage) if usage is not None else None,
+        "model": str(provider_config.get("model") or ""),
+        "response_id": request_id,
+        "finish_reason": str(result.get("action") or ""),
+        "agent_metrics": dict(metrics),
+    }
+
+
+async def run_realtime_coach_routed(
+    *,
+    request: RealtimeIntelligenceRequest,
+    provider: Any,
+    requested_runtime: str,
+    pi_runtime: Any = None,
+    pi_provider_config: Mapping[str, Any] | None = None,
+    before_attempt: Any = None,
+    on_usage: Any = None,
+) -> dict[str, Any]:
+    """Select direct or Pi execution and fail back to direct on Pi errors."""
+
+    normalized_runtime = str(requested_runtime or "direct").strip().lower()
+    if normalized_runtime == "pi":
+        try:
+            result = await run_realtime_coach_via_pi(
+                request=request,
+                pi_runtime=pi_runtime,
+                provider_config=dict(pi_provider_config or {}),
+                before_attempt=before_attempt,
+                on_usage=on_usage,
+            )
+            return {
+                **result,
+                "runtime_requested": "pi",
+                "runtime_used": "pi",
+                "fallback_error_code": None,
+            }
+        except Exception as exc:
+            result = await run_realtime_coach(
+                request=request,
+                provider=provider,
+                before_attempt=before_attempt,
+                on_usage=on_usage,
+            )
+            return {
+                **result,
+                "runtime_requested": "pi",
+                "runtime_used": "direct",
+                "fallback_error_code": str(getattr(exc, "code", type(exc).__name__))[:120],
+            }
+    result = await run_realtime_coach(
+        request=request,
+        provider=provider,
+        before_attempt=before_attempt,
+        on_usage=on_usage,
+    )
+    return {
+        **result,
+        "runtime_requested": "direct",
+        "runtime_used": "direct",
+        "fallback_error_code": None,
     }
 
 
