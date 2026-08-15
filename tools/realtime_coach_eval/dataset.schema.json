@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://talktrace.local/schemas/realtime-coach-eval-case.v1.json",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["case_id", "new_paragraphs", "expected"],
+  "properties": {
+    "case_id": { "type": "string", "minLength": 1 },
+    "session_id": { "type": "string", "minLength": 1 },
+    "state_revision": { "type": "integer", "minimum": 1 },
+    "difficulty": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+    "new_paragraphs": { "type": "array", "minItems": 1, "maxItems": 8 },
+    "context_paragraphs": { "type": "array", "maxItems": 3 },
+    "semantic_windows": { "type": "array", "maxItems": 8 },
+    "rolling_state": { "type": "object" },
+    "meeting_goal": { "type": ["string", "null"] },
+    "expected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["action"],
+      "properties": {
+        "action": { "enum": ["intervention", "silent"] },
+        "event_types": {
+          "type": "array",
+          "items": { "enum": ["question_to_user", "commitment_risk", "goal_at_risk", "contradiction"] },
+          "uniqueItems": true
+        },
+        "required_evidence_ids": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "deadline_ms": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    }
+  }
+}

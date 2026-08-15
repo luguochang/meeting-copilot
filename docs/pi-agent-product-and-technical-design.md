@@ -1,6 +1,6 @@
 # Talktrace 实时对话 Agent：产品与技术方案
 
-> 状态：方向重置后的评审稿
+> 状态：方向重置后的评审稿；2026-08-16 已完成受限 Pi SDK Spike，实测结论见[实施与决策报告](realtime-coach-pi-spike-report.md)
 > 日期：2026-08-13
 > 适用范围：Talktrace Windows 本地优先桌面端
 > 核心依赖候选：[`@earendil-works/pi-agent-core`](https://github.com/luguochang/pi/tree/main/packages/agent)
