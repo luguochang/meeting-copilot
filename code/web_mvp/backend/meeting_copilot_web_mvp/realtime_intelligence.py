@@ -7,7 +7,7 @@ is rejected while the canonical transcript remains available.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import inspect
 import json
@@ -24,12 +24,20 @@ MAX_ROLLING_STATE_BYTES = 24_000
 MAX_GLOSSARY_ITEMS = 100
 MAX_GLOSSARY_ITEM_CHARACTERS = 120
 MAX_REPAIR_SOURCE_CHARACTERS = 16_000
+MAX_SEMANTIC_WINDOWS = 8
+MAX_SEMANTIC_WINDOW_CHARACTERS = 16_000
 
 _STATE_KINDS = frozenset({"decision", "action_item", "risk", "open_question"})
 _STATE_OPERATIONS = frozenset({"add", "update", "resolve", "noop"})
 _TOPIC_OPERATIONS = frozenset({"add", "update", "noop"})
 _URGENCY_VALUES = frozenset({"low", "medium", "high"})
 _ROLLING_STATE_KEYS = frozenset({"topic", "open_items", "summary", "version"})
+_SOURCE_TRACKS = frozenset({"microphone", "system_audio", "unknown"})
+_ROLE_HINTS = frozenset({"self_or_room", "remote_mix", "unknown"})
+_SEMANTIC_WINDOW_STATUSES = frozenset({"active", "stable"})
+_COACH_EVENT_TYPES = frozenset(
+    {"question_to_user", "commitment_risk", "goal_at_risk", "contradiction"}
+)
 
 
 class IntelligenceResponseValidationError(ValueError):
@@ -50,6 +58,9 @@ class IntelligenceParagraph:
     start_ms: int | None
     end_ms: int | None
     speaker: str | None
+    speaker_confidence: float | None
+    source_track: str
+    role_hint: str
 
     @classmethod
     def from_payload(cls, value: Mapping[str, Any], *, field: str) -> "IntelligenceParagraph":
@@ -67,6 +78,16 @@ class IntelligenceParagraph:
         if start_ms is not None and end_ms is not None and end_ms < start_ms:
             raise ValueError(f"{field}.end_ms must not precede start_ms")
         speaker = _optional_text(value.get("speaker"), maximum=120)
+        speaker_confidence = _optional_confidence(
+            value.get("speaker_confidence"),
+            f"{field}.speaker_confidence",
+        )
+        source_track = _optional_text(value.get("source_track"), maximum=40) or "unknown"
+        if source_track not in _SOURCE_TRACKS:
+            raise ValueError(f"{field}.source_track is unsupported")
+        role_hint = _optional_text(value.get("role_hint"), maximum=40) or _role_hint_for_source_track(source_track)
+        if role_hint not in _ROLE_HINTS:
+            raise ValueError(f"{field}.role_hint is unsupported")
         return cls(
             id=paragraph_id,
             text=text,
@@ -74,6 +95,9 @@ class IntelligenceParagraph:
             start_ms=start_ms,
             end_ms=end_ms,
             speaker=speaker,
+            speaker_confidence=speaker_confidence,
+            source_track=source_track,
+            role_hint=role_hint,
         )
 
     def to_prompt_dict(self) -> dict[str, Any]:
@@ -84,6 +108,98 @@ class IntelligenceParagraph:
             "start_ms": self.start_ms,
             "end_ms": self.end_ms,
             "speaker": self.speaker,
+            "speaker_confidence": self.speaker_confidence,
+            "source_track": self.source_track,
+            "role_hint": self.role_hint,
+        }
+
+
+@dataclass(frozen=True)
+class IntelligenceSemanticWindow:
+    id: str
+    text: str
+    revision: int
+    start_ms: int | None
+    end_ms: int | None
+    status: str
+    segment_ids: tuple[str, ...]
+    source_tracks: tuple[str, ...]
+    role_hints: tuple[str, ...]
+
+    @classmethod
+    def from_payload(
+        cls,
+        value: Mapping[str, Any],
+        *,
+        field: str,
+        allowed_segment_ids: frozenset[str],
+    ) -> "IntelligenceSemanticWindow":
+        if not isinstance(value, Mapping):
+            raise ValueError(f"{field} must be an object")
+        window_id = _required_text(value.get("id"), f"{field}.id", maximum=240)
+        text = _required_text(
+            value.get("text"),
+            f"{field}.text",
+            maximum=MAX_SEMANTIC_WINDOW_CHARACTERS,
+        )
+        revision = _positive_integer(value.get("revision", 1), f"{field}.revision")
+        start_ms = _optional_non_negative_integer(value.get("start_ms"), f"{field}.start_ms")
+        end_ms = _optional_non_negative_integer(value.get("end_ms"), f"{field}.end_ms")
+        if start_ms is not None and end_ms is not None and end_ms < start_ms:
+            raise ValueError(f"{field}.end_ms must not precede start_ms")
+        status = _optional_text(value.get("status"), maximum=20) or "active"
+        if status not in _SEMANTIC_WINDOW_STATUSES:
+            raise ValueError(f"{field}.status is unsupported")
+        segment_ids = _bounded_unique_text_items(
+            value.get("segment_ids"),
+            f"{field}.segment_ids",
+            maximum_items=MAX_NEW_PARAGRAPHS + MAX_CONTEXT_PARAGRAPHS,
+            maximum_characters=200,
+        )
+        if not segment_ids:
+            raise ValueError(f"{field}.segment_ids must not be empty")
+        unknown_ids = set(segment_ids) - allowed_segment_ids
+        if unknown_ids:
+            raise ValueError(f"{field}.segment_ids reference paragraphs outside this request")
+        source_tracks = _bounded_unique_text_items(
+            value.get("source_tracks"),
+            f"{field}.source_tracks",
+            maximum_items=3,
+            maximum_characters=40,
+        )
+        if any(item not in _SOURCE_TRACKS for item in source_tracks):
+            raise ValueError(f"{field}.source_tracks contains an unsupported value")
+        role_hints = _bounded_unique_text_items(
+            value.get("role_hints"),
+            f"{field}.role_hints",
+            maximum_items=3,
+            maximum_characters=40,
+        )
+        if any(item not in _ROLE_HINTS for item in role_hints):
+            raise ValueError(f"{field}.role_hints contains an unsupported value")
+        return cls(
+            id=window_id,
+            text=text,
+            revision=revision,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            status=status,
+            segment_ids=segment_ids,
+            source_tracks=source_tracks,
+            role_hints=role_hints,
+        )
+
+    def to_prompt_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "text": self.text,
+            "revision": self.revision,
+            "start_ms": self.start_ms,
+            "end_ms": self.end_ms,
+            "status": self.status,
+            "segment_ids": list(self.segment_ids),
+            "source_tracks": list(self.source_tracks),
+            "role_hints": list(self.role_hints),
         }
 
 
@@ -93,6 +209,7 @@ class RealtimeIntelligenceRequest:
     state_revision: int
     new_paragraphs: tuple[IntelligenceParagraph, ...]
     context_paragraphs: tuple[IntelligenceParagraph, ...]
+    semantic_windows: tuple[IntelligenceSemanticWindow, ...]
     rolling_state: Mapping[str, Any]
     glossary: tuple[str, ...]
     meeting_goal: str | None
@@ -106,6 +223,7 @@ class RealtimeIntelligenceRequest:
         state_revision: Any,
         new_paragraphs: Sequence[Mapping[str, Any]],
         context_paragraphs: Sequence[Mapping[str, Any]],
+        semantic_windows: Sequence[Mapping[str, Any]] | None = None,
         rolling_state: Mapping[str, Any],
         glossary: Sequence[Any] | None = None,
         meeting_goal: Any = None,
@@ -137,6 +255,20 @@ class RealtimeIntelligenceRequest:
         all_ids = [item.id for item in (*context_items, *new_items)]
         if len(set(all_ids)) != len(all_ids):
             raise ValueError("paragraph ids must be unique within one intelligence request")
+        raw_windows = list(semantic_windows or [])
+        if len(raw_windows) > MAX_SEMANTIC_WINDOWS:
+            raise ValueError(f"semantic_windows must contain at most {MAX_SEMANTIC_WINDOWS} items")
+        allowed_segment_ids = frozenset(all_ids)
+        window_items = tuple(
+            IntelligenceSemanticWindow.from_payload(
+                item,
+                field=f"semantic_windows[{index}]",
+                allowed_segment_ids=allowed_segment_ids,
+            )
+            for index, item in enumerate(raw_windows)
+        )
+        if len({item.id for item in window_items}) != len(window_items):
+            raise ValueError("semantic window ids must be unique within one intelligence request")
 
         bounded_state = {
             key: _json_compatible(value)
@@ -163,6 +295,7 @@ class RealtimeIntelligenceRequest:
             state_revision=normalized_revision,
             new_paragraphs=new_items,
             context_paragraphs=context_items,
+            semantic_windows=window_items,
             rolling_state=bounded_state,
             glossary=tuple(glossary_items),
             meeting_goal=_optional_text(meeting_goal, maximum=2_000),
@@ -179,7 +312,9 @@ class RealtimeIntelligenceRequest:
 
     @property
     def input_characters(self) -> int:
-        return sum(len(item.text) for item in (*self.context_paragraphs, *self.new_paragraphs))
+        return sum(len(item.text) for item in (*self.context_paragraphs, *self.new_paragraphs)) + sum(
+            len(item.text) for item in self.semantic_windows
+        )
 
 
 @dataclass(frozen=True)
@@ -221,6 +356,33 @@ class FollowUp:
     evidence_segment_ids: tuple[str, ...]
     evidence_quote: str
     urgency: str
+    coach_event_type: str | None = None
+    title: str | None = None
+    confidence: float | None = None
+
+
+@dataclass(frozen=True)
+class CoachIntervention:
+    event_type: str
+    title: str
+    recommendation: str
+    reason: str
+    evidence_segment_ids: tuple[str, ...]
+    evidence_quote: str
+    urgency: str
+    confidence: float
+
+    def to_follow_up(self) -> FollowUp:
+        return FollowUp(
+            question=self.recommendation,
+            reason=self.reason,
+            evidence_segment_ids=self.evidence_segment_ids,
+            evidence_quote=self.evidence_quote,
+            urgency=self.urgency,
+            coach_event_type=self.event_type,
+            title=self.title,
+            confidence=self.confidence,
+        )
 
 
 @dataclass(frozen=True)
@@ -269,6 +431,8 @@ def build_realtime_intelligence_messages(
         (
             "你是中文会议实时理解引擎。只依据输入中的会议原话返回一个 JSON 对象，不要输出 Markdown。",
             "不得用关键词匹配、常识补全或猜测生成决定、待办、风险、问题或追问；没有充分证据时返回空数组或 null。",
+            "source_track 是采集来源；system_audio/remote_mix 通常是电脑中对方的混音，microphone/self_or_room 可能是用户本人也可能是同处一室的人，归因必须保守。",
+            "semantic_windows 是从原始段落派生的理解窗口，只用于理解上下文；所有证据 ID 仍必须从 new_paragraphs 或 context_paragraphs 的 id 中复制。",
             revision_rule,
             "state_changes.operation 只能是 add、update、resolve、noop，正式变更必须携带可逐字核验的证据 ID 和原话。",
             "输出字段固定且必须全部存在：paragraph_revisions、topic_update、state_changes、follow_up。",
@@ -285,6 +449,7 @@ def build_realtime_intelligence_messages(
         "state_revision": request.state_revision,
         "new_paragraphs": [item.to_prompt_dict() for item in request.new_paragraphs],
         "context_paragraphs": [item.to_prompt_dict() for item in request.context_paragraphs],
+        "semantic_windows": [item.to_prompt_dict() for item in request.semantic_windows],
         "rolling_state": request.rolling_state,
         "glossary": list(request.glossary),
         "meeting_goal": request.meeting_goal,
@@ -399,6 +564,7 @@ def realtime_intelligence_idempotency_key(request: RealtimeIntelligenceRequest) 
         "state_revision": request.state_revision,
         "new_paragraphs": [item.to_prompt_dict() for item in request.new_paragraphs],
         "context_paragraphs": [item.to_prompt_dict() for item in request.context_paragraphs],
+        "semantic_windows": [item.to_prompt_dict() for item in request.semantic_windows],
         "rolling_state": request.rolling_state,
         "glossary": list(request.glossary),
         "meeting_goal": request.meeting_goal,
@@ -422,6 +588,7 @@ def realtime_intelligence_batch_id(request: RealtimeIntelligenceRequest) -> str:
         "state_revision": request.state_revision,
         "new_paragraph_ids": [item.id for item in request.new_paragraphs],
         "context_paragraph_ids": [item.id for item in request.context_paragraphs],
+        "semantic_window_ids": [item.id for item in request.semantic_windows],
     }
     digest = hashlib.sha256(
         json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -493,6 +660,164 @@ def dynamic_output_token_limit(input_characters: int) -> int:
     estimate = 512 + (characters * 1.25)
     rounded = int(math.floor((estimate / 256) + 0.5) * 256)
     return min(4_096, max(768, rounded))
+
+
+def should_run_realtime_coach(request: RealtimeIntelligenceRequest) -> bool:
+    """Limit the first coach MVP to new computer-playback speech.
+
+    System audio is the one source where Talktrace can conservatively infer
+    that a remote party, rather than the local microphone environment, spoke.
+    """
+
+    if not isinstance(request, RealtimeIntelligenceRequest):
+        raise TypeError("request must be a RealtimeIntelligenceRequest")
+    return any(item.source_track == "system_audio" for item in request.new_paragraphs)
+
+
+def build_realtime_coach_messages(
+    request: RealtimeIntelligenceRequest,
+) -> list[dict[str, str]]:
+    if not isinstance(request, RealtimeIntelligenceRequest):
+        raise TypeError("request must be a RealtimeIntelligenceRequest")
+    system = "".join(
+        (
+            "你是仅服务于软件使用者的实时私人对话教练。只返回 JSON，不要输出 Markdown。",
+            "任务不是总结、复盘或重复原话，而是判断刚发生的时刻是否值得立刻给用户一句可说出口的建议。",
+            "只允许四类介入：question_to_user（对方问题尚未完整回答）、commitment_risk（用户可能形成缺少条件的承诺）、",
+            "goal_at_risk（用户目标即将被跳过）、contradiction（当前说法与前文存在有损决策的冲突）。",
+            "system_audio/remote_mix 通常来自电脑中对方的混音；microphone/self_or_room 不能确定就是用户本人。",
+            "没有高价值、可执行且仍来得及的介入时 intervention 必须是 null。不要为了显得有帮助而生成提示。",
+            "不得猜测说话人身份、公司信息、数字、期限或用户立场。依据必须逐字出现在引用的 paragraph 中。",
+            "recommendation 必须是 8 到 120 个字符的可直接说出口短句；不要写分析过程。",
+        )
+    )
+    payload = {
+        "state_revision": request.state_revision,
+        "new_paragraphs": [item.to_prompt_dict() for item in request.new_paragraphs],
+        "context_paragraphs": [item.to_prompt_dict() for item in request.context_paragraphs],
+        "semantic_windows": [item.to_prompt_dict() for item in request.semantic_windows],
+        "rolling_state": request.rolling_state,
+        "meeting_goal": request.meeting_goal,
+        "output_contract": {
+            "intervention": {
+                "event_type": "question_to_user|commitment_risk|goal_at_risk|contradiction",
+                "title": "short_string",
+                "recommendation": "directly_speakable_string",
+                "reason": "short_string",
+                "evidence_segment_ids": "non_empty_array: input paragraph ids",
+                "evidence_quote": "non_empty verbatim substring of referenced paragraphs",
+                "urgency": "low|medium|high",
+                "confidence": "number: 0..1",
+            },
+            "empty_result": {"intervention": None},
+        },
+    }
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":"))},
+    ]
+
+
+def parse_realtime_coach_response(
+    content: Any,
+    *,
+    request: RealtimeIntelligenceRequest,
+) -> CoachIntervention | None:
+    payload = _decode_json_object(content)
+    unexpected = set(payload) - {"intervention"}
+    if unexpected:
+        raise IntelligenceResponseValidationError(
+            f"coach response contains unsupported fields: {', '.join(sorted(unexpected))}"
+        )
+    value = payload.get("intervention")
+    if value is None:
+        return None
+    item = _required_object(value, "intervention")
+    event_type = _required_response_text(item.get("event_type"), "intervention.event_type", maximum=40)
+    if event_type not in _COACH_EVENT_TYPES:
+        raise IntelligenceResponseValidationError("intervention.event_type is unsupported")
+    evidence_ids = _parse_evidence_ids(
+        item.get("evidence_segment_ids"),
+        request=request,
+        field="intervention",
+    )
+    evidence_quote = _required_response_text(
+        item.get("evidence_quote"),
+        "intervention.evidence_quote",
+        maximum=1_000,
+    )
+    _validate_evidence_quote(
+        evidence_quote,
+        evidence_ids=evidence_ids,
+        request=request,
+        field="intervention.evidence_quote",
+    )
+    urgency = _required_response_text(item.get("urgency"), "intervention.urgency", maximum=20)
+    if urgency not in _URGENCY_VALUES:
+        raise IntelligenceResponseValidationError("intervention.urgency is unsupported")
+    recommendation = _required_response_text(
+        item.get("recommendation"),
+        "intervention.recommendation",
+        maximum=120,
+    )
+    if len(recommendation) < 8:
+        raise IntelligenceResponseValidationError("intervention.recommendation is too short")
+    return CoachIntervention(
+        event_type=event_type,
+        title=_required_response_text(item.get("title"), "intervention.title", maximum=80),
+        recommendation=recommendation,
+        reason=_required_response_text(item.get("reason"), "intervention.reason", maximum=300),
+        evidence_segment_ids=evidence_ids,
+        evidence_quote=evidence_quote,
+        urgency=urgency,
+        confidence=_response_confidence(item.get("confidence"), "intervention.confidence"),
+    )
+
+
+async def run_realtime_coach(
+    *,
+    request: RealtimeIntelligenceRequest,
+    provider: Any,
+    before_attempt: Any = None,
+    on_usage: Any = None,
+) -> dict[str, Any]:
+    """Run the focused coach lane without coupling its failure to fact extraction."""
+
+    if not hasattr(provider, "complete"):
+        raise TypeError("provider must expose an async complete method")
+    await _notify_callback(before_attempt, 1)
+    result = await provider.complete(
+        build_realtime_coach_messages(request),
+        idempotency_key=f"{realtime_intelligence_idempotency_key(request)}:coach:v1",
+        temperature=0.1,
+        max_completion_tokens=768,
+    )
+    await _notify_callback(on_usage, _usage_dict(result.usage), 1)
+    intervention = parse_realtime_coach_response(result.content, request=request)
+    if intervention is not None and intervention.confidence < 0.78:
+        intervention = None
+    return {
+        "intervention": intervention,
+        "transport_mode": result.transport_mode.value,
+        "ttft_ms": result.timings.time_to_first_token_seconds * 1_000,
+        "usage": _usage_dict(result.usage),
+        "model": result.model,
+        "response_id": result.response_id,
+        "finish_reason": result.finish_reason,
+    }
+
+
+def apply_coach_intervention(
+    response: RealtimeIntelligenceResponse,
+    intervention: CoachIntervention | None,
+) -> RealtimeIntelligenceResponse:
+    if not isinstance(response, RealtimeIntelligenceResponse):
+        raise TypeError("response must be a RealtimeIntelligenceResponse")
+    if intervention is None:
+        return response
+    if not isinstance(intervention, CoachIntervention):
+        raise TypeError("intervention must be a CoachIntervention or None")
+    return replace(response, follow_up=intervention.to_follow_up())
 
 
 def build_realtime_intelligence_repair_messages(
@@ -961,6 +1286,47 @@ def _optional_non_negative_integer(value: Any, field: str) -> int | None:
     if number < 0:
         raise ValueError(f"{field} must be a non-negative integer")
     return number
+
+
+def _optional_confidence(value: Any, field: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be a number from 0 to 1")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be a number from 0 to 1") from exc
+    if not 0 <= number <= 1:
+        raise ValueError(f"{field} must be a number from 0 to 1")
+    return number
+
+
+def _bounded_unique_text_items(
+    value: Any,
+    field: str,
+    *,
+    maximum_items: int,
+    maximum_characters: int,
+) -> tuple[str, ...]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise ValueError(f"{field} must be an array")
+    if len(value) > maximum_items:
+        raise ValueError(f"{field} must contain at most {maximum_items} items")
+    items: list[str] = []
+    for index, raw_item in enumerate(value):
+        item = _required_text(raw_item, f"{field}[{index}]", maximum=maximum_characters)
+        if item not in items:
+            items.append(item)
+    return tuple(items)
+
+
+def _role_hint_for_source_track(source_track: str) -> str:
+    if source_track == "system_audio":
+        return "remote_mix"
+    if source_track == "microphone":
+        return "self_or_room"
+    return "unknown"
 
 
 def _response_confidence(value: Any, field: str) -> float:

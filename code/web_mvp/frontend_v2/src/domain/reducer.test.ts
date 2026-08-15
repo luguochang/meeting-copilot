@@ -485,6 +485,39 @@ describe("meetingReducer", () => {
     });
   });
 
+  it("preserves realtime coach event metadata for the private coach card", () => {
+    const current = meetingReducer(createInitialMeetingState("meeting-1"), {
+      type: "events.received",
+      events: [event({
+        seq: 3,
+        type: "meeting.intelligence.applied",
+        aggregateType: "meeting_intelligence",
+        aggregateId: "intelligence-coach-1",
+        payload: {
+          ...formalAiPayload("remote-segment"),
+          follow_up: {
+            question: "可以把周五作为目标，但需要以周四压测达标为上线条件。",
+            reason: "对方要求确定日期，但压测尚未完成。",
+            evidence_segment_ids: ["local-segment", "remote-segment"],
+            evidence_quote: "压测还没有完成",
+            urgency: "high",
+            coach_event_type: "commitment_risk",
+            title: "先限定承诺条件",
+            confidence: 0.91,
+          },
+        },
+      })],
+      receivedAtMs: 3_000,
+    });
+
+    expect(current.followUp).toMatchObject({
+      coachEventType: "commitment_risk",
+      title: "先限定承诺条件",
+      confidence: 0.91,
+      urgency: "high",
+    });
+  });
+
   it("does not project an intelligence event without a called LLM envelope", () => {
     const current = meetingReducer(createInitialMeetingState("meeting-1"), {
       type: "events.received",

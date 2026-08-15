@@ -907,12 +907,23 @@ function parseFollowUp(value: unknown): FollowUpProjection | null {
   const urgency = urgencyValue === "low" || urgencyValue === "medium" || urgencyValue === "high"
     ? urgencyValue
     : "medium";
+  const coachEventTypeValue = optionalString(first(item, "coach_event_type", "coachEventType"));
+  const coachEventType =
+    coachEventTypeValue === "question_to_user" || coachEventTypeValue === "commitment_risk" ||
+    coachEventTypeValue === "goal_at_risk" || coachEventTypeValue === "contradiction"
+      ? coachEventTypeValue
+      : null;
+  const title = optionalString(first(item, "title"));
+  const confidence = optionalNumber(first(item, "confidence"));
   return {
     question,
     reason,
     evidenceSegmentIds: strings(first(item, "evidence_segment_ids", "evidenceSegmentIds")),
     evidenceQuote: optionalString(first(item, "evidence_quote", "evidenceQuote")) ?? "",
     urgency,
+    ...(coachEventType ? { coachEventType } : {}),
+    ...(title ? { title } : {}),
+    ...(confidence !== null ? { confidence } : {}),
     formalAi: parseFormalAi(item),
   };
 }

@@ -9,14 +9,19 @@ import pytest
 from meeting_copilot_web_mvp.realtime_intelligence import (
     IntelligenceResponseValidationError,
     RealtimeIntelligenceRequest,
+    apply_coach_intervention,
+    build_realtime_coach_messages,
     build_realtime_intelligence_messages,
     build_realtime_intelligence_repair_messages,
     dynamic_output_token_limit,
     parse_realtime_intelligence_response,
+    parse_realtime_coach_response,
     realtime_intelligence_idempotency_key,
     realtime_intelligence_batch_id,
     build_llm_first_event_context,
     run_realtime_intelligence,
+    run_realtime_coach,
+    should_run_realtime_coach,
 )
 
 
@@ -85,6 +90,68 @@ def test_prompt_contains_only_bounded_incremental_context_and_schema_contract() 
     assert payload["glossary"] == ["checkout-service", "P99"]
     assert payload["meeting_goal"] == "确认发布和回滚方案"
     assert "private_internal_field" not in messages[1]["content"]
+
+
+def test_prompt_preserves_source_roles_and_bounded_semantic_windows() -> None:
+    request = RealtimeIntelligenceRequest.from_payload(
+        meeting_id="meeting-source-aware",
+        state_revision=2,
+        new_paragraphs=[
+            {
+                **_paragraph("remote-question", "这个方案周五能上线吗？"),
+                "source_track": "system_audio",
+                "speaker_confidence": 0.92,
+            }
+        ],
+        context_paragraphs=[
+            {
+                **_paragraph("local-answer", "我先确认压测结果。"),
+                "source_track": "microphone",
+            }
+        ],
+        semantic_windows=[
+            {
+                "id": "window-1",
+                "text": "[self_or_room] 我先确认压测结果。\n[remote_mix] 这个方案周五能上线吗？",
+                "revision": 3,
+                "start_ms": 0,
+                "end_ms": 2_000,
+                "status": "stable",
+                "segment_ids": ["local-answer", "remote-question"],
+                "source_tracks": ["microphone", "system_audio"],
+                "role_hints": ["self_or_room", "remote_mix"],
+            }
+        ],
+        rolling_state={},
+    )
+
+    payload = json.loads(build_realtime_intelligence_messages(request)[1]["content"])
+
+    assert payload["new_paragraphs"][0]["role_hint"] == "remote_mix"
+    assert payload["new_paragraphs"][0]["speaker_confidence"] == pytest.approx(0.92)
+    assert payload["context_paragraphs"][0]["role_hint"] == "self_or_room"
+    assert payload["semantic_windows"][0]["segment_ids"] == ["local-answer", "remote-question"]
+    assert "理解窗口" in build_realtime_intelligence_messages(request)[0]["content"]
+
+
+def test_semantic_window_rejects_evidence_ids_outside_the_bounded_request() -> None:
+    with pytest.raises(ValueError, match="outside this request"):
+        RealtimeIntelligenceRequest.from_payload(
+            meeting_id="meeting-source-aware",
+            state_revision=2,
+            new_paragraphs=[_paragraph("remote-question", "这个方案周五能上线吗？")],
+            context_paragraphs=[],
+            semantic_windows=[
+                {
+                    "id": "window-1",
+                    "text": "越界窗口",
+                    "segment_ids": ["not-visible"],
+                    "source_tracks": ["unknown"],
+                    "role_hints": ["unknown"],
+                }
+            ],
+            rolling_state={},
+        )
 
 
 def test_request_rejects_more_than_three_read_only_context_paragraphs() -> None:
@@ -407,6 +474,144 @@ class _Provider:
             model="fast-model",
             finish_reason="stop",
         )
+
+
+def _coach_request() -> RealtimeIntelligenceRequest:
+    return RealtimeIntelligenceRequest.from_payload(
+        meeting_id="meeting-coach",
+        state_revision=4,
+        new_paragraphs=[
+            {
+                **_paragraph("remote-4", "你能承诺周五一定上线吗？"),
+                "source_track": "system_audio",
+            }
+        ],
+        context_paragraphs=[
+            {
+                **_paragraph("local-3", "压测还没有完成。"),
+                "source_track": "microphone",
+            }
+        ],
+        semantic_windows=[
+            {
+                "id": "window-coach",
+                "text": "[self_or_room] 压测还没有完成。\n[remote_mix] 你能承诺周五一定上线吗？",
+                "segment_ids": ["local-3", "remote-4"],
+                "source_tracks": ["microphone", "system_audio"],
+                "role_hints": ["self_or_room", "remote_mix"],
+                "status": "stable",
+            }
+        ],
+        rolling_state={"open_items": []},
+        meeting_goal="避免在压测完成前承诺上线日期",
+    )
+
+
+def test_coach_lane_only_triggers_for_new_system_audio() -> None:
+    assert should_run_realtime_coach(_coach_request()) is True
+    assert should_run_realtime_coach(_request()) is False
+
+
+def test_coach_prompt_is_focused_on_timely_action_instead_of_summary() -> None:
+    messages = build_realtime_coach_messages(_coach_request())
+    payload = json.loads(messages[1]["content"])
+
+    assert [item["id"] for item in payload["new_paragraphs"]] == ["remote-4"]
+    assert payload["meeting_goal"] == "避免在压测完成前承诺上线日期"
+    assert "任务不是总结" in messages[0]["content"]
+    assert "不要为了显得有帮助" in messages[0]["content"]
+
+
+def test_coach_parser_builds_an_evidence_bound_private_intervention() -> None:
+    intervention = parse_realtime_coach_response(
+        json.dumps(
+            {
+                "intervention": {
+                    "event_type": "commitment_risk",
+                    "title": "先限定承诺条件",
+                    "recommendation": "可以把周五作为目标，但需要以周四压测达标为上线条件。",
+                    "reason": "对方要求确定日期，但压测尚未完成。",
+                    "evidence_segment_ids": ["local-3", "remote-4"],
+                    "evidence_quote": "压测还没有完成",
+                    "urgency": "high",
+                    "confidence": 0.91,
+                }
+            },
+            ensure_ascii=False,
+        ),
+        request=_coach_request(),
+    )
+
+    assert intervention is not None
+    assert intervention.event_type == "commitment_risk"
+    assert intervention.evidence_segment_ids == ("local-3", "remote-4")
+    response = apply_coach_intervention(
+        parse_realtime_intelligence_response(
+            json.dumps(
+                {
+                    "paragraph_revisions": [],
+                    "topic_update": None,
+                    "state_changes": [],
+                    "follow_up": None,
+                }
+            ),
+            request=_coach_request(),
+        ),
+        intervention,
+    )
+    assert response.follow_up is not None
+    assert response.follow_up.coach_event_type == "commitment_risk"
+    assert response.follow_up.question == intervention.recommendation
+
+
+def test_coach_parser_rejects_a_quote_not_present_in_evidence() -> None:
+    content = json.dumps(
+        {
+            "intervention": {
+                "event_type": "commitment_risk",
+                "title": "虚构证据",
+                "recommendation": "先确认条件，再给出准确日期。",
+                "reason": "证据并不存在。",
+                "evidence_segment_ids": ["remote-4"],
+                "evidence_quote": "客户要求本周无条件交付",
+                "urgency": "high",
+                "confidence": 0.9,
+            }
+        },
+        ensure_ascii=False,
+    )
+    with pytest.raises(IntelligenceResponseValidationError, match="meeting evidence"):
+        parse_realtime_coach_response(content, request=_coach_request())
+
+
+def test_coach_runner_suppresses_low_confidence_interventions() -> None:
+    asyncio.run(_test_coach_runner_suppresses_low_confidence_interventions())
+
+
+async def _test_coach_runner_suppresses_low_confidence_interventions() -> None:
+    provider = _Provider(
+        json.dumps(
+            {
+                "intervention": {
+                    "event_type": "question_to_user",
+                    "title": "可能需要回答",
+                    "recommendation": "我先确认压测结果，再给出准确上线日期。",
+                    "reason": "对方询问了上线时间。",
+                    "evidence_segment_ids": ["remote-4"],
+                    "evidence_quote": "周五一定上线吗",
+                    "urgency": "medium",
+                    "confidence": 0.62,
+                }
+            },
+            ensure_ascii=False,
+        )
+    )
+
+    result = await run_realtime_coach(request=_coach_request(), provider=provider)
+
+    assert result["intervention"] is None
+    assert provider.parameters["max_completion_tokens"] == 768
+    assert provider.idempotency_key.endswith(":coach:v1")
 
 
 def test_runner_validates_one_structured_response_and_returns_latency_usage() -> None:

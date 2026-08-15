@@ -102,9 +102,12 @@ from meeting_copilot_web_mvp.v2_streaming_suggestions import (
 )
 from meeting_copilot_web_mvp.realtime_intelligence import (
     RealtimeIntelligenceRequest,
+    apply_coach_intervention,
     build_llm_first_event_context,
     realtime_intelligence_batch_id,
+    run_realtime_coach,
     run_realtime_intelligence,
+    should_run_realtime_coach,
 )
 from meeting_copilot_web_mvp.asr_semantic_quality import (
     BLOCKER as ASR_SEMANTIC_QUALITY_BLOCKER,
@@ -482,6 +485,79 @@ def _v2_intelligence_batch_segments(
         if int(segment.get("transcript_seq") or 0) < first_seq
     ][-3:]
     return new_segments, context
+
+
+def _v2_intelligence_role_hint(source_track: Any) -> str:
+    normalized = str(source_track or "").strip()
+    if normalized == "system_audio":
+        return "remote_mix"
+    if normalized == "microphone":
+        return "self_or_room"
+    return "unknown"
+
+
+def _v2_intelligence_source_track(source_track: Any) -> str:
+    normalized = str(source_track or "").strip()
+    return normalized if normalized in {"microphone", "system_audio"} else "unknown"
+
+
+def _v2_intelligence_semantic_windows(
+    persistence: V2Persistence,
+    *,
+    meeting_id: str,
+    segments: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Project existing semantic paragraphs into bounded, source-aware LLM windows.
+
+    Segment ids remain the evidence contract. Windows are understanding-only
+    context so the durable projection can continue validating original quotes.
+    """
+
+    selected = {str(segment.get("segment_id") or ""): segment for segment in segments}
+    selected.pop("", None)
+    if not selected:
+        return []
+    windows: list[dict[str, Any]] = []
+    for paragraph in persistence.list_semantic_paragraphs(meeting_id).get("paragraphs") or []:
+        segment_ids = [
+            str(segment_id)
+            for segment_id in paragraph.get("checkpoint_ids") or []
+            if str(segment_id) in selected
+        ]
+        if not segment_ids:
+            continue
+        window_segments = [selected[segment_id] for segment_id in segment_ids]
+        source_tracks = list(
+            dict.fromkeys(
+                _v2_intelligence_source_track(segment.get("source_track"))
+                for segment in window_segments
+            )
+        )
+        role_hints = list(
+            dict.fromkeys(_v2_intelligence_role_hint(segment.get("source_track")) for segment in window_segments)
+        )
+        text_lines = [
+            f"[{_v2_intelligence_role_hint(segment.get('source_track'))}] "
+            f"{str(segment.get('normalized_text') or segment.get('text') or '').strip()}"
+            for segment in window_segments
+            if str(segment.get("normalized_text") or segment.get("text") or "").strip()
+        ]
+        if not text_lines:
+            continue
+        windows.append(
+            {
+                "id": str(paragraph.get("paragraph_id") or ""),
+                "text": "\n".join(text_lines),
+                "revision": int(paragraph.get("revision") or 1),
+                "start_ms": window_segments[0].get("started_at_ms"),
+                "end_ms": window_segments[-1].get("ended_at_ms"),
+                "status": str(paragraph.get("status") or "active"),
+                "segment_ids": segment_ids,
+                "source_tracks": source_tracks,
+                "role_hints": role_hints,
+            }
+        )
+    return windows[-8:]
 
 
 def _v2_export_payload(persistence: V2Persistence, meeting_id: str) -> dict[str, Any]:
@@ -8731,6 +8807,11 @@ def create_app(
             "version": int(job.get("input_transcript_seq") or job.get("input_version") or 1),
         }
         preparation = meeting_preparation_store.get(meeting_id) if meeting_preparation_store is not None else None
+        semantic_windows = _v2_intelligence_semantic_windows(
+            v2_persistence,
+            meeting_id=meeting_id,
+            segments=[*context, *new_segments],
+        )
         request = RealtimeIntelligenceRequest.from_payload(
             meeting_id=meeting_id,
             state_revision=int(job.get("input_transcript_seq") or job.get("input_version") or 1),
@@ -8741,7 +8822,10 @@ def create_app(
                     "revision": int(segment.get("revision") or 1),
                     "start_ms": segment.get("started_at_ms"),
                     "end_ms": segment.get("ended_at_ms"),
-                    "speaker": segment.get("speaker"),
+                    "speaker": segment.get("speaker_label") or segment.get("speaker_id"),
+                    "speaker_confidence": segment.get("speaker_confidence"),
+                    "source_track": _v2_intelligence_source_track(segment.get("source_track")),
+                    "role_hint": _v2_intelligence_role_hint(segment.get("source_track")),
                 }
                 for segment in new_segments
             ],
@@ -8752,10 +8836,14 @@ def create_app(
                     "revision": int(segment.get("revision") or 1),
                     "start_ms": segment.get("started_at_ms"),
                     "end_ms": segment.get("ended_at_ms"),
-                    "speaker": segment.get("speaker"),
+                    "speaker": segment.get("speaker_label") or segment.get("speaker_id"),
+                    "speaker_confidence": segment.get("speaker_confidence"),
+                    "source_track": _v2_intelligence_source_track(segment.get("source_track")),
+                    "role_hint": _v2_intelligence_role_hint(segment.get("source_track")),
                 }
                 for segment in context
             ],
+            semantic_windows=semantic_windows,
             rolling_state=rolling_state,
             glossary=list(preparation.hotwords) if preparation is not None else [],
             meeting_goal=(
@@ -8798,12 +8886,65 @@ def create_app(
                 usage=usage,
             )
 
-        result = await run_realtime_intelligence(
+        def before_coach_attempt(_attempt: int) -> None:
+            _enforce_llm_budget(
+                meeting_id,
+                purpose="realtime_coach",
+                config=config,
+            )
+
+        def record_coach_attempt_usage(usage: dict[str, Any] | None, _attempt: int) -> None:
+            _record_llm_usage(
+                meeting_id,
+                purpose="realtime_coach",
+                config=config,
+                usage=usage,
+            )
+
+        intelligence_call = run_realtime_intelligence(
             request=request,
             provider=provider,
             before_attempt=before_intelligence_attempt,
             on_usage=record_intelligence_attempt_usage,
         )
+        coach_enabled = str(
+            os.environ.get("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
+        ).strip().lower() not in {"0", "false", "off", "no"}
+        coach_triggered = coach_enabled and should_run_realtime_coach(request)
+        coach_result: dict[str, Any] | None = None
+        coach_status = "not_triggered" if coach_enabled else "disabled"
+        if coach_triggered:
+            intelligence_outcome, coach_outcome = await asyncio.gather(
+                intelligence_call,
+                run_realtime_coach(
+                    request=request,
+                    provider=provider,
+                    before_attempt=before_coach_attempt,
+                    on_usage=record_coach_attempt_usage,
+                ),
+                return_exceptions=True,
+            )
+            if isinstance(intelligence_outcome, BaseException):
+                raise intelligence_outcome
+            result = intelligence_outcome
+            if isinstance(coach_outcome, BaseException):
+                coach_status = "failed_open"
+                _log.warning(
+                    "meeting.v2.realtime_coach_failed_open",
+                    meeting_id=meeting_id,
+                    job_id=str(job["id"]),
+                    error_class=type(coach_outcome).__name__,
+                    error_detail=str(coach_outcome),
+                )
+            else:
+                coach_result = coach_outcome
+                coach_status = "intervention" if coach_result.get("intervention") is not None else "silent"
+                result["response"] = apply_coach_intervention(
+                    result["response"],
+                    coach_result.get("intervention"),
+                )
+        else:
+            result = await intelligence_call
         formal_event_context = build_llm_first_event_context(
             request=request,
             response=result["response"],
@@ -8871,6 +9012,14 @@ def create_app(
             "repair_attempted": result.get("repair_attempted", False),
             "usage": result.get("usage"),
             "model": result.get("model"),
+            "coach": {
+                "enabled": coach_enabled,
+                "triggered": coach_triggered,
+                "status": coach_status,
+                "ttft_ms": coach_result.get("ttft_ms") if coach_result is not None else None,
+                "usage": coach_result.get("usage") if coach_result is not None else None,
+                "model": coach_result.get("model") if coach_result is not None else None,
+            },
         }
 
     def _default_v2_correction_job_handler(job: dict[str, Any]) -> dict[str, Any]:

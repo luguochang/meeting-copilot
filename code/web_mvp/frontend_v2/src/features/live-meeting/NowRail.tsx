@@ -92,6 +92,15 @@ function factEvidenceQuote(fact: RailFact): string {
   return fact.evidenceSpans[0]?.quote || "查看依据";
 }
 
+function coachLabel(followUp: FollowUpProjection): string {
+  if (followUp.title) return followUp.title;
+  if (followUp.coachEventType === "question_to_user") return "对方正在等你回答";
+  if (followUp.coachEventType === "commitment_risk") return "先限定承诺条件";
+  if (followUp.coachEventType === "goal_at_risk") return "目标可能被跳过";
+  if (followUp.coachEventType === "contradiction") return "前后口径需要确认";
+  return "建议追问";
+}
+
 function factIsResolved(fact: RailFact): boolean {
   return ["done", "answered", "resolved", "dismissed"].includes(String(fact.status));
 }
@@ -401,7 +410,7 @@ export function NowRail({
       <section className="rail-section suggestion-section" aria-labelledby="suggestion-title">
         <header className="rail-heading">
           <MessageCircleQuestion size={16} />
-          <h2 id="suggestion-title">AI 实时建议</h2>
+          <h2 id="suggestion-title">AI 实时教练</h2>
           {suggestion?.status === "draft" || suggestion?.status === "validating" ? (
             <span className="draft-badge">生成中</span>
           ) : null}
@@ -410,7 +419,7 @@ export function NowRail({
         {formalFollowUp ? (
           <div className="follow-up-card" data-testid="follow-up-card">
             <div className="follow-up-heading">
-              <strong>建议追问</strong>
+              <strong>{coachLabel(formalFollowUp)}</strong>
               <span
                 className="follow-up-reason"
                 title={`为什么现在提示：${formalFollowUp.reason}${formalFollowUp.evidenceQuote ? `；依据：${formalFollowUp.evidenceQuote}` : ""}`}

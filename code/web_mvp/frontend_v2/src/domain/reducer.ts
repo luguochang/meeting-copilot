@@ -453,12 +453,23 @@ function eventFollowUp(event: MeetingEvent): FollowUpProjection | null {
   const reason = stringValue(value, "reason");
   if (!question || !reason) return null;
   const urgency = stringValue(value, "urgency");
+  const coachEventType = stringValue(value, "coach_event_type", "coachEventType");
+  const recognizedCoachEventType =
+    coachEventType === "question_to_user" || coachEventType === "commitment_risk" ||
+    coachEventType === "goal_at_risk" || coachEventType === "contradiction"
+      ? coachEventType
+      : null;
+  const title = stringValue(value, "title");
+  const confidence = numberValue(value, "confidence");
   return {
     question,
     reason,
     evidenceSegmentIds: stringArray(value.evidence_segment_ids ?? value.evidenceSegmentIds),
     evidenceQuote: stringValue(value, "evidence_quote", "evidenceQuote") ?? "",
     urgency: urgency === "low" || urgency === "high" ? urgency : "medium",
+    ...(recognizedCoachEventType ? { coachEventType: recognizedCoachEventType } : {}),
+    ...(title ? { title } : {}),
+    ...(confidence !== null ? { confidence } : {}),
     formalAi: formalAiFromPayload(event.payload),
   };
 }
