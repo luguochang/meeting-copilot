@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from meeting_copilot_web_mvp.v2_persistence import (
+    IntelligenceEvidenceSuperseded,
     IntelligenceProjectionError,
     JobLeaseLostError,
     TranscriptRevisionIdentityConflict,
@@ -1845,6 +1846,76 @@ def test_chapters_and_ask_ai_workspace_are_durable_and_searchable(tmp_path):
         ]
     finally:
         reopened.close()
+
+
+def test_stale_intelligence_can_enqueue_one_refresh_over_latest_evidence(tmp_path):
+    persistence = V2Persistence(
+        tmp_path / "intelligence-refresh.db",
+        semantic_projection_mode="llm_first",
+    )
+    try:
+        committed = persistence.commit_final_and_enqueue(
+            meeting_id="meeting-refresh",
+            final_id="refresh-final-1",
+            segment_id="refresh-segment-1",
+            text="直播真的很重要。",
+            normalized_text="直播真的很重要。",
+            started_at_ms=0,
+            ended_at_ms=1_000,
+            evidence_hash="refresh-hash-1",
+            now_ms=1_000,
+        )
+        claimed = persistence.claim_next_job(
+            worker_id="stale-intelligence-worker",
+            lane="intelligence",
+            now_ms=4_000,
+            lease_ms=5_000,
+        )
+        assert claimed is not None
+        revised = persistence.commit_transcript_revision(
+            meeting_id="meeting-refresh",
+            segment_id="refresh-segment-1",
+            expected_evidence_hash="refresh-hash-1",
+            corrected_text="直播交流真的很重要。",
+            revision_id="refresh-revision-1",
+            now_ms=4_100,
+            causation_id="correction-job-1",
+        )
+        assert revised is not None
+
+        with pytest.raises(IntelligenceEvidenceSuperseded, match="evidence is stale"):
+            persistence.apply_intelligence_response(
+                meeting_id="meeting-refresh",
+                job_id=committed["job_ids"]["intelligence"],
+                response={
+                    "paragraph_revisions": [],
+                    "topic_update": None,
+                    "state_changes": [],
+                    "follow_up": None,
+                },
+                now_ms=4_200,
+            )
+
+        replacement = persistence.enqueue_latest_intelligence(
+            meeting_id="meeting-refresh",
+            superseded_job_id=claimed["id"],
+            now_ms=4_200,
+        )
+        repeated = persistence.enqueue_latest_intelligence(
+            meeting_id="meeting-refresh",
+            superseded_job_id=claimed["id"],
+            now_ms=4_300,
+        )
+
+        assert replacement is not None
+        assert repeated is not None
+        assert replacement["id"] == repeated["id"]
+        assert replacement["status"] == "pending"
+        assert replacement["input_transcript_seq"] == 1
+        assert replacement["input_version"] == 2
+        assert replacement["evidence_hash"] == revised["evidence_hash"]
+    finally:
+        persistence.close()
 
 
 def test_formal_notes_support_search_edit_evidence_and_meeting_deletion(persistence):

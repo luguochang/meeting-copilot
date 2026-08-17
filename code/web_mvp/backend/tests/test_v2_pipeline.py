@@ -365,6 +365,45 @@ def test_non_retryable_handler_failure_reaches_terminal_state_once(tmp_path):
     asyncio.run(scenario())
 
 
+def test_superseded_handler_is_cancelled_instead_of_reported_failed(tmp_path):
+    class EvidenceSuperseded(RuntimeError):
+        superseded = True
+        retryable = False
+
+    async def scenario() -> None:
+        persistence = V2Persistence(tmp_path / "meeting_copilot.db")
+        committed = _commit_final(persistence, final_number=1, now_ms=1_000)
+        cancelled_job_ids: list[str] = []
+
+        async def correction_handler(job: dict):
+            return {"ok": job["id"]}
+
+        async def suggestion_handler(_job: dict):
+            raise EvidenceSuperseded("new transcript evidence replaced this request")
+
+        executor = DurableJobExecutor(
+            persistence,
+            correction_handler=correction_handler,
+            suggestion_handler=suggestion_handler,
+            worker_id="superseded-test",
+            poll_interval_ms=5,
+            cancellation_observer=cancelled_job_ids.append,
+        )
+        suggestion_job_id = committed["job_ids"]["suggestion"]
+        try:
+            await executor.start()
+            await _wait_until(lambda: persistence.get_job(suggestion_job_id)["status"] == "cancelled")
+            cancelled = persistence.get_job(suggestion_job_id)
+            assert cancelled["attempts"] == 1
+            assert cancelled["error_class"] == "evidence_superseded"
+            assert cancelled_job_ids == [suggestion_job_id]
+        finally:
+            await executor.stop()
+            persistence.close()
+
+    asyncio.run(scenario())
+
+
 def test_correction_timeout_preserves_original_and_next_segment_continues(tmp_path):
     async def scenario() -> None:
         persistence = V2Persistence(tmp_path / "meeting_copilot.db")

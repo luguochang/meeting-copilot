@@ -457,6 +457,12 @@ class IntelligenceProjectionError(RuntimeError):
     retryable = False
 
 
+class IntelligenceEvidenceSuperseded(IntelligenceProjectionError):
+    """The transcript changed while an intelligence request was in flight."""
+
+    superseded = True
+
+
 class ReviewDocumentConflict(RuntimeError):
     def __init__(self, *, expected_revision: int, current_document: Mapping[str, Any] | None) -> None:
         current_revision = int(current_document["revision"]) if current_document is not None else 0
@@ -2858,7 +2864,90 @@ class V2Persistence:
                 status="running",
                 now_ms=now_ms,
             )
-        return self._job_dict(row)
+            return self._job_dict(row)
+
+    def enqueue_latest_intelligence(
+        self,
+        *,
+        meeting_id: str,
+        superseded_job_id: str,
+        now_ms: int,
+    ) -> dict[str, Any] | None:
+        """Ensure stale realtime work is followed by one job over current evidence."""
+
+        meeting_id = _required(meeting_id, "meeting_id")
+        superseded_job_id = _required(superseded_job_id, "superseded_job_id")
+        now_ms = max(0, int(now_ms))
+        if self.semantic_projection_mode != "llm_first":
+            return None
+        with self._write_transaction():
+            latest = self._conn.execute(
+                "SELECT * FROM transcript_segments WHERE meeting_id = ? "
+                "AND duplicate_of_segment_id IS NULL ORDER BY transcript_seq DESC LIMIT 1",
+                (meeting_id,),
+            ).fetchone()
+            if latest is None:
+                return None
+            paragraph = self._conn.execute(
+                "SELECT paragraph.paragraph_id, paragraph.revision "
+                "FROM semantic_paragraph_checkpoints mapping "
+                "JOIN semantic_paragraphs paragraph ON paragraph.meeting_id = mapping.meeting_id "
+                "AND paragraph.paragraph_id = mapping.paragraph_id "
+                "WHERE mapping.meeting_id = ? AND mapping.checkpoint_id = ?",
+                (meeting_id, latest["segment_id"]),
+            ).fetchone()
+            if paragraph is None:
+                return None
+            existing = self._conn.execute(
+                "SELECT * FROM jobs WHERE meeting_id = ? AND kind = 'intelligence' "
+                "AND id != ? AND status IN ('pending', 'running', 'retry_wait') "
+                "AND input_transcript_seq = ? AND input_version = ? "
+                "AND evidence_segment_id = ? AND evidence_hash = ? "
+                "ORDER BY created_at_ms DESC, id DESC LIMIT 1",
+                (
+                    meeting_id,
+                    superseded_job_id,
+                    int(latest["transcript_seq"]),
+                    int(paragraph["revision"]),
+                    str(latest["segment_id"]),
+                    str(latest["evidence_hash"]),
+                ),
+            ).fetchone()
+            if existing is not None:
+                return self._job_dict(existing)
+            job_id = _stable_id(
+                "job",
+                meeting_id,
+                str(latest["segment_id"]),
+                str(latest["evidence_hash"]),
+                str(paragraph["revision"]),
+                "intelligence-refresh",
+            )
+            self._conn.execute(
+                "INSERT OR IGNORE INTO jobs ("
+                "id, meeting_id, kind, status, priority, input_transcript_seq, "
+                "input_version, evidence_segment_id, evidence_hash, generation_id, "
+                "idempotency_key, attempts, max_attempts, next_attempt_at_ms, "
+                "deadline_at_ms, created_at_ms, updated_at_ms"
+                ") VALUES (?, ?, 'intelligence', 'pending', 110, ?, ?, ?, ?, NULL, ?, 0, 3, ?, NULL, ?, ?)",
+                (
+                    job_id,
+                    meeting_id,
+                    int(latest["transcript_seq"]),
+                    int(paragraph["revision"]),
+                    str(latest["segment_id"]),
+                    str(latest["evidence_hash"]),
+                    (
+                        f"intelligence-refresh:{meeting_id}:{latest['segment_id']}:"
+                        f"{latest['evidence_hash']}:{paragraph['revision']}"
+                    ),
+                    now_ms + INTELLIGENCE_DEBOUNCE_MS,
+                    now_ms,
+                    now_ms,
+                ),
+            )
+            row = self._conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            return self._job_dict(row) if row is not None else None
 
     def heartbeat_job(
         self,
@@ -2910,6 +2999,36 @@ class V2Persistence:
                 job_row=row,
                 status="succeeded",
                 now_ms=now_ms,
+            )
+        return self._job_dict(row)
+
+    def cancel_job(
+        self,
+        *,
+        job_id: str,
+        worker_id: str,
+        now_ms: int,
+        error_class: str = "evidence_superseded",
+    ) -> dict[str, Any] | None:
+        job_id = _required(job_id, "job_id")
+        worker_id = _required(worker_id, "worker_id")
+        error_class = _public_job_error_class(_required(error_class, "error_class"))
+        now_ms = max(0, int(now_ms))
+        with self._write_transaction():
+            result = self._conn.execute(
+                "UPDATE jobs SET status = 'cancelled', lease_owner = NULL, "
+                "lease_until_ms = NULL, error_class = ?, completed_at_ms = ?, updated_at_ms = ? "
+                "WHERE id = ? AND status = 'running' AND lease_owner = ? AND lease_until_ms > ?",
+                (error_class, now_ms, now_ms, job_id, worker_id, now_ms),
+            )
+            if result.rowcount != 1:
+                return None
+            row = self._conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            self._sync_correction_status_for_job_locked(
+                job_row=row,
+                status="cancelled",
+                now_ms=now_ms,
+                error_class=error_class,
             )
         return self._job_dict(row)
 
@@ -3434,7 +3553,7 @@ class V2Persistence:
                 or int(evidence_row["transcript_seq"]) != int(job_row["input_transcript_seq"])
                 or not (evidence_hash_is_current or evidence_hash_was_advanced_by_job)
             ):
-                raise IntelligenceProjectionError("intelligence job evidence is stale")
+                raise IntelligenceEvidenceSuperseded("intelligence job evidence is stale")
             paragraph_row = self._conn.execute(
                 "SELECT paragraph.revision FROM semantic_paragraphs paragraph "
                 "JOIN semantic_paragraph_checkpoints mapping "
@@ -3445,7 +3564,7 @@ class V2Persistence:
             ).fetchone()
             expected_paragraph_revision = int(job_row["input_version"]) + len(own_revisions)
             if paragraph_row is None or int(paragraph_row["revision"]) != expected_paragraph_revision:
-                raise IntelligenceProjectionError("intelligence paragraph evidence is stale")
+                raise IntelligenceEvidenceSuperseded("intelligence paragraph evidence is stale")
 
         # Transcript revisions use their existing CAS implementation. Do this
         # before entity projection so stale evidence can never produce facts.

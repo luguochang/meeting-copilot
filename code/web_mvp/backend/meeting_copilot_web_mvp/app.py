@@ -63,6 +63,7 @@ from meeting_copilot_web_mvp.application_schema import (
 )
 from meeting_copilot_web_mvp.v2_persistence import (
     DEFAULT_EVENT_PAGE_LIMIT,
+    IntelligenceEvidenceSuperseded,
     INTELLIGENCE_MAX_BATCH_SEGMENTS,
     MAX_EVENT_PAGE_LIMIT,
     ReviewDocumentConflict,
@@ -592,7 +593,7 @@ def _coach_runtime_capability(
         return {
             "state": "busy",
             "label": "Pi 教练正在检查" if requested == "pi" else "实时教练正在检查",
-            "detail": "问题、承诺、目标、口径和介入价值",
+            "detail": "问题、承诺、目标、口径、表达清晰和介入价值",
         }
 
     output = latest_job.get("output") if isinstance(latest_job, Mapping) else None
@@ -626,16 +627,21 @@ def _coach_runtime_capability(
     checklist_count = len(checklist_ids) if isinstance(checklist_ids, list) else 0
     history_searches = max(0, int(metrics.get("history_searches") or 0))
     session_reused = metrics.get("session_reused") is True
-    detail_parts = [f"本轮完成 {checklist_count or 5} 项检查"]
+    detail_parts = [f"本轮完成 {checklist_count or 6} 项检查"]
     if history_searches:
         detail_parts.append(f"检索历史 {history_searches} 次")
+    decision = None
     if coach.get("status") == "silent":
-        detail_parts.append("本轮判断无需打断")
+        decision_reason = str(coach.get("decision_reason") or "").strip()[:160]
+        decision = "本轮结论：暂不打断"
+        if decision_reason:
+            decision = f"{decision}，{decision_reason}"
     detail_parts.append("已延续会议上下文" if session_reused else "已建立会议上下文")
     return {
         "state": "active",
         "label": "Pi 教练监听中" if runtime_used == "pi" else "实时教练监听中",
         "detail": " · ".join(detail_parts),
+        "decision": decision,
     }
 
 
@@ -9109,6 +9115,23 @@ def create_app(
                 response=result["response"].to_dict(),
                 now_ms=time.time_ns() // 1_000_000,
             )
+        except IntelligenceEvidenceSuperseded:
+            replacement = await asyncio.to_thread(
+                v2_persistence.enqueue_latest_intelligence,
+                meeting_id=meeting_id,
+                superseded_job_id=str(job["id"]),
+                now_ms=time.time_ns() // 1_000_000,
+            )
+            executor = getattr(app.state, "v2_executor", None)
+            if replacement is not None and executor is not None:
+                executor.wake("intelligence")
+            _log.info(
+                "meeting.v2.intelligence_evidence_superseded",
+                meeting_id=meeting_id,
+                job_id=str(job["id"]),
+                replacement_job_id=(str(replacement["id"]) if replacement is not None else None),
+            )
+            raise
         except Exception as exc:
             _log.error(
                 "meeting.v2.intelligence_projection_failed",

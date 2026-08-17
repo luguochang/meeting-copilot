@@ -45,8 +45,9 @@ def test_coach_runtime_capability_exposes_pi_loop_metrics():
                 "coach": {
                     "status": "silent",
                     "runtime_used": "pi",
+                    "decision_reason": "没有发现需要立刻介入的表达问题",
                     "agent_metrics": {
-                        "checklist_item_ids": ["question", "commitment", "goal", "conflict", "value"],
+                        "checklist_item_ids": ["question", "commitment", "goal", "conflict", "clarity", "value"],
                         "history_searches": 2,
                         "session_reused": True,
                     },
@@ -58,7 +59,8 @@ def test_coach_runtime_capability_exposes_pi_loop_metrics():
     assert capability == {
         "state": "active",
         "label": "Pi 教练监听中",
-        "detail": "本轮完成 5 项检查 · 检索历史 2 次 · 本轮判断无需打断 · 已延续会议上下文",
+        "detail": "本轮完成 6 项检查 · 检索历史 2 次 · 已延续会议上下文",
+        "decision": "本轮结论：暂不打断，没有发现需要立刻介入的表达问题",
     }
 
 

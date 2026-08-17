@@ -309,7 +309,15 @@ class DurableJobExecutor:
                 max(0, int(requested_delay_ms)),
             )
         error_class = _handler_error_class(error)
-        if getattr(error, "preserve_attempt", False):
+        if getattr(error, "superseded", False):
+            retried = await asyncio.to_thread(
+                self._persistence.cancel_job,
+                job_id=job["id"],
+                worker_id=worker_id,
+                now_ms=now_ms,
+                error_class="evidence_superseded",
+            )
+        elif getattr(error, "preserve_attempt", False):
             retried = await asyncio.to_thread(
                 self._persistence.defer_job,
                 job_id=job["id"],
@@ -342,11 +350,17 @@ class DurableJobExecutor:
             self._notify_telemetry(self._cancellation_observer, str(job["id"]), "cancelled")
         elif retried["status"] == "retry_wait":
             self._notify_telemetry(self._retry_observer, str(job["id"]), "retry")
-        log = self._logger.info if getattr(error, "preserve_attempt", False) else self._logger.warning
+        log = self._logger.info if (
+            getattr(error, "preserve_attempt", False) or getattr(error, "superseded", False)
+        ) else self._logger.warning
+        if getattr(error, "superseded", False):
+            message = "V2 %s job %s superseded on attempt %s with %s; status=%s"
+        elif getattr(error, "preserve_attempt", False):
+            message = "V2 %s job %s deferred on attempt %s with %s; status=%s"
+        else:
+            message = "V2 %s job %s failed on attempt %s with %s; status=%s"
         log(
-            "V2 %s job %s deferred on attempt %s with %s; status=%s"
-            if getattr(error, "preserve_attempt", False)
-            else "V2 %s job %s failed on attempt %s with %s; status=%s",
+            message,
             job["kind"],
             job["id"],
             attempt,
