@@ -68,20 +68,17 @@ function harness() {
 test("Pi executes a context tool loop and returns only a validated intervention", async () => {
   const { faux, runtime } = harness();
   faux.setResponses([
-    fauxAssistantMessage(fauxToolCall("review_coaching_checklist", {}), {
-      stopReason: "toolUse",
-    }),
     fauxAssistantMessage(fauxToolCall("read_realtime_context", { scope: "meeting_goal" }), {
       stopReason: "toolUse",
     }),
     fauxAssistantMessage(
       fauxToolCall("submit_intervention", {
-        event_type: "question_to_user",
+        event_type: "commitment_risk",
         title: "对方正在等你回答",
         recommendation: "我先确认压测结果，再给出准确的上线日期。",
         reason: "对方直接询问了上线时间。",
-        evidence_segment_ids: ["remote-1"],
-        evidence_quote: "周五一定上线吗",
+        evidence_segment_ids: ["local-1", "remote-1"],
+        evidence_quote: "周五一定上线吗\n压测通过后才能确定日期",
         urgency: "high",
         confidence: 0.93,
       }),
@@ -92,10 +89,10 @@ test("Pi executes a context tool loop and returns only a validated intervention"
   const result = await runtime.evaluate(request());
 
   assert.equal(result.action, "intervention");
-  assert.equal(result.intervention.event_type, "question_to_user");
-  assert.equal(result.metrics.turns, 3);
+  assert.equal(result.intervention.event_type, "commitment_risk");
+  assert.equal(result.metrics.turns, 2);
   assert.equal(result.metrics.context_reads, 1);
-  assert.equal(result.metrics.tool_calls, 3);
+  assert.equal(result.metrics.tool_calls, 2);
   assert.equal(result.metrics.checklist_reviewed, true);
   assert.deepEqual(result.metrics.checklist_item_ids, [
     "unanswered_question",
@@ -106,12 +103,9 @@ test("Pi executes a context tool loop and returns only a validated intervention"
   ]);
 });
 
-test("Pi can deliberately keep silent after the mandatory checklist", async () => {
+test("Pi can deliberately keep silent after the host checklist", async () => {
   const { faux, runtime } = harness();
   faux.setResponses([
-    fauxAssistantMessage(fauxToolCall("review_coaching_checklist", {}), {
-      stopReason: "toolUse",
-    }),
     fauxAssistantMessage(fauxToolCall("keep_silent", { reason: "No actionable moment." }), {
       stopReason: "toolUse",
     }),
@@ -122,22 +116,42 @@ test("Pi can deliberately keep silent after the mandatory checklist", async () =
   assert.equal(result.action, "silent");
   assert.equal(result.intervention, null);
   assert.equal(result.decision_reason, "No actionable moment.");
-  assert.equal(result.metrics.turns, 2);
-  assert.equal(faux.state.callCount, 2);
+  assert.equal(result.metrics.turns, 1);
+  assert.equal(result.metrics.checklist_reviews, 1);
+  assert.equal(faux.state.callCount, 1);
 });
 
-test("the checklist exposes bounded routing signals before the terminal decision", async () => {
+test("the host checklist lets Pi reach a terminal decision in one provider turn", async () => {
   const { faux, runtime } = harness();
   faux.setResponses([
-    fauxAssistantMessage(fauxToolCall("review_coaching_checklist", {}), {
-      stopReason: "toolUse",
-    }),
+    fauxAssistantMessage(
+      fauxToolCall("keep_silent", { reason: "No actionable moment." }),
+      { stopReason: "toolUse" },
+    ),
+  ]);
+
+  const result = await runtime.evaluate(request());
+
+  assert.equal(result.action, "silent");
+  assert.equal(result.metrics.turns, 1);
+  assert.equal(result.metrics.tool_calls, 1);
+  assert.deepEqual(result.metrics.tool_names, ["keep_silent"]);
+  assert.equal(result.metrics.checklist_reviewed, true);
+  assert.equal(faux.state.callCount, 1);
+});
+
+test("the host checklist exposes bounded routing signals in the initial request", async () => {
+  const { faux, runtime } = harness();
+  faux.setResponses([
     (context) => {
-      const checklistResult = context.messages.find((message) => (
-        message.role === "toolResult" && message.toolName === "review_coaching_checklist"
-      ));
-      assert.ok(checklistResult);
-      const payload = JSON.parse(checklistResult.content.find((block) => block.type === "text").text);
+      const userMessage = context.messages.findLast((message) => message.role === "user");
+      assert.ok(userMessage);
+      const text = typeof userMessage.content === "string"
+        ? userMessage.content
+        : userMessage.content.find((block) => block.type === "text").text;
+      const payload = JSON.parse(text);
+      assert.equal(payload.checklist_reviewed, true);
+      assert.equal(payload.checklist.length, 5);
       assert.equal(payload.context_signals.meeting_goal, request().context.meeting_goal);
       assert.deepEqual(payload.context_signals.rolling_state, request().context.rolling_state);
       assert.deepEqual(
@@ -166,9 +180,6 @@ test("the checklist exposes bounded routing signals before the terminal decision
 test("the tool boundary rejects invented evidence", async () => {
   const { faux, runtime } = harness();
   faux.setResponses([
-    fauxAssistantMessage(fauxToolCall("review_coaching_checklist", {}), {
-      stopReason: "toolUse",
-    }),
     fauxAssistantMessage(
       fauxToolCall("submit_intervention", {
         event_type: "commitment_risk",
@@ -190,15 +201,15 @@ test("the tool boundary rejects invented evidence", async () => {
   const result = await runtime.evaluate(request());
 
   assert.equal(result.action, "silent");
-  assert.equal(result.metrics.turns, 3);
+  assert.equal(result.metrics.turns, 2);
+  assert.deepEqual(result.metrics.tool_errors, [
+    { tool: "submit_intervention", code: "evidence_quote_not_verbatim" },
+  ]);
 });
 
 test("a contradiction cannot be submitted without prior evidence", async () => {
   const { faux, runtime } = harness();
   faux.setResponses([
-    fauxAssistantMessage(fauxToolCall("review_coaching_checklist", {}), {
-      stopReason: "toolUse",
-    }),
     fauxAssistantMessage(
       fauxToolCall("submit_intervention", {
         event_type: "contradiction",
@@ -221,19 +232,16 @@ test("a contradiction cannot be submitted without prior evidence", async () => {
   const result = await runtime.evaluate(request());
 
   assert.equal(result.action, "silent");
-  assert.equal(result.metrics.turns, 3);
+  assert.equal(result.metrics.turns, 2);
+  assert.deepEqual(result.metrics.tool_errors, [
+    { tool: "submit_intervention", code: "prior_evidence_required" },
+  ]);
 });
 
 test("the same Pi session retains bounded history across evaluations", async () => {
   const { faux, runtime } = harness();
   faux.setResponses([
-    fauxAssistantMessage(fauxToolCall("review_coaching_checklist", {}), {
-      stopReason: "toolUse",
-    }),
     fauxAssistantMessage(fauxToolCall("keep_silent", { reason: "First moment is not actionable." }), {
-      stopReason: "toolUse",
-    }),
-    fauxAssistantMessage(fauxToolCall("review_coaching_checklist", {}), {
       stopReason: "toolUse",
     }),
     fauxAssistantMessage(fauxToolCall("keep_silent", { reason: "Second moment is not actionable." }), {
@@ -252,9 +260,6 @@ test("the same Pi session retains bounded history across evaluations", async () 
 test("Pi can search bounded prior transcript evidence before deciding", async () => {
   const { faux, runtime } = harness();
   faux.setResponses([
-    fauxAssistantMessage(fauxToolCall("review_coaching_checklist", {}), {
-      stopReason: "toolUse",
-    }),
     fauxAssistantMessage(fauxToolCall("search_prior_evidence", {
       query: "五百并发确认达标",
       max_results: 3,

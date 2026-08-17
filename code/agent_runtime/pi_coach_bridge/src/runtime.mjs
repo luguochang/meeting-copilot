@@ -56,7 +56,9 @@ const SYSTEM_PROMPT = [
   "Allowed events are question_to_user, commitment_risk, goal_at_risk, and contradiction.",
   "system_audio/remote_mix usually represents the remote computer-audio mix. microphone/self_or_room is not guaranteed to be the local user.",
   "Microphone turns may update whether a question or commitment is still open, but never attribute them to the user without corroboration.",
-  "Begin every evaluation with review_coaching_checklist. Its context_signals are routing evidence, not optional metadata: compare the latest utterance with the meeting goal, rolling state, and recent context before deciding.",
+  "The host applies the complete coaching checklist before every evaluation. Treat checklist_reviewed and context_signals as mandatory routing evidence, not optional metadata.",
+  "When evidence is already sufficient, call exactly one terminal tool in the first response.",
+  "When prior evidence is needed, call search_prior_evidence in the first response, then use one terminal tool in the next response.",
   "When context_signals suggest an earlier condition or position may conflict with the latest utterance, use search_prior_evidence before deciding.",
   "Use read_realtime_context for semantic windows that are still needed after reviewing context_signals.",
   "Never invent a person, number, deadline, position, or goal.",
@@ -74,8 +76,6 @@ const readContextParameters = Type.Object(
   },
   { additionalProperties: false },
 );
-
-const emptyParameters = Type.Object({}, { additionalProperties: false });
 
 const searchEvidenceParameters = Type.Object(
   {
@@ -100,7 +100,11 @@ const interventionParameters = Type.Object(
       minItems: 1,
       maxItems: 12,
     }),
-    evidence_quote: Type.String({ minLength: 1, maxLength: 1000 }),
+    evidence_quote: Type.String({
+      minLength: 1,
+      maxLength: 1000,
+      description: "Verbatim evidence only. For multiple fragments, put one exact fragment on each line.",
+    }),
     urgency: Type.Union([
       Type.Literal("low"),
       Type.Literal("medium"),
@@ -353,7 +357,14 @@ function validateInterventionEvidence(intervention, context) {
       );
     }
   }
-  if (!texts.some((text) => text.includes(intervention.evidence_quote)) && !texts.join("\n").includes(intervention.evidence_quote)) {
+  const quoteFragments = intervention.evidence_quote
+    .split(/\r?\n/u)
+    .map((fragment) => fragment.trim())
+    .filter(Boolean);
+  const quoteIsVerbatim = texts.some((text) => text.includes(intervention.evidence_quote))
+    || (quoteFragments.length > 1
+      && quoteFragments.every((fragment) => texts.some((text) => text.includes(fragment))));
+  if (!quoteIsVerbatim) {
     throw new PiCoachProtocolError("evidence quote is not verbatim input", "invalid_agent_action");
   }
   return { ...intervention, evidence_segment_ids: uniqueIds };
@@ -365,6 +376,14 @@ function selectContext(scope, context) {
   return { meeting_goal: context.meeting_goal };
 }
 
+function contextSignals(context) {
+  return {
+    meeting_goal: context.meeting_goal,
+    rolling_state: context.rolling_state,
+    recent_context_paragraphs: context.context_paragraphs,
+  };
+}
+
 function setTerminalAction(entry, action) {
   if (entry.run.terminalAction) {
     throw new PiCoachProtocolError("the agent selected more than one terminal action", "invalid_agent_action");
@@ -372,38 +391,22 @@ function setTerminalAction(entry, action) {
   entry.run.terminalAction = action;
 }
 
+function toolErrorCode(result) {
+  const text = (result?.content ?? [])
+    .filter((block) => block?.type === "text")
+    .map((block) => String(block.text || ""))
+    .join(" ")
+    .toLocaleLowerCase();
+  if (text.includes("unknown evidence")) return "unknown_evidence";
+  if (text.includes("evidence quote is not verbatim")) return "evidence_quote_not_verbatim";
+  if (text.includes("require prior evidence")) return "prior_evidence_required";
+  if (text.includes("more than one terminal action")) return "multiple_terminal_actions";
+  if (text.includes("checklist")) return "checklist_not_reviewed";
+  return "tool_execution_error";
+}
+
 function createRestrictedTools(entry) {
   return [
-    {
-      name: "review_coaching_checklist",
-      label: "Review coaching checklist",
-      description: "Start the evaluation by reviewing every realtime coaching guardrail and the available evidence sources.",
-      parameters: emptyParameters,
-      executionMode: "sequential",
-      execute: async () => {
-        entry.run.checklistReviewed = true;
-        entry.run.checklistReviews += 1;
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              checklist: COACHING_CHECKLIST,
-              meeting_goal_available: Boolean(entry.activeContext.meeting_goal),
-              rolling_state_available: Object.keys(entry.activeContext.rolling_state).length > 0,
-              searchable_prior_paragraphs: entry.activeContext.retrieval_paragraphs.length,
-              context_signals: {
-                meeting_goal: entry.activeContext.meeting_goal,
-                rolling_state: entry.activeContext.rolling_state,
-                recent_context_paragraphs: entry.activeContext.context_paragraphs,
-              },
-              routing_rule:
-                "Compare the latest utterance with context_signals. Search prior evidence when an earlier condition or position may matter.",
-            }),
-          }],
-          details: { checklist_item_ids: COACHING_CHECKLIST.map((item) => item.id) },
-        };
-      },
-    },
     {
       name: "read_realtime_context",
       label: "Read realtime context",
@@ -446,7 +449,7 @@ function createRestrictedTools(entry) {
       executionMode: "sequential",
       execute: async (_toolCallId, params) => {
         if (!entry.run.checklistReviewed) {
-          throw new PiCoachProtocolError("review_coaching_checklist must run first", "checklist_not_reviewed");
+          throw new PiCoachProtocolError("host coaching checklist must be complete", "checklist_not_reviewed");
         }
         const intervention = validateInterventionEvidence(params, entry.activeContext);
         setTerminalAction(entry, { action: "intervention", intervention });
@@ -465,7 +468,7 @@ function createRestrictedTools(entry) {
       executionMode: "sequential",
       execute: async (_toolCallId, params) => {
         if (!entry.run.checklistReviewed) {
-          throw new PiCoachProtocolError("review_coaching_checklist must run first", "checklist_not_reviewed");
+          throw new PiCoachProtocolError("host coaching checklist must be complete", "checklist_not_reviewed");
         }
         setTerminalAction(entry, { action: "silent", reason: params.reason });
         return {
@@ -483,8 +486,11 @@ function buildPrompt(context) {
     task: "decide_realtime_coaching_intervention",
     state_revision: context.state_revision,
     new_paragraphs: context.new_paragraphs,
+    checklist_reviewed: true,
+    checklist: COACHING_CHECKLIST,
+    context_signals: contextSignals(context),
     searchable_prior_paragraph_count: context.retrieval_paragraphs.length,
-    reminder: "Review the checklist first, then use exactly one terminal tool. Read or search additional context only if needed.",
+    reminder: "The host checklist is complete. Use exactly one terminal tool now when evidence is sufficient; otherwise use one context tool, then decide next turn.",
   });
 }
 
@@ -509,11 +515,19 @@ function createSessionEntry(sessionId, backend) {
     transformContext: async (messages) => pruneContext(messages),
     toolExecution: "sequential",
     sessionId,
-    shouldStopAfterTurn: () => entry.run.turns >= MAX_AGENT_TURNS_PER_EVALUATION,
-    beforeToolCall: async () => {
+    shouldStopAfterTurn: () => Boolean(entry.run.terminalAction)
+      || entry.run.turns >= MAX_AGENT_TURNS_PER_EVALUATION,
+    beforeToolCall: async ({ toolCall }) => {
       entry.run.toolCalls += 1;
+      entry.run.toolNames.push(toolCall.name);
       if (entry.run.toolCalls > 8) {
         return { block: true, reason: "Tool-call budget exhausted.", terminate: true };
+      }
+      return undefined;
+    },
+    afterToolCall: async ({ toolCall, result, isError }) => {
+      if (isError) {
+        entry.run.toolErrors.push({ tool: toolCall.name, code: toolErrorCode(result) });
       }
       return undefined;
     },
@@ -573,9 +587,11 @@ export class PiCoachRuntime {
       terminalAction: null,
       turns: 0,
       toolCalls: 0,
+      toolNames: [],
+      toolErrors: [],
       contextReads: 0,
-      checklistReviewed: false,
-      checklistReviews: 0,
+      checklistReviewed: true,
+      checklistReviews: 1,
       historySearches: 0,
       historyResults: 0,
     };
@@ -604,6 +620,8 @@ export class PiCoachRuntime {
           elapsed_ms: elapsedMs,
           turns: entry.run.turns,
           tool_calls: entry.run.toolCalls,
+          tool_names: [...entry.run.toolNames],
+          tool_errors: [...entry.run.toolErrors],
           context_reads: entry.run.contextReads,
           checklist_reviewed: entry.run.checklistReviewed,
           checklist_reviews: entry.run.checklistReviews,
