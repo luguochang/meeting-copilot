@@ -1358,7 +1358,7 @@ describe("LiveMeetingWorkbench", () => {
     expect(api.saveFactStatus).toHaveBeenCalledWith("meeting-1", "risk", "risk-1", "dismissed");
     await waitFor(() => expect(within(facts).queryByText("P99 延迟可能超标")).not.toBeInTheDocument());
 
-    expect(screen.getByRole("heading", { name: "AI 实时建议" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "AI 实时教练" })).toBeVisible();
     expect(screen.getByRole("heading", { name: "未闭环问题" })).toBeVisible();
   });
 });

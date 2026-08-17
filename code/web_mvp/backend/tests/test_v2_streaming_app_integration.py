@@ -212,6 +212,7 @@ def test_llm_first_lane_runs_structured_intelligence_without_keyword_projection(
     monkeypatch.setenv("LLM_GATEWAY_MODEL", "review-model")
     monkeypatch.setenv("LLM_GATEWAY_REALTIME_MODEL", "fast-model")
     monkeypatch.setenv("LLM_GATEWAY_API_STYLE", "responses")
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "direct")
     monkeypatch.delenv("LLM_GATEWAY_IS_MOCK", raising=False)
 
     app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")

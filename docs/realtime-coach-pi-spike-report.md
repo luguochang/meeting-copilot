@@ -1,5 +1,7 @@
 # Talktrace 实时私人教练：Pi SDK Spike 实施与决策报告
 
+> 2026-08-17 更新：持续 Pi Session、强制教练 checklist、较早转写检索和用户可见运行状态已在 `feat/pi-continuous-coach-loop` 实现。详见[持续实时教练 Agent Loop 实施说明](pi-continuous-coach-loop.md)。本文其余内容保留为首轮 Spike 的历史结论。
+
 > 日期：2026-08-16
 > 代码基线：`3bf287a` 及后续评测提交
 > 结论状态：工程 Go，产品效果待 A/B；生产打包 No-Go
