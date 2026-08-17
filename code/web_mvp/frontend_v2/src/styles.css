@@ -1643,6 +1643,77 @@ button:focus-visible,
   background: var(--warning-soft);
 }
 
+.coach-runtime-badge {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  max-width: 138px;
+  margin-left: auto;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 10px;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.coach-runtime-badge > span {
+  width: 7px;
+  height: 7px;
+  margin-right: 5px;
+  flex: 0 0 auto;
+  background: #5d7669;
+  border-radius: 50%;
+}
+
+.coach-runtime-badge[data-state="active"] > span {
+  background: #2e7d5b;
+}
+
+.coach-runtime-badge[data-state="busy"] > span {
+  background: #d28a25;
+  box-shadow: 0 0 0 3px rgb(210 138 37 / 14%);
+}
+
+.coach-runtime-badge[data-state="paused"] > span,
+.coach-runtime-badge[data-state="offline"] > span,
+.coach-runtime-badge[data-state="error"] > span {
+  background: #b55b4f;
+}
+
+.coach-loop-empty {
+  margin-top: 12px;
+  color: var(--text-secondary);
+}
+
+.coach-loop-empty p {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.coach-loop-empty ul {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 5px 12px;
+  margin: 10px 0 0;
+  padding: 0;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  list-style: none;
+}
+
+.coach-loop-empty li::before {
+  content: "";
+  display: inline-block;
+  width: 4px;
+  height: 4px;
+  margin: 0 6px 2px 0;
+  background: #839389;
+  border-radius: 50%;
+}
+
 .suggestion-card {
   position: relative;
   margin-top: 12px;

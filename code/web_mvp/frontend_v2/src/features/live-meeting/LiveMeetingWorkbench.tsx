@@ -733,6 +733,7 @@ export function LiveMeetingWorkbench({
             selectionAction={askSelectionAction}
             currentTopic={state.currentTopic}
             followUp={state.followUp}
+            coachRuntime={taskCapabilities.realtime_suggestions}
             openQuestions={state.openQuestions}
             suggestions={state.suggestions}
             decisionCandidates={state.decisionCandidates}

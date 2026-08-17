@@ -9,6 +9,7 @@ import type {
   MeetingFactStatus,
   OpenQuestionProjection,
   RiskProjection,
+  RuntimeIndicator,
   Suggestion,
   SuggestionFeedback,
   TopicProjection,
@@ -22,6 +23,7 @@ interface NowRailProps {
   decisionCandidates: DecisionCandidate[];
   actionItems: ActionItemProjection[];
   risks: RiskProjection[];
+  coachRuntime?: RuntimeIndicator | null;
   onEvidence(segmentId: string): void;
   onFeedback(suggestionId: string, feedback: SuggestionFeedback): Promise<void>;
   onFactStatus(factType: MeetingFactKind, factId: string, status: Extract<MeetingFactStatus, "confirmed" | "dismissed">): Promise<void>;
@@ -306,6 +308,7 @@ function FactGroup({
 export function NowRail({
   currentTopic,
   followUp,
+  coachRuntime,
   openQuestions,
   suggestions,
   decisionCandidates,
@@ -411,6 +414,11 @@ export function NowRail({
         <header className="rail-heading">
           <MessageCircleQuestion size={16} />
           <h2 id="suggestion-title">AI 实时教练</h2>
+          {coachRuntime ? (
+            <span className="coach-runtime-badge" data-state={coachRuntime.state} title={coachRuntime.detail ?? coachRuntime.label}>
+              <span aria-hidden="true" />{coachRuntime.label}
+            </span>
+          ) : null}
           {suggestion?.status === "draft" || suggestion?.status === "validating" ? (
             <span className="draft-badge">生成中</span>
           ) : null}
@@ -486,7 +494,15 @@ export function NowRail({
             </div>
           </div>
         ) : (
-          <p className="rail-empty">暂无实时建议</p>
+          <div className="coach-loop-empty" data-state={coachRuntime?.state ?? "idle"}>
+            <p>{coachRuntime?.detail ?? "等待下一段稳定对话"}</p>
+            <ul aria-label="教练检查项">
+              <li>问题回应</li>
+              <li>承诺条件</li>
+              <li>目标覆盖</li>
+              <li>前后口径</li>
+            </ul>
+          </div>
         )}
       </section>
 

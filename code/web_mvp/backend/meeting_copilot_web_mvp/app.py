@@ -565,6 +565,71 @@ def _v2_intelligence_semantic_windows(
     return windows[-8:]
 
 
+def _coach_runtime_capability(
+    *,
+    enabled: bool,
+    provider_configured: bool,
+    active: bool,
+    requested_runtime: str,
+    latest_job: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Project the last coach loop into a compact, user-visible runtime status."""
+
+    requested = "pi" if str(requested_runtime).strip().lower() == "pi" else "direct"
+    if not enabled:
+        return {
+            "state": "paused",
+            "label": "实时教练已关闭",
+            "detail": None,
+        }
+    if not provider_configured:
+        return {
+            "state": "offline",
+            "label": "Pi 教练等待模型",
+            "detail": "录音和转写继续运行",
+        }
+    if active:
+        return {
+            "state": "busy",
+            "label": "Pi 教练正在检查" if requested == "pi" else "实时教练正在检查",
+            "detail": "问题、承诺、目标、口径和介入价值",
+        }
+
+    output = latest_job.get("output") if isinstance(latest_job, Mapping) else None
+    coach = output.get("coach") if isinstance(output, Mapping) else None
+    if not isinstance(coach, Mapping):
+        return {
+            "state": "idle",
+            "label": "Pi 教练监听中" if requested == "pi" else "实时教练监听中",
+            "detail": "等待下一段稳定对话",
+        }
+
+    runtime_used = str(coach.get("runtime_used") or "")
+    fallback_error = str(coach.get("fallback_error_code") or "").strip()
+    if requested == "pi" and runtime_used == "direct":
+        return {
+            "state": "paused",
+            "label": "Pi 已回退普通模式",
+            "detail": f"回退原因：{fallback_error or 'Pi runtime unavailable'}",
+            "error_class": fallback_error or "pi_runtime_fallback",
+        }
+
+    metrics = coach.get("agent_metrics") if isinstance(coach.get("agent_metrics"), Mapping) else {}
+    checklist_ids = metrics.get("checklist_item_ids")
+    checklist_count = len(checklist_ids) if isinstance(checklist_ids, list) else 0
+    history_searches = max(0, int(metrics.get("history_searches") or 0))
+    session_reused = metrics.get("session_reused") is True
+    detail_parts = [f"本轮完成 {checklist_count or 5} 项检查"]
+    if history_searches:
+        detail_parts.append(f"检索历史 {history_searches} 次")
+    detail_parts.append("已延续会议上下文" if session_reused else "已建立会议上下文")
+    return {
+        "state": "active",
+        "label": "Pi 教练监听中" if runtime_used == "pi" else "实时教练监听中",
+        "detail": " · ".join(detail_parts),
+    }
+
+
 def _v2_export_payload(persistence: V2Persistence, meeting_id: str) -> dict[str, Any]:
     meeting = persistence.get_meeting(meeting_id)
     snapshot = persistence.get_snapshot(meeting_id, segment_limit=1_000)
@@ -1451,7 +1516,14 @@ def create_app(
         correction_statuses = [str(segment.get("correction_status") or "pending") for segment in projected.get("segments") or []]
         review = dict(projected.get("review") or {})
         preparation = meeting_preparation_store.get(meeting_id) if meeting_preparation_store is not None else None
-        if preparation is not None and preparation.proactive_suggestion_policy == "off":
+        coach_enabled = str(
+            os.environ.get("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
+        ).strip().lower() not in {"0", "false", "off", "no"}
+        coach_policy_enabled = (
+            coach_enabled
+            and not (preparation is not None and preparation.proactive_suggestion_policy == "off")
+        )
+        if not coach_policy_enabled:
             projected["follow_up"] = None
         runtime["ai"]["capabilities"] = {
             "provider": {
@@ -1476,14 +1548,13 @@ def create_app(
                 "label": runtime["ai"]["label"],
                 "error_class": runtime["ai"].get("error_class"),
             },
-            "proactive_suggestions": {
-                "state": "paused" if preparation is not None and preparation.proactive_suggestion_policy == "off" else "idle",
-                "label": (
-                    "主动建议已关闭"
-                    if preparation is not None and preparation.proactive_suggestion_policy == "off"
-                    else "低频建议"
-                ),
-            },
+            "proactive_suggestions": _coach_runtime_capability(
+                enabled=coach_policy_enabled,
+                provider_configured=provider_config is not None,
+                active=bool(active_jobs),
+                requested_runtime=configured_coach_runtime(),
+                latest_job=latest_job,
+            ),
             "review": {
                 "state": "error" if review.get("status") == "failed" else "busy" if review.get("status") == "processing" else "idle",
                 "label": (

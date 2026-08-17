@@ -34,6 +34,54 @@ def test_dedupe_strings_handles_empty_values_and_preserves_order():
     ]
 
 
+def test_coach_runtime_capability_exposes_pi_loop_metrics():
+    capability = app_module._coach_runtime_capability(
+        enabled=True,
+        provider_configured=True,
+        active=False,
+        requested_runtime="pi",
+        latest_job={
+            "output": {
+                "coach": {
+                    "runtime_used": "pi",
+                    "agent_metrics": {
+                        "checklist_item_ids": ["question", "commitment", "goal", "conflict", "value"],
+                        "history_searches": 2,
+                        "session_reused": True,
+                    },
+                }
+            }
+        },
+    )
+
+    assert capability == {
+        "state": "active",
+        "label": "Pi 教练监听中",
+        "detail": "本轮完成 5 项检查 · 检索历史 2 次 · 已延续会议上下文",
+    }
+
+
+def test_coach_runtime_capability_makes_pi_fallback_visible():
+    capability = app_module._coach_runtime_capability(
+        enabled=True,
+        provider_configured=True,
+        active=False,
+        requested_runtime="pi",
+        latest_job={
+            "output": {
+                "coach": {
+                    "runtime_used": "direct",
+                    "fallback_error_code": "pi_unavailable",
+                }
+            }
+        },
+    )
+
+    assert capability["state"] == "paused"
+    assert capability["label"] == "Pi 已回退普通模式"
+    assert capability["error_class"] == "pi_unavailable"
+
+
 def test_v2_intelligence_batch_reads_only_the_next_bounded_increment(tmp_path):
     persistence = V2Persistence(
         tmp_path / "intelligence-batch.db",
