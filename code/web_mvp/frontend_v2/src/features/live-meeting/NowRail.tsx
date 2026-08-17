@@ -1,13 +1,15 @@
-import { Bookmark, Check, CircleAlert, CircleHelp, Copy, EyeOff, Flag, GitMerge, ListChecks, MessageCircleQuestion, MoreHorizontal, Pencil, Quote, Save, ShieldAlert, TimerOff, X } from "lucide-react";
+import { Bookmark, Check, ChevronDown, ChevronUp, CircleAlert, CircleHelp, Copy, EyeOff, Flag, GitMerge, History, ListChecks, MessageCircleQuestion, MoreHorizontal, Pencil, Quote, Save, ShieldAlert, TimerOff, X } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { useMemo, useState } from "react";
 import type {
   ActionItemProjection,
+  CoachHistoryEntry,
   DecisionCandidate,
   FollowUpProjection,
   MeetingFactKind,
   MeetingFactStatus,
   OpenQuestionProjection,
+  RecentContextEntry,
   RiskProjection,
   RuntimeIndicator,
   Suggestion,
@@ -18,6 +20,8 @@ import type {
 interface NowRailProps {
   currentTopic: TopicProjection | null;
   followUp: FollowUpProjection | null | undefined;
+  coachHistory?: CoachHistoryEntry[];
+  recentContextHistory?: RecentContextEntry[];
   openQuestions: OpenQuestionProjection[];
   suggestions: Suggestion[];
   decisionCandidates: DecisionCandidate[];
@@ -102,6 +106,15 @@ function coachLabel(followUp: FollowUpProjection): string {
   if (followUp.coachEventType === "contradiction") return "前后口径需要确认";
   if (followUp.coachEventType === "communication_clarity") return "表达需要收束";
   return "建议追问";
+}
+
+function coachHistoryTime(createdAtMs: number): string {
+  if (!createdAtMs) return "刚刚";
+  return new Intl.DateTimeFormat("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(new Date(createdAtMs));
 }
 
 function factIsResolved(fact: RailFact): boolean {
@@ -309,6 +322,7 @@ function FactGroup({
 export function NowRail({
   currentTopic,
   followUp,
+  coachHistory = [],
   coachRuntime,
   openQuestions,
   suggestions,
@@ -329,7 +343,12 @@ export function NowRail({
   const questions = openQuestions.filter((question) => isFormalAi(question) && questionIsOpen(question)).slice(0, 3);
   const formalTopic = currentTopic && isFormalAi(currentTopic) ? currentTopic : null;
   const formalFollowUp = followUp && isFormalAi(followUp) ? followUp : null;
+  const formalCoachHistory = coachHistory
+    .filter((item) => isFormalAi(item))
+    .sort((left, right) => left.createdAtMs - right.createdAtMs);
+  const pastCoachHistory = formalCoachHistory.slice(0, -1).reverse();
   const [menuOpen, setMenuOpen] = useState(false);
+  const [coachHistoryExpanded, setCoachHistoryExpanded] = useState(false);
   const [saving, setSaving] = useState<SuggestionFeedback | null>(null);
   const [dismissedFactIds, setDismissedFactIds] = useState<Set<string>>(new Set());
   const [factStatusOverrides, setFactStatusOverrides] = useState<Record<string, MeetingFactStatus>>({});
@@ -508,6 +527,42 @@ export function NowRail({
             </ul>
           </div>
         )}
+
+        {pastCoachHistory.length ? (
+          <div className="coach-history">
+            <div className="coach-history-heading">
+              <span><History size={13} />过去建议 <small>{pastCoachHistory.length}</small></span>
+              {pastCoachHistory.length > 3 ? (
+                <button
+                  className="icon-button icon-button--small"
+                  type="button"
+                  onClick={() => setCoachHistoryExpanded((current) => !current)}
+                  title={coachHistoryExpanded ? "收起过去建议" : "展开全部过去建议"}
+                  aria-label={coachHistoryExpanded ? "收起过去建议" : "展开全部过去建议"}
+                  aria-expanded={coachHistoryExpanded}
+                >
+                  {coachHistoryExpanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                </button>
+              ) : null}
+            </div>
+            <ol className="coach-history-list" aria-label="过去的教练建议">
+              {(coachHistoryExpanded ? pastCoachHistory : pastCoachHistory.slice(0, 3)).map((item) => {
+                const evidenceId = item.evidenceSegmentIds[0];
+                return (
+                  <li key={item.historyId}>
+                    <div>
+                      <time dateTime={new Date(item.createdAtMs).toISOString()}>{coachHistoryTime(item.createdAtMs)}</time>
+                      <span>{coachLabel(item)}</span>
+                    </div>
+                    {evidenceId ? (
+                      <button type="button" onClick={() => onEvidence(evidenceId)}>{item.question}</button>
+                    ) : <p>{item.question}</p>}
+                  </li>
+                );
+              })}
+            </ol>
+          </div>
+        ) : null}
       </section>
 
       <section className="rail-section questions-section" aria-labelledby="questions-title">

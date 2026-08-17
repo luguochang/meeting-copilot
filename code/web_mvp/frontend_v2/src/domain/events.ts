@@ -197,6 +197,21 @@ export interface FollowUpProjection {
   formalAi?: FormalAiProvenance | null;
 }
 
+export interface CoachHistoryEntry extends FollowUpProjection {
+  historyId: string;
+  createdAtMs: number;
+}
+
+export interface RecentContextEntry {
+  contextId: string;
+  kind: "topic" | "decision" | "question";
+  title: string;
+  summary: string | null;
+  updatedAtMs: number;
+  evidenceSegmentIds: string[];
+  formalAi?: FormalAiProvenance | null;
+}
+
 export type MeetingFactKind = "decision" | "action_item" | "risk" | "open_question";
 
 export type MeetingFactStatus =
@@ -542,6 +557,8 @@ export interface MeetingSnapshot {
   currentTopic: TopicProjection | null;
   openQuestions: OpenQuestionProjection[];
   followUp?: FollowUpProjection | null;
+  coachHistory: CoachHistoryEntry[];
+  recentContextHistory: RecentContextEntry[];
   minutes: MinutesArtifact | null;
   approach: ApproachReview;
   reviewJobs: ReviewJobs;

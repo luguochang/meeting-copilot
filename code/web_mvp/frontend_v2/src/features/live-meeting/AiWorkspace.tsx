@@ -33,6 +33,21 @@ function assistantEvidence(message: AskAiMessage): string | null {
   return message.evidence[0]?.segmentId ?? null;
 }
 
+function recentContextKindLabel(kind: "topic" | "decision" | "question"): string {
+  if (kind === "decision") return "结论";
+  if (kind === "question") return "待确认";
+  return "主题";
+}
+
+function recentContextTime(updatedAtMs: number): string {
+  if (!updatedAtMs) return "刚刚";
+  return new Intl.DateTimeFormat("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(new Date(updatedAtMs));
+}
+
 export function AiWorkspace({
   meetingId,
   api,
@@ -47,6 +62,7 @@ export function AiWorkspace({
   const [scope, setScope] = useState<AskAiScope>("recent");
   const [recentMinutes, setRecentMinutes] = useState<1 | 3 | 5 | 10>(3);
   const [recentContextOpen, setRecentContextOpen] = useState(true);
+  const [recentContextExpanded, setRecentContextExpanded] = useState(false);
   const [chapters, setChapters] = useState<MeetingChapter[]>([]);
   const [chapterId, setChapterId] = useState("");
   const [threads, setThreads] = useState<AskAiThread[]>([]);
@@ -250,11 +266,37 @@ export function AiWorkspace({
     }
   };
 
-  const recentTopic = railProps.currentTopic?.text ?? null;
-  const recentDecision = railProps.decisionCandidates.find((item) => item.status === "confirmed")?.text ?? null;
-  const recentQuestion = railProps.openQuestions.find((item) =>
-    ["open", "carried_over", "unknown"].includes(item.status))?.text ?? railProps.followUp?.question ?? null;
-  const hasRecentContext = Boolean(recentTopic || recentDecision || recentQuestion);
+  const historyContext = railProps.recentContextHistory ?? [];
+  const fallbackContext = historyContext.length ? [] : [
+    railProps.currentTopic ? {
+      contextId: `topic:${railProps.currentTopic.id}`,
+      kind: "topic" as const,
+      title: railProps.currentTopic.text,
+      summary: null,
+      updatedAtMs: railProps.currentTopic.updatedAtMs ?? 0,
+      evidenceSegmentIds: railProps.currentTopic.evidenceSegmentIds,
+    } : null,
+    ...railProps.decisionCandidates.filter((item) => item.status === "confirmed").map((item) => ({
+      contextId: `decision:${item.id}`,
+      kind: "decision" as const,
+      title: item.text,
+      summary: null,
+      updatedAtMs: item.updatedAtMs,
+      evidenceSegmentIds: item.evidenceSegmentIds,
+    })),
+    ...railProps.openQuestions.filter((item) => ["open", "carried_over", "unknown"].includes(item.status)).map((item) => ({
+      contextId: `question:${item.id}`,
+      kind: "question" as const,
+      title: item.text,
+      summary: null,
+      updatedAtMs: item.updatedAtMs ?? 0,
+      evidenceSegmentIds: item.evidenceSegmentIds,
+    })),
+  ].filter((item): item is NonNullable<typeof item> => item !== null);
+  const recentContextItems = [...historyContext, ...fallbackContext]
+    .sort((left, right) => right.updatedAtMs - left.updatedAtMs)
+    .slice(0, 10);
+  const visibleRecentContext = recentContextExpanded ? recentContextItems : recentContextItems.slice(0, 5);
 
   return (
     <aside className="ai-workspace" aria-label="会议 AI 工作区">
@@ -316,11 +358,36 @@ export function AiWorkspace({
               {recentContextOpen ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
             </button>
             {recentContextOpen ? (
-              <div className={hasRecentContext ? undefined : "recent-context-strip__empty"}>
-                {recentTopic ? <p><strong>主题</strong>{recentTopic}</p> : null}
-                {recentDecision ? <p><strong>结论</strong>{recentDecision}</p> : null}
-                {recentQuestion ? <p><strong>待确认</strong>{recentQuestion}</p> : null}
-                {!hasRecentContext ? <span>暂无可用上下文</span> : null}
+              <div className={recentContextItems.length ? undefined : "recent-context-strip__empty"}>
+                {recentContextItems.length ? (
+                  <ol className="recent-context-timeline" aria-label="最近讨论时间线">
+                    {visibleRecentContext.map((item) => {
+                      const evidenceId = item.evidenceSegmentIds[0];
+                      return (
+                        <li key={item.contextId} data-kind={item.kind}>
+                          <button type="button" disabled={!evidenceId} onClick={() => evidenceId && onEvidence(evidenceId)}>
+                            <span className="recent-context-kind">{recentContextKindLabel(item.kind)}</span>
+                            <span className="recent-context-copy">
+                              <strong>{item.title}</strong>
+                              {item.summary && item.summary !== item.title ? <small>{item.summary}</small> : null}
+                            </span>
+                            <time dateTime={item.updatedAtMs ? new Date(item.updatedAtMs).toISOString() : undefined}>{recentContextTime(item.updatedAtMs)}</time>
+                          </button>
+                        </li>
+                      );
+                    })}
+                  </ol>
+                ) : <span>暂无可用上下文</span>}
+                {recentContextItems.length > 5 ? (
+                  <button
+                    className="recent-context-more"
+                    type="button"
+                    onClick={() => setRecentContextExpanded((current) => !current)}
+                    aria-expanded={recentContextExpanded}
+                  >
+                    {recentContextExpanded ? <><ChevronUp size={13} />收起</> : <><ChevronDown size={13} />查看更早的 {recentContextItems.length - 5} 条</>}
+                  </button>
+                ) : null}
               </div>
             ) : null}
           </section>

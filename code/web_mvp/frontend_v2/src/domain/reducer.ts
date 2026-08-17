@@ -5,6 +5,7 @@ import type {
   ActivePartial,
   ApproachCard,
   ActionItemProjection,
+  CoachHistoryEntry,
   DecisionCandidate,
   EvidenceSpan,
   FollowUpProjection,
@@ -17,6 +18,7 @@ import type {
   MeetingSpeaker,
   MeetingViewState,
   OpenQuestionProjection,
+  RecentContextEntry,
   RiskProjection,
   ReviewJobKind,
   Suggestion,
@@ -48,6 +50,8 @@ export function createInitialMeetingState(meetingId: string): MeetingViewState {
     currentTopic: null,
     openQuestions: [],
     followUp: null,
+    coachHistory: [],
+    recentContextHistory: [],
     minutes: null,
     approach: { cards: [], degraded: null, updatedAtMs: null },
     reviewJobs: {},
@@ -494,6 +498,85 @@ function formalAiFromPayload(value: Record<string, unknown>): MeetingFact["forma
   };
 }
 
+function normalizedHistoryText(...values: Array<string | null | undefined>): string {
+  return values.map((value) => value?.trim().replace(/\s+/g, " ").toLocaleLowerCase() ?? "").join("|");
+}
+
+function mergeCoachHistory(current: CoachHistoryEntry[], incoming: CoachHistoryEntry[]): CoachHistoryEntry[] {
+  const byKey = new Map<string, CoachHistoryEntry>();
+  for (const item of [...current, ...incoming].sort((left, right) => left.createdAtMs - right.createdAtMs)) {
+    const key = normalizedHistoryText(item.coachEventType, item.question);
+    const existing = byKey.get(key);
+    if (!existing || item.createdAtMs >= existing.createdAtMs) byKey.set(key, item);
+  }
+  return [...byKey.values()]
+    .sort((left, right) => left.createdAtMs - right.createdAtMs || left.historyId.localeCompare(right.historyId))
+    .slice(-12);
+}
+
+function mergeRecentContextHistory(current: RecentContextEntry[], incoming: RecentContextEntry[]): RecentContextEntry[] {
+  const byKey = new Map<string, RecentContextEntry>();
+  for (const item of [...current, ...incoming].sort((left, right) => left.updatedAtMs - right.updatedAtMs)) {
+    const key = normalizedHistoryText(item.kind, item.title, item.summary);
+    const existing = byKey.get(key);
+    if (!existing || item.updatedAtMs >= existing.updatedAtMs) byKey.set(key, item);
+  }
+  return [...byKey.values()]
+    .sort((left, right) => left.updatedAtMs - right.updatedAtMs || left.contextId.localeCompare(right.contextId))
+    .slice(-10);
+}
+
+function coachHistoryEntryFromEvent(event: MeetingEvent, followUp: FollowUpProjection): CoachHistoryEntry {
+  return {
+    ...followUp,
+    historyId: event.eventId,
+    createdAtMs: event.occurredAtMs,
+  };
+}
+
+function recentContextEntryFromEvent(event: MeetingEvent): RecentContextEntry | null {
+  if (event.type === "meeting.topic.updated") {
+    const topic = eventTopic(event);
+    if (!topic) return null;
+    const value = asRecord(event.payload.topic) ?? event.payload;
+    const evidence = asRecord(value.evidence);
+    return {
+      contextId: event.eventId,
+      kind: "topic",
+      title: topic.text,
+      summary: stringValue(event.payload, "summary") ?? (evidence ? stringValue(evidence, "summary") : null),
+      updatedAtMs: topic.updatedAtMs ?? event.occurredAtMs,
+      evidenceSegmentIds: topic.evidenceSegmentIds,
+      formalAi: topic.formalAi,
+    };
+  }
+  if (event.type === "meeting.decision.updated") {
+    const decision = eventFact(event, "decision") as DecisionCandidate | null;
+    return decision ? {
+      contextId: event.eventId,
+      kind: "decision",
+      title: decision.text,
+      summary: null,
+      updatedAtMs: decision.updatedAtMs,
+      evidenceSegmentIds: decision.evidenceSegmentIds,
+      formalAi: decision.formalAi,
+    } : null;
+  }
+  if (event.type === "meeting.open_question.updated") {
+    const question = eventQuestion(event);
+    return question ? {
+      contextId: event.eventId,
+      kind: "question",
+      title: question.text,
+      summary: null,
+      updatedAtMs: question.updatedAtMs ?? event.occurredAtMs,
+      evidenceSegmentIds: question.evidenceSegmentIds,
+      formalAi: question.formalAi,
+    } : null;
+  }
+  return null;
+}
+
 function booleanValue(record: Record<string, unknown>, ...keys: string[]): boolean | null {
   for (const key of keys) {
     if (typeof record[key] === "boolean") return record[key];
@@ -721,16 +804,38 @@ function applyEvent(state: MeetingViewState, event: MeetingEvent): MeetingViewSt
   } else if (event.type === "transcript.segment.partial") {
     next = { ...next, activePartial: eventPartial(event) };
   } else if (event.type === "meeting.topic.updated") {
-    next = { ...next, currentTopic: eventTopic(event) };
+    const topic = eventTopic(event);
+    const recentContext = recentContextEntryFromEvent(event);
+    next = {
+      ...next,
+      currentTopic: topic,
+      recentContextHistory: recentContext
+        ? mergeRecentContextHistory(next.recentContextHistory, [recentContext])
+        : next.recentContextHistory,
+    };
   } else if (event.type === "meeting.open_question.updated") {
     const question = eventQuestion(event);
     if (question) {
       const questions = new Map(next.openQuestions.map((item) => [item.id, item]));
       questions.set(question.id, question);
-      next = { ...next, openQuestions: [...questions.values()] };
+      const recentContext = recentContextEntryFromEvent(event);
+      next = {
+        ...next,
+        openQuestions: [...questions.values()],
+        recentContextHistory: recentContext
+          ? mergeRecentContextHistory(next.recentContextHistory, [recentContext])
+          : next.recentContextHistory,
+      };
     }
   } else if (event.type === "meeting.intelligence.applied") {
-    next = { ...next, followUp: eventFollowUp(event) };
+    const followUp = eventFollowUp(event);
+    if (followUp) {
+      next = {
+        ...next,
+        followUp,
+        coachHistory: mergeCoachHistory(next.coachHistory, [coachHistoryEntryFromEvent(event, followUp)]),
+      };
+    }
   } else if (event.type === "meeting.decision.updated" || event.type === "meeting.action_item.updated" || event.type === "meeting.risk.updated") {
     const kind = event.type === "meeting.decision.updated"
       ? "decision"
@@ -739,8 +844,15 @@ function applyEvent(state: MeetingViewState, event: MeetingEvent): MeetingViewSt
         : "risk";
     const fact = eventFact(event, kind);
     if (fact) {
+      const recentContext = kind === "decision" ? recentContextEntryFromEvent(event) : null;
       next = kind === "decision"
-        ? { ...next, decisionCandidates: mergeFacts(next.decisionCandidates, [fact as DecisionCandidate]) }
+        ? {
+          ...next,
+          decisionCandidates: mergeFacts(next.decisionCandidates, [fact as DecisionCandidate]),
+          recentContextHistory: recentContext
+            ? mergeRecentContextHistory(next.recentContextHistory, [recentContext])
+            : next.recentContextHistory,
+        }
         : kind === "action_item"
           ? { ...next, actionItems: mergeFacts(next.actionItems, [fact as ActionItemProjection]) }
           : { ...next, risks: mergeFacts(next.risks, [fact as RiskProjection]) };
@@ -820,6 +932,8 @@ function applyEvent(state: MeetingViewState, event: MeetingEvent): MeetingViewSt
 function applySnapshot(state: MeetingViewState, snapshot: MeetingSnapshot, receivedAtMs: number): MeetingViewState {
   if (snapshot.meetingId !== state.meetingId || snapshot.lastSeq < state.lastSeq) return state;
   const snapshotSegments = mergeTranscriptSegments(state.segments, snapshot.segments);
+  const snapshotCoachHistory = snapshot.coachHistory ?? [];
+  const snapshotRecentContextHistory = snapshot.recentContextHistory ?? [];
   const compacted = compactSegments(snapshotSegments);
   return {
     ...state,
@@ -834,7 +948,9 @@ function applySnapshot(state: MeetingViewState, snapshot: MeetingSnapshot, recei
     decisionCandidates: mergeFacts(state.decisionCandidates, snapshot.decisionCandidates),
     actionItems: mergeFacts(state.actionItems, snapshot.actionItems),
     risks: mergeFacts(state.risks, snapshot.risks),
-    followUp: snapshot.followUp ?? null,
+    followUp: snapshot.followUp ?? snapshotCoachHistory.at(-1) ?? null,
+    coachHistory: mergeCoachHistory([], snapshotCoachHistory),
+    recentContextHistory: mergeRecentContextHistory([], snapshotRecentContextHistory),
     connection: "live",
     lastSyncedAtMs: receivedAtMs,
     transportError: null,

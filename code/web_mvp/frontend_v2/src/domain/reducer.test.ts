@@ -483,6 +483,80 @@ describe("meetingReducer", () => {
         },
       },
     });
+    expect(current.coachHistory).toHaveLength(1);
+    expect(current.coachHistory[0]).toMatchObject({
+      historyId: "event-2",
+      createdAtMs: 2_000,
+      question: "请确认回滚负责人。",
+    });
+  });
+
+  it("keeps the latest useful coach advice when a later Pi loop stays silent", () => {
+    const advised = meetingReducer(createInitialMeetingState("meeting-1"), {
+      type: "events.received",
+      events: [event({
+        seq: 2,
+        type: "meeting.intelligence.applied",
+        payload: {
+          ...formalAiPayload("segment-2"),
+          follow_up: {
+            question: "先确认回滚负责人。",
+            reason: "负责人尚未明确。",
+            evidence_segment_ids: ["segment-2"],
+            evidence_quote: "需要明确回滚负责人。",
+            urgency: "high",
+          },
+        },
+      })],
+      receivedAtMs: 2_000,
+    });
+    const silent = meetingReducer(advised, {
+      type: "events.received",
+      events: [event({
+        seq: 3,
+        eventId: "event-3",
+        type: "meeting.intelligence.applied",
+        payload: { ...formalAiPayload("segment-3"), follow_up: null },
+      })],
+      receivedAtMs: 3_000,
+    });
+
+    expect(silent.followUp?.question).toBe("先确认回滚负责人。");
+    expect(silent.coachHistory).toHaveLength(1);
+  });
+
+  it("builds a bounded recent-context timeline from live formal events", () => {
+    const current = meetingReducer(createInitialMeetingState("meeting-1"), {
+      type: "events.received",
+      events: [
+        event({
+          seq: 2,
+          eventId: "topic-event",
+          type: "meeting.topic.updated",
+          payload: {
+            ...formalAiPayload("segment-2"),
+            summary: "确认上线与回滚安排。",
+            topic: { id: "current-topic", text: "发布安排", status: "active", evidence_segment_ids: ["segment-2"] },
+          },
+        }),
+        event({
+          seq: 3,
+          eventId: "decision-event",
+          occurredAtMs: 3_000,
+          type: "meeting.decision.updated",
+          payload: {
+            ...formalAiPayload("segment-3"),
+            decision: { id: "decision-1", text: "采用蓝绿发布", status: "confirmed", evidence_segment_ids: ["segment-3"] },
+          },
+        }),
+      ],
+      receivedAtMs: 3_000,
+    });
+
+    expect(current.recentContextHistory.map((item) => [item.kind, item.title])).toEqual([
+      ["topic", "发布安排"],
+      ["decision", "采用蓝绿发布"],
+    ]);
   });
 
   it("preserves realtime coach event metadata for the private coach card", () => {

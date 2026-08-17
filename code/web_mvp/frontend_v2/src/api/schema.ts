@@ -4,6 +4,7 @@ import type {
   ApproachCard,
   ApproachReview,
   AudioChunk,
+  CoachHistoryEntry,
   DataGovernanceSettings,
   DataRetentionPolicy,
   DecisionCandidate,
@@ -25,6 +26,7 @@ import type {
   MeetingSnapshot,
   MinutesArtifact,
   OpenQuestionProjection,
+  RecentContextEntry,
   RiskProjection,
   ReviewJob,
   ReviewJobKind,
@@ -929,6 +931,34 @@ function parseFollowUp(value: unknown): FollowUpProjection | null {
   };
 }
 
+function parseCoachHistoryEntry(value: unknown, index: number): CoachHistoryEntry | null {
+  const item = optionalRecord(value);
+  const followUp = parseFollowUp(value);
+  if (!item || !followUp) return null;
+  return {
+    ...followUp,
+    historyId: optionalString(first(item, "history_id", "historyId")) ?? `coach-history-${index}`,
+    createdAtMs: optionalNumber(first(item, "created_at_ms", "createdAtMs")) ?? 0,
+  };
+}
+
+function parseRecentContextEntry(value: unknown, index: number): RecentContextEntry | null {
+  const item = optionalRecord(value);
+  if (!item) return null;
+  const title = optionalString(item.title);
+  const kind = optionalString(item.kind);
+  if (!title || (kind !== "topic" && kind !== "decision" && kind !== "question")) return null;
+  return {
+    contextId: optionalString(first(item, "context_id", "contextId")) ?? `recent-context-${index}`,
+    kind,
+    title,
+    summary: optionalString(item.summary),
+    updatedAtMs: optionalNumber(first(item, "updated_at_ms", "updatedAtMs")) ?? 0,
+    evidenceSegmentIds: strings(first(item, "evidence_segment_ids", "evidenceSegmentIds")),
+    formalAi: parseFormalAi(item),
+  };
+}
+
 function parsePartial(value: unknown): ActivePartial | null {
   const item = optionalRecord(value);
   if (!item) return null;
@@ -998,11 +1028,14 @@ export function parseMeetingSnapshot(value: unknown): MeetingSnapshot {
   const decisionValues = factValues(source, "decision_candidates", "decisionCandidates");
   const actionValues = factValues(source, "action_items", "actionItems");
   const riskValues = factValues(source, "risks", "riskItems");
+  const coachHistoryValues = first(source, "coach_history", "coachHistory");
+  const recentContextHistoryValues = first(source, "recent_context_history", "recentContextHistory");
   const knownKeys = new Set([
     "meeting_id", "meetingId", "title", "last_seq", "lastSeq", "segments", "suggestions",
     "semantic_paragraphs", "semanticParagraphs", "active_paragraph", "activeParagraph",
     "decision_candidates", "decisionCandidates", "action_items", "actionItems", "risks", "riskItems",
     "current_topic", "currentTopic", "open_questions", "openQuestions", "open_question", "openQuestion",
+    "follow_up", "followUp", "coach_history", "coachHistory", "recent_context_history", "recentContextHistory",
     "active_partial", "activePartial", "minutes", "approach_cards", "approachCards", "review_jobs", "reviewJobs",
     "audio", "runtime", "meeting_status", "meetingStatus", "status", "diagnostics", "transcript_page", "jobs",
     "title_source", "titleSource", "updated_at_ms", "updatedAtMs", "documents", "review_documents", "reviewDocuments",
@@ -1037,6 +1070,12 @@ export function parseMeetingSnapshot(value: unknown): MeetingSnapshot {
     currentTopic: parseTopic(first(source, "current_topic", "currentTopic")),
     openQuestions: questionValues.map(parseQuestion).filter((item): item is OpenQuestionProjection => item !== null),
     followUp: parseFollowUp(first(source, "follow_up", "followUp")),
+    coachHistory: Array.isArray(coachHistoryValues)
+      ? coachHistoryValues.map(parseCoachHistoryEntry).filter((item): item is CoachHistoryEntry => item !== null)
+      : [],
+    recentContextHistory: Array.isArray(recentContextHistoryValues)
+      ? recentContextHistoryValues.map(parseRecentContextEntry).filter((item): item is RecentContextEntry => item !== null)
+      : [],
     minutes: parseMinutes(source.minutes),
     approach: parseApproach(first(source, "approach_cards", "approachCards"), reviewJobs.approach),
     reviewJobs,

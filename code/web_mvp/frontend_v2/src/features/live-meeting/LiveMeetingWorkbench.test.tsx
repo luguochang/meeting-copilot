@@ -186,6 +186,8 @@ function realSnapshot(): MeetingSnapshot {
         formalAi: formalAi("question-1"),
       },
     ],
+    coachHistory: [],
+    recentContextHistory: [],
     minutes: null,
     approach: { cards: [], degraded: null, updatedAtMs: null },
     reviewJobs: {},
