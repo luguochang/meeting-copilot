@@ -283,6 +283,68 @@ def test_parser_rejects_evidence_quote_not_present_in_referenced_paragraph() -> 
         parse_realtime_intelligence_response(content, request=request)
 
 
+def test_parser_accepts_verbatim_multiline_quotes_in_a_different_evidence_order() -> None:
+    request = RealtimeIntelligenceRequest.from_payload(
+        meeting_id="meeting-multiline-evidence",
+        state_revision=1,
+        new_paragraphs=[_paragraph("paragraph-current", "We can ship on Friday without conditions.")],
+        context_paragraphs=[_paragraph("paragraph-prior", "Earlier we required the load test to pass first.")],
+        rolling_state={},
+    )
+    content = json.dumps(
+        {
+            "paragraph_revisions": [],
+            "topic_update": None,
+            "state_changes": [],
+            "follow_up": {
+                "question": "Should we resolve the changed release condition before committing?",
+                "reason": "The current commitment conflicts with the earlier condition.",
+                "evidence_segment_ids": ["paragraph-current", "paragraph-prior"],
+                "evidence_quote": (
+                    "Earlier we required the load test to pass first.\n"
+                    "We can ship on Friday without conditions."
+                ),
+                "urgency": "high",
+            },
+        }
+    )
+
+    response = parse_realtime_intelligence_response(content, request=request)
+
+    assert response.follow_up is not None
+    assert response.follow_up.evidence_segment_ids == ("paragraph-current", "paragraph-prior")
+
+
+def test_parser_rejects_multiline_quote_when_any_line_is_not_verbatim_evidence() -> None:
+    request = RealtimeIntelligenceRequest.from_payload(
+        meeting_id="meeting-invalid-multiline-evidence",
+        state_revision=1,
+        new_paragraphs=[_paragraph("paragraph-current", "We can ship on Friday without conditions.")],
+        context_paragraphs=[_paragraph("paragraph-prior", "Earlier we required the load test to pass first.")],
+        rolling_state={},
+    )
+    content = json.dumps(
+        {
+            "paragraph_revisions": [],
+            "topic_update": None,
+            "state_changes": [],
+            "follow_up": {
+                "question": "Should we resolve the changed release condition before committing?",
+                "reason": "The current commitment conflicts with the earlier condition.",
+                "evidence_segment_ids": ["paragraph-current", "paragraph-prior"],
+                "evidence_quote": (
+                    "Earlier we required the load test to pass first.\n"
+                    "The customer approved unconditional release."
+                ),
+                "urgency": "high",
+            },
+        }
+    )
+
+    with pytest.raises(IntelligenceResponseValidationError, match="evidence_quote"):
+        parse_realtime_intelligence_response(content, request=request)
+
+
 def test_parser_rejects_fact_changing_paragraph_correction_without_repair() -> None:
     request = RealtimeIntelligenceRequest.from_payload(
         meeting_id="meeting-fact-safety",

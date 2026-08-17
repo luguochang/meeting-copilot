@@ -1305,16 +1305,21 @@ def _validate_evidence_quote(
     request: RealtimeIntelligenceRequest,
     field: str,
 ) -> None:
-    normalized_quote = _normalize_for_evidence(quote)
-    if not normalized_quote:
+    quote_lines = tuple(
+        normalized
+        for line in quote.splitlines()
+        if (normalized := _normalize_for_evidence(line))
+    )
+    if not quote_lines:
         raise IntelligenceResponseValidationError(
             f"{field} must not be empty",
             category="evidence",
         )
-    if not any(
-        normalized_quote in _normalize_for_evidence(request.paragraphs_by_id[item_id].text)
+    evidence_texts = tuple(
+        _normalize_for_evidence(request.paragraphs_by_id[item_id].text)
         for item_id in evidence_ids
-    ):
+    )
+    if not all(any(line in evidence_text for evidence_text in evidence_texts) for line in quote_lines):
         raise IntelligenceResponseValidationError(
             f"{field} is not present in the referenced meeting evidence",
             category="evidence",
