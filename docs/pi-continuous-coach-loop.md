@@ -2,7 +2,7 @@
 
 > 分支：`feat/pi-continuous-coach-loop`
 >
-> 实施提交：`8c36b09`、`9ef5364`、`0cb383d`、`3d271c2`、`6f106eb`、`e2ec16a`、`09e050c`
+> 实施提交：`8c36b09`、`9ef5364`、`0cb383d`、`3d271c2`、`6f106eb`、`e2ec16a`、`09e050c`、`fe64d78`、`cb2cd5f`、`ba3cb54`
 >
 > 日期：2026-08-17
 
@@ -152,6 +152,25 @@ A/B 需要真实 Provider 配置，但不需要播放或外放声音。
 - 可直接说出的建议为：“我的核心观点是：直播时提供情绪价值，拍戏时把戏拍好，两件事都要专业。”
 - 浏览器验收确认教练卡、原因、依据入口和 `Pi 教练监听中` 状态均可见。
 
+### 教练与最近讨论历史验收
+
+原实现虽然持久化了每轮 `meeting.intelligence.applied` 和 `meeting.topic.updated`，但快照和前端只投影最后一条，造成右侧内容不断覆盖。修复不增加数据库表，直接从正式事件生成两个有界信息流：
+
+- 教练建议最多保留 12 条，连续重复建议合并；当前区只突出本轮有效介入，历史默认显示 3 条并可展开。
+- 最近讨论最多保留 10 条，混合主题、结论和待确认问题；Ask AI 默认显示 5 条并可展开。
+- 最新 Pi 轮次选择静默时，当前区展示静默原因，过去建议全部留在历史，不继续突出已经解决的旧建议。
+- 每条历史保留时间、事件类型、正式模型来源和可定位的原文证据。
+
+2026-08-18 使用 `pi-coach-history-silent-20260818` 直接注入 5 段稳定转写，未播放音频，也未打开麦克风：
+
+1. 冗长且无结论的麦克风表达触发 `communication_clarity`。
+2. 系统声音中的直接提问触发 `question_to_user`，证明电脑会议对方声音进入转写后可以驱动教练。
+3. 无视安全测试和预算审批的上线承诺触发 `commitment_risk`。
+4. 只修正上线条件但仍缺审批责任人，再产生一条有依据的追问建议。
+5. 明确负责人、截止时间、同步方式和上线前提后，Pi 调用 `keep_silent`；当前主卡消失并展示“不需要打断”，此前 4 条建议仍可展开回看。
+
+最终快照包含 4 条教练历史和 10 条最近讨论。浏览器实际检查了默认数量、展开交互、静默状态、证据入口和无重叠布局。自动化结果为后端 135 项通过、1 项跳过，前端 242 项通过，Pi bridge 10 项通过且 faux-provider smoke 成功，TypeScript、ESLint、Ruff 和生产构建均通过。
+
 ## 8. 当前边界
 
 - 桌面安装包仍需把 Node `>=22.19.0` 和 Pi sidecar 一起打包；源码开发环境已经跑通，生产打包尚未完成。
@@ -165,4 +184,5 @@ A/B 需要真实 Provider 配置，但不需要播放或外放声音。
 - Python sidecar 与回退：`code/web_mvp/backend/meeting_copilot_web_mvp/pi_coach_runtime.py`
 - 双音轨触发和教练路由：`code/web_mvp/backend/meeting_copilot_web_mvp/realtime_intelligence.py`
 - 历史转写投影和运行状态：`code/web_mvp/backend/meeting_copilot_web_mvp/app.py`
-- 用户可见教练状态：`code/web_mvp/frontend_v2/src/features/live-meeting/NowRail.tsx`
+- 用户可见教练状态与历史：`code/web_mvp/frontend_v2/src/features/live-meeting/NowRail.tsx`
+- 最近讨论时间线：`code/web_mvp/frontend_v2/src/features/live-meeting/AiWorkspace.tsx`
