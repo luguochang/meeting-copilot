@@ -99,6 +99,7 @@ test("Pi executes a context tool loop and returns only a validated intervention"
     "unsafe_commitment",
     "goal_coverage",
     "position_conflict",
+    "expression_clarity",
     "intervention_value",
   ]);
 });
@@ -151,7 +152,7 @@ test("the host checklist exposes bounded routing signals in the initial request"
         : userMessage.content.find((block) => block.type === "text").text;
       const payload = JSON.parse(text);
       assert.equal(payload.checklist_reviewed, true);
-      assert.equal(payload.checklist.length, 5);
+      assert.equal(payload.checklist.length, 6);
       assert.equal(payload.context_signals.meeting_goal, request().context.meeting_goal);
       assert.deepEqual(payload.context_signals.rolling_state, request().context.rolling_state);
       assert.deepEqual(
@@ -284,6 +285,52 @@ test("Pi can search bounded prior transcript evidence before deciding", async ()
   assert.equal(result.action, "intervention");
   assert.equal(result.metrics.history_searches, 1);
   assert.equal(result.metrics.history_results, 1);
+});
+
+test("Pi accepts grounded communication clarity coaching over sustained speech", async () => {
+  const { faux, runtime } = harness();
+  const clarityRequest = request();
+  clarityRequest.context.new_paragraphs = [
+    {
+      id: "local-expression-1",
+      text: "说白了直播很重要，大家说对不对。",
+      revision: 1,
+      source_track: "microphone",
+      role_hint: "self_or_room",
+    },
+    {
+      id: "local-expression-2",
+      text: "所以说直播真的很重要，你们觉得我说得对吗。",
+      revision: 1,
+      source_track: "microphone",
+      role_hint: "self_or_room",
+    },
+  ];
+  faux.setResponses([
+    (context) => {
+      assert.match(context.systemPrompt, /sustained microphone\/self_or_room speech is sufficient evidence/);
+      assert.match(context.systemPrompt, /never keep silent only because microphone speaker identity is unconfirmed/);
+      return fauxAssistantMessage(
+        fauxToolCall("submit_intervention", {
+          event_type: "communication_clarity",
+          title: "先收束核心观点",
+          recommendation: "下一句先给结论：直播的价值是持续交流；然后只补一个例子。",
+          reason: "连续两段重复强调重要性，但还没有形成清晰结论。",
+          evidence_segment_ids: ["local-expression-1", "local-expression-2"],
+          evidence_quote: "说白了直播很重要\n所以说直播真的很重要",
+          urgency: "medium",
+          confidence: 0.9,
+        }),
+        { stopReason: "toolUse" },
+      );
+    },
+  ]);
+
+  const result = await runtime.evaluate(clarityRequest);
+
+  assert.equal(result.action, "intervention");
+  assert.equal(result.intervention.event_type, "communication_clarity");
+  assert.deepEqual(result.intervention.evidence_segment_ids, ["local-expression-1", "local-expression-2"]);
 });
 
 test("ordinary assistant text is not accepted as a business result", async () => {

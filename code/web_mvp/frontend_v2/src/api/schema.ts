@@ -910,7 +910,8 @@ function parseFollowUp(value: unknown): FollowUpProjection | null {
   const coachEventTypeValue = optionalString(first(item, "coach_event_type", "coachEventType"));
   const coachEventType =
     coachEventTypeValue === "question_to_user" || coachEventTypeValue === "commitment_risk" ||
-    coachEventTypeValue === "goal_at_risk" || coachEventTypeValue === "contradiction"
+    coachEventTypeValue === "goal_at_risk" || coachEventTypeValue === "contradiction" ||
+    coachEventTypeValue === "communication_clarity"
       ? coachEventTypeValue
       : null;
   const title = optionalString(first(item, "title"));
@@ -959,6 +960,7 @@ function parseIndicator(value: unknown, fallbackLabel: string): RuntimeIndicator
     label: optionalString(item.label) ?? fallbackLabel,
     level: optionalNumber(first(item, "level", "input_level", "inputLevel")),
     detail: optionalString(item.detail),
+    decision: optionalString(item.decision),
     errorClass: optionalString(first(item, "error_class", "errorClass")),
     capabilities: rawCapabilities
       ? Object.fromEntries(Object.entries(rawCapabilities).map(([key, capability]) => [

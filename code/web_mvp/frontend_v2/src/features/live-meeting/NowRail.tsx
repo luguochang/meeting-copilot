@@ -100,6 +100,7 @@ function coachLabel(followUp: FollowUpProjection): string {
   if (followUp.coachEventType === "commitment_risk") return "先限定承诺条件";
   if (followUp.coachEventType === "goal_at_risk") return "目标可能被跳过";
   if (followUp.coachEventType === "contradiction") return "前后口径需要确认";
+  if (followUp.coachEventType === "communication_clarity") return "表达需要收束";
   return "建议追问";
 }
 
@@ -495,12 +496,15 @@ export function NowRail({
           </div>
         ) : (
           <div className="coach-loop-empty" data-state={coachRuntime?.state ?? "idle"}>
+            {coachRuntime?.decision ? <strong>{coachRuntime.decision}</strong> : null}
             <p>{coachRuntime?.detail ?? "等待下一段稳定对话"}</p>
             <ul aria-label="教练检查项">
               <li>问题回应</li>
               <li>承诺条件</li>
               <li>目标覆盖</li>
               <li>前后口径</li>
+              <li>表达清晰</li>
+              <li>介入价值</li>
             </ul>
           </div>
         )}

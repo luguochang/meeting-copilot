@@ -659,6 +659,68 @@ def test_coach_parser_rejects_a_quote_not_present_in_evidence() -> None:
         parse_realtime_coach_response(content, request=_coach_request())
 
 
+def test_coach_parser_accepts_grounded_communication_clarity_intervention() -> None:
+    request = RealtimeIntelligenceRequest.from_payload(
+        meeting_id="meeting-clarity",
+        state_revision=2,
+        new_paragraphs=[
+            {
+                **_paragraph("local-1", "说白了直播很重要，大家说对不对。"),
+                "source_track": "microphone",
+            },
+            {
+                **_paragraph("local-2", "所以说直播真的很重要，你们觉得我说得对吗。"),
+                "source_track": "microphone",
+            },
+        ],
+        context_paragraphs=[],
+        rolling_state={},
+    )
+
+    intervention = parse_realtime_coach_response(
+        json.dumps(
+            {
+                "intervention": {
+                    "event_type": "communication_clarity",
+                    "title": "先收束核心观点",
+                    "recommendation": "下一句先给结论：直播的价值是持续交流；然后只补一个例子。",
+                    "reason": "连续两段重复强调重要性，但还没有形成清晰结论。",
+                    "evidence_segment_ids": ["local-1", "local-2"],
+                    "evidence_quote": "说白了直播很重要\n所以说直播真的很重要",
+                    "urgency": "medium",
+                    "confidence": 0.9,
+                }
+            },
+            ensure_ascii=False,
+        ),
+        request=request,
+    )
+
+    assert intervention is not None
+    assert intervention.event_type == "communication_clarity"
+
+
+def test_coach_parser_rejects_communication_clarity_with_one_fragment() -> None:
+    content = json.dumps(
+        {
+            "intervention": {
+                "event_type": "communication_clarity",
+                "title": "表达需要收束",
+                "recommendation": "下一句先给出明确结论，再补充一个具体例子。",
+                "reason": "没有足够证据证明这是持续表达模式。",
+                "evidence_segment_ids": ["remote-4"],
+                "evidence_quote": "周五一定上线吗",
+                "urgency": "medium",
+                "confidence": 0.9,
+            }
+        },
+        ensure_ascii=False,
+    )
+
+    with pytest.raises(IntelligenceResponseValidationError, match="two verbatim"):
+        parse_realtime_coach_response(content, request=_coach_request())
+
+
 def test_coach_runner_suppresses_low_confidence_interventions() -> None:
     asyncio.run(_test_coach_runner_suppresses_low_confidence_interventions())
 

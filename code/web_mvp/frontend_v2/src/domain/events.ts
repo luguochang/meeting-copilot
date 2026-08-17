@@ -191,7 +191,7 @@ export interface FollowUpProjection {
   evidenceSegmentIds: string[];
   evidenceQuote: string;
   urgency: "low" | "medium" | "high";
-  coachEventType?: "question_to_user" | "commitment_risk" | "goal_at_risk" | "contradiction";
+  coachEventType?: "question_to_user" | "commitment_risk" | "goal_at_risk" | "contradiction" | "communication_clarity";
   title?: string;
   confidence?: number;
   formalAi?: FormalAiProvenance | null;
@@ -249,6 +249,7 @@ export interface RuntimeIndicator {
   label: string;
   level: number | null;
   detail: string | null;
+  decision?: string | null;
   errorClass?: string | null;
   capabilities?: Record<string, RuntimeIndicator>;
 }

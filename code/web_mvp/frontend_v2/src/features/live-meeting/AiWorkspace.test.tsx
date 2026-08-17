@@ -39,7 +39,8 @@ it("shows the active Pi checklist loop when no intervention is needed", async ()
         state: "active",
         label: "Pi 教练监听中",
         level: null,
-        detail: "本轮完成 5 项检查 · 检索历史 1 次 · 已延续会议上下文",
+        detail: "本轮完成 6 项检查 · 检索历史 1 次 · 已延续会议上下文",
+        decision: "本轮结论：暂不打断，没有发现需要立刻介入的表达问题",
       }}
       openQuestions={[]}
       suggestions={[]}
@@ -54,9 +55,11 @@ it("shows the active Pi checklist loop when no intervention is needed", async ()
   );
 
   expect(await screen.findByText("Pi 教练监听中")).toBeVisible();
-  expect(screen.getByText("本轮完成 5 项检查 · 检索历史 1 次 · 已延续会议上下文")).toBeVisible();
+  expect(screen.getByText("本轮结论：暂不打断，没有发现需要立刻介入的表达问题")).toBeVisible();
+  expect(screen.getByText("本轮完成 6 项检查 · 检索历史 1 次 · 已延续会议上下文")).toBeVisible();
   expect(screen.getByRole("list", { name: "教练检查项" })).toHaveTextContent("问题回应");
   expect(screen.getByRole("list", { name: "教练检查项" })).toHaveTextContent("承诺条件");
+  expect(screen.getByRole("list", { name: "教练检查项" })).toHaveTextContent("表达清晰");
 });
 
 it("asks against a transcript selection, streams the answer, persists the thread, and saves a formal note", async () => {

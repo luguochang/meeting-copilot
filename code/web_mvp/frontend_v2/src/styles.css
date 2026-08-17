@@ -1693,6 +1693,15 @@ button:focus-visible,
   line-height: 1.55;
 }
 
+.coach-loop-empty strong {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.45;
+}
+
 .coach-loop-empty ul {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

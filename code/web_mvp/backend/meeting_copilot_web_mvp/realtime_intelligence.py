@@ -38,7 +38,13 @@ _SOURCE_TRACKS = frozenset({"microphone", "system_audio", "unknown"})
 _ROLE_HINTS = frozenset({"self_or_room", "remote_mix", "unknown"})
 _SEMANTIC_WINDOW_STATUSES = frozenset({"active", "stable"})
 _COACH_EVENT_TYPES = frozenset(
-    {"question_to_user", "commitment_risk", "goal_at_risk", "contradiction"}
+    {
+        "question_to_user",
+        "commitment_risk",
+        "goal_at_risk",
+        "contradiction",
+        "communication_clarity",
+    }
 )
 
 
@@ -707,9 +713,14 @@ def build_realtime_coach_messages(
         (
             "你是仅服务于软件使用者的实时私人对话教练。只返回 JSON，不要输出 Markdown。",
             "任务不是总结、复盘或重复原话，而是判断刚发生的时刻是否值得立刻给用户一句可说出口的建议。",
-            "只允许四类介入：question_to_user（对方问题尚未完整回答）、commitment_risk（用户可能形成缺少条件的承诺）、",
-            "goal_at_risk（用户目标即将被跳过）、contradiction（当前说法与前文存在有损决策的冲突）。",
+            "只允许五类介入：question_to_user（对方问题尚未完整回答）、commitment_risk（用户可能形成缺少条件的承诺）、",
+            "goal_at_risk（用户目标即将被跳过）、contradiction（当前说法与前文存在有损决策的冲突）、",
+            "communication_clarity（持续表达出现重复、失焦或缺少结论，此刻需要收束或重组下一句话）。",
+            "communication_clarity 必须由至少两处逐字原话证明持续模式，不能针对单句措辞或 ASR 错字；建议必须给出下一句或具体结构，不得只做批评或泛泛而谈。",
             "system_audio/remote_mix 通常来自电脑中对方的混音；microphone/self_or_room 不能确定就是用户本人。",
+            "涉及承诺、立场或责任时，不得仅凭 microphone/self_or_room 归因给用户本人。",
+            "但 communication_clarity 可以直接使用持续的 microphone/self_or_room 原话判断当前可听见的表达模式；建议只针对表达本身，不推断说话者身份，也不能仅因身份未确认而保持静默。",
+            "对 communication_clarity 而言，听众抓不住核心观点或错过及时收束结论属于具体损失，只要此刻能用一句下一步表达修正，就具有介入价值。",
             "没有高价值、可执行且仍来得及的介入时 intervention 必须是 null。不要为了显得有帮助而生成提示。",
             "不得猜测说话人身份、公司信息、数字、期限或用户立场。依据必须逐字出现在引用的 paragraph 中。",
             "recommendation 必须是 8 到 120 个字符的可直接说出口短句；不要写分析过程。",
@@ -724,7 +735,7 @@ def build_realtime_coach_messages(
         "meeting_goal": request.meeting_goal,
         "output_contract": {
             "intervention": {
-                "event_type": "question_to_user|commitment_risk|goal_at_risk|contradiction",
+                "event_type": "question_to_user|commitment_risk|goal_at_risk|contradiction|communication_clarity",
                 "title": "short_string",
                 "recommendation": "directly_speakable_string",
                 "reason": "short_string",
@@ -776,6 +787,13 @@ def parse_realtime_coach_response(
         request=request,
         field="intervention.evidence_quote",
     )
+    if event_type == "communication_clarity" and len(
+        [line for line in evidence_quote.splitlines() if _normalize_for_evidence(line)]
+    ) < 2:
+        raise IntelligenceResponseValidationError(
+            "communication_clarity requires two verbatim evidence fragments",
+            category="evidence",
+        )
     urgency = _required_response_text(item.get("urgency"), "intervention.urgency", maximum=20)
     if urgency not in _URGENCY_VALUES:
         raise IntelligenceResponseValidationError("intervention.urgency is unsupported")

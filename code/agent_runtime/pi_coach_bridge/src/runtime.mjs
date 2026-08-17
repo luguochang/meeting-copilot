@@ -14,6 +14,7 @@ const EVENT_TYPES = new Set([
   "commitment_risk",
   "goal_at_risk",
   "contradiction",
+  "communication_clarity",
 ]);
 const URGENCIES = new Set(["low", "medium", "high"]);
 const MAX_SESSION_USER_TURNS = 4;
@@ -43,9 +44,14 @@ const COACHING_CHECKLIST = [
     question: "Does the current claim conflict with an earlier material fact, condition, or position?",
   },
   {
+    id: "expression_clarity",
+    event_type: "communication_clarity",
+    question: "Across sustained recent speech, including microphone/self_or_room speech, is repetition, drift, or a missing conclusion making the point hard to follow right now?",
+  },
+  {
     id: "intervention_value",
     event_type: null,
-    question: "Would an intervention still be useful now and prevent a concrete loss, rather than merely restate the dialogue?",
+    question: "Would an intervention still be useful now and prevent a concrete loss, including the listener losing the main point, rather than merely restate the dialogue?",
   },
 ];
 
@@ -53,9 +59,13 @@ const SYSTEM_PROMPT = [
   "You are Talktrace's private realtime conversation coach.",
   "You assist only the person running Talktrace; this is not a meeting summary task.",
   "Most moments require no interruption. A useful intervention must still be actionable now, be grounded in quoted evidence, and reduce a concrete loss.",
-  "Allowed events are question_to_user, commitment_risk, goal_at_risk, and contradiction.",
+  "Allowed events are question_to_user, commitment_risk, goal_at_risk, contradiction, and communication_clarity.",
+  "communication_clarity is for a sustained speaking pattern, not an isolated wording issue or ASR error. Use it when at least two verbatim fragments show repetition, drift, or a missing conclusion and a concrete next sentence or structure would help immediately.",
+  "For communication_clarity, recommend how to state the next point or close the current point. Do not merely criticize, summarize, or give generic public-speaking advice.",
   "system_audio/remote_mix usually represents the remote computer-audio mix. microphone/self_or_room is not guaranteed to be the local user.",
-  "Microphone turns may update whether a question or commitment is still open, but never attribute them to the user without corroboration.",
+  "For identity-sensitive events such as commitments and contradictions, microphone turns may update whether an issue is open, but never attribute them to the user without corroboration.",
+  "For communication_clarity, sustained microphone/self_or_room speech is sufficient evidence of the currently audible expression pattern. Coach that pattern without claiming who the speaker is, and never keep silent only because microphone speaker identity is unconfirmed.",
+  "For communication_clarity, the listener losing the main point or the speaker missing a timely conclusion is a concrete loss when a short next sentence can fix it now.",
   "The host applies the complete coaching checklist before every evaluation. Treat checklist_reviewed and context_signals as mandatory routing evidence, not optional metadata.",
   "When evidence is already sufficient, call exactly one terminal tool in the first response.",
   "When prior evidence is needed, call search_prior_evidence in the first response, then use one terminal tool in the next response.",
@@ -92,6 +102,7 @@ const interventionParameters = Type.Object(
       Type.Literal("commitment_risk"),
       Type.Literal("goal_at_risk"),
       Type.Literal("contradiction"),
+      Type.Literal("communication_clarity"),
     ]),
     title: Type.String({ minLength: 1, maxLength: 80 }),
     recommendation: Type.String({ minLength: 8, maxLength: 120 }),
@@ -361,6 +372,12 @@ function validateInterventionEvidence(intervention, context) {
     .split(/\r?\n/u)
     .map((fragment) => fragment.trim())
     .filter(Boolean);
+  if (intervention.event_type === "communication_clarity" && quoteFragments.length < 2) {
+    throw new PiCoachProtocolError(
+      "communication clarity interventions require two verbatim fragments",
+      "invalid_agent_action",
+    );
+  }
   const quoteIsVerbatim = texts.some((text) => text.includes(intervention.evidence_quote))
     || (quoteFragments.length > 1
       && quoteFragments.every((fragment) => texts.some((text) => text.includes(fragment))));
