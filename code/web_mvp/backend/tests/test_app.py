@@ -34,6 +34,107 @@ def test_dedupe_strings_handles_empty_values_and_preserves_order():
     ]
 
 
+def _formal_projection_event(
+    *,
+    seq: int,
+    event_type: str,
+    projection: dict | None,
+    occurred_at_ms: int | None = None,
+) -> dict:
+    projection_keys = {
+        "meeting.intelligence.applied": "follow_up",
+        "meeting.topic.updated": "topic",
+        "meeting.decision.updated": "decision",
+        "meeting.open_question.updated": "question",
+    }
+    payload = {
+        "source": "llm_first",
+        "job_id": f"job-{seq}",
+        "batch_id": f"batch-{seq}",
+        "provider": "test-provider",
+        "model": "test-model",
+        "llm_called": True,
+        "evidence": {"segment_ids": [f"segment-{seq}"], "quote": f"quote-{seq}"},
+        projection_keys[event_type]: projection,
+    }
+    if event_type == "meeting.topic.updated" and projection is not None:
+        payload["summary"] = projection.get("summary")
+    return {
+        "seq": seq,
+        "event_id": f"event-{seq}",
+        "type": event_type,
+        "aggregate_id": f"aggregate-{seq}",
+        "occurred_at_ms": occurred_at_ms or seq * 1_000,
+        "payload": payload,
+    }
+
+
+def test_coach_history_keeps_last_non_empty_advice_across_silent_rounds_and_deduplicates():
+    first = {
+        "question": "建议先说清楚验收标准。",
+        "reason": "标准还没有被明确。",
+        "urgency": "medium",
+        "coach_event_type": "communication_clarity",
+    }
+    repeated = {**first, "reason": "新一轮仍然没有明确标准。"}
+    second = {
+        "question": "建议确认由谁负责回滚。",
+        "reason": "回滚负责人尚未确认。",
+        "urgency": "high",
+        "coach_event_type": "commitment_risk",
+    }
+    events = [
+        _formal_projection_event(seq=1, event_type="meeting.intelligence.applied", projection=first),
+        _formal_projection_event(seq=2, event_type="meeting.intelligence.applied", projection=None),
+        _formal_projection_event(seq=3, event_type="meeting.intelligence.applied", projection=repeated),
+        _formal_projection_event(seq=4, event_type="meeting.intelligence.applied", projection=second),
+        _formal_projection_event(seq=5, event_type="meeting.intelligence.applied", projection=None),
+    ]
+
+    history = app_module._bounded_formal_coach_history(events)
+
+    assert [item["question"] for item in history] == [first["question"], second["question"]]
+    assert history[0]["reason"] == repeated["reason"]
+    assert history[0]["history_id"] == "event-3"
+    assert history[-1]["formal_evidence"]["segment_ids"] == ["segment-4"]
+
+
+def test_recent_context_history_is_mixed_deduplicated_and_bounded():
+    events = [
+        _formal_projection_event(
+            seq=1,
+            event_type="meeting.topic.updated",
+            projection={"text": "发布方案", "summary": "先确认发布窗口。"},
+        ),
+        _formal_projection_event(
+            seq=2,
+            event_type="meeting.decision.updated",
+            projection={"text": "采用蓝绿发布", "updated_at_ms": 2_000},
+        ),
+        _formal_projection_event(
+            seq=3,
+            event_type="meeting.topic.updated",
+            projection={"text": "发布方案", "summary": "先确认发布窗口。"},
+        ),
+        _formal_projection_event(
+            seq=4,
+            event_type="meeting.open_question.updated",
+            projection={"text": "谁负责回滚？", "updated_at_ms": 4_000},
+        ),
+    ]
+
+    history = app_module._bounded_recent_context_history(events, limit=2)
+
+    assert [(item["kind"], item["title"]) for item in history] == [
+        ("decision", "采用蓝绿发布"),
+        ("question", "谁负责回滚？"),
+    ]
+    full_history = app_module._bounded_recent_context_history(events)
+    assert len(full_history) == 3
+    assert full_history[0]["context_id"] == "event-3"
+    assert full_history[0]["evidence_segment_ids"] == ["segment-3"]
+
+
 def test_coach_runtime_capability_exposes_pi_loop_metrics():
     capability = app_module._coach_runtime_capability(
         enabled=True,

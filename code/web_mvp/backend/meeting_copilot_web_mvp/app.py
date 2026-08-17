@@ -1406,12 +1406,11 @@ def create_app(
         if v2_persistence is None or v2_persistence.semantic_projection_mode != "llm_first":
             return snapshot
         formal_events = _all_v2_formal_events(meeting_id)
+        coach_history = _bounded_formal_coach_history(formal_events)
+        recent_context_history = _bounded_recent_context_history(formal_events)
         by_projection: dict[tuple[str, str], dict[str, Any]] = {}
-        intelligence_events: list[dict[str, Any]] = []
         for event in formal_events:
             event_type = str(event.get("type") or "")
-            if event_type == "meeting.intelligence.applied":
-                intelligence_events.append(event)
             by_projection[(event_type, str(event.get("aggregate_id") or ""))] = event
 
         def project_item(item: Any, event_type: str) -> dict[str, Any] | None:
@@ -1477,20 +1476,10 @@ def create_app(
                     for value in snapshot.get("risks") or []
                 ) if item is not None
             ],
-            "follow_up": snapshot.get("follow_up") if intelligence_events else None,
+            "follow_up": coach_history[-1] if coach_history else None,
+            "coach_history": coach_history,
+            "recent_context_history": recent_context_history,
         }
-        if projected["follow_up"] is not None and intelligence_events:
-            latest_payload = dict(intelligence_events[-1].get("payload") or {})
-            projected["follow_up"] = {
-                **dict(projected["follow_up"]),
-                "source": latest_payload.get("source"),
-                "job_id": latest_payload.get("job_id"),
-                "batch_id": latest_payload.get("batch_id"),
-                "provider": latest_payload.get("provider"),
-                "model": latest_payload.get("model"),
-                "llm_called": latest_payload.get("llm_called"),
-                "formal_evidence": latest_payload.get("evidence"),
-            }
 
         intelligence_jobs = [
             job for job in v2_persistence.list_jobs(meeting_id=meeting_id)
@@ -1540,6 +1529,7 @@ def create_app(
         )
         if not coach_policy_enabled:
             projected["follow_up"] = None
+            projected["coach_history"] = []
         runtime["ai"]["capabilities"] = {
             "provider": {
                 "state": "active" if provider_config is not None else "offline",
@@ -10660,6 +10650,128 @@ _RECOVERABLE_TRANSCRIPT_DEGRADATION_REASONS = {
     "offline_refinement_unavailable",
     "offline_refinement_text_too_short",
 }
+COACH_HISTORY_LIMIT = 12
+RECENT_CONTEXT_HISTORY_LIMIT = 10
+
+
+def _normalized_history_text(*values: Any) -> str:
+    return " ".join(
+        " ".join(str(value or "").split()).casefold()
+        for value in values
+        if str(value or "").strip()
+    )
+
+
+def _formal_projection_metadata(event: dict[str, Any]) -> dict[str, Any]:
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    return {
+        "source": payload.get("source"),
+        "job_id": payload.get("job_id"),
+        "batch_id": payload.get("batch_id"),
+        "provider": payload.get("provider"),
+        "model": payload.get("model"),
+        "llm_called": payload.get("llm_called"),
+        "formal_evidence": payload.get("evidence"),
+    }
+
+
+def _bounded_formal_coach_history(
+    formal_events: list[dict[str, Any]],
+    *,
+    limit: int = COACH_HISTORY_LIMIT,
+) -> list[dict[str, Any]]:
+    history: list[dict[str, Any]] = []
+    for event in formal_events:
+        if event.get("type") != "meeting.intelligence.applied":
+            continue
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        follow_up = payload.get("follow_up")
+        if not isinstance(follow_up, dict):
+            continue
+        question = str(follow_up.get("question") or "").strip()
+        reason = str(follow_up.get("reason") or "").strip()
+        if not question or not reason:
+            continue
+        entry = {
+            **follow_up,
+            **_formal_projection_metadata(event),
+            "history_id": str(
+                event.get("event_id")
+                or f"coach:{event.get('seq') or event.get('aggregate_id') or len(history)}"
+            ),
+            "created_at_ms": int(event.get("occurred_at_ms") or 0),
+        }
+        key = _normalized_history_text(follow_up.get("coach_event_type"), question)
+        if history and history[-1]["_dedupe_key"] == key:
+            history[-1] = {**entry, "_dedupe_key": key}
+        else:
+            history.append({**entry, "_dedupe_key": key})
+    return [
+        {key: value for key, value in entry.items() if key != "_dedupe_key"}
+        for entry in history[-max(0, limit):]
+    ]
+
+
+def _bounded_recent_context_history(
+    formal_events: list[dict[str, Any]],
+    *,
+    limit: int = RECENT_CONTEXT_HISTORY_LIMIT,
+) -> list[dict[str, Any]]:
+    event_kinds = {
+        "meeting.topic.updated": ("topic", "topic"),
+        "meeting.decision.updated": ("decision", "decision"),
+        "meeting.open_question.updated": ("question", "question"),
+    }
+    history_by_key: dict[str, dict[str, Any]] = {}
+    ordered_keys: list[str] = []
+    for event in formal_events:
+        event_type = str(event.get("type") or "")
+        kind_and_key = event_kinds.get(event_type)
+        if kind_and_key is None:
+            continue
+        kind, projection_key = kind_and_key
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        projection = payload.get(projection_key)
+        if not isinstance(projection, dict):
+            projection = payload.get("entity")
+        if not isinstance(projection, dict):
+            continue
+        title = str(
+            projection.get("text")
+            or projection.get("title")
+            or projection.get("question")
+            or ""
+        ).strip()
+        if not title:
+            continue
+        summary = ""
+        if kind == "topic":
+            evidence = projection.get("evidence") if isinstance(projection.get("evidence"), dict) else {}
+            summary = str(payload.get("summary") or evidence.get("summary") or "").strip()
+        formal_evidence = payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {}
+        evidence_ids = formal_evidence.get("segment_ids") or projection.get("evidence_segment_ids") or []
+        normalized_evidence_ids = [
+            str(item).strip() for item in evidence_ids if str(item).strip()
+        ] if isinstance(evidence_ids, list) else []
+        dedupe_key = _normalized_history_text(kind, title, summary)
+        entry = {
+            "context_id": str(
+                event.get("event_id")
+                or f"context:{event.get('seq') or event.get('aggregate_id') or len(ordered_keys)}"
+            ),
+            "kind": kind,
+            "title": title,
+            "summary": summary or None,
+            "updated_at_ms": int(
+                projection.get("updated_at_ms") or event.get("occurred_at_ms") or 0
+            ),
+            "evidence_segment_ids": normalized_evidence_ids,
+            **_formal_projection_metadata(event),
+        }
+        if dedupe_key not in history_by_key:
+            ordered_keys.append(dedupe_key)
+        history_by_key[dedupe_key] = entry
+    return [history_by_key[key] for key in ordered_keys[-max(0, limit):]]
 
 
 def _realtime_correction_blockers(record: dict[str, Any]) -> list[str]:
