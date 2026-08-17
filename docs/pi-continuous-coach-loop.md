@@ -2,7 +2,7 @@
 
 > 分支：`feat/pi-continuous-coach-loop`
 >
-> 实施提交：`8c36b09`、`9ef5364`
+> 实施提交：`8c36b09`、`9ef5364`、`0cb383d`、`3d271c2`、`6f106eb`
 >
 > 日期：2026-08-17
 
@@ -122,6 +122,17 @@ uv run --frozen python ../../../tools/realtime_coach_eval/replay.py `
 
 A/B 需要真实 Provider 配置，但不需要播放或外放声音。
 
+### 真实 Provider 端到端结果
+
+2026-08-17 使用 `gpt-5.6-sol`、`chat_completions` 和两条直接注入的稳定转写进行验收，未播放音频，也未打开麦克风：
+
+1. 远端先声明“压测通过前不得承诺发布日期”，Pi 完成 5 项 checklist 后选择静默；`runtime_used=pi`，无回退，1 个 Agent turn、1 次 `keep_silent`，约 3.46 秒。
+2. 麦克风轨随后出现“即使压测未通过也承诺周五上线”，同一 Pi Session 识别为 `commitment_risk` 并立即建议撤回无条件承诺；`runtime_used=pi`，无回退，1 个 Agent turn、1 次 `submit_intervention`，约 9.37 秒。
+3. 第二轮 `session_reused=true`，建议同时引用两条逐字证据。两条证据已在当前有界语义窗口内，因此本例无需额外调用历史搜索工具；更早证据才走 `search_prior_evidence`。
+4. Python 与 Node 均支持“每行一条”的多证据引用校验；任何一行不是所选证据的逐字子串都会拒绝，避免用改写内容冒充原话。
+
+工作台验收会议为 `pi-coach-proof-grounded-20260817`。用户可见结果为 `Pi 教练监听中`、`本轮完成 5 项检查 · 已延续会议上下文`，并展示高紧急教练卡、可展开的两条依据、未闭环问题、决策和风险候选。
+
 ## 8. 当前边界
 
 - 桌面安装包仍需把 Node `>=22.19.0` 和 Pi sidecar 一起打包；源码开发环境已经跑通，生产打包尚未完成。
@@ -136,4 +147,3 @@ A/B 需要真实 Provider 配置，但不需要播放或外放声音。
 - 双音轨触发和教练路由：`code/web_mvp/backend/meeting_copilot_web_mvp/realtime_intelligence.py`
 - 历史转写投影和运行状态：`code/web_mvp/backend/meeting_copilot_web_mvp/app.py`
 - 用户可见教练状态：`code/web_mvp/frontend_v2/src/features/live-meeting/NowRail.tsx`
-
