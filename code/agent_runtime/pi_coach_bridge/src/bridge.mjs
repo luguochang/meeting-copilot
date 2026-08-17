@@ -51,6 +51,9 @@ async function runSmoke() {
   const models = createModels();
   models.setProvider(faux.provider);
   faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("review_coaching_checklist", {}), {
+      stopReason: "toolUse",
+    }),
     fauxAssistantMessage(
       fauxToolCall("read_realtime_context", { scope: "meeting_goal" }),
       { stopReason: "toolUse" },
@@ -99,7 +102,11 @@ async function runSmoke() {
     },
   });
   writeJson(result);
-  if (result.action !== "intervention" || result.metrics.turns !== 2) process.exitCode = 1;
+  if (
+    result.action !== "intervention"
+    || result.metrics.turns !== 3
+    || result.metrics.checklist_reviewed !== true
+  ) process.exitCode = 1;
 }
 
 if (process.argv.includes("--smoke")) {

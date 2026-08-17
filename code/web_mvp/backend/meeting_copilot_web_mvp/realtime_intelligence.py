@@ -20,6 +20,7 @@ from meeting_copilot_web_mvp.realtime_transcript_correction import correction_is
 
 MAX_NEW_PARAGRAPHS = 8
 MAX_CONTEXT_PARAGRAPHS = 3
+MAX_RETRIEVAL_PARAGRAPHS = 48
 MAX_PARAGRAPH_CHARACTERS = 12_000
 MAX_ROLLING_STATE_BYTES = 24_000
 MAX_GLOSSARY_ITEMS = 100
@@ -210,6 +211,7 @@ class RealtimeIntelligenceRequest:
     state_revision: int
     new_paragraphs: tuple[IntelligenceParagraph, ...]
     context_paragraphs: tuple[IntelligenceParagraph, ...]
+    retrieval_paragraphs: tuple[IntelligenceParagraph, ...]
     semantic_windows: tuple[IntelligenceSemanticWindow, ...]
     rolling_state: Mapping[str, Any]
     glossary: tuple[str, ...]
@@ -224,6 +226,7 @@ class RealtimeIntelligenceRequest:
         state_revision: Any,
         new_paragraphs: Sequence[Mapping[str, Any]],
         context_paragraphs: Sequence[Mapping[str, Any]],
+        retrieval_paragraphs: Sequence[Mapping[str, Any]] | None = None,
         semantic_windows: Sequence[Mapping[str, Any]] | None = None,
         rolling_state: Mapping[str, Any],
         glossary: Sequence[Any] | None = None,
@@ -240,6 +243,11 @@ class RealtimeIntelligenceRequest:
             raise ValueError("context_paragraphs must be an array")
         if len(context_paragraphs) > MAX_CONTEXT_PARAGRAPHS:
             raise ValueError(f"context_paragraphs must contain at most {MAX_CONTEXT_PARAGRAPHS} items")
+        raw_retrieval_paragraphs = list(retrieval_paragraphs or [])
+        if len(raw_retrieval_paragraphs) > MAX_RETRIEVAL_PARAGRAPHS:
+            raise ValueError(
+                f"retrieval_paragraphs must contain at most {MAX_RETRIEVAL_PARAGRAPHS} items"
+            )
         if not isinstance(rolling_state, Mapping):
             raise ValueError("rolling_state must be an object")
         if not isinstance(allow_paragraph_revisions, bool):
@@ -253,7 +261,11 @@ class RealtimeIntelligenceRequest:
             IntelligenceParagraph.from_payload(item, field=f"context_paragraphs[{index}]")
             for index, item in enumerate(context_paragraphs)
         )
-        all_ids = [item.id for item in (*context_items, *new_items)]
+        retrieval_items = tuple(
+            IntelligenceParagraph.from_payload(item, field=f"retrieval_paragraphs[{index}]")
+            for index, item in enumerate(raw_retrieval_paragraphs)
+        )
+        all_ids = [item.id for item in (*retrieval_items, *context_items, *new_items)]
         if len(set(all_ids)) != len(all_ids):
             raise ValueError("paragraph ids must be unique within one intelligence request")
         raw_windows = list(semantic_windows or [])
@@ -296,6 +308,7 @@ class RealtimeIntelligenceRequest:
             state_revision=normalized_revision,
             new_paragraphs=new_items,
             context_paragraphs=context_items,
+            retrieval_paragraphs=retrieval_items,
             semantic_windows=window_items,
             rolling_state=bounded_state,
             glossary=tuple(glossary_items),
@@ -305,7 +318,10 @@ class RealtimeIntelligenceRequest:
 
     @property
     def paragraphs_by_id(self) -> dict[str, IntelligenceParagraph]:
-        return {item.id: item for item in (*self.context_paragraphs, *self.new_paragraphs)}
+        return {
+            item.id: item
+            for item in (*self.retrieval_paragraphs, *self.context_paragraphs, *self.new_paragraphs)
+        }
 
     @property
     def writable_paragraph_ids(self) -> frozenset[str]:
@@ -663,8 +679,12 @@ def dynamic_output_token_limit(input_characters: int) -> int:
     return min(4_096, max(768, rounded))
 
 
-def should_run_realtime_coach(request: RealtimeIntelligenceRequest) -> bool:
-    """Limit the first coach MVP to new computer-playback speech.
+def should_run_realtime_coach(
+    request: RealtimeIntelligenceRequest,
+    *,
+    requested_runtime: str = "direct",
+) -> bool:
+    """Run Pi for every new audio turn while keeping direct mode conservative.
 
     System audio is the one source where Talktrace can conservatively infer
     that a remote party, rather than the local microphone environment, spoke.
@@ -672,7 +692,10 @@ def should_run_realtime_coach(request: RealtimeIntelligenceRequest) -> bool:
 
     if not isinstance(request, RealtimeIntelligenceRequest):
         raise TypeError("request must be a RealtimeIntelligenceRequest")
-    return any(item.source_track == "system_audio" for item in request.new_paragraphs)
+    source_tracks = {item.source_track for item in request.new_paragraphs}
+    if str(requested_runtime or "direct").strip().lower() == "pi":
+        return bool(source_tracks & {"system_audio", "microphone"})
+    return "system_audio" in source_tracks
 
 
 def build_realtime_coach_messages(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import json
 from types import SimpleNamespace
 
@@ -512,6 +513,15 @@ def _coach_request() -> RealtimeIntelligenceRequest:
 def test_coach_lane_only_triggers_for_new_system_audio() -> None:
     assert should_run_realtime_coach(_coach_request()) is True
     assert should_run_realtime_coach(_request()) is False
+    mic_request = replace(
+        _coach_request(),
+        new_paragraphs=tuple(
+            replace(item, source_track="microphone", role_hint="self_or_room")
+            for item in _coach_request().new_paragraphs
+        ),
+    )
+    assert should_run_realtime_coach(mic_request) is False
+    assert should_run_realtime_coach(mic_request, requested_runtime="pi") is True
 
 
 def test_coach_prompt_is_focused_on_timely_action_instead_of_summary() -> None:
@@ -664,6 +674,10 @@ async def _test_pi_coach_runner_preserves_the_existing_evidence_contract() -> No
                 "turns": 2,
                 "tool_calls": 2,
                 "context_reads": 1,
+                "checklist_reviewed": True,
+                "checklist_reviews": 1,
+                "history_searches": 1,
+                "history_results": 2,
                 "usage": {"prompt_tokens": 90, "completion_tokens": 20, "total_tokens": 110},
             },
         }
@@ -681,6 +695,7 @@ async def _test_pi_coach_runner_preserves_the_existing_evidence_contract() -> No
     assert result["intervention"].evidence_segment_ids == ("remote-4",)
     assert result["transport_mode"] == "pi_agent_jsonl"
     assert result["agent_metrics"]["turns"] == 2
+    assert result["agent_metrics"]["checklist_reviewed"] is True
     assert pi_runtime.payload["context"]["new_paragraphs"][0]["source_track"] == "system_audio"
     assert pi_runtime.payload["provider"]["model"] == "coach-model"
     assert usages == [(1, {"prompt_tokens": 90, "completion_tokens": 20, "total_tokens": 110})]

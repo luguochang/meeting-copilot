@@ -105,6 +105,7 @@ from meeting_copilot_web_mvp.v2_streaming_suggestions import (
     generate_streaming_suggestion,
 )
 from meeting_copilot_web_mvp.realtime_intelligence import (
+    MAX_RETRIEVAL_PARAGRAPHS,
     RealtimeIntelligenceRequest,
     apply_coach_intervention,
     build_llm_first_event_context,
@@ -8817,6 +8818,16 @@ def create_app(
             meeting_id=meeting_id,
             segments=[*context, *new_segments],
         )
+        active_segment_ids = {
+            str(segment.get("segment_id") or "")
+            for segment in (*context, *new_segments)
+        }
+        retrieval_segments = [
+            segment
+            for segment in _v2_complete_transcript(v2_persistence, meeting_id)
+            if str(segment.get("segment_id") or "") not in active_segment_ids
+            and int(segment.get("transcript_seq") or 0) < int(target.get("transcript_seq") or 0)
+        ][-MAX_RETRIEVAL_PARAGRAPHS:]
         request = RealtimeIntelligenceRequest.from_payload(
             meeting_id=meeting_id,
             state_revision=int(job.get("input_transcript_seq") or job.get("input_version") or 1),
@@ -8847,6 +8858,21 @@ def create_app(
                     "role_hint": _v2_intelligence_role_hint(segment.get("source_track")),
                 }
                 for segment in context
+            ],
+            retrieval_paragraphs=[
+                {
+                    "id": str(segment.get("segment_id") or ""),
+                    "text": str(segment.get("normalized_text") or segment.get("text") or "")[:2_000],
+                    "revision": int(segment.get("revision") or 1),
+                    "start_ms": segment.get("started_at_ms"),
+                    "end_ms": segment.get("ended_at_ms"),
+                    "speaker": segment.get("speaker_label") or segment.get("speaker_id"),
+                    "speaker_confidence": segment.get("speaker_confidence"),
+                    "source_track": _v2_intelligence_source_track(segment.get("source_track")),
+                    "role_hint": _v2_intelligence_role_hint(segment.get("source_track")),
+                }
+                for segment in retrieval_segments
+                if str(segment.get("normalized_text") or segment.get("text") or "").strip()
             ],
             semantic_windows=semantic_windows,
             rolling_state=rolling_state,
@@ -8916,7 +8942,10 @@ def create_app(
             os.environ.get("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
         ).strip().lower() not in {"0", "false", "off", "no"}
         coach_runtime_requested = configured_coach_runtime()
-        coach_triggered = coach_enabled and should_run_realtime_coach(request)
+        coach_triggered = coach_enabled and should_run_realtime_coach(
+            request,
+            requested_runtime=coach_runtime_requested,
+        )
         coach_result: dict[str, Any] | None = None
         coach_status = "not_triggered" if coach_enabled else "disabled"
         if coach_triggered:

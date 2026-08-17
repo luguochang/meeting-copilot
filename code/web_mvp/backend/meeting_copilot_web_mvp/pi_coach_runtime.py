@@ -36,7 +36,7 @@ class PiCoachRuntimeError(RuntimeError):
 
 
 def configured_coach_runtime(value: Any = None) -> str:
-    normalized = str(value if value is not None else os.environ.get(PI_RUNTIME_ENV, "direct")).strip().lower()
+    normalized = str(value if value is not None else os.environ.get(PI_RUNTIME_ENV, "pi")).strip().lower()
     return normalized if normalized in {"direct", "pi"} else "direct"
 
 
@@ -81,6 +81,7 @@ def build_pi_coach_request(
             "state_revision": int(request.state_revision),
             "new_paragraphs": [asdict(item) for item in request.new_paragraphs],
             "context_paragraphs": [asdict(item) for item in request.context_paragraphs],
+            "retrieval_paragraphs": [asdict(item) for item in request.retrieval_paragraphs],
             "semantic_windows": [asdict(item) for item in request.semantic_windows],
             "rolling_state": dict(request.rolling_state),
             "meeting_goal": request.meeting_goal,

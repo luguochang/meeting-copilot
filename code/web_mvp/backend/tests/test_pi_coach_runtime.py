@@ -39,9 +39,9 @@ def _request() -> RealtimeIntelligenceRequest:
     )
 
 
-def test_runtime_flag_defaults_closed_to_the_direct_path(monkeypatch) -> None:
+def test_runtime_flag_defaults_to_the_pi_coach_branch(monkeypatch) -> None:
     monkeypatch.delenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", raising=False)
-    assert configured_coach_runtime() == "direct"
+    assert configured_coach_runtime() == "pi"
     assert configured_coach_runtime("pi") == "pi"
     assert configured_coach_runtime("unsupported") == "direct"
 

@@ -19,6 +19,35 @@ const URGENCIES = new Set(["low", "medium", "high"]);
 const MAX_SESSION_USER_TURNS = 4;
 const MAX_AGENT_TURNS_PER_EVALUATION = 4;
 const MAX_SESSIONS = 8;
+const MAX_RETRIEVAL_PARAGRAPHS = 48;
+
+const COACHING_CHECKLIST = [
+  {
+    id: "unanswered_question",
+    event_type: "question_to_user",
+    question: "Did the remote party ask something the user still needs to answer?",
+  },
+  {
+    id: "unsafe_commitment",
+    event_type: "commitment_risk",
+    question: "Is a deadline, scope, result, or responsibility being accepted without necessary conditions?",
+  },
+  {
+    id: "goal_coverage",
+    event_type: "goal_at_risk",
+    question: "Is the conversation leaving a topic before the user's goal or focus point is covered?",
+  },
+  {
+    id: "position_conflict",
+    event_type: "contradiction",
+    question: "Does the current claim conflict with an earlier material fact, condition, or position?",
+  },
+  {
+    id: "intervention_value",
+    event_type: null,
+    question: "Would an intervention still be useful now and prevent a concrete loss, rather than merely restate the dialogue?",
+  },
+];
 
 const SYSTEM_PROMPT = [
   "You are Talktrace's private realtime conversation coach.",
@@ -26,7 +55,9 @@ const SYSTEM_PROMPT = [
   "Most moments require no interruption. A useful intervention must still be actionable now, be grounded in quoted evidence, and reduce a concrete loss.",
   "Allowed events are question_to_user, commitment_risk, goal_at_risk, and contradiction.",
   "system_audio/remote_mix usually represents the remote computer-audio mix. microphone/self_or_room is not guaranteed to be the local user.",
-  "Use read_realtime_context only when the new utterance alone is insufficient. Never invent a person, number, deadline, position, or goal.",
+  "Microphone turns may update whether a question or commitment is still open, but never attribute them to the user without corroboration.",
+  "Begin every evaluation with review_coaching_checklist. Use read_realtime_context or search_prior_evidence only when the new utterance alone is insufficient.",
+  "Never invent a person, number, deadline, position, or goal.",
   "Match the language of the latest dialogue in the intervention, which will usually be Chinese.",
   "You must finish by calling exactly one terminal tool: submit_intervention or keep_silent. Do not answer with ordinary text.",
 ].join(" ");
@@ -38,6 +69,16 @@ const readContextParameters = Type.Object(
       Type.Literal("rolling_state"),
       Type.Literal("meeting_goal"),
     ]),
+  },
+  { additionalProperties: false },
+);
+
+const emptyParameters = Type.Object({}, { additionalProperties: false });
+
+const searchEvidenceParameters = Type.Object(
+  {
+    query: Type.String({ minLength: 2, maxLength: 160 }),
+    max_results: Type.Optional(Type.Integer({ minimum: 1, maximum: 6 })),
   },
   { additionalProperties: false },
 );
@@ -143,16 +184,22 @@ function validateContext(value) {
     throw new PiCoachProtocolError("context.new_paragraphs must not be empty", "invalid_request");
   }
   const contextParagraphs = validateParagraphs(value.context_paragraphs ?? [], "context.context_paragraphs", 3);
+  const retrievalParagraphs = validateParagraphs(
+    value.retrieval_paragraphs ?? [],
+    "context.retrieval_paragraphs",
+    MAX_RETRIEVAL_PARAGRAPHS,
+  );
   const semanticWindows = Array.isArray(value.semantic_windows) ? value.semantic_windows.slice(-8) : [];
   const rollingState = value.rolling_state && typeof value.rolling_state === "object" ? value.rolling_state : {};
-  const serialized = JSON.stringify({ newParagraphs, contextParagraphs, semanticWindows, rollingState });
-  if (serialized.length > 80000) {
+  const serialized = JSON.stringify({ newParagraphs, contextParagraphs, retrievalParagraphs, semanticWindows, rollingState });
+  if (serialized.length > 160000) {
     throw new PiCoachProtocolError("context exceeds the bridge byte budget", "invalid_request");
   }
   return {
     state_revision: Number.isInteger(value.state_revision) && value.state_revision > 0 ? value.state_revision : 1,
     new_paragraphs: newParagraphs,
     context_paragraphs: contextParagraphs,
+    retrieval_paragraphs: retrievalParagraphs,
     semantic_windows: semanticWindows,
     rolling_state: rollingState,
     meeting_goal: optionalText(value.meeting_goal, 2000),
@@ -248,8 +295,37 @@ function pruneContext(messages) {
 
 function evidenceTextById(context) {
   return new Map(
-    [...context.context_paragraphs, ...context.new_paragraphs].map((paragraph) => [paragraph.id, paragraph.text]),
+    [...context.retrieval_paragraphs, ...context.context_paragraphs, ...context.new_paragraphs].map(
+      (paragraph) => [paragraph.id, paragraph.text],
+    ),
   );
+}
+
+function searchTokens(query) {
+  const normalized = query.toLocaleLowerCase().trim();
+  const tokens = new Set(normalized.match(/[a-z0-9][a-z0-9._/-]+/g) ?? []);
+  for (const sequence of normalized.match(/[\p{Script=Han}]+/gu) ?? []) {
+    if (sequence.length <= 2) tokens.add(sequence);
+    for (let index = 0; index < sequence.length - 1; index += 1) {
+      tokens.add(sequence.slice(index, index + 2));
+    }
+  }
+  return [...tokens].filter((token) => token.length >= 2).slice(0, 24);
+}
+
+function searchPriorEvidence(query, paragraphs, maximumResults) {
+  const tokens = searchTokens(query);
+  if (tokens.length === 0) return [];
+  return paragraphs
+    .map((paragraph, index) => {
+      const text = paragraph.text.toLocaleLowerCase();
+      const score = tokens.reduce((total, token) => total + (text.includes(token) ? token.length : 0), 0);
+      return { paragraph, index, score };
+    })
+    .filter((candidate) => candidate.score > 0)
+    .sort((left, right) => right.score - left.score || right.index - left.index)
+    .slice(0, maximumResults)
+    .map(({ paragraph }) => paragraph);
 }
 
 function validateInterventionEvidence(intervention, context) {
@@ -288,6 +364,29 @@ function setTerminalAction(entry, action) {
 function createRestrictedTools(entry) {
   return [
     {
+      name: "review_coaching_checklist",
+      label: "Review coaching checklist",
+      description: "Start the evaluation by reviewing every realtime coaching guardrail and the available evidence sources.",
+      parameters: emptyParameters,
+      executionMode: "sequential",
+      execute: async () => {
+        entry.run.checklistReviewed = true;
+        entry.run.checklistReviews += 1;
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              checklist: COACHING_CHECKLIST,
+              meeting_goal_available: Boolean(entry.activeContext.meeting_goal),
+              rolling_state_available: Object.keys(entry.activeContext.rolling_state).length > 0,
+              searchable_prior_paragraphs: entry.activeContext.retrieval_paragraphs.length,
+            }),
+          }],
+          details: { checklist_item_ids: COACHING_CHECKLIST.map((item) => item.id) },
+        };
+      },
+    },
+    {
       name: "read_realtime_context",
       label: "Read realtime context",
       description: "Read one bounded part of the current Talktrace context when necessary for the decision.",
@@ -302,12 +401,35 @@ function createRestrictedTools(entry) {
       },
     },
     {
+      name: "search_prior_evidence",
+      label: "Search prior evidence",
+      description: "Search bounded earlier transcript evidence for a prior condition, position, question, or commitment.",
+      parameters: searchEvidenceParameters,
+      executionMode: "sequential",
+      execute: async (_toolCallId, params) => {
+        const results = searchPriorEvidence(
+          params.query,
+          entry.activeContext.retrieval_paragraphs,
+          params.max_results ?? 4,
+        );
+        entry.run.historySearches += 1;
+        entry.run.historyResults += results.length;
+        return {
+          content: [{ type: "text", text: JSON.stringify({ query: params.query, results }) }],
+          details: { result_count: results.length },
+        };
+      },
+    },
+    {
       name: "submit_intervention",
       label: "Submit intervention",
       description: "Submit one evidence-grounded intervention that is still useful right now, then stop.",
       parameters: interventionParameters,
       executionMode: "sequential",
       execute: async (_toolCallId, params) => {
+        if (!entry.run.checklistReviewed) {
+          throw new PiCoachProtocolError("review_coaching_checklist must run first", "checklist_not_reviewed");
+        }
         const intervention = validateInterventionEvidence(params, entry.activeContext);
         setTerminalAction(entry, { action: "intervention", intervention });
         return {
@@ -324,6 +446,9 @@ function createRestrictedTools(entry) {
       parameters: silentParameters,
       executionMode: "sequential",
       execute: async (_toolCallId, params) => {
+        if (!entry.run.checklistReviewed) {
+          throw new PiCoachProtocolError("review_coaching_checklist must run first", "checklist_not_reviewed");
+        }
         setTerminalAction(entry, { action: "silent", reason: params.reason });
         return {
           content: [{ type: "text", text: "Silence accepted." }],
@@ -340,7 +465,8 @@ function buildPrompt(context) {
     task: "decide_realtime_coaching_intervention",
     state_revision: context.state_revision,
     new_paragraphs: context.new_paragraphs,
-    reminder: "Use exactly one terminal tool. Read additional context only if needed.",
+    searchable_prior_paragraph_count: context.retrieval_paragraphs.length,
+    reminder: "Review the checklist first, then use exactly one terminal tool. Read or search additional context only if needed.",
   });
 }
 
@@ -425,7 +551,16 @@ export class PiCoachRuntime {
       entry.agent.streamFunction = backend.streamFn;
     }
     entry.activeContext = request.context;
-    entry.run = { terminalAction: null, turns: 0, toolCalls: 0, contextReads: 0 };
+    entry.run = {
+      terminalAction: null,
+      turns: 0,
+      toolCalls: 0,
+      contextReads: 0,
+      checklistReviewed: false,
+      checklistReviews: 0,
+      historySearches: 0,
+      historyResults: 0,
+    };
     const priorMessageCount = entry.agent.state.messages.length;
     const startedAt = this.clock();
     try {
@@ -451,6 +586,11 @@ export class PiCoachRuntime {
           turns: entry.run.turns,
           tool_calls: entry.run.toolCalls,
           context_reads: entry.run.contextReads,
+          checklist_reviewed: entry.run.checklistReviewed,
+          checklist_reviews: entry.run.checklistReviews,
+          checklist_item_ids: COACHING_CHECKLIST.map((item) => item.id),
+          history_searches: entry.run.historySearches,
+          history_results: entry.run.historyResults,
           session_reused: sessionReused,
           usage: runUsage,
         },
