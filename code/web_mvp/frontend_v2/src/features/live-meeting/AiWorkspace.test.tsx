@@ -52,6 +52,17 @@ it("shows the active Pi checklist loop when no intervention is needed", async ()
       askSelectionNonce={0}
       currentTopic={null}
       followUp={null}
+      coachHistory={[{
+        historyId: "prior-coach-1",
+        createdAtMs: 1_000,
+        question: "先确认负责人，再承诺时间。",
+        reason: "此前负责人尚未确认。",
+        evidenceSegmentIds: ["segment-1"],
+        evidenceQuote: "负责人还没定",
+        urgency: "high",
+        coachEventType: "commitment_risk",
+        formalAi: formalAi("segment-1"),
+      }]}
       coachRuntime={{
         state: "active",
         label: "Pi 教练监听中",
@@ -77,6 +88,7 @@ it("shows the active Pi checklist loop when no intervention is needed", async ()
   expect(screen.getByRole("list", { name: "教练检查项" })).toHaveTextContent("问题回应");
   expect(screen.getByRole("list", { name: "教练检查项" })).toHaveTextContent("承诺条件");
   expect(screen.getByRole("list", { name: "教练检查项" })).toHaveTextContent("表达清晰");
+  expect(screen.getByRole("list", { name: "过去的教练建议" })).toHaveTextContent("先确认负责人，再承诺时间。");
 });
 
 it("keeps the latest coach intervention prominent and exposes prior advice", async () => {

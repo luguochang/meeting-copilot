@@ -491,7 +491,7 @@ describe("meetingReducer", () => {
     });
   });
 
-  it("keeps the latest useful coach advice when a later Pi loop stays silent", () => {
+  it("moves prior coach advice into history when a later Pi loop stays silent", () => {
     const advised = meetingReducer(createInitialMeetingState("meeting-1"), {
       type: "events.received",
       events: [event({
@@ -521,7 +521,7 @@ describe("meetingReducer", () => {
       receivedAtMs: 3_000,
     });
 
-    expect(silent.followUp?.question).toBe("先确认回滚负责人。");
+    expect(silent.followUp).toBeNull();
     expect(silent.coachHistory).toHaveLength(1);
   });
 

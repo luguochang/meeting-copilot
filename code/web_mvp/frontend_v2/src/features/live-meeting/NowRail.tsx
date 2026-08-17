@@ -346,7 +346,13 @@ export function NowRail({
   const formalCoachHistory = coachHistory
     .filter((item) => isFormalAi(item))
     .sort((left, right) => left.createdAtMs - right.createdAtMs);
-  const pastCoachHistory = formalCoachHistory.slice(0, -1).reverse();
+  const currentCoachHistoryId = formalFollowUp
+    ? [...formalCoachHistory].reverse().find((item) =>
+      item.question === formalFollowUp.question && item.coachEventType === formalFollowUp.coachEventType)?.historyId
+    : null;
+  const pastCoachHistory = formalCoachHistory
+    .filter((item) => item.historyId !== currentCoachHistoryId)
+    .reverse();
   const [menuOpen, setMenuOpen] = useState(false);
   const [coachHistoryExpanded, setCoachHistoryExpanded] = useState(false);
   const [saving, setSaving] = useState<SuggestionFeedback | null>(null);

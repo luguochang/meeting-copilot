@@ -1407,6 +1407,7 @@ def create_app(
             return snapshot
         formal_events = _all_v2_formal_events(meeting_id)
         coach_history = _bounded_formal_coach_history(formal_events)
+        current_coach_follow_up = _latest_formal_coach_follow_up(formal_events)
         recent_context_history = _bounded_recent_context_history(formal_events)
         by_projection: dict[tuple[str, str], dict[str, Any]] = {}
         for event in formal_events:
@@ -1476,7 +1477,7 @@ def create_app(
                     for value in snapshot.get("risks") or []
                 ) if item is not None
             ],
-            "follow_up": coach_history[-1] if coach_history else None,
+            "follow_up": current_coach_follow_up,
             "coach_history": coach_history,
             "recent_context_history": recent_context_history,
         }
@@ -10710,6 +10711,29 @@ def _bounded_formal_coach_history(
         {key: value for key, value in entry.items() if key != "_dedupe_key"}
         for entry in history[-max(0, limit):]
     ]
+
+
+def _latest_formal_coach_follow_up(
+    formal_events: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    latest_event = next(
+        (
+            event for event in reversed(formal_events)
+            if event.get("type") == "meeting.intelligence.applied"
+        ),
+        None,
+    )
+    if latest_event is None:
+        return None
+    payload = latest_event.get("payload") if isinstance(latest_event.get("payload"), dict) else {}
+    follow_up = payload.get("follow_up")
+    if not isinstance(follow_up, dict):
+        return None
+    question = str(follow_up.get("question") or "").strip()
+    reason = str(follow_up.get("reason") or "").strip()
+    if not question or not reason:
+        return None
+    return {**follow_up, **_formal_projection_metadata(latest_event)}
 
 
 def _bounded_recent_context_history(

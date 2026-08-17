@@ -69,7 +69,7 @@ def _formal_projection_event(
     }
 
 
-def test_coach_history_keeps_last_non_empty_advice_across_silent_rounds_and_deduplicates():
+def test_coach_history_retains_advice_across_silent_rounds_and_deduplicates():
     first = {
         "question": "建议先说清楚验收标准。",
         "reason": "标准还没有被明确。",
@@ -97,6 +97,7 @@ def test_coach_history_keeps_last_non_empty_advice_across_silent_rounds_and_dedu
     assert history[0]["reason"] == repeated["reason"]
     assert history[0]["history_id"] == "event-3"
     assert history[-1]["formal_evidence"]["segment_ids"] == ["segment-4"]
+    assert app_module._latest_formal_coach_follow_up(events) is None
 
 
 def test_recent_context_history_is_mixed_deduplicated_and_bounded():

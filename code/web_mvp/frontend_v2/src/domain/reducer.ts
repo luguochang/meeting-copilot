@@ -835,6 +835,8 @@ function applyEvent(state: MeetingViewState, event: MeetingEvent): MeetingViewSt
         followUp,
         coachHistory: mergeCoachHistory(next.coachHistory, [coachHistoryEntryFromEvent(event, followUp)]),
       };
+    } else {
+      next = { ...next, followUp: null };
     }
   } else if (event.type === "meeting.decision.updated" || event.type === "meeting.action_item.updated" || event.type === "meeting.risk.updated") {
     const kind = event.type === "meeting.decision.updated"
@@ -948,7 +950,7 @@ function applySnapshot(state: MeetingViewState, snapshot: MeetingSnapshot, recei
     decisionCandidates: mergeFacts(state.decisionCandidates, snapshot.decisionCandidates),
     actionItems: mergeFacts(state.actionItems, snapshot.actionItems),
     risks: mergeFacts(state.risks, snapshot.risks),
-    followUp: snapshot.followUp ?? snapshotCoachHistory.at(-1) ?? null,
+    followUp: snapshot.followUp ?? null,
     coachHistory: mergeCoachHistory([], snapshotCoachHistory),
     recentContextHistory: mergeRecentContextHistory([], snapshotRecentContextHistory),
     connection: "live",
