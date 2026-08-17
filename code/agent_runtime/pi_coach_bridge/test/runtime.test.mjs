@@ -121,8 +121,46 @@ test("Pi can deliberately keep silent after the mandatory checklist", async () =
 
   assert.equal(result.action, "silent");
   assert.equal(result.intervention, null);
+  assert.equal(result.decision_reason, "No actionable moment.");
   assert.equal(result.metrics.turns, 2);
   assert.equal(faux.state.callCount, 2);
+});
+
+test("the checklist exposes bounded routing signals before the terminal decision", async () => {
+  const { faux, runtime } = harness();
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("review_coaching_checklist", {}), {
+      stopReason: "toolUse",
+    }),
+    (context) => {
+      const checklistResult = context.messages.find((message) => (
+        message.role === "toolResult" && message.toolName === "review_coaching_checklist"
+      ));
+      assert.ok(checklistResult);
+      const payload = JSON.parse(checklistResult.content.find((block) => block.type === "text").text);
+      assert.equal(payload.context_signals.meeting_goal, request().context.meeting_goal);
+      assert.deepEqual(payload.context_signals.rolling_state, request().context.rolling_state);
+      assert.deepEqual(
+        payload.context_signals.recent_context_paragraphs.map((paragraph) => ({
+          id: paragraph.id,
+          text: paragraph.text,
+          revision: paragraph.revision,
+          source_track: paragraph.source_track,
+          role_hint: paragraph.role_hint,
+        })),
+        request().context.context_paragraphs,
+      );
+      return fauxAssistantMessage(
+        fauxToolCall("keep_silent", { reason: "The bounded context does not require intervention." }),
+        { stopReason: "toolUse" },
+      );
+    },
+  ]);
+
+  const result = await runtime.evaluate(request());
+
+  assert.equal(result.action, "silent");
+  assert.equal(result.metrics.checklist_reviews, 1);
 });
 
 test("the tool boundary rejects invented evidence", async () => {
@@ -147,6 +185,37 @@ test("the tool boundary rejects invented evidence", async () => {
     fauxAssistantMessage(fauxToolCall("keep_silent", { reason: "Evidence was not valid." }), {
       stopReason: "toolUse",
     }),
+  ]);
+
+  const result = await runtime.evaluate(request());
+
+  assert.equal(result.action, "silent");
+  assert.equal(result.metrics.turns, 3);
+});
+
+test("a contradiction cannot be submitted without prior evidence", async () => {
+  const { faux, runtime } = harness();
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("review_coaching_checklist", {}), {
+      stopReason: "toolUse",
+    }),
+    fauxAssistantMessage(
+      fauxToolCall("submit_intervention", {
+        event_type: "contradiction",
+        title: "Current claim alone is not a contradiction",
+        recommendation: "Check the earlier condition before treating this claim as confirmed.",
+        reason: "Only the latest claim was cited.",
+        evidence_segment_ids: ["remote-1"],
+        evidence_quote: request().context.new_paragraphs[0].text,
+        urgency: "high",
+        confidence: 0.9,
+      }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage(
+      fauxToolCall("keep_silent", { reason: "No prior evidence was established." }),
+      { stopReason: "toolUse" },
+    ),
   ]);
 
   const result = await runtime.evaluate(request());

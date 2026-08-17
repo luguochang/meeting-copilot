@@ -43,6 +43,7 @@ def test_coach_runtime_capability_exposes_pi_loop_metrics():
         latest_job={
             "output": {
                 "coach": {
+                    "status": "silent",
                     "runtime_used": "pi",
                     "agent_metrics": {
                         "checklist_item_ids": ["question", "commitment", "goal", "conflict", "value"],
@@ -57,7 +58,7 @@ def test_coach_runtime_capability_exposes_pi_loop_metrics():
     assert capability == {
         "state": "active",
         "label": "Pi 教练监听中",
-        "detail": "本轮完成 5 项检查 · 检索历史 2 次 · 已延续会议上下文",
+        "detail": "本轮完成 5 项检查 · 检索历史 2 次 · 本轮判断无需打断 · 已延续会议上下文",
     }
 
 
@@ -72,6 +73,7 @@ def test_coach_runtime_capability_makes_pi_fallback_visible():
                 "coach": {
                     "runtime_used": "direct",
                     "fallback_error_code": "pi_unavailable",
+                    "fallback_reason": "runtime_unavailable",
                 }
             }
         },
@@ -79,6 +81,7 @@ def test_coach_runtime_capability_makes_pi_fallback_visible():
 
     assert capability["state"] == "paused"
     assert capability["label"] == "Pi 已回退普通模式"
+    assert capability["detail"] == "回退原因：Pi 运行组件不可用"
     assert capability["error_class"] == "pi_unavailable"
 
 

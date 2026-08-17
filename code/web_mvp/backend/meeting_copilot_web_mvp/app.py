@@ -606,11 +606,18 @@ def _coach_runtime_capability(
 
     runtime_used = str(coach.get("runtime_used") or "")
     fallback_error = str(coach.get("fallback_error_code") or "").strip()
+    fallback_reason = str(coach.get("fallback_reason") or "").strip()
     if requested == "pi" and runtime_used == "direct":
+        fallback_labels = {
+            "provider_temporarily_unavailable": "上游模型暂时不可用",
+            "provider_timeout": "上游模型响应超时",
+            "runtime_unavailable": "Pi 运行组件不可用",
+            "protocol_error": "Pi 通信协议异常",
+        }
         return {
             "state": "paused",
             "label": "Pi 已回退普通模式",
-            "detail": f"回退原因：{fallback_error or 'Pi runtime unavailable'}",
+            "detail": f"回退原因：{fallback_labels.get(fallback_reason, fallback_error or 'Pi runtime unavailable')}",
             "error_class": fallback_error or "pi_runtime_fallback",
         }
 
@@ -622,6 +629,8 @@ def _coach_runtime_capability(
     detail_parts = [f"本轮完成 {checklist_count or 5} 项检查"]
     if history_searches:
         detail_parts.append(f"检索历史 {history_searches} 次")
+    if coach.get("status") == "silent":
+        detail_parts.append("本轮判断无需打断")
     detail_parts.append("已延续会议上下文" if session_reused else "已建立会议上下文")
     return {
         "state": "active",
@@ -9148,6 +9157,8 @@ def create_app(
                 "fallback_error_code": (
                     coach_result.get("fallback_error_code") if coach_result is not None else None
                 ),
+                "fallback_reason": coach_result.get("fallback_reason") if coach_result is not None else None,
+                "decision_reason": coach_result.get("decision_reason") if coach_result is not None else None,
                 "agent_metrics": coach_result.get("agent_metrics") if coach_result is not None else None,
             },
         }

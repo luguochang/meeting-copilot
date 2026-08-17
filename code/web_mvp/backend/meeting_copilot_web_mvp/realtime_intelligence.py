@@ -874,8 +874,25 @@ async def run_realtime_coach_via_pi(
         "model": str(provider_config.get("model") or ""),
         "response_id": request_id,
         "finish_reason": str(result.get("action") or ""),
+        "decision_reason": str(result.get("decision_reason") or "")[:160] or None,
         "agent_metrics": dict(metrics),
     }
+
+
+def _pi_fallback_reason(error: Exception) -> str:
+    """Classify Pi failures without reflecting provider payloads or credentials."""
+
+    message = str(error or "").strip().lower()
+    code = str(getattr(error, "code", type(error).__name__))[:120]
+    if any(token in message for token in ("temporarily unavailable", "service unavailable", "upstream")):
+        return "provider_temporarily_unavailable"
+    if "timed out" in message or "timeout" in message or code in {"pi_timeout", "pi_startup_timeout"}:
+        return "provider_timeout"
+    if code in {"pi_unavailable", "pi_spawn_failed", "pi_transport_error"}:
+        return "runtime_unavailable"
+    if "protocol" in code or "protocol" in message:
+        return "protocol_error"
+    return code
 
 
 async def run_realtime_coach_routed(
@@ -905,6 +922,7 @@ async def run_realtime_coach_routed(
                 "runtime_requested": "pi",
                 "runtime_used": "pi",
                 "fallback_error_code": None,
+                "fallback_reason": None,
             }
         except Exception as exc:
             result = await run_realtime_coach(
@@ -918,6 +936,7 @@ async def run_realtime_coach_routed(
                 "runtime_requested": "pi",
                 "runtime_used": "direct",
                 "fallback_error_code": str(getattr(exc, "code", type(exc).__name__))[:120],
+                "fallback_reason": _pi_fallback_reason(exc),
             }
     result = await run_realtime_coach(
         request=request,
@@ -930,6 +949,7 @@ async def run_realtime_coach_routed(
         "runtime_requested": "direct",
         "runtime_used": "direct",
         "fallback_error_code": None,
+        "fallback_reason": None,
     }
 
 

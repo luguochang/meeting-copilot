@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from meeting_copilot_web_mvp.realtime_intelligence import (
+    _pi_fallback_reason,
     IntelligenceResponseValidationError,
     RealtimeIntelligenceRequest,
     apply_coach_intervention,
@@ -680,6 +681,7 @@ async def _test_pi_coach_runner_preserves_the_existing_evidence_contract() -> No
                 "history_results": 2,
                 "usage": {"prompt_tokens": 90, "completion_tokens": 20, "total_tokens": 110},
             },
+            "decision_reason": None,
         }
     )
     usages = []
@@ -696,6 +698,7 @@ async def _test_pi_coach_runner_preserves_the_existing_evidence_contract() -> No
     assert result["transport_mode"] == "pi_agent_jsonl"
     assert result["agent_metrics"]["turns"] == 2
     assert result["agent_metrics"]["checklist_reviewed"] is True
+    assert result["decision_reason"] is None
     assert pi_runtime.payload["context"]["new_paragraphs"][0]["source_track"] == "system_audio"
     assert pi_runtime.payload["provider"]["model"] == "coach-model"
     assert usages == [(1, {"prompt_tokens": 90, "completion_tokens": 20, "total_tokens": 110})]
@@ -722,7 +725,17 @@ async def _test_pi_runtime_failure_falls_back_to_the_direct_coach() -> None:
     assert result["runtime_requested"] == "pi"
     assert result["runtime_used"] == "direct"
     assert result["fallback_error_code"] == "pi_unavailable"
+    assert result["fallback_reason"] == "runtime_unavailable"
     assert len(direct_provider.calls) == 1
+
+
+def test_pi_fallback_reason_redacts_provider_detail() -> None:
+    class ExpectedPiError(RuntimeError):
+        code = "agent_provider_error"
+
+    error = ExpectedPiError("Upstream service temporarily unavailable: request body omitted")
+
+    assert _pi_fallback_reason(error) == "provider_temporarily_unavailable"
 
 
 def test_runner_validates_one_structured_response_and_returns_latency_usage() -> None:

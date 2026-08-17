@@ -56,7 +56,9 @@ const SYSTEM_PROMPT = [
   "Allowed events are question_to_user, commitment_risk, goal_at_risk, and contradiction.",
   "system_audio/remote_mix usually represents the remote computer-audio mix. microphone/self_or_room is not guaranteed to be the local user.",
   "Microphone turns may update whether a question or commitment is still open, but never attribute them to the user without corroboration.",
-  "Begin every evaluation with review_coaching_checklist. Use read_realtime_context or search_prior_evidence only when the new utterance alone is insufficient.",
+  "Begin every evaluation with review_coaching_checklist. Its context_signals are routing evidence, not optional metadata: compare the latest utterance with the meeting goal, rolling state, and recent context before deciding.",
+  "When context_signals suggest an earlier condition or position may conflict with the latest utterance, use search_prior_evidence before deciding.",
+  "Use read_realtime_context for semantic windows that are still needed after reviewing context_signals.",
   "Never invent a person, number, deadline, position, or goal.",
   "Match the language of the latest dialogue in the intervention, which will usually be Chinese.",
   "You must finish by calling exactly one terminal tool: submit_intervention or keep_silent. Do not answer with ordinary text.",
@@ -342,6 +344,15 @@ function validateInterventionEvidence(intervention, context) {
     if (!text) throw new PiCoachProtocolError("intervention referenced unknown evidence", "invalid_agent_action");
     return text;
   });
+  if (intervention.event_type === "contradiction") {
+    const newEvidenceIds = new Set(context.new_paragraphs.map((paragraph) => paragraph.id));
+    if (!uniqueIds.some((id) => !newEvidenceIds.has(id))) {
+      throw new PiCoachProtocolError(
+        "contradiction interventions require prior evidence",
+        "invalid_agent_action",
+      );
+    }
+  }
   if (!texts.some((text) => text.includes(intervention.evidence_quote)) && !texts.join("\n").includes(intervention.evidence_quote)) {
     throw new PiCoachProtocolError("evidence quote is not verbatim input", "invalid_agent_action");
   }
@@ -380,6 +391,13 @@ function createRestrictedTools(entry) {
               meeting_goal_available: Boolean(entry.activeContext.meeting_goal),
               rolling_state_available: Object.keys(entry.activeContext.rolling_state).length > 0,
               searchable_prior_paragraphs: entry.activeContext.retrieval_paragraphs.length,
+              context_signals: {
+                meeting_goal: entry.activeContext.meeting_goal,
+                rolling_state: entry.activeContext.rolling_state,
+                recent_context_paragraphs: entry.activeContext.context_paragraphs,
+              },
+              routing_rule:
+                "Compare the latest utterance with context_signals. Search prior evidence when an earlier condition or position may matter.",
             }),
           }],
           details: { checklist_item_ids: COACHING_CHECKLIST.map((item) => item.id) },
@@ -581,6 +599,7 @@ export class PiCoachRuntime {
         runtime: "pi-agent-core",
         action: entry.run.terminalAction.action,
         intervention: entry.run.terminalAction.intervention ?? null,
+        decision_reason: entry.run.terminalAction.reason ?? null,
         metrics: {
           elapsed_ms: elapsedMs,
           turns: entry.run.turns,
