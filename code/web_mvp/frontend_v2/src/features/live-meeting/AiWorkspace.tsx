@@ -58,7 +58,8 @@ export function AiWorkspace({
   onMessage,
   ...railProps
 }: AiWorkspaceProps) {
-  const [tab, setTab] = useState<"ask" | "insights" | "context">(api.askMeeting ? "ask" : "insights");
+  // Realtime coaching is the primary meeting workflow; Ask AI remains available as a deliberate follow-up tool.
+  const [tab, setTab] = useState<"ask" | "insights" | "context">("insights");
   const [scope, setScope] = useState<AskAiScope>("recent");
   const [recentMinutes, setRecentMinutes] = useState<1 | 3 | 5 | 10>(3);
   const [recentContextOpen, setRecentContextOpen] = useState(true);

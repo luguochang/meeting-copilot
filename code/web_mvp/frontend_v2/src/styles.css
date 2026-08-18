@@ -1826,6 +1826,13 @@ button:focus-visible,
   background: #b55b4f;
 }
 
+.coach-runtime-detail {
+  margin: 8px 0 0;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
 .coach-loop-empty {
   margin-top: 12px;
   color: var(--text-secondary);

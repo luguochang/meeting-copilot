@@ -483,6 +483,10 @@ export function NowRail({
           ) : null}
         </header>
 
+        {coachRuntime?.detail && (formalFollowUp || (suggestion && text)) ? (
+          <p className="coach-runtime-detail" role="status">{coachRuntime.detail}</p>
+        ) : null}
+
         {formalFollowUp ? (
           <div className="follow-up-card" data-testid="follow-up-card">
             <div className="follow-up-heading">

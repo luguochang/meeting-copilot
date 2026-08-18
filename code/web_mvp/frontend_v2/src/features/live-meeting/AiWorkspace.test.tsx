@@ -147,6 +147,12 @@ it("keeps the latest coach intervention prominent and exposes prior advice", asy
       currentTopic={null}
       followUp={latestAdvice}
       coachHistory={[oldAdvice, latestAdvice]}
+      coachRuntime={{
+        state: "active",
+        label: "Pi 教练已分析正文",
+        level: null,
+        detail: "本轮完成 7 项检查 · 已延续会议上下文",
+      }}
       openQuestions={[]}
       suggestions={[]}
       decisionCandidates={[]}
@@ -160,6 +166,7 @@ it("keeps the latest coach intervention prominent and exposes prior advice", asy
   );
 
   expect(await screen.findByText(latestAdvice.question, { selector: "blockquote" })).toBeVisible();
+  expect(screen.getByRole("status")).toHaveTextContent("本轮完成 7 项检查");
   expect(screen.getByRole("list", { name: "过去的教练建议" })).toHaveTextContent(oldAdvice.question);
   expect(screen.getByText("过去建议").parentElement).toHaveTextContent("1");
 });
@@ -202,6 +209,8 @@ it("shows recent discussion as a bounded timeline that can reveal earlier items"
     />,
   );
 
+  await screen.findByRole("tab", { name: "会议重点" });
+  fireEvent.click(screen.getByRole("tab", { name: "Ask AI" }));
   const timeline = await screen.findByRole("list", { name: "最近讨论时间线" });
   expect(timeline).toHaveTextContent("讨论内容 6");
   expect(timeline).not.toHaveTextContent("讨论内容 1");

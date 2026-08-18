@@ -152,6 +152,9 @@ def test_coach_runtime_capability_exposes_pi_loop_metrics():
                         "checklist_item_ids": ["question", "commitment", "goal", "conflict", "clarity", "value"],
                         "history_searches": 2,
                         "session_reused": True,
+                        "turns": 2,
+                        "tool_calls": 3,
+                        "elapsed_ms": 4_320,
                     },
                 }
             }
@@ -161,7 +164,7 @@ def test_coach_runtime_capability_exposes_pi_loop_metrics():
     assert capability == {
         "state": "active",
         "label": "Pi 教练监听中",
-        "detail": "本轮完成 6 项检查 · 检索历史 2 次 · 已延续会议上下文",
+        "detail": "本轮完成 6 项检查 · 2 轮 Agent · 3 次工具调用 · 检索历史 2 次 · 响应约 4.3 秒 · 已延续会议上下文",
         "decision": "本轮结论：暂不打断，没有发现需要立刻介入的表达问题",
     }
 
@@ -198,6 +201,9 @@ def test_coach_runtime_capability_surfaces_completed_body_analysis_without_captu
                     "agent_metrics": {
                         "checklist_item_ids": ["question", "commitment", "goal"],
                         "session_reused": True,
+                        "turns": 1,
+                        "tool_calls": 1,
+                        "elapsed_ms": 4_320,
                     },
                 }
             }
@@ -207,7 +213,7 @@ def test_coach_runtime_capability_surfaces_completed_body_analysis_without_captu
     assert capability == {
         "state": "active",
         "label": "Pi 教练已分析正文",
-        "detail": "本轮完成 3 项检查 · 已延续会议上下文 · 当前没有录音输入，开始录音后继续检查新内容",
+        "detail": "本轮完成 3 项检查 · 1 轮 Agent · 1 次工具调用 · 响应约 4.3 秒 · 已延续会议上下文 · 当前没有录音输入，开始录音后继续检查新内容",
         "decision": None,
     }
 

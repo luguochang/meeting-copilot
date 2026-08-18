@@ -67,7 +67,10 @@ def request_from_case(case: Mapping[str, Any]) -> RealtimeIntelligenceRequest:
 def prediction_from_result(result: Mapping[str, Any]) -> dict[str, Any]:
     intervention = result.get("intervention")
     if intervention is None:
-        return {"action": "silent"}
+        return {
+            "action": "silent",
+            "decision_reason": str(result.get("decision_reason") or "").strip() or None,
+        }
     return {
         "action": "intervention",
         "event_type": intervention.event_type,
@@ -75,6 +78,8 @@ def prediction_from_result(result: Mapping[str, Any]) -> dict[str, Any]:
         "recommendation": intervention.recommendation,
         "confidence": intervention.confidence,
         "evidence_segment_ids": list(intervention.evidence_segment_ids),
+        "evidence_quote": intervention.evidence_quote,
+        "decision_reason": str(result.get("decision_reason") or "").strip() or None,
     }
 
 
@@ -99,6 +104,7 @@ async def replay_mode(
         started_at = time.perf_counter()
         base_record = {
             "case_id": case["case_id"],
+            "session_id": str(case.get("session_id") or case["case_id"]),
             "coach_skill_id": str(case.get("coach_skill_id") or "general"),
             "difficulty": list(case.get("difficulty") or []),
             "expected": dict(case["expected"]),
@@ -128,6 +134,7 @@ async def replay_mode(
                     "latency_ms": round((time.perf_counter() - started_at) * 1_000, 2),
                     "agent_turns": metrics.get("turns"),
                     "agent_tool_calls": metrics.get("tool_calls"),
+                    "agent_tool_names": metrics.get("tool_names"),
                     "usage": result.get("usage"),
                 }
             )

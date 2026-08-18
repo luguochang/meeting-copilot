@@ -62,3 +62,40 @@ def test_score_separates_event_hits_false_positives_and_silence() -> None:
     assert score["latency_p95_ms"] == 4_000
     assert score["average_agent_turns"] == 1.5
     assert score["fallback_count"] == 1
+
+
+def test_score_flags_missing_reasons_duplicate_interventions_and_evidence() -> None:
+    score = score_predictions(
+        [
+            {
+                "case_id": "case-1",
+                "session_id": "session-1",
+                "expected": {"action": "intervention"},
+                "prediction": {
+                    "action": "intervention",
+                    "event_type": "goal_at_risk",
+                    "evidence_segment_ids": ["p-1"],
+                },
+            },
+            {
+                "case_id": "case-2",
+                "session_id": "session-1",
+                "expected": {"action": "intervention"},
+                "prediction": {
+                    "action": "intervention",
+                    "event_type": "goal_at_risk",
+                    "evidence_segment_ids": ["p-1"],
+                },
+            },
+            {
+                "case_id": "case-3",
+                "session_id": "session-1",
+                "expected": {"action": "silent"},
+                "prediction": {"action": "silent"},
+            },
+        ]
+    )
+
+    assert score["intervention_evidence_rate"] == 1.0
+    assert score["silent_reason_rate"] == 0.0
+    assert score["duplicate_intervention_count"] == 1

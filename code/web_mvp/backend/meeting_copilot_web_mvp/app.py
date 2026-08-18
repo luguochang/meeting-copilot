@@ -640,10 +640,19 @@ def _coach_runtime_capability(
     checklist_ids = metrics.get("checklist_item_ids")
     checklist_count = len(checklist_ids) if isinstance(checklist_ids, list) else 0
     history_searches = max(0, int(metrics.get("history_searches") or 0))
+    agent_turns = max(0, int(metrics.get("turns") or 0))
+    tool_calls = max(0, int(metrics.get("tool_calls") or 0))
     session_reused = metrics.get("session_reused") is True
+    elapsed_ms = metrics.get("elapsed_ms") or metrics.get("decision_latency_ms")
     detail_parts = [f"本轮完成 {checklist_count or 6} 项检查"]
+    if agent_turns:
+        detail_parts.append(f"{agent_turns} 轮 Agent")
+    if tool_calls:
+        detail_parts.append(f"{tool_calls} 次工具调用")
     if history_searches:
         detail_parts.append(f"检索历史 {history_searches} 次")
+    if isinstance(elapsed_ms, (int, float)) and elapsed_ms > 0:
+        detail_parts.append(f"响应约 {elapsed_ms / 1_000:.1f} 秒")
     decision = None
     if coach.get("status") == "silent":
         decision_reason = str(coach.get("decision_reason") or "").strip()[:160]

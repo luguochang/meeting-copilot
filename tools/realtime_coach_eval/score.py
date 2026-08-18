@@ -39,8 +39,14 @@ def score_predictions(records: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     latency_hits = 0
     fallback_count = 0
     error_count = 0
+    intervention_evidence_checks = 0
+    intervention_evidence_hits = 0
+    silent_reason_checks = 0
+    silent_reason_hits = 0
+    duplicate_intervention_count = 0
     latencies: list[float] = []
     agent_turns: list[float] = []
+    seen_interventions: dict[str, set[tuple[str, tuple[str, ...]]]] = {}
 
     for item in items:
         expected = item.get("expected") if isinstance(item.get("expected"), Mapping) else {}
@@ -70,6 +76,21 @@ def score_predictions(records: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
             expected_silences += 1
         if predicted_action == "intervention":
             predicted_interventions += 1
+            evidence_ids = tuple(
+                sorted({str(value) for value in prediction.get("evidence_segment_ids") or [] if str(value)})
+            )
+            intervention_evidence_checks += 1
+            intervention_evidence_hits += int(bool(evidence_ids))
+            session_id = str(item.get("session_id") or item.get("case_id") or "")
+            fingerprint = (predicted_type, evidence_ids)
+            session_interventions = seen_interventions.setdefault(session_id, set())
+            if fingerprint in session_interventions:
+                duplicate_intervention_count += 1
+            else:
+                session_interventions.add(fingerprint)
+        elif predicted_action == "silent":
+            silent_reason_checks += 1
+            silent_reason_hits += int(bool(str(prediction.get("decision_reason") or "").strip()))
 
         intervention_correct = (
             expected_action == "intervention"
@@ -106,6 +127,9 @@ def score_predictions(records: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
         "recall": _ratio(correct_interventions, expected_interventions),
         "silent_accuracy": _ratio(correct_silences, expected_silences),
         "required_evidence_accuracy": _ratio(evidence_hits, evidence_checks),
+        "intervention_evidence_rate": _ratio(intervention_evidence_hits, intervention_evidence_checks),
+        "silent_reason_rate": _ratio(silent_reason_hits, silent_reason_checks),
+        "duplicate_intervention_count": duplicate_intervention_count,
         "deadline_pass_rate": _ratio(latency_hits, latency_checks),
         "latency_p50_ms": _percentile(latencies, 0.5),
         "latency_p95_ms": _percentile(latencies, 0.95),
