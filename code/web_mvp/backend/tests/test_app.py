@@ -183,6 +183,35 @@ def test_coach_runtime_capability_waits_for_capture_input():
     }
 
 
+def test_coach_runtime_capability_surfaces_completed_body_analysis_without_capture():
+    capability = app_module._coach_runtime_capability(
+        enabled=True,
+        provider_configured=True,
+        active=False,
+        capture_active=False,
+        requested_runtime="pi",
+        latest_job={
+            "output": {
+                "coach": {
+                    "status": "intervention",
+                    "runtime_used": "pi",
+                    "agent_metrics": {
+                        "checklist_item_ids": ["question", "commitment", "goal"],
+                        "session_reused": True,
+                    },
+                }
+            }
+        },
+    )
+
+    assert capability == {
+        "state": "active",
+        "label": "Pi 教练已分析正文",
+        "detail": "本轮完成 3 项检查 · 已延续会议上下文 · 当前没有录音输入，开始录音后继续检查新内容",
+        "decision": None,
+    }
+
+
 def test_coach_runtime_capability_makes_pi_fallback_visible():
     capability = app_module._coach_runtime_capability(
         enabled=True,

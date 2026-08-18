@@ -597,20 +597,26 @@ def _coach_runtime_capability(
             "detail": "问题、承诺、目标、口径、表达清晰和介入价值",
         }
 
-    if not capture_active:
-        return {
-            "state": "idle",
-            "label": "Pi 教练等待录音" if requested == "pi" else "实时教练等待录音",
-            "detail": "当前没有录音输入；开始录音后才会检查新的会议文字，已有建议仍保留。",
-        }
-
     output = latest_job.get("output") if isinstance(latest_job, Mapping) else None
     coach = output.get("coach") if isinstance(output, Mapping) else None
     if not isinstance(coach, Mapping):
+        if not capture_active:
+            return {
+                "state": "idle",
+                "label": "Pi 教练等待录音" if requested == "pi" else "实时教练等待录音",
+                "detail": "当前没有录音输入；开始录音后才会检查新的会议文字，已有建议仍保留。",
+            }
         return {
             "state": "idle",
             "label": "Pi 教练监听中" if requested == "pi" else "实时教练监听中",
             "detail": "等待下一段稳定对话",
+        }
+
+    if not capture_active and str(coach.get("status") or "") not in {"intervention", "silent"}:
+        return {
+            "state": "idle",
+            "label": "Pi 教练等待录音" if requested == "pi" else "实时教练等待录音",
+            "detail": "当前没有录音输入；开始录音后才会检查新的会议文字，已有建议仍保留。",
         }
 
     runtime_used = str(coach.get("runtime_used") or "")
@@ -645,9 +651,17 @@ def _coach_runtime_capability(
         if decision_reason:
             decision = f"{decision}，{decision_reason}"
     detail_parts.append("已延续会议上下文" if session_reused else "已建立会议上下文")
+    if not capture_active:
+        detail_parts.append("当前没有录音输入，开始录音后继续检查新内容")
     return {
         "state": "active",
-        "label": "Pi 教练监听中" if runtime_used == "pi" else "实时教练监听中",
+        "label": (
+            "Pi 教练已分析正文"
+            if requested == "pi" and not capture_active and runtime_used == "pi"
+            else "Pi 教练监听中"
+            if runtime_used == "pi"
+            else "实时教练监听中"
+        ),
         "detail": " · ".join(detail_parts),
         "decision": decision,
     }
