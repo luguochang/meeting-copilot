@@ -1833,6 +1833,16 @@ button:focus-visible,
   line-height: 1.45;
 }
 
+.coach-runtime-decision {
+  margin: 6px 0 0;
+  padding: 7px 9px;
+  border-left: 2px solid var(--border-strong);
+  color: var(--text-secondary);
+  background: var(--surface-subtle);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
 .coach-loop-empty {
   margin-top: 12px;
   color: var(--text-secondary);

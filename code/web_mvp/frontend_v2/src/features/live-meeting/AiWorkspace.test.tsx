@@ -152,6 +152,7 @@ it("keeps the latest coach intervention prominent and exposes prior advice", asy
         label: "Pi 教练已分析正文",
         level: null,
         detail: "本轮完成 7 项检查 · 已延续会议上下文",
+        decision: "本轮结论：暂不打断，新内容与当前议题无关",
       }}
       openQuestions={[]}
       suggestions={[]}
@@ -166,7 +167,8 @@ it("keeps the latest coach intervention prominent and exposes prior advice", asy
   );
 
   expect(await screen.findByText(latestAdvice.question, { selector: "blockquote" })).toBeVisible();
-  expect(screen.getByRole("status")).toHaveTextContent("本轮完成 7 项检查");
+  expect(screen.getAllByRole("status")[0]).toHaveTextContent("本轮完成 7 项检查");
+  expect(screen.getByText("本轮结论：暂不打断，新内容与当前议题无关")).toBeVisible();
   expect(screen.getByRole("list", { name: "过去的教练建议" })).toHaveTextContent(oldAdvice.question);
   expect(screen.getByText("过去建议").parentElement).toHaveTextContent("1");
 });
