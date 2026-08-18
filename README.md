@@ -1,14 +1,38 @@
 # 言迹 Talktrace
 
-本地优先的中文技术会议工作台。言迹 Talktrace 将麦克风与系统音频采集、实时转写、证据化建议、会后复盘和个人笔记整合在一个桌面应用中。核心设计不是让单个模型同时承担低延迟和高准确率，而是采用“在线预览 + 离线精修 + 可选 LLM”的分层链路。
+本地优先的实时语音理解与私人教练。言迹 Talktrace 监听用户授权的麦克风和电脑系统音频，把稳定转写持续交给 AI 理解，在对话仍在进行时给出少量、可直接说出口、可追溯原文的建议，同时保留会后复盘和个人笔记。
+
+它不是腾讯会议或 Zoom 的替代品，也不依赖加入某个会议平台。腾讯会议、浏览器视频、播放器等声音只要从当前 Windows 输出设备播放，就可以通过 WASAPI loopback 进入系统音频轨；现场发言则进入麦克风轨。
 
 [官网](https://talktrace.codexai.club/) · [GitHub](https://github.com/luguochang/meeting-copilot) · [CSDN 博客](https://blog.csdn.net/luguochang) · [AI 赞助商](https://codexai.club/)
 
 ![言迹 Talktrace 界面预览](docs/assets/talktrace-tour.gif)
 
+> 当前 `feat/pi-realtime-coach-agent-loop` 分支集成 Pi SDK 作为实时教练 Agent runtime，尚未合并到 `main`。Pi 不替代 ASR 或底层 LLM，而是在稳定转写之上增加持续会话、工具调用、历史检索、介入判断和可审计的 Agent Loop。
+
+## 产品工作方式
+
+```mermaid
+flowchart LR
+    Sound["麦克风 / 电脑系统声音"] --> Transcript["本地实时转写"]
+    Transcript --> Stable["稳定语义段落"]
+    Stable --> Coach["Pi 实时教练 Agent Loop"]
+    Coach -->|"值得立刻介入"| Advice["可直接说出的下一句"]
+    Coach -->|"当前无需打断"| Silent["显示静默原因并继续监听"]
+    Advice --> History["有界历史与原文证据"]
+    Silent --> History
+    Stable --> Review["会后纪要 / 复盘 / Ask AI"]
+```
+
+会中与会后采用不同目标：
+
+- **会中**：优先低延迟和介入价值。每个新稳定片段触发一次检查，但只有能避免具体损失、补上关键回答或改善当前表达时才展示建议。
+- **会后**：允许后台慢速整理整场内容，生成纪要、事实、行动项、风险和复盘结果。
+- **全程可追溯**：AI 结论必须带原文 segment ID 和逐字证据；转写被修订后，过期结果不能覆盖新状态。
+
 ## 技术架构
 
-Talktrace 采用桌面壳、Web 工作台、本地服务、领域核心与模型运行时分层。Tauri 负责原生音频和进程生命周期，React 负责交互，FastAPI 统一编排 ASR、持久化和 AI 任务，SQLite 保存规范化会议事实。
+Talktrace 采用桌面采集、Web 工作台、本地编排、领域核心、模型运行时和持久化事件六层结构。Tauri 负责原生音频和进程生命周期，React 负责交互，FastAPI 编排 ASR 与 AI 任务，Pi sidecar 负责持续 Agent Loop，SQLite 保存规范转写、会议事实、任务和正式事件。
 
 ```mermaid
 flowchart LR
@@ -22,6 +46,7 @@ flowchart LR
         API["FastAPI<br/>HTTP / WebSocket / 任务编排"]
         ASR["FunASR 本地运行时<br/>在线识别 + 离线精修"]
         Core["领域核心<br/>转写 / 证据 / 状态 / 建议闸门"]
+        Pi["Pi SDK sidecar<br/>Session / Tools / Agent Loop"]
         Store["SQLite + 受控音频目录"]
     end
 
@@ -34,7 +59,33 @@ flowchart LR
     API <--> ASR
     API <--> Core
     API <--> Store
-    API -. "仅发送所需会议文本" .-> LLM
+    API <-->|"JSONL 本机进程协议"| Pi
+    Pi -. "仅发送必要文本与工具结果" .-> LLM
+    API -. "Pi 不可用时回退 direct LLM" .-> LLM
+```
+
+### 会中 Agent 数据流
+
+```mermaid
+sequenceDiagram
+    participant Audio as 麦克风/系统音频
+    participant ASR as 本地 ASR
+    participant API as FastAPI + SQLite
+    participant Pi as Pi Session
+    participant LLM as OpenAI-compatible LLM
+    participant UI as 实时教练 UI
+
+    Audio->>ASR: 16 kHz PCM
+    ASR->>API: stable final / revision
+    API->>API: 生成证据哈希与有界语义窗口
+    API->>Pi: 新片段、当前状态、会议目标
+    Pi->>Pi: 执行 6 项教练 checklist
+    Pi->>API: 按需读取上下文或检索较早证据
+    Pi->>LLM: 继续同一会议 Session 的推理
+    LLM-->>Pi: 工具调用
+    Pi-->>API: submit_intervention 或 keep_silent
+    API->>API: 校验证据、版本和结构并写入正式事件
+    API-->>UI: 当前状态 + 有界历史时间线
 ```
 
 ### 语音转文字链路
@@ -73,6 +124,32 @@ flowchart LR
 - **安全的 LLM 校正**：校正任务累计到 80 字或等待 15 秒后触发，单批最多 2,000 字；长度比例必须在 `0.65-1.40` 内，文本相似度不得低于 `0.65`，不满足条件的改写会被拒绝。
 - **失败可降级**：离线精修不可用时保留在线结果并标记降级；LLM 超时、限流或返回非法结构时不破坏规范转写。任务通过租约、有限重试和审计状态避免重复提交。
 
+### Pi 实时私人教练
+
+原有 LLM 链路适合把一个文本批次转换成主题、待办或纪要，但它本质上仍是一次请求、一次响应。Pi SDK 被用于需要跨轮状态和明确行动边界的实时教练，不用于替代已经能完成结构化抽取的普通 LLM 调用。
+
+Pi Agent Loop 每轮执行以下检查：
+
+| 检查项 | 关注的问题 | 典型输出 |
+| --- | --- | --- |
+| 问题回应 | 对方是否正在等待直接回答 | 先回答问题，再补背景 |
+| 承诺条件 | 时间、范围、结果或责任是否缺少前提 | 给承诺补上测试、审批或资源条件 |
+| 目标覆盖 | 当前讨论是否偏离会议目标 | 用一句话拉回需要达成的结果 |
+| 前后口径 | 当前说法是否与较早立场冲突 | 立即澄清或撤回冲突表述 |
+| 表达清晰 | 是否重复、失焦或迟迟没有结论 | 给出可直接说出口的收束句 |
+| 介入价值 | 现在提示是否仍来得及且确有价值 | 选择介入或正式保持静默 |
+
+Pi 相对单次 LLM 增加的是运行机制，而不是一个新的模型能力：
+
+- **会议级 Session**：同一会议复用会话，保留有界的教练判断历史，不必在每轮 Prompt 中重复整场内容。
+- **工具调用**：Agent 可以读取当前会议目标、rolling state，并按需检索最多 48 条较早转写证据。
+- **明确终止动作**：每轮只能通过 `submit_intervention` 提交建议，或通过 `keep_silent` 说明为何不打断；普通自由文本不能直接进入产品。
+- **证据闸门**：Python 与 Node 两侧都会校验 segment ID、逐字引用和转写版本，阻止虚构或过期依据。
+- **运行时回退**：Pi sidecar 不可用或协议异常时自动回退 direct LLM，并在界面暴露回退原因。
+- **低频但可见**：没有值得介入的内容时，界面显示本轮检查数量和静默原因，用户能区分“正在监听但选择静默”和“AI 没有运行”。
+
+实时建议采用有界信息流，避免新内容覆盖旧内容：当前区只显示本轮有效建议或静默结论；过去建议最多保留 12 条，默认展示 3 条；“刚刚讨论”最多保留 10 条，默认展示 5 条。连续重复项会合并，所有条目都可以回到原文证据。
+
 ### 证据化会议理解
 
 远程 LLM 不直接修改会议事实。FastAPI 先从规范转写中构造带时间范围和段落 ID 的证据，再通过 OpenAI-compatible Chat Completions 或 Responses API 生成结构化结果。传输默认优先使用 SSE 流式响应，不支持流式的服务可显式降级到非流式模式。
@@ -83,6 +160,29 @@ flowchart LR
 - 会议状态围绕负责人、截止时间、测试验证、指标监控和回滚条件建模，用于识别技术讨论中的未闭环项。
 - ASR 语义质量不足或链路处于降级状态时，系统阻止生成高置信度建议，保留转写并明确暴露质量状态。
 - 增量 AI 任务保存输入转写版本和证据哈希；提交前再次检查证据版本，避免过期结果覆盖新内容。
+
+## 本分支的改进
+
+| 原有能力或问题 | 本分支改进 | 用户可见结果 |
+| --- | --- | --- |
+| LLM 按批次抽取主题、待办和风险 | 稳定转写驱动持续 Pi Agent Loop | 对话仍在发生时给出下一句建议，而不只做会后总结 |
+| 只关注结构化会议实体 | 增加问题回应、承诺、目标、矛盾、表达清晰和介入价值检查 | 能处理“没回答”“承诺过头”“说了很久没结论”等实时表达问题 |
+| 每轮上下文主要依赖 Prompt 拼接 | 会议级 Session + 按需历史检索 | 跨多轮理解较早条件，同时控制上下文和调用成本 |
+| 新一轮结果覆盖右侧旧内容 | 12 条教练历史 + 10 条最近讨论的有界时间线 | 用户错过即时提示后仍能回看，不形成无限卡片墙 |
+| 静默时看起来像 AI 没工作 | `keep_silent`、checklist 指标和静默原因可见 | 能知道 Pi 已检查，只是判断当前不应打断 |
+| 旧建议在问题解决后仍可能显得有效 | 最新静默轮次撤下主卡，旧建议进入历史 | 不把已经解决的问题继续当作当前风险 |
+| 转写精修可能使在途证据过期 | 取消旧任务并对最新 evidence hash 补排分析 | 左侧文字修订后，教练不会永久漏掉本轮分析 |
+| Agent runtime 异常可能阻断建议 | Pi 自动回退 direct LLM | 降级可见，基础 AI 能力继续工作 |
+
+边界也保持明确：Pi 不提高 ASR 本身的识别率，不保证弱模型自动变强，也不会在没有新稳定转写时持续轮询。它的价值是把模型放进可持续、可取证、会判断是否介入的业务循环。
+
+### 部署成本与当前状态
+
+- **不新增服务器或数据库**：Pi 以一个懒启动的本机 Node sidecar 运行，继续复用 FastAPI、SQLite 和用户已经配置的 LLM Provider。
+- **增加一个本机运行时**：源码开发需要 Node.js `>=22.19.0` 和约束锁定的 npm 依赖；Python 通过 JSONL 管理 sidecar 生命周期和超时。
+- **增加实时模型调用**：只有出现新稳定转写时才运行 Agent Loop；静音、ASR partial 和没有新内容的等待期不调用模型。
+- **安装包尚未完成**：当前 Windows Release 不包含 Node runtime 和 Pi sidecar。本分支已跑通源码环境，正式发布前仍需完成 helper 打包、SBOM、签名和升级策略。
+- **失败不会阻断基础链路**：Pi 启动、协议或 Provider 失败时回退 direct LLM；即使所有远程 AI 都不可用，本地录音和转写仍继续工作。
 
 ## 技术栈
 
@@ -95,6 +195,7 @@ flowchart LR
 | 本地 ASR | FunASR 1.3.10、FunASR ONNX、ONNX Runtime、Paraformer | 在线低延迟识别与本地离线精修 |
 | 语音后处理 | SeACo Paraformer、FSMN VAD、CT-Transformer Punctuation | 端点检测、完整段重识别、标点与热词增强 |
 | 远程 AI | OpenAI-compatible Chat Completions / Responses、HTTPX、SSE | 可选文本校正、实时建议、纪要与复盘生成 |
+| Agent runtime | `@earendil-works/pi-agent-core` 0.84.2、Node.js sidecar、JSONL | 会议级 Session、工具循环、历史检索、介入或静默决策 |
 | 工程质量 | Pytest、Vitest、Testing Library、Ruff、ESLint、Cargo Check | 单元、契约、集成、前端和桌面端验证 |
 | 发布 | Tauri/NSIS、`.mcpkg`、CycloneDX SBOM | Windows 安装包、独立模型能力包与供应链清单 |
 
@@ -111,7 +212,9 @@ flowchart LR
 ## 主要功能
 
 - **会议工作台**：麦克风与系统音频输入、连续转写、当前议题和会议状态集中展示。
-- **AI 建议**：围绕负责人、截止时间、验证、监控和回滚条件生成带原文依据的追问建议。
+- **Pi 实时私人教练**：监听稳定转写，围绕问题回应、承诺条件、目标、前后口径和表达清晰度给出可直接说出的下一句；无介入价值时保持静默。
+- **可回看时间线**：当前建议、过去教练建议和最近讨论分层展示，限制数量、合并重复并保留原文定位。
+- **证据化会议理解**：围绕负责人、截止时间、验证、监控和回滚条件生成带原文依据的主题、事实、行动项与风险。
 - **会后复盘**：在同一场会议中查看纪要、方案与风险、待确认项、完整文字和录音。
 - **录音导入**：导入已有音频并跟踪转写和分析进度。
 - **会议与笔记管理**：搜索、筛选、重命名、删除历史会议，并整理个人笔记。
@@ -143,10 +246,21 @@ cd meeting-copilot\code\web_mvp\frontend_v2
 npm ci
 npm run build
 
-cd ..\backend
+cd ..\..\agent_runtime\pi_coach_bridge
+npm ci
+
+cd ..\..\web_mvp\backend
 uv sync --frozen --group dev
 uv run python ..\..\..\tools\workbench_server.py start
 ```
+
+Pi 是本分支默认的实时教练 runtime。仍需在设置中配置可用的 OpenAI-compatible Provider；Pi SDK 不自带模型。需要临时切回原有单次 LLM 路径时设置：
+
+```powershell
+$env:MEETING_COPILOT_REALTIME_COACH_RUNTIME = "direct"
+```
+
+完全关闭实时教练时设置 `MEETING_COPILOT_REALTIME_COACH_ENABLED=0`。默认 Agent 路径、回退行为和无声验证结果见 [Pi 持续教练实现说明](docs/pi-continuous-coach-loop.md)。
 
 打开 `http://127.0.0.1:8765/workbench`。停止服务：
 
@@ -166,7 +280,9 @@ meeting-copilot/
 │  │  ├─ backend/           # FastAPI、SQLite、ASR 与 AI 任务编排
 │  │  └─ frontend_v2/       # React + TypeScript 工作台
 │  ├─ desktop_tauri/        # Tauri 桌面壳、WASAPI 音频与进程管理
-│  └─ asr_runtime/          # FunASR worker、模型清单与转写工具
+│  ├─ asr_runtime/          # FunASR worker、模型清单与转写工具
+│  └─ agent_runtime/
+│     └─ pi_coach_bridge/   # Pi SDK Session、工具边界与 JSONL sidecar
 ├─ configs/                 # 配置模板与术语表
 ├─ data/                    # 脱敏演示数据和评测词表
 ├─ docs/                    # 用户与技术文档
@@ -190,6 +306,11 @@ cd ..\backend
 uv run --frozen ruff check meeting_copilot_web_mvp
 uv run --frozen pytest -q
 
+# Pi 实时教练（faux provider，不访问麦克风或扬声器）
+cd ..\..\agent_runtime\pi_coach_bridge
+npm test
+npm run smoke
+
 # 桌面端
 cargo check --locked --manifest-path ..\..\desktop_tauri\src-tauri\Cargo.toml
 
@@ -207,6 +328,8 @@ npm run check
 | [架构说明](docs/architecture.md) | 组件职责、数据流和安全边界 |
 | [实时智能质量提升方案](docs/realtime-intelligence-quality-and-agent-decision-plan.md) | 分片诊断、语义窗口、任务拆分、质量评测与 Pi Go / No-Go |
 | [实时对话 Agent 产品与技术方案](docs/pi-agent-product-and-technical-design.md) | 双音轨实时教练、Pi 边界、腾讯会议采集、介入策略与实施路线 |
+| [Pi 持续教练实现说明](docs/pi-continuous-coach-loop.md) | SDK 集成、Agent Loop、checklist、历史信息流、回退与真实 Provider 验收 |
+| [Pi SDK 技术调研](docs/realtime-coach-pi-spike-report.md) | SDK 能力、PoC、部署成本、风险和 Go / No-Go 结论 |
 | [开发指南](docs/development.md) | 开发环境、命令、测试和贡献约定 |
 | [隐私说明](docs/privacy.md) | 本地数据、远程调用和删除边界 |
 | [故障排查](docs/troubleshooting.md) | 启动、音频、转写与 AI 配置问题 |
