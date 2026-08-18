@@ -42,6 +42,22 @@ it("shows the active Pi checklist loop when no intervention is needed", async ()
     getAskThreads: vi.fn(async () => []),
     getChapters: vi.fn(async () => []),
     listNotes: vi.fn(async () => []),
+    getMeetingPreparation: vi.fn(async () => ({
+      meetingId: "meeting-1",
+      hotwords: [],
+      inputSource: "microphone" as const,
+      inputDeviceId: null,
+      inputDeviceName: null,
+      noticeAcknowledged: true,
+      presetId: "interview" as const,
+      meetingGoal: "理解用户的真实行为",
+      participantRole: "访谈者",
+      focusPoints: ["具体场景"],
+      outputFormat: "brief" as const,
+      proactiveSuggestionPolicy: "low_frequency" as const,
+      version: 1,
+      updatedAtMs: 1,
+    })),
   } as unknown as MeetingApi;
 
   render(
@@ -83,11 +99,13 @@ it("shows the active Pi checklist loop when no intervention is needed", async ()
   );
 
   expect(await screen.findByText("Pi 教练监听中")).toBeVisible();
+  expect(await screen.findByText("用户访谈")).toBeVisible();
   expect(screen.getByText("本轮结论：暂不打断，没有发现需要立刻介入的表达问题")).toBeVisible();
   expect(screen.getByText("本轮完成 6 项检查 · 检索历史 1 次 · 已延续会议上下文")).toBeVisible();
   expect(screen.getByRole("list", { name: "教练检查项" })).toHaveTextContent("问题回应");
   expect(screen.getByRole("list", { name: "教练检查项" })).toHaveTextContent("承诺条件");
   expect(screen.getByRole("list", { name: "教练检查项" })).toHaveTextContent("表达清晰");
+  expect(screen.getByRole("list", { name: "教练检查项" })).toHaveTextContent("访谈证据深度");
   expect(screen.getByRole("list", { name: "过去的教练建议" })).toHaveTextContent("先确认负责人，再承诺时间。");
 });
 

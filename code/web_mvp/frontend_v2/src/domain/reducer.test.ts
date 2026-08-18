@@ -575,7 +575,7 @@ describe("meetingReducer", () => {
             evidence_segment_ids: ["local-segment", "remote-segment"],
             evidence_quote: "压测还没有完成",
             urgency: "high",
-            coach_event_type: "commitment_risk",
+            coach_event_type: "decision_readiness",
             title: "先限定承诺条件",
             confidence: 0.91,
           },
@@ -585,7 +585,7 @@ describe("meetingReducer", () => {
     });
 
     expect(current.followUp).toMatchObject({
-      coachEventType: "commitment_risk",
+      coachEventType: "decision_readiness",
       title: "先限定承诺条件",
       confidence: 0.91,
       urgency: "high",

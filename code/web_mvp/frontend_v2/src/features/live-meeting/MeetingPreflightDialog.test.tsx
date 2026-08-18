@@ -113,6 +113,25 @@ describe("MeetingPreflightDialog", () => {
     }));
   });
 
+  it("selects a scene coach skill and explains its realtime behavior", async () => {
+    const onStart = vi.fn().mockResolvedValue(undefined);
+    render(<MeetingPreflightDialog open busy={false} onCancel={vi.fn()} onStart={onStart} />);
+
+    expect(await screen.findByText("本地中文实时识别可用")).toBeVisible();
+    fireEvent.change(screen.getByDisplayValue("通用对话教练"), { target: { value: "interview" } });
+
+    expect(screen.getByText(/中立追问补齐具体行为/)).toBeVisible();
+    fireEvent.click(screen.getByLabelText("我已告知参会者并确认可以录音"));
+    fireEvent.click(screen.getByRole("button", { name: "开始会议" }));
+
+    await waitFor(() => expect(onStart).toHaveBeenCalledWith(expect.objectContaining({
+      presetId: "interview",
+      meetingGoal: "完整记录访谈洞察和待验证假设",
+      focusPoints: ["用户原话", "痛点", "需求", "待验证假设"],
+      outputFormat: "brief",
+    })));
+  });
+
   it("keeps system audio hidden in the Web runtime", async () => {
     render(<MeetingPreflightDialog open busy={false} onCancel={vi.fn()} onStart={vi.fn()} />);
 

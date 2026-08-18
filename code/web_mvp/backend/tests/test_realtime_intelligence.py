@@ -597,6 +597,41 @@ def test_coach_prompt_is_focused_on_timely_action_instead_of_summary() -> None:
     assert "不要为了显得有帮助" in messages[0]["content"]
 
 
+def test_coach_prompt_loads_the_selected_scene_skill() -> None:
+    request = replace(_coach_request(), coach_skill_id="interview")
+
+    messages = build_realtime_coach_messages(request)
+    payload = json.loads(messages[1]["content"])
+
+    assert payload["coach_skill_id"] == "interview"
+    assert "User interview coach" in messages[0]["content"]
+    assert "discovery_gap" in messages[0]["content"]
+    assert "discovery_gap" in payload["output_contract"]["intervention"]["event_type"]
+    assert "execution_gap" not in payload["output_contract"]["intervention"]["event_type"]
+
+
+def test_coach_parser_rejects_an_event_from_an_inactive_scene_skill() -> None:
+    request = replace(_coach_request(), coach_skill_id="interview")
+    content = json.dumps(
+        {
+            "intervention": {
+                "event_type": "execution_gap",
+                "title": "缺少执行条件",
+                "recommendation": "请先确认负责人和截止时间，再结束当前话题。",
+                "reason": "这不是用户访谈技能允许的场景介入。",
+                "evidence_segment_ids": ["remote-4"],
+                "evidence_quote": "周五一定上线吗",
+                "urgency": "medium",
+                "confidence": 0.9,
+            }
+        },
+        ensure_ascii=False,
+    )
+
+    with pytest.raises(IntelligenceResponseValidationError, match="unsupported"):
+        parse_realtime_coach_response(content, request=request)
+
+
 def test_coach_parser_builds_an_evidence_bound_private_intervention() -> None:
     intervention = parse_realtime_coach_response(
         json.dumps(
@@ -824,6 +859,7 @@ async def _test_pi_coach_runner_preserves_the_existing_evidence_contract() -> No
     assert result["agent_metrics"]["checklist_reviewed"] is True
     assert result["decision_reason"] is None
     assert pi_runtime.payload["context"]["new_paragraphs"][0]["source_track"] == "system_audio"
+    assert pi_runtime.payload["context"]["coach_skill"]["id"] == "general"
     assert pi_runtime.payload["provider"]["model"] == "coach-model"
     assert usages == [(1, {"prompt_tokens": 90, "completion_tokens": 20, "total_tokens": 110})]
 
@@ -860,6 +896,30 @@ def test_pi_fallback_reason_redacts_provider_detail() -> None:
     error = ExpectedPiError("Upstream service temporarily unavailable: request body omitted")
 
     assert _pi_fallback_reason(error) == "provider_temporarily_unavailable"
+
+
+def test_pi_provider_timeout_does_not_double_call_the_model() -> None:
+    asyncio.run(_test_pi_provider_timeout_does_not_double_call_the_model())
+
+
+async def _test_pi_provider_timeout_does_not_double_call_the_model() -> None:
+    class ExpectedPiError(RuntimeError):
+        code = "agent_provider_error"
+
+    direct_provider = _Provider(json.dumps({"intervention": None}))
+    result = await run_realtime_coach_routed(
+        request=_coach_request(),
+        provider=direct_provider,
+        requested_runtime="pi",
+        pi_runtime=_PiRuntime(error=ExpectedPiError("provider timeout")),
+        pi_provider_config=_pi_provider_config(),
+    )
+
+    assert result["intervention"] is None
+    assert result["runtime_used"] == "pi"
+    assert result["fallback_reason"] == "provider_timeout"
+    assert result["agent_metrics"] == {"fallback_suppressed": True}
+    assert direct_provider.calls == []
 
 
 def test_runner_validates_one_structured_response_and_returns_latency_usage() -> None:

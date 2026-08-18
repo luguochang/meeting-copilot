@@ -178,6 +178,97 @@ test("the host checklist exposes bounded routing signals in the initial request"
   assert.equal(result.metrics.checklist_reviews, 1);
 });
 
+test("the selected scene skill extends the checklist and accepts its bounded event", async () => {
+  const { faux, runtime } = harness();
+  const interviewRequest = request("interview-1");
+  interviewRequest.context.coach_skill = {
+    id: "interview",
+    version: 1,
+    name: "User interview coach",
+    objective: "Uncover concrete behavior without leading the interviewee.",
+    intervention_style: "Offer one neutral follow-up question grounded in exact words.",
+    checklist: [{
+      id: "discovery_depth",
+      event_type: "discovery_gap",
+      question: "Is a concrete example or impact still missing?",
+    }],
+  };
+  faux.setResponses([
+    (context) => {
+      const userMessage = context.messages.findLast((message) => message.role === "user");
+      const text = typeof userMessage.content === "string"
+        ? userMessage.content
+        : userMessage.content.find((block) => block.type === "text").text;
+      const payload = JSON.parse(text);
+      assert.equal(payload.coach_skill.id, "interview");
+      assert.equal(payload.checklist.length, 7);
+      return fauxAssistantMessage(
+        fauxToolCall("submit_intervention", {
+          event_type: "discovery_gap",
+          title: "补一个具体例子",
+          recommendation: "你最近一次遇到这个问题是什么时候？",
+          reason: "当前只有结论，还没有具体行为场景。",
+          evidence_segment_ids: ["remote-1"],
+          evidence_quote: "周五一定上线吗",
+          urgency: "medium",
+          confidence: 0.9,
+        }),
+        { stopReason: "toolUse" },
+      );
+    },
+  ]);
+
+  const result = await runtime.evaluate(interviewRequest);
+
+  assert.equal(result.intervention.event_type, "discovery_gap");
+  assert.equal(result.metrics.coach_skill_id, "interview");
+  assert.equal(result.metrics.coach_skill_version, 1);
+  assert.equal(result.metrics.decision_latency_budget_ms, 10000);
+  assert.ok(result.metrics.checklist_item_ids.includes("discovery_depth"));
+});
+
+test("the tool boundary rejects events owned by a different scene skill", async () => {
+  const { faux, runtime } = harness();
+  const interviewRequest = request("interview-wrong-event");
+  interviewRequest.context.coach_skill = {
+    id: "interview",
+    version: 1,
+    name: "User interview coach",
+    objective: "Uncover concrete behavior without leading the interviewee.",
+    intervention_style: "Offer one neutral follow-up question grounded in exact words.",
+    checklist: [{
+      id: "discovery_depth",
+      event_type: "discovery_gap",
+      question: "Is a concrete example or impact still missing?",
+    }],
+  };
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("submit_intervention", {
+        event_type: "execution_gap",
+        title: "Missing owner",
+        recommendation: "Please name an owner and deadline before moving on.",
+        reason: "This event belongs to the project skill.",
+        evidence_segment_ids: ["remote-1"],
+        evidence_quote: "周五一定上线吗",
+        urgency: "medium",
+        confidence: 0.9,
+      }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage(
+      fauxToolCall("keep_silent", { reason: "The requested event is not allowed by this skill." }),
+      { stopReason: "toolUse" },
+    ),
+  ]);
+
+  const result = await runtime.evaluate(interviewRequest);
+
+  assert.equal(result.action, "silent");
+  assert.equal(result.intervention, null);
+  assert.equal(result.metrics.turns, 2);
+});
+
 test("the tool boundary rejects invented evidence", async () => {
   const { faux, runtime } = harness();
   faux.setResponses([

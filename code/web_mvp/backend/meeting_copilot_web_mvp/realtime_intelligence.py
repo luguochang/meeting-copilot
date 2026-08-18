@@ -14,6 +14,13 @@ import json
 import math
 from typing import Any, Mapping, Sequence
 
+from meeting_copilot_web_mvp.coach_skills import (
+    BASE_COACH_EVENT_TYPES,
+    SCENE_COACH_EVENT_TYPES,
+    coach_skill_event_types,
+    coach_skill_prompt,
+    normalize_coach_skill_id,
+)
 from meeting_copilot_web_mvp.pi_coach_runtime import build_pi_coach_request
 from meeting_copilot_web_mvp.realtime_transcript_correction import correction_is_safe
 
@@ -37,15 +44,7 @@ _ROLLING_STATE_KEYS = frozenset({"topic", "open_items", "summary", "version"})
 _SOURCE_TRACKS = frozenset({"microphone", "system_audio", "unknown"})
 _ROLE_HINTS = frozenset({"self_or_room", "remote_mix", "unknown"})
 _SEMANTIC_WINDOW_STATUSES = frozenset({"active", "stable"})
-_COACH_EVENT_TYPES = frozenset(
-    {
-        "question_to_user",
-        "commitment_risk",
-        "goal_at_risk",
-        "contradiction",
-        "communication_clarity",
-    }
-)
+_COACH_EVENT_TYPES = BASE_COACH_EVENT_TYPES | SCENE_COACH_EVENT_TYPES
 
 
 class IntelligenceResponseValidationError(ValueError):
@@ -222,6 +221,7 @@ class RealtimeIntelligenceRequest:
     rolling_state: Mapping[str, Any]
     glossary: tuple[str, ...]
     meeting_goal: str | None
+    coach_skill_id: str
     allow_paragraph_revisions: bool
 
     @classmethod
@@ -237,6 +237,7 @@ class RealtimeIntelligenceRequest:
         rolling_state: Mapping[str, Any],
         glossary: Sequence[Any] | None = None,
         meeting_goal: Any = None,
+        coach_skill_id: Any = "general",
         allow_paragraph_revisions: bool = True,
     ) -> "RealtimeIntelligenceRequest":
         normalized_meeting_id = _required_text(meeting_id, "meeting_id", maximum=240)
@@ -319,6 +320,7 @@ class RealtimeIntelligenceRequest:
             rolling_state=bounded_state,
             glossary=tuple(glossary_items),
             meeting_goal=_optional_text(meeting_goal, maximum=2_000),
+            coach_skill_id=normalize_coach_skill_id(coach_skill_id),
             allow_paragraph_revisions=allow_paragraph_revisions,
         )
 
@@ -713,9 +715,10 @@ def build_realtime_coach_messages(
         (
             "你是仅服务于软件使用者的实时私人对话教练。只返回 JSON，不要输出 Markdown。",
             "任务不是总结、复盘或重复原话，而是判断刚发生的时刻是否值得立刻给用户一句可说出口的建议。",
-            "只允许五类介入：question_to_user（对方问题尚未完整回答）、commitment_risk（用户可能形成缺少条件的承诺）、",
+            "基础介入类型包括：question_to_user（对方问题尚未完整回答）、commitment_risk（用户可能形成缺少条件的承诺）、",
             "goal_at_risk（用户目标即将被跳过）、contradiction（当前说法与前文存在有损决策的冲突）、",
             "communication_clarity（持续表达出现重复、失焦或缺少结论，此刻需要收束或重组下一句话）。",
+            "当前场景技能包可以增加一种受限介入类型；只能使用 output_contract 列出的类型，并严格执行技能包检查项。",
             "communication_clarity 必须由至少两处逐字原话证明持续模式，不能针对单句措辞或 ASR 错字；建议必须给出下一句或具体结构，不得只做批评或泛泛而谈。",
             "system_audio/remote_mix 通常来自电脑中对方的混音；microphone/self_or_room 不能确定就是用户本人。",
             "涉及承诺、立场或责任时，不得仅凭 microphone/self_or_room 归因给用户本人。",
@@ -725,7 +728,7 @@ def build_realtime_coach_messages(
             "不得猜测说话人身份、公司信息、数字、期限或用户立场。依据必须逐字出现在引用的 paragraph 中。",
             "recommendation 必须是 8 到 120 个字符的可直接说出口短句；不要写分析过程。",
         )
-    )
+    ) + coach_skill_prompt(request.coach_skill_id)
     payload = {
         "state_revision": request.state_revision,
         "new_paragraphs": [item.to_prompt_dict() for item in request.new_paragraphs],
@@ -733,9 +736,10 @@ def build_realtime_coach_messages(
         "semantic_windows": [item.to_prompt_dict() for item in request.semantic_windows],
         "rolling_state": request.rolling_state,
         "meeting_goal": request.meeting_goal,
+        "coach_skill_id": request.coach_skill_id,
         "output_contract": {
             "intervention": {
-                "event_type": "question_to_user|commitment_risk|goal_at_risk|contradiction|communication_clarity",
+                "event_type": "|".join(sorted(coach_skill_event_types(request.coach_skill_id))),
                 "title": "short_string",
                 "recommendation": "directly_speakable_string",
                 "reason": "short_string",
@@ -769,7 +773,7 @@ def parse_realtime_coach_response(
         return None
     item = _required_object(value, "intervention")
     event_type = _required_response_text(item.get("event_type"), "intervention.event_type", maximum=40)
-    if event_type not in _COACH_EVENT_TYPES:
+    if event_type not in coach_skill_event_types(request.coach_skill_id):
         raise IntelligenceResponseValidationError("intervention.event_type is unsupported")
     evidence_ids = _parse_evidence_ids(
         item.get("evidence_segment_ids"),
@@ -913,6 +917,42 @@ def _pi_fallback_reason(error: Exception) -> str:
     return code
 
 
+def _can_fall_back_before_model_work(error: Exception) -> bool:
+    """Avoid a second model call after Pi already consumed the realtime budget."""
+
+    return str(getattr(error, "code", "")) in {
+        "pi_unavailable",
+        "pi_spawn_failed",
+        "pi_startup_timeout",
+        "pi_transport_error",
+    }
+
+
+def _silent_pi_failure(
+    *,
+    request: RealtimeIntelligenceRequest,
+    provider_config: Mapping[str, Any],
+    error: Exception,
+) -> dict[str, Any]:
+    reason = _pi_fallback_reason(error)
+    return {
+        "intervention": None,
+        "transport_mode": "pi_agent_jsonl",
+        "ttft_ms": None,
+        "decision_latency_ms": None,
+        "usage": None,
+        "model": str(provider_config.get("model") or ""),
+        "response_id": f"{realtime_intelligence_idempotency_key(request)}:coach:pi:v1",
+        "finish_reason": "failed_open_silent",
+        "decision_reason": "实时教练本轮超出响应预算，已保持静默。" if reason == "provider_timeout" else "实时教练本轮未能形成可靠建议，已保持静默。",
+        "agent_metrics": {"fallback_suppressed": True},
+        "runtime_requested": "pi",
+        "runtime_used": "pi",
+        "fallback_error_code": str(getattr(error, "code", type(error).__name__))[:120],
+        "fallback_reason": reason,
+    }
+
+
 async def run_realtime_coach_routed(
     *,
     request: RealtimeIntelligenceRequest,
@@ -943,19 +983,25 @@ async def run_realtime_coach_routed(
                 "fallback_reason": None,
             }
         except Exception as exc:
-            result = await run_realtime_coach(
+            if _can_fall_back_before_model_work(exc):
+                result = await run_realtime_coach(
+                    request=request,
+                    provider=provider,
+                    before_attempt=before_attempt,
+                    on_usage=on_usage,
+                )
+                return {
+                    **result,
+                    "runtime_requested": "pi",
+                    "runtime_used": "direct",
+                    "fallback_error_code": str(getattr(exc, "code", type(exc).__name__))[:120],
+                    "fallback_reason": _pi_fallback_reason(exc),
+                }
+            return _silent_pi_failure(
                 request=request,
-                provider=provider,
-                before_attempt=before_attempt,
-                on_usage=on_usage,
+                provider_config=dict(pi_provider_config or {}),
+                error=exc,
             )
-            return {
-                **result,
-                "runtime_requested": "pi",
-                "runtime_used": "direct",
-                "fallback_error_code": str(getattr(exc, "code", type(exc).__name__))[:120],
-                "fallback_reason": _pi_fallback_reason(exc),
-            }
     result = await run_realtime_coach(
         request=request,
         provider=provider,

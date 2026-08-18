@@ -123,16 +123,17 @@ const PRESET_DEFAULTS: Record<MeetingPresetId, {
   goal: string;
   focusPoints: string;
   outputFormat: MeetingOutputFormat;
+  coachSummary: string;
 }> = {
-  general: { goal: "", focusPoints: "", outputFormat: "standard" },
-  decision: { goal: "形成可执行且有依据的决策", focusPoints: "决策结论、备选方案、决策依据、反对意见", outputFormat: "decision_log" },
-  project: { goal: "同步项目进度并明确下一步", focusPoints: "进展、阻塞、负责人、截止时间", outputFormat: "action_plan" },
-  interview: { goal: "完整记录访谈洞察和待验证假设", focusPoints: "用户原话、痛点、需求、待验证假设", outputFormat: "brief" },
-  brainstorm: { goal: "发散方案并收敛可验证的下一步", focusPoints: "新想法、约束、争议、实验方案", outputFormat: "standard" },
+  general: { goal: "", focusPoints: "", outputFormat: "standard", coachSummary: "低频检查问题回应、承诺条件、目标偏离、前后矛盾和表达清晰度。" },
+  decision: { goal: "形成可执行且有依据的决策", focusPoints: "决策结论、备选方案、决策依据、反对意见", outputFormat: "decision_log", coachSummary: "在决策落定前检查备选方案、依据、反对意见、负责人和成功标准。" },
+  project: { goal: "同步项目进度并明确下一步", focusPoints: "进展、阻塞、负责人、截止时间", outputFormat: "action_plan", coachSummary: "关注阻塞、依赖、负责人、截止时间和验收条件是否闭环。" },
+  interview: { goal: "完整记录访谈洞察和待验证假设", focusPoints: "用户原话、痛点、需求、待验证假设", outputFormat: "brief", coachSummary: "用中立追问补齐具体行为、场景、频率、影响和替代方案。" },
+  brainstorm: { goal: "发散方案并收敛可验证的下一步", focusPoints: "新想法、约束、争议、实验方案", outputFormat: "standard", coachSummary: "不过早收敛，在合适时机把想法转成假设、最小实验和成功信号。" },
 };
 
 function parseFocusPoints(value: string): string[] {
-  return value.split(/[,，;；\n]+/).map((item) => item.trim()).filter(Boolean).slice(0, 12);
+  return value.split(/[,，、;；\n]+/).map((item) => item.trim()).filter(Boolean).slice(0, 12);
 }
 
 function parseHotwords(value: string): string[] {
@@ -786,7 +787,7 @@ export function MeetingPreflightDialog({
 
           <div className="preflight-ai-context">
             <label>
-              <span>会议预设</span>
+              <span>教练技能包</span>
               <select
                 value={presetId}
                 onChange={(event) => {
@@ -799,12 +800,13 @@ export function MeetingPreflightDialog({
                 }}
                 disabled={busy}
               >
-                <option value="general">通用会议</option>
-                <option value="decision">决策评审</option>
-                <option value="project">项目同步</option>
-                <option value="interview">用户访谈</option>
-                <option value="brainstorm">头脑风暴</option>
+                <option value="general">通用对话教练</option>
+                <option value="decision">决策准备度教练</option>
+                <option value="project">项目执行教练</option>
+                <option value="interview">用户访谈教练</option>
+                <option value="brainstorm">头脑风暴教练</option>
               </select>
+              <small>{PRESET_DEFAULTS[presetId].coachSummary}</small>
             </label>
             <label>
               <span>我的角色</span>

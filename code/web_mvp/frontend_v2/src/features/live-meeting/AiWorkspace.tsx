@@ -315,7 +315,12 @@ export function AiWorkspace({
       </div>
 
       {tab === "insights" ? (
-        <NowRail {...railProps} onEvidence={onEvidence} onMessage={onMessage} />
+        <NowRail
+          {...railProps}
+          activeCoachSkillId={preparation?.presetId ?? "general"}
+          onEvidence={onEvidence}
+          onMessage={onMessage}
+        />
       ) : tab === "context" ? (
         <section className="meeting-context-panel" aria-label="会议目标和关注点">
           <header>

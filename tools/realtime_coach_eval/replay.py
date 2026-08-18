@@ -59,6 +59,7 @@ def request_from_case(case: Mapping[str, Any]) -> RealtimeIntelligenceRequest:
         rolling_state=case.get("rolling_state") or {},
         glossary=case.get("glossary") or [],
         meeting_goal=case.get("meeting_goal"),
+        coach_skill_id=case.get("coach_skill_id") or "general",
         allow_paragraph_revisions=False,
     )
 
@@ -98,6 +99,7 @@ async def replay_mode(
         started_at = time.perf_counter()
         base_record = {
             "case_id": case["case_id"],
+            "coach_skill_id": str(case.get("coach_skill_id") or "general"),
             "difficulty": list(case.get("difficulty") or []),
             "expected": dict(case["expected"]),
             "runtime_requested": runtime_name,
@@ -164,6 +166,12 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 results[mode] = {
                     "score": score_predictions(records),
+                    "score_by_skill": {
+                        skill_id: score_predictions(
+                            record for record in records if record.get("coach_skill_id") == skill_id
+                        )
+                        for skill_id in sorted({str(record["coach_skill_id"]) for record in records})
+                    },
                     "records": records,
                 }
     finally:

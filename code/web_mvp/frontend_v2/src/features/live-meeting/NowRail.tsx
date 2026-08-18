@@ -28,6 +28,7 @@ interface NowRailProps {
   actionItems: ActionItemProjection[];
   risks: RiskProjection[];
   coachRuntime?: RuntimeIndicator | null;
+  activeCoachSkillId?: "general" | "decision" | "project" | "interview" | "brainstorm" | null;
   onEvidence(segmentId: string): void;
   onFeedback(suggestionId: string, feedback: SuggestionFeedback): Promise<void>;
   onFactStatus(factType: MeetingFactKind, factId: string, status: Extract<MeetingFactStatus, "confirmed" | "dismissed">): Promise<void>;
@@ -105,8 +106,30 @@ function coachLabel(followUp: FollowUpProjection): string {
   if (followUp.coachEventType === "goal_at_risk") return "目标可能被跳过";
   if (followUp.coachEventType === "contradiction") return "前后口径需要确认";
   if (followUp.coachEventType === "communication_clarity") return "表达需要收束";
+  if (followUp.coachEventType === "decision_readiness") return "决策条件还不完整";
+  if (followUp.coachEventType === "execution_gap") return "执行条件还未闭环";
+  if (followUp.coachEventType === "discovery_gap") return "补一个具体场景";
+  if (followUp.coachEventType === "experiment_gap") return "把想法变成小实验";
   return "建议追问";
 }
+
+const COACH_SKILL_LABELS: Record<NonNullable<NowRailProps["activeCoachSkillId"]>, string> = {
+  general: "通用对话",
+  decision: "决策准备度",
+  project: "项目执行",
+  interview: "用户访谈",
+  brainstorm: "头脑风暴",
+};
+
+const BASE_COACH_CHECK_LABELS = ["问题回应", "承诺条件", "目标覆盖", "前后口径", "表达清晰", "介入价值"];
+
+const COACH_SKILL_CHECK_LABELS: Record<NonNullable<NowRailProps["activeCoachSkillId"]>, string | null> = {
+  general: null,
+  decision: "决策完整度",
+  project: "执行闭环",
+  interview: "访谈证据深度",
+  brainstorm: "最小实验",
+};
 
 function coachHistoryTime(createdAtMs: number): string {
   if (!createdAtMs) return "刚刚";
@@ -324,6 +347,7 @@ export function NowRail({
   followUp,
   coachHistory = [],
   coachRuntime,
+  activeCoachSkillId = "general",
   openQuestions,
   suggestions,
   decisionCandidates,
@@ -361,6 +385,10 @@ export function NowRail({
   const [savingQuestionId, setSavingQuestionId] = useState<string | null>(null);
   const [factView, setFactView] = useState<FactView>("active");
   const text = suggestion ? suggestionText(suggestion) : "";
+  const sceneCheckLabel = activeCoachSkillId ? COACH_SKILL_CHECK_LABELS[activeCoachSkillId] : null;
+  const coachCheckLabels = sceneCheckLabel
+    ? [...BASE_COACH_CHECK_LABELS, sceneCheckLabel]
+    : BASE_COACH_CHECK_LABELS;
 
   const withFactStatusOverrides = <T extends RailFact>(factType: MeetingFactKind, facts: T[]): T[] => facts.map((fact) => {
     const status = factStatusOverrides[`${factType}:${fact.id}`];
@@ -440,6 +468,11 @@ export function NowRail({
         <header className="rail-heading">
           <MessageCircleQuestion size={16} />
           <h2 id="suggestion-title">AI 实时教练</h2>
+          {activeCoachSkillId ? (
+            <span className="coach-skill-badge" title="本轮实时教练使用的场景技能包">
+              {COACH_SKILL_LABELS[activeCoachSkillId]}
+            </span>
+          ) : null}
           {coachRuntime ? (
             <span className="coach-runtime-badge" data-state={coachRuntime.state} title={coachRuntime.detail ?? coachRuntime.label}>
               <span aria-hidden="true" />{coachRuntime.label}
@@ -524,12 +557,7 @@ export function NowRail({
             {coachRuntime?.decision ? <strong>{coachRuntime.decision}</strong> : null}
             <p>{coachRuntime?.detail ?? "等待下一段稳定对话"}</p>
             <ul aria-label="教练检查项">
-              <li>问题回应</li>
-              <li>承诺条件</li>
-              <li>目标覆盖</li>
-              <li>前后口径</li>
-              <li>表达清晰</li>
-              <li>介入价值</li>
+              {coachCheckLabels.map((label) => <li key={label}>{label}</li>)}
             </ul>
           </div>
         )}

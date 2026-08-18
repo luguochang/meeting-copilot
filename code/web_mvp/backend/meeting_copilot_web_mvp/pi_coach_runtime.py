@@ -14,12 +14,15 @@ import threading
 import time
 from typing import Any, Mapping
 
+from meeting_copilot_web_mvp.coach_skills import coach_skill_payload
+
 
 PROTOCOL = "talktrace-pi-coach-jsonl.v1"
 PI_RUNTIME_ENV = "MEETING_COPILOT_REALTIME_COACH_RUNTIME"
 PI_BRIDGE_ENTRY_ENV = "MEETING_COPILOT_PI_BRIDGE_ENTRY"
 PI_NODE_EXECUTABLE_ENV = "MEETING_COPILOT_NODE_EXECUTABLE"
-DEFAULT_TIMEOUT_SECONDS = 28.0
+DEFAULT_TIMEOUT_SECONDS = 12.0
+REALTIME_PROVIDER_TIMEOUT_SECONDS = 10.0
 MAX_REQUEST_BYTES = 200_000
 MAX_RESPONSE_BYTES = 200_000
 
@@ -75,7 +78,9 @@ def build_pi_coach_request(
             "api_key": str(api_key),
             "model": str(model),
             "api_style": str(api_style),
-            "timeout_ms": int(max(1.0, min(float(timeout_seconds), 30.0)) * 1_000),
+            "timeout_ms": int(
+                max(1.0, min(float(timeout_seconds), REALTIME_PROVIDER_TIMEOUT_SECONDS)) * 1_000
+            ),
         },
         "context": {
             "state_revision": int(request.state_revision),
@@ -85,6 +90,7 @@ def build_pi_coach_request(
             "semantic_windows": [asdict(item) for item in request.semantic_windows],
             "rolling_state": dict(request.rolling_state),
             "meeting_goal": request.meeting_goal,
+            "coach_skill": coach_skill_payload(request.coach_skill_id),
         },
     }
 

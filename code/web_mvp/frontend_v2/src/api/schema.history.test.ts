@@ -29,7 +29,7 @@ it("parses bounded coach and recent-context history from a snapshot", () => {
       evidence_segment_ids: ["segment-1"],
       evidence_quote: "负责人还没有定",
       urgency: "high",
-      coach_event_type: "commitment_risk",
+      coach_event_type: "discovery_gap",
       ...formalMetadata("segment-1"),
     }],
     recent_context_history: [{
@@ -46,7 +46,7 @@ it("parses bounded coach and recent-context history from a snapshot", () => {
   expect(snapshot.coachHistory[0]).toMatchObject({
     historyId: "coach-event-1",
     createdAtMs: 1_000,
-    coachEventType: "commitment_risk",
+    coachEventType: "discovery_gap",
     formalAi: { source: "llm_first", jobId: "job-segment-1" },
   });
   expect(snapshot.recentContextHistory[0]).toMatchObject({

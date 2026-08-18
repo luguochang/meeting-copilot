@@ -461,7 +461,9 @@ function eventFollowUp(event: MeetingEvent): FollowUpProjection | null {
   const recognizedCoachEventType =
     coachEventType === "question_to_user" || coachEventType === "commitment_risk" ||
     coachEventType === "goal_at_risk" || coachEventType === "contradiction" ||
-    coachEventType === "communication_clarity"
+    coachEventType === "communication_clarity" || coachEventType === "decision_readiness" ||
+    coachEventType === "execution_gap" || coachEventType === "discovery_gap" ||
+    coachEventType === "experiment_gap"
       ? coachEventType
       : null;
   const title = stringValue(value, "title");

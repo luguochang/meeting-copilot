@@ -913,7 +913,9 @@ function parseFollowUp(value: unknown): FollowUpProjection | null {
   const coachEventType =
     coachEventTypeValue === "question_to_user" || coachEventTypeValue === "commitment_risk" ||
     coachEventTypeValue === "goal_at_risk" || coachEventTypeValue === "contradiction" ||
-    coachEventTypeValue === "communication_clarity"
+    coachEventTypeValue === "communication_clarity" || coachEventTypeValue === "decision_readiness" ||
+    coachEventTypeValue === "execution_gap" || coachEventTypeValue === "discovery_gap" ||
+    coachEventTypeValue === "experiment_gap"
       ? coachEventTypeValue
       : null;
   const title = optionalString(first(item, "title"));

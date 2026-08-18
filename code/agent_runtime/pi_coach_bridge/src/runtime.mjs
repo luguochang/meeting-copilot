@@ -15,12 +15,19 @@ const EVENT_TYPES = new Set([
   "goal_at_risk",
   "contradiction",
   "communication_clarity",
+  "decision_readiness",
+  "execution_gap",
+  "discovery_gap",
+  "experiment_gap",
 ]);
+const SUPPORTED_SKILL_IDS = new Set(["general", "decision", "project", "interview", "brainstorm"]);
 const URGENCIES = new Set(["low", "medium", "high"]);
 const MAX_SESSION_USER_TURNS = 4;
-const MAX_AGENT_TURNS_PER_EVALUATION = 4;
+const MAX_AGENT_TURNS_PER_EVALUATION = 2;
+const MAX_TOOL_CALLS_PER_EVALUATION = 4;
 const MAX_SESSIONS = 8;
 const MAX_RETRIEVAL_PARAGRAPHS = 48;
+const DECISION_LATENCY_BUDGET_MS = 10_000;
 
 const COACHING_CHECKLIST = [
   {
@@ -55,11 +62,21 @@ const COACHING_CHECKLIST = [
   },
 ];
 
+const DEFAULT_COACH_SKILL = {
+  id: "general",
+  version: 1,
+  name: "General conversation coach",
+  objective: "Protect the user's immediate conversational goal while keeping interventions rare and actionable.",
+  intervention_style: "Prefer one short next sentence. Do not summarize the dialogue.",
+  checklist: [],
+};
+
 const SYSTEM_PROMPT = [
   "You are Talktrace's private realtime conversation coach.",
   "You assist only the person running Talktrace; this is not a meeting summary task.",
   "Most moments require no interruption. A useful intervention must still be actionable now, be grounded in quoted evidence, and reduce a concrete loss.",
-  "Allowed events are question_to_user, commitment_risk, goal_at_risk, contradiction, and communication_clarity.",
+  "Base events are question_to_user, commitment_risk, goal_at_risk, contradiction, and communication_clarity.",
+  "The active coach skill may add one bounded event type listed in its checklist; never use an event outside the supplied checklist and base events.",
   "communication_clarity is for a sustained speaking pattern, not an isolated wording issue or ASR error. Use it when at least two verbatim fragments show repetition, drift, or a missing conclusion and a concrete next sentence or structure would help immediately.",
   "For communication_clarity, recommend how to state the next point or close the current point. Do not merely criticize, summarize, or give generic public-speaking advice.",
   "system_audio/remote_mix usually represents the remote computer-audio mix. microphone/self_or_room is not guaranteed to be the local user.",
@@ -103,6 +120,10 @@ const interventionParameters = Type.Object(
       Type.Literal("goal_at_risk"),
       Type.Literal("contradiction"),
       Type.Literal("communication_clarity"),
+      Type.Literal("decision_readiness"),
+      Type.Literal("execution_gap"),
+      Type.Literal("discovery_gap"),
+      Type.Literal("experiment_gap"),
     ]),
     title: Type.String({ minLength: 1, maxLength: 80 }),
     recommendation: Type.String({ minLength: 8, maxLength: 120 }),
@@ -192,6 +213,53 @@ function validateParagraphs(value, field, maximumItems) {
   });
 }
 
+function validateCoachSkill(value) {
+  if (value === undefined || value === null) return { ...DEFAULT_COACH_SKILL, checklist: [] };
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new PiCoachProtocolError("context.coach_skill must be an object", "invalid_request");
+  }
+  const id = requiredText(value.id, "context.coach_skill.id", 40);
+  if (!SUPPORTED_SKILL_IDS.has(id)) {
+    throw new PiCoachProtocolError("context.coach_skill.id is unsupported", "invalid_request");
+  }
+  const checklist = Array.isArray(value.checklist) ? value.checklist : [];
+  if (checklist.length > 4) {
+    throw new PiCoachProtocolError("context.coach_skill.checklist is too large", "invalid_request");
+  }
+  return {
+    id,
+    version: Number.isInteger(value.version) && value.version > 0 ? value.version : 1,
+    name: requiredText(value.name, "context.coach_skill.name", 120),
+    objective: requiredText(value.objective, "context.coach_skill.objective", 600),
+    intervention_style: requiredText(
+      value.intervention_style,
+      "context.coach_skill.intervention_style",
+      600,
+    ),
+    checklist: checklist.map((item, index) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) {
+        throw new PiCoachProtocolError(
+          `context.coach_skill.checklist[${index}] must be an object`,
+          "invalid_request",
+        );
+      }
+      const eventType = requiredText(
+        item.event_type,
+        `context.coach_skill.checklist[${index}].event_type`,
+        40,
+      );
+      if (!EVENT_TYPES.has(eventType)) {
+        throw new PiCoachProtocolError("coach skill event type is unsupported", "invalid_request");
+      }
+      return {
+        id: requiredText(item.id, `context.coach_skill.checklist[${index}].id`, 80),
+        event_type: eventType,
+        question: requiredText(item.question, `context.coach_skill.checklist[${index}].question`, 400),
+      };
+    }),
+  };
+}
+
 function validateContext(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new PiCoachProtocolError("context must be an object", "invalid_request");
@@ -208,7 +276,15 @@ function validateContext(value) {
   );
   const semanticWindows = Array.isArray(value.semantic_windows) ? value.semantic_windows.slice(-8) : [];
   const rollingState = value.rolling_state && typeof value.rolling_state === "object" ? value.rolling_state : {};
-  const serialized = JSON.stringify({ newParagraphs, contextParagraphs, retrievalParagraphs, semanticWindows, rollingState });
+  const coachSkill = validateCoachSkill(value.coach_skill);
+  const serialized = JSON.stringify({
+    newParagraphs,
+    contextParagraphs,
+    retrievalParagraphs,
+    semanticWindows,
+    rollingState,
+    coachSkill,
+  });
   if (serialized.length > 160000) {
     throw new PiCoachProtocolError("context exceeds the bridge byte budget", "invalid_request");
   }
@@ -220,6 +296,7 @@ function validateContext(value) {
     semantic_windows: semanticWindows,
     rolling_state: rollingState,
     meeting_goal: optionalText(value.meeting_goal, 2000),
+    coach_skill: coachSkill,
   };
 }
 
@@ -285,7 +362,7 @@ export function createOpenAICompatibleBackend(providerInput) {
   if (!configuredModel) {
     throw new PiCoachProtocolError("Pi could not register the configured model", "invalid_provider");
   }
-  const timeoutMs = Math.max(1000, Math.min(Number(providerInput.timeout_ms) || 25000, 30000));
+  const timeoutMs = Math.max(1000, Math.min(Number(providerInput.timeout_ms) || 8000, DECISION_LATENCY_BUDGET_MS));
   return {
     identity: `${api}:${baseUrl}:${modelId}`,
     model: configuredModel,
@@ -293,7 +370,7 @@ export function createOpenAICompatibleBackend(providerInput) {
       models.streamSimple(activeModel, context, {
         ...options,
         temperature: 0.1,
-        maxTokens: 768,
+        maxTokens: 512,
         timeoutMs,
         maxRetries: 0,
         cacheRetention: "short",
@@ -316,6 +393,13 @@ function evidenceTextById(context) {
       (paragraph) => [paragraph.id, paragraph.text],
     ),
   );
+}
+
+function allowedEventTypes(context) {
+  return new Set([
+    ...COACHING_CHECKLIST.map((item) => item.event_type),
+    ...context.coach_skill.checklist.map((item) => item.event_type),
+  ]);
 }
 
 function searchTokens(query) {
@@ -346,7 +430,9 @@ function searchPriorEvidence(query, paragraphs, maximumResults) {
 }
 
 function validateInterventionEvidence(intervention, context) {
-  if (!EVENT_TYPES.has(intervention.event_type) || !URGENCIES.has(intervention.urgency)) {
+  if (!EVENT_TYPES.has(intervention.event_type)
+    || !allowedEventTypes(context).has(intervention.event_type)
+    || !URGENCIES.has(intervention.urgency)) {
     throw new PiCoachProtocolError("intervention enum is unsupported", "invalid_agent_action");
   }
   const evidence = evidenceTextById(context);
@@ -398,7 +484,12 @@ function contextSignals(context) {
     meeting_goal: context.meeting_goal,
     rolling_state: context.rolling_state,
     recent_context_paragraphs: context.context_paragraphs,
+    coach_skill_id: context.coach_skill.id,
   };
+}
+
+function coachingChecklist(context) {
+  return [...COACHING_CHECKLIST, ...context.coach_skill.checklist];
 }
 
 function setTerminalAction(entry, action) {
@@ -499,12 +590,14 @@ function createRestrictedTools(entry) {
 }
 
 function buildPrompt(context) {
+  const checklist = coachingChecklist(context);
   return JSON.stringify({
     task: "decide_realtime_coaching_intervention",
     state_revision: context.state_revision,
     new_paragraphs: context.new_paragraphs,
     checklist_reviewed: true,
-    checklist: COACHING_CHECKLIST,
+    checklist,
+    coach_skill: context.coach_skill,
     context_signals: contextSignals(context),
     searchable_prior_paragraph_count: context.retrieval_paragraphs.length,
     reminder: "The host checklist is complete. Use exactly one terminal tool now when evidence is sufficient; otherwise use one context tool, then decide next turn.",
@@ -537,7 +630,7 @@ function createSessionEntry(sessionId, backend) {
     beforeToolCall: async ({ toolCall }) => {
       entry.run.toolCalls += 1;
       entry.run.toolNames.push(toolCall.name);
-      if (entry.run.toolCalls > 8) {
+      if (entry.run.toolCalls > MAX_TOOL_CALLS_PER_EVALUATION) {
         return { block: true, reason: "Tool-call budget exhausted.", terminate: true };
       }
       return undefined;
@@ -583,9 +676,15 @@ export class PiCoachRuntime {
     const request = validateEvaluationRequest(rawRequest);
     const backend = this.backendFactory(request.provider);
     let entry = this.sessions.get(request.session_id);
-    const sessionReused = Boolean(entry && entry.backendIdentity === backend.identity);
+    const skillIdentity = `${request.context.coach_skill.id}:${request.context.coach_skill.version}`;
+    const sessionReused = Boolean(
+      entry
+      && entry.backendIdentity === backend.identity
+      && entry.skillIdentity === skillIdentity,
+    );
     if (!sessionReused) {
       entry = createSessionEntry(request.session_id, backend);
+      entry.skillIdentity = skillIdentity;
       this.sessions.set(request.session_id, entry);
       while (this.sessions.size > MAX_SESSIONS) {
         const oldestSessionId = this.sessions.keys().next().value;
@@ -624,6 +723,7 @@ export class PiCoachRuntime {
       }
       const elapsedMs = Math.max(0, this.clock() - startedAt);
       const runUsage = usageFromMessages(entry.agent.state.messages.slice(priorMessageCount));
+      const checklist = coachingChecklist(request.context);
       entry.agent.state.messages = pruneContext(entry.agent.state.messages);
       return {
         protocol: PROTOCOL,
@@ -642,7 +742,11 @@ export class PiCoachRuntime {
           context_reads: entry.run.contextReads,
           checklist_reviewed: entry.run.checklistReviewed,
           checklist_reviews: entry.run.checklistReviews,
-          checklist_item_ids: COACHING_CHECKLIST.map((item) => item.id),
+          checklist_item_ids: checklist.map((item) => item.id),
+          coach_skill_id: request.context.coach_skill.id,
+          coach_skill_version: request.context.coach_skill.version,
+          decision_latency_budget_ms: DECISION_LATENCY_BUDGET_MS,
+          within_latency_budget: elapsedMs <= DECISION_LATENCY_BUDGET_MS,
           history_searches: entry.run.historySearches,
           history_results: entry.run.historyResults,
           session_reused: sessionReused,

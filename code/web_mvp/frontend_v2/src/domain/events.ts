@@ -191,7 +191,16 @@ export interface FollowUpProjection {
   evidenceSegmentIds: string[];
   evidenceQuote: string;
   urgency: "low" | "medium" | "high";
-  coachEventType?: "question_to_user" | "commitment_risk" | "goal_at_risk" | "contradiction" | "communication_clarity";
+  coachEventType?:
+    | "question_to_user"
+    | "commitment_risk"
+    | "goal_at_risk"
+    | "contradiction"
+    | "communication_clarity"
+    | "decision_readiness"
+    | "execution_gap"
+    | "discovery_gap"
+    | "experiment_gap";
   title?: string;
   confidence?: number;
   formalAi?: FormalAiProvenance | null;

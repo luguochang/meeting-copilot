@@ -8968,6 +8968,7 @@ def create_app(
                 if preparation is not None
                 else None
             ),
+            coach_skill_id=(preparation.preset_id if preparation is not None else "general"),
             allow_paragraph_revisions=False,
         )
         provider = OpenAICompatibleStreamingProvider(

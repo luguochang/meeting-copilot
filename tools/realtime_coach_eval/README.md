@@ -25,3 +25,5 @@ npm ci --ignore-scripts --no-audit --no-fund
 ```
 
 The report includes intervention precision/recall, silent accuracy, required-evidence accuracy, deadline pass rate, P50/P95 latency, Agent turns, Pi fallback count, and provider errors. A faux-provider smoke proves SDK wiring only; it is not product-quality evidence.
+
+Each case may set `coach_skill_id` to `general`, `decision`, `project`, `interview`, or `brainstorm`. The report includes both the overall score and `score_by_skill`. For realtime acceptance, use at least 20 intervention and 20 silence cases per skill; target P95 decision latency at or below 3,500 ms and reject any run that exceeds the 10,000 ms hard budget.

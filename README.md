@@ -8,7 +8,7 @@
 
 ![言迹 Talktrace 界面预览](docs/assets/talktrace-tour.gif)
 
-> 当前 `feat/pi-realtime-coach-agent-loop` 分支集成 Pi SDK 作为实时教练 Agent runtime，尚未合并到 `main`。Pi 不替代 ASR 或底层 LLM，而是在稳定转写之上增加持续会话、工具调用、历史检索、介入判断和可审计的 Agent Loop。
+> 当前 `feat/pi-realtime-coach-agent-loop` 分支集成 Pi SDK 作为实时教练 Agent runtime，尚未合并到 `main`。Pi 不替代 ASR 或底层 LLM，而是在稳定转写之上增加持续会话、工具调用、历史检索、介入判断和可审计的 Agent Loop。场景技能包的产品与技术方案见 [`docs/pi-coach-skill-packs.md`](docs/pi-coach-skill-packs.md)。
 
 ## 产品工作方式
 
@@ -128,7 +128,7 @@ flowchart LR
 
 原有 LLM 链路适合把一个文本批次转换成主题、待办或纪要，但它本质上仍是一次请求、一次响应。Pi SDK 被用于需要跨轮状态和明确行动边界的实时教练，不用于替代已经能完成结构化抽取的普通 LLM 调用。
 
-Pi Agent Loop 每轮执行以下检查：
+Pi Agent Loop 每轮执行基础 6 项检查，并叠加当前技能包的 1 项场景检查：
 
 | 检查项 | 关注的问题 | 典型输出 |
 | --- | --- | --- |
@@ -170,6 +170,7 @@ Pi 相对单次 LLM 增加的是运行机制，而不是一个新的模型能力
 | 每轮上下文主要依赖 Prompt 拼接 | 会议级 Session + 按需历史检索 | 跨多轮理解较早条件，同时控制上下文和调用成本 |
 | 新一轮结果覆盖右侧旧内容 | 12 条教练历史 + 10 条最近讨论的有界时间线 | 用户错过即时提示后仍能回看，不形成无限卡片墙 |
 | 静默时看起来像 AI 没工作 | `keep_silent`、checklist 指标和静默原因可见 | 能知道 Pi 已检查，只是判断当前不应打断 |
+| 不同场景得到同一种泛化建议 | 版本化场景技能包、专属检查项和事件白名单 | 决策、项目、访谈和头脑风暴各自关注不同的下一步缺口 |
 | 旧建议在问题解决后仍可能显得有效 | 最新静默轮次撤下主卡，旧建议进入历史 | 不把已经解决的问题继续当作当前风险 |
 | 转写精修可能使在途证据过期 | 取消旧任务并对最新 evidence hash 补排分析 | 左侧文字修订后，教练不会永久漏掉本轮分析 |
 | Agent runtime 异常可能阻断建议 | Pi 自动回退 direct LLM | 降级可见，基础 AI 能力继续工作 |
