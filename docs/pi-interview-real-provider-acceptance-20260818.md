@@ -38,7 +38,7 @@ The first recommendation asked for the most recent export episode. The second as
 On the `会议重点` tab, the real Workbench showed:
 
 - `用户访谈` scene skill badge
-- `Pi 教练监听中` runtime status
+- `Pi 教练等待录音` runtime status：本次验收使用直接文字注入，没有启用麦克风；Pi 处理的是已注入的文字，不代表页面正在收音
 - current `discovery_gap` recommendation and urgency
 - intervention reason
 - `查看依据` control and the verbatim transcript evidence
@@ -53,5 +53,7 @@ Screenshots are kept locally at:
 ## Result
 
 The real-provider and Pi integration gate passed: the page result is a new `discovery_gap` intervention produced by Pi with no direct-LLM fallback, and the page exposes its reason, evidence, and retained history.
+
+The follow-up status fix is recorded in commit `c56dfdc`: a live meeting without a recording session or durable audio chunk now reports `等待录音`, and the Pi badge reports `Pi 教练等待录音`. This prevents an injected-text acceptance fixture from appearing to listen to the microphone.
 
 The latency target did not pass in this run. Pi coach elapsed time was 6.76 s and 8.76 s; the intelligence provider-total sample was 10.61 s. This is an observed performance gap, not a mocked or suppressed result, and should be addressed separately before claiming a 3.5 s P95 target.
