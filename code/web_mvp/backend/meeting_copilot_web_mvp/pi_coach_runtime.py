@@ -89,8 +89,11 @@ def build_pi_coach_request(
             # prompt small and let the bounded search tool retrieve older
             # evidence only when the current decision needs it.
             "context_paragraphs": [asdict(item) for item in request.context_paragraphs[-2:]],
-            "retrieval_paragraphs": [asdict(item) for item in request.retrieval_paragraphs[-12:]],
-            "semantic_windows": [asdict(item) for item in request.semantic_windows[-4:]],
+            # Historical evidence is available through Pi's bounded search
+            # tool. Keep the initial prompt small; replaying a long meeting
+            # here made later coach turns pay for the same text repeatedly.
+            "retrieval_paragraphs": [asdict(item) for item in request.retrieval_paragraphs[-8:]],
+            "semantic_windows": [asdict(item) for item in request.semantic_windows[-2:]],
             "rolling_state": dict(request.rolling_state),
             "meeting_goal": request.meeting_goal,
             "coach_skill": coach_skill_payload(request.coach_skill_id),

@@ -25,7 +25,10 @@ const URGENCIES = new Set(["low", "medium", "high"]);
 // Keep a short stateful session without replaying an entire meeting into
 // every model call. Older evidence remains available through the bounded
 // search tool when a contradiction or open commitment requires it.
-const MAX_SESSION_USER_TURNS = 3;
+// The host sends the current rolling state and fresh evidence on every
+// evaluation. Keep only two prior decisions in the Pi session so session
+// reuse preserves continuity without replaying a growing prompt every turn.
+const MAX_SESSION_USER_TURNS = 2;
 const MAX_AGENT_TURNS_PER_EVALUATION = 2;
 const MAX_TOOL_CALLS_PER_EVALUATION = 4;
 const MAX_SESSIONS = 8;
