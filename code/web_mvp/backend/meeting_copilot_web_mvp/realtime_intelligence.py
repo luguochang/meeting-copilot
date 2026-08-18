@@ -692,17 +692,57 @@ def should_run_realtime_coach(
     *,
     requested_runtime: str = "direct",
 ) -> bool:
-    """Run Pi for every new audio turn while keeping direct mode conservative.
+    """Gate Pi on a likely coaching moment instead of every microphone turn.
 
-    System audio is the one source where Talktrace can conservatively infer
-    that a remote party, rather than the local microphone environment, spoke.
+    Pi is useful for stateful decisions, not for paraphrasing ordinary speech.
+    The lexical gate is intentionally permissive and only controls whether the
+    expensive coach lane runs; ASR and the normal intelligence lane are left
+    untouched. System audio remains eligible for the direct lane because it is
+    the strongest signal that a remote question or commitment just happened.
     """
 
     if not isinstance(request, RealtimeIntelligenceRequest):
         raise TypeError("request must be a RealtimeIntelligenceRequest")
     source_tracks = {item.source_track for item in request.new_paragraphs}
     if str(requested_runtime or "direct").strip().lower() == "pi":
-        return bool(source_tracks & {"system_audio", "microphone"})
+        if not source_tracks & {"system_audio", "microphone"}:
+            return False
+        text = " ".join(item.text for item in request.new_paragraphs).casefold()
+        # Questions and execution/decision language are high-signal moments
+        # for a private coach. A longer multi-paragraph turn is also eligible
+        # for the clarity check, while isolated ASR fragments stay silent.
+        signal_terms = (
+            "?",
+            "？",
+            "吗",
+            "能否",
+            "是否",
+            "为什么",
+            "怎么",
+            "什么时候",
+            "请问",
+            "承诺",
+            "保证",
+            "一定",
+            "上线",
+            "交付",
+            "截止",
+            "负责人",
+            "验收",
+            "预算",
+            "成本",
+            "风险",
+            "阻塞",
+            "决定",
+            "结论",
+            "方案",
+            "下一步",
+            "完成",
+            "需要",
+        )
+        if any(term in text for term in signal_terms):
+            return True
+        return len(request.new_paragraphs) >= 2 and len(text) >= 120
     return "system_audio" in source_tracks
 
 

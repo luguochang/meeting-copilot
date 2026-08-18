@@ -85,9 +85,12 @@ def build_pi_coach_request(
         "context": {
             "state_revision": int(request.state_revision),
             "new_paragraphs": [asdict(item) for item in request.new_paragraphs],
-            "context_paragraphs": [asdict(item) for item in request.context_paragraphs],
-            "retrieval_paragraphs": [asdict(item) for item in request.retrieval_paragraphs],
-            "semantic_windows": [asdict(item) for item in request.semantic_windows],
+            # Pi is a decision lane, not the transcript index. Keep its
+            # prompt small and let the bounded search tool retrieve older
+            # evidence only when the current decision needs it.
+            "context_paragraphs": [asdict(item) for item in request.context_paragraphs[-2:]],
+            "retrieval_paragraphs": [asdict(item) for item in request.retrieval_paragraphs[-12:]],
+            "semantic_windows": [asdict(item) for item in request.semantic_windows[-4:]],
             "rolling_state": dict(request.rolling_state),
             "meeting_goal": request.meeting_goal,
             "coach_skill": coach_skill_payload(request.coach_skill_id),

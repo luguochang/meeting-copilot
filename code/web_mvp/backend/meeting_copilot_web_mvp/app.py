@@ -642,6 +642,12 @@ def _coach_runtime_capability(
     history_searches = max(0, int(metrics.get("history_searches") or 0))
     agent_turns = max(0, int(metrics.get("turns") or 0))
     tool_calls = max(0, int(metrics.get("tool_calls") or 0))
+    usage = coach.get("usage") if isinstance(coach.get("usage"), Mapping) else metrics.get("usage")
+    total_tokens = (
+        max(0, int(usage.get("total_tokens") or 0))
+        if isinstance(usage, Mapping)
+        else 0
+    )
     session_reused = metrics.get("session_reused") is True
     elapsed_ms = metrics.get("elapsed_ms") or metrics.get("decision_latency_ms")
     detail_parts = [f"本轮完成 {checklist_count or 6} 项检查"]
@@ -649,6 +655,8 @@ def _coach_runtime_capability(
         detail_parts.append(f"{agent_turns} 轮 Agent")
     if tool_calls:
         detail_parts.append(f"{tool_calls} 次工具调用")
+    if total_tokens:
+        detail_parts.append(f"{total_tokens} tokens")
     if history_searches:
         detail_parts.append(f"检索历史 {history_searches} 次")
     if isinstance(elapsed_ms, (int, float)) and elapsed_ms > 0:

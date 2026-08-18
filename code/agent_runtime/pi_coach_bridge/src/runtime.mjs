@@ -22,7 +22,10 @@ const EVENT_TYPES = new Set([
 ]);
 const SUPPORTED_SKILL_IDS = new Set(["general", "decision", "project", "interview", "brainstorm"]);
 const URGENCIES = new Set(["low", "medium", "high"]);
-const MAX_SESSION_USER_TURNS = 4;
+// Keep a short stateful session without replaying an entire meeting into
+// every model call. Older evidence remains available through the bounded
+// search tool when a contradiction or open commitment requires it.
+const MAX_SESSION_USER_TURNS = 3;
 const MAX_AGENT_TURNS_PER_EVALUATION = 2;
 const MAX_TOOL_CALLS_PER_EVALUATION = 4;
 const MAX_SESSIONS = 8;
@@ -480,10 +483,21 @@ function selectContext(scope, context) {
 }
 
 function contextSignals(context) {
+  const state = context.rolling_state && typeof context.rolling_state === "object"
+    ? context.rolling_state
+    : {};
+  const openItems = Array.isArray(state.open_items)
+    ? state.open_items.slice(-6)
+    : [];
+  const compactState = {};
+  for (const key of ["topic", "summary", "version"]) {
+    if (state[key] !== undefined) compactState[key] = state[key];
+  }
+  if (openItems.length > 0) compactState.open_items = openItems;
   return {
     meeting_goal: context.meeting_goal,
-    rolling_state: context.rolling_state,
-    recent_context_paragraphs: context.context_paragraphs,
+    rolling_state: compactState,
+    recent_context_paragraphs: context.context_paragraphs.slice(-2),
     coach_skill_id: context.coach_skill.id,
   };
 }
