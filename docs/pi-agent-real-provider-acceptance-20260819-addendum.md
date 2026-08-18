@@ -16,6 +16,7 @@ The local WAV replay retained 120 seconds of audio and 9 authoritative transcrip
 - Actionable phrase: answer `我做得对吗` before continuing the unrelated quotation
 - Runtime: 7 checklist items, 1 agent turn, 1 `submit_intervention`, 9,592 total tokens, about 7.2 seconds
 - Screenshot: `artifacts/tmp/pi-agent-agent-eval-20260819/long-audio-pi-coach.png`
+- Existing 8766 history view with three retained prior interventions: `artifacts/tmp/pi-agent-agent-eval-20260819/current-coach-page.png`
 
 This is the useful product behavior: Pi decides whether to interrupt, validates verbatim evidence, and turns a live problem into one sentence the user can say immediately. It is not a second meeting summarizer.
 
