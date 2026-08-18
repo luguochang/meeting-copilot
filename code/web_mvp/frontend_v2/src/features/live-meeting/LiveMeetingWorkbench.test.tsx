@@ -309,6 +309,27 @@ function microphoneController(
 }
 
 describe("LiveMeetingWorkbench", () => {
+  it("makes inactive capture explicit before speech can be mistaken for recorded input", async () => {
+    const user = userEvent.setup();
+    const { api, transport } = dependencies();
+
+    render(
+      <LiveMeetingWorkbench
+        meetingId="meeting-1"
+        api={api}
+        transport={transport}
+        microphoneController={microphoneController()}
+      />,
+    );
+
+    const warning = await screen.findByRole("alert");
+    expect(warning).toHaveTextContent("当前没有录音输入");
+    expect(warning).toHaveTextContent("Pi 教练也不会收到新内容");
+
+    await user.click(within(warning).getByRole("button", { name: "立即开始录音" }));
+    expect(await screen.findByRole("dialog", { name: "准备开始会议" })).toBeVisible();
+  });
+
   it("shows recording, ASR, refinement, speaker, LLM and task states independently", async () => {
     const { api, transport } = dependencies();
     render(

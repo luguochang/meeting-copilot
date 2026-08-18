@@ -516,7 +516,7 @@ export function LiveMeetingWorkbench({
   return (
     <div className={`product-app ${meetingEnded ? "product-app--review" : "product-app--live"}`}>
       <ProductNavigation active="live" onOpenMeetings={onBackToMeetings} onOpenNotes={onOpenNotes} onOpenCapabilities={onOpenCapabilities} />
-      <div className={`workbench-shell${nativeSystemAudioHealth || transcriptBackfill ? " workbench-shell--status-band" : ""}`}>
+      <div className={`workbench-shell${nativeSystemAudioHealth || transcriptBackfill || canStartCapture ? " workbench-shell--status-band" : ""}`}>
       <header className="app-header">
         <div className="meeting-identity">
           {onBackToMeetings ? (
@@ -616,8 +616,25 @@ export function LiveMeetingWorkbench({
         </div>
       </header>
 
-      {nativeSystemAudioHealth || transcriptBackfill ? (
+      {nativeSystemAudioHealth || transcriptBackfill || canStartCapture ? (
         <div className="meeting-status-bands">
+        {canStartCapture ? (
+          <div className="capture-inactive-status" role="alert" aria-live="polite">
+            <AlertCircle size={17} aria-hidden="true" />
+            <div>
+              <strong>{microphone.state.phase === "error" ? "录音已中断" : "当前没有录音输入"}</strong>
+              <span>现在说话不会进入会议文字，Pi 教练也不会收到新内容。</span>
+            </div>
+            <button
+              className="start-recording-button capture-inactive-status__action"
+              type="button"
+              onClick={() => setPreflightOpen(true)}
+            >
+              <Mic size={15} />
+              {microphone.state.phase === "error" ? "立即恢复录音" : "立即开始录音"}
+            </button>
+          </div>
+        ) : null}
         {transcriptBackfill ? (
           <div
             className={`transcript-backfill-status transcript-backfill-status--${transcriptBackfill.status}`}
