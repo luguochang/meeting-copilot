@@ -877,7 +877,7 @@ async def run_realtime_coach_via_pi(
         timeout_seconds=float(provider_config.get("timeout_seconds") or 25.0),
     )
     result = await pi_runtime.evaluate(payload)
-    metrics = result.get("metrics") if isinstance(result.get("metrics"), Mapping) else {}
+    metrics = dict(result.get("metrics")) if isinstance(result.get("metrics"), Mapping) else {}
     usage = metrics.get("usage") if isinstance(metrics.get("usage"), Mapping) else None
     await _notify_callback(on_usage, dict(usage) if usage is not None else None, 1)
     intervention = parse_realtime_coach_response(
@@ -886,6 +886,20 @@ async def run_realtime_coach_via_pi(
     )
     if intervention is not None and intervention.confidence < 0.78:
         intervention = None
+    decision_reason = str(result.get("decision_reason") or "")[:160] or None
+    if intervention is not None and set(intervention.evidence_segment_ids).isdisjoint(
+        request.writable_paragraph_ids
+    ):
+        intervention = None
+        metrics.update(
+            {
+                "intervention_suppressed": True,
+                "suppression_reason": "stale_evidence",
+            }
+        )
+        decision_reason = (
+            "Pi 建议未引用本轮新内容，已抑制重复提醒，保留上一条有依据建议。"
+        )
     elapsed_ms = float(metrics.get("elapsed_ms") or 0.0)
     return {
         "intervention": intervention,
@@ -896,8 +910,8 @@ async def run_realtime_coach_via_pi(
         "model": str(provider_config.get("model") or ""),
         "response_id": request_id,
         "finish_reason": str(result.get("action") or ""),
-        "decision_reason": str(result.get("decision_reason") or "")[:160] or None,
-        "agent_metrics": dict(metrics),
+        "decision_reason": decision_reason,
+        "agent_metrics": metrics,
     }
 
 

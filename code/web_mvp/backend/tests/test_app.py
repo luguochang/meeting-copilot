@@ -97,7 +97,10 @@ def test_coach_history_retains_advice_across_silent_rounds_and_deduplicates():
     assert history[0]["reason"] == repeated["reason"]
     assert history[0]["history_id"] == "event-3"
     assert history[-1]["formal_evidence"]["segment_ids"] == ["segment-4"]
-    assert app_module._latest_formal_coach_follow_up(events) is None
+    latest = app_module._latest_formal_coach_follow_up(events)
+    assert latest is not None
+    assert latest["question"] == second["question"]
+    assert latest["formal_evidence"]["segment_ids"] == ["segment-4"]
 
 
 def test_recent_context_history_is_mixed_deduplicated_and_bounded():

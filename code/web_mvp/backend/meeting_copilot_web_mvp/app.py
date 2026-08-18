@@ -10749,24 +10749,18 @@ def _bounded_formal_coach_history(
 def _latest_formal_coach_follow_up(
     formal_events: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
-    latest_event = next(
-        (
-            event for event in reversed(formal_events)
-            if event.get("type") == "meeting.intelligence.applied"
-        ),
-        None,
-    )
-    if latest_event is None:
-        return None
-    payload = latest_event.get("payload") if isinstance(latest_event.get("payload"), dict) else {}
-    follow_up = payload.get("follow_up")
-    if not isinstance(follow_up, dict):
-        return None
-    question = str(follow_up.get("question") or "").strip()
-    reason = str(follow_up.get("reason") or "").strip()
-    if not question or not reason:
-        return None
-    return {**follow_up, **_formal_projection_metadata(latest_event)}
+    for event in reversed(formal_events):
+        if event.get("type") != "meeting.intelligence.applied":
+            continue
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        follow_up = payload.get("follow_up")
+        if not isinstance(follow_up, dict):
+            continue
+        question = str(follow_up.get("question") or "").strip()
+        reason = str(follow_up.get("reason") or "").strip()
+        if question and reason:
+            return {**follow_up, **_formal_projection_metadata(event)}
+    return None
 
 
 def _bounded_recent_context_history(

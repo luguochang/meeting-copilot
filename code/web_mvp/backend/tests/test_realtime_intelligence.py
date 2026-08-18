@@ -864,6 +864,85 @@ async def _test_pi_coach_runner_preserves_the_existing_evidence_contract() -> No
     assert usages == [(1, {"prompt_tokens": 90, "completion_tokens": 20, "total_tokens": 110})]
 
 
+def test_pi_coach_suppresses_an_intervention_grounded_only_in_old_context() -> None:
+    asyncio.run(_test_pi_coach_suppresses_an_intervention_grounded_only_in_old_context())
+
+
+async def _test_pi_coach_suppresses_an_intervention_grounded_only_in_old_context() -> None:
+    request = _coach_request()
+    pi_runtime = _PiRuntime(
+        {
+            "action": "intervention",
+            "intervention": {
+                "event_type": "commitment_risk",
+                "title": "重复提醒",
+                "recommendation": "请再次说明压测完成后才能承诺上线日期。",
+                "reason": "历史上下文提到压测尚未完成。",
+                "evidence_segment_ids": ["local-3"],
+                "evidence_quote": request.context_paragraphs[0].text,
+                "urgency": "medium",
+                "confidence": 0.91,
+            },
+            "metrics": {"turns": 1, "tool_calls": 1},
+            "decision_reason": None,
+        }
+    )
+
+    result = await run_realtime_coach_routed(
+        request=request,
+        provider=_Provider(json.dumps({"intervention": None})),
+        requested_runtime="pi",
+        pi_runtime=pi_runtime,
+        pi_provider_config=_pi_provider_config(),
+    )
+
+    assert result["intervention"] is None
+    assert result["runtime_used"] == "pi"
+    assert result["decision_reason"] == (
+        "Pi 建议未引用本轮新内容，已抑制重复提醒，保留上一条有依据建议。"
+    )
+    assert result["agent_metrics"]["intervention_suppressed"] is True
+    assert result["agent_metrics"]["suppression_reason"] == "stale_evidence"
+
+
+def test_pi_coach_allows_combined_new_and_historical_evidence() -> None:
+    asyncio.run(_test_pi_coach_allows_combined_new_and_historical_evidence())
+
+
+async def _test_pi_coach_allows_combined_new_and_historical_evidence() -> None:
+    request = _coach_request()
+    pi_runtime = _PiRuntime(
+        {
+            "action": "intervention",
+            "intervention": {
+                "event_type": "commitment_risk",
+                "title": "先限定承诺条件",
+                "recommendation": "先说明压测尚未完成，再把周五定义为有条件目标。",
+                "reason": "新问题要求明确承诺，而历史证据表明压测尚未完成。",
+                "evidence_segment_ids": ["local-3", "remote-4"],
+                "evidence_quote": request.context_paragraphs[0].text,
+                "urgency": "high",
+                "confidence": 0.93,
+            },
+            "metrics": {"turns": 1, "tool_calls": 1},
+            "decision_reason": None,
+        }
+    )
+
+    result = await run_realtime_coach_routed(
+        request=request,
+        provider=_Provider(json.dumps({"intervention": None})),
+        requested_runtime="pi",
+        pi_runtime=pi_runtime,
+        pi_provider_config=_pi_provider_config(),
+    )
+
+    assert result["intervention"] is not None
+    assert result["intervention"].evidence_segment_ids == ("local-3", "remote-4")
+    assert result["runtime_used"] == "pi"
+    assert result["agent_metrics"].get("intervention_suppressed") is None
+
+
 def test_pi_runtime_failure_falls_back_to_the_direct_coach() -> None:
     asyncio.run(_test_pi_runtime_failure_falls_back_to_the_direct_coach())
 
