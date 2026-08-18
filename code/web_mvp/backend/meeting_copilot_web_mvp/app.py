@@ -571,6 +571,7 @@ def _coach_runtime_capability(
     enabled: bool,
     provider_configured: bool,
     active: bool,
+    capture_active: bool = True,
     requested_runtime: str,
     latest_job: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
@@ -594,6 +595,13 @@ def _coach_runtime_capability(
             "state": "busy",
             "label": "Pi 教练正在检查" if requested == "pi" else "实时教练正在检查",
             "detail": "问题、承诺、目标、口径、表达清晰和介入价值",
+        }
+
+    if not capture_active:
+        return {
+            "state": "idle",
+            "label": "Pi 教练等待录音" if requested == "pi" else "实时教练等待录音",
+            "detail": "当前没有录音输入；开始录音后才会检查新的会议文字，已有建议仍保留。",
         }
 
     output = latest_job.get("output") if isinstance(latest_job, Mapping) else None
@@ -1558,6 +1566,7 @@ def create_app(
                 enabled=coach_policy_enabled,
                 provider_configured=provider_config is not None,
                 active=bool(active_jobs),
+                capture_active=(projected.get("audio") or {}).get("status") == "recording",
                 requested_runtime=configured_coach_runtime(),
                 latest_job=latest_job,
             ),

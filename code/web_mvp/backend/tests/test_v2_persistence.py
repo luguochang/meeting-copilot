@@ -2794,6 +2794,16 @@ def test_audio_chunk_fact_is_idempotent_and_visible_before_first_final(persisten
     assert persistence.get_snapshot("audio-meeting")["runtime"]["phase"] == "live"
 
 
+def test_live_meeting_without_capture_session_reports_waiting_for_recording(persistence):
+    persistence.create_meeting(meeting_id="live-before-capture", title=None, now_ms=1_000)
+
+    snapshot = persistence.get_snapshot("live-before-capture")
+
+    assert snapshot["runtime"]["phase"] == "live"
+    assert snapshot["runtime"]["recording"]["state"] == "unknown"
+    assert snapshot["audio"]["status"] == "unknown"
+
+
 def test_native_audio_chunk_source_range_is_durable_and_part_of_idempotency(persistence):
     parameters = {
         "meeting_id": "native-range",

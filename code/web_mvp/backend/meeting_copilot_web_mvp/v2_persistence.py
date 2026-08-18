@@ -7163,19 +7163,23 @@ class V2Persistence:
         ]
         review_documents = {str(row["document_kind"]): self._review_document_dict(row) for row in review_document_rows}
         recording_statuses = {str(row["status"]) for row in recording_rows}
-        audio_status = (
-            "failed"
-            if "failed" in recording_statuses
-            else "recording"
-            if "active" in recording_statuses
-            else "assembling"
-            if recording_statuses & {"sealed", "exporting", "interrupted"}
-            else "saved"
-            if "ready" in recording_statuses or (audio_rows and meeting is not None and meeting["state"] != "live")
-            else "recording"
-            if meeting is not None and meeting["state"] == "live"
-            else "unknown"
-        )
+        if "failed" in recording_statuses:
+            audio_status = "failed"
+        elif "active" in recording_statuses:
+            audio_status = "recording"
+        elif recording_statuses & {"sealed", "exporting", "interrupted"}:
+            audio_status = "assembling"
+        elif "ready" in recording_statuses or (
+            audio_rows and meeting is not None and meeting["state"] != "live"
+        ):
+            audio_status = "saved"
+        elif audio_rows:
+            audio_status = "recording"
+        else:
+            # A live meeting is created before the capture transport starts.
+            # Without an active session or durable audio chunk, report that
+            # waiting state instead of claiming that recording is active.
+            audio_status = "unknown"
         recording_indicator = (
             {"state": "error", "label": "录音整理失败"}
             if audio_status == "failed"

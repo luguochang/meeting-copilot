@@ -166,6 +166,23 @@ def test_coach_runtime_capability_exposes_pi_loop_metrics():
     }
 
 
+def test_coach_runtime_capability_waits_for_capture_input():
+    capability = app_module._coach_runtime_capability(
+        enabled=True,
+        provider_configured=True,
+        active=False,
+        capture_active=False,
+        requested_runtime="pi",
+        latest_job={"output": {"coach": {"runtime_used": "pi"}}},
+    )
+
+    assert capability == {
+        "state": "idle",
+        "label": "Pi 教练等待录音",
+        "detail": "当前没有录音输入；开始录音后才会检查新的会议文字，已有建议仍保留。",
+    }
+
+
 def test_coach_runtime_capability_makes_pi_fallback_visible():
     capability = app_module._coach_runtime_capability(
         enabled=True,
