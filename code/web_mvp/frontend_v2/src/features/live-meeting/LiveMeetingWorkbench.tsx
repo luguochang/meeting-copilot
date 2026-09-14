@@ -188,6 +188,7 @@ export function LiveMeetingWorkbench({
   const [transcriptSelection, setTranscriptSelection] = useState<TranscriptSelection | null>(null);
   const [askSelectionNonce, setAskSelectionNonce] = useState(0);
   const [askSelectionAction, setAskSelectionAction] = useState<TranscriptSelectionAction>("ask");
+  const [preparationRefreshKey, setPreparationRefreshKey] = useState(0);
 
   useEffect(() => {
     if (!message) return;
@@ -235,6 +236,7 @@ export function LiveMeetingWorkbench({
       await api.createMeeting(activeMeetingId, preparation.title ?? null, preparation.inputSource);
       meetingCreated = true;
       await api.saveMeetingPreparation(activeMeetingId, preparation);
+      setPreparationRefreshKey((current) => current + 1);
       if (createdFromList) onOpenMeeting?.(activeMeetingId);
       await microphone.start(activeMeetingId, {
         inputDeviceId: preparation.inputDeviceId,
@@ -748,8 +750,11 @@ export function LiveMeetingWorkbench({
             selection={transcriptSelection}
             askSelectionNonce={askSelectionNonce}
             selectionAction={askSelectionAction}
+            preparationRefreshKey={preparationRefreshKey}
             currentTopic={state.currentTopic}
             followUp={state.followUp}
+            semanticFollowUp={state.semanticFollowUp}
+            coachDecision={state.coachDecision}
             coachHistory={state.coachHistory}
             recentContextHistory={state.recentContextHistory}
             coachRuntime={taskCapabilities.realtime_suggestions}

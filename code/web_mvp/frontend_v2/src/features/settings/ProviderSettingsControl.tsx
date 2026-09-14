@@ -1,5 +1,6 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
+  AlertTriangle,
   BookOpenText,
   Check,
   CheckCircle2,
@@ -15,8 +16,10 @@ import {
 import { type FormEvent, type MouseEvent, useCallback, useEffect, useState } from "react";
 import { fetchProviderStatus } from "../../api/client";
 import {
+  parseProviderProbeResult,
   reconcileProviderStatus,
   type ProviderProbeStatus,
+  type ProviderProbeResult,
   type ProviderStatus,
 } from "../../api/schema";
 import { resolveTauriInvoke } from "../../desktop/tauri";
@@ -30,6 +33,13 @@ interface ProviderConfigResponse {
   base_url: string | null;
   model: string | null;
   realtime_model: string | null;
+  realtime_model_source?: string | null;
+  realtime_model_explicit?: boolean;
+  realtime_model_warning?: string | null;
+  correction_model: string | null;
+  correction_model_source?: string | null;
+  correction_model_explicit?: boolean;
+  correction_model_warning?: string | null;
   api_style: ProviderApiStyle | null;
   provider_label: string;
   runtime_synced: boolean;
@@ -57,6 +67,7 @@ interface CostStatsResponse {
 }
 
 type ProviderPhase = "loading" | "unavailable" | "unconfigured" | "saved" | "configured" | "error";
+type ProviderConnectionState = "testing" | "connected" | "slow" | "unknown" | "failed" | "untested" | "unconfigured";
 
 const DEFAULT_BASE_URL = "https://codexai.club";
 const BASE_URL_PLACEHOLDER = "https://api.example.com/v1";
@@ -72,6 +83,13 @@ const emptyResponse: ProviderConfigResponse = {
   base_url: null,
   model: null,
   realtime_model: null,
+  realtime_model_source: "not_configured",
+  realtime_model_explicit: false,
+  realtime_model_warning: null,
+  correction_model: null,
+  correction_model_source: "not_configured",
+  correction_model_explicit: false,
+  correction_model_warning: null,
   api_style: null,
   provider_label: "openai_compatible_gateway",
   runtime_synced: false,
@@ -84,6 +102,11 @@ const emptyProviderStatus: ProviderStatus = {
   probe_status: "not_run",
   model: null,
   realtime_model: null,
+  operational: null,
+  realtime_ready: null,
+  probe_latency_ms: null,
+  probe_usage: null,
+  realtime_cutoff_ms: 2_500,
 };
 
 function phaseFor(response: ProviderConfigResponse, status: ProviderStatus): ProviderPhase {
@@ -94,6 +117,39 @@ function phaseFor(response: ProviderConfigResponse, status: ProviderStatus): Pro
 
 function responseError(response: ProviderConfigResponse, fallback: string): Error {
   return new Error(response.errors.filter(Boolean).join("；") || fallback);
+}
+
+function editableRealtimeModel(response: ProviderConfigResponse): string {
+  if (response.realtime_model_explicit === false) return "";
+  return response.realtime_model ?? response.model ?? "";
+}
+
+function editableCorrectionModel(response: ProviderConfigResponse): string {
+  if (response.correction_model_explicit === false) return "";
+  return response.correction_model ?? response.model ?? "";
+}
+
+function statusAfterProbe(
+  base: ProviderStatus,
+  probeResult: ProviderProbeResult | null,
+): ProviderStatus {
+  return {
+    ...base,
+    // A successful HTTP response without a valid readiness contract is not a
+    // successful probe. Keep the runtime connected, but require a fresh test.
+    probe_status: probeResult ? "succeeded" : "not_run",
+    operational: probeResult?.operational ?? null,
+    realtime_ready: probeResult?.realtime_ready ?? null,
+    probe_latency_ms: probeResult?.probe_latency_ms ?? null,
+    probe_usage: probeResult?.usage ?? null,
+    realtime_cutoff_ms: probeResult?.realtime_cutoff_ms ?? base.realtime_cutoff_ms,
+  };
+}
+
+function probeSuccessMessage(probeResult: ProviderProbeResult | null, suffix = ""): string {
+  if (probeResult?.realtime_ready === true) return `Provider 探测通过，实时稳定性待验收${suffix}`;
+  if (probeResult?.realtime_ready === false) return `Provider 已连接，但单次探测超过实时窗口${suffix}`;
+  return `Provider 已连接，实时性待确认${suffix}`;
 }
 
 async function getJson<T>(path: string): Promise<T> {
@@ -135,13 +191,25 @@ function formatTokenCount(value: number): string {
   return new Intl.NumberFormat("zh-CN").format(value);
 }
 
-async function verifyProviderConnection(): Promise<void> {
+async function verifyProviderConnection(): Promise<ProviderProbeResult | null> {
   const response = await fetch("/providers/llm/probe", {
     method: "POST",
     headers: { "X-Meeting-Copilot-Verification": "1" },
   });
-  const body = await response.json().catch(() => null) as { detail?: { message?: string } } | null;
-  if (!response.ok) throw new Error(body?.detail?.message ?? `连接测试失败（${response.status}）`);
+  const body = await response.json().catch(() => null) as {
+    detail?: { message?: unknown };
+  } | null;
+  if (!response.ok) {
+    const detailMessage = typeof body?.detail?.message === "string" ? body.detail.message : null;
+    throw new Error(detailMessage ?? `连接测试失败（${response.status}）`);
+  }
+  try {
+    return parseProviderProbeResult(body);
+  } catch {
+    // Older sidecars returned only {ok:true}. The connection result remains
+    // useful, but readiness must stay unknown until a full probe is available.
+    return null;
+  }
 }
 
 function formatCost(value: number, currency: string): string {
@@ -201,6 +269,7 @@ export function ProviderSettingsControl() {
   const [baseUrl, setBaseUrl] = useState(DEFAULT_BASE_URL);
   const [model, setModel] = useState(DEFAULT_MODEL);
   const [realtimeModel, setRealtimeModel] = useState("");
+  const [correctionModel, setCorrectionModel] = useState("");
   const [apiStyle, setApiStyle] = useState<ProviderApiStyle>("chat_completions");
   const [apiKey, setApiKey] = useState("");
   const [busy, setBusy] = useState<"save" | "probe" | "clear" | null>(null);
@@ -227,7 +296,8 @@ export function ProviderSettingsControl() {
       setProviderStatus(status);
       setBaseUrl(response.base_url ?? DEFAULT_BASE_URL);
       setModel(response.model ?? DEFAULT_MODEL);
-      setRealtimeModel(response.realtime_model ?? response.model ?? "");
+      setRealtimeModel(editableRealtimeModel(response));
+      setCorrectionModel(editableCorrectionModel(response));
       setApiStyle(response.api_style ?? "chat_completions");
       setPhase(phaseFor(response, status));
       setError(response.command_status === "ok" ? null : response.errors.join("；"));
@@ -268,6 +338,7 @@ export function ProviderSettingsControl() {
           apiKey,
           model: model.trim(),
           realtimeModel: realtimeModel.trim() || null,
+          correctionModel: correctionModel.trim() || null,
           apiStyle,
         })
         : await requestWebProviderConfig("PUT", {
@@ -275,6 +346,7 @@ export function ProviderSettingsControl() {
           api_key: apiKey.trim() || null,
           model: model.trim(),
           realtime_model: realtimeModel.trim() || null,
+          correction_model: correctionModel.trim() || null,
           api_style: apiStyle,
         });
       if (response.command_status !== "ok") throw responseError(response, "AI 配置保存失败");
@@ -286,19 +358,24 @@ export function ProviderSettingsControl() {
       if (synced.command_status !== "ok" || !synced.runtime_synced) {
         throw responseError(synced, "AI 配置连接失败");
       }
-      await verifyProviderConnection();
-      const connectedStatus: ProviderStatus = {
+      const probeResult = await verifyProviderConnection();
+      const connectedStatus = statusAfterProbe({
+        ...providerStatus,
         configured: true,
         runtime_synced: true,
-        probe_status: "succeeded",
         model: synced.model,
         realtime_model: synced.realtime_model ?? synced.model,
-      };
+        operational: null,
+        realtime_ready: null,
+        probe_latency_ms: null,
+        probe_usage: null,
+        realtime_cutoff_ms: providerStatus.realtime_cutoff_ms || 2_500,
+      }, probeResult);
       setConfig(synced);
       setProviderStatus(connectedStatus);
       setPhase("configured");
       setApiKey("");
-      setMessage("连接正常，配置已保存");
+      setMessage(probeSuccessMessage(probeResult, "，配置已保存"));
       setConfirmingClear(false);
       setDirty(false);
       await loadUsage();
@@ -316,6 +393,19 @@ export function ProviderSettingsControl() {
     setError(null);
     setMessage(null);
     let activeModel = config.model;
+    let probeBaseStatus: ProviderStatus = {
+      ...providerStatus,
+      configured: true,
+      runtime_synced: true,
+      probe_status: "not_run",
+      model: config.model,
+      realtime_model: config.realtime_model ?? config.model,
+      operational: null,
+      realtime_ready: null,
+      probe_latency_ms: null,
+      probe_usage: null,
+      realtime_cutoff_ms: providerStatus.realtime_cutoff_ms || 2_500,
+    };
     try {
       if (!providerStatus.runtime_synced) {
         const invoke = resolveTauriInvoke();
@@ -327,30 +417,42 @@ export function ProviderSettingsControl() {
         }
         setConfig(synced);
         activeModel = synced.model;
-        const syncedStatus: ProviderStatus = {
+        probeBaseStatus = {
+          ...providerStatus,
           configured: true,
           runtime_synced: true,
           probe_status: "not_run",
           model: synced.model,
           realtime_model: synced.realtime_model ?? synced.model,
+          operational: null,
+          realtime_ready: null,
+          probe_latency_ms: null,
+          probe_usage: null,
+          realtime_cutoff_ms: 2_500,
         };
-        setProviderStatus(syncedStatus);
-        setPhase(phaseFor(synced, syncedStatus));
+        setProviderStatus(probeBaseStatus);
+        setPhase(phaseFor(synced, probeBaseStatus));
       }
-      await verifyProviderConnection();
-      setProviderStatus({
-        configured: true,
-        runtime_synced: true,
-        probe_status: "succeeded",
+      const probeResult = await verifyProviderConnection();
+      const probedStatus = statusAfterProbe({
+        ...probeBaseStatus,
         model: activeModel,
-        realtime_model: config.realtime_model ?? activeModel,
-      });
+      }, probeResult);
+      setProviderStatus(probedStatus);
       setPhase("configured");
-      setMessage("连接正常");
+      setMessage(probeSuccessMessage(probeResult));
       await loadUsage();
     } catch (probeError) {
+      setPhase("error");
       setProviderStatus((current) => current.runtime_synced
-        ? { ...current, probe_status: "failed" }
+        ? {
+          ...current,
+          probe_status: "failed",
+          operational: false,
+          realtime_ready: false,
+          probe_latency_ms: null,
+          probe_usage: null,
+        }
         : current);
       setError(probeError instanceof Error ? probeError.message : "连接测试失败");
     } finally {
@@ -375,6 +477,7 @@ export function ProviderSettingsControl() {
       setBaseUrl(DEFAULT_BASE_URL);
       setModel(DEFAULT_MODEL);
       setRealtimeModel("");
+      setCorrectionModel("");
       setApiStyle("chat_completions");
       setApiKey("");
       setMessage("AI 配置已移除");
@@ -387,12 +490,45 @@ export function ProviderSettingsControl() {
     }
   };
 
+  const probeSucceeded = providerStatus.probe_status === "succeeded";
+  const realtimeReady = probeSucceeded
+    && providerStatus.operational === true
+    && providerStatus.realtime_ready === true;
+  const realtimeSlow = probeSucceeded
+    && providerStatus.operational === true
+    && providerStatus.realtime_ready === false;
+  const realtimeCircuitUnavailable = providerStatus.realtime_circuit?.state === "open"
+    || providerStatus.realtime_circuit?.state === "half_open";
+  const connectionState: ProviderConnectionState = busy === "save" || busy === "probe"
+    ? "testing"
+    : realtimeCircuitUnavailable
+      || providerStatus.probe_status === "failed"
+      || providerStatus.operational === false
+      || phase === "error"
+      ? "failed"
+      : realtimeReady
+        ? "connected"
+        : realtimeSlow
+          ? "slow"
+          : providerStatus.probe_status === "succeeded"
+            || (config.configured && providerStatus.runtime_synced)
+            ? "unknown"
+            : config.configured
+              ? "untested"
+              : "unconfigured";
+
   const triggerLabel = phase === "configured"
-    ? (providerStatus.probe_status === "succeeded"
+    ? (connectionState === "connected"
       ? `AI 已连接 · ${providerStatus.model ?? config.model ?? model}`
-      : providerStatus.probe_status === "failed"
-        ? `AI 连接失败 · ${providerStatus.model ?? config.model ?? model}`
-        : "AI 已配置")
+      : connectionState === "slow"
+        ? "AI 已连接 · 实时延迟较高"
+        : connectionState === "unknown"
+          ? "AI 已连接 · 实时性待确认"
+          : connectionState === "failed"
+            ? realtimeCircuitUnavailable
+              ? `AI 实时通道异常 · ${providerStatus.model ?? config.model ?? model}`
+              : `AI 连接失败 · ${providerStatus.model ?? config.model ?? model}`
+            : "AI 已配置")
     : phase === "saved"
       ? "AI 待连接"
       : phase === "error"
@@ -401,32 +537,47 @@ export function ProviderSettingsControl() {
           ? "读取 AI 配置"
           : "配置 AI";
 
-  const connectionState = busy === "save" || busy === "probe"
-    ? "testing"
-    : providerStatus.probe_status === "succeeded"
-      ? "connected"
-      : providerStatus.probe_status === "failed" || phase === "error"
-        ? "failed"
-        : config.configured
-          ? "untested"
-          : "unconfigured";
-
   const connectionLabel = connectionState === "testing"
     ? "正在测试连接"
     : connectionState === "connected"
-      ? "连接正常"
-      : connectionState === "failed"
-        ? "连接失败"
-        : connectionState === "untested"
-          ? "待测试"
-          : "尚未配置";
+      ? "Provider 探测通过"
+      : connectionState === "slow"
+        ? "已连接，但实时响应过慢"
+        : connectionState === "unknown"
+          ? "已连接，实时性待确认"
+          : connectionState === "failed"
+            ? realtimeCircuitUnavailable
+              ? "实时通道暂不可用"
+              : "连接失败"
+            : connectionState === "untested"
+              ? "待测试"
+              : "尚未配置";
+
+  const realtimeReadinessLabel = connectionState === "slow"
+    ? `单次探测超过实时窗口${providerStatus.probe_latency_ms !== null
+      ? ` · 探测 ${providerStatus.probe_latency_ms}ms > 实时窗口 ${providerStatus.realtime_cutoff_ms}ms`
+      : ""}`
+    : connectionState === "connected"
+      ? `Provider 探测通过 · 实时稳定性待验收 · 探测 ${providerStatus.probe_latency_ms ?? 0}ms`
+      : connectionState === "unknown"
+        ? "实时性待确认 · 请完成一次完整连接测试"
+        : realtimeCircuitUnavailable
+          ? "连续实时请求失败 · 请完成连接测试后恢复"
+        : null;
 
   const markConfigChanged = () => {
     setDirty(true);
     setMessage(null);
     setError(null);
     setProviderStatus((current) => current.probe_status === "succeeded"
-      ? { ...current, probe_status: "not_run" }
+      ? {
+        ...current,
+        probe_status: "not_run",
+        operational: null,
+        realtime_ready: null,
+        probe_latency_ms: null,
+        probe_usage: null,
+      }
       : current);
   };
 
@@ -474,7 +625,9 @@ export function ProviderSettingsControl() {
                     ? <LoaderCircle className="spin" size={18} />
                     : connectionState === "connected"
                       ? <CheckCircle2 size={18} />
-                      : <Settings size={18} />}
+                      : connectionState === "slow" || connectionState === "unknown" || connectionState === "failed"
+                        ? <AlertTriangle size={18} />
+                        : <Settings size={18} />}
                 </span>
                 <div>
                   <strong>{connectionLabel}</strong>
@@ -483,6 +636,11 @@ export function ProviderSettingsControl() {
                       ? `${config.model ?? model}${dirty ? " · 配置有修改" : ""}`
                       : "未配置，不影响本地转写"}
                   </span>
+                  {realtimeReadinessLabel ? (
+                    <span className={providerStatus.realtime_ready === true ? "provider-realtime-ready" : "provider-realtime-warning"} role="status">
+                      {realtimeReadinessLabel}
+                    </span>
+                  ) : null}
                 </div>
                 {config.configured ? (
                   <button
@@ -608,7 +766,32 @@ export function ProviderSettingsControl() {
                           disabled={Boolean(busy)}
                         />
                       </label>
+                      <label>
+                        <span>转写校正模型（可选）</span>
+                        <input
+                          value={correctionModel}
+                          onChange={(event) => {
+                            setCorrectionModel(event.target.value);
+                            markConfigChanged();
+                          }}
+                          placeholder="留空则使用上方模型"
+                          autoComplete="off"
+                          disabled={Boolean(busy)}
+                        />
+                      </label>
                     </div>
+                    {config.realtime_model_warning === "realtime_model_inherits_general_model"
+                      && !realtimeModel.trim() ? (
+                        <p className="inline-warning" role="status">
+                          实时教练当前继承通用模型 {config.model ?? model}。建议单独配置已通过延迟门禁的实时模型。
+                        </p>
+                    ) : null}
+                    {config.correction_model_warning === "correction_model_inherits_general_model"
+                      && !correctionModel.trim() ? (
+                      <p className="inline-warning" role="status">
+                        转写校正当前继承通用模型 {config.model ?? model}。可单独配置更快或更稳定的校正模型。
+                      </p>
+                    ) : null}
                   </details>
 
                   <p className="provider-settings-note">AI 仅接收会议文字，不上传录音。测试连接会发送一次最小请求，可能产生少量费用。</p>

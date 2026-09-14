@@ -185,9 +185,128 @@ export interface OpenQuestionProjection {
   formalAi?: FormalAiProvenance | null;
 }
 
+export type CoachDecisionOrigin =
+  | "pi"
+  | "local_reflex"
+  | "direct_intelligence"
+  | "direct_fallback";
+
+export type CoachDecisionStatus =
+  | "intervention"
+  | "not_triggered"
+  | "protected_silent"
+  | "timed_out"
+  | "failed"
+  | "stale";
+
+export type CoachLifecycleAction = "retain" | "retract" | "deprioritize";
+export type CoachLifecycleStatus = "resolved" | "retracted" | "superseded";
+
+export type LocalReflexKind =
+  | "missing_next_step"
+  | "communication_clarity"
+  | "strong_objection"
+  | "pending_question";
+
+export const LOCAL_REFLEX_EVENT_TYPES = {
+  missing_next_step: "execution_gap",
+  communication_clarity: "communication_clarity",
+  strong_objection: "discovery_gap",
+  pending_question: "question_to_user",
+} as const satisfies Record<LocalReflexKind, NonNullable<FollowUpProjection["coachEventType"]>>;
+
+export interface CoachAgentToolError {
+  tool?: string;
+  code?: string;
+}
+
+export interface CoachAgentMetrics {
+  elapsedMs?: number;
+  decisionLatencyMs?: number;
+  ttftMs?: number;
+  turns?: number;
+  toolCalls?: number;
+  contextReads?: number;
+  checklistReviews?: number;
+  historySearches?: number;
+  historyResults?: number;
+  decisionLatencyBudgetMs?: number;
+  decisionTimeoutMs?: number;
+  promptCharacters?: number;
+  sessionMessageCountBefore?: number;
+  sidecarQueueMs?: number;
+  bridgeStartupMs?: number;
+  bridgeRoundTripMs?: number;
+  jobQueueLatencyMs?: number;
+  jobBudgetRemainingAtCoachStartMs?: number;
+  softBudgetRemainingAtCoachStartMs?: number;
+  softProviderBudgetMs?: number;
+  softDeadlineAtMs?: number;
+  softCutoffElapsedMs?: number;
+  softTimeoutProjectionAtMs?: number;
+  lateResultCompletedAtMs?: number;
+  providerTimeoutMs?: number;
+  coachSkillVersion?: number;
+  checklistReviewed?: boolean;
+  withinLatencyBudget?: boolean;
+  sessionReused?: boolean;
+  bridgeProcessReused?: boolean;
+  correctionLaneActiveAtCoachStart?: boolean;
+  interventionSuppressed?: boolean;
+  fallbackSuppressed?: boolean;
+  coachSkillId?: string;
+  suppressionReason?: string;
+  checklistItemIds?: string[];
+  toolNames?: string[];
+  toolErrors?: CoachAgentToolError[];
+  timings?: {
+    clock?: "unix_epoch_ms" | "monotonic_ms";
+    startedAtMs?: number;
+    firstTokenAtMs?: number;
+    completedAtMs?: number;
+  };
+  usage?: {
+    promptTokens?: number;
+    completionTokens?: number;
+    totalTokens?: number;
+  };
+}
+
+export interface CoachDecisionProjection {
+  provenanceVersion?: string;
+  origin?: CoachDecisionOrigin;
+  status?: CoachDecisionStatus;
+  statusReason?: string;
+  decisionReason?: string;
+  runId?: string;
+  decisionId?: string;
+  evidenceRevision?: string | number;
+  meetingId?: string;
+  jobId?: string;
+  triggered?: boolean;
+  createdAtMs?: number;
+  completedAtMs?: number;
+  deadlineAtMs?: number;
+  softDeadlineAtMs?: number;
+  softCutoffElapsedMs?: number;
+  softTimeoutProjectionAtMs?: number;
+  deliveryStatus?: "on_time" | "too_late" | "not_applicable";
+  softCutoffTriggered?: boolean;
+  lateResultDiscarded?: boolean;
+  validUntil?: number;
+  lifecycleAction?: CoachLifecycleAction;
+  lifecycleStatus?: CoachLifecycleStatus;
+  supersedesDecisionId?: string | null;
+  supersededBy?: string | null;
+  agentMetrics?: CoachAgentMetrics;
+}
+
 export interface FollowUpProjection {
   question: string;
   reason: string;
+  /** Product-facing aliases; legacy question/reason remain supported. */
+  sayThis?: string;
+  whyNow?: string;
   evidenceSegmentIds: string[];
   evidenceQuote: string;
   urgency: "low" | "medium" | "high";
@@ -203,11 +322,56 @@ export interface FollowUpProjection {
     | "experiment_gap";
   title?: string;
   confidence?: number;
+  provenanceVersion?: string;
+  origin?: CoachDecisionOrigin;
+  localReflexKind?: LocalReflexKind;
+  status?: CoachDecisionStatus;
+  statusReason?: string;
+  decisionReason?: string;
+  runId?: string;
+  decisionId?: string;
+  evidenceRevision?: string | number;
+  validUntil?: number;
+  lifecycleAction?: CoachLifecycleAction;
+  lifecycleStatus?: CoachLifecycleStatus;
+  supersedesDecisionId?: string | null;
+  supersededBy?: string | null;
   formalAi?: FormalAiProvenance | null;
+}
+
+/** Keep semantic follow-ups out of the private-coach card and its history. */
+export function isCoachInterventionProjection(value: FollowUpProjection): boolean {
+  if (value.origin === "local_reflex") {
+    return isLocalReflexCoachProjection(value);
+  }
+  if (value.status !== undefined) return value.status === "intervention";
+  if (value.origin === "direct_intelligence") return false;
+  if (value.origin === "pi" || value.origin === "direct_fallback") return true;
+  return Boolean(value.coachEventType);
+}
+
+export function isLocalReflexCoachProjection(value: FollowUpProjection): boolean {
+  if (value.origin !== "local_reflex" || value.status !== "intervention" ||
+      !value.localReflexKind || !value.coachEventType) return false;
+  return LOCAL_REFLEX_EVENT_TYPES[value.localReflexKind] === value.coachEventType &&
+    Boolean(value.sayThis?.trim()) && Boolean(value.whyNow?.trim()) &&
+    Boolean(value.evidenceQuote.trim()) && value.evidenceSegmentIds.some((item) => Boolean(item.trim())) &&
+    typeof value.validUntil === "number" && Number.isFinite(value.validUntil);
 }
 
 export interface CoachHistoryEntry extends FollowUpProjection {
   historyId: string;
+  createdAtMs: number;
+}
+
+export interface CoachDueWorkItem {
+  itemId: string;
+  status: "due";
+  nextCheckAtMs: number;
+  coachEventType?: FollowUpProjection["coachEventType"];
+  title?: string | null;
+  evidenceSegmentIds: string[];
+  evidenceQuote: string;
   createdAtMs: number;
 }
 
@@ -559,6 +723,7 @@ export interface MeetingSnapshot {
   semanticParagraphs?: SemanticParagraph[];
   activeParagraph?: SemanticParagraph | null;
   activePartial: ActivePartial | null;
+  coachDueItems?: CoachDueWorkItem[];
   suggestions: Suggestion[];
   decisionCandidates: DecisionCandidate[];
   actionItems: ActionItemProjection[];
@@ -566,6 +731,8 @@ export interface MeetingSnapshot {
   currentTopic: TopicProjection | null;
   openQuestions: OpenQuestionProjection[];
   followUp?: FollowUpProjection | null;
+  semanticFollowUp?: FollowUpProjection | null;
+  coachDecision?: CoachDecisionProjection | null;
   coachHistory: CoachHistoryEntry[];
   recentContextHistory: RecentContextEntry[];
   minutes: MinutesArtifact | null;
@@ -621,6 +788,54 @@ export function isFormalLlmFirstPayload(value: unknown): value is Record<string,
   if (evidence === null || typeof evidence !== "object" || Array.isArray(evidence)) return false;
   const segmentIds = (evidence as Record<string, unknown>).segment_ids;
   return Array.isArray(segmentIds) && segmentIds.some((item) => typeof item === "string" && Boolean(item.trim()));
+}
+
+function payloadRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function nonEmptyPayloadString(value: unknown): value is string {
+  return typeof value === "string" && Boolean(value.trim());
+}
+
+/**
+ * Admit only the three deterministic local reflexes without weakening the
+ * LLM-first contract for any other realtime projection.
+ */
+export function isLocalReflexCoachPayload(value: unknown): value is Record<string, unknown> {
+  const payload = payloadRecord(value);
+  if (!payload || payload.source !== "local_reflex" || payload.llm_called !== false ||
+      payload.llm_call_status !== "not_called" || payload.runtime_used !== "local_reflex" ||
+      payload.pi_provider_attempted !== false) return false;
+
+  const intervention = payloadRecord(payload.coach_intervention ?? payload.coachIntervention);
+  const decision = payloadRecord(payload.coach_decision ?? payload.coachDecision);
+  const evidence = payloadRecord(payload.evidence);
+  if (!intervention || !decision || !evidence ||
+      intervention.origin !== "local_reflex" || decision.origin !== "local_reflex" ||
+      intervention.runtime_used !== "local_reflex" || decision.runtime_used !== "local_reflex" ||
+      intervention.pi_provider_attempted !== false || decision.pi_provider_attempted !== false ||
+      decision.status !== "intervention") return false;
+
+  const eventType = intervention.coach_event_type ?? intervention.coachEventType ??
+    intervention.event_type ?? intervention.eventType;
+  const localReflexKind = intervention.local_reflex_kind ?? intervention.localReflexKind;
+  const segmentIds = intervention.evidence_segment_ids ?? intervention.evidenceSegmentIds;
+  const contextSegmentIds = evidence.segment_ids ?? evidence.segmentIds;
+  const validUntil = intervention.valid_until_ms ?? intervention.validUntilMs ??
+    decision.valid_until_ms ?? decision.validUntilMs;
+  return typeof localReflexKind === "string" &&
+    localReflexKind in LOCAL_REFLEX_EVENT_TYPES &&
+    LOCAL_REFLEX_EVENT_TYPES[localReflexKind as LocalReflexKind] === eventType &&
+    nonEmptyPayloadString(intervention.say_this ?? intervention.sayThis) &&
+    nonEmptyPayloadString(intervention.why_now ?? intervention.whyNow) &&
+    nonEmptyPayloadString(intervention.evidence_quote ?? intervention.evidenceQuote) &&
+    Array.isArray(segmentIds) && segmentIds.some(nonEmptyPayloadString) &&
+    Array.isArray(contextSegmentIds) && contextSegmentIds.some(nonEmptyPayloadString) &&
+    nonEmptyPayloadString(evidence.quote) &&
+    typeof validUntil === "number" && Number.isFinite(validUntil);
 }
 
 export interface EventsPage {

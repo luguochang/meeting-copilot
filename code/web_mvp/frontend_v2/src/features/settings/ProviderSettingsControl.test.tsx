@@ -11,6 +11,13 @@ const unconfigured = {
   base_url: null,
   model: null,
   realtime_model: null,
+  realtime_model_source: "not_configured",
+  realtime_model_explicit: false,
+  realtime_model_warning: null,
+  correction_model: null,
+  correction_model_source: "not_configured",
+  correction_model_explicit: false,
+  correction_model_warning: null,
   api_style: null,
   provider_label: "openai_compatible_gateway",
   runtime_synced: false,
@@ -24,11 +31,45 @@ const configured = {
   base_url: "https://relay.example",
   model: "gpt-test",
   realtime_model: "gpt-realtime-test",
+  realtime_model_source: "runtime_realtime_model",
+  realtime_model_explicit: true,
+  realtime_model_warning: null,
+  correction_model: "gpt-test",
+  correction_model_source: "general_model_fallback",
+  correction_model_explicit: false,
+  correction_model_warning: "correction_model_inherits_general_model",
   api_style: "chat_completions",
   runtime_synced: true,
 };
 
+const realtimeProbe = {
+  ok: true,
+  operational: true,
+  realtime_ready: true,
+  probe_latency_ms: 120,
+  realtime_cutoff_ms: 2_500,
+  usage: {
+    prompt_tokens: 7,
+    completion_tokens: 2,
+    total_tokens: 9,
+  },
+};
+
+const slowProbe = {
+  ...realtimeProbe,
+  realtime_ready: false,
+  probe_latency_ms: 3_000,
+};
+
 const saved = { ...configured, runtime_synced: false };
+
+const inheritedRealtimeModel = {
+  ...configured,
+  realtime_model: "gpt-test",
+  realtime_model_source: "general_model_fallback",
+  realtime_model_explicit: false,
+  realtime_model_warning: "realtime_model_inherits_general_model",
+};
 
 const connectedProviderStatus = {
   configured: true,
@@ -36,6 +77,11 @@ const connectedProviderStatus = {
   probe_status: "succeeded",
   model: "gpt-test",
   realtime_model: "gpt-realtime-test",
+  operational: true,
+  realtime_ready: true,
+  probe_latency_ms: 120,
+  probe_usage: realtimeProbe.usage,
+  realtime_cutoff_ms: 2_500,
 };
 
 const emptyProviderStatus = {
@@ -98,7 +144,14 @@ describe("ProviderSettingsControl", () => {
     });
     vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
       if (String(input) === "/providers/status") {
-        return Promise.resolve(jsonResponse({ ...connectedProviderStatus, probe_status: "failed" }));
+        return Promise.resolve(jsonResponse({
+          ...connectedProviderStatus,
+          probe_status: "failed",
+          operational: false,
+          realtime_ready: false,
+          probe_latency_ms: null,
+          probe_usage: null,
+        }));
       }
       return Promise.reject(new Error(`unexpected request: ${String(input)}`));
     }));
@@ -106,6 +159,41 @@ describe("ProviderSettingsControl", () => {
 
     render(<ProviderSettingsControl />);
     expect(await screen.findByRole("button", { name: "打开 AI 设置" })).toHaveTextContent("AI 连接失败 · gpt-test");
+  });
+
+  it("does not describe an open realtime circuit as connected", async () => {
+    const invoke = vi.fn(async (command: string) => {
+      if (command === "provider_config_status") return configured;
+      throw new Error(`unexpected command: ${command}`);
+    });
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      if (String(input) === "/providers/status") {
+        return Promise.resolve(jsonResponse({
+          ...connectedProviderStatus,
+          probe_status: "not_run",
+          operational: null,
+          realtime_ready: null,
+          probe_latency_ms: null,
+          probe_usage: null,
+          realtime_circuit: {
+            state: "open",
+            reason: "realtime_provider_recovery_probe_required",
+            failure_count: 3,
+            retry_after_ms: 0,
+            half_open: false,
+            identity_generation: 4,
+            last_failure_class: "timeout",
+          },
+        }));
+      }
+      return Promise.reject(new Error(`unexpected request: ${String(input)}`));
+    }));
+    window.__TAURI__ = { core: { invoke: invoke as unknown as TauriInvoke } };
+
+    render(<ProviderSettingsControl />);
+    const trigger = await screen.findByRole("button", { name: "打开 AI 设置" });
+    expect(trigger).toHaveTextContent("AI 实时通道异常 · gpt-test");
+    expect(trigger).not.toHaveTextContent("AI 已连接");
   });
 
   it("keeps remote AI optional and shows the sponsor and project links", async () => {
@@ -155,7 +243,7 @@ describe("ProviderSettingsControl", () => {
       if (path === "/providers/status") return Promise.resolve(jsonResponse(emptyProviderStatus));
       if (path === "/settings/cost-stats") return Promise.resolve(jsonResponse(costStats));
       if (path === "/providers/config" && init?.method === "PUT") return Promise.resolve(jsonResponse(configured));
-      if (path === "/providers/llm/probe") return Promise.resolve(jsonResponse({ ok: true }));
+      if (path === "/providers/llm/probe") return Promise.resolve(jsonResponse(realtimeProbe));
       return Promise.reject(new Error(`unexpected request: ${path}`));
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -171,8 +259,8 @@ describe("ProviderSettingsControl", () => {
     await user.click(within(dialog).getByRole("button", { name: "保存并测试" }));
 
     const connectionRegion = within(dialog).getByRole("region", { name: "AI 连接状态" });
-    await waitFor(() => expect(within(connectionRegion).getByText("连接正常")).toBeVisible());
-    expect(within(dialog).getByText("连接正常，配置已保存")).toBeVisible();
+    await waitFor(() => expect(within(connectionRegion).getByText("Provider 探测通过")).toBeVisible());
+    expect(within(dialog).getByText("Provider 探测通过，实时稳定性待验收，配置已保存")).toBeVisible();
     expect(screen.getByRole("dialog", { name: "AI 设置" })).toBeVisible();
     expect(within(dialog).getByRole("button", { name: "测试连接" })).toHaveClass("provider-test-button--connected");
     const saveCall = fetchMock.mock.calls.find(([input, init]) =>
@@ -183,8 +271,62 @@ describe("ProviderSettingsControl", () => {
       api_key: "sk-web-test",
       model: "gpt-test",
       realtime_model: null,
+      correction_model: null,
       api_style: "chat_completions",
     }));
+  });
+
+  it("keeps inherited realtime models blank and warns before a later save", async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      if (path === "/providers/config" && (!init || init.method === "GET")) {
+        return Promise.resolve(jsonResponse(inheritedRealtimeModel));
+      }
+      if (path === "/providers/status") {
+        return Promise.resolve(jsonResponse(connectedProviderStatus));
+      }
+      if (path === "/settings/cost-stats") {
+        return Promise.resolve(jsonResponse({ breakdown: [] }));
+      }
+      if (path === "/providers/config" && init?.method === "PUT") {
+        return Promise.resolve(jsonResponse(inheritedRealtimeModel));
+      }
+      if (path === "/providers/llm/probe") {
+        return Promise.resolve(jsonResponse({ ok: true }));
+      }
+      return Promise.reject(new Error(`unexpected request: ${path}`));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<ProviderSettingsControl />);
+
+    await user.click(await screen.findByRole("button", { name: "打开 AI 设置" }));
+    const dialog = screen.getByRole("dialog", { name: "AI 设置" });
+    await user.click(within(dialog).getByText("高级设置"));
+
+    expect(within(dialog).getByLabelText("实时模型（可选）")).toHaveValue("");
+    expect(within(dialog).getByText("实时教练当前继承通用模型 gpt-test", { exact: false })).toBeVisible();
+    expect(within(dialog).getByText("实时教练当前继承通用模型 gpt-test", { exact: false })).toHaveTextContent(
+      "实时教练当前继承通用模型 gpt-test",
+    );
+
+    await user.clear(within(dialog).getByLabelText("模型"));
+    await user.type(within(dialog).getByLabelText("模型"), "gpt-test-updated");
+    await user.click(within(dialog).getByRole("button", { name: "保存并测试" }));
+
+    await waitFor(() => {
+      const saveCall = fetchMock.mock.calls.find(([input, init]) =>
+        String(input) === "/providers/config" && init?.method === "PUT",
+      );
+      expect(saveCall?.[1]?.body).toBe(JSON.stringify({
+        base_url: "https://relay.example",
+        api_key: null,
+        model: "gpt-test-updated",
+        realtime_model: null,
+        correction_model: null,
+        api_style: "chat_completions",
+      }));
+    });
   });
 
   it("stores a provider through Tauri without putting the saved key back into the form", async () => {
@@ -219,6 +361,10 @@ describe("ProviderSettingsControl", () => {
     })));
     expect(within(dialog).getByLabelText("API Key")).toHaveValue("");
     expect(within(dialog).getByLabelText("API Key")).toHaveAttribute("placeholder", "留空以继续使用已保存密钥");
+    const connectionRegion = within(dialog).getByRole("region", { name: "AI 连接状态" });
+    await waitFor(() => expect(connectionRegion).toHaveClass("provider-connection--unknown"));
+    expect(connectionRegion).not.toHaveClass("provider-connection--connected");
+    expect(within(connectionRegion).getByText("已连接，实时性待确认")).toBeVisible();
   });
 
   it("syncs a saved desktop configuration only when the user tests it", async () => {
@@ -232,7 +378,7 @@ describe("ProviderSettingsControl", () => {
       const path = String(input);
       if (path === "/providers/status") return Promise.resolve(jsonResponse({ ...connectedProviderStatus, runtime_synced: false, probe_status: "not_run" }));
       if (path === "/settings/cost-stats") return Promise.resolve(jsonResponse({ breakdown: [] }));
-      if (path === "/providers/llm/probe") return Promise.resolve(jsonResponse({ ok: true }));
+      if (path === "/providers/llm/probe") return Promise.resolve(jsonResponse(realtimeProbe));
       return Promise.reject(new Error(`unexpected request: ${path}`));
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -247,7 +393,61 @@ describe("ProviderSettingsControl", () => {
 
     await waitFor(() => expect(invoke).toHaveBeenCalledWith("provider_config_sync"));
     const connectionRegion = within(dialog).getByRole("region", { name: "AI 连接状态" });
-    await waitFor(() => expect(within(connectionRegion).getByText("连接正常")).toBeVisible());
+    await waitFor(() => expect(within(connectionRegion).getByText("Provider 探测通过")).toBeVisible());
+  });
+
+  it("uses a warning state when the provider is reachable but misses the realtime cutoff", async () => {
+    const user = userEvent.setup();
+    const invoke = vi.fn(async (command: string) => {
+      if (command === "provider_config_status") return configured;
+      throw new Error(`unexpected command: ${command}`);
+    });
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path === "/providers/status") return Promise.resolve(jsonResponse(connectedProviderStatus));
+      if (path === "/settings/cost-stats") return Promise.resolve(jsonResponse({ breakdown: [] }));
+      if (path === "/providers/llm/probe") return Promise.resolve(jsonResponse(slowProbe));
+      return Promise.reject(new Error(`unexpected request: ${path}`));
+    }));
+    window.__TAURI__ = { core: { invoke: invoke as unknown as TauriInvoke } };
+    render(<ProviderSettingsControl />);
+
+    await user.click(await screen.findByRole("button", { name: "打开 AI 设置" }));
+    const dialog = screen.getByRole("dialog", { name: "AI 设置" });
+    const region = within(dialog).getByRole("region", { name: "AI 连接状态" });
+    await user.click(within(dialog).getByRole("button", { name: "测试连接" }));
+
+    await waitFor(() => expect(region).toHaveClass("provider-connection--slow"));
+    expect(region).not.toHaveClass("provider-connection--connected");
+    expect(within(region).getByText("已连接，但实时响应过慢")).toBeVisible();
+    expect(within(region).getByText(/3000ms > 实时窗口 2500ms/)).toBeVisible();
+  });
+
+  it("keeps readiness unknown when a legacy probe omits evidence", async () => {
+    const user = userEvent.setup();
+    const invoke = vi.fn(async (command: string) => {
+      if (command === "provider_config_status") return configured;
+      throw new Error(`unexpected command: ${command}`);
+    });
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path === "/providers/status") return Promise.resolve(jsonResponse(connectedProviderStatus));
+      if (path === "/settings/cost-stats") return Promise.resolve(jsonResponse({ breakdown: [] }));
+      if (path === "/providers/llm/probe") return Promise.resolve(jsonResponse({ ok: true }));
+      return Promise.reject(new Error(`unexpected request: ${path}`));
+    }));
+    window.__TAURI__ = { core: { invoke: invoke as unknown as TauriInvoke } };
+    render(<ProviderSettingsControl />);
+
+    await user.click(await screen.findByRole("button", { name: "打开 AI 设置" }));
+    const dialog = screen.getByRole("dialog", { name: "AI 设置" });
+    const region = within(dialog).getByRole("region", { name: "AI 连接状态" });
+    await user.click(within(dialog).getByRole("button", { name: "测试连接" }));
+
+    await waitFor(() => expect(region).toHaveClass("provider-connection--unknown"));
+    expect(region).not.toHaveClass("provider-connection--connected");
+    expect(within(region).getByText("已连接，实时性待确认")).toBeVisible();
+    expect(within(region).getByText("实时性待确认 · 请完成一次完整连接测试")).toBeVisible();
   });
 
   it("uses an in-app confirmation before removing a configuration", async () => {

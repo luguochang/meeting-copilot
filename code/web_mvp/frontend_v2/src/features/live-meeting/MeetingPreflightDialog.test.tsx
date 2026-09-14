@@ -12,8 +12,18 @@ class FakeAnalyser {
 
 class FakeProbeAudioContext {
   static sampleValue = 0.05;
+  static resumePending = false;
+  static closePending = false;
   readonly analyser = new FakeAnalyser();
-  close = vi.fn().mockResolvedValue(undefined);
+  get state(): AudioContextState {
+    return FakeProbeAudioContext.resumePending ? "suspended" : "running";
+  }
+  resume = vi.fn(() => FakeProbeAudioContext.resumePending
+    ? new Promise<void>(() => {})
+    : Promise.resolve());
+  close = vi.fn(() => FakeProbeAudioContext.closePending
+    ? new Promise<void>(() => {})
+    : Promise.resolve());
   createAnalyser = vi.fn(() => this.analyser as unknown as AnalyserNode);
   createMediaStreamSource = vi.fn(() => ({ connect: vi.fn() }) as unknown as MediaStreamAudioSourceNode);
 }
@@ -35,11 +45,31 @@ function response(body: unknown, status = 200) {
   });
 }
 
+const realtimeProviderEvidence = {
+  operational: true,
+  realtime_ready: true,
+  probe_latency_ms: 120,
+  probe_usage: {
+    prompt_tokens: 7,
+    completion_tokens: 2,
+    total_tokens: 9,
+  },
+  realtime_cutoff_ms: 2_500,
+};
+
+const slowProviderEvidence = {
+  ...realtimeProviderEvidence,
+  realtime_ready: false,
+  probe_latency_ms: 3_000,
+};
+
 describe("MeetingPreflightDialog", () => {
   beforeEach(() => {
     delete window.__TAURI__;
     delete window.__TAURI_INTERNALS__;
     FakeProbeAudioContext.sampleValue = 0.05;
+    FakeProbeAudioContext.resumePending = false;
+    FakeProbeAudioContext.closePending = false;
     stopTrack.mockReset();
     vi.stubGlobal("AudioContext", FakeProbeAudioContext);
     vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
@@ -57,10 +87,16 @@ describe("MeetingPreflightDialog", () => {
           runtime_synced: true,
           probe_status: "succeeded",
           model: "gpt-5.5",
+          ...realtimeProviderEvidence,
         }));
       }
       return Promise.resolve(response({
-        llm: { configured: true, provider: "relay", model: "gpt-5.5" },
+        llm: {
+          configured: true,
+          provider: "relay",
+          model: "gpt-5.5",
+          ...realtimeProviderEvidence,
+        },
         asr: { realtime_asr_available: true, realtime_providers: ["funasr_realtime"] },
         cost_policy: { remote_asr_default_enabled: false, raw_audio_uploaded_by_default: false },
       }));
@@ -327,6 +363,29 @@ describe("MeetingPreflightDialog", () => {
     expect(screen.getByRole("dialog", { name: "准备开始会议" })).toBeVisible();
   });
 
+  it("shows an actionable message when the page is connected to a stopped local service", async () => {
+    vi.mocked(fetch).mockRejectedValue(new TypeError("Failed to fetch"));
+
+    render(<MeetingPreflightDialog open busy={false} onCancel={vi.fn()} onStart={vi.fn()} />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "无法连接本地会议服务，请确认当前页面地址对应的会议服务已启动后重试",
+    );
+    expect(screen.queryByText("正在检查本地服务")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "开始会议" })).toBeDisabled();
+  });
+
+  it("identifies a stale page served by an incompatible local service", async () => {
+    vi.mocked(fetch).mockResolvedValue(response({}, 404));
+
+    render(<MeetingPreflightDialog open busy={false} onCancel={vi.fn()} onStart={vi.fn()} />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "当前页面连接的会议服务版本不匹配，请打开正在运行的本地会议服务后重试",
+    );
+    expect(screen.getByRole("button", { name: "开始会议" })).toBeDisabled();
+  });
+
   it("checks the browser microphone on explicit user action", async () => {
     render(<MeetingPreflightDialog open busy={false} onCancel={vi.fn()} onStart={vi.fn()} />);
     await screen.findByText("本地中文实时识别可用");
@@ -334,9 +393,11 @@ describe("MeetingPreflightDialog", () => {
 
     vi.useFakeTimers();
     fireEvent.click(screen.getByRole("button", { name: "检查麦克风" }));
+    expect(screen.getByRole("status")).toHaveTextContent("等待麦克风权限");
     await act(async () => {
       await vi.advanceTimersByTimeAsync(150);
     });
+    expect(screen.getByRole("status")).toHaveTextContent("麦克风权限已通过，正在采样输入音量");
     expect(screen.getByLabelText("输入音量 5.0%")).toHaveAttribute("data-probe-status", "checking");
     await finishBrowserProbe();
 
@@ -376,6 +437,144 @@ describe("MeetingPreflightDialog", () => {
 
     expect(await screen.findByRole("alert")).toHaveTextContent(expectedMessage);
     expect(screen.getByLabelText("检查后显示输入音量")).toHaveAttribute("data-probe-status", probeStatus);
+  });
+
+  it("对挂起的浏览器权限请求超时，并允许在同一弹窗直接重试", async () => {
+    let resolveLateStream!: (stream: MediaStream) => void;
+    vi.mocked(navigator.mediaDevices.getUserMedia).mockReturnValueOnce(
+      new Promise<MediaStream>((resolve) => {
+        resolveLateStream = resolve;
+      }),
+    );
+    render(<MeetingPreflightDialog open busy={false} onCancel={vi.fn()} onStart={vi.fn()} />);
+    await screen.findByText("本地中文实时识别可用");
+
+    vi.useFakeTimers();
+    fireEvent.click(screen.getByRole("button", { name: "检查麦克风" }));
+    expect(screen.getByRole("status")).toHaveTextContent("等待麦克风权限");
+    expect(screen.getByLabelText("检查后显示输入音量")).toHaveTextContent("等待授权");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(8_100);
+    });
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "麦克风权限请求超时，请解锁设备或在浏览器设置中允许访问后重试",
+    );
+    expect(screen.getByLabelText("检查后显示输入音量")).toHaveAttribute("data-probe-status", "error");
+    expect(screen.getByRole("button", { name: "检查麦克风" })).toBeEnabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "检查麦克风" }));
+    await finishBrowserProbe();
+    expect(screen.getByText("正常收到声音，麦克风可用")).toBeVisible();
+    expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalledTimes(2);
+
+    const lateStop = vi.fn();
+    await act(async () => {
+      resolveLateStream({ getTracks: () => [{ stop: lateStop }] } as unknown as MediaStream);
+      await Promise.resolve();
+    });
+    expect(lateStop).toHaveBeenCalledOnce();
+    expect(stopTrack).toHaveBeenCalledOnce();
+  });
+
+  it("切换麦克风设备会取消旧设备的挂起检查并清空旧状态", async () => {
+    vi.mocked(navigator.mediaDevices.enumerateDevices).mockResolvedValueOnce([
+      { kind: "audioinput", deviceId: "mic-1", label: "MacBook Microphone", groupId: "group-1", toJSON: () => ({}) },
+      { kind: "audioinput", deviceId: "mic-2", label: "USB Microphone", groupId: "group-2", toJSON: () => ({}) },
+    ] as MediaDeviceInfo[]);
+    let resolveOldStream!: (stream: MediaStream) => void;
+    vi.mocked(navigator.mediaDevices.getUserMedia).mockReturnValueOnce(
+      new Promise<MediaStream>((resolve) => {
+        resolveOldStream = resolve;
+      }),
+    );
+    render(<MeetingPreflightDialog open busy={false} onCancel={vi.fn()} onStart={vi.fn()} />);
+    await screen.findByText("本地中文实时识别可用");
+
+    fireEvent.click(screen.getByRole("button", { name: "检查麦克风" }));
+    expect(screen.getByRole("status")).toHaveTextContent("等待麦克风权限");
+    fireEvent.change(screen.getByRole("combobox", { name: "输入设备" }), {
+      target: { value: "mic-2" },
+    });
+
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("检查后显示输入音量")).toHaveAttribute("data-probe-status", "idle");
+    expect(screen.getByLabelText("检查后显示输入音量")).toHaveTextContent("尚未检查");
+    expect(screen.getByRole("button", { name: "检查麦克风" })).toBeEnabled();
+
+    const oldStop = vi.fn();
+    await act(async () => {
+      resolveOldStream({ getTracks: () => [{ stop: oldStop }] } as unknown as MediaStream);
+      await Promise.resolve();
+    });
+    expect(oldStop).toHaveBeenCalledOnce();
+    expect(screen.queryByText("正常收到声音，麦克风可用")).not.toBeInTheDocument();
+  });
+
+  it("对挂起的 AudioContext 启动超时，避免权限成功后仍卡在采样中", async () => {
+    FakeProbeAudioContext.resumePending = true;
+    render(<MeetingPreflightDialog open busy={false} onCancel={vi.fn()} onStart={vi.fn()} />);
+    await screen.findByText("本地中文实时识别可用");
+
+    vi.useFakeTimers();
+    fireEvent.click(screen.getByRole("button", { name: "检查麦克风" }));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalled();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_600);
+    });
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "麦克风音频上下文启动超时，请检查浏览器页面权限后重试",
+    );
+    expect(screen.getByLabelText("检查后显示输入音量")).toHaveAttribute("data-probe-status", "error");
+    expect(stopTrack).toHaveBeenCalledOnce();
+  });
+
+  it("对挂起的 AudioContext 关闭操作超时，检查结果仍可返回", async () => {
+    FakeProbeAudioContext.closePending = true;
+    render(<MeetingPreflightDialog open busy={false} onCancel={vi.fn()} onStart={vi.fn()} />);
+    await screen.findByText("本地中文实时识别可用");
+
+    vi.useFakeTimers();
+    fireEvent.click(screen.getByRole("button", { name: "检查麦克风" }));
+    await act(async () => {
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(3_100);
+    });
+
+    expect(screen.getByText("正常收到声音，麦克风可用")).toBeVisible();
+    expect(screen.getByRole("button", { name: "重新检查" })).toBeEnabled();
+    expect(stopTrack).toHaveBeenCalledOnce();
+  });
+
+  it("关闭弹窗会取消挂起的权限检查并停止迟到的流", async () => {
+    let resolveLateStream!: (stream: MediaStream) => void;
+    vi.mocked(navigator.mediaDevices.getUserMedia).mockReturnValueOnce(
+      new Promise<MediaStream>((resolve) => {
+        resolveLateStream = resolve;
+      }),
+    );
+    const onCancel = vi.fn();
+    const { rerender } = render(
+      <MeetingPreflightDialog open busy={false} onCancel={onCancel} onStart={vi.fn()} />,
+    );
+    await screen.findByText("本地中文实时识别可用");
+
+    fireEvent.click(screen.getByRole("button", { name: "检查麦克风" }));
+    expect(screen.getByRole("status")).toHaveTextContent("等待麦克风权限");
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+    expect(onCancel).toHaveBeenCalledOnce();
+    rerender(<MeetingPreflightDialog open={false} busy={false} onCancel={onCancel} onStart={vi.fn()} />);
+
+    await act(async () => {
+      resolveLateStream({ getTracks: () => [{ stop: stopTrack }] } as unknown as MediaStream);
+      await Promise.resolve();
+    });
+    expect(stopTrack).toHaveBeenCalledOnce();
   });
 
   it("treats a stream without a live audio track as no_device", async () => {
@@ -542,6 +741,129 @@ describe("MeetingPreflightDialog", () => {
     expect(screen.queryByText("gpt-5.5 已配置")).not.toBeInTheDocument();
   });
 
+  it("keeps a slow provider as a warning without blocking local recording", async () => {
+    vi.mocked(fetch).mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/v2/storage/preflight")) {
+        return Promise.resolve(response({
+          allowed: true,
+          writable_capacity_bytes: 4 * 1024 ** 3,
+          estimated_meeting_bytes: 110 * 1024 ** 2,
+        }));
+      }
+      if (url.endsWith("/providers/status")) {
+        return Promise.resolve(response({
+          configured: true,
+          runtime_synced: true,
+          probe_status: "succeeded",
+          model: "gpt-5.5",
+          ...slowProviderEvidence,
+        }));
+      }
+      return Promise.resolve(response({
+        llm: {
+          configured: true,
+          provider: "relay",
+          model: "gpt-5.5",
+          ...slowProviderEvidence,
+        },
+        asr: { realtime_asr_available: true, realtime_providers: ["funasr_realtime"] },
+      }));
+    });
+
+    render(<MeetingPreflightDialog open busy={false} onCancel={vi.fn()} onStart={vi.fn()} />);
+
+    const status = await screen.findByText(/AI 可连接，但实时教练延迟过高/);
+    expect(status).toBeVisible();
+    expect(status).toHaveTextContent("3000ms > 2500ms");
+    expect(status.closest("div")).toHaveClass("preflight-status--warning");
+    expect(screen.getByText("本地中文实时识别可用")).toBeVisible();
+  });
+
+  it("shows realtime readiness as pending when probe evidence is incomplete", async () => {
+    vi.mocked(fetch).mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/v2/storage/preflight")) {
+        return Promise.resolve(response({
+          allowed: true,
+          writable_capacity_bytes: 4 * 1024 ** 3,
+          estimated_meeting_bytes: 110 * 1024 ** 2,
+        }));
+      }
+      if (url.endsWith("/providers/status")) {
+        return Promise.resolve(response({
+          configured: true,
+          runtime_synced: true,
+          probe_status: "succeeded",
+          model: "gpt-5.5",
+          operational: true,
+          realtime_ready: null,
+          probe_latency_ms: null,
+          probe_usage: null,
+          realtime_cutoff_ms: 2_500,
+        }));
+      }
+      return Promise.resolve(response({
+        llm: { configured: true, provider: "relay", model: "gpt-5.5" },
+        asr: { realtime_asr_available: true, realtime_providers: ["funasr_realtime"] },
+      }));
+    });
+
+    render(<MeetingPreflightDialog open busy={false} onCancel={vi.fn()} onStart={vi.fn()} />);
+
+    const status = await screen.findByText(/已连接，实时性待确认/);
+    expect(status).toBeVisible();
+    expect(status).toHaveTextContent("会议仍可录音和转写");
+    expect(status.closest("div")).toHaveClass("preflight-status--warning");
+    expect(screen.queryByText(/^AI 已连接 · gpt-5\.5$/)).not.toBeInTheDocument();
+  });
+
+  it("surfaces an open realtime circuit instead of calling it connected", async () => {
+    const circuit = {
+      state: "open",
+      reason: "realtime_provider_recovery_probe_required",
+      failure_count: 4,
+      retry_after_ms: 0,
+      half_open: false,
+      identity_generation: 7,
+      last_failure_class: "timeout",
+    };
+    vi.mocked(fetch).mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/v2/storage/preflight")) {
+        return Promise.resolve(response({
+          allowed: true,
+          writable_capacity_bytes: 4 * 1024 ** 3,
+          estimated_meeting_bytes: 110 * 1024 ** 2,
+        }));
+      }
+      if (url.endsWith("/providers/status")) {
+        return Promise.resolve(response({
+          configured: true,
+          runtime_synced: true,
+          probe_status: "not_run",
+          model: "gpt-5.5",
+          operational: null,
+          realtime_ready: null,
+          realtime_circuit: circuit,
+        }));
+      }
+      return Promise.resolve(response({
+        llm: { configured: true, provider: "relay", model: "gpt-5.5" },
+        realtime_circuit: circuit,
+        asr: { realtime_asr_available: true, realtime_providers: ["funasr_realtime"] },
+      }));
+    });
+
+    render(<MeetingPreflightDialog open busy={false} onCancel={vi.fn()} onStart={vi.fn()} />);
+
+    const status = await screen.findByText(/实时通道连续失败/);
+    expect(status).toHaveTextContent("需重新测试连接");
+    expect(status).toHaveTextContent("会议仍可录音和转写");
+    expect(status.closest("div")).toHaveClass("preflight-status--warning");
+    expect(screen.queryByText(/已连接，实时性待确认/)).not.toBeInTheDocument();
+  });
+
   it("explicitly syncs saved desktop AI config and refreshes preflight health without probing", async () => {
     let healthReads = 0;
     let resolveSync!: (value: unknown) => void;
@@ -611,7 +933,7 @@ describe("MeetingPreflightDialog", () => {
       errors: [],
     });
 
-    expect(await screen.findByText("gpt-5.5 已同步，连接尚未测试")).toBeVisible();
+    expect(await screen.findByText(/gpt-5.5 已连接，实时性待确认/)).toBeVisible();
     expect(screen.getByText("AI 运行时已同步")).toBeVisible();
     expect(fetchMock.mock.calls.filter(([input]) => String(input).endsWith("/v2/storage/preflight"))).toHaveLength(2);
     expect(fetchMock.mock.calls.filter(([input]) => String(input).endsWith("/providers/health"))).toHaveLength(2);

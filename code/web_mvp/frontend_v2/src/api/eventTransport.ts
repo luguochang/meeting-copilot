@@ -27,6 +27,7 @@ const V2_NAMED_EVENT_TYPES = [
   "suggestion.superseded",
   "suggestion.evidence.remapped",
   "suggestion.feedback.updated",
+  "meeting.intelligence.applied",
   "meeting.topic.updated",
   "meeting.open_question.updated",
   "meeting.ended",

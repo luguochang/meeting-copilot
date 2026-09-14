@@ -95,6 +95,46 @@ function formalAiPayload(segmentId = "segment-1") {
   };
 }
 
+function localReflexPayload(overrides: Record<string, unknown> = {}) {
+  return {
+    source: "local_reflex",
+    llm_called: false,
+    llm_call_status: "not_called",
+    runtime_used: "local_reflex",
+    pi_provider_attempted: false,
+    evidence: {
+      segment_ids: ["segment-local-reflex"],
+      quote: "这个目标我再重复一下，我们先把目标说清楚",
+    },
+    coach_intervention: {
+      origin: "local_reflex",
+      runtime_used: "local_reflex",
+      pi_provider_attempted: false,
+      local_reflex_kind: "communication_clarity",
+      status: "intervention",
+      coach_event_type: "communication_clarity",
+      say_this: "我先收束一下：当前只确认目标，细节稍后逐项核对。",
+      why_now: "同一观点已经连续重复，需要先收束表达。",
+      evidence_segment_ids: ["segment-local-reflex"],
+      evidence_quote: "这个目标我再重复一下，我们先把目标说清楚",
+      urgency: "medium",
+      valid_until_ms: 40_000,
+      lifecycle_action: "retain",
+      decision_id: "local-reflex-decision-1",
+    },
+    coach_decision: {
+      origin: "local_reflex",
+      runtime_used: "local_reflex",
+      pi_provider_attempted: false,
+      status: "intervention",
+      decision_id: "local-reflex-decision-1",
+      valid_until_ms: 40_000,
+      lifecycle_action: "retain",
+    },
+    ...overrides,
+  };
+}
+
 describe("meetingReducer", () => {
   it("projects sealed and ready recording events without waiting for a full snapshot", () => {
     const initial = meetingReducer(createInitialMeetingState("meeting-1"), {
@@ -483,12 +523,9 @@ describe("meetingReducer", () => {
         },
       },
     });
-    expect(current.coachHistory).toHaveLength(1);
-    expect(current.coachHistory[0]).toMatchObject({
-      historyId: "event-2",
-      createdAtMs: 2_000,
-      question: "请确认回滚负责人。",
-    });
+    // A plain semantic follow-up is retained as the current follow-up for
+    // compatibility, but it is not allowed to masquerade as coach history.
+    expect(current.coachHistory).toHaveLength(0);
   });
 
   it("moves prior coach advice into history when a later Pi loop stays silent", () => {
@@ -505,6 +542,11 @@ describe("meetingReducer", () => {
             evidence_segment_ids: ["segment-2"],
             evidence_quote: "需要明确回滚负责人。",
             urgency: "high",
+            coach_event_type: "commitment_risk",
+            origin: "pi",
+            status: "intervention",
+            run_id: "coach-run-2",
+            decision_id: "coach-decision-2",
           },
         },
       })],
@@ -516,13 +558,292 @@ describe("meetingReducer", () => {
         seq: 3,
         eventId: "event-3",
         type: "meeting.intelligence.applied",
-        payload: { ...formalAiPayload("segment-3"), follow_up: null },
+        payload: {
+          ...formalAiPayload("segment-3"),
+          follow_up: null,
+          coach_decision: {
+            origin: "pi",
+            status: "protected_silent",
+            decision_id: "coach-decision-3",
+            decision_reason: "新证据没有形成值得打断用户的建议。",
+            lifecycle_action: "deprioritize",
+            agent_metrics: {
+              decision_latency_ms: 1_250,
+              bridge_process_reused: true,
+              tool_errors: [{ tool: "submit_intervention", code: "evidence_quote_not_verbatim" }],
+              provider_response: "must-not-enter-typed-state",
+            },
+          },
+        },
       })],
       receivedAtMs: 3_000,
     });
 
     expect(silent.followUp).toBeNull();
     expect(silent.coachHistory).toHaveLength(1);
+    expect(silent.coachHistory[0]).toMatchObject({
+      decisionId: "coach-decision-2",
+      question: "先确认回滚负责人。",
+    });
+    expect(silent.coachDecision).toMatchObject({
+      decisionId: "coach-decision-3",
+      status: "protected_silent",
+      lifecycleAction: "deprioritize",
+      agentMetrics: {
+        decisionLatencyMs: 1_250,
+        bridgeProcessReused: true,
+        toolErrors: [{ tool: "submit_intervention", code: "evidence_quote_not_verbatim" }],
+      },
+    });
+    expect(silent.coachDecision?.agentMetrics).not.toHaveProperty("providerResponse");
+  });
+
+  it("retracts the current coach card without deleting the prior intervention history", () => {
+    const advised = meetingReducer(createInitialMeetingState("meeting-1"), {
+      type: "events.received",
+      events: [event({
+        seq: 2,
+        type: "meeting.intelligence.applied",
+        payload: {
+          ...formalAiPayload("segment-2"),
+          coach_intervention: {
+            question: "先确认回滚负责人。",
+            reason: "负责人尚未明确。",
+            evidence_segment_ids: ["segment-2"],
+            evidence_quote: "需要明确回滚负责人。",
+            urgency: "high",
+            coach_event_type: "commitment_risk",
+          },
+          coach_decision: {
+            origin: "pi",
+            status: "intervention",
+            decision_id: "coach-decision-2",
+            lifecycle_action: "retain",
+          },
+        },
+      })],
+      receivedAtMs: 2_000,
+    });
+    const retracted = meetingReducer(advised, {
+      type: "events.received",
+      events: [event({
+        seq: 3,
+        eventId: "event-3",
+        type: "meeting.intelligence.applied",
+        payload: {
+          ...formalAiPayload("segment-3"),
+          coach_intervention: null,
+          coach_decision: {
+            origin: "pi",
+            status: "stale",
+            decision_id: "coach-decision-3",
+            decision_reason: "负责人已经确认，旧建议不再成立。",
+            lifecycle_action: "retract",
+            supersedes_decision_id: "coach-decision-2",
+            superseded_by: null,
+          },
+        },
+      })],
+      receivedAtMs: 3_000,
+    });
+
+    expect(retracted.followUp).toBeNull();
+    expect(retracted.coachDecision).toMatchObject({
+      status: "stale",
+      lifecycleAction: "retract",
+    });
+    expect(retracted.coachHistory).toHaveLength(1);
+    expect(retracted.coachHistory[0]).toMatchObject({
+      decisionId: "coach-decision-2",
+      question: "先确认回滚负责人。",
+      lifecycleAction: "retract",
+      supersededBy: "coach-decision-3",
+    });
+  });
+
+  it("deprioritizes the previous card when a newer intervention supersedes it", () => {
+    const advised = meetingReducer(createInitialMeetingState("meeting-1"), {
+      type: "events.received",
+      events: [event({
+        seq: 2,
+        eventId: "coach-event-2",
+        type: "meeting.intelligence.applied",
+        payload: {
+          ...formalAiPayload("segment-2"),
+          coach_intervention: {
+            question: "先确认回滚负责人。",
+            reason: "负责人尚未明确。",
+            evidence_segment_ids: ["segment-2"],
+            evidence_quote: "周五上线",
+            urgency: "high",
+            coach_event_type: "commitment_risk",
+          },
+          coach_decision: {
+            origin: "pi",
+            status: "intervention",
+            decision_id: "coach-decision-2",
+            lifecycle_action: "retain",
+          },
+        },
+      })],
+      receivedAtMs: 2_000,
+    });
+    const replaced = meetingReducer(advised, {
+      type: "events.received",
+      events: [event({
+        seq: 3,
+        eventId: "coach-event-3",
+        type: "meeting.intelligence.applied",
+        payload: {
+          ...formalAiPayload("segment-3"),
+          coach_intervention: {
+            question: "再确认验收条件。",
+            reason: "负责人已明确，但验收条件还不完整。",
+            evidence_segment_ids: ["segment-3"],
+            evidence_quote: "李明负责回滚",
+            urgency: "medium",
+            coach_event_type: "decision_readiness",
+          },
+          coach_decision: {
+            origin: "pi",
+            status: "intervention",
+            decision_id: "coach-decision-3",
+            lifecycle_action: "retain",
+            supersedes_decision_id: "coach-decision-2",
+          },
+        },
+      })],
+      receivedAtMs: 3_000,
+    });
+
+    expect(replaced.followUp).toMatchObject({
+      decisionId: "coach-decision-3",
+      question: "再确认验收条件。",
+      supersedesDecisionId: "coach-decision-2",
+    });
+    expect(replaced.coachHistory).toHaveLength(2);
+    expect(replaced.coachHistory[0]).toMatchObject({
+      decisionId: "coach-decision-2",
+      lifecycleAction: "deprioritize",
+      supersededBy: "coach-decision-3",
+    });
+    expect(replaced.coachHistory[1]).toMatchObject({
+      decisionId: "coach-decision-3",
+      lifecycleAction: "retain",
+    });
+  });
+
+  it("ends capture authoritatively and ignores a late coach result while keeping history", () => {
+    const advised = meetingReducer(createInitialMeetingState("meeting-1"), {
+      type: "snapshot.received",
+      snapshot: snapshot({ lastSeq: 1 }),
+      receivedAtMs: 1_000,
+    });
+    const withAdvice = meetingReducer(advised, {
+      type: "events.received",
+      events: [event({
+        seq: 2,
+        type: "meeting.intelligence.applied",
+        payload: {
+          ...formalAiPayload("segment-2"),
+          coach_intervention: {
+            question: "请先确认上线负责人。",
+            reason: "当前承诺没有负责人。",
+            evidence_segment_ids: ["segment-2"],
+            evidence_quote: "周五上线",
+            urgency: "high",
+            coach_event_type: "commitment_risk",
+          },
+          coach_decision: {
+            origin: "pi",
+            status: "intervention",
+            decision_id: "coach-decision-before-end",
+            lifecycle_action: "retain",
+          },
+        },
+      })],
+      receivedAtMs: 2_000,
+    });
+    const ended = meetingReducer(withAdvice, {
+      type: "events.received",
+      events: [event({ seq: 3, eventId: "meeting-ended", type: "meeting.ended", payload: {} })],
+      receivedAtMs: 3_000,
+    });
+    const afterLateCoach = meetingReducer(ended, {
+      type: "events.received",
+      events: [event({
+        seq: 4,
+        eventId: "late-coach",
+        type: "meeting.intelligence.applied",
+        payload: {
+          ...formalAiPayload("segment-4"),
+          coach_intervention: {
+            question: "这条迟到建议不应重新出现。",
+            reason: "会议已经结束。",
+            evidence_segment_ids: ["segment-4"],
+            evidence_quote: "会议结束后的结果",
+            urgency: "high",
+            coach_event_type: "goal_at_risk",
+          },
+          coach_decision: {
+            origin: "pi",
+            status: "intervention",
+            decision_id: "coach-decision-too-late",
+            lifecycle_action: "retain",
+          },
+        },
+      })],
+      receivedAtMs: 4_000,
+    });
+
+    expect(ended.runtime.phase).toBe("ended");
+    expect(ended.runtime.recording.state).not.toBe("active");
+    expect(ended.runtime.input.state).not.toBe("active");
+    expect(ended.audio.status).not.toBe("recording");
+    expect(ended.followUp).toBeNull();
+    expect(ended.coachHistory).toHaveLength(1);
+    expect(afterLateCoach.lastSeq).toBe(4);
+    expect(afterLateCoach.followUp).toBeNull();
+    expect(afterLateCoach.coachDecision).toBeNull();
+    expect(afterLateCoach.coachHistory).toEqual(ended.coachHistory);
+
+    const afterStaleLiveSnapshot = meetingReducer(afterLateCoach, {
+      type: "snapshot.received",
+      snapshot: snapshot({
+        lastSeq: 4,
+        followUp: {
+          question: "快照中的迟到建议也不应重新出现。",
+          reason: "会议已经结束。",
+          evidenceSegmentIds: ["segment-4"],
+          evidenceQuote: "会议结束后的结果",
+          urgency: "high",
+          coachEventType: "goal_at_risk",
+          origin: "pi",
+          status: "intervention",
+          decisionId: "coach-decision-too-late",
+          lifecycleAction: "retain",
+        },
+      }),
+      receivedAtMs: 4_100,
+    });
+    expect(afterStaleLiveSnapshot.runtime.phase).toBe("ended");
+    expect(afterStaleLiveSnapshot.followUp).toBeNull();
+  });
+
+  it("normalizes stale active capture fields from an ended snapshot", () => {
+    const current = meetingReducer(createInitialMeetingState("meeting-1"), {
+      type: "snapshot.received",
+      snapshot: snapshot({
+        runtime: { ...snapshot().runtime, phase: "ended" },
+        audio: { ...snapshot().audio, status: "recording" },
+      }),
+      receivedAtMs: 2_000,
+    });
+
+    expect(current.runtime.phase).toBe("ended");
+    expect(current.runtime.recording).toMatchObject({ state: "busy", label: "正在整理录音" });
+    expect(current.runtime.input).toMatchObject({ state: "idle", label: "输入已结束", level: 0 });
+    expect(current.audio.status).toBe("assembling");
   });
 
   it("builds a bounded recent-context timeline from live formal events", () => {
@@ -571,13 +892,26 @@ describe("meetingReducer", () => {
           ...formalAiPayload("remote-segment"),
           follow_up: {
             question: "可以把周五作为目标，但需要以周四压测达标为上线条件。",
+            say_this: "可以把周五作为目标，但需要以周四压测达标为上线条件。",
             reason: "对方要求确定日期，但压测尚未完成。",
+            why_now: "对方要求确定日期，但压测尚未完成。",
             evidence_segment_ids: ["local-segment", "remote-segment"],
             evidence_quote: "压测还没有完成",
             urgency: "high",
             coach_event_type: "decision_readiness",
             title: "先限定承诺条件",
             confidence: 0.91,
+            provenance_version: "realtime_coach_provenance.v1",
+            origin: "pi",
+            status: "intervention",
+            status_reason: "intervention_submitted",
+            decision_reason: "压测条件还未说明。",
+            run_id: "coach-run-3",
+            decision_id: "coach-decision-3",
+            evidence_revision: "coach-evidence:3:abc",
+            valid_until_ms: 12_000,
+            lifecycle_action: "retain",
+            superseded_by: null,
           },
         },
       })],
@@ -586,9 +920,56 @@ describe("meetingReducer", () => {
 
     expect(current.followUp).toMatchObject({
       coachEventType: "decision_readiness",
+      sayThis: "可以把周五作为目标，但需要以周四压测达标为上线条件。",
+      whyNow: "对方要求确定日期，但压测尚未完成。",
       title: "先限定承诺条件",
       confidence: 0.91,
       urgency: "high",
+      origin: "pi",
+      status: "intervention",
+      statusReason: "intervention_submitted",
+      decisionReason: "压测条件还未说明。",
+      runId: "coach-run-3",
+      decisionId: "coach-decision-3",
+      evidenceRevision: "coach-evidence:3:abc",
+      validUntil: 12_000,
+      lifecycleAction: "retain",
+      supersededBy: null,
+    });
+  });
+
+  it("accepts canonical coach aliases when an event omits legacy names", () => {
+    const current = meetingReducer(createInitialMeetingState("meeting-canonical-card"), {
+      type: "events.received",
+      events: [event({
+        meetingId: "meeting-canonical-card",
+        seq: 4,
+        type: "meeting.intelligence.applied",
+        payload: {
+          ...formalAiPayload("segment-4"),
+          coach_intervention: {
+            say_this: "我先确认验收条件，再给出日期。",
+            why_now: "现在需要避免在条件不清时作出承诺。",
+            evidence_segment_ids: ["segment-4"],
+            evidence_quote: "验收条件还没定",
+            urgency: "high",
+            coach_event_type: "commitment_risk",
+          },
+          coach_decision: {
+            origin: "pi",
+            status: "intervention",
+            decision_id: "coach-decision-canonical",
+          },
+        },
+      })],
+      receivedAtMs: 4_000,
+    });
+
+    expect(current.followUp).toMatchObject({
+      question: "我先确认验收条件，再给出日期。",
+      reason: "现在需要避免在条件不清时作出承诺。",
+      sayThis: "我先确认验收条件，再给出日期。",
+      whyNow: "现在需要避免在条件不清时作出承诺。",
     });
   });
 
@@ -622,6 +1003,251 @@ describe("meetingReducer", () => {
     });
 
     expect(current.followUp).toBeNull();
+  });
+
+  it("projects a strictly attributed local clarity reflex without formal-AI provenance", () => {
+    const current = meetingReducer(createInitialMeetingState("meeting-1"), {
+      type: "events.received",
+      events: [event({
+        seq: 5,
+        eventId: "local-reflex-event-5",
+        type: "meeting.intelligence.applied",
+        aggregateType: "meeting_intelligence",
+        aggregateId: "local-reflex-intelligence-5",
+        payload: localReflexPayload(),
+      })],
+      receivedAtMs: 5_000,
+    });
+
+    expect(current.followUp).toMatchObject({
+      origin: "local_reflex",
+      localReflexKind: "communication_clarity",
+      status: "intervention",
+      coachEventType: "communication_clarity",
+      sayThis: "我先收束一下：当前只确认目标，细节稍后逐项核对。",
+      whyNow: "同一观点已经连续重复，需要先收束表达。",
+      validUntil: 40_000,
+      decisionId: "local-reflex-decision-1",
+    });
+    expect(current.followUp?.formalAi).toBeNull();
+    expect(current.coachDecision).toMatchObject({
+      origin: "local_reflex",
+      status: "intervention",
+      decisionId: "local-reflex-decision-1",
+    });
+    expect(current.coachHistory).toHaveLength(1);
+    expect(current.coachHistory[0]).toMatchObject({
+      historyId: "local-reflex-event-5",
+      origin: "local_reflex",
+    });
+    expect(current.coachHistory[0].formalAi).toBeNull();
+  });
+
+  it.each([
+    ["missing_next_step", "execution_gap"],
+    ["communication_clarity", "communication_clarity"],
+    ["strong_objection", "discovery_gap"],
+  ] as const)("projects the valid %s/%s local-reflex event", (localReflexKind, coachEventType) => {
+    const base = localReflexPayload();
+    const intervention = {
+      ...(base.coach_intervention as Record<string, unknown>),
+      local_reflex_kind: localReflexKind,
+      coach_event_type: coachEventType,
+    };
+    const current = meetingReducer(createInitialMeetingState("meeting-1"), {
+      type: "events.received",
+      events: [event({
+        seq: 7,
+        eventId: `local-reflex-${localReflexKind}`,
+        type: "meeting.intelligence.applied",
+        payload: localReflexPayload({ coach_intervention: intervention }),
+      })],
+      receivedAtMs: 7_000,
+    });
+
+    expect(current.followUp).toMatchObject({
+      origin: "local_reflex",
+      localReflexKind,
+      coachEventType,
+    });
+    expect(current.coachHistory).toHaveLength(1);
+  });
+
+  it.each([
+    ["missing_next_step", "communication_clarity"],
+    ["communication_clarity", "discovery_gap"],
+    ["strong_objection", "execution_gap"],
+    ["unknown_reflex", "execution_gap"],
+  ])("rejects the mismatched local-reflex event %s/%s", (localReflexKind, coachEventType) => {
+    const base = localReflexPayload();
+    const intervention = {
+      ...(base.coach_intervention as Record<string, unknown>),
+      local_reflex_kind: localReflexKind,
+      coach_event_type: coachEventType,
+    };
+    const current = meetingReducer(createInitialMeetingState("meeting-1"), {
+      type: "events.received",
+      events: [event({
+        seq: 8,
+        type: "meeting.intelligence.applied",
+        payload: localReflexPayload({ coach_intervention: intervention }),
+      })],
+      receivedAtMs: 8_000,
+    });
+
+    expect(current.followUp).toBeNull();
+    expect(current.coachDecision).toBeNull();
+    expect(current.coachHistory).toEqual([]);
+  });
+
+  it("rejects local-reflex provenance that claims a Pi provider attempt", () => {
+    const current = meetingReducer(createInitialMeetingState("meeting-1"), {
+      type: "events.received",
+      events: [event({
+        seq: 9,
+        type: "meeting.intelligence.applied",
+        payload: localReflexPayload({ pi_provider_attempted: true }),
+      })],
+      receivedAtMs: 9_000,
+    });
+
+    expect(current.followUp).toBeNull();
+    expect(current.coachDecision).toBeNull();
+    expect(current.coachHistory).toEqual([]);
+  });
+
+  it("rejects a local-reflex envelope that tries to generate non-clarity advice", () => {
+    const unsafeIntervention = {
+      ...(localReflexPayload().coach_intervention as Record<string, unknown>),
+      coach_event_type: "commitment_risk",
+    };
+    const current = meetingReducer(createInitialMeetingState("meeting-1"), {
+      type: "events.received",
+      events: [event({
+        seq: 6,
+        type: "meeting.intelligence.applied",
+        payload: localReflexPayload({ coach_intervention: unsafeIntervention }),
+      })],
+      receivedAtMs: 6_000,
+    });
+
+    expect(current.followUp).toBeNull();
+    expect(current.coachDecision).toBeNull();
+    expect(current.coachHistory).toEqual([]);
+  });
+
+  it("drops an invalid local-reflex entry from snapshot coach history", () => {
+    const invalidHistory = {
+      question: "直接承诺周五上线。",
+      reason: "本地规则不允许生成承诺。",
+      evidenceSegmentIds: ["segment-unsafe"],
+      evidenceQuote: "周五上线",
+      urgency: "high" as const,
+      coachEventType: "commitment_risk" as const,
+      origin: "local_reflex" as const,
+      status: "intervention" as const,
+      validUntil: 40_000,
+      historyId: "unsafe-local-reflex-history",
+      createdAtMs: 5_000,
+    };
+    const current = meetingReducer(createInitialMeetingState("meeting-1"), {
+      type: "snapshot.received",
+      snapshot: snapshot({ coachHistory: [invalidHistory] }),
+      receivedAtMs: 5_000,
+    });
+
+    expect(current.coachHistory).toEqual([]);
+  });
+
+  it("keeps a retained local-reflex snapshot card current and preserves its history identity", () => {
+    const retained = {
+      question: "先确认一下：下一步是什么、谁来负责、什么时候回看？",
+      sayThis: "先确认一下：下一步是什么、谁来负责、什么时候回看？",
+      reason: "对话正在收尾，但还没有明确下一步。",
+      whyNow: "对话正在收尾，但还没有明确下一步。",
+      evidenceSegmentIds: ["segment-close"],
+      evidenceQuote: "我们已经把方案讨论完了今天先到这",
+      urgency: "high" as const,
+      coachEventType: "execution_gap" as const,
+      origin: "local_reflex" as const,
+      localReflexKind: "missing_next_step" as const,
+      status: "intervention" as const,
+      lifecycleAction: "retain" as const,
+      decisionId: "local-reflex-decision-close",
+      validUntil: 100_000,
+      formalAi: null,
+    };
+    const current = meetingReducer(createInitialMeetingState("meeting-1"), {
+      type: "snapshot.received",
+      snapshot: snapshot({
+        followUp: retained,
+        coachDecision: {
+          origin: "local_reflex",
+          status: "intervention",
+          lifecycleAction: "retain",
+          decisionId: "local-reflex-decision-close",
+          validUntil: 100_000,
+        },
+        coachHistory: [{
+          ...retained,
+          historyId: "local-reflex-history-close",
+          createdAtMs: 10_000,
+        }],
+      }),
+      receivedAtMs: 10_100,
+    });
+
+    expect(current.followUp).toMatchObject({
+      origin: "local_reflex",
+      status: "intervention",
+      lifecycleAction: "retain",
+      decisionId: "local-reflex-decision-close",
+    });
+    expect(current.coachHistory).toHaveLength(1);
+    expect(current.coachHistory[0].historyId).toBe("local-reflex-history-close");
+    expect(current.coachHistory[0].lifecycleAction).toBe("retain");
+  });
+
+  it("keeps a direct semantic follow-up out of Pi coach history", () => {
+    const current = meetingReducer(createInitialMeetingState("meeting-1"), {
+      type: "events.received",
+      events: [event({
+        seq: 4,
+        type: "meeting.intelligence.applied",
+        payload: {
+          ...formalAiPayload("segment-4"),
+          semantic_follow_up: {
+            question: "可以再补充一个真实使用场景吗？",
+            reason: "这是普通语义追问，不是教练介入决策。",
+            evidence_segment_ids: ["segment-4"],
+            evidence_quote: "想了解更多场景",
+            urgency: "medium",
+          },
+          coach_decision: {
+            origin: "direct_intelligence",
+            status: "protected_silent",
+            decision_id: "coach-decision-silent-4",
+            decision_reason: "本轮没有达到教练介入门槛。",
+            valid_until_ms: 94_000,
+            lifecycle_action: "deprioritize",
+          },
+        },
+      })],
+      receivedAtMs: 4_000,
+    });
+
+    expect(current.followUp).toBeNull();
+    expect(current.semanticFollowUp).toMatchObject({
+      question: "可以再补充一个真实使用场景吗？",
+    });
+    expect(current.coachDecision).toMatchObject({
+      origin: "direct_intelligence",
+      status: "protected_silent",
+      decisionId: "coach-decision-silent-4",
+      validUntil: 94_000,
+      lifecycleAction: "deprioritize",
+    });
+    expect(current.coachHistory).toEqual([]);
   });
 
   it("does not project a deterministic fact candidate as a formal AI fact", () => {

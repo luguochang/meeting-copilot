@@ -1,10 +1,15 @@
+import { isLocalReflexCoachProjection } from "../domain/events";
 import type {
   ActivePartial,
   ActionItemProjection,
   ApproachCard,
   ApproachReview,
   AudioChunk,
+  CoachDueWorkItem,
   CoachHistoryEntry,
+  CoachDecisionProjection,
+  CoachDecisionOrigin,
+  CoachDecisionStatus,
   DataGovernanceSettings,
   DataRetentionPolicy,
   DecisionCandidate,
@@ -21,6 +26,7 @@ import type {
   MeetingHistoryItem,
   ImportJob,
   ImportJobStage,
+  LocalReflexKind,
   MeetingRuntime,
   MeetingSpeaker,
   MeetingSnapshot,
@@ -47,6 +53,7 @@ import type {
   TranscriptPage,
   TranscriptSegment,
 } from "../domain/events";
+import { parseCoachAgentMetrics } from "../domain/coachAgentMetrics";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -61,12 +68,50 @@ export type AudioTrackId = "microphone" | "system_audio";
 
 export type ProviderProbeStatus = "not_run" | "probing" | "succeeded" | "failed";
 
+export interface ProviderProbeUsage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+}
+
+export interface ProviderProbeResult {
+  operational: true;
+  realtime_ready: boolean;
+  probe_latency_ms: number;
+  realtime_cutoff_ms: number;
+  usage: ProviderProbeUsage;
+  cached: boolean;
+}
+
+export interface RealtimeProviderCircuitStatus {
+  state: "closed" | "open" | "half_open";
+  reason: string;
+  failure_count: number;
+  retry_after_ms: number;
+  half_open: boolean;
+  identity_generation: number;
+  last_failure_class: string | null;
+}
+
 export interface ProviderStatus {
   configured: boolean;
   runtime_synced: boolean;
   probe_status: ProviderProbeStatus;
   model: string | null;
   realtime_model?: string | null;
+  realtime_model_source?: string | null;
+  realtime_model_explicit?: boolean;
+  realtime_model_warning?: string | null;
+  correction_model?: string | null;
+  correction_model_source?: string | null;
+  correction_model_explicit?: boolean;
+  correction_model_warning?: string | null;
+  operational: boolean | null;
+  realtime_ready: boolean | null;
+  probe_latency_ms: number | null;
+  probe_usage: ProviderProbeUsage | null;
+  realtime_cutoff_ms: number;
+  realtime_circuit?: RealtimeProviderCircuitStatus | null;
 }
 
 export interface DesktopProviderStatusLike {
@@ -75,7 +120,22 @@ export interface DesktopProviderStatusLike {
   probe_status?: ProviderProbeStatus;
   model?: string | null;
   realtime_model?: string | null;
+  realtime_model_source?: string | null;
+  realtime_model_explicit?: boolean;
+  realtime_model_warning?: string | null;
+  correction_model?: string | null;
+  correction_model_source?: string | null;
+  correction_model_explicit?: boolean;
+  correction_model_warning?: string | null;
+  operational?: boolean | null;
+  realtime_ready?: boolean | null;
+  probe_latency_ms?: number | null;
+  probe_usage?: ProviderProbeUsage | null;
+  realtime_cutoff_ms?: number | null;
+  realtime_circuit?: RealtimeProviderCircuitStatus | null;
 }
+
+export const DEFAULT_PROVIDER_REALTIME_CUTOFF_MS = 2_500;
 
 export type AudioTrackStatus =
   | "active"
@@ -199,6 +259,86 @@ function optionalBoolean(value: unknown): boolean | null {
   return typeof value === "boolean" ? value : null;
 }
 
+function optionalProviderProbeUsage(value: unknown): ProviderProbeUsage | null {
+  if (value === undefined || value === null) return null;
+  const usage = record(value, "provider status.probe_usage");
+  const promptTokens = nonNegativeInteger(usage.prompt_tokens, "provider status.probe_usage.prompt_tokens");
+  const completionTokens = nonNegativeInteger(usage.completion_tokens, "provider status.probe_usage.completion_tokens");
+  const totalTokens = nonNegativeInteger(usage.total_tokens, "provider status.probe_usage.total_tokens");
+  if (totalTokens <= 0 || totalTokens !== promptTokens + completionTokens) {
+    throw new ContractError("provider status.probe_usage is inconsistent");
+  }
+  return {
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens: totalTokens,
+  };
+}
+
+export function parseProviderProbeResult(value: unknown): ProviderProbeResult {
+  const source = record(value, "provider probe result");
+  if (source.ok !== true || source.operational !== true) {
+    throw new ContractError("provider probe did not report an operational success");
+  }
+  const probeLatencyMs = nonNegativeInteger(
+    source.probe_latency_ms,
+    "provider probe result.probe_latency_ms",
+  );
+  const realtimeCutoffMs = nonNegativeInteger(
+    source.realtime_cutoff_ms,
+    "provider probe result.realtime_cutoff_ms",
+  );
+  const usage = optionalProviderProbeUsage(source.usage);
+  if (realtimeCutoffMs <= 0 || usage === null || typeof source.realtime_ready !== "boolean") {
+    throw new ContractError("provider probe result is missing readiness evidence");
+  }
+  const realtimeReady = probeLatencyMs <= realtimeCutoffMs;
+  if (source.realtime_ready !== realtimeReady) {
+    throw new ContractError("provider probe readiness contradicts its latency evidence");
+  }
+  return {
+    operational: true,
+    realtime_ready: realtimeReady,
+    probe_latency_ms: probeLatencyMs,
+    realtime_cutoff_ms: realtimeCutoffMs,
+    usage,
+    cached: source.cached === true,
+  };
+}
+
+function optionalRealtimeProviderCircuit(value: unknown): RealtimeProviderCircuitStatus | null {
+  if (value === undefined || value === null) return null;
+  const source = record(value, "provider status.realtime_circuit");
+  const state = String(source.state ?? "");
+  if (!["closed", "open", "half_open"].includes(state)) {
+    throw new ContractError("provider status.realtime_circuit.state is invalid");
+  }
+  if (typeof source.reason !== "string" || !source.reason.trim()) {
+    throw new ContractError("provider status.realtime_circuit.reason must be a string");
+  }
+  if (typeof source.half_open !== "boolean") {
+    throw new ContractError("provider status.realtime_circuit.half_open must be a boolean");
+  }
+  return {
+    state: state as RealtimeProviderCircuitStatus["state"],
+    reason: source.reason.trim(),
+    failure_count: nonNegativeInteger(
+      source.failure_count,
+      "provider status.realtime_circuit.failure_count",
+    ),
+    retry_after_ms: nonNegativeInteger(
+      source.retry_after_ms,
+      "provider status.realtime_circuit.retry_after_ms",
+    ),
+    half_open: source.half_open,
+    identity_generation: nonNegativeInteger(
+      source.identity_generation,
+      "provider status.realtime_circuit.identity_generation",
+    ),
+    last_failure_class: optionalString(source.last_failure_class),
+  };
+}
+
 export function parseProviderStatus(value: unknown): ProviderStatus {
   const source = record(value, "provider status");
   const probeStatus = source.probe_status;
@@ -211,12 +351,57 @@ export function parseProviderStatus(value: unknown): ProviderStatus {
   if (!["not_run", "probing", "succeeded", "failed"].includes(String(probeStatus))) {
     throw new ContractError("provider status.probe_status is invalid");
   }
+  const operational = optionalBoolean(source.operational);
+  const realtimeReady = optionalBoolean(source.realtime_ready);
+  const probeLatencyMs = source.probe_latency_ms === undefined || source.probe_latency_ms === null
+    ? null
+    : nonNegativeInteger(source.probe_latency_ms, "provider status.probe_latency_ms");
+  const realtimeCutoffMs = source.realtime_cutoff_ms === undefined || source.realtime_cutoff_ms === null
+    ? DEFAULT_PROVIDER_REALTIME_CUTOFF_MS
+    : nonNegativeInteger(source.realtime_cutoff_ms, "provider status.realtime_cutoff_ms");
+  const probeUsage = optionalProviderProbeUsage(source.probe_usage);
+  if (probeStatus === "succeeded" && realtimeReady !== null && (
+    operational !== true
+    || realtimeCutoffMs <= 0
+    || probeLatencyMs === null
+    || probeUsage === null
+  )) {
+    throw new ContractError("provider status readiness is missing probe evidence");
+  }
+  if (realtimeReady === true && (
+    probeStatus !== "succeeded"
+    || operational !== true
+    || probeLatencyMs === null
+    || probeLatencyMs > realtimeCutoffMs
+      || probeUsage === null
+  )) {
+    throw new ContractError("provider status.realtime_ready requires a valid in-window probe");
+  }
+  if (probeStatus === "succeeded" && realtimeReady !== null && probeLatencyMs !== null) {
+    const derivedRealtimeReady = probeLatencyMs <= realtimeCutoffMs;
+    if (realtimeReady !== derivedRealtimeReady) {
+      throw new ContractError("provider status readiness contradicts its latency evidence");
+    }
+  }
   return {
     configured: source.configured,
     runtime_synced: source.runtime_synced,
     probe_status: probeStatus as ProviderProbeStatus,
     model: optionalString(source.model),
     realtime_model: optionalString(source.realtime_model) ?? optionalString(source.model),
+    realtime_model_source: optionalString(source.realtime_model_source),
+    realtime_model_explicit: optionalBoolean(source.realtime_model_explicit) ?? undefined,
+    realtime_model_warning: optionalString(source.realtime_model_warning),
+    correction_model: optionalString(source.correction_model) ?? optionalString(source.model),
+    correction_model_source: optionalString(source.correction_model_source),
+    correction_model_explicit: optionalBoolean(source.correction_model_explicit) ?? undefined,
+    correction_model_warning: optionalString(source.correction_model_warning),
+    operational: probeStatus === "failed" ? false : operational,
+    realtime_ready: probeStatus === "failed" ? false : realtimeReady,
+    probe_latency_ms: probeStatus === "succeeded" ? probeLatencyMs : null,
+    probe_usage: probeStatus === "succeeded" ? probeUsage : null,
+    realtime_cutoff_ms: realtimeCutoffMs || DEFAULT_PROVIDER_REALTIME_CUTOFF_MS,
+    realtime_circuit: optionalRealtimeProviderCircuit(source.realtime_circuit),
   };
 }
 
@@ -231,6 +416,19 @@ export function reconcileProviderStatus(
       probe_status: "not_run",
       model: null,
       realtime_model: null,
+      realtime_model_source: "not_configured",
+      realtime_model_explicit: false,
+      realtime_model_warning: null,
+      correction_model: null,
+      correction_model_source: "not_configured",
+      correction_model_explicit: false,
+      correction_model_warning: null,
+      operational: null,
+      realtime_ready: null,
+      probe_latency_ms: null,
+      probe_usage: null,
+      realtime_cutoff_ms: DEFAULT_PROVIDER_REALTIME_CUTOFF_MS,
+      realtime_circuit: null,
     };
   }
   const configured = desktop.configured === true;
@@ -240,20 +438,83 @@ export function reconcileProviderStatus(
   const realtimeModel = typeof desktop.realtime_model === "string" && desktop.realtime_model.trim()
     ? desktop.realtime_model.trim()
     : model ?? null;
+  const realtimeModelSource = desktop.realtime_model_source
+    ?? runtime?.realtime_model_source
+    ?? (configured ? "general_model_fallback" : "not_configured");
+  const realtimeModelExplicit = desktop.realtime_model_explicit
+    ?? runtime?.realtime_model_explicit
+    ?? (realtimeModelSource !== "general_model_fallback" && configured);
+  const realtimeModelWarning = desktop.realtime_model_warning
+    ?? runtime?.realtime_model_warning
+    ?? (realtimeModelSource === "general_model_fallback"
+      ? "realtime_model_inherits_general_model"
+      : null);
+  const correctionModel = typeof desktop.correction_model === "string" && desktop.correction_model.trim()
+    ? desktop.correction_model.trim()
+    : runtime?.correction_model ?? model ?? null;
+  const correctionModelSource = desktop.correction_model_source
+    ?? runtime?.correction_model_source
+    ?? (configured ? "general_model_fallback" : "not_configured");
+  const correctionModelExplicit = desktop.correction_model_explicit
+    ?? runtime?.correction_model_explicit
+    ?? (correctionModelSource !== "general_model_fallback" && configured);
+  const correctionModelWarning = desktop.correction_model_warning
+    ?? runtime?.correction_model_warning
+    ?? (correctionModelSource === "general_model_fallback"
+      ? "correction_model_inherits_general_model"
+      : null);
   const sameModel = (!runtime?.model || !model || runtime.model === model)
-    && (!runtime?.realtime_model || !realtimeModel || runtime.realtime_model === realtimeModel);
+    && (!runtime?.realtime_model || !realtimeModel || runtime.realtime_model === realtimeModel)
+    && (!runtime?.correction_model || !correctionModel || runtime.correction_model === correctionModel);
+  const sameProvenance = (!runtime?.realtime_model_source
+      || runtime.realtime_model_source === realtimeModelSource)
+    && (runtime?.realtime_model_explicit === undefined
+      || runtime.realtime_model_explicit === realtimeModelExplicit)
+    && (!runtime?.correction_model_source
+      || runtime.correction_model_source === correctionModelSource)
+    && (runtime?.correction_model_explicit === undefined
+      || runtime.correction_model_explicit === correctionModelExplicit);
   const runtimeSynced = configured
     && desktop.runtime_synced === true
     && (runtime === null || runtime.runtime_synced === true)
-    && sameModel;
+    && sameModel
+    && sameProvenance;
+  const probeStatus = runtimeSynced
+    ? runtime?.probe_status ?? desktop.probe_status ?? "not_run"
+    : "not_run";
+  const probeSucceeded = probeStatus === "succeeded";
+  const probeFailed = probeStatus === "failed";
   return {
     configured,
     runtime_synced: runtimeSynced,
-    probe_status: runtimeSynced
-      ? runtime?.probe_status ?? desktop.probe_status ?? "not_run"
-      : "not_run",
+    probe_status: probeStatus,
     model,
     realtime_model: realtimeModel,
+    realtime_model_source: realtimeModelSource,
+    realtime_model_explicit: realtimeModelExplicit,
+    realtime_model_warning: realtimeModelWarning,
+    correction_model: correctionModel,
+    correction_model_source: correctionModelSource,
+    correction_model_explicit: correctionModelExplicit,
+    correction_model_warning: correctionModelWarning,
+    operational: probeFailed
+      ? false
+      : probeSucceeded ? runtime?.operational ?? desktop.operational ?? null : null,
+    realtime_ready: probeFailed
+      ? false
+      : probeSucceeded ? runtime?.realtime_ready ?? desktop.realtime_ready ?? null : null,
+    probe_latency_ms: probeSucceeded
+      ? runtime?.probe_latency_ms ?? desktop.probe_latency_ms ?? null
+      : null,
+    probe_usage: probeSucceeded
+      ? runtime?.probe_usage ?? desktop.probe_usage ?? null
+      : null,
+    realtime_cutoff_ms: runtime?.realtime_cutoff_ms
+      ?? desktop.realtime_cutoff_ms
+      ?? DEFAULT_PROVIDER_REALTIME_CUTOFF_MS,
+    realtime_circuit: runtimeSynced
+      ? runtime?.realtime_circuit ?? desktop.realtime_circuit ?? null
+      : null,
   };
 }
 
@@ -899,17 +1160,20 @@ function parseQuestion(value: unknown, index: number): OpenQuestionProjection | 
   };
 }
 
-function parseFollowUp(value: unknown): FollowUpProjection | null {
-  const item = optionalRecord(value);
-  if (!item) return null;
-  const question = optionalString(first(item, "question"));
-  const reason = optionalString(first(item, "reason"));
+function parseFollowUp(value: unknown, metadataValue?: unknown): FollowUpProjection | null {
+  const rawItem = optionalRecord(value);
+  if (!rawItem) return null;
+  const item = { ...(optionalRecord(metadataValue) ?? {}), ...rawItem };
+  const sayThis = optionalString(first(item, "say_this", "sayThis"));
+  const whyNow = optionalString(first(item, "why_now", "whyNow"));
+  const question = optionalString(first(item, "question", "recommendation")) ?? sayThis;
+  const reason = optionalString(first(item, "reason")) ?? whyNow;
   if (!question || !reason) return null;
   const urgencyValue = optionalString(first(item, "urgency"));
   const urgency = urgencyValue === "low" || urgencyValue === "medium" || urgencyValue === "high"
     ? urgencyValue
     : "medium";
-  const coachEventTypeValue = optionalString(first(item, "coach_event_type", "coachEventType"));
+  const coachEventTypeValue = optionalString(first(item, "coach_event_type", "coachEventType", "event_type", "eventType"));
   const coachEventType =
     coachEventTypeValue === "question_to_user" || coachEventTypeValue === "commitment_risk" ||
     coachEventTypeValue === "goal_at_risk" || coachEventTypeValue === "contradiction" ||
@@ -920,26 +1184,205 @@ function parseFollowUp(value: unknown): FollowUpProjection | null {
       : null;
   const title = optionalString(first(item, "title"));
   const confidence = optionalNumber(first(item, "confidence"));
-  return {
+  const originValue = optionalString(first(item, "origin"));
+  const origin = (
+    originValue === "pi" || originValue === "local_reflex" ||
+    originValue === "direct_intelligence" || originValue === "direct_fallback"
+  ) ? originValue as CoachDecisionOrigin : null;
+  const localReflexKindValue = optionalString(first(item, "local_reflex_kind", "localReflexKind"));
+  const localReflexKind = (
+    localReflexKindValue === "missing_next_step" || localReflexKindValue === "communication_clarity" ||
+    localReflexKindValue === "strong_objection" || localReflexKindValue === "pending_question"
+  ) ? localReflexKindValue as LocalReflexKind : null;
+  const statusValue = optionalString(first(item, "status"));
+  const status = (
+    statusValue === "intervention" || statusValue === "not_triggered" ||
+    statusValue === "protected_silent" || statusValue === "timed_out" ||
+    statusValue === "failed" || statusValue === "stale"
+  ) ? statusValue as CoachDecisionStatus : null;
+  const evidenceRevisionValue = first(item, "evidence_revision", "evidenceRevision");
+  const evidenceRevision = typeof evidenceRevisionValue === "number" && Number.isFinite(evidenceRevisionValue)
+    ? evidenceRevisionValue
+    : optionalString(evidenceRevisionValue);
+  const provenanceVersion = optionalString(first(item, "provenance_version", "provenanceVersion"));
+  const statusReason = optionalString(first(item, "status_reason", "statusReason"));
+  const decisionReason = optionalString(first(item, "decision_reason", "decisionReason"));
+  const runId = optionalString(first(item, "run_id", "runId"));
+  const decisionId = optionalString(first(item, "decision_id", "decisionId"));
+  const validUntil = optionalNumber(first(
+    item,
+    "valid_until_ms",
+    "validUntilMs",
+    "valid_until",
+    "validUntil",
+  ));
+  const softDeadlineAtMs = optionalNumber(first(item, "soft_deadline_at_ms", "softDeadlineAtMs"));
+  const softCutoffElapsedMs = optionalNumber(first(item, "soft_cutoff_elapsed_ms", "softCutoffElapsedMs"));
+  const softTimeoutProjectionAtMs = optionalNumber(
+    first(item, "soft_timeout_projection_at_ms", "softTimeoutProjectionAtMs"),
+  );
+  const deliveryStatusValue = optionalString(first(item, "delivery_status", "deliveryStatus"));
+  const deliveryStatus = deliveryStatusValue === "on_time" || deliveryStatusValue === "too_late" || deliveryStatusValue === "not_applicable"
+    ? deliveryStatusValue
+    : null;
+  const softCutoffTriggered = typeof item.soft_cutoff_triggered === "boolean"
+    ? item.soft_cutoff_triggered
+    : typeof item.softCutoffTriggered === "boolean" ? item.softCutoffTriggered : null;
+  const lateResultDiscarded = typeof item.late_result_discarded === "boolean"
+    ? item.late_result_discarded
+    : typeof item.lateResultDiscarded === "boolean" ? item.lateResultDiscarded : null;
+  const lifecycleValue = optionalString(first(item, "lifecycle_action", "lifecycleAction"));
+  const lifecycleAction = lifecycleValue === "retain" || lifecycleValue === "retract" || lifecycleValue === "deprioritize"
+    ? lifecycleValue
+    : null;
+  const lifecycleStatusValue = optionalString(first(item, "lifecycle_status", "lifecycleStatus"));
+  const lifecycleStatus = lifecycleStatusValue === "resolved" || lifecycleStatusValue === "retracted" || lifecycleStatusValue === "superseded"
+    ? lifecycleStatusValue
+    : null;
+  const supersedesDecisionIdValue = first(item, "supersedes_decision_id", "supersedesDecisionId");
+  const supersededByValue = first(item, "superseded_by", "supersededBy");
+  const parsed: FollowUpProjection = {
     question,
     reason,
+    ...(sayThis ? { sayThis } : {}),
+    ...(whyNow ? { whyNow } : {}),
     evidenceSegmentIds: strings(first(item, "evidence_segment_ids", "evidenceSegmentIds")),
     evidenceQuote: optionalString(first(item, "evidence_quote", "evidenceQuote")) ?? "",
     urgency,
     ...(coachEventType ? { coachEventType } : {}),
     ...(title ? { title } : {}),
     ...(confidence !== null ? { confidence } : {}),
+    ...(provenanceVersion ? { provenanceVersion } : {}),
+    ...(origin ? { origin } : {}),
+    ...(localReflexKind ? { localReflexKind } : {}),
+    ...(status ? { status } : {}),
+    ...(statusReason ? { statusReason } : {}),
+    ...(decisionReason ? { decisionReason } : {}),
+    ...(runId ? { runId } : {}),
+    ...(decisionId ? { decisionId } : {}),
+    ...(evidenceRevision !== null ? { evidenceRevision } : {}),
+    ...(validUntil !== null ? { validUntil } : {}),
+    ...(softDeadlineAtMs !== null ? { softDeadlineAtMs } : {}),
+    ...(softCutoffElapsedMs !== null ? { softCutoffElapsedMs } : {}),
+    ...(softTimeoutProjectionAtMs !== null ? { softTimeoutProjectionAtMs } : {}),
+    ...(deliveryStatus ? { deliveryStatus } : {}),
+    ...(softCutoffTriggered !== null ? { softCutoffTriggered } : {}),
+    ...(lateResultDiscarded !== null ? { lateResultDiscarded } : {}),
+    ...(lifecycleAction ? { lifecycleAction } : {}),
+    ...(lifecycleStatus ? { lifecycleStatus } : {}),
+    ...(typeof supersedesDecisionIdValue === "string" || supersedesDecisionIdValue === null
+      ? { supersedesDecisionId: supersedesDecisionIdValue }
+      : {}),
+    ...(typeof supersededByValue === "string" || supersededByValue === null ? { supersededBy: supersededByValue } : {}),
     formalAi: parseFormalAi(item),
+  };
+  return parsed.origin === "local_reflex" && !isLocalReflexCoachProjection(parsed) ? null : parsed;
+}
+
+function parseCoachDecision(value: unknown): CoachDecisionProjection | null {
+  const item = optionalRecord(value);
+  if (!item) return null;
+  const originValue = optionalString(first(item, "origin"));
+  const statusValue = optionalString(first(item, "status"));
+  const origin = originValue === "pi" || originValue === "local_reflex" ||
+    originValue === "direct_intelligence" || originValue === "direct_fallback"
+    ? originValue as CoachDecisionProjection["origin"]
+    : undefined;
+  const status = statusValue === "intervention" || statusValue === "not_triggered" ||
+    statusValue === "protected_silent" || statusValue === "timed_out" ||
+    statusValue === "failed" || statusValue === "stale"
+    ? statusValue as CoachDecisionProjection["status"]
+    : undefined;
+  const rawEvidenceRevision = first(item, "evidence_revision", "evidenceRevision");
+  const evidenceRevision = typeof rawEvidenceRevision === "number" && Number.isFinite(rawEvidenceRevision)
+    ? rawEvidenceRevision
+    : optionalString(rawEvidenceRevision) ?? undefined;
+  const stringField = (snake: string, camel: string) => optionalString(first(item, snake, camel)) ?? undefined;
+  const numberField = (snake: string, camel: string) => optionalNumber(first(item, snake, camel)) ?? undefined;
+  const lifecycleValue = stringField("lifecycle_action", "lifecycleAction");
+  const lifecycleAction = lifecycleValue === "retain" || lifecycleValue === "retract" || lifecycleValue === "deprioritize"
+    ? lifecycleValue
+    : undefined;
+  const lifecycleStatusValue = stringField("lifecycle_status", "lifecycleStatus");
+  const lifecycleStatus = lifecycleStatusValue === "resolved" || lifecycleStatusValue === "retracted" || lifecycleStatusValue === "superseded"
+    ? lifecycleStatusValue
+    : undefined;
+  const supersedesDecisionIdValue = first(item, "supersedes_decision_id", "supersedesDecisionId");
+  const supersededByValue = first(item, "superseded_by", "supersededBy");
+  const agentMetrics = parseCoachAgentMetrics(first(item, "agent_metrics", "agentMetrics"));
+  return {
+    provenanceVersion: stringField("provenance_version", "provenanceVersion"),
+    origin,
+    status,
+    statusReason: stringField("status_reason", "statusReason"),
+    decisionReason: stringField("decision_reason", "decisionReason"),
+    runId: stringField("run_id", "runId"),
+    decisionId: stringField("decision_id", "decisionId"),
+    evidenceRevision,
+    meetingId: stringField("meeting_id", "meetingId"),
+    jobId: stringField("job_id", "jobId"),
+    triggered: typeof item.triggered === "boolean" ? item.triggered : undefined,
+    createdAtMs: numberField("created_at_ms", "createdAtMs"),
+    completedAtMs: numberField("completed_at_ms", "completedAtMs"),
+    deadlineAtMs: numberField("deadline_at_ms", "deadlineAtMs"),
+    softDeadlineAtMs: numberField("soft_deadline_at_ms", "softDeadlineAtMs"),
+    softCutoffElapsedMs: numberField("soft_cutoff_elapsed_ms", "softCutoffElapsedMs"),
+    softTimeoutProjectionAtMs: numberField(
+      "soft_timeout_projection_at_ms",
+      "softTimeoutProjectionAtMs",
+    ),
+    deliveryStatus: (() => {
+      const value = stringField("delivery_status", "deliveryStatus");
+      return value === "on_time" || value === "too_late" || value === "not_applicable"
+        ? value
+        : undefined;
+    })(),
+    softCutoffTriggered: typeof item.soft_cutoff_triggered === "boolean"
+      ? item.soft_cutoff_triggered
+      : typeof item.softCutoffTriggered === "boolean"
+        ? item.softCutoffTriggered
+        : undefined,
+    lateResultDiscarded: typeof item.late_result_discarded === "boolean"
+      ? item.late_result_discarded
+      : typeof item.lateResultDiscarded === "boolean"
+        ? item.lateResultDiscarded
+        : undefined,
+    validUntil: numberField("valid_until_ms", "validUntilMs"),
+    lifecycleAction,
+    lifecycleStatus,
+    ...(typeof supersedesDecisionIdValue === "string" || supersedesDecisionIdValue === null
+      ? { supersedesDecisionId: supersedesDecisionIdValue }
+      : {}),
+    ...(typeof supersededByValue === "string" || supersededByValue === null ? { supersededBy: supersededByValue } : {}),
+    ...(agentMetrics ? { agentMetrics } : {}),
   };
 }
 
 function parseCoachHistoryEntry(value: unknown, index: number): CoachHistoryEntry | null {
   const item = optionalRecord(value);
-  const followUp = parseFollowUp(value);
+  const followUp = parseFollowUp(value, item ? first(item, "coach_decision", "coachDecision") : undefined);
   if (!item || !followUp) return null;
   return {
     ...followUp,
     historyId: optionalString(first(item, "history_id", "historyId")) ?? `coach-history-${index}`,
+    createdAtMs: optionalNumber(first(item, "created_at_ms", "createdAtMs")) ?? 0,
+  };
+}
+
+function parseCoachDueWorkItem(value: unknown): CoachDueWorkItem | null {
+  const item = optionalRecord(value);
+  if (!item) return null;
+  const itemId = optionalString(first(item, "item_id", "itemId"));
+  const nextCheckAtMs = optionalNumber(first(item, "next_check_at_ms", "nextCheckAtMs"));
+  if (!itemId || item.status !== "due" || nextCheckAtMs === null) return null;
+  return {
+    itemId,
+    status: "due",
+    nextCheckAtMs,
+    coachEventType: optionalString(first(item, "coach_event_type", "coachEventType")) as CoachDueWorkItem["coachEventType"],
+    title: optionalString(item.title),
+    evidenceSegmentIds: strings(first(item, "evidence_segment_ids", "evidenceSegmentIds")),
+    evidenceQuote: optionalString(first(item, "evidence_quote", "evidenceQuote")) ?? "",
     createdAtMs: optionalNumber(first(item, "created_at_ms", "createdAtMs")) ?? 0,
   };
 }
@@ -1031,13 +1474,35 @@ export function parseMeetingSnapshot(value: unknown): MeetingSnapshot {
   const actionValues = factValues(source, "action_items", "actionItems");
   const riskValues = factValues(source, "risks", "riskItems");
   const coachHistoryValues = first(source, "coach_history", "coachHistory");
+  const coachDueValues = first(source, "coach_due_items", "coachDueItems");
   const recentContextHistoryValues = first(source, "recent_context_history", "recentContextHistory");
+  const coachDecisionValue = first(source, "coach_decision", "coachDecision");
+  const coachInterventionValue = first(source, "coach_intervention", "coachIntervention");
+  const semanticFollowUpValue = first(source, "semantic_follow_up", "semanticFollowUp");
+  const hasProvenanceLanes = coachInterventionValue !== undefined ||
+    semanticFollowUpValue !== undefined || coachDecisionValue !== undefined;
+  const explicitCoachFollowUp = parseFollowUp(coachInterventionValue, coachDecisionValue);
+  const legacyFollowUp = coachInterventionValue === undefined || coachInterventionValue === null
+    ? parseFollowUp(first(source, "follow_up", "followUp"), coachDecisionValue)
+    : null;
+  const trustedLegacyCoachFollowUp = legacyFollowUp && isLocalReflexCoachProjection(legacyFollowUp)
+    ? legacyFollowUp
+    : null;
+  const parsedFollowUp = explicitCoachFollowUp ?? (
+    hasProvenanceLanes ? trustedLegacyCoachFollowUp : legacyFollowUp
+  );
+  const parsedCoachDecision = parseCoachDecision(coachDecisionValue);
+  const trustedCoachDecision = parsedCoachDecision?.origin === "local_reflex" &&
+    parsedCoachDecision.status === "intervention" && !parsedFollowUp
+    ? null
+    : parsedCoachDecision;
   const knownKeys = new Set([
     "meeting_id", "meetingId", "title", "last_seq", "lastSeq", "segments", "suggestions",
     "semantic_paragraphs", "semanticParagraphs", "active_paragraph", "activeParagraph",
     "decision_candidates", "decisionCandidates", "action_items", "actionItems", "risks", "riskItems",
     "current_topic", "currentTopic", "open_questions", "openQuestions", "open_question", "openQuestion",
-    "follow_up", "followUp", "coach_history", "coachHistory", "recent_context_history", "recentContextHistory",
+    "follow_up", "followUp", "coach_intervention", "coachIntervention", "semantic_follow_up", "semanticFollowUp",
+    "coach_decision", "coachDecision", "coach_history", "coachHistory", "recent_context_history", "recentContextHistory",
     "active_partial", "activePartial", "minutes", "approach_cards", "approachCards", "review_jobs", "reviewJobs",
     "audio", "runtime", "meeting_status", "meetingStatus", "status", "diagnostics", "transcript_page", "jobs",
     "title_source", "titleSource", "updated_at_ms", "updatedAtMs", "documents", "review_documents", "reviewDocuments",
@@ -1071,9 +1536,14 @@ export function parseMeetingSnapshot(value: unknown): MeetingSnapshot {
       .filter((item): item is RiskProjection => item !== null),
     currentTopic: parseTopic(first(source, "current_topic", "currentTopic")),
     openQuestions: questionValues.map(parseQuestion).filter((item): item is OpenQuestionProjection => item !== null),
-    followUp: parseFollowUp(first(source, "follow_up", "followUp")),
+    followUp: parsedFollowUp,
+    semanticFollowUp: parseFollowUp(semanticFollowUpValue),
+    coachDecision: trustedCoachDecision,
     coachHistory: Array.isArray(coachHistoryValues)
       ? coachHistoryValues.map(parseCoachHistoryEntry).filter((item): item is CoachHistoryEntry => item !== null)
+      : [],
+    coachDueItems: Array.isArray(coachDueValues)
+      ? coachDueValues.map(parseCoachDueWorkItem).filter((item): item is CoachDueWorkItem => item !== null)
       : [],
     recentContextHistory: Array.isArray(recentContextHistoryValues)
       ? recentContextHistoryValues.map(parseRecentContextEntry).filter((item): item is RecentContextEntry => item !== null)

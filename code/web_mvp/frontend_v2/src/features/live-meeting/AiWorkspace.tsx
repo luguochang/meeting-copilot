@@ -12,6 +12,7 @@ interface AiWorkspaceProps extends ComponentProps<typeof NowRail> {
   selection: TranscriptSelection | null;
   askSelectionNonce: number;
   selectionAction?: TranscriptSelectionAction;
+  preparationRefreshKey?: number;
 }
 
 const SCOPE_LABELS: Record<AskAiScope, string> = {
@@ -54,6 +55,7 @@ export function AiWorkspace({
   selection,
   askSelectionNonce,
   selectionAction = "ask",
+  preparationRefreshKey = 0,
   onEvidence,
   onMessage,
   ...railProps
@@ -129,7 +131,7 @@ export function AiWorkspace({
       setContextFocus(nextPreparation.focusPoints.join("、"));
     }).catch(() => undefined);
     return () => { cancelled = true; };
-  }, [api, meetingId]);
+  }, [api, meetingId, preparationRefreshKey]);
 
   useEffect(() => {
     if (!askSelectionNonce || !selection) return;

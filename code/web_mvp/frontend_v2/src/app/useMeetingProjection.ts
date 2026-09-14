@@ -1,9 +1,45 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef } from "react";
-import type { MeetingApi } from "../api/client";
+import { ApiError, type MeetingApi } from "../api/client";
 import type { MeetingEventTransport } from "../api/eventTransport";
-import { isFormalLlmFirstPayload, isRealtimeAiProjectionEventType } from "../domain/events";
+import {
+  isFormalLlmFirstPayload,
+  isLocalReflexCoachPayload,
+  isRealtimeAiProjectionEventType,
+} from "../domain/events";
 import type { MeetingEvent, MeetingViewState, SuggestionFeedback } from "../domain/events";
 import { createInitialMeetingState, meetingReducer } from "../domain/reducer";
+
+const ASR_FINALIZATION_RETRY_WINDOW_MS = 10_000;
+const ASR_FINALIZATION_RETRY_INTERVAL_MS = 250;
+
+function isAsrFinalizationPending(error: unknown): boolean {
+  if (!(error instanceof ApiError) || error.status !== 409) return false;
+  const body = error.body;
+  if (!body || typeof body !== "object" || !("detail" in body)) return false;
+  const detail = (body as { detail?: unknown }).detail;
+  return Boolean(
+    detail
+    && typeof detail === "object"
+    && "error" in detail
+    && (detail as { error?: unknown }).error === "asr_finalization_pending",
+  );
+}
+
+async function endMeetingAfterAsrFinalization(
+  api: MeetingApi,
+  meetingId: string,
+): Promise<void> {
+  const deadline = Date.now() + ASR_FINALIZATION_RETRY_WINDOW_MS;
+  while (true) {
+    try {
+      await api.endMeeting(meetingId);
+      return;
+    } catch (error) {
+      if (!isAsrFinalizationPending(error) || Date.now() >= deadline) throw error;
+      await new Promise<void>((resolve) => window.setTimeout(resolve, ASR_FINALIZATION_RETRY_INTERVAL_MS));
+    }
+  }
+}
 
 export function useMeetingProjection(
   meetingId: string | null,
@@ -25,11 +61,20 @@ export function useMeetingProjection(
   }, [normalizedMeetingId]);
 
   const queueRenderAck = (event: MeetingEvent) => {
-    if (event.type !== "suggestion.committed" && event.type !== "transcript.segment.revised") return;
-    if (isRealtimeAiProjectionEventType(event.type) && !isFormalLlmFirstPayload(event.payload)) return;
-    const jobId = typeof event.payload.job_id === "string" && event.payload.job_id.trim()
-      ? event.payload.job_id.trim()
-      : event.causationId;
+    const isIntelligenceEvent = event.type === "meeting.intelligence.applied";
+    if (!isIntelligenceEvent && event.type !== "suggestion.committed" && event.type !== "transcript.segment.revised") return;
+    if (isIntelligenceEvent) {
+      // Formal LLM-first events and validated provider-less local reflexes
+      // both have a trace. Other intelligence payloads are intentionally
+      // ignored so a malformed/legacy event cannot become a render sample.
+      if (!isFormalLlmFirstPayload(event.payload) && !isLocalReflexCoachPayload(event.payload)) return;
+      // Silent/terminal decisions do not produce a card. Do not retain them
+      // in the pending map while a long meeting continues to receive events.
+      if (!eventMayRenderCard(event)) return;
+    } else if (isRealtimeAiProjectionEventType(event.type) && !isFormalLlmFirstPayload(event.payload)) {
+      return;
+    }
+    const jobId = eventJobId(event);
     if (!jobId) return;
     pendingRenderAcksRef.current.set(`${jobId}:${event.seq}`, event);
   };
@@ -191,9 +236,11 @@ export function useMeetingProjection(
     const frame = window.requestAnimationFrame(() => {
       for (const [key, event] of ready) {
         if (sentRenderAcksRef.current.has(key)) continue;
-        const jobId = typeof event.payload.job_id === "string" && event.payload.job_id.trim()
-          ? event.payload.job_id.trim()
-          : event.causationId;
+        // State projection alone does not prove that the card is mounted:
+        // switching away from the Insights tab unmounts the rail. Keep the
+        // event pending until the corresponding card is present in the DOM.
+        if (!eventHasVisibleUiTarget(event)) continue;
+        const jobId = eventJobId(event);
         if (!jobId) continue;
         sentRenderAcksRef.current.add(key);
         pendingRenderAcksRef.current.delete(key);
@@ -214,7 +261,7 @@ export function useMeetingProjection(
         if (!normalizedMeetingId || state.ending) return;
         dispatch({ type: "meeting.ending" });
         try {
-          await api.endMeeting(normalizedMeetingId);
+          await endMeetingAfterAsrFinalization(api, normalizedMeetingId);
           await refreshSnapshot();
         } catch (error) {
           dispatch({
@@ -250,6 +297,32 @@ export function useMeetingProjection(
 
 function eventIsRendered(state: MeetingViewState, event: MeetingEvent): boolean {
   if (event.seq > state.lastSeq) return false;
+  if (event.type === "meeting.intelligence.applied") {
+    if (state.runtime.phase === "ended") return false;
+
+    const payload = event.payload;
+    const intervention = payloadRecord(payload.coach_intervention ?? payload.coachIntervention);
+    const semanticFollowUp = payloadRecord(payload.semantic_follow_up ?? payload.semanticFollowUp);
+    const legacyFollowUp = payloadRecord(payload.follow_up ?? payload.followUp);
+    const decision = payloadRecord(payload.coach_decision ?? payload.coachDecision);
+    const decisionStatus = payloadString(decision, "status");
+    const coachRenderable = Boolean(intervention) && (!decisionStatus || decisionStatus === "intervention");
+
+    // A protected-silent/timeout/failed decision deliberately has no visible
+    // intervention card. A semantic follow-up can still be rendered in its
+    // own lane, so evaluate that lane independently.
+    if (coachRenderable || (!semanticFollowUp && legacyFollowUp && (!decisionStatus || decisionStatus === "intervention"))) {
+      const current = state.followUp;
+      if (!current || (current.status !== undefined && current.status !== "intervention")) return false;
+      return projectionMatchesEvent(current, state, event, decision);
+    }
+    if (semanticFollowUp) {
+      const current = state.semanticFollowUp;
+      if (!current || (current.status !== undefined && current.status !== "intervention")) return false;
+      return projectionMatchesEvent(current, state, event, null);
+    }
+    return false;
+  }
   if (event.type === "suggestion.committed") {
     const generationId = typeof event.payload.generation_id === "string"
       ? event.payload.generation_id
@@ -267,4 +340,76 @@ function eventIsRendered(state: MeetingViewState, event: MeetingEvent): boolean 
     );
   }
   return false;
+}
+
+function payloadRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function payloadString(value: Record<string, unknown> | null, ...keys: string[]): string | null {
+  if (!value) return null;
+  for (const key of keys) {
+    const candidate = value[key];
+    if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+  }
+  return null;
+}
+
+function eventJobId(event: MeetingEvent): string | null {
+  return payloadString(event.payload, "job_id", "jobId")
+    ?? (typeof event.causationId === "string" && event.causationId.trim() ? event.causationId.trim() : null);
+}
+
+function eventMayRenderCard(event: MeetingEvent): boolean {
+  if (event.type !== "meeting.intelligence.applied") return true;
+  const payload = event.payload;
+  const decision = payloadRecord(payload.coach_decision ?? payload.coachDecision);
+  const decisionStatus = payloadString(decision, "status");
+  const hasCopy = (value: Record<string, unknown> | null) => Boolean(
+    payloadString(value, "say_this", "sayThis", "question", "recommendation") &&
+    payloadString(value, "why_now", "whyNow", "reason"),
+  );
+  const intervention = payloadRecord(payload.coach_intervention ?? payload.coachIntervention);
+  if (intervention && (!decisionStatus || decisionStatus === "intervention") && hasCopy(intervention)) return true;
+  const semantic = payloadRecord(payload.semantic_follow_up ?? payload.semanticFollowUp);
+  if (semantic && hasCopy(semantic)) return true;
+  const legacy = payloadRecord(payload.follow_up ?? payload.followUp);
+  return Boolean(legacy && (!decisionStatus || decisionStatus === "intervention") && hasCopy(legacy));
+}
+
+function projectionMatchesEvent(
+  projection: MeetingViewState["followUp"] | MeetingViewState["semanticFollowUp"],
+  state: MeetingViewState,
+  event: MeetingEvent,
+  decision: Record<string, unknown> | null,
+): boolean {
+  if (!projection) return false;
+  const jobId = eventJobId(event);
+  const projectionJobId = projection.formalAi?.jobId ?? (decision ? state.coachDecision?.jobId : null);
+  if (jobId && projectionJobId && jobId !== projectionJobId) return false;
+
+  const eventDecisionId = payloadString(decision, "decision_id", "decisionId");
+  const projectionDecisionId = decision ? state.coachDecision?.decisionId ?? projection.decisionId : null;
+  if (eventDecisionId && projectionDecisionId && eventDecisionId !== projectionDecisionId) return false;
+  return true;
+}
+
+function eventHasVisibleUiTarget(event: MeetingEvent): boolean {
+  // Transcript revisions have historically used state projection as their
+  // receipt. Coach and suggestion traces must additionally prove that the
+  // corresponding card is mounted in the browser before becoming
+  // `ui_rendered`.
+  if (event.type !== "meeting.intelligence.applied" && event.type !== "suggestion.committed") return true;
+  const jobId = eventJobId(event);
+  if (!jobId || typeof document === "undefined") return false;
+  const nodes = document.querySelectorAll<HTMLElement>("[data-ui-render-job-id]");
+  return Array.from(nodes).some((node) => {
+    if (node.dataset.uiRenderJobId !== jobId) return false;
+    if (node.hidden || node.getAttribute("aria-hidden") === "true") return false;
+    if (typeof window.getComputedStyle !== "function") return true;
+    const style = window.getComputedStyle(node);
+    return style.display !== "none" && style.visibility !== "hidden";
+  });
 }

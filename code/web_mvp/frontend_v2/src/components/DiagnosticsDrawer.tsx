@@ -28,11 +28,73 @@ const connectionLabels: Record<MeetingViewState["connection"], string> = {
   offline: "本地服务不可用",
 };
 
+function coachRuntimeIssue(state: MeetingViewState): string | null {
+  const decision = state.coachDecision;
+  if (decision) {
+    if (decision.statusReason === "realtime_provider_circuit_open"
+    || decision.statusReason === "realtime_provider_recovery_probe_required") {
+      return "AI 实时通道连续失败，需要连接测试恢复";
+    }
+    if (decision.status === "timed_out") return "Pi 实时教练超时，本轮未生成建议";
+    if (decision.status === "failed") return "Pi 实时教练执行失败，本轮未生成建议";
+  }
+
+  const history = state.diagnostics.coach_runtime_history;
+  if (!Array.isArray(history)) return null;
+  const failures = history.filter((item): item is Record<string, unknown> => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return false;
+    const value = item as Record<string, unknown>;
+    return value.outcome === "failure" && (value.origin === "pi" || value.pi_provider_attempted === true);
+  });
+  const latest = failures.at(-1);
+  if (!latest) return null;
+  const reason = latest.status_reason === "provider_timeout" || latest.fallback_reason === "provider_timeout"
+    ? "Pi Provider 超时"
+    : latest.status === "timed_out"
+      ? "Pi 实时教练超时"
+      : "Pi 实时教练执行失败";
+  const count = failures.length > 1 ? `（${failures.length} 次）` : "";
+  return `本场曾发生 ${reason}，本场未生成 Pi 建议${count}`;
+}
+
+function coachRuntimeInfo(state: MeetingViewState): string | null {
+  const history = state.diagnostics.coach_runtime_history;
+  if (!Array.isArray(history)) return null;
+  const fallbacks = history.filter((item): item is Record<string, unknown> => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return false;
+    return (item as Record<string, unknown>).outcome === "local_reflex_fallback";
+  });
+  if (!fallbacks.length) return null;
+  const providerAttempts = fallbacks.filter((item) =>
+    item.pi_provider_attempted === true || item.provider_attempted === true,
+  ).length;
+  if (providerAttempts === 0) return `本场有 ${fallbacks.length} 轮使用本地实时提示，未调用 Pi Provider`;
+  if (providerAttempts === fallbacks.length) {
+    return `本场有 ${fallbacks.length} 轮使用本地实时提示，Pi Provider 已调用但未在实时窗口内完成`;
+  }
+  return `本场有 ${fallbacks.length} 轮使用本地实时提示，其中 ${providerAttempts} 轮已调用 Pi Provider 但未在实时窗口内完成`;
+}
+
 export function DiagnosticsDrawer({ open, onClose, onRefresh, onExport, state, transportKind }: DiagnosticsDrawerProps) {
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState("");
   if (!open) return null;
-  const healthy = state.connection === "live" && !state.transportError;
+  const coachIssue = coachRuntimeIssue(state);
+  const coachInfo = coachRuntimeInfo(state);
+  const connectionHealthy = state.connection === "live" && !state.transportError;
+  const healthy = connectionHealthy && !coachIssue;
+  const healthTitle = healthy
+    ? "运行正常"
+    : connectionHealthy
+      ? "AI 实时能力异常"
+      : "连接异常";
+  const healthDetail = coachIssue ?? connectionLabels[state.connection];
+  const technicalDetails = {
+    ...state.diagnostics,
+    ...(state.coachDecision?.agentMetrics
+      ? { coach_agent_metrics: state.coachDecision.agentMetrics }
+      : {}),
+  };
 
   const exportBundle = async () => {
     if (exporting) return;
@@ -61,8 +123,8 @@ export function DiagnosticsDrawer({ open, onClose, onRefresh, onExport, state, t
         <div className={`diagnostics-health-summary diagnostics-health-summary--${healthy ? "healthy" : "attention"}`} role="status">
           {healthy ? <CircleCheckBig size={22} /> : <TriangleAlert size={22} />}
           <div>
-            <strong>{healthy ? "运行正常" : "连接异常"}</strong>
-            <span>{healthy ? "本地服务已连接" : connectionLabels[state.connection]}</span>
+            <strong>{healthTitle}</strong>
+            <span>{healthy ? (coachInfo ?? "本地服务和 AI 实时能力正常") : healthDetail}</span>
           </div>
         </div>
 
@@ -74,6 +136,7 @@ export function DiagnosticsDrawer({ open, onClose, onRefresh, onExport, state, t
           <div><dt>最后读取</dt><dd>{formattedTime(state.lastSyncedAtMs)}</dd></div>
           <div><dt>已确认段落</dt><dd>{state.archivedSegmentCount + state.segments.length}</dd></div>
           <div><dt>建议记录</dt><dd>{state.suggestions.length}</dd></div>
+          <div><dt>AI 教练</dt><dd>{coachIssue ?? coachInfo ?? "未发现运行异常"}</dd></div>
         </dl>
 
         {state.transportError ? (
@@ -92,7 +155,7 @@ export function DiagnosticsDrawer({ open, onClose, onRefresh, onExport, state, t
 
         <details className="diagnostics-raw">
           <summary>技术详情</summary>
-          <pre>{JSON.stringify(state.diagnostics, null, 2)}</pre>
+          <pre>{JSON.stringify(technicalDetails, null, 2)}</pre>
         </details>
 
         <div className="drawer-actions">

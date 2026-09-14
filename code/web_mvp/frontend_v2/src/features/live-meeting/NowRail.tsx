@@ -1,8 +1,10 @@
 import { Bookmark, Check, ChevronDown, ChevronUp, CircleAlert, CircleHelp, Copy, EyeOff, Flag, GitMerge, History, ListChecks, MessageCircleQuestion, MoreHorizontal, Pencil, Quote, Save, ShieldAlert, TimerOff, X } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { isCoachInterventionProjection, isLocalReflexCoachProjection } from "../../domain/events";
 import type {
   ActionItemProjection,
+  CoachDecisionProjection,
   CoachHistoryEntry,
   DecisionCandidate,
   FollowUpProjection,
@@ -20,6 +22,8 @@ import type {
 interface NowRailProps {
   currentTopic: TopicProjection | null;
   followUp: FollowUpProjection | null | undefined;
+  semanticFollowUp?: FollowUpProjection | null;
+  coachDecision?: CoachDecisionProjection | null;
   coachHistory?: CoachHistoryEntry[];
   recentContextHistory?: RecentContextEntry[];
   openQuestions: OpenQuestionProjection[];
@@ -100,6 +104,11 @@ function factEvidenceQuote(fact: RailFact): string {
 }
 
 function coachLabel(followUp: FollowUpProjection): string {
+  if (followUp.origin === "local_reflex") {
+    if (followUp.localReflexKind === "missing_next_step") return "收尾前明确下一步";
+    if (followUp.localReflexKind === "communication_clarity") return "表达需要收束";
+    if (followUp.localReflexKind === "strong_objection") return "先澄清反对条件";
+  }
   if (followUp.title) return followUp.title;
   if (followUp.coachEventType === "question_to_user") return "对方正在等你回答";
   if (followUp.coachEventType === "commitment_risk") return "先限定承诺条件";
@@ -111,6 +120,122 @@ function coachLabel(followUp: FollowUpProjection): string {
   if (followUp.coachEventType === "discovery_gap") return "补一个具体场景";
   if (followUp.coachEventType === "experiment_gap") return "把想法变成小实验";
   return "建议追问";
+}
+
+const COACH_ORIGIN_LABELS = {
+  pi: "Pi Agent",
+  local_reflex: "本地实时提示",
+  direct_intelligence: "直连智能",
+  direct_fallback: "直连降级",
+} as const;
+
+function CoachOriginBadge({ origin, compact = false }: {
+  origin: FollowUpProjection["origin"];
+  compact?: boolean;
+}) {
+  if (!origin) return null;
+  const label = COACH_ORIGIN_LABELS[origin];
+  return (
+    <span
+      className={`coach-origin-badge${compact ? " coach-origin-badge--compact" : ""}`}
+      data-origin={origin}
+      title={`来源：${label}`}
+    >
+      {label}
+    </span>
+  );
+}
+
+function isTrustedCoachProjection(value: FollowUpProjection): boolean {
+  if (value.origin === "local_reflex") return isLocalReflexCoachProjection(value);
+  if (isFormalAi(value)) return true;
+  return false;
+}
+
+/**
+ * Correlate a mounted card with the backend pipeline trace that produced it.
+ *
+ * Coach decisions carry the job id for local-reflex and provenance-rich
+ * responses. Legacy/formal follow-ups expose it through their LLM envelope.
+ * Keeping this as a DOM data attribute lets the projection hook acknowledge
+ * only cards that are actually mounted in the visible Insights tab.
+ */
+function renderJobId(
+  followUp: FollowUpProjection | null | undefined,
+  coachDecision?: CoachDecisionProjection | null,
+): string | undefined {
+  const value = coachDecision?.jobId ?? followUp?.formalAi?.jobId;
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+interface CoachLifecycleView {
+  state: "not_triggered" | "protected_silent" | "timed_out" | "failed" | "stale" | "expired";
+  label: string;
+  detail: string;
+}
+
+function coachLifecycleView(
+  followUp: Pick<FollowUpProjection, "validUntil" | "status" | "decisionReason" | "lifecycleAction">,
+  nowMs: number,
+): CoachLifecycleView | null {
+  if (followUp.lifecycleAction === "retract") {
+    return {
+      state: "stale",
+      label: "建议已撤回",
+      detail: followUp.decisionReason ?? "新证据已使上一条建议失效。",
+    };
+  }
+  if (followUp.lifecycleAction === "deprioritize") {
+    return {
+      state: "stale",
+      label: "建议已替换",
+      detail: followUp.decisionReason ?? "这条建议已不再是当前最高优先级。",
+    };
+  }
+  if (followUp.validUntil !== undefined && followUp.validUntil <= nowMs) {
+    return {
+      state: "expired",
+      label: "建议已过期",
+      detail: followUp.decisionReason ?? "这条建议已超过当前对话的有效时间。",
+    };
+  }
+  if (!followUp.status || followUp.status === "intervention") return null;
+  const labels = {
+    not_triggered: "本轮未触发",
+    protected_silent: "本轮保持静默",
+    timed_out: "本轮已超时",
+    failed: "本轮分析失败",
+    stale: "建议已撤回",
+  } as const;
+  const details = {
+    not_triggered: "当前输入未达到实时教练的介入门槛。",
+    protected_silent: "当前没有高置信度且可立即执行的建议。",
+    timed_out: "本轮超出实时响应预算，迟到结果不会显示。",
+    failed: "本轮未能形成可靠建议，已保持静默。",
+    stale: "新证据已使这轮判断失效。",
+  } as const;
+  return {
+    state: followUp.status,
+    label: labels[followUp.status],
+    detail: followUp.decisionReason ?? details[followUp.status],
+  };
+}
+
+function coachHistoryState(item: CoachHistoryEntry, nowMs: number): string | null {
+  if (item.lifecycleStatus === "resolved") return "已解决";
+  if (item.lifecycleStatus === "retracted") return "已撤回";
+  if (item.lifecycleStatus === "superseded") return "已替代";
+  if (item.lifecycleAction === "retract" || item.status === "stale") return "已撤回";
+  if (item.lifecycleAction === "deprioritize") return item.supersededBy ? "已替换" : "已降级";
+  if (item.validUntil !== undefined && item.validUntil <= nowMs) return "已过期";
+  return null;
+}
+
+function coachValidityLabel(validUntil: number | undefined, nowMs: number): string | null {
+  if (validUntil === undefined || !Number.isFinite(validUntil)) return null;
+  const remainingMs = validUntil - nowMs;
+  if (remainingMs <= 0) return "已过期";
+  return `当前窗口剩余 ${Math.max(1, Math.ceil(remainingMs / 1_000))} 秒`;
 }
 
 const COACH_SKILL_LABELS: Record<NonNullable<NowRailProps["activeCoachSkillId"]>, string> = {
@@ -345,6 +470,8 @@ function FactGroup({
 export function NowRail({
   currentTopic,
   followUp,
+  semanticFollowUp: semanticFollowUpProp = null,
+  coachDecision = null,
   coachHistory = [],
   coachRuntime,
   activeCoachSkillId = "general",
@@ -360,19 +487,57 @@ export function NowRail({
   onFactMerge,
   onMessage,
 }: NowRailProps) {
+  const [, refreshCoachExpiration] = useState(0);
+  const nowMs = Date.now();
+  const coachDecisionValidUntil = coachDecision?.validUntil;
+  const followUpValidUntil = followUp?.validUntil;
+  useEffect(() => {
+    const validUntil = coachDecisionValidUntil ?? followUpValidUntil;
+    if (validUntil === undefined) return undefined;
+    const remainingMs = validUntil - Date.now();
+    if (remainingMs <= 0) return undefined;
+    const timer = window.setTimeout(
+      () => refreshCoachExpiration((current) => current + 1),
+      Math.min(remainingMs + 25, 2_147_483_647),
+    );
+    return () => window.clearTimeout(timer);
+  }, [coachDecisionValidUntil, followUpValidUntil]);
   const suggestion = useMemo(
     () => currentSuggestion(suggestions.filter((item) => isFormalAi(item))),
     [suggestions],
   );
   const questions = openQuestions.filter((question) => isFormalAi(question) && questionIsOpen(question)).slice(0, 3);
   const formalTopic = currentTopic && isFormalAi(currentTopic) ? currentTopic : null;
-  const formalFollowUp = followUp && isFormalAi(followUp) ? followUp : null;
+  const formalFollowUpCandidate = followUp && isTrustedCoachProjection(followUp) ? followUp : null;
+  const coachLifecycle = coachDecision
+    ? coachLifecycleView(coachDecision, nowMs)
+    : formalFollowUpCandidate
+      ? coachLifecycleView(formalFollowUpCandidate, nowMs)
+      : null;
+  const formalFollowUp = formalFollowUpCandidate &&
+    isCoachInterventionProjection(formalFollowUpCandidate) && !coachLifecycle
+    ? formalFollowUpCandidate
+    : null;
+  const formalSemanticFollowUpCandidate = semanticFollowUpProp && isFormalAi(semanticFollowUpProp)
+    ? semanticFollowUpProp
+    : formalFollowUpCandidate && !isCoachInterventionProjection(formalFollowUpCandidate)
+      && formalFollowUpCandidate.status === undefined
+      ? formalFollowUpCandidate
+      : null;
+  const semanticLifecycle = formalSemanticFollowUpCandidate
+    ? coachLifecycleView(formalSemanticFollowUpCandidate, nowMs)
+    : null;
+  const semanticFollowUp = formalSemanticFollowUpCandidate && !semanticLifecycle
+    ? formalSemanticFollowUpCandidate
+    : null;
   const formalCoachHistory = coachHistory
-    .filter((item) => isFormalAi(item))
+    .filter((item) => isTrustedCoachProjection(item) && isCoachInterventionProjection(item))
     .sort((left, right) => left.createdAtMs - right.createdAtMs);
   const currentCoachHistoryId = formalFollowUp
     ? [...formalCoachHistory].reverse().find((item) =>
-      item.question === formalFollowUp.question && item.coachEventType === formalFollowUp.coachEventType)?.historyId
+      formalFollowUp.decisionId && item.decisionId
+        ? item.decisionId === formalFollowUp.decisionId
+        : item.question === formalFollowUp.question && item.coachEventType === formalFollowUp.coachEventType)?.historyId
     : null;
   const pastCoachHistory = formalCoachHistory
     .filter((item) => item.historyId !== currentCoachHistoryId)
@@ -491,19 +656,40 @@ export function NowRail({
         ) : null}
 
         {formalFollowUp ? (
-          <div className="follow-up-card" data-testid="follow-up-card">
+          <div
+            className="follow-up-card"
+            data-testid="follow-up-card"
+            data-ui-render-card="coach"
+            data-ui-render-job-id={renderJobId(formalFollowUp, coachDecision)}
+            data-valid-until-ms={formalFollowUp.validUntil ?? undefined}
+          >
             <div className="follow-up-heading">
-              <strong>{coachLabel(formalFollowUp)}</strong>
+              <div className="follow-up-title">
+                <strong>{coachLabel(formalFollowUp)}</strong>
+                <CoachOriginBadge origin={formalFollowUp.origin} />
+              </div>
               <span
                 className="follow-up-reason"
-                title={`为什么现在提示：${formalFollowUp.reason}${formalFollowUp.evidenceQuote ? `；依据：${formalFollowUp.evidenceQuote}` : ""}`}
+                title={`为什么现在提示：${formalFollowUp.whyNow ?? formalFollowUp.reason}${formalFollowUp.evidenceQuote ? `；依据：${formalFollowUp.evidenceQuote}` : ""}`}
               >
                 <CircleHelp size={15} aria-hidden="true" />
-                <span className="sr-only">{formalFollowUp.reason}</span>
+                <span className="sr-only">{formalFollowUp.whyNow ?? formalFollowUp.reason}</span>
               </span>
             </div>
-            <blockquote>{formalFollowUp.question}</blockquote>
-            <p className="follow-up-reason-text">{formalFollowUp.reason}</p>
+            <div className="follow-up-field">
+              <span className="follow-up-field-label">为什么现在</span>
+              <p className="follow-up-reason-text">{formalFollowUp.whyNow ?? formalFollowUp.reason}</p>
+            </div>
+            <div className="follow-up-field follow-up-field--say-this">
+              <span className="follow-up-field-label">建议说</span>
+              <blockquote>{formalFollowUp.sayThis ?? formalFollowUp.question}</blockquote>
+            </div>
+            {formalFollowUp.evidenceQuote ? (
+              <div className="follow-up-evidence" aria-label="依据原话">
+                <span className="follow-up-field-label"><Quote size={12} aria-hidden="true" />依据原话</span>
+                <p>{formalFollowUp.evidenceQuote}</p>
+              </div>
+            ) : null}
             <div className="suggestion-footer">
               {formalFollowUp.evidenceSegmentIds[0] ? (
                 <button
@@ -514,11 +700,73 @@ export function NowRail({
                   <Quote size={13} />查看依据
                 </button>
               ) : <span className="evidence-link evidence-link--disabled">暂无可定位依据</span>}
-              <span className="follow-up-urgency">{formalFollowUp.urgency === "high" ? "紧急" : formalFollowUp.urgency === "low" ? "低优先" : "适时确认"}</span>
+              <div className="follow-up-footer-meta">
+                {coachValidityLabel(formalFollowUp.validUntil, nowMs) ? (
+                  <span className="follow-up-validity">{coachValidityLabel(formalFollowUp.validUntil, nowMs)}</span>
+                ) : null}
+                <span className="follow-up-urgency">{formalFollowUp.urgency === "high" ? "紧急" : formalFollowUp.urgency === "low" ? "低优先" : "适时确认"}</span>
+              </div>
+            </div>
+          </div>
+        ) : semanticFollowUp ? (
+          <div
+            className="follow-up-card follow-up-card--semantic"
+            data-testid="semantic-follow-up-card"
+            data-ui-render-card="semantic"
+            data-ui-render-job-id={renderJobId(semanticFollowUp)}
+            data-valid-until-ms={semanticFollowUp.validUntil ?? undefined}
+          >
+            <div className="follow-up-heading">
+              <div className="follow-up-title">
+                <strong>普通智能追问</strong>
+                <CoachOriginBadge origin={semanticFollowUp.origin} />
+              </div>
+              <span
+                className="follow-up-reason"
+                title={`为什么现在提示：${semanticFollowUp.reason}${semanticFollowUp.evidenceQuote ? `；依据：${semanticFollowUp.evidenceQuote}` : ""}`}
+              >
+                <CircleHelp size={15} aria-hidden="true" />
+                <span className="sr-only">{semanticFollowUp.reason}</span>
+              </span>
+            </div>
+            <div className="follow-up-field">
+              <span className="follow-up-field-label">为什么现在</span>
+              <p className="follow-up-reason-text">{semanticFollowUp.whyNow ?? semanticFollowUp.reason}</p>
+            </div>
+            <div className="follow-up-field follow-up-field--say-this">
+              <span className="follow-up-field-label">建议说</span>
+              <blockquote>{semanticFollowUp.sayThis ?? semanticFollowUp.question}</blockquote>
+            </div>
+            {semanticFollowUp.evidenceQuote ? (
+              <div className="follow-up-evidence" aria-label="依据原话">
+                <span className="follow-up-field-label"><Quote size={12} aria-hidden="true" />依据原话</span>
+                <p>{semanticFollowUp.evidenceQuote}</p>
+              </div>
+            ) : null}
+            <div className="suggestion-footer">
+              {semanticFollowUp.evidenceSegmentIds[0] ? (
+                <button
+                  className="evidence-link"
+                  type="button"
+                  onClick={() => onEvidence(semanticFollowUp.evidenceSegmentIds[0])}
+                >
+                  <Quote size={13} />查看依据
+                </button>
+              ) : <span className="evidence-link evidence-link--disabled">暂无可定位依据</span>}
+              <div className="follow-up-footer-meta">
+                {coachValidityLabel(semanticFollowUp.validUntil, nowMs) ? (
+                  <span className="follow-up-validity">{coachValidityLabel(semanticFollowUp.validUntil, nowMs)}</span>
+                ) : null}
+                <span className="follow-up-urgency">{semanticFollowUp.urgency === "high" ? "紧急" : semanticFollowUp.urgency === "low" ? "低优先" : "适时确认"}</span>
+              </div>
             </div>
           </div>
         ) : suggestion && text ? (
-          <div className={`suggestion-card suggestion-card--${suggestion.status}`}>
+          <div
+            className={`suggestion-card suggestion-card--${suggestion.status}`}
+            data-ui-render-card="suggestion"
+            data-ui-render-job-id={suggestion.jobId ?? suggestion.formalAi?.jobId ?? undefined}
+          >
             <blockquote>{text}</blockquote>
             <div className="suggestion-footer">
               <button
@@ -560,9 +808,14 @@ export function NowRail({
             </div>
           </div>
         ) : (
-          <div className="coach-loop-empty" data-state={coachRuntime?.state ?? "idle"}>
-            {coachRuntime?.decision ? <strong>{coachRuntime.decision}</strong> : null}
-            <p>{coachRuntime?.detail ?? "等待下一段稳定对话"}</p>
+          <div className="coach-loop-empty" data-state={coachLifecycle?.state ?? coachRuntime?.state ?? "idle"}>
+            {coachLifecycle ? (
+              <div className="coach-lifecycle-heading">
+                <strong>{coachLifecycle.label}</strong>
+                <CoachOriginBadge origin={coachDecision?.origin ?? formalFollowUpCandidate?.origin} />
+              </div>
+            ) : coachRuntime?.decision ? <strong>{coachRuntime.decision}</strong> : null}
+            <p>{coachLifecycle?.detail ?? coachRuntime?.detail ?? "等待下一段稳定对话"}</p>
             <ul aria-label="教练检查项">
               {coachCheckLabels.map((label) => <li key={label}>{label}</li>)}
             </ul>
@@ -594,6 +847,10 @@ export function NowRail({
                     <div>
                       <time dateTime={new Date(item.createdAtMs).toISOString()}>{coachHistoryTime(item.createdAtMs)}</time>
                       <span>{coachLabel(item)}</span>
+                      <CoachOriginBadge origin={item.origin} compact />
+                      {coachHistoryState(item, nowMs) ? (
+                        <span className="coach-history-state">{coachHistoryState(item, nowMs)}</span>
+                      ) : null}
                     </div>
                     {evidenceId ? (
                       <button type="button" onClick={() => onEvidence(evidenceId)}>{item.question}</button>

@@ -1,11 +1,16 @@
 import {
+  isCoachInterventionProjection,
   isFormalLlmFirstPayload,
+  isLocalReflexCoachProjection,
+  isLocalReflexCoachPayload,
 } from "./events";
+import { parseCoachAgentMetrics } from "./coachAgentMetrics";
 import type {
   ActivePartial,
   ApproachCard,
   ActionItemProjection,
   CoachHistoryEntry,
+  CoachDecisionProjection,
   DecisionCandidate,
   EvidenceSpan,
   FollowUpProjection,
@@ -50,6 +55,8 @@ export function createInitialMeetingState(meetingId: string): MeetingViewState {
     currentTopic: null,
     openQuestions: [],
     followUp: null,
+    semanticFollowUp: null,
+    coachDecision: null,
     coachHistory: [],
     recentContextHistory: [],
     minutes: null,
@@ -450,14 +457,25 @@ function eventQuestion(event: MeetingEvent): OpenQuestionProjection | null {
   };
 }
 
-function eventFollowUp(event: MeetingEvent): FollowUpProjection | null {
-  const value = asRecord(event.payload.follow_up ?? event.payload.followUp);
+function eventFollowUp(event: MeetingEvent, lane: "coach" | "semantic" = "coach"): FollowUpProjection | null {
+  const hasSemanticLane = "semantic_follow_up" in event.payload || "semanticFollowUp" in event.payload;
+  const explicitCoach = asRecord(event.payload.coach_intervention ?? event.payload.coachIntervention);
+  const legacyFollowUp = asRecord(event.payload.follow_up ?? event.payload.followUp);
+  const value = lane === "semantic"
+    ? asRecord(event.payload.semantic_follow_up ?? event.payload.semanticFollowUp)
+    : explicitCoach ?? (hasSemanticLane ? null : legacyFollowUp);
   if (!value) return null;
-  const question = stringValue(value, "question");
-  const reason = stringValue(value, "reason");
+  const coachDecision = lane === "coach"
+    ? asRecord(event.payload.coach_decision ?? event.payload.coachDecision)
+    : null;
+  const metadata = { ...event.payload, ...value, ...(coachDecision ?? {}) };
+  const sayThis = stringValue(value, "say_this", "sayThis");
+  const whyNow = stringValue(value, "why_now", "whyNow");
+  const question = stringValue(value, "question", "recommendation") ?? sayThis;
+  const reason = stringValue(value, "reason") ?? whyNow;
   if (!question || !reason) return null;
   const urgency = stringValue(value, "urgency");
-  const coachEventType = stringValue(value, "coach_event_type", "coachEventType");
+  const coachEventType = stringValue(value, "coach_event_type", "coachEventType", "event_type", "eventType");
   const recognizedCoachEventType =
     coachEventType === "question_to_user" || coachEventType === "commitment_risk" ||
     coachEventType === "goal_at_risk" || coachEventType === "contradiction" ||
@@ -468,16 +486,140 @@ function eventFollowUp(event: MeetingEvent): FollowUpProjection | null {
       : null;
   const title = stringValue(value, "title");
   const confidence = numberValue(value, "confidence");
+  const originValue = stringValue(metadata, "origin");
+  const origin = originValue === "pi" || originValue === "local_reflex" ||
+    originValue === "direct_intelligence" || originValue === "direct_fallback"
+    ? originValue
+    : null;
+  const localReflexKindValue = stringValue(metadata, "local_reflex_kind", "localReflexKind");
+  const localReflexKind = localReflexKindValue === "missing_next_step" ||
+    localReflexKindValue === "communication_clarity" || localReflexKindValue === "strong_objection"
+    ? localReflexKindValue
+    : null;
+  const statusValue = stringValue(metadata, "status");
+  const status = statusValue === "intervention" || statusValue === "not_triggered" ||
+    statusValue === "protected_silent" || statusValue === "timed_out" ||
+    statusValue === "failed" || statusValue === "stale"
+    ? statusValue
+    : null;
+  const rawEvidenceRevision = metadata.evidence_revision ?? metadata.evidenceRevision;
+  const evidenceRevision = typeof rawEvidenceRevision === "number" && Number.isFinite(rawEvidenceRevision)
+    ? rawEvidenceRevision
+    : typeof rawEvidenceRevision === "string" && rawEvidenceRevision.trim()
+      ? rawEvidenceRevision.trim()
+      : null;
+  const provenanceVersion = stringValue(metadata, "provenance_version", "provenanceVersion");
+  const statusReason = stringValue(metadata, "status_reason", "statusReason");
+  const decisionReason = stringValue(metadata, "decision_reason", "decisionReason");
+  const runId = stringValue(metadata, "run_id", "runId");
+  const decisionId = stringValue(metadata, "decision_id", "decisionId");
+  const validUntil = numberValue(
+    metadata,
+    "valid_until_ms",
+    "validUntilMs",
+    "valid_until",
+    "validUntil",
+  );
+  const lifecycleValue = stringValue(metadata, "lifecycle_action", "lifecycleAction");
+  const lifecycleAction = lifecycleValue === "retain" || lifecycleValue === "retract" || lifecycleValue === "deprioritize"
+    ? lifecycleValue
+    : null;
+  const lifecycleStatusValue = stringValue(metadata, "lifecycle_status", "lifecycleStatus");
+  const lifecycleStatus = lifecycleStatusValue === "resolved" || lifecycleStatusValue === "retracted" || lifecycleStatusValue === "superseded"
+    ? lifecycleStatusValue
+    : null;
+  const supersedesDecisionIdValue = "supersedes_decision_id" in metadata
+    ? metadata.supersedes_decision_id
+    : metadata.supersedesDecisionId;
+  const supersededByValue = "superseded_by" in metadata ? metadata.superseded_by : metadata.supersededBy;
   return {
     question,
     reason,
+    ...(sayThis ? { sayThis } : {}),
+    ...(whyNow ? { whyNow } : {}),
     evidenceSegmentIds: stringArray(value.evidence_segment_ids ?? value.evidenceSegmentIds),
     evidenceQuote: stringValue(value, "evidence_quote", "evidenceQuote") ?? "",
     urgency: urgency === "low" || urgency === "high" ? urgency : "medium",
     ...(recognizedCoachEventType ? { coachEventType: recognizedCoachEventType } : {}),
     ...(title ? { title } : {}),
     ...(confidence !== null ? { confidence } : {}),
+    ...(provenanceVersion ? { provenanceVersion } : {}),
+    ...(origin ? { origin } : {}),
+    ...(localReflexKind ? { localReflexKind } : {}),
+    ...(status ? { status } : {}),
+    ...(statusReason ? { statusReason } : {}),
+    ...(decisionReason ? { decisionReason } : {}),
+    ...(runId ? { runId } : {}),
+    ...(decisionId ? { decisionId } : {}),
+    ...(evidenceRevision !== null ? { evidenceRevision } : {}),
+    ...(validUntil !== null ? { validUntil } : {}),
+    ...(lifecycleAction ? { lifecycleAction } : {}),
+    ...(lifecycleStatus ? { lifecycleStatus } : {}),
+    ...(typeof supersedesDecisionIdValue === "string" || supersedesDecisionIdValue === null
+      ? { supersedesDecisionId: supersedesDecisionIdValue }
+      : {}),
+    ...(typeof supersededByValue === "string" || supersededByValue === null ? { supersededBy: supersededByValue } : {}),
     formalAi: formalAiFromPayload(event.payload),
+  };
+}
+
+function eventCoachDecision(event: MeetingEvent): CoachDecisionProjection | null {
+  const value = asRecord(event.payload.coach_decision ?? event.payload.coachDecision);
+  if (!value) return null;
+  const originValue = stringValue(value, "origin");
+  const statusValue = stringValue(value, "status");
+  const origin = originValue === "pi" || originValue === "local_reflex" ||
+    originValue === "direct_intelligence" || originValue === "direct_fallback"
+    ? originValue
+    : undefined;
+  const status = statusValue === "intervention" || statusValue === "not_triggered" ||
+    statusValue === "protected_silent" || statusValue === "timed_out" ||
+    statusValue === "failed" || statusValue === "stale"
+    ? statusValue
+    : undefined;
+  const rawEvidenceRevision = value.evidence_revision ?? value.evidenceRevision;
+  const evidenceRevision = typeof rawEvidenceRevision === "number" && Number.isFinite(rawEvidenceRevision)
+    ? rawEvidenceRevision
+    : typeof rawEvidenceRevision === "string" && rawEvidenceRevision.trim()
+      ? rawEvidenceRevision.trim()
+      : undefined;
+  const validUntil = numberValue(value, "valid_until_ms", "validUntilMs", "valid_until", "validUntil");
+  const lifecycleValue = stringValue(value, "lifecycle_action", "lifecycleAction");
+  const lifecycleAction = lifecycleValue === "retain" || lifecycleValue === "retract" || lifecycleValue === "deprioritize"
+    ? lifecycleValue
+    : null;
+  const lifecycleStatusValue = stringValue(value, "lifecycle_status", "lifecycleStatus");
+  const lifecycleStatus = lifecycleStatusValue === "resolved" || lifecycleStatusValue === "retracted" || lifecycleStatusValue === "superseded"
+    ? lifecycleStatusValue
+    : null;
+  const supersedesDecisionIdValue = "supersedes_decision_id" in value
+    ? value.supersedes_decision_id
+    : value.supersedesDecisionId;
+  const supersededByValue = "superseded_by" in value ? value.superseded_by : value.supersededBy;
+  const agentMetrics = parseCoachAgentMetrics(value.agent_metrics ?? value.agentMetrics);
+  return {
+    ...(stringValue(value, "provenance_version", "provenanceVersion") ? { provenanceVersion: stringValue(value, "provenance_version", "provenanceVersion")! } : {}),
+    ...(origin ? { origin } : {}),
+    ...(status ? { status } : {}),
+    ...(stringValue(value, "status_reason", "statusReason") ? { statusReason: stringValue(value, "status_reason", "statusReason")! } : {}),
+    ...(stringValue(value, "decision_reason", "decisionReason") ? { decisionReason: stringValue(value, "decision_reason", "decisionReason")! } : {}),
+    ...(stringValue(value, "run_id", "runId") ? { runId: stringValue(value, "run_id", "runId")! } : {}),
+    ...(stringValue(value, "decision_id", "decisionId") ? { decisionId: stringValue(value, "decision_id", "decisionId")! } : {}),
+    ...(evidenceRevision !== undefined ? { evidenceRevision } : {}),
+    ...(stringValue(value, "meeting_id", "meetingId") ? { meetingId: stringValue(value, "meeting_id", "meetingId")! } : {}),
+    ...(stringValue(value, "job_id", "jobId") ? { jobId: stringValue(value, "job_id", "jobId")! } : {}),
+    ...(typeof value.triggered === "boolean" ? { triggered: value.triggered } : {}),
+    ...(numberValue(value, "created_at_ms", "createdAtMs") !== null ? { createdAtMs: numberValue(value, "created_at_ms", "createdAtMs")! } : {}),
+    ...(numberValue(value, "completed_at_ms", "completedAtMs") !== null ? { completedAtMs: numberValue(value, "completed_at_ms", "completedAtMs")! } : {}),
+    ...(numberValue(value, "deadline_at_ms", "deadlineAtMs") !== null ? { deadlineAtMs: numberValue(value, "deadline_at_ms", "deadlineAtMs")! } : {}),
+    ...(validUntil !== null ? { validUntil } : {}),
+    ...(lifecycleAction ? { lifecycleAction } : {}),
+    ...(lifecycleStatus ? { lifecycleStatus } : {}),
+    ...(typeof supersedesDecisionIdValue === "string" || supersedesDecisionIdValue === null
+      ? { supersedesDecisionId: supersedesDecisionIdValue }
+      : {}),
+    ...(typeof supersededByValue === "string" || supersededByValue === null ? { supersededBy: supersededByValue } : {}),
+    ...(agentMetrics ? { agentMetrics } : {}),
   };
 }
 
@@ -507,13 +649,33 @@ function normalizedHistoryText(...values: Array<string | null | undefined>): str
 function mergeCoachHistory(current: CoachHistoryEntry[], incoming: CoachHistoryEntry[]): CoachHistoryEntry[] {
   const byKey = new Map<string, CoachHistoryEntry>();
   for (const item of [...current, ...incoming].sort((left, right) => left.createdAtMs - right.createdAtMs)) {
-    const key = normalizedHistoryText(item.coachEventType, item.question);
+    if (!isCoachInterventionProjection(item)) continue;
+    const key = item.decisionId ?? normalizedHistoryText(item.coachEventType, item.question);
     const existing = byKey.get(key);
     if (!existing || item.createdAtMs >= existing.createdAtMs) byKey.set(key, item);
   }
   return [...byKey.values()]
     .sort((left, right) => left.createdAtMs - right.createdAtMs || left.historyId.localeCompare(right.historyId))
     .slice(-12);
+}
+
+function applyCoachSupersession(
+  history: CoachHistoryEntry[],
+  decision: CoachDecisionProjection | null,
+): CoachHistoryEntry[] {
+  const supersedesDecisionId = decision?.supersedesDecisionId;
+  const replacementDecisionId = decision?.decisionId;
+  if (!supersedesDecisionId || !replacementDecisionId || supersedesDecisionId === replacementDecisionId) {
+    return history;
+  }
+  const lifecycleAction = decision.lifecycleAction === "retract" ? "retract" : "deprioritize";
+  return history.map((item) => item.decisionId === supersedesDecisionId
+    ? {
+      ...item,
+      lifecycleAction,
+      supersededBy: replacementDecisionId,
+    }
+    : item);
 }
 
 function mergeRecentContextHistory(current: RecentContextEntry[], incoming: RecentContextEntry[]): RecentContextEntry[] {
@@ -755,6 +917,16 @@ function feedbackFromEvent(event: MeetingEvent): { suggestionId: string; feedbac
   return { suggestionId, feedback };
 }
 
+function endedRuntime(runtime: MeetingViewState["runtime"]): MeetingViewState["runtime"] {
+  const recording = runtime.recording.state === "active" || runtime.recording.state === "unknown"
+    ? { state: "busy" as const, label: "正在整理录音", level: null, detail: null }
+    : runtime.recording;
+  const input = runtime.input.state === "active" || runtime.input.state === "busy" || runtime.input.state === "unknown"
+    ? { state: "idle" as const, label: "输入已结束", level: 0, detail: null }
+    : runtime.input;
+  return { ...runtime, phase: "ended", recording, input };
+}
+
 function applyEvent(state: MeetingViewState, event: MeetingEvent): MeetingViewState {
   if (event.seq <= state.lastSeq || event.meetingId !== state.meetingId) return state;
   let next: MeetingViewState = { ...state, lastSeq: event.seq };
@@ -765,7 +937,9 @@ function applyEvent(state: MeetingViewState, event: MeetingEvent): MeetingViewSt
     event.type === "suggestion.draft.started" || event.type === "suggestion.draft.delta" ||
     event.type === "suggestion.committed" || event.type === "suggestion.superseded" ||
     event.type === "suggestion.evidence.remapped";
-  if (formalAiEvent && !isFormalLlmFirstPayload(event.payload)) return next;
+  const localReflexEvent = event.type === "meeting.intelligence.applied" &&
+    isLocalReflexCoachPayload(event.payload);
+  if (formalAiEvent && !isFormalLlmFirstPayload(event.payload) && !localReflexEvent) return next;
 
   if (event.type === "transcript.segment.finalized" || event.type === "transcript.segment.corrected" ||
       event.type === "transcript.segment.revised") {
@@ -830,15 +1004,31 @@ function applyEvent(state: MeetingViewState, event: MeetingEvent): MeetingViewSt
       };
     }
   } else if (event.type === "meeting.intelligence.applied") {
-    const followUp = eventFollowUp(event);
-    if (followUp) {
-      next = {
-        ...next,
-        followUp,
-        coachHistory: mergeCoachHistory(next.coachHistory, [coachHistoryEntryFromEvent(event, followUp)]),
-      };
-    } else {
-      next = { ...next, followUp: null };
+    if (next.runtime.phase !== "ended") {
+      const followUp = eventFollowUp(event);
+      const semanticFollowUp = eventFollowUp(event, "semantic");
+      const coachDecision = eventCoachDecision(event);
+      const supersededCoachHistory = applyCoachSupersession(next.coachHistory, coachDecision);
+      if (followUp) {
+        next = {
+          ...next,
+          followUp,
+          semanticFollowUp,
+          coachDecision,
+          coachHistory: mergeCoachHistory(
+            supersededCoachHistory,
+            [coachHistoryEntryFromEvent(event, followUp)],
+          ),
+        };
+      } else {
+        next = {
+          ...next,
+          followUp: null,
+          semanticFollowUp,
+          coachDecision,
+          coachHistory: supersededCoachHistory,
+        };
+      }
     }
   } else if (event.type === "meeting.decision.updated" || event.type === "meeting.action_item.updated" || event.type === "meeting.risk.updated") {
     const kind = event.type === "meeting.decision.updated"
@@ -866,7 +1056,11 @@ function applyEvent(state: MeetingViewState, event: MeetingEvent): MeetingViewSt
       ...next,
       activePartial: null,
       ending: false,
-      runtime: { ...next.runtime, phase: "ended" },
+      followUp: null,
+      semanticFollowUp: null,
+      coachDecision: null,
+      audio: next.audio.status === "recording" ? { ...next.audio, status: "assembling" } : next.audio,
+      runtime: endedRuntime(next.runtime),
     };
   } else if (event.type === "meeting.minutes.ready") {
     const minutes = eventMinutes(event);
@@ -939,6 +1133,16 @@ function applySnapshot(state: MeetingViewState, snapshot: MeetingSnapshot, recei
   const snapshotCoachHistory = snapshot.coachHistory ?? [];
   const snapshotRecentContextHistory = snapshot.recentContextHistory ?? [];
   const compacted = compactSegments(snapshotSegments);
+  const meetingEnded = state.runtime.phase === "ended" || snapshot.runtime.phase === "ended";
+  const mergedCoachHistory = mergeCoachHistory(state.coachHistory, snapshotCoachHistory);
+  const snapshotFollowUp = snapshot.followUp?.origin === "local_reflex" &&
+    !isLocalReflexCoachProjection(snapshot.followUp)
+    ? null
+    : snapshot.followUp ?? null;
+  const snapshotCoachDecision = snapshot.coachDecision?.origin === "local_reflex" &&
+    snapshot.coachDecision.status === "intervention" && !snapshotFollowUp
+    ? null
+    : snapshot.coachDecision ?? null;
   return {
     ...state,
     ...snapshot,
@@ -952,9 +1156,15 @@ function applySnapshot(state: MeetingViewState, snapshot: MeetingSnapshot, recei
     decisionCandidates: mergeFacts(state.decisionCandidates, snapshot.decisionCandidates),
     actionItems: mergeFacts(state.actionItems, snapshot.actionItems),
     risks: mergeFacts(state.risks, snapshot.risks),
-    followUp: snapshot.followUp ?? null,
-    coachHistory: mergeCoachHistory([], snapshotCoachHistory),
+    followUp: meetingEnded ? null : snapshotFollowUp,
+    semanticFollowUp: meetingEnded ? null : snapshot.semanticFollowUp ?? null,
+    coachDecision: meetingEnded ? null : snapshotCoachDecision,
+    coachHistory: applyCoachSupersession(mergedCoachHistory, snapshotCoachDecision),
     recentContextHistory: mergeRecentContextHistory([], snapshotRecentContextHistory),
+    audio: meetingEnded && snapshot.audio.status === "recording"
+      ? { ...snapshot.audio, status: "assembling" }
+      : snapshot.audio,
+    runtime: meetingEnded ? endedRuntime(snapshot.runtime) : snapshot.runtime,
     connection: "live",
     lastSyncedAtMs: receivedAtMs,
     transportError: null,

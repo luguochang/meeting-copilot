@@ -32,6 +32,10 @@ export interface BrowserMicrophoneState {
 interface UseBrowserMicrophoneOptions {
   asrBaseUrl?: string;
   permissionTimeoutMs?: number;
+  audioContextTimeoutMs?: number;
+  audioWorkletLoadTimeoutMs?: number;
+  socketOpenTimeoutMs?: number;
+  asrReadyTimeoutMs?: number;
   endTimeoutMs?: number;
 }
 
@@ -76,15 +80,28 @@ interface MicrophoneRuntime {
   captureEpoch: number;
   reconnectTimer: number | null;
   stableConnectionTimer: number | null;
+  initialSocketOpenTimer: number | null;
+  cancelInitialSocketOpen: (() => void) | null;
+  socketOpenTimer: number | null;
+  asrReadyTimer: number | null;
+  flushPending: boolean;
 }
 
 const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 const MAX_QUEUED_FRAMES = 450;
 const MAX_SOCKET_BUFFER_BYTES = 2 * 1024 * 1024;
 const DEFAULT_PERMISSION_TIMEOUT_MS = 15_000;
+const DEFAULT_AUDIO_CONTEXT_TIMEOUT_MS = 1_500;
+const DEFAULT_AUDIO_WORKLET_LOAD_TIMEOUT_MS = 1_500;
+const DEFAULT_SOCKET_OPEN_TIMEOUT_MS = 5_000;
+// Keep the browser deadline just above the backend recognizer's 60 s warm-up
+// contract. Warm resident workers normally answer in under a second, while a
+// cold model must be allowed to finish instead of being restarted in a loop.
+const DEFAULT_ASR_READY_TIMEOUT_MS = 65_000;
 const DEFAULT_END_TIMEOUT_MS = 12_000;
 const MAX_RECONNECT_ATTEMPTS = 3;
 const STABLE_CONNECTION_RESET_MS = 30_000;
+const STREAM_FLUSH_COMMAND = "FLUSH";
 
 const initialState: BrowserMicrophoneState = {
   phase: "idle",
@@ -125,6 +142,7 @@ function buildWebSocketUrl(meetingId: string, captureEpoch: number, baseUrl = ""
   url.search = new URLSearchParams({
     audio_source: "browser_live_mic",
     capture_epoch: String(captureEpoch),
+    transport_handshake: "1",
   }).toString();
   return url.toString();
 }
@@ -170,6 +188,77 @@ function requestMicrophone(
   });
 }
 
+/**
+ * An embedded browser can leave resume() pending when autoplay or device
+ * permission is waiting on another surface. Keep startup bounded and consume
+ * a late rejection so it cannot become an unhandled promise.
+ */
+function resumeAudioContext(context: AudioContext, timeoutMs: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = window.setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error("麦克风音频上下文启动超时，请检查浏览器页面权限后重试"));
+    }, timeoutMs);
+    let request: Promise<void>;
+    try {
+      request = context.resume();
+    } catch (error) {
+      settled = true;
+      window.clearTimeout(timer);
+      reject(error);
+      return;
+    }
+    Promise.resolve(request).then(
+      () => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        resolve();
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+/**
+ * WebKit can leave addModule() pending even after its AudioContext resumed.
+ * Treat a slow worklet as unavailable and use ScriptProcessor for this session.
+ */
+function loadAudioWorkletModule(
+  context: AudioContext,
+  moduleUrl: string,
+  timeoutMs: number,
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (loaded: boolean) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      resolve(loaded);
+    };
+    const timer = window.setTimeout(() => finish(false), timeoutMs);
+    let request: Promise<void>;
+    try {
+      request = context.audioWorklet.addModule(moduleUrl);
+    } catch {
+      finish(false);
+      return;
+    }
+    Promise.resolve(request).then(
+      () => finish(true),
+      () => finish(false),
+    );
+  });
+}
+
 function elapsed(runtime: MicrophoneRuntime, nowMs = Date.now()): number {
   const end = runtime.stoppedAtMs ?? runtime.pausedAtMs ?? nowMs;
   return Math.max(0, end - runtime.startedAtMs - runtime.totalPausedMs);
@@ -203,8 +292,15 @@ export function useBrowserMicrophone(
   const dispose = useCallback((runtime: MicrophoneRuntime, closeSocket = true) => {
     if (runtime.disposed) return;
     runtime.disposed = true;
+    runtime.cancelInitialSocketOpen?.();
     if (runtime.reconnectTimer !== null) window.clearTimeout(runtime.reconnectTimer);
     if (runtime.stableConnectionTimer !== null) window.clearTimeout(runtime.stableConnectionTimer);
+    if (runtime.socketOpenTimer !== null) window.clearTimeout(runtime.socketOpenTimer);
+    if (runtime.asrReadyTimer !== null) window.clearTimeout(runtime.asrReadyTimer);
+    runtime.reconnectTimer = null;
+    runtime.stableConnectionTimer = null;
+    runtime.socketOpenTimer = null;
+    runtime.asrReadyTimer = null;
     closeAudio(runtime);
     if (closeSocket && runtime.socket && runtime.socket.readyState < WebSocket.CLOSING) {
       try { runtime.socket.close(1000, "client_cleanup"); } catch { /* already closed */ }
@@ -295,6 +391,11 @@ export function useBrowserMicrophone(
       captureEpoch: 1,
       reconnectTimer: null,
       stableConnectionTimer: null,
+      initialSocketOpenTimer: null,
+      cancelInitialSocketOpen: null,
+      socketOpenTimer: null,
+      asrReadyTimer: null,
+      flushPending: false,
     };
     runtimeRef.current = runtime;
 
@@ -307,6 +408,10 @@ export function useBrowserMicrophone(
         runtime.stream.getTracks().forEach((track) => track.stop());
         return;
       }
+      updateState({
+        phase: "starting",
+        statusMessage: "麦克风权限已通过，正在初始化音频采集",
+      });
 
       const AudioContextConstructor = window.AudioContext;
       if (!AudioContextConstructor) throw new Error("当前浏览器不支持 AudioContext");
@@ -314,7 +419,10 @@ export function useBrowserMicrophone(
         latencyHint: "interactive",
         sampleRate: 16_000,
       });
-      await runtime.context.resume();
+      await resumeAudioContext(
+        runtime.context,
+        optionsRef.current.audioContextTimeoutMs ?? DEFAULT_AUDIO_CONTEXT_TIMEOUT_MS,
+      );
       runtime.framer = new StreamingPcmFramer(runtime.context.sampleRate);
       runtime.source = runtime.context.createMediaStreamSource(runtime.stream);
       runtime.monitor = runtime.context.createGain();
@@ -323,18 +431,24 @@ export function useBrowserMicrophone(
       let processor: AudioNode | null = null;
       if (runtime.context.audioWorklet && typeof AudioWorkletNode !== "undefined") {
         try {
-          await runtime.context.audioWorklet.addModule(
+          const loaded = await loadAudioWorkletModule(
+            runtime.context,
             new URL("./audio-capture-worklet.js", import.meta.url).href,
+            optionsRef.current.audioWorkletLoadTimeoutMs
+              ?? DEFAULT_AUDIO_WORKLET_LOAD_TIMEOUT_MS,
           );
-          const worklet = new AudioWorkletNode(runtime.context, "meeting-copilot-audio-capture", {
-            numberOfInputs: 1,
-            numberOfOutputs: 1,
-            outputChannelCount: [1],
-          });
-          worklet.port.onmessage = (event: MessageEvent<Float32Array>) => {
-            consumeAudio(runtime, new Float32Array(event.data));
-          };
-          processor = worklet;
+          if (runtimeRef.current !== runtime || runtime.disposed) return;
+          if (loaded) {
+            const worklet = new AudioWorkletNode(runtime.context, "meeting-copilot-audio-capture", {
+              numberOfInputs: 1,
+              numberOfOutputs: 1,
+              outputChannelCount: [1],
+            });
+            worklet.port.onmessage = (event: MessageEvent<Float32Array>) => {
+              consumeAudio(runtime, new Float32Array(event.data));
+            };
+            processor = worklet;
+          }
         } catch {
           processor = null;
         }
@@ -351,7 +465,10 @@ export function useBrowserMicrophone(
       processor.connect(runtime.monitor);
       runtime.monitor.connect(runtime.context.destination);
 
-      const connectSocket = (): void => {
+      const connectSocket = (initialHandshake?: {
+        onOpen(): void;
+        onClose(): void;
+      }): void => {
         if (runtime.disposed || runtime.stopping) return;
         const socket = new WebSocket(buildWebSocketUrl(
           normalizedMeetingId,
@@ -360,15 +477,42 @@ export function useBrowserMicrophone(
         ));
         runtime.socket = socket;
         socket.binaryType = "arraybuffer";
+        let asrReady = false;
         socket.onopen = () => {
           if (runtime.disposed || runtime.socket !== socket) return;
+          if (runtime.socketOpenTimer !== null) {
+            window.clearTimeout(runtime.socketOpenTimer);
+            runtime.socketOpenTimer = null;
+          }
+          initialHandshake?.onOpen();
           runtime.resolveOpen();
-          flushQueue(runtime);
+          flushQueue(runtime, runtime.flushPending);
+          if (runtime.flushPending) {
+            socket.send(STREAM_FLUSH_COMMAND);
+            runtime.flushPending = false;
+          }
           if (runtime.stableConnectionTimer !== null) window.clearTimeout(runtime.stableConnectionTimer);
           runtime.stableConnectionTimer = window.setTimeout(() => {
             runtime.reconnectAttempts = 0;
             runtime.stableConnectionTimer = null;
           }, STABLE_CONNECTION_RESET_MS);
+          if (runtime.asrReadyTimer !== null) window.clearTimeout(runtime.asrReadyTimer);
+          runtime.asrReadyTimer = window.setTimeout(() => {
+            if (runtime.disposed || runtime.stopping || runtime.socket !== socket || asrReady) return;
+            runtime.asrReadyTimer = null;
+            updateState({
+              phase: "reconnecting",
+              asrReady: false,
+              error: null,
+              statusMessage: "实时识别服务未就绪，正在自动恢复",
+            });
+            try {
+              if (socket.readyState < WebSocket.CLOSING) socket.close(4001, "asr_ready_timeout");
+            } catch {
+              // The close handler owns retry scheduling; an already-closed
+              // socket will reach it without another action here.
+            }
+          }, optionsRef.current.asrReadyTimeoutMs ?? DEFAULT_ASR_READY_TIMEOUT_MS);
           updateState({
             phase: runtime.paused ? "paused" : "starting",
             error: null,
@@ -384,12 +528,33 @@ export function useBrowserMicrophone(
           return;
         }
         const eventType = String(event.event_type ?? "");
+        if (eventType === "asr_transport_ready") {
+          // A server can accept the socket before the browser dispatches its
+          // `open` callback. Treat the explicit application handshake as an
+          // equivalent startup confirmation so a recognizer startup failure
+          // remains recoverable instead of rolling back the meeting.
+          initialHandshake?.onOpen();
+          updateState({
+            phase: runtime.paused ? "paused" : "starting",
+            error: null,
+            statusMessage: "麦克风已连接，正在准备实时识别",
+          });
+          return;
+        }
         if (eventType === "asr_starting") {
+          initialHandshake?.onOpen();
           updateState({ asrReady: false, phase: "starting", statusMessage: "正在准备实时识别" });
           return;
         }
         if (eventType === "asr_ready") {
           const ready = event.ready === true;
+          if (ready) {
+            asrReady = true;
+            if (runtime.asrReadyTimer !== null) {
+              window.clearTimeout(runtime.asrReadyTimer);
+              runtime.asrReadyTimer = null;
+            }
+          }
           updateState({
             asrReady: ready,
             phase: runtime.paused ? "paused" : ready ? "recording" : "starting",
@@ -418,6 +583,7 @@ export function useBrowserMicrophone(
           return;
         }
         if (eventType === "error" || eventType === "provider_error") {
+          initialHandshake?.onOpen();
           const messageText = String(event.message ?? event.detail ?? "实时识别服务异常");
           updateState({ phase: "error", error: messageText, statusMessage: messageText });
         }
@@ -428,6 +594,15 @@ export function useBrowserMicrophone(
           }
         };
         socket.onclose = () => {
+          if (runtime.socketOpenTimer !== null) {
+            window.clearTimeout(runtime.socketOpenTimer);
+            runtime.socketOpenTimer = null;
+          }
+          if (runtime.asrReadyTimer !== null) {
+            window.clearTimeout(runtime.asrReadyTimer);
+            runtime.asrReadyTimer = null;
+          }
+          initialHandshake?.onClose();
           runtime.resolveOpen();
           if (runtime.stopping || runtime.disposed || runtime.socket !== socket) return;
           if (runtime.stableConnectionTimer !== null) {
@@ -460,16 +635,55 @@ export function useBrowserMicrophone(
             statusMessage: "录音连接等待手动继续",
           });
         };
+        if (!initialHandshake) {
+          runtime.socketOpenTimer = window.setTimeout(() => {
+            if (runtime.disposed || runtime.stopping || runtime.socket !== socket) return;
+            runtime.socketOpenTimer = null;
+            try {
+              if (socket.readyState < WebSocket.CLOSING) socket.close(4002, "reconnect_open_timeout");
+            } catch {
+              // The close handler owns retry scheduling.
+            }
+          }, optionsRef.current.socketOpenTimeoutMs ?? DEFAULT_SOCKET_OPEN_TIMEOUT_MS);
+        }
       };
 
-      connectSocket();
-
       updateState({ phase: "connecting", elapsedMs: 0, statusMessage: "正在连接录音服务" });
+      await new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const finish = (handler: () => void) => {
+          if (settled) return;
+          settled = true;
+          if (runtime.initialSocketOpenTimer !== null) {
+            window.clearTimeout(runtime.initialSocketOpenTimer);
+            runtime.initialSocketOpenTimer = null;
+          }
+          runtime.cancelInitialSocketOpen = null;
+          handler();
+        };
+        runtime.cancelInitialSocketOpen = () => {
+          finish(() => reject(new Error("实时识别服务连接已取消")));
+        };
+        runtime.initialSocketOpenTimer = window.setTimeout(() => {
+          finish(() => reject(new Error("实时识别服务连接超时，请确认本机服务可用后重试")));
+        }, optionsRef.current.socketOpenTimeoutMs ?? DEFAULT_SOCKET_OPEN_TIMEOUT_MS);
+        try {
+          connectSocket({
+            onOpen: () => finish(resolve),
+            onClose: () => finish(() => reject(new Error("实时识别服务在连接就绪前中断，请重试"))),
+          });
+        } catch (error) {
+          finish(() => reject(error));
+        }
+      });
     } catch (error) {
+      const ownsRuntime = runtimeRef.current === runtime;
       dispose(runtime);
-      if (runtimeRef.current === runtime) runtimeRef.current = null;
+      if (ownsRuntime) runtimeRef.current = null;
       const message = errorMessage(error);
-      updateState({ phase: "error", error: message, statusMessage: message, inputLevel: 0 });
+      if (ownsRuntime) {
+        updateState({ phase: "error", error: message, statusMessage: message, inputLevel: 0 });
+      }
       throw error;
     }
   }, [closeAudio, consumeAudio, dispose, flushQueue, updateState]);
@@ -487,8 +701,17 @@ export function useBrowserMicrophone(
     }
     runtime.paused = true;
     runtime.pausedAtMs = nowMs;
+    if (runtime.framer) {
+      for (const frame of runtime.framer.flush()) queueOrSend(runtime, frame);
+    }
+    runtime.flushPending = true;
+    if (runtime.socket?.readyState === WebSocket.OPEN) {
+      flushQueue(runtime, true);
+      runtime.socket.send(STREAM_FLUSH_COMMAND);
+      runtime.flushPending = false;
+    }
     updateState({ phase: "paused", inputLevel: 0, elapsedMs: elapsed(runtime, nowMs), statusMessage: "录音已暂停" });
-  }, [updateState]);
+  }, [flushQueue, queueOrSend, updateState]);
 
   const end = useCallback(async () => {
     const runtime = runtimeRef.current;

@@ -121,6 +121,9 @@ describe("HttpMeetingApi", () => {
       probe_status: "succeeded",
       model: "gpt-old",
       realtime_model: "gpt-realtime-old",
+      realtime_model_source: "runtime_realtime_model",
+      realtime_model_explicit: true,
+      realtime_model_warning: null,
     }));
     vi.stubGlobal("fetch", fetchSpy);
 
@@ -132,18 +135,46 @@ describe("HttpMeetingApi", () => {
       probe_status: "succeeded",
       model: "gpt-old",
       realtime_model: "gpt-realtime-old",
+      realtime_model_source: "runtime_realtime_model",
+      realtime_model_explicit: true,
+      realtime_model_warning: null,
+      correction_model: "gpt-old",
+      correction_model_source: null,
+      correction_model_explicit: undefined,
+      correction_model_warning: null,
+      operational: null,
+      realtime_ready: null,
+      probe_latency_ms: null,
+      probe_usage: null,
+      realtime_cutoff_ms: 2500,
+      realtime_circuit: null,
     });
     expect(reconcileProviderStatus({
       configured: true,
       runtime_synced: true,
       model: "gpt-old",
       realtime_model: "gpt-realtime-new",
+      realtime_model_source: "runtime_realtime_model",
+      realtime_model_explicit: true,
     }, runtime)).toEqual({
       configured: true,
       runtime_synced: false,
       probe_status: "not_run",
       model: "gpt-old",
       realtime_model: "gpt-realtime-new",
+      realtime_model_source: "runtime_realtime_model",
+      realtime_model_explicit: true,
+      realtime_model_warning: null,
+      correction_model: "gpt-old",
+      correction_model_source: "general_model_fallback",
+      correction_model_explicit: false,
+      correction_model_warning: "correction_model_inherits_general_model",
+      operational: null,
+      realtime_ready: null,
+      probe_latency_ms: null,
+      probe_usage: null,
+      realtime_cutoff_ms: 2500,
+      realtime_circuit: null,
     });
     expect(reconcileProviderStatus({
       configured: true,
@@ -157,6 +188,33 @@ describe("HttpMeetingApi", () => {
       realtime_model: "gpt-realtime-old",
     });
     expect(fetchSpy).toHaveBeenCalledWith("/providers/status", expect.objectContaining({ method: "GET" }));
+  });
+
+  it("keeps the shared realtime circuit in the provider status contract", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response({
+      configured: true,
+      runtime_synced: true,
+      probe_status: "not_run",
+      model: "gpt-realtime",
+      realtime_circuit: {
+        state: "open",
+        reason: "realtime_provider_recovery_probe_required",
+        failure_count: 3,
+        retry_after_ms: 0,
+        half_open: false,
+        identity_generation: 4,
+        last_failure_class: "timeout",
+      },
+    })));
+
+    await expect(fetchProviderStatus()).resolves.toMatchObject({
+      realtime_circuit: {
+        state: "open",
+        reason: "realtime_provider_recovery_probe_required",
+        failure_count: 3,
+        last_failure_class: "timeout",
+      },
+    });
   });
 
   it("parses the two recording tracks and keeps a partial failure explicit", async () => {

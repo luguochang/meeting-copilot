@@ -1,6 +1,6 @@
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import type { MeetingApi } from "../../api/client";
+import { ApiError, type MeetingApi } from "../../api/client";
 import type { MeetingEventTransport } from "../../api/eventTransport";
 import type { FormalAiProvenance, MeetingSnapshot } from "../../domain/events";
 import { LiveMeetingWorkbench } from "./LiveMeetingWorkbench";
@@ -500,6 +500,65 @@ describe("LiveMeetingWorkbench", () => {
     expect(order).toEqual(["meeting-created", "preparation-saved", "meeting-opened", "microphone-started"]);
   });
 
+  it("refreshes the coach skill after preparation is first missing and then saved", async () => {
+    const user = userEvent.setup();
+    const { api, transport } = dependencies();
+    const microphone = microphoneController();
+    let preparationSaved = false;
+    const projectPreparation = {
+      meetingId: "meeting-1",
+      hotwords: [],
+      inputSource: "microphone" as const,
+      inputDeviceId: "mic-1",
+      inputDeviceName: "MacBook Microphone",
+      noticeAcknowledged: true,
+      presetId: "project" as const,
+      meetingGoal: "同步项目进度并明确下一步",
+      participantRole: null,
+      focusPoints: ["进展", "阻塞", "负责人", "截止时间"],
+      outputFormat: "action_plan" as const,
+      proactiveSuggestionPolicy: "low_frequency" as const,
+      version: 1,
+      updatedAtMs: 1,
+    };
+    api.getMeetingPreparation = vi.fn(async () => {
+      if (!preparationSaved) throw new Error("meeting preparation not found");
+      return projectPreparation;
+    });
+    api.getMeetingPreparationVersions = vi.fn(async () => (
+      preparationSaved ? [projectPreparation] : []
+    ));
+    vi.mocked(api.saveMeetingPreparation).mockImplementation(async () => {
+      preparationSaved = true;
+    });
+
+    render(
+      <LiveMeetingWorkbench
+        meetingId="meeting-1"
+        api={api}
+        transport={transport}
+        microphoneController={microphone}
+      />,
+    );
+
+    expect(await screen.findByText("通用对话")).toBeVisible();
+    await waitFor(() => expect(api.getMeetingPreparation).toHaveBeenCalledTimes(1));
+
+    await user.click(screen.getByRole("button", { name: "立即开始录音" }));
+    const dialog = await screen.findByRole("dialog", { name: "准备开始会议" });
+    await within(dialog).findByText("本地中文实时识别可用");
+    await user.selectOptions(within(dialog).getByRole("combobox", { name: /^教练技能包/ }), "project");
+    await user.click(within(dialog).getByLabelText("我已告知参会者并确认可以录音"));
+    await user.click(within(dialog).getByRole("button", { name: "开始会议" }));
+
+    await waitFor(() => expect(api.saveMeetingPreparation).toHaveBeenCalledWith(
+      "meeting-1",
+      expect.objectContaining({ presetId: "project" }),
+    ));
+    expect(await screen.findByText("项目执行")).toBeVisible();
+    expect(api.getMeetingPreparation).toHaveBeenCalledTimes(2);
+  });
+
   it("passes the packaged system-audio selection to the single capture owner", async () => {
     const user = userEvent.setup();
     const { api, transport } = dependencies();
@@ -948,6 +1007,96 @@ describe("LiveMeetingWorkbench", () => {
     expect(screen.queryByText("trace unavailable")).not.toBeInTheDocument();
   });
 
+  it("reports a Pi coach trace only after the intervention card is mounted", async () => {
+    const { api } = dependencies();
+    const jobId = "job-coach-render-1";
+    vi.mocked(api.getSnapshot).mockResolvedValue({
+      ...realSnapshot(),
+      lastSeq: 0,
+      suggestions: [],
+      followUp: null,
+      semanticFollowUp: null,
+      coachDecision: null,
+      coachHistory: [],
+    });
+    const coachEvent = {
+      meetingId: "meeting-1",
+      seq: 1,
+      eventId: "coach-event-1",
+      type: "meeting.intelligence.applied",
+      aggregateType: "meeting_intelligence",
+      aggregateId: jobId,
+      occurredAtMs: 9_000,
+      correlationId: "meeting-1",
+      causationId: jobId,
+      idempotencyKey: `meeting.intelligence.applied:${jobId}`,
+      payload: {
+        source: "llm_first",
+        job_id: jobId,
+        batch_id: "batch-coach-render-1",
+        provider: "openai_compatible_gateway",
+        model: "fixture-model",
+        llm_called: true,
+        llm_call_status: "called",
+        evidence: {
+          segment_ids: ["segment-1"],
+          quote: "负责人还没有确定",
+          evidence_hash: "hash-1",
+          state_revision: 1,
+        },
+        coach_intervention: {
+          say_this: "可以把周五作为目标，但请先确认负责人。",
+          why_now: "当前承诺缺少明确负责人。",
+          evidence_segment_ids: ["segment-1"],
+          evidence_quote: "负责人还没有确定",
+          urgency: "high",
+          event_type: "commitment_risk",
+          title: "先限定承诺条件",
+          confidence: 0.92,
+          provenance_version: "realtime_coach_provenance.v1",
+          origin: "pi",
+          status: "intervention",
+          status_reason: "intervention_submitted",
+          decision_reason: "负责人尚未确定。",
+          run_id: "coach-run-render-1",
+          decision_id: "coach-decision-render-1",
+          valid_until_ms: Date.now() + 60_000,
+          lifecycle_action: "retain",
+        },
+        coach_decision: {
+          provenance_version: "realtime_coach_provenance.v1",
+          origin: "pi",
+          status: "intervention",
+          status_reason: "intervention_submitted",
+          decision_reason: "负责人尚未确定。",
+          run_id: "coach-run-render-1",
+          decision_id: "coach-decision-render-1",
+          meeting_id: "meeting-1",
+          job_id: jobId,
+          triggered: true,
+          valid_until_ms: Date.now() + 60_000,
+          lifecycle_action: "retain",
+        },
+      },
+      publishedAtMs: null,
+    };
+    const transport: MeetingEventTransport = {
+      kind: "sse",
+      subscribe(subscription) {
+        subscription.onConnection("live");
+        subscription.onEvents([coachEvent]);
+        return () => undefined;
+      },
+    };
+
+    render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} />);
+
+    const card = await screen.findByTestId("follow-up-card");
+    expect(card).toHaveAttribute("data-ui-render-card", "coach");
+    expect(card).toHaveAttribute("data-ui-render-job-id", jobId);
+    await waitFor(() => expect(api.markUiRendered).toHaveBeenCalledWith(jobId, 1, 0));
+  });
+
   it("flushes and ends microphone capture before requesting post-meeting processing", async () => {
     const user = userEvent.setup();
     const order: string[] = [];
@@ -977,6 +1126,38 @@ describe("LiveMeetingWorkbench", () => {
 
     await waitFor(() => expect(api.endMeeting).toHaveBeenCalledWith("meeting-1"));
     expect(order).toEqual(["audio-end", "api-end"]);
+  });
+
+  it("retries the end request while the backend finalizes a disconnected ASR stream", async () => {
+    const user = userEvent.setup();
+    const { api, transport } = dependencies();
+    vi.mocked(api.endMeeting)
+      .mockRejectedValueOnce(new ApiError(
+        409,
+        "Realtime ASR is still finalizing; retry ending the meeting.",
+        { detail: { error: "asr_finalization_pending" } },
+      ))
+      .mockResolvedValueOnce(undefined);
+    const microphone = microphoneController({
+      phase: "recording",
+      asrReady: true,
+      elapsedMs: 12_000,
+      statusMessage: "实时识别已就绪",
+    });
+    vi.mocked(microphone.end).mockResolvedValue(undefined);
+    render(
+      <LiveMeetingWorkbench
+        meetingId="meeting-1"
+        api={api}
+        transport={transport}
+        microphoneController={microphone}
+      />,
+    );
+    await screen.findByText("支付服务上线安排");
+    await user.click(screen.getByRole("button", { name: "结束并整理" }));
+
+    await waitFor(() => expect(api.endMeeting).toHaveBeenCalledTimes(2), { timeout: 2_000 });
+    expect(api.endMeeting).toHaveBeenLastCalledWith("meeting-1");
   });
 
   it("does not show an unsupported pause command for system-audio capture", async () => {
@@ -1240,6 +1421,30 @@ describe("LiveMeetingWorkbench", () => {
     const statuses = screen.getByLabelText("会议运行状态");
     expect(within(statuses).getByText("输入已结束")).toBeVisible();
     expect(within(statuses).queryByText("检测中")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "结束并整理" })).not.toBeInTheDocument();
+  });
+
+  it("does not present stale active recording fields after an ended snapshot", async () => {
+    const { api, transport } = dependencies();
+    vi.mocked(api.getSnapshot).mockResolvedValue({
+      ...realSnapshot(),
+      activePartial: null,
+      runtime: { ...realSnapshot().runtime, phase: "ended" },
+    });
+
+    render(
+      <LiveMeetingWorkbench
+        meetingId="meeting-1"
+        api={api}
+        transport={transport}
+        microphoneController={microphoneController({ phase: "recording", inputLevel: 0.9 })}
+      />,
+    );
+
+    const statuses = await screen.findByLabelText("会议运行状态");
+    expect(within(statuses).getByText("正在整理录音")).toBeVisible();
+    expect(within(statuses).getByText("输入已结束")).toBeVisible();
+    expect(within(statuses).queryByText("录音中")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "结束并整理" })).not.toBeInTheDocument();
   });
 

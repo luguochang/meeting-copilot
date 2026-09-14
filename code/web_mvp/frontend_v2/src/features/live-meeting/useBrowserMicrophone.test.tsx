@@ -29,13 +29,18 @@ class FakeScriptProcessor extends FakeNode {
 
 class FakeAudioContext {
   static latest: FakeAudioContext | null = null;
+  static resumeImplementation: (() => Promise<void>) | null = null;
+  static workletImplementation: (() => Promise<void>) | null = null;
   readonly sampleRate = 16_000;
   readonly destination = new FakeNode() as unknown as AudioDestinationNode;
-  readonly audioWorklet = { addModule: vi.fn().mockRejectedValue(new Error("worklet unavailable")) };
+  readonly audioWorklet = {
+    addModule: vi.fn(() => FakeAudioContext.workletImplementation?.()
+      ?? Promise.reject(new Error("worklet unavailable"))),
+  };
   readonly source = new FakeNode();
   readonly processor = new FakeScriptProcessor();
   readonly gain = Object.assign(new FakeNode(), { gain: { value: 1 } });
-  resume = vi.fn().mockResolvedValue(undefined);
+  resume = vi.fn(() => FakeAudioContext.resumeImplementation?.() ?? Promise.resolve());
   close = vi.fn().mockResolvedValue(undefined);
   createMediaStreamSource = vi.fn(() => this.source as unknown as MediaStreamAudioSourceNode);
   createScriptProcessor = vi.fn(() => this.processor as unknown as ScriptProcessorNode);
@@ -77,10 +82,29 @@ class FakeWebSocket {
     this.onmessage?.(new MessageEvent("message", { data: JSON.stringify(payload) }));
   }
 
-  close() {
+  close = vi.fn(() => {
     this.readyState = FakeWebSocket.CLOSED;
     this.onclose?.(new CloseEvent("close", { code: 1000 }));
-  }
+  });
+}
+
+async function flushMicrotasks(turns = 10) {
+  await act(async () => {
+    for (let index = 0; index < turns; index += 1) await Promise.resolve();
+  });
+}
+
+async function startAndOpen(start: () => Promise<void>): Promise<FakeWebSocket> {
+  let startPromise!: Promise<void>;
+  act(() => {
+    startPromise = start();
+  });
+  await flushMicrotasks();
+  const socket = FakeWebSocket.latest;
+  expect(socket).not.toBeNull();
+  act(() => socket!.open());
+  await act(async () => startPromise);
+  return socket!;
 }
 
 describe("useBrowserMicrophone", () => {
@@ -89,6 +113,8 @@ describe("useBrowserMicrophone", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     FakeAudioContext.latest = null;
+    FakeAudioContext.resumeImplementation = null;
+    FakeAudioContext.workletImplementation = null;
     FakeWebSocket.latest = null;
     vi.stubGlobal("WebSocket", FakeWebSocket);
     vi.stubGlobal("AudioContext", FakeAudioContext);
@@ -107,11 +133,9 @@ describe("useBrowserMicrophone", () => {
   it("streams real Float32 microphone frames and projects one live partial", async () => {
     const { result } = renderHook(() => useBrowserMicrophone({ asrBaseUrl: "http://127.0.0.1:8765" }));
 
-    await act(async () => result.current.start("rec_test"));
-    const socket = FakeWebSocket.latest!;
-    expect(socket.url).toBe("ws://127.0.0.1:8765/live/asr/stream/ws/rec_test?audio_source=browser_live_mic&capture_epoch=1");
+    const socket = await startAndOpen(() => result.current.start("rec_test"));
+    expect(socket.url).toBe("ws://127.0.0.1:8765/live/asr/stream/ws/rec_test?audio_source=browser_live_mic&capture_epoch=1&transport_handshake=1");
 
-    act(() => socket.open());
     act(() => {
       socket.message({ event_type: "asr_starting" });
       socket.message({ event_type: "asr_ready", ready: true });
@@ -138,6 +162,23 @@ describe("useBrowserMicrophone", () => {
     expect(result.current.state.activePartial).toBeNull();
   });
 
+  it("accepts the explicit transport handshake before the browser open callback", async () => {
+    const { result } = renderHook(() => useBrowserMicrophone());
+    let startPromise!: Promise<void>;
+    act(() => {
+      startPromise = result.current.start("rec_transport_handshake");
+    });
+    await flushMicrotasks();
+    const socket = FakeWebSocket.latest!;
+    expect(socket).not.toBeNull();
+
+    act(() => socket.message({ event_type: "asr_transport_ready", ready: true }));
+    await act(async () => startPromise);
+
+    expect(result.current.state.error).toBeNull();
+    expect(result.current.state.phase).toBe("starting");
+  });
+
   it("rejects a remote ASR target before requesting microphone permission or opening a socket", async () => {
     const { result } = renderHook(() => useBrowserMicrophone({ asrBaseUrl: "https://api.example.test" }));
 
@@ -149,14 +190,159 @@ describe("useBrowserMicrophone", () => {
     expect(FakeWebSocket.latest).toBeNull();
   });
 
-  it("pauses capture and ends with END before releasing browser audio resources", async () => {
-    const { result } = renderHook(() => useBrowserMicrophone({ endTimeoutMs: 500 }));
-    await act(async () => result.current.start("rec_stop"));
-    const socket = FakeWebSocket.latest!;
-    act(() => socket.open());
+  it("times out a browser permission request, stops a late stream, and can retry", async () => {
+    vi.useFakeTimers();
+    let resolveLateStream!: (value: MediaStream) => void;
+    vi.mocked(navigator.mediaDevices.getUserMedia).mockReturnValueOnce(
+      new Promise<MediaStream>((resolve) => {
+        resolveLateStream = resolve;
+      }),
+    );
+    const { result } = renderHook(() => useBrowserMicrophone({ permissionTimeoutMs: 100 }));
+    let startPromise!: Promise<void>;
+    act(() => {
+      startPromise = result.current.start("rec_permission_timeout");
+    });
+    const rejection = expect(startPromise).rejects.toThrow("麦克风权限请求超时");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(101);
+    });
+    await rejection;
+    expect(result.current.state.phase).toBe("error");
 
-    act(() => result.current.togglePause());
+    const lateTrack = new FakeTrack();
+    await act(async () => {
+      resolveLateStream({ getTracks: () => [lateTrack] } as unknown as MediaStream);
+      await Promise.resolve();
+    });
+    expect(lateTrack.stop).toHaveBeenCalledOnce();
+
+    const retrySocket = await startAndOpen(() => result.current.start("rec_permission_retry"));
+    expect(retrySocket.url).toContain("/rec_permission_retry?");
+    expect(result.current.state.phase).toBe("starting");
+    expect(result.current.state.error).toBeNull();
+  });
+
+  it("times out a suspended AudioContext instead of hanging microphone startup", async () => {
+    vi.useFakeTimers();
+    FakeAudioContext.resumeImplementation = () => new Promise<void>(() => {});
+    Object.defineProperty(FakeAudioContext.prototype, "state", {
+      configurable: true,
+      get: () => "suspended",
+    });
+    const { result } = renderHook(() => useBrowserMicrophone({ audioContextTimeoutMs: 100 }));
+    let startPromise!: Promise<void>;
+    act(() => {
+      startPromise = result.current.start("rec_audio_context_timeout");
+    });
+    const rejection = expect(startPromise).rejects.toThrow("麦克风音频上下文启动超时");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(101);
+    });
+    await rejection;
+    expect(result.current.state.phase).toBe("error");
+    expect(stream.track.stop).toHaveBeenCalled();
+    expect(FakeAudioContext.latest?.close).toHaveBeenCalled();
+  });
+
+  it("falls back to ScriptProcessor when the AudioWorklet module load stays pending", async () => {
+    vi.useFakeTimers();
+    FakeAudioContext.workletImplementation = () => new Promise<void>(() => {});
+    vi.stubGlobal("AudioWorkletNode", class FakeAudioWorkletNode {});
+    const { result } = renderHook(() => useBrowserMicrophone({
+      audioWorkletLoadTimeoutMs: 100,
+      socketOpenTimeoutMs: 1_000,
+    }));
+    let startPromise!: Promise<void>;
+    act(() => {
+      startPromise = result.current.start("rec_worklet_timeout");
+    });
+    await flushMicrotasks();
+    expect(result.current.state.statusMessage).toBe("麦克风权限已通过，正在初始化音频采集");
+    expect(FakeAudioContext.latest?.audioWorklet.addModule).toHaveBeenCalledOnce();
+    expect(FakeWebSocket.latest).toBeNull();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(101);
+    });
+    await flushMicrotasks();
+    expect(FakeAudioContext.latest?.createScriptProcessor).toHaveBeenCalledOnce();
+    const socket = FakeWebSocket.latest!;
+    expect(socket).not.toBeNull();
+    act(() => socket.open());
+    await act(async () => startPromise);
+
+    expect(result.current.state.phase).toBe("starting");
+    expect(stream.track.stop).not.toHaveBeenCalled();
+  });
+
+  it("fails and releases microphone resources when the first WebSocket never opens", async () => {
+    vi.useFakeTimers();
+    const { result } = renderHook(() => useBrowserMicrophone({ socketOpenTimeoutMs: 100 }));
+    let startPromise!: Promise<void>;
+    act(() => {
+      startPromise = result.current.start("rec_socket_timeout");
+    });
+    const rejection = expect(startPromise).rejects.toThrow("实时识别服务连接超时");
+    await flushMicrotasks();
+    const socket = FakeWebSocket.latest!;
+    expect(socket).not.toBeNull();
+    expect(socket.readyState).toBe(FakeWebSocket.CONNECTING);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(101);
+    });
+    await rejection;
+
+    expect(result.current.state.phase).toBe("error");
+    expect(result.current.state.error).toContain("实时识别服务连接超时");
+    expect(stream.track.stop).toHaveBeenCalled();
+    expect(FakeAudioContext.latest?.close).toHaveBeenCalled();
+    expect(socket.close).toHaveBeenCalledOnce();
+  });
+
+  it("reconnects when a WebSocket opens but never reports ASR ready", async () => {
+    vi.useFakeTimers();
+    const { result } = renderHook(() => useBrowserMicrophone({
+      asrReadyTimeoutMs: 100,
+      socketOpenTimeoutMs: 100,
+    }));
+    const firstSocket = await startAndOpen(() => result.current.start("rec_asr_ready_timeout"));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(101);
+    });
+    expect(firstSocket.close).toHaveBeenCalledWith(4001, "asr_ready_timeout");
+    expect(result.current.state.phase).toBe("reconnecting");
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+    });
+    const resumedSocket = FakeWebSocket.latest!;
+    expect(resumedSocket).not.toBe(firstSocket);
+    expect(resumedSocket.url).toContain("capture_epoch=2");
+    expect(resumedSocket.readyState).toBe(FakeWebSocket.CONNECTING);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(101);
+    });
+    expect(resumedSocket.close).toHaveBeenCalledWith(4002, "reconnect_open_timeout");
+    expect(result.current.state.phase).toBe("reconnecting");
+  });
+
+  it("flushes the pending tail on pause and ends with END without a second pause flush", async () => {
+    const { result } = renderHook(() => useBrowserMicrophone({ endTimeoutMs: 500 }));
+    const socket = await startAndOpen(() => result.current.start("rec_stop"));
+
+    act(() => {
+      FakeAudioContext.latest!.processor.emit(new Float32Array(800).fill(0.2));
+      result.current.togglePause();
+    });
     expect(result.current.state.phase).toBe("paused");
+    expect(socket.send.mock.calls.map(([payload]) => payload)).toEqual([
+      expect.any(ArrayBuffer),
+      "FLUSH",
+    ]);
     act(() => result.current.togglePause());
     expect(result.current.state.phase).toBe("recording");
 
@@ -168,6 +354,7 @@ describe("useBrowserMicrophone", () => {
     act(() => socket.message({ event_type: "end_of_stream" }));
     await act(async () => ending);
 
+    expect(socket.send.mock.calls.filter(([payload]) => payload === "FLUSH")).toHaveLength(1);
     expect(stream.track.stop).toHaveBeenCalled();
     expect(FakeAudioContext.latest!.close).toHaveBeenCalled();
     expect(result.current.state.phase).toBe("ended");
@@ -175,10 +362,10 @@ describe("useBrowserMicrophone", () => {
 
   it("keeps microphone capture alive and reconnects the same meeting after a socket interruption", async () => {
     vi.useFakeTimers();
-    const { result } = renderHook(() => useBrowserMicrophone());
-    await act(async () => result.current.start("rec_resume"));
-    const firstSocket = FakeWebSocket.latest!;
-    act(() => firstSocket.open());
+    const { result } = renderHook(() => useBrowserMicrophone({ socketOpenTimeoutMs: 100 }));
+    const firstSocket = await startAndOpen(() => result.current.start("rec_resume"));
+    act(() => vi.advanceTimersByTime(101));
+    expect(result.current.state.phase).toBe("starting");
     act(() => firstSocket.close());
 
     expect(result.current.state.phase).toBe("reconnecting");
@@ -200,7 +387,7 @@ describe("useBrowserMicrophone", () => {
 
   it("stops tracks and the AudioContext when the page unmounts", async () => {
     const { result, unmount } = renderHook(() => useBrowserMicrophone());
-    await act(async () => result.current.start("rec_unmount"));
+    await startAndOpen(() => result.current.start("rec_unmount"));
 
     unmount();
 

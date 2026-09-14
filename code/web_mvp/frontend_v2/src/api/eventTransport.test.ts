@@ -135,6 +135,37 @@ describe("SseEventTransport", () => {
     expect(FakeEventSource.instances[0].closed).toBe(true);
   });
 
+  it("consumes named Pi intelligence events from SSE", () => {
+    const events = vi.fn();
+    const transport = new SseEventTransport("http://127.0.0.1:8767/");
+    const stop = transport.subscribe({
+      meetingId: "meeting-1",
+      afterSeq: 0,
+      signal: new AbortController().signal,
+      onEvents: events,
+      onConnection: vi.fn(),
+    });
+
+    FakeEventSource.instances[0].emit("meeting.intelligence.applied", {
+      ...suggestionEvent(12),
+      type: "meeting.intelligence.applied",
+      aggregate_type: "meeting",
+      aggregate_id: "meeting-1",
+      causation_id: "pi-job-12",
+      idempotency_key: "meeting.intelligence.applied:pi-job-12",
+      payload: {
+        job_id: "pi-job-12",
+        decision_id: "decision-12",
+        status: "intervention",
+      },
+    });
+
+    expect(events).toHaveBeenCalledWith([
+      expect.objectContaining({ seq: 12, type: "meeting.intelligence.applied" }),
+    ]);
+    stop();
+  });
+
   it("reconnects with the latest consumed sequence and deduplicates replay", async () => {
     vi.useFakeTimers();
     const events = vi.fn();

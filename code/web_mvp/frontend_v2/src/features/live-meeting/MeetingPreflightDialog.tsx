@@ -10,12 +10,13 @@ import {
   ShieldCheck,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { fetchProviderStatus } from "../../api/client";
 import {
   parseProviderStatus,
   reconcileProviderStatus,
   type DesktopProviderStatusLike,
+  type RealtimeProviderCircuitStatus,
   type ProviderStatus,
 } from "../../api/schema";
 import { resolveTauriInvoke } from "../../desktop/tauri";
@@ -40,17 +41,30 @@ interface StoragePreflight {
 interface ProviderHealth {
   llm?: {
     configured?: boolean;
+    runtime_synced?: boolean;
+    probe_status?: "not_run" | "probing" | "succeeded" | "failed";
     provider?: string;
     model?: string;
+    operational?: boolean | null;
+    realtime_ready?: boolean | null;
+    probe_latency_ms?: number | null;
+    probe_usage?: {
+      prompt_tokens: number;
+      completion_tokens: number;
+      total_tokens: number;
+    } | null;
+    realtime_cutoff_ms?: number | null;
   };
   asr?: {
     realtime_asr_available?: boolean;
+    file_asr_available?: boolean;
     realtime_providers?: string[];
   };
   cost_policy?: {
     remote_asr_default_enabled?: boolean;
     raw_audio_uploaded_by_default?: boolean;
   };
+  realtime_circuit?: RealtimeProviderCircuitStatus | null;
 }
 
 interface NativeMicProbeResponse {
@@ -102,6 +116,7 @@ interface BrowserInputProbe {
 
 type MicrophoneProbeStatus = "permission_denied" | "no_device" | "silent" | "receiving_audio";
 type InputCheck = "idle" | "checking" | MicrophoneProbeStatus | "error";
+type BrowserInputCheckStage = "idle" | "permission" | "sampling";
 type SystemAudioCheck = "idle" | "checking" | "available" | "failed";
 type AiConnectionState = "idle" | "connecting" | "error";
 
@@ -113,6 +128,11 @@ interface ProviderConfigSyncResponse {
 
 const MEETING_NOTICE = "本次会议将录音并实时转写，用于生成会议建议和会后纪要。原始音频默认仅保存在本机。";
 const MICROPHONE_PROBE_DURATION_MS = 2_500;
+const MICROPHONE_PERMISSION_TIMEOUT_MS = 8_000;
+const MICROPHONE_AUDIO_CONTEXT_TIMEOUT_MS = 1_500;
+const MICROPHONE_AUDIO_CONTEXT_CLOSE_TIMEOUT_MS = 500;
+const PREFLIGHT_REQUEST_TIMEOUT_MS = 8_000;
+const NATIVE_CAPTURE_REQUEST_TIMEOUT_MS = 5_000;
 const AUDIBLE_RMS_THRESHOLD = 0.002;
 
 type MeetingPresetId = NonNullable<MeetingPreparationInput["presetId"]>;
@@ -157,9 +177,38 @@ function formatBytes(value: number | undefined): string {
   return `${Math.round(value / 1024 ** 2)} MB`;
 }
 
+function operationWithTimeout<T>(
+  operation: () => PromiseLike<T>,
+  timeoutMs: number,
+  timeoutError: () => Error,
+): Promise<T> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const settle = (handler: () => void) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      handler();
+    };
+    const timer = window.setTimeout(() => settle(() => reject(timeoutError())), timeoutMs);
+    let request: PromiseLike<T>;
+    try {
+      request = operation();
+    } catch (error) {
+      settle(() => reject(error));
+      return;
+    }
+    Promise.resolve(request).then(
+      (value) => settle(() => resolve(value)),
+      (error) => settle(() => reject(error)),
+    );
+  });
+}
+
 async function sampleBrowserInputLevel(
   stream: MediaStream,
   onFrame?: (rms: number, level: number) => void,
+  signal?: AbortSignal,
 ): Promise<BrowserInputProbe> {
   const AudioContextCtor = window.AudioContext
     ?? (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
@@ -167,7 +216,17 @@ async function sampleBrowserInputLevel(
   let context: AudioContext | null = null;
   try {
     context = new AudioContextCtor();
-    if (context.state === "suspended") await context.resume();
+    if (context.state === "suspended") {
+      await operationWithTimeout(
+        () => context!.resume(),
+        MICROPHONE_AUDIO_CONTEXT_TIMEOUT_MS,
+        () => {
+          const timeout = new Error("麦克风音频上下文启动超时，请检查浏览器页面权限后重试");
+          timeout.name = "AudioContextTimeoutError";
+          return timeout;
+        },
+      );
+    }
     const analyser = context.createAnalyser();
     analyser.fftSize = 1_024;
     const source = context.createMediaStreamSource(stream);
@@ -179,6 +238,7 @@ async function sampleBrowserInputLevel(
     const startedAt = Date.now();
     const deadline = startedAt + MICROPHONE_PROBE_DURATION_MS;
     while (Date.now() < deadline) {
+      if (signal?.aborted) throw new DOMException("麦克风检查已取消", "AbortError");
       analyser.getFloatTimeDomainData(values);
       let frameSquares = 0;
       for (const value of values) frameSquares += value * value;
@@ -196,11 +256,73 @@ async function sampleBrowserInputLevel(
       level: Math.min(1, peakRms * 6),
       durationMs: Date.now() - startedAt,
     };
-  } catch {
+  } catch (error) {
+    // Keep bounded startup failures actionable; generic analyser failures use
+    // the compact probe error shown by the dialog.
+    if (error instanceof Error && error.name === "AudioContextTimeoutError") throw error;
     throw new Error("无法读取麦克风输入电平");
   } finally {
-    await context?.close().catch(() => undefined);
+    if (context) {
+      await operationWithTimeout(
+        () => context!.close(),
+        MICROPHONE_AUDIO_CONTEXT_CLOSE_TIMEOUT_MS,
+        () => new Error("麦克风音频上下文关闭超时"),
+      ).catch(() => undefined);
+    }
   }
+}
+
+/**
+ * Browser permission prompts can remain pending while a Mac is locked or the
+ * browser has lost its capture permission. Bound the request and stop a late
+ * stream so a failed preflight cannot leave the microphone open invisibly.
+ */
+function requestBrowserMicrophone(
+  constraints: MediaStreamConstraints,
+  signal?: AbortSignal,
+): Promise<MediaStream> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let request: Promise<MediaStream>;
+    const stopLateStream = (stream: MediaStream) => {
+      stream.getTracks().forEach((track) => track.stop());
+    };
+    const settle = (handler: () => void) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      signal?.removeEventListener("abort", abortRequest);
+      handler();
+    };
+    const abortRequest = () => settle(() => reject(new DOMException("麦克风检查已取消", "AbortError")));
+    const timer = window.setTimeout(() => {
+      settle(() => reject(new DOMException(
+        "麦克风权限请求超时，请解锁设备或在浏览器设置中允许访问后重试",
+        "TimeoutError",
+      )));
+    }, MICROPHONE_PERMISSION_TIMEOUT_MS);
+    if (signal?.aborted) {
+      abortRequest();
+      return;
+    }
+    signal?.addEventListener("abort", abortRequest, { once: true });
+    try {
+      request = navigator.mediaDevices.getUserMedia(constraints);
+    } catch (error) {
+      settle(() => reject(error));
+      return;
+    }
+    request.then(
+      (stream) => {
+        if (settled) {
+          stopLateStream(stream);
+          return;
+        }
+        settle(() => resolve(stream));
+      },
+      (error) => settle(() => reject(error)),
+    );
+  });
 }
 
 function browserMicrophoneError(error: unknown): { status: MicrophoneProbeStatus | "error"; message: string } {
@@ -213,6 +335,20 @@ function browserMicrophoneError(error: unknown): { status: MicrophoneProbeStatus
     return {
       status: "permission_denied",
       message: "麦克风权限被拒绝，请在系统或浏览器设置中允许访问",
+    };
+  }
+  if (name === "TimeoutError") {
+    return {
+      status: "error",
+      message: "麦克风权限请求超时，请解锁设备或在浏览器设置中允许访问后重试",
+    };
+  }
+  if (name === "AudioContextTimeoutError") {
+    return {
+      status: "error",
+      message: error instanceof Error
+        ? error.message
+        : "麦克风音频上下文启动超时，请检查浏览器页面权限后重试",
     };
   }
   if (["NotFoundError", "DevicesNotFoundError", "NotReadableError", "TrackStartError"].includes(name)) {
@@ -241,22 +377,61 @@ function nativeProbeError(response: NativeMicProbeResponse): string {
 
 function providerStatusFromHealth(health: ProviderHealth): ProviderStatus {
   try {
-    return parseProviderStatus(health.llm);
+    return parseProviderStatus({
+      ...health.llm,
+      realtime_circuit: health.realtime_circuit,
+    });
   } catch {
     const configured = health.llm?.configured === true;
+    const probeFailed = health.llm?.probe_status === "failed";
+    const rawCutoff = health.llm?.realtime_cutoff_ms;
+    const realtimeCutoffMs = typeof rawCutoff === "number"
+      && Number.isFinite(rawCutoff)
+      && Number.isInteger(rawCutoff)
+      && rawCutoff > 0
+      ? rawCutoff
+      : 2_500;
     return {
       configured,
-      runtime_synced: configured,
-      probe_status: "not_run",
+      runtime_synced: health.llm?.runtime_synced === true,
+      // A malformed success payload is not evidence of a successful probe.
+      // Preserve an explicit failure, but force all other parse failures to
+      // the unknown/pending state.
+      probe_status: probeFailed ? "failed" : "not_run",
       model: health.llm?.model ?? null,
+      realtime_model: health.llm?.model ?? null,
+      operational: probeFailed ? false : null,
+      realtime_ready: probeFailed ? false : null,
+      probe_latency_ms: null,
+      probe_usage: null,
+      realtime_cutoff_ms: realtimeCutoffMs,
+      realtime_circuit: health.realtime_circuit ?? null,
     };
   }
 }
 
 async function responseJson<T>(response: Response): Promise<T> {
   const body = await response.json().catch(() => null);
-  if (!response.ok || !body) throw new Error(`预检请求失败（${response.status}）`);
+  if (!response.ok || !body) {
+    if (response.status === 404) {
+      throw new Error("当前页面连接的会议服务版本不匹配，请打开正在运行的本地会议服务后重试");
+    }
+    if (response.status >= 500) {
+      throw new Error(`会议服务暂时不可用（${response.status}），请确认本地服务仍在运行后重试`);
+    }
+    throw new Error(`预检请求失败（${response.status}）`);
+  }
   return body as T;
+}
+
+function preflightErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    if (error.name === "TypeError" || /failed to fetch|networkerror|load failed/i.test(error.message)) {
+      return "无法连接本地会议服务，请确认当前页面地址对应的会议服务已启动后重试";
+    }
+    return error.message;
+  }
+  return "会前检查失败";
 }
 
 function windowsAudioDevices(response: WindowsAudioDeviceResponse | null): SelectableAudioDevice[] {
@@ -298,6 +473,7 @@ export function MeetingPreflightDialog({
   const [suggestionPolicy, setSuggestionPolicy] = useState<SuggestionPolicy>("low_frequency");
   const [noticeAcknowledged, setNoticeAcknowledged] = useState(false);
   const [inputCheck, setInputCheck] = useState<InputCheck>("idle");
+  const [browserInputCheckStage, setBrowserInputCheckStage] = useState<BrowserInputCheckStage>("idle");
   const [inputLevel, setInputLevel] = useState(0);
   const [inputRms, setInputRms] = useState(0);
   const [inputLevelAvailable, setInputLevelAvailable] = useState(false);
@@ -306,28 +482,66 @@ export function MeetingPreflightDialog({
   const [message, setMessage] = useState<string | null>(null);
   const [aiConnectionState, setAiConnectionState] = useState<AiConnectionState>("idle");
   const [aiConnectionError, setAiConnectionError] = useState<string | null>(null);
+  const inputCheckRuntimeRef = useRef<{ generation: number; controller: AbortController | null }>({
+    generation: 0,
+    controller: null,
+  });
   const nativeDesktop = Boolean(resolveTauriInvoke());
+
+  const cancelInputCheck = useCallback(() => {
+    inputCheckRuntimeRef.current.generation += 1;
+    inputCheckRuntimeRef.current.controller?.abort();
+    inputCheckRuntimeRef.current.controller = null;
+  }, []);
 
   const refreshPreflight = useCallback(async (isCancelled: () => boolean = () => false) => {
     const invoke = resolveTauriInvoke();
     const [storageResult, providerResult, runtimeStatus, desktopStatus, deviceResult, dualTrackResult] = await Promise.all([
-      fetch("/v2/storage/preflight").then((response) => responseJson<StoragePreflight>(response)),
-      fetch("/providers/health").then((response) => responseJson<ProviderHealth>(response)),
-      fetchProviderStatus().catch(() => null),
+      operationWithTimeout(
+        () => fetch("/v2/storage/preflight").then((response) => responseJson<StoragePreflight>(response)),
+        PREFLIGHT_REQUEST_TIMEOUT_MS,
+        () => new Error("本地存储检查超时，请确认会议服务正在运行后重试"),
+      ),
+      operationWithTimeout(
+        () => fetch("/providers/health").then((response) => responseJson<ProviderHealth>(response)),
+        PREFLIGHT_REQUEST_TIMEOUT_MS,
+        () => new Error("AI 服务检查超时，请确认本机服务正在运行后重试"),
+      ),
+      operationWithTimeout(
+        () => fetchProviderStatus(),
+        PREFLIGHT_REQUEST_TIMEOUT_MS,
+        () => new Error("AI 状态检查超时"),
+      ).catch(() => null),
       invoke
-        ? invoke<DesktopProviderStatusLike>("provider_config_status").then((value) => (
+        ? operationWithTimeout(
+          () => invoke<DesktopProviderStatusLike>("provider_config_status"),
+          NATIVE_CAPTURE_REQUEST_TIMEOUT_MS,
+          () => new Error("桌面 AI 配置检查超时"),
+        ).then((value) => (
           typeof value.configured === "boolean" ? value : null
         )).catch(() => null)
         : Promise.resolve(null),
       invoke
         ? Promise.all([
-          invoke<WindowsAudioDeviceResponse>("windows_audio_devices", { flow: "microphone" }).catch(() => null),
-          invoke<WindowsAudioDeviceResponse>("windows_audio_devices", { flow: "render_loopback" }).catch(() => null),
+          operationWithTimeout(
+            () => invoke<WindowsAudioDeviceResponse>("windows_audio_devices", { flow: "microphone" }),
+            NATIVE_CAPTURE_REQUEST_TIMEOUT_MS,
+            () => new Error("麦克风设备枚举超时"),
+          ).catch(() => null),
+          operationWithTimeout(
+            () => invoke<WindowsAudioDeviceResponse>("windows_audio_devices", { flow: "render_loopback" }),
+            NATIVE_CAPTURE_REQUEST_TIMEOUT_MS,
+            () => new Error("系统音频设备枚举超时"),
+          ).catch(() => null),
         ]).then(([microphones, systemAudio]): PreflightDevices => ({
           microphones: windowsAudioDevices(microphones),
           systemAudio: windowsAudioDevices(systemAudio),
         }))
-        : (navigator.mediaDevices?.enumerateDevices?.() ?? Promise.resolve([] as MediaDeviceInfo[]))
+        : operationWithTimeout(
+          () => navigator.mediaDevices?.enumerateDevices?.() ?? Promise.resolve([] as MediaDeviceInfo[]),
+          PREFLIGHT_REQUEST_TIMEOUT_MS,
+          () => new Error("麦克风设备检查超时，请确认浏览器页面仍处于前台后重试"),
+        )
           .then((browserDevices): PreflightDevices => ({
             microphones: browserDevices
               .filter((device) => device.kind === "audioinput")
@@ -339,7 +553,11 @@ export function MeetingPreflightDialog({
             systemAudio: [],
           })),
       invoke
-        ? dualTrackStatus().catch(() => null)
+        ? operationWithTimeout(
+          () => dualTrackStatus(),
+          NATIVE_CAPTURE_REQUEST_TIMEOUT_MS,
+          () => new Error("双轨能力检查超时"),
+        ).catch(() => null)
         : Promise.resolve(null),
     ]);
     if (isCancelled()) return null;
@@ -373,6 +591,7 @@ export function MeetingPreflightDialog({
     setDualTrackAvailable(false);
     setSystemAudioCheck("idle");
     setInputCheck("idle");
+    setBrowserInputCheckStage("idle");
     setProviderStatus(null);
     setInputLevel(0);
     setInputRms(0);
@@ -381,15 +600,16 @@ export function MeetingPreflightDialog({
     setAiConnectionError(null);
     void refreshPreflight(() => cancelled).catch((preflightError: unknown) => {
       if (!cancelled) {
-        setError(preflightError instanceof Error ? preflightError.message : "会前检查失败");
+        setError(preflightErrorMessage(preflightError));
       }
     }).finally(() => {
       if (!cancelled) setLoading(false);
     });
     return () => {
       cancelled = true;
+      cancelInputCheck();
     };
-  }, [open, refreshPreflight]);
+  }, [cancelInputCheck, open, refreshPreflight]);
 
   const selectedDevice = useMemo(
     () => devices.find((device) => device.deviceId === deviceId) ?? null,
@@ -404,7 +624,22 @@ export function MeetingPreflightDialog({
 
   const selectMicrophone = () => {
     if (busy || systemAudioCheck === "checking") return;
+    cancelInputCheck();
     setInputSource("microphone");
+    setInputCheck("idle");
+    setError(null);
+    setMessage(null);
+    setBrowserInputCheckStage("idle");
+  };
+
+  const selectMicrophoneDevice = (nextDeviceId: string) => {
+    cancelInputCheck();
+    setDeviceId(nextDeviceId);
+    setInputCheck("idle");
+    setBrowserInputCheckStage("idle");
+    setInputLevel(0);
+    setInputRms(0);
+    setInputLevelAvailable(false);
     setError(null);
     setMessage(null);
   };
@@ -413,11 +648,18 @@ export function MeetingPreflightDialog({
     if (busy || systemAudioCheck === "checking") return;
     const invoke = resolveTauriInvoke();
     if (!invoke) return;
+    cancelInputCheck();
+    setInputCheck("idle");
+    setBrowserInputCheckStage("idle");
     setSystemAudioCheck("checking");
     setError(null);
     setMessage(null);
     try {
-      const response = await invoke<NativeSystemAudioPrepareResponse>("system_audio_adapter_prepare", undefined);
+      const response = await operationWithTimeout(
+        () => invoke<NativeSystemAudioPrepareResponse>("system_audio_adapter_prepare", undefined),
+        NATIVE_CAPTURE_REQUEST_TIMEOUT_MS,
+        () => new Error("系统音频采集检查超时，请确认桌面权限后重试"),
+      );
       if (response.command_status !== "ok"
         || response.source !== "system_audio"
         || response.helper_present !== true
@@ -440,10 +682,12 @@ export function MeetingPreflightDialog({
 
   const selectDualTrack = () => {
     if (busy || !dualTrackAvailable || systemAudioCheck === "checking") return;
+    cancelInputCheck();
     setInputSource("dual_track");
     setError(null);
     setMessage(null);
     setInputCheck("idle");
+    setBrowserInputCheckStage("idle");
     setInputLevel(0);
     setInputRms(0);
     setInputLevelAvailable(false);
@@ -451,7 +695,15 @@ export function MeetingPreflightDialog({
 
   const checkInput = async () => {
     if (inputSource !== "microphone" || inputCheck === "checking") return;
+    cancelInputCheck();
+    const generation = inputCheckRuntimeRef.current.generation;
+    const controller = new AbortController();
+    inputCheckRuntimeRef.current.controller = controller;
+    const isCurrent = () => inputCheckRuntimeRef.current.generation === generation
+      && inputCheckRuntimeRef.current.controller === controller
+      && !controller.signal.aborted;
     setInputCheck("checking");
+    setBrowserInputCheckStage(nativeDesktop ? "idle" : "permission");
     setError(null);
     setMessage(null);
     setInputLevel(0);
@@ -461,10 +713,15 @@ export function MeetingPreflightDialog({
     try {
       const invoke = resolveTauriInvoke();
       if (invoke) {
-        const response = await invoke<NativeMicProbeResponse>(
-          "mic_adapter_probe",
-          deviceId ? { deviceId } : undefined,
+        const response = await operationWithTimeout(
+          () => invoke<NativeMicProbeResponse>(
+            "mic_adapter_probe",
+            deviceId ? { deviceId } : undefined,
+          ),
+          NATIVE_CAPTURE_REQUEST_TIMEOUT_MS,
+          () => new Error("麦克风设备检查超时，请确认桌面权限后重试"),
         );
+        if (!isCurrent()) return;
         const probeStatus = normalizeNativeProbeStatus(response);
         if (probeStatus === "permission_denied" || probeStatus === "no_device") {
           failureStatus = probeStatus;
@@ -486,6 +743,7 @@ export function MeetingPreflightDialog({
         setInputLevelAvailable(true);
         if (probeStatus === "silent") {
           setInputCheck("silent");
+          setBrowserInputCheckStage("idle");
           setError("未检测到声音，请检查麦克风是否静音");
           return;
         }
@@ -494,22 +752,30 @@ export function MeetingPreflightDialog({
         if (!navigator.mediaDevices?.getUserMedia) throw new Error("当前环境不支持麦克风访问");
         let stream: MediaStream | null = null;
         try {
-          stream = await navigator.mediaDevices.getUserMedia({
+          stream = await requestBrowserMicrophone({
             audio: deviceId ? { deviceId: { exact: deviceId } } : true,
             video: false,
-          });
+          }, controller.signal);
+          if (!isCurrent()) return;
+          // Keep permission waiting separate from the analyser window. This
+          // is the point where the browser has returned a MediaStream and the
+          // user can see that authorization succeeded.
+          setBrowserInputCheckStage("sampling");
           const activeTrack = stream.getAudioTracks().find((track) => track.readyState === "live");
           if (!activeTrack) throw new DOMException("没有可用的麦克风设备", "NotFoundError");
           const probe = await sampleBrowserInputLevel(stream, (rms, level) => {
+            if (!isCurrent()) return;
             setInputRms(rms);
             setInputLevel(level);
             setInputLevelAvailable(true);
-          });
+          }, controller.signal);
+          if (!isCurrent()) return;
           setInputRms(probe.rms);
           setInputLevel(probe.level);
           setInputLevelAvailable(true);
           if (probe.peakRms < AUDIBLE_RMS_THRESHOLD) {
             setInputCheck("silent");
+            setBrowserInputCheckStage("idle");
             setError("未检测到声音，请检查麦克风是否静音");
             return;
           }
@@ -517,16 +783,25 @@ export function MeetingPreflightDialog({
           stream?.getTracks().forEach((track) => track.stop());
         }
       }
+      if (!isCurrent()) return;
       setInputCheck("receiving_audio");
+      setBrowserInputCheckStage("idle");
       setMessage("正常收到声音，麦克风可用");
     } catch (inputError) {
+      if (!isCurrent()) return;
       if (resolveTauriInvoke()) {
         setInputCheck(failureStatus);
+        setBrowserInputCheckStage("idle");
         setError(inputError instanceof Error ? inputError.message : "麦克风检查失败");
       } else {
         const failure = browserMicrophoneError(inputError);
         setInputCheck(failure.status);
+        setBrowserInputCheckStage("idle");
         setError(failure.message);
+      }
+    } finally {
+      if (inputCheckRuntimeRef.current.controller === controller) {
+        inputCheckRuntimeRef.current.controller = null;
       }
     }
   };
@@ -549,7 +824,11 @@ export function MeetingPreflightDialog({
     setError(null);
     setMessage(null);
     try {
-      const response = await invoke<ProviderConfigSyncResponse>("provider_config_sync");
+      const response = await operationWithTimeout(
+        () => invoke<ProviderConfigSyncResponse>("provider_config_sync"),
+        NATIVE_CAPTURE_REQUEST_TIMEOUT_MS,
+        () => new Error("AI 配置连接超时，请重试"),
+      );
       if (response.command_status !== "ok" || response.runtime_synced !== true) {
         throw new Error(response.errors?.filter(Boolean).join("；") || "AI 配置连接失败");
       }
@@ -558,7 +837,17 @@ export function MeetingPreflightDialog({
         throw new Error("AI 已同步，但后端尚未确认配置，请重试");
       }
       setAiConnectionState("idle");
-      setMessage(refreshedProviders.probe_status === "succeeded" ? "AI 已连接" : "AI 运行时已同步");
+      setMessage(refreshedProviders.probe_status === "succeeded"
+        && refreshedProviders.operational === true
+        && refreshedProviders.realtime_ready === true
+        ? "AI 已连接，Provider 单次探测通过；实时稳定性待验收"
+        : refreshedProviders.probe_status === "succeeded"
+          && refreshedProviders.operational === true
+          && refreshedProviders.realtime_ready === false
+          ? "AI 已连接，但单次探测超过实时窗口"
+          : refreshedProviders.probe_status === "succeeded"
+            ? "AI 已连接，实时性待确认"
+            : "AI 运行时已同步");
     } catch (connectionError) {
       setAiConnectionState("error");
       setAiConnectionError(connectionError instanceof Error ? connectionError.message : "AI 配置连接失败");
@@ -567,6 +856,9 @@ export function MeetingPreflightDialog({
 
   const submit = async () => {
     if (!noticeAcknowledged || storage?.allowed !== true || busy) return;
+    cancelInputCheck();
+    setInputCheck("idle");
+    setBrowserInputCheckStage("idle");
     setError(null);
     try {
       await onStart({
@@ -595,24 +887,37 @@ export function MeetingPreflightDialog({
 
   const localAsrReady = providers?.asr?.realtime_asr_available === true;
   const llmReady = providerStatus?.runtime_synced === true;
-  const llmConnected = llmReady && providerStatus?.probe_status === "succeeded";
-  const llmStatusText = llmConnected
-    ? `AI 已连接 · ${providerStatus?.model ?? "默认模型"}`
-    : providerStatus?.probe_status === "failed"
-      ? `${providerStatus.model ?? "AI"} 连接测试失败，会议仍可录音和转写`
-      : llmReady
-        ? `${providerStatus?.model ?? "AI"} 已同步，连接尚未测试`
-        : providerStatus?.configured
-          ? `${providerStatus.model ?? "AI"} 已保存，AI 待连接`
-          : "AI 未配置，会议仍可录音和转写";
+  const realtimeCircuitUnavailable = providerStatus?.realtime_circuit?.state === "open"
+    || providerStatus?.realtime_circuit?.state === "half_open";
+  const llmOperational = llmReady
+    && !realtimeCircuitUnavailable
+    && providerStatus?.probe_status === "succeeded"
+    && providerStatus.operational === true;
+  const llmRealtimeReady = llmOperational && providerStatus?.realtime_ready === true;
+  const llmRealtimeSlow = llmOperational && providerStatus?.realtime_ready === false;
+  const llmStatusText = realtimeCircuitUnavailable
+    ? `${providerStatus?.model ?? "AI"} 实时通道连续失败，需重新测试连接；会议仍可录音和转写`
+    : llmRealtimeReady
+      ? `AI 已连接 · ${providerStatus?.model ?? "默认模型"}`
+      : llmRealtimeSlow
+      ? `AI 可连接，但实时教练延迟过高${providerStatus.probe_latency_ms !== null
+        ? `（${providerStatus.probe_latency_ms}ms > ${providerStatus.realtime_cutoff_ms}ms）`
+        : ""}，会议仍可录音和转写`
+      : providerStatus?.probe_status === "failed" || providerStatus?.operational === false
+        ? `${providerStatus.model ?? "AI"} 连接测试失败，会议仍可录音和转写`
+        : llmReady
+          ? `${providerStatus?.model ?? "AI"} 已连接，实时性待确认，会议仍可录音和转写`
+          : providerStatus?.configured
+            ? `${providerStatus.model ?? "AI"} 已保存，AI 待连接`
+            : "AI 未配置，会议仍可录音和转写";
 
   return (
     <div className="drawer-layer meeting-preflight-layer" role="presentation">
-      <button className="drawer-scrim" aria-label="关闭会前检查" onClick={onCancel} disabled={busy} />
+      <button className="drawer-scrim" aria-label="关闭会前检查" onClick={() => { cancelInputCheck(); onCancel(); }} disabled={busy} />
       <section className="meeting-preflight-dialog" role="dialog" aria-modal="true" aria-labelledby="meeting-preflight-title">
         <header className="drawer-header">
           <h2 id="meeting-preflight-title">准备开始会议</h2>
-          <button className="icon-button" type="button" onClick={onCancel} disabled={busy} aria-label="关闭会前检查" title="关闭">
+          <button className="icon-button" type="button" onClick={() => { cancelInputCheck(); onCancel(); }} disabled={busy} aria-label="关闭会前检查" title="关闭">
             <X size={18} />
           </button>
         </header>
@@ -634,8 +939,8 @@ export function MeetingPreflightDialog({
                 {localAsrReady ? <CheckCircle2 size={17} /> : <AlertTriangle size={17} />}
                 <span>{localAsrReady ? "本地中文实时识别可用" : "本地实时识别不可用"}</span>
               </div>
-              <div className={llmConnected ? "preflight-status preflight-status--ready" : "preflight-status preflight-status--warning"}>
-                {llmConnected ? <CheckCircle2 size={17} /> : <AlertTriangle size={17} />}
+              <div className={llmRealtimeReady ? "preflight-status preflight-status--ready" : "preflight-status preflight-status--warning"}>
+                {llmRealtimeReady ? <CheckCircle2 size={17} /> : <AlertTriangle size={17} />}
                 <span>{llmStatusText}</span>
               </div>
             </div>
@@ -718,7 +1023,11 @@ export function MeetingPreflightDialog({
               {devices.length ? (
                 <label>
                   <span className="sr-only">输入设备</span>
-                  <select value={deviceId} onChange={(event) => setDeviceId(event.target.value)} disabled={busy}>
+                  <select
+                    value={deviceId}
+                    onChange={(event) => selectMicrophoneDevice(event.target.value)}
+                    disabled={busy}
+                  >
                     {devices.map((device, index) => (
                       <option key={device.deviceId || `microphone-${index}`} value={device.deviceId}>
                         {device.label || `麦克风 ${index + 1}`}
@@ -729,6 +1038,15 @@ export function MeetingPreflightDialog({
               ) : (
                 <p className="preflight-help">使用系统默认麦克风，点击检查时会申请权限。</p>
               )}
+              {inputCheck === "checking" ? (
+                <p className="preflight-help" role="status">
+                  {nativeDesktop
+                    ? "正在读取麦克风输入，请对着所选设备说一句话。"
+                    : browserInputCheckStage === "permission"
+                      ? "等待麦克风权限：请在浏览器提示或地址栏左侧的麦克风图标中选择“允许”。没有弹窗时，请检查浏览器和 macOS 的麦克风权限。8 秒内未返回会自动结束，可直接重试。"
+                      : "麦克风权限已通过，正在采样输入音量，请对着麦克风说一句话。"}
+                </p>
+              ) : null}
               <div
                 className="preflight-input-meter"
                 data-probe-status={inputCheck}
@@ -736,7 +1054,13 @@ export function MeetingPreflightDialog({
               >
                 <span>输入音量</span>
                 <span className="preflight-input-meter-track"><span style={{ transform: `scaleX(${inputLevel})` }} /></span>
-                <small>{inputLevelAvailable ? `${(inputRms * 100).toFixed(1)}%` : inputCheck === "checking" ? "采样中" : "尚未检查"}</small>
+                <small>{inputLevelAvailable
+                  ? `${(inputRms * 100).toFixed(1)}%`
+                  : inputCheck !== "checking"
+                    ? "尚未检查"
+                    : browserInputCheckStage === "permission"
+                      ? "等待授权"
+                      : "采样中"}</small>
               </div>
             </div>
           ) : (
@@ -888,12 +1212,19 @@ export function MeetingPreflightDialog({
           </label>
 
           {error ? <p className="inline-error" role="alert">{error}</p> : null}
+          {inputSource === "microphone"
+            && inputCheck === "error"
+            && error?.includes("麦克风权限请求超时") ? (
+            <p className="preflight-help" role="note">
+              当前页面可能无法弹出系统授权（应用内预览尤其常见）。请改用本机 Chrome/Safari 或完整桌面端重试；若“文件转写”已就绪，也可以先用“导入录音”验证转写和 Pi 链路。
+            </p>
+          ) : null}
           {aiConnectionError ? <p className="inline-error" role="alert">{aiConnectionError}</p> : null}
           {message ? <p className="inline-success" role="status">{message}</p> : null}
         </div>
 
         <footer className="meeting-preflight-actions">
-          <button className="secondary-button" type="button" onClick={onCancel} disabled={busy}>取消</button>
+          <button className="secondary-button" type="button" onClick={() => { cancelInputCheck(); onCancel(); }} disabled={busy}>取消</button>
           <button
             className="primary-button"
             type="button"
