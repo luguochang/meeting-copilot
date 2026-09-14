@@ -16,6 +16,12 @@ const KEYCHAIN_ACCOUNT: &str = "gateway-api-key";
 const PROVIDER_LABEL: &str = "openai_compatible_gateway";
 const API_STYLE_CHAT_COMPLETIONS: &str = "chat_completions";
 const API_STYLE_RESPONSES: &str = "responses";
+const REALTIME_MODEL_SOURCE_RUNTIME: &str = "runtime_realtime_model";
+const REALTIME_MODEL_SOURCE_FALLBACK: &str = "general_model_fallback";
+const REALTIME_MODEL_INHERITED_WARNING: &str = "realtime_model_inherits_general_model";
+const CORRECTION_MODEL_SOURCE_RUNTIME: &str = "runtime_correction_model";
+const CORRECTION_MODEL_SOURCE_FALLBACK: &str = "general_model_fallback";
+const CORRECTION_MODEL_INHERITED_WARNING: &str = "correction_model_inherits_general_model";
 
 trait CredentialStore: Send + Sync {
     fn get(&self) -> Result<Option<String>, String>;
@@ -63,6 +69,12 @@ struct ProviderMetadata {
     #[serde(default)]
     realtime_model: String,
     #[serde(default)]
+    realtime_model_source: String,
+    #[serde(default)]
+    correction_model: String,
+    #[serde(default)]
+    correction_model_source: String,
+    #[serde(default)]
     api_style: String,
     provider_label: String,
 }
@@ -75,6 +87,13 @@ pub struct ProviderConfigResponse {
     pub base_url: Option<String>,
     pub model: Option<String>,
     pub realtime_model: Option<String>,
+    pub realtime_model_source: String,
+    pub realtime_model_explicit: bool,
+    pub realtime_model_warning: Option<String>,
+    pub correction_model: Option<String>,
+    pub correction_model_source: String,
+    pub correction_model_explicit: bool,
+    pub correction_model_warning: Option<String>,
     pub api_style: Option<String>,
     pub provider_label: String,
     pub runtime_synced: bool,
@@ -167,6 +186,7 @@ impl ProviderConfigSupervisor {
         api_key: String,
         model: String,
         realtime_model: Option<String>,
+        correction_model: Option<String>,
         api_style: String,
     ) -> ProviderConfigResponse {
         let _operation = match self.operation_lock.lock() {
@@ -183,8 +203,13 @@ impl ProviderConfigSupervisor {
             .map(|value| *value)
             .unwrap_or(false);
         let result = (|| {
-            let metadata =
-                validate_metadata_with_models(base_url, model, realtime_model, api_style)?;
+            let metadata = validate_metadata_with_models(
+                base_url,
+                model,
+                realtime_model,
+                correction_model,
+                api_style,
+            )?;
             let replacing_secret = !api_key.is_empty();
             if !replacing_secret && previous_metadata.is_none() {
                 return Err("请输入 API Key".to_string());
@@ -328,6 +353,21 @@ impl ProviderConfigSupervisor {
         config: Option<&RuntimeProviderConfig>,
         errors: Vec<String>,
     ) -> ProviderConfigResponse {
+        let realtime_model_source = config
+            .map(|value| value.realtime_model_source.clone())
+            .unwrap_or_else(|| "not_configured".to_string());
+        let realtime_model_explicit =
+            config.is_some() && realtime_model_source != REALTIME_MODEL_SOURCE_FALLBACK;
+        let realtime_model_warning = (realtime_model_source == REALTIME_MODEL_SOURCE_FALLBACK)
+            .then(|| REALTIME_MODEL_INHERITED_WARNING.to_string());
+        let correction_model_source = config
+            .map(|value| value.correction_model_source.clone())
+            .unwrap_or_else(|| "not_configured".to_string());
+        let correction_model_explicit =
+            config.is_some() && correction_model_source != CORRECTION_MODEL_SOURCE_FALLBACK;
+        let correction_model_warning = (correction_model_source
+            == CORRECTION_MODEL_SOURCE_FALLBACK)
+            .then(|| CORRECTION_MODEL_INHERITED_WARNING.to_string());
         ProviderConfigResponse {
             command_status,
             configured: config.is_some(),
@@ -335,6 +375,13 @@ impl ProviderConfigSupervisor {
             base_url: config.map(|value| value.base_url.clone()),
             model: config.map(|value| value.model.clone()),
             realtime_model: config.map(|value| value.realtime_model.clone()),
+            realtime_model_source,
+            realtime_model_explicit,
+            realtime_model_warning,
+            correction_model: config.map(|value| value.correction_model.clone()),
+            correction_model_source,
+            correction_model_explicit,
+            correction_model_warning,
             api_style: config.map(|value| value.api_style.clone()),
             provider_label: config
                 .map(|value| value.provider_label.clone())
@@ -391,6 +438,9 @@ fn runtime_config(metadata: ProviderMetadata, api_key: String) -> RuntimeProvide
         api_key,
         model: metadata.model,
         realtime_model: metadata.realtime_model,
+        realtime_model_source: metadata.realtime_model_source,
+        correction_model: metadata.correction_model,
+        correction_model_source: metadata.correction_model_source,
         api_style: metadata.api_style,
         provider_label: metadata.provider_label,
     }
@@ -402,6 +452,7 @@ fn validate_metadata(base_url: String, model: String) -> Result<ProviderMetadata
         base_url,
         model,
         None,
+        None,
         API_STYLE_CHAT_COMPLETIONS.to_string(),
     )
 }
@@ -410,6 +461,7 @@ fn validate_metadata_with_models(
     base_url: String,
     model: String,
     realtime_model: Option<String>,
+    correction_model: Option<String>,
     api_style: String,
 ) -> Result<ProviderMetadata, String> {
     let raw_base_url = base_url.trim();
@@ -434,7 +486,24 @@ fn validate_metadata_with_models(
         return Err("中转站地址不能包含账号、查询参数或片段".to_string());
     }
     let normalized_model = validate_model_name(&model)?;
+    let realtime_model_explicit = realtime_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some();
     let normalized_realtime_model = realtime_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(validate_model_name)
+        .transpose()?
+        .unwrap_or_else(|| normalized_model.clone());
+    let correction_model_explicit = correction_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some();
+    let normalized_correction_model = correction_model
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -447,6 +516,17 @@ fn validate_metadata_with_models(
         base_url: raw_base_url.trim_end_matches('/').to_string(),
         model: normalized_model,
         realtime_model: normalized_realtime_model,
+        realtime_model_source: if realtime_model_explicit {
+            REALTIME_MODEL_SOURCE_RUNTIME.to_string()
+        } else {
+            REALTIME_MODEL_SOURCE_FALLBACK.to_string()
+        },
+        correction_model: normalized_correction_model,
+        correction_model_source: if correction_model_explicit {
+            CORRECTION_MODEL_SOURCE_RUNTIME.to_string()
+        } else {
+            CORRECTION_MODEL_SOURCE_FALLBACK.to_string()
+        },
         api_style: normalized_api_style,
         provider_label: PROVIDER_LABEL.to_string(),
     })
@@ -544,10 +624,41 @@ fn decode_metadata(raw: &[u8]) -> Result<ProviderMetadata, String> {
             API_STYLE_CHAT_COMPLETIONS.to_string()
         };
     }
-    metadata.realtime_model = if metadata.realtime_model.trim().is_empty() {
-        metadata.model.clone()
-    } else {
-        validate_model_name(&metadata.realtime_model)?
+    let legacy_realtime_model_present = !metadata.realtime_model.trim().is_empty();
+    if metadata.realtime_model_source.trim().is_empty() {
+        metadata.realtime_model_source = if legacy_realtime_model_present {
+            REALTIME_MODEL_SOURCE_RUNTIME.to_string()
+        } else {
+            REALTIME_MODEL_SOURCE_FALLBACK.to_string()
+        };
+    }
+    metadata.realtime_model = match metadata.realtime_model_source.as_str() {
+        REALTIME_MODEL_SOURCE_FALLBACK => metadata.model.clone(),
+        REALTIME_MODEL_SOURCE_RUNTIME if legacy_realtime_model_present => {
+            validate_model_name(&metadata.realtime_model)?
+        }
+        REALTIME_MODEL_SOURCE_RUNTIME => {
+            return Err("explicit realtime model is missing".to_string());
+        }
+        _ => return Err("unsupported realtime model source".to_string()),
+    };
+    let legacy_correction_model_present = !metadata.correction_model.trim().is_empty();
+    if metadata.correction_model_source.trim().is_empty() {
+        metadata.correction_model_source = if legacy_correction_model_present {
+            CORRECTION_MODEL_SOURCE_RUNTIME.to_string()
+        } else {
+            CORRECTION_MODEL_SOURCE_FALLBACK.to_string()
+        };
+    }
+    metadata.correction_model = match metadata.correction_model_source.as_str() {
+        CORRECTION_MODEL_SOURCE_FALLBACK => metadata.model.clone(),
+        CORRECTION_MODEL_SOURCE_RUNTIME if legacy_correction_model_present => {
+            validate_model_name(&metadata.correction_model)?
+        }
+        CORRECTION_MODEL_SOURCE_RUNTIME => {
+            return Err("explicit correction model is missing".to_string());
+        }
+        _ => return Err("unsupported correction model source".to_string()),
     };
     metadata.api_style = validate_api_style(&metadata.api_style)?;
     Ok(metadata)
@@ -588,6 +699,10 @@ mod tests {
         assert_eq!(metadata.base_url, "https://relay.example/root");
         assert_eq!(metadata.model, "gpt-test");
         assert_eq!(metadata.realtime_model, "gpt-test");
+        assert_eq!(
+            metadata.realtime_model_source,
+            REALTIME_MODEL_SOURCE_FALLBACK
+        );
         assert_eq!(metadata.api_style, API_STYLE_CHAT_COMPLETIONS);
         assert!(validate_metadata(
             "https://user:pass@relay.example".to_string(),
@@ -615,6 +730,29 @@ mod tests {
 
         assert_eq!(metadata.api_style, API_STYLE_RESPONSES);
         assert_eq!(metadata.realtime_model, "gpt-5.5");
+        assert_eq!(
+            metadata.realtime_model_source,
+            REALTIME_MODEL_SOURCE_FALLBACK
+        );
+    }
+
+    #[test]
+    fn legacy_metadata_with_a_realtime_model_remains_explicit() {
+        let raw = br#"{
+            "schema_version":"meeting_copilot.provider_config.v1",
+            "base_url":"https://relay.example",
+            "model":"gpt-5.5",
+            "realtime_model":"gpt-5.4-mini",
+            "provider_label":"openai_compatible_gateway"
+        }"#;
+
+        let metadata = decode_metadata(raw).unwrap();
+
+        assert_eq!(metadata.realtime_model, "gpt-5.4-mini");
+        assert_eq!(
+            metadata.realtime_model_source,
+            REALTIME_MODEL_SOURCE_RUNTIME
+        );
     }
 
     #[test]
@@ -630,6 +768,7 @@ mod tests {
         persist_metadata(&path, &metadata).unwrap();
         let raw = fs::read_to_string(path).unwrap();
         assert!(raw.contains("\"realtime_model\": \"gpt-test\""));
+        assert!(raw.contains("\"realtime_model_source\": \"general_model_fallback\""));
         assert!(!raw.contains("api_key"));
         assert!(!raw.contains("sk-"));
         let _ = fs::remove_dir_all(root);
@@ -680,6 +819,15 @@ mod tests {
         assert_eq!(response.model.as_deref(), Some("gpt-test"));
         assert_eq!(response.realtime_model.as_deref(), Some("gpt-test"));
         assert_eq!(
+            response.realtime_model_source,
+            REALTIME_MODEL_SOURCE_FALLBACK
+        );
+        assert!(!response.realtime_model_explicit);
+        assert_eq!(
+            response.realtime_model_warning.as_deref(),
+            Some(REALTIME_MODEL_INHERITED_WARNING)
+        );
+        assert_eq!(
             response.api_style.as_deref(),
             Some(API_STYLE_CHAT_COMPLETIONS)
         );
@@ -715,6 +863,7 @@ mod tests {
                 assert_eq!(config.api_key, "sk-old-secret");
                 assert_eq!(config.model, "gpt-test");
                 assert_eq!(config.realtime_model, "gpt-test");
+                assert_eq!(config.realtime_model_source, REALTIME_MODEL_SOURCE_FALLBACK);
                 injection_started_tx.send(()).unwrap();
                 release_injection_rx
                     .recv_timeout(Duration::from_secs(2))
@@ -777,6 +926,7 @@ mod tests {
             String::new(),
             "new-model".to_string(),
             Some("new-realtime-model".to_string()),
+            Some("new-correction-model".to_string()),
             API_STYLE_RESPONSES.to_string(),
         );
 
@@ -790,6 +940,12 @@ mod tests {
         let saved = decode_metadata(&fs::read(metadata_path).unwrap()).unwrap();
         assert_eq!(saved.model, "new-model");
         assert_eq!(saved.realtime_model, "new-realtime-model");
+        assert_eq!(saved.realtime_model_source, REALTIME_MODEL_SOURCE_RUNTIME);
+        assert_eq!(saved.correction_model, "new-correction-model");
+        assert_eq!(
+            saved.correction_model_source,
+            CORRECTION_MODEL_SOURCE_RUNTIME
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -821,6 +977,7 @@ mod tests {
             "https://new-relay.example".to_string(),
             "bad".to_string(),
             "new-model".to_string(),
+            None,
             None,
             API_STYLE_CHAT_COMPLETIONS.to_string(),
         );

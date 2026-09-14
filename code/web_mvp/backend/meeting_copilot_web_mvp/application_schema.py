@@ -26,7 +26,7 @@ from .sqlite_schema import (
 )
 
 
-APPLICATION_SCHEMA_VERSION = 6
+APPLICATION_SCHEMA_VERSION = 11
 APPLICATION_MAX_SUPPORTED_SCHEMA_VERSION = APPLICATION_SCHEMA_VERSION
 
 _SHANGHAI_TIMEZONE = timezone(timedelta(hours=8))
@@ -1044,6 +1044,118 @@ APPLICATION_SCHEMA_MIGRATIONS = (
         (
             "ALTER TABLE semantic_paragraphs ADD COLUMN projection_version INTEGER NOT NULL "
             "DEFAULT 1 CHECK (projection_version > 0)",
+        ),
+    ),
+    sql_migration(
+        7,
+        "add_realtime_intelligence_timing_chain",
+        (
+            "ALTER TABLE jobs ADD COLUMN final_committed_at_ms INTEGER",
+            "ALTER TABLE jobs ADD COLUMN job_started_at_ms INTEGER",
+            "ALTER TABLE jobs ADD COLUMN decision_completed_at_ms INTEGER",
+            "ALTER TABLE jobs ADD COLUMN projected_at_ms INTEGER",
+        ),
+    ),
+    sql_migration(
+        8,
+        "add_realtime_provider_circuit_state",
+        (
+            "CREATE TABLE realtime_provider_circuits ("
+            "identity_key TEXT PRIMARY KEY CHECK (length(identity_key) = 64 AND "
+            "identity_key NOT GLOB '*[^0-9a-f]*'), "
+            "state TEXT NOT NULL CHECK (state IN ('closed', 'open', 'half_open')), "
+            "failure_count INTEGER NOT NULL DEFAULT 0 CHECK (failure_count >= 0), "
+            "last_failure_class TEXT CHECK (last_failure_class IS NULL OR "
+            "last_failure_class IN ('timeout', 'transport', 'provider_server', 'rate_limit')), "
+            "opened_at_ms INTEGER CHECK (opened_at_ms IS NULL OR opened_at_ms >= 0), "
+            "open_until_ms INTEGER CHECK (open_until_ms IS NULL OR open_until_ms >= 0), "
+            "backoff_source TEXT CHECK (backoff_source IS NULL OR "
+            "backoff_source IN ('default', 'provider_retry_after')), "
+            "half_open_permit_token TEXT, "
+            "half_open_lease_until_ms INTEGER CHECK (half_open_lease_until_ms IS NULL OR "
+            "half_open_lease_until_ms >= 0), "
+            "epoch INTEGER NOT NULL DEFAULT 0 CHECK (epoch >= 0), "
+            "revision INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0), "
+            "updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= 0), "
+            "CHECK ((state = 'closed' AND opened_at_ms IS NULL AND open_until_ms IS NULL "
+            "AND backoff_source IS NULL AND half_open_permit_token IS NULL "
+            "AND half_open_lease_until_ms IS NULL) OR "
+            "(state = 'open' AND opened_at_ms IS NOT NULL AND open_until_ms IS NOT NULL "
+            "AND open_until_ms >= opened_at_ms AND backoff_source IS NOT NULL "
+            "AND half_open_permit_token IS NULL AND half_open_lease_until_ms IS NULL) OR "
+            "(state = 'half_open' AND opened_at_ms IS NOT NULL AND open_until_ms IS NOT NULL "
+            "AND open_until_ms >= opened_at_ms AND backoff_source IS NOT NULL "
+            "AND half_open_permit_token IS NOT NULL "
+            "AND half_open_lease_until_ms IS NOT NULL)))",
+            "CREATE INDEX idx_realtime_provider_circuits_open_until "
+            "ON realtime_provider_circuits(state, open_until_ms)",
+        ),
+    ),
+    sql_migration(
+        9,
+        "add_intelligence_trigger_contract",
+        (
+            "ALTER TABLE jobs ADD COLUMN trigger_type TEXT NOT NULL DEFAULT 'delta'",
+            "ALTER TABLE jobs ADD COLUMN work_item_id TEXT",
+            "ALTER TABLE jobs ADD COLUMN trigger_reference_seq INTEGER",
+            "ALTER TABLE jobs ADD COLUMN user_request TEXT",
+        ),
+    ),
+    sql_migration(
+        10,
+        "add_intelligence_input_coverage",
+        (
+            "CREATE TABLE intelligence_input_coverage ("
+            "meeting_id TEXT NOT NULL, event_seq INTEGER NOT NULL CHECK (event_seq > 0), "
+            "segment_id TEXT NOT NULL, revision INTEGER NOT NULL CHECK (revision > 0), "
+            "status TEXT NOT NULL CHECK (status IN ("
+            "'pending', 'in_flight', 'processed', 'excluded', 'retryable_error', 'terminal_error'"
+            ")), run_id TEXT, failure_reason TEXT, input_transcript_seq INTEGER NOT NULL "
+            "CHECK (input_transcript_seq > 0), input_text_hash TEXT NOT NULL, "
+            "created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL, "
+            "PRIMARY KEY (meeting_id, event_seq), "
+            "UNIQUE (meeting_id, segment_id, revision), "
+            "FOREIGN KEY (meeting_id, segment_id) REFERENCES transcript_segments(meeting_id, segment_id) "
+            "ON DELETE CASCADE)"
+            ,
+            "CREATE INDEX idx_intelligence_input_coverage_status "
+            "ON intelligence_input_coverage(meeting_id, status, input_transcript_seq)",
+            "CREATE INDEX idx_intelligence_input_coverage_run "
+            "ON intelligence_input_coverage(run_id, status) WHERE run_id IS NOT NULL",
+        ),
+    ),
+    sql_migration(
+        11,
+        "add_durable_pi_work_items",
+        (
+            "CREATE TABLE agent_work_items ("
+            "work_item_id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL, "
+            "dedupe_key TEXT NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ("
+            "'proposed', 'investigating', 'waiting_for_evidence', 'ready', 'resolved', "
+            "'dismissed', 'expired', 'failed', 'superseded')), priority INTEGER NOT NULL DEFAULT 0, "
+            "title TEXT NOT NULL, summary TEXT NOT NULL, trigger_type TEXT NOT NULL, "
+            "trigger_job_id TEXT, latest_decision_id TEXT, latest_run_id TEXT, "
+            "evidence_json TEXT NOT NULL DEFAULT '[]', evidence_segment_ids_json TEXT NOT NULL DEFAULT '[]', "
+            "needed_json TEXT NOT NULL DEFAULT '[]', last_checked_seq INTEGER, next_check_at_ms INTEGER, "
+            "last_execution_status TEXT NOT NULL DEFAULT 'unknown', failure_reason TEXT, "
+            "version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0), created_at_ms INTEGER NOT NULL, "
+            "updated_at_ms INTEGER NOT NULL, resolved_at_ms INTEGER, "
+            "UNIQUE (meeting_id, dedupe_key), FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE)"
+            ,
+            "CREATE INDEX idx_agent_work_items_state "
+            "ON agent_work_items(meeting_id, state, next_check_at_ms, priority DESC)",
+            "CREATE INDEX idx_agent_work_items_decision "
+            "ON agent_work_items(meeting_id, latest_decision_id)",
+            "CREATE TABLE agent_work_item_evidence ("
+            "work_item_id TEXT NOT NULL, meeting_id TEXT NOT NULL, segment_id TEXT NOT NULL, "
+            "revision INTEGER NOT NULL CHECK (revision > 0), relation TEXT NOT NULL CHECK (relation IN ("
+            "'supporting', 'contradicting', 'trigger')), quote TEXT NOT NULL, observed_at_ms INTEGER NOT NULL, "
+            "PRIMARY KEY (work_item_id, segment_id, revision, relation), "
+            "FOREIGN KEY (work_item_id) REFERENCES agent_work_items(work_item_id) ON DELETE CASCADE, "
+            "FOREIGN KEY (meeting_id, segment_id) REFERENCES transcript_segments(meeting_id, segment_id) ON DELETE CASCADE)"
+            ,
+            "CREATE INDEX idx_agent_work_item_evidence_meeting "
+            "ON agent_work_item_evidence(meeting_id, segment_id, revision)",
         ),
     ),
 )

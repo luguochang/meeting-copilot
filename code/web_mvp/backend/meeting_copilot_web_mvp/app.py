@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+from contextvars import ContextVar
+import hashlib
+import inspect
 import hmac
 import json
+import math
 import os
 import platform
 import structlog
@@ -16,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import re
 import sqlite3
-from typing import Any, Literal, Mapping
+from typing import Any, Literal, Mapping, Sequence
 import unicodedata
 from urllib.parse import quote, urlsplit
 
@@ -47,6 +51,7 @@ from meeting_copilot_web_mvp.docx_export import render_docx
 from meeting_copilot_web_mvp import asr_correct
 from meeting_copilot_web_mvp import auto_suggestion_orchestrator
 from meeting_copilot_web_mvp import audio_assets
+from meeting_copilot_web_mvp import correction_budget_policy
 from meeting_copilot_web_mvp import desktop_parent_watchdog
 from meeting_copilot_web_mvp import realtime_transcript_correction
 from meeting_copilot_web_mvp.canonical_transcript import project_canonical_transcript
@@ -54,8 +59,18 @@ from meeting_copilot_web_mvp.capability_pack_manager import (
     CapabilityPackError,
     CapabilityPackManager,
 )
-from meeting_copilot_web_mvp.llm_lane_locks import LaneLockRegistry
-from meeting_copilot_web_mvp.pipeline_trace import PipelineTraceCollector
+from meeting_copilot_web_mvp.llm_lane_locks import LaneLockRegistry, ProviderLaneRegistry
+from meeting_copilot_web_mvp.realtime_provider_circuit import (
+    CircuitAdmission,
+    RealtimeProviderCircuit,
+    classify_realtime_provider_failure,
+    normalize_retry_after_ms,
+)
+from meeting_copilot_web_mvp.pipeline_trace import (
+    PipelineTraceCollector,
+    classify_pipeline_failure,
+    observe_provider_timing,
+)
 from meeting_copilot_web_mvp.realtime_slo import RealtimeSLOStore
 from meeting_copilot_web_mvp.application_schema import (
     bootstrap_application_schema,
@@ -63,12 +78,16 @@ from meeting_copilot_web_mvp.application_schema import (
 )
 from meeting_copilot_web_mvp.v2_persistence import (
     DEFAULT_EVENT_PAGE_LIMIT,
+    IntelligenceDeadlineExceeded,
     IntelligenceEvidenceSuperseded,
+    INTELLIGENCE_DEBOUNCE_MS,
     INTELLIGENCE_MAX_BATCH_SEGMENTS,
+    INTELLIGENCE_REALTIME_BUDGET_MS,
     MAX_EVENT_PAGE_LIMIT,
     ReviewDocumentConflict,
     REVIEW_DOCUMENT_KINDS,
     SpeakerLabelConflict,
+    MeetingDeletedError,
     V2Persistence,
     transcript_evidence_hash,
 )
@@ -88,7 +107,7 @@ from meeting_copilot_web_mvp.v2_migration import (
     MigrationExecutionError,
     migrate_v1_to_v2,
 )
-from meeting_copilot_web_mvp.v2_pipeline import DurableJobExecutor
+from meeting_copilot_web_mvp.v2_pipeline import DurableJobExecutor, DueCoachRefreshScheduler
 from meeting_copilot_web_mvp.recording_export import RecordingExportExecutor
 from meeting_copilot_web_mvp.recording_recovery import (
     reconcile_and_recover_abandoned_recordings,
@@ -100,17 +119,24 @@ from meeting_copilot_web_mvp.streaming_llm_provider import (
 from meeting_copilot_web_mvp.pi_coach_runtime import (
     PiCoachSidecar,
     configured_coach_runtime,
+    pi_bridge_prewarm_enabled,
 )
+from meeting_copilot_web_mvp.pi_evidence_registry import PiEvidenceRegistry
 from meeting_copilot_web_mvp.v2_streaming_suggestions import (
     build_realtime_suggestion_messages,
     generate_streaming_suggestion,
 )
 from meeting_copilot_web_mvp.realtime_intelligence import (
+    CoachCandidateEvent,
+    CoachIntervention,
     MAX_RETRIEVAL_PARAGRAPHS,
     RealtimeIntelligenceRequest,
-    apply_coach_intervention,
+    RealtimeIntelligenceResponse,
+    build_local_reflex_intervention,
+    build_realtime_coach_provenance_decision,
     build_llm_first_event_context,
     realtime_intelligence_batch_id,
+    realtime_coach_candidate_events,
     run_realtime_coach_routed,
     run_realtime_intelligence,
     should_run_realtime_coach,
@@ -140,6 +166,378 @@ from meeting_copilot_web_mvp.local_api_auth import (
 configure_logging()
 _log = get_logger("meeting_copilot_web_mvp.app")
 _metrics.log_config_status()
+
+
+def _run_coroutine_sync(coroutine: Any) -> Any:
+    """Bridge legacy synchronous callers without nesting ``asyncio.run``.
+
+    The durable executor owns the native async path. A few API/test callers
+    still invoke correction handlers synchronously, sometimes from a running
+    event loop (for example a TestClient lifespan). In that case run the
+    coroutine in a short-lived helper thread rather than attempting to nest
+    event loops in the current thread.
+    """
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coroutine)
+
+    result: dict[str, Any] = {}
+    failure: list[BaseException] = []
+
+    def runner() -> None:
+        try:
+            result["value"] = asyncio.run(coroutine)
+        except BaseException as exc:  # pragma: no cover - propagated below
+            failure.append(exc)
+
+    thread = threading.Thread(target=runner, daemon=True)
+    thread.start()
+    thread.join()
+    if failure:
+        raise failure[0]
+    return result.get("value")
+
+
+def _positive_provider_lane_setting(name: str, default: int) -> int:
+    """Read a bounded lane setting and fail closed on invalid configuration."""
+
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a positive integer") from exc
+    if value < 1 or value > 64:
+        raise RuntimeError(f"{name} must be between 1 and 64")
+    return value
+
+
+# Pi candidates are already gated and an authoritative FunASR final is the
+# endpoint boundary, so do not spend any of the 2.5s usefulness window waiting
+# by default. Direct callers and legacy jobs retain the persistence default of
+# 750ms; this Pi-only override remains configurable for controlled experiments.
+REALTIME_INTELLIGENCE_DEBOUNCE_DEFAULT_MS = 0
+
+
+def _pi_local_reflex_first_enabled() -> bool:
+    """Keep the low-latency reflex policy explicit for controlled Pi runs.
+
+    The default preserves the existing safety behavior for deployments that
+    have not opted into a real Provider evaluation. Setting this to ``0``
+    makes an eligible Pi request enter the agent lane first; the existing
+    timeout/unavailable path still supplies the evidence-bound local fallback.
+    """
+
+    return str(
+        os.environ.get("MEETING_COPILOT_PI_LOCAL_REFLEX_FIRST", "1")
+    ).strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _realtime_intelligence_debounce_ms() -> int:
+    raw = os.environ.get("MEETING_COPILOT_REALTIME_INTELLIGENCE_DEBOUNCE_MS")
+    if raw is None or not raw.strip():
+        return REALTIME_INTELLIGENCE_DEBOUNCE_DEFAULT_MS
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            "MEETING_COPILOT_REALTIME_INTELLIGENCE_DEBOUNCE_MS must be an integer"
+        ) from exc
+    if value < 0 or value > INTELLIGENCE_DEBOUNCE_MS:
+        raise RuntimeError(
+            "MEETING_COPILOT_REALTIME_INTELLIGENCE_DEBOUNCE_MS must be between 0 and "
+            f"{INTELLIGENCE_DEBOUNCE_MS}"
+        )
+    return value
+
+
+def _configured_intelligence_debounce_for_app(
+    semantic_projection_mode: str,
+) -> int | None:
+    """Shorten only the Pi-backed live lane; preserve direct/legacy timing."""
+
+    if str(semantic_projection_mode or "").strip().lower() != "llm_first":
+        return None
+    coach_enabled = str(
+        os.environ.get("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
+    ).strip().lower() not in {"0", "false", "off", "no"}
+    if not coach_enabled or configured_coach_runtime() != "pi":
+        return None
+    return _realtime_intelligence_debounce_ms()
+
+
+def _realtime_provider_identity(config: llm_service.LlmConfig | None) -> tuple[str, ...]:
+    """Return the effective realtime Provider identity used by every lane.
+
+    Callers often hold the general configuration (for example the status and
+    health endpoints), while the coach normalizes to ``realtime_config``
+    before admission. Normalize here as well so diagnostics, probes and jobs
+    cannot observe different circuit rows for the same configured Provider.
+    """
+
+    if config is None:
+        return ("not_configured",)
+    config = llm_service.realtime_config(config)
+    return (
+        str(config.base_url),
+        str(llm_service.provider_identifier(config)),
+        str(config.model),
+        str(config.realtime_model or config.model),
+        str(config.api_style),
+        str(llm_service.provider_idempotency_header_value(config.api_key) or ""),
+    )
+
+
+def _realtime_retry_after_ms(value: Any) -> int | None:
+    """Extract a bounded provider backoff hint from direct or Pi outcomes."""
+
+    candidates: list[Any] = []
+    if isinstance(value, Mapping):
+        for key in ("retry_after_ms", "provider_retry_after_ms", "retry_after"):
+            if key in value:
+                candidates.append(value.get(key))
+        for metrics_key in ("agent_metrics", "metrics"):
+            metrics = value.get(metrics_key)
+            if isinstance(metrics, Mapping):
+                for key in ("retry_after_ms", "provider_retry_after_ms", "retry_after"):
+                    if key in metrics:
+                        candidates.append(metrics.get(key))
+    else:
+        for key in ("retry_after_ms", "provider_retry_after_ms", "retry_after"):
+            if hasattr(value, key):
+                candidates.append(getattr(value, key))
+    for candidate in candidates:
+        normalized = normalize_retry_after_ms(candidate)
+        if normalized is not None:
+            return normalized
+    return None
+
+
+REALTIME_COACH_PROJECTION_RESERVE_MS = 750
+REALTIME_COACH_MIN_PROVIDER_BUDGET_MS = 1_000
+# The ten-second intelligence deadline remains the hard safety barrier. This
+# shorter product cutoff controls when a realtime coach result is still useful
+# enough to show in the live meeting UI.
+REALTIME_COACH_SOFT_CUTOFF_MS = provider_config_runtime.REALTIME_READY_CUTOFF_MS
+# Keep a small local reserve for cancellation, validation, and the durable
+# event projection after the soft cutoff timer fires.
+REALTIME_COACH_SOFT_PROJECTION_RESERVE_MS = 250
+# Keep a crashed Pi attempt visible to a restarted worker long enough for the
+# provider request and durable projection to settle, but never indefinitely.
+REALTIME_COACH_RESERVATION_TTL_MS = 30_000
+# Descriptive alias used by reports and external probes.
+REALTIME_COACH_SOFT_DELIVERY_CUTOFF_MS = REALTIME_COACH_SOFT_CUTOFF_MS
+# Correction has its own cancellable transport and Provider lane. Keep its
+# deadline short so stale transcript cleanup cannot accumulate or waste cost.
+# Correction runs asynchronously after the authoritative final and is not on
+# the coach delivery path.  The acceptance gateway's first token can take
+# several seconds, so a four-second cap preserved raw ASR text even when the
+# same Provider was healthy. Keep this bounded, but allow a complete short
+# correction turn to finish.
+REALTIME_CORRECTION_PROVIDER_TIMEOUT_SECONDS = 12.0
+# Avoid tight durable-queue polling when the correction lane itself is full.
+REALTIME_CORRECTION_LANE_RETRY_MS = 750
+# A live Pi job owns the short realtime window. Correction must yield before
+# starting a Provider request, then retry without consuming its attempt budget.
+REALTIME_CORRECTION_PRIORITY_RETRY_MS = 250
+# A candidate Pi intervention is the user-visible realtime contract. Keep
+# semantic extraction off that critical path; it can be retried or produced by
+# the post-meeting lane without making a valid coach card miss its deadline.
+REALTIME_COACH_PI_PRIORITY_SEMANTIC_STATUS = "deferred_for_pi_priority"
+# Pi and direct semantic extraction use one Provider availability state.  The
+# scope remains explicit in durable provenance so a future product-approved
+# bypass cannot become an invisible second path to the same failing gateway.
+REALTIME_PROVIDER_AVAILABILITY_POLICY_VERSION = "shared_realtime_provider.v1"
+
+
+def _acquire_direct_semantic_provider_admission(
+    circuit: RealtimeProviderCircuit,
+    identity: Any,
+) -> CircuitAdmission:
+    """Admit direct semantic work only from a known-closed shared circuit.
+
+    Direct semantic extraction has the ten-second background job deadline and
+    must not become the half-open recovery probe after Pi exposed a Provider
+    outage.  Explicit health probes, or a Pi turn constrained by the shorter
+    product cutoff, own recovery.  Direct semantic still records its outcomes
+    into this same circuit whenever the circuit is closed.
+    """
+
+    snapshot = circuit.snapshot(identity)
+    if snapshot.state != "closed":
+        reason = snapshot.reason
+        if snapshot.state == "open" and snapshot.retry_after_ms <= 0:
+            reason = "realtime_provider_recovery_probe_required"
+        return CircuitAdmission(
+            admitted=False,
+            snapshot=replace(snapshot, reason=reason),
+        )
+    admission = circuit.acquire(identity)
+    if admission.admitted and admission.permit is not None and admission.permit.half_open:
+        # Another process may open the circuit between snapshot and acquire.
+        # Return the exclusive trial without issuing an outbound semantic call.
+        admission.permit.release()
+        return CircuitAdmission(
+            admitted=False,
+            snapshot=replace(
+                admission.snapshot,
+                reason="realtime_provider_recovery_probe_required",
+            ),
+        )
+    return admission
+
+
+def _elapsed_milliseconds(started_at_ns: int) -> int:
+    elapsed_ns = max(0, time.monotonic_ns() - started_at_ns)
+    return (elapsed_ns + 999_999) // 1_000_000
+
+
+def _provider_probe_result_with_readiness(
+    result: Mapping[str, Any],
+    *,
+    fallback_latency_ms: int,
+) -> dict[str, Any]:
+    """Attach the realtime contract only after latency and usage are valid."""
+
+    if result.get("operational") is not True:
+        raise ValueError("gateway probe did not report operational=true")
+    raw_latency_ms = result.get("probe_latency_ms")
+    if raw_latency_ms is None:
+        probe_latency_ms = fallback_latency_ms
+    elif type(raw_latency_ms) is int and raw_latency_ms >= 0:
+        probe_latency_ms = raw_latency_ms
+    else:
+        raise ValueError("gateway probe reported invalid latency")
+    raw_usage = result.get("usage")
+    if not isinstance(raw_usage, Mapping):
+        raise ValueError("gateway probe reported invalid usage")
+    usage: dict[str, int] = {}
+    for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        value = raw_usage.get(field)
+        if type(value) is not int or value < 0:
+            raise ValueError("gateway probe reported invalid usage")
+        usage[field] = value
+    if (
+        usage["total_tokens"] <= 0
+        or usage["total_tokens"]
+        != usage["prompt_tokens"] + usage["completion_tokens"]
+    ):
+        raise ValueError("gateway probe reported inconsistent usage")
+    return {
+        **dict(result),
+        "operational": True,
+        "realtime_ready": probe_latency_ms <= REALTIME_COACH_SOFT_CUTOFF_MS,
+        "probe_latency_ms": probe_latency_ms,
+        "realtime_cutoff_ms": REALTIME_COACH_SOFT_CUTOFF_MS,
+        "usage": usage,
+    }
+
+
+def _mark_provider_probe_succeeded(
+    config: llm_service.LlmConfig,
+    result: Mapping[str, Any],
+) -> None:
+    provider_config_runtime.mark_probe_succeeded(
+        config,
+        latency_ms=result.get("probe_latency_ms"),
+        usage=(result.get("usage") if isinstance(result.get("usage"), Mapping) else None),
+        realtime_ready=(
+            result.get("realtime_ready")
+            if isinstance(result.get("realtime_ready"), bool)
+            else None
+        ),
+    )
+
+
+def _realtime_coach_budget_ms(
+    *,
+    deadline_at_ms: int | None,
+    now_ms: int,
+    configured_timeout_seconds: float,
+) -> tuple[int | None, int]:
+    """Return job time remaining and the bounded Pi decision budget."""
+
+    configured_timeout_ms = max(1, int(max(0.001, float(configured_timeout_seconds)) * 1_000))
+    if deadline_at_ms is None:
+        return None, configured_timeout_ms
+    remaining_ms = max(0, int(deadline_at_ms) - int(now_ms))
+    provider_budget_ms = max(0, remaining_ms - REALTIME_COACH_PROJECTION_RESERVE_MS)
+    return remaining_ms, min(configured_timeout_ms, provider_budget_ms)
+
+
+def _realtime_coach_soft_deadline_at_ms(
+    *,
+    final_committed_at_ms: Any,
+    fallback_created_at_ms: Any = None,
+) -> int | None:
+    """Return the absolute product cutoff without extending the hard deadline."""
+
+    def non_negative_int(value: Any) -> int | None:
+        if isinstance(value, bool) or value is None:
+            return None
+        try:
+            normalized = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return normalized if normalized >= 0 else None
+
+    base_ms = non_negative_int(final_committed_at_ms)
+    if base_ms is None:
+        base_ms = non_negative_int(fallback_created_at_ms)
+    if base_ms is None:
+        return None
+    return base_ms + REALTIME_COACH_SOFT_CUTOFF_MS
+
+
+def _realtime_coach_soft_budget_ms(
+    *,
+    soft_deadline_at_ms: int | None,
+    now_ms: int,
+) -> tuple[int | None, int]:
+    """Return remaining soft time and its provider budget after reserve."""
+
+    if soft_deadline_at_ms is None:
+        return None, 0
+    remaining_ms = max(0, int(soft_deadline_at_ms) - int(now_ms))
+    provider_budget_ms = max(0, remaining_ms - REALTIME_COACH_SOFT_PROJECTION_RESERVE_MS)
+    return remaining_ms, provider_budget_ms
+
+
+def _pi_priority_intelligence_result(
+    *,
+    coach_result: Mapping[str, Any],
+    model: str,
+) -> dict[str, Any]:
+    """Build an empty semantic envelope while preserving Pi timing evidence.
+
+    The durable intelligence projection owns both semantic entities and the
+    coach card. On a high-value Pi candidate, the card must not be discarded
+    merely because the optional semantic extraction lane is slower. Keeping an
+    empty, schema-valid response lets the normal evidence/deadline barriers
+    run while making the deferred semantic work explicit in diagnostics.
+    """
+
+    raw_timings = coach_result.get("timings")
+    timings = dict(raw_timings) if isinstance(raw_timings, Mapping) else {}
+    return {
+        "response": RealtimeIntelligenceResponse((), None, (), None),
+        "idempotency_key": None,
+        "transport_mode": "pi_agent_jsonl",
+        "fallback_reason": REALTIME_COACH_PI_PRIORITY_SEMANTIC_STATUS,
+        "ttft_ms": coach_result.get("ttft_ms"),
+        "repair_ttft_ms": None,
+        "provider_attempt_count": 0,
+        "repair_attempted": False,
+        "timings": timings,
+        "usage": None,
+        "response_id": None,
+        "model": str(coach_result.get("model") or model),
+        "finish_reason": "semantic_deferred_for_pi_priority",
+        "semantic_branch_status": REALTIME_COACH_PI_PRIORITY_SEMANTIC_STATUS,
+    }
 
 
 async def _cancel_active_capture_tasks(
@@ -301,6 +699,12 @@ FORMAL_REALTIME_AI_PROJECTION_KEYS = {
     "meeting.decision.updated": "decision",
     "meeting.action_item.updated": "action_item",
     "meeting.risk.updated": "risk",
+}
+LOCAL_REFLEX_COACH_EVENT_TYPES = {
+    "missing_next_step": "execution_gap",
+    "communication_clarity": "communication_clarity",
+    "strong_objection": "discovery_gap",
+    "pending_question": "question_to_user",
 }
 
 V2_MEETING_TITLE_MAX_LENGTH = 200
@@ -464,6 +868,27 @@ def _v2_intelligence_batch_segments(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     meeting_id = str(job["meeting_id"])
     target_seq = int(job.get("input_transcript_seq") or 0)
+    trigger_type = str(job.get("trigger_type") or "delta").strip()
+    all_segments = _v2_complete_transcript(persistence, meeting_id)
+    if trigger_type == "task_due":
+        reference_seq = int(job.get("trigger_reference_seq") or target_seq)
+        new_segments = [
+            segment
+            for segment in all_segments
+            if reference_seq < int(segment.get("transcript_seq") or 0) <= target_seq
+        ][-INTELLIGENCE_MAX_BATCH_SEGMENTS:]
+        context = [
+            segment
+            for segment in all_segments
+            if int(segment.get("transcript_seq") or 0) <= reference_seq
+        ][-3:]
+        return new_segments, context
+    if trigger_type == "user_request":
+        # An explicit coach request is evaluated against the current meeting
+        # snapshot rather than a fresh transcript delta. Keep these as
+        # context evidence so provenance does not claim the user request
+        # created new speech, while still giving Pi a bounded, useful window.
+        return [], all_segments[-3:]
     terminal_statuses = {"succeeded", "failed", "cancelled"}
     previous_batch_end = max(
         (
@@ -476,7 +901,6 @@ def _v2_intelligence_batch_segments(
         ),
         default=0,
     )
-    all_segments = _v2_complete_transcript(persistence, meeting_id)
     new_segments = [
         segment
         for segment in all_segments
@@ -588,7 +1012,7 @@ def _coach_runtime_capability(
         return {
             "state": "offline",
             "label": "Pi 教练等待模型",
-            "detail": "录音和转写继续运行",
+            "detail": "本地实时提示仍可用，录音和转写继续运行",
         }
     if active:
         return {
@@ -650,7 +1074,11 @@ def _coach_runtime_capability(
     )
     session_reused = metrics.get("session_reused") is True
     elapsed_ms = metrics.get("elapsed_ms") or metrics.get("decision_latency_ms")
-    detail_parts = [f"本轮完成 {checklist_count or 6} 项检查"]
+    detail_parts = [
+        f"本轮完成 {checklist_count} 项检查"
+        if checklist_count
+        else "本技能包关注 6 项检查"
+    ]
     if agent_turns:
         detail_parts.append(f"{agent_turns} 轮 Agent")
     if tool_calls:
@@ -662,9 +1090,9 @@ def _coach_runtime_capability(
     if isinstance(elapsed_ms, (int, float)) and elapsed_ms > 0:
         detail_parts.append(f"响应约 {elapsed_ms / 1_000:.1f} 秒")
     decision = None
-    if coach.get("status") == "silent":
+    if coach.get("status") in {"silent", "protected_silent", "timed_out", "failed", "stale", "not_triggered"}:
         decision_reason = str(coach.get("decision_reason") or "").strip()[:160]
-        decision = "本轮结论：暂不打断"
+        decision = "本轮结论：暂不打断" if coach.get("status") != "not_triggered" else "本轮未触发教练"
         if decision_reason:
             decision = f"{decision}，{decision_reason}"
     detail_parts.append("已延续会议上下文" if session_reused else "已建立会议上下文")
@@ -681,6 +1109,57 @@ def _coach_runtime_capability(
         ),
         "detail": " · ".join(detail_parts),
         "decision": decision,
+    }
+
+
+def _clear_ended_coach_projection(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    """Clear live coach state after meeting end while retaining audit history."""
+
+    projected = dict(snapshot)
+    runtime = dict(projected.get("runtime") or {})
+    if runtime.get("phase") != "ended":
+        return projected
+    ai = dict(runtime.get("ai") or {})
+    capabilities = dict(ai.get("capabilities") or {})
+    capabilities["proactive_suggestions"] = {
+        "state": "idle",
+        "label": "Pi 教练已结束",
+        "detail": "会中建议已停止，历史建议保留在会议记录中",
+        "decision": None,
+    }
+    ai["capabilities"] = capabilities
+    runtime["ai"] = ai
+    return {
+        **projected,
+        "follow_up": None,
+        "coach_intervention": None,
+        "semantic_follow_up": None,
+        "coach_decision": None,
+        "runtime": runtime,
+    }
+
+
+def _overlay_realtime_provider_reservation(
+    value: Any,
+    authoritative: Mapping[str, Any] | None,
+) -> Any:
+    """Replace an embedded reservation status with the durable read-model state."""
+
+    if not isinstance(value, Mapping) or not isinstance(authoritative, Mapping):
+        return value
+    embedded = value.get("provider_reservation")
+    if not isinstance(embedded, Mapping):
+        return value
+    embedded_id = str(embedded.get("reservation_id") or "").strip()
+    authoritative_id = str(authoritative.get("reservation_id") or "").strip()
+    if not embedded_id or embedded_id != authoritative_id:
+        return value
+    return {
+        **dict(value),
+        "provider_reservation": {
+            **dict(embedded),
+            **dict(authoritative),
+        },
     }
 
 
@@ -900,8 +1379,44 @@ class CorrectionBatchDeferred(RuntimeError):
         self.retry_after_ms = max(250, int(retry_after_ms))
 
 
+class CorrectionLaneCapacityDeferred(RuntimeError):
+    """Keep correction durable work queued while its own lane is saturated."""
+
+    preserve_attempt = True
+    retry_after_ms = REALTIME_CORRECTION_LANE_RETRY_MS
+
+    def __init__(self) -> None:
+        super().__init__("transcript correction Provider lane is at capacity")
+
+
+class CorrectionProviderPriorityDeferred(RuntimeError):
+    """Yield a live correction job while the same meeting has Pi work open."""
+
+    preserve_attempt = True
+    retry_after_ms = REALTIME_CORRECTION_PRIORITY_RETRY_MS
+
+    def __init__(self, *, blocking_job_ids: list[str] | tuple[str, ...]) -> None:
+        self.blocking_job_ids = tuple(str(job_id) for job_id in blocking_job_ids)
+        super().__init__(
+            "realtime intelligence has Provider priority for this live meeting"
+        )
+
+
+def _realtime_correction_provider_error_code(error: BaseException) -> str:
+    """Classify correction transport failures without persisting provider text."""
+
+    category = str(getattr(error, "category", "") or "").strip().lower()
+    if category == "timeout":
+        return "provider_timeout"
+    if category == "transport":
+        return "provider_transport"
+    if int(getattr(error, "status_code", 0) or 0) == 502:
+        return "provider_502"
+    return "realtime_correction_provider_failed"
+
+
 class RealtimeCorrectionProviderError(HTTPException):
-    def __init__(self, *, retryable: bool) -> None:
+    def __init__(self, *, retryable: bool, durable_error_class: str = "realtime_correction_provider_failed") -> None:
         super().__init__(
             status_code=502,
             detail=llm_service.provider_error_payload(
@@ -910,11 +1425,87 @@ class RealtimeCorrectionProviderError(HTTPException):
             ),
         )
         self.retryable = bool(retryable)
+        self.durable_error_class = str(durable_error_class or "realtime_correction_provider_failed")
+
+
+CORRECTION_BLOCKED_BY_ASR_QUALITY = "correction_blocked_by_asr_quality"
+DEGRADED_ASR_SESSION = "degraded_asr_session"
+
+
+_REALTIME_CORRECTION_ASR_BLOCKERS = frozenset(
+    {
+        "asr_semantic_quality_blocked",
+        "degraded_asr_session",
+        "asr_fallback_used",
+        "asr_provider_not_real",
+        "asr_final_missing",
+        "asr_transcript_empty",
+        "mock_or_demo_session",
+        "local_event_file_not_real_input",
+    }
+)
+
+
+def _correction_blocker_error_code_for_blockers(
+    blockers: Sequence[object] | None,
+) -> str | None:
+    """Map ASR eligibility blockers to a safe, non-retryable durable code."""
+
+    normalized = {
+        str(blocker or "").strip()
+        for blocker in (blockers or ())
+        if str(blocker or "").strip()
+    }
+    if "asr_semantic_quality_blocked" in normalized:
+        return CORRECTION_BLOCKED_BY_ASR_QUALITY
+    if "degraded_asr_session" in normalized:
+        return DEGRADED_ASR_SESSION
+    if normalized.intersection(_REALTIME_CORRECTION_ASR_BLOCKERS):
+        return CORRECTION_BLOCKED_BY_ASR_QUALITY
+    return None
+
+
+def _realtime_correction_blocker_error_code(error: BaseException) -> str | None:
+    """Extract a blocker code from a realtime correction eligibility error.
+
+    The public route continues to expose the original HTTP 409 detail. Durable
+    execution only persists this bounded code and never persists provider or
+    session text. The fallback parser keeps compatibility with older callers
+    that construct a plain ``HTTPException`` instead of attaching ``blockers``.
+    """
+
+    explicit = str(getattr(error, "durable_error_class", "") or "").strip()
+    if explicit in {CORRECTION_BLOCKED_BY_ASR_QUALITY, DEGRADED_ASR_SESSION}:
+        return explicit
+    if not isinstance(error, HTTPException) or int(error.status_code or 0) != 409:
+        return None
+
+    blockers = getattr(error, "blockers", None)
+    if not isinstance(blockers, (list, tuple, set, frozenset)):
+        detail = error.detail
+        if isinstance(detail, Mapping):
+            blockers = detail.get("blockers")
+        elif isinstance(detail, str) and "blockers:" in detail:
+            blockers = detail.split("blockers:", 1)[1].split(",")
+    if not isinstance(blockers, (list, tuple, set, frozenset)):
+        return None
+    return _correction_blocker_error_code_for_blockers(blockers)
+
+
+class CorrectionProviderTerminalDegraded(RuntimeError):
+    """Stop a durable correction job once a local budget gate has closed."""
+
+    retryable = False
+
+    def __init__(self, error_code: str) -> None:
+        super().__init__(error_code)
+        self.durable_error_class = error_code
 
 
 class ProviderRuntimeNotConfiguredDeferred(RuntimeError):
     preserve_attempt = True
     retry_after_ms = 10_000
+    pause_until_explicit_resume = True
 
     def __init__(self) -> None:
         super().__init__("AI provider is waiting for explicit desktop connection")
@@ -1115,6 +1706,15 @@ class DesktopProviderConfigRequest(BaseModel):
     api_key: SecretStr
     model: str = Field(min_length=1, max_length=128)
     realtime_model: str | None = Field(default=None, min_length=1, max_length=128)
+    realtime_model_source: Literal[
+        "runtime_realtime_model",
+        "general_model_fallback",
+    ] | None = None
+    correction_model: str | None = Field(default=None, min_length=1, max_length=128)
+    correction_model_source: Literal[
+        "runtime_correction_model",
+        "general_model_fallback",
+    ] | None = None
     api_style: Literal["chat_completions", "responses"] = "chat_completions"
     provider_label: str = Field(
         default="openai_compatible_gateway",
@@ -1130,6 +1730,7 @@ class WebProviderConfigRequest(BaseModel):
     api_key: SecretStr | None = None
     model: str = Field(min_length=1, max_length=128)
     realtime_model: str | None = Field(default=None, min_length=1, max_length=128)
+    correction_model: str | None = Field(default=None, min_length=1, max_length=128)
     api_style: Literal["chat_completions", "responses"] = "chat_completions"
     provider_label: str = Field(
         default="openai_compatible_gateway",
@@ -1225,6 +1826,10 @@ def create_app(
         v2_persistence = V2Persistence(
             db_path,
             semantic_projection_mode=semantic_projection_mode,
+            projection_clock_ms=lambda: time.time_ns() // 1_000_000,
+            intelligence_debounce_ms=_configured_intelligence_debounce_for_app(
+                semantic_projection_mode
+            ),
         )
         sqlite_repositories.extend([repo, asr_live_repo, persistence_coordinator, v2_persistence])
     else:
@@ -1276,6 +1881,21 @@ def create_app(
                         if stored_provider.get("realtime_model")
                         else None
                     ),
+                    realtime_model_source=(
+                        str(stored_provider["realtime_model_source"])
+                        if stored_provider.get("realtime_model_source")
+                        else None
+                    ),
+                    correction_model=(
+                        str(stored_provider["correction_model"])
+                        if stored_provider.get("correction_model")
+                        else None
+                    ),
+                    correction_model_source=(
+                        str(stored_provider["correction_model_source"])
+                        if stored_provider.get("correction_model_source")
+                        else None
+                    ),
                     provider_label=str(
                         stored_provider.get("provider_label") or "openai_compatible_gateway"
                     ),
@@ -1315,6 +1935,49 @@ def create_app(
             return None
         return dict(value)
 
+    def _valid_local_reflex_event_payload(value: Any) -> dict[str, Any] | None:
+        if not isinstance(value, dict):
+            return None
+        if (
+            value.get("source") != "local_reflex"
+            or value.get("llm_called") is not False
+            or value.get("llm_call_status") != "not_called"
+            or value.get("runtime_used") != "local_reflex"
+            or value.get("pi_provider_attempted") is not False
+        ):
+            return None
+        decision = value.get("coach_decision")
+        intervention = value.get("coach_intervention")
+        evidence = value.get("evidence")
+        if (
+            not isinstance(decision, dict)
+            or not isinstance(intervention, dict)
+            or not isinstance(evidence, dict)
+            or decision.get("origin") != "local_reflex"
+            or intervention.get("origin") != "local_reflex"
+            or decision.get("status") != "intervention"
+        ):
+            return None
+        local_reflex_kind = str(
+            intervention.get("local_reflex_kind")
+            or decision.get("local_reflex_kind")
+            or ""
+        ).strip()
+        if (
+            decision.get("local_reflex_kind") != local_reflex_kind
+            or LOCAL_REFLEX_COACH_EVENT_TYPES.get(local_reflex_kind)
+            != intervention.get("event_type")
+        ):
+            return None
+        evidence_ids = evidence.get("segment_ids")
+        if (
+            not isinstance(evidence_ids, list)
+            or not any(str(item).strip() for item in evidence_ids)
+            or not str(evidence.get("quote") or "").strip()
+        ):
+            return None
+        return dict(value)
+
     def _llm_first_event_context_for_job(job_id: str) -> dict[str, Any] | None:
         normalized_job_id = str(job_id or "").strip()
         if not normalized_job_id:
@@ -1346,7 +2009,7 @@ def create_app(
             segment_ids = [str(item).strip() for item in fallback.get("segment_ids") or [] if str(item).strip()]
         evidence = {
             "segment_ids": segment_ids,
-            "quote": str(source.get("quote") or fallback.get("quote") or "").strip(),
+            "quote": str(source.get("quote") or source.get("evidence_quote") or fallback.get("quote") or "").strip(),
         }
         for key in ("evidence_hash", "state_revision"):
             if source.get(key) is not None:
@@ -1362,7 +2025,10 @@ def create_app(
         if event_type == "meeting.topic.updated":
             return _evidence_from_value(context.get("topic_evidence"), fallback)
         if event_type == "meeting.intelligence.applied":
-            follow_up = payload.get("follow_up")
+            coach_intervention = payload.get("coach_intervention")
+            if isinstance(coach_intervention, dict):
+                return _evidence_from_value(coach_intervention, fallback)
+            follow_up = payload.get("semantic_follow_up") or payload.get("follow_up")
             return _evidence_from_value(
                 context.get("follow_up_evidence") if isinstance(follow_up, dict) else None,
                 fallback,
@@ -1417,6 +2083,34 @@ def create_app(
     def _all_v2_formal_events(meeting_id: str) -> list[dict[str, Any]]:
         if v2_persistence is None:
             return []
+
+        def is_pi_silent_terminal(event: Mapping[str, Any]) -> bool:
+            """Keep explicit no-call Pi outcomes visible for explainable silence.
+
+            A circuit/deadline/reservation decision is still a formal coach
+            event even though it must not claim a Provider call. Require the
+            complete negative provenance tuple and a non-retaining lifecycle
+            action so a malformed or accidentally empty semantic event cannot
+            become a user-visible decision.
+            """
+
+            payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+            decision = payload.get("coach_decision")
+            if not isinstance(decision, Mapping):
+                return False
+            return bool(
+                payload.get("source") == "llm_first"
+                and decision.get("origin") == "pi"
+                and str(decision.get("status") or "")
+                in {"protected_silent", "timed_out", "failed", "stale", "not_triggered"}
+                and decision.get("pi_provider_attempted") is False
+                and decision.get("llm_called") is False
+                and decision.get("llm_call_status") == "not_called"
+                and str(decision.get("lifecycle_action") or "") == "deprioritize"
+                and str(decision.get("decision_id") or "").strip()
+                and str(decision.get("status_reason") or "").strip()
+            )
+
         cursor = 0
         formal_events: list[dict[str, Any]] = []
         while True:
@@ -1430,8 +2124,15 @@ def create_app(
                 event
                 for event in decorated
                 if event.get("type") in FORMAL_REALTIME_AI_EVENT_TYPES
-                and (event.get("payload") or {}).get("llm_called") is True
-                and (event.get("payload") or {}).get("source") == "llm_first"
+                and (
+                    (
+                        (event.get("payload") or {}).get("llm_called") is True
+                        and (event.get("payload") or {}).get("source") == "llm_first"
+                    )
+                    or is_pi_silent_terminal(event)
+                    or _valid_local_reflex_event_payload(event.get("payload"))
+                    is not None
+                )
             )
             if not page["has_more"]:
                 break
@@ -1447,7 +2148,30 @@ def create_app(
         formal_events = _all_v2_formal_events(meeting_id)
         coach_history = _bounded_formal_coach_history(formal_events)
         current_coach_follow_up = _latest_formal_coach_follow_up(formal_events)
+        current_coach_decision = _latest_formal_coach_decision(formal_events)
+        current_semantic_follow_up = _latest_formal_semantic_follow_up(formal_events)
         recent_context_history = _bounded_recent_context_history(formal_events)
+        coach_runtime_history = _bounded_coach_runtime_history(formal_events)
+        reservation_states = snapshot.get("realtime_provider_reservations")
+        if not isinstance(reservation_states, Mapping):
+            reservation_states = {}
+
+        def overlay_authoritative_reservation(value: Any) -> Any:
+            if not isinstance(value, Mapping):
+                return value
+            embedded = value.get("provider_reservation")
+            if not isinstance(embedded, Mapping):
+                return value
+            reservation_id = str(embedded.get("reservation_id") or "").strip()
+            authoritative = reservation_states.get(reservation_id)
+            return _overlay_realtime_provider_reservation(value, authoritative)
+
+        current_coach_follow_up = overlay_authoritative_reservation(current_coach_follow_up)
+        current_coach_decision = overlay_authoritative_reservation(current_coach_decision)
+        coach_history = [
+            overlay_authoritative_reservation(entry)
+            for entry in coach_history
+        ]
         by_projection: dict[tuple[str, str], dict[str, Any]] = {}
         for event in formal_events:
             event_type = str(event.get("type") or "")
@@ -1517,7 +2241,18 @@ def create_app(
                 ) if item is not None
             ],
             "follow_up": current_coach_follow_up,
+            # The web client intentionally refuses a Pi card carried only in
+            # the legacy follow_up field once a provenance decision exists.
+            # Hydrate the canonical lane as well so refresh/re-entry renders
+            # the same current card that the realtime event delivered.
+            "coach_intervention": current_coach_follow_up,
+            "semantic_follow_up": current_semantic_follow_up,
+            "coach_decision": current_coach_decision,
             "coach_history": coach_history,
+            "coach_due_items": _coach_due_work_items(
+                formal_events,
+                now_ms=time.time_ns() // 1_000_000,
+            ),
             "recent_context_history": recent_context_history,
         }
 
@@ -1542,7 +2277,7 @@ def create_app(
                 "state": "paused",
                 "label": "AI 未连接",
                 "level": None,
-                "detail": "录音和转写可继续，连接模型后恢复 AI 功能",
+                "detail": "本地实时提示可用；连接模型后恢复 Pi 和语义理解",
                 "error_class": "ProviderRuntimeNotConfiguredDeferred",
             }
         elif active_jobs:
@@ -1569,6 +2304,8 @@ def create_app(
         )
         if not coach_policy_enabled:
             projected["follow_up"] = None
+            projected["coach_intervention"] = None
+            projected["coach_decision"] = None
             projected["coach_history"] = []
         runtime["ai"]["capabilities"] = {
             "provider": {
@@ -1612,8 +2349,10 @@ def create_app(
             },
         }
         projected["runtime"] = runtime
+        projected = _clear_ended_coach_projection(projected)
         diagnostics = dict(projected.get("diagnostics") or {})
-        diagnostics["formal_ai_projection"] = "llm_first_only"
+        diagnostics["formal_ai_projection"] = "llm_first_with_strict_local_reflex"
+        diagnostics["coach_runtime_history"] = coach_runtime_history
         projected["diagnostics"] = diagnostics
         return projected
 
@@ -1712,7 +2451,32 @@ def create_app(
     recording_import_stop_event = asyncio.Event()
     app.state.recording_import_worker_task = None
     app.state.desktop_parent_watchdog_task = None
-    app.state.pi_coach_runtime = PiCoachSidecar()
+    evidence_registry_factory = (
+        (lambda meeting_id: PiEvidenceRegistry(v2_persistence, meeting_id=meeting_id))
+        if v2_persistence is not None else None
+    )
+    try:
+        app.state.pi_coach_runtime = PiCoachSidecar(
+            evidence_registry_factory=evidence_registry_factory,
+        )
+    except TypeError:
+        # Test doubles and older embedders may still expose the zero-arg
+        # sidecar constructor; production sidecars use the registry path.
+        app.state.pi_coach_runtime = PiCoachSidecar()
+    app.state.pi_coach_prewarm = {
+        "attempted": False,
+        "enabled": False,
+        "ready": False,
+    }
+    app.state.streaming_llm_client = None
+    app.state.realtime_llm_client = None
+    app.state.correction_llm_client = None
+    # Older integrations replace ``streaming_llm_client`` before lifespan
+    # startup (usually with a MockTransport). Keep that injection usable for
+    # every LLM lane while the caller migrates to explicit lane clients. The
+    # flag is set only when startup observes that legacy-only shape; normal
+    # startup still creates three independent pools.
+    app.state.provider_lane_legacy_client_injection = False
 
     def _recording_asset_lock(meeting_id: str) -> threading.Lock:
         with recording_asset_locks_guard:
@@ -1791,6 +2555,8 @@ def create_app(
         if normalized in {
             "microphone",
             "browser_live_mic",
+            "simulated_realtime_wav",
+            "speaker_loopback",
             "tauri_native_mic",
             "native_microphone_streaming",
         }:
@@ -1864,6 +2630,7 @@ def create_app(
     def _commit_v2_final(session_id: str, event: dict[str, Any]) -> dict[str, Any] | None:
         if v2_persistence is None:
             return None
+        speech_endpoint_at_ns = time.monotonic_ns()
         raw_segment_id = str(event.get("segment_id") or "").strip()
         text = str(event.get("text") or "").strip()
         if not raw_segment_id or not text:
@@ -1893,23 +2660,52 @@ def create_app(
         normalized_text = str(event.get("normalized_text") or text).strip()
         evidence_hash = transcript_evidence_hash(segment_id, normalized_text)
         timeline_offset_ms = max(0, int(event.get("timeline_offset_ms") or 0))
-        committed = v2_persistence.commit_final_and_enqueue(
-            meeting_id=session_id,
-            final_id=f"final:{session_id}:{segment_id}",
-            segment_id=segment_id,
-            text=text,
-            normalized_text=normalized_text,
-            started_at_ms=timeline_offset_ms + int(event.get("start_ms") or 0),
-            ended_at_ms=timeline_offset_ms + int(
-                event.get("end_ms") or event.get("received_at_ms") or 0
-            ),
-            evidence_hash=evidence_hash,
-            now_ms=time.time_ns() // 1_000_000,
-            speaker_id=(str(event["speaker_id"]) if event.get("speaker_id") is not None else None),
-            speaker_confidence=event.get("speaker_confidence"),
-            correlation_id=session_id,
-            source_track=source_track,
+        realtime_reservation_id = (
+            f"intelligence-commit:{uuid.uuid4().hex}"
+            if v2_persistence.semantic_projection_mode == "llm_first"
+            else None
         )
+        if realtime_reservation_id is not None:
+            # Reserve before the SQLite commit becomes visible so pending Pi
+            # lifecycle state remains observable across the commit/claim gap.
+            provider_lane_registry.reserve_unbound_realtime(
+                realtime_reservation_id
+            )
+        try:
+            committed = v2_persistence.commit_final_and_enqueue(
+                meeting_id=session_id,
+                final_id=f"final:{session_id}:{segment_id}",
+                segment_id=segment_id,
+                text=text,
+                normalized_text=normalized_text,
+                started_at_ms=timeline_offset_ms + int(event.get("start_ms") or 0),
+                ended_at_ms=timeline_offset_ms + int(
+                    event.get("end_ms") or event.get("received_at_ms") or 0
+                ),
+                evidence_hash=evidence_hash,
+                now_ms=time.time_ns() // 1_000_000,
+                speaker_id=(str(event["speaker_id"]) if event.get("speaker_id") is not None else None),
+                speaker_confidence=event.get("speaker_confidence"),
+                correlation_id=session_id,
+                source_track=source_track,
+            )
+        except BaseException:
+            if realtime_reservation_id is not None:
+                provider_lane_registry.release_realtime_reservation(
+                    realtime_reservation_id
+                )
+            raise
+        intelligence_job_id = committed.get("job_ids", {}).get("intelligence")
+        if realtime_reservation_id is not None:
+            if intelligence_job_id is None:
+                provider_lane_registry.release_realtime_reservation(
+                    realtime_reservation_id
+                )
+            else:
+                provider_lane_registry.replace_realtime_reservation(
+                    realtime_reservation_id,
+                    str(intelligence_job_id),
+                )
         _log.info(
             "meeting.v2.final_committed",
             session_id=session_id,
@@ -1942,6 +2738,16 @@ def create_app(
                     monotonic_ns=trace_at_ns,
                     attributes={"segment_id": segment_id},
                 )
+                # Keep the ASR endpoint as an explicit provenance boundary.
+                # ``final_committed`` is recorded after SQLite accepts the
+                # authoritative text; using a separate timestamp makes a
+                # pre-commit gap measurable without fabricating Provider time.
+                pipeline_traces.record_provenance_stage(
+                    job_id,
+                    "speech_endpoint",
+                    monotonic_ns=speech_endpoint_at_ns,
+                    attributes={"source_track": source_track},
+                )
                 pipeline_traces.observe(
                     job_id,
                     "job_queued",
@@ -1953,6 +2759,13 @@ def create_app(
                 )
             executor = getattr(app.state, "v2_executor", None)
             if executor is not None:
+                intelligence_job_id = committed["job_ids"].get("intelligence")
+                if intelligence_job_id is not None:
+                    executor.supersede_running(
+                        "intelligence",
+                        meeting_id=session_id,
+                        replacement_job_id=str(intelligence_job_id),
+                    )
                 executor.wake()
         return committed
 
@@ -2573,10 +3386,144 @@ def create_app(
         "key": None,
         "expires_at_monotonic": 0.0,
         "result": None,
+        "circuit_identity_generation": None,
     }
+    # This breaker is shared by Pi coach and direct semantic work that target
+    # the same realtime Provider identity. Correction, general LLM calls, and
+    # post-meeting lanes retain their independent availability contracts.
+    realtime_provider_circuit = RealtimeProviderCircuit(
+        failure_threshold=2,
+        cooldown_seconds=15.0,
+        # Use the application database when the production SQLite path is
+        # active. Repository-only tests intentionally retain the process-local
+        # circuit because they have no durable application store.
+        persistence=v2_persistence,
+    )
+    app.state.realtime_provider_circuit = realtime_provider_circuit
     llm_lane_locks = LaneLockRegistry()
+    provider_lane_registry = ProviderLaneRegistry(
+        realtime_max_active=_positive_provider_lane_setting(
+            "MEETING_COPILOT_PROVIDER_REALTIME_MAX_IN_FLIGHT",
+            1,
+        ),
+        deep_max_active=_positive_provider_lane_setting(
+            "MEETING_COPILOT_PROVIDER_DEEP_MAX_IN_FLIGHT",
+            1,
+        ),
+        correction_max_active=_positive_provider_lane_setting(
+            "MEETING_COPILOT_PROVIDER_CORRECTION_MAX_IN_FLIGHT",
+            1,
+        ),
+    )
     app.state.llm_lane_locks = llm_lane_locks
     app.state.llm_session_locks = llm_lane_locks._locks
+    app.state.provider_lane_registry = provider_lane_registry
+    # Compatibility for diagnostics/tests written before provider lanes were
+    # split. This object no longer performs cross-lane priority exclusion.
+    app.state.provider_priority_arbiter = provider_lane_registry
+    provider_lane_client_limits = {
+        "general": _positive_provider_lane_setting(
+            "MEETING_COPILOT_PROVIDER_GENERAL_MAX_CONNECTIONS",
+            8,
+        ),
+        "realtime": _positive_provider_lane_setting(
+            "MEETING_COPILOT_PROVIDER_REALTIME_MAX_CONNECTIONS",
+            2,
+        ),
+        "deep": _positive_provider_lane_setting(
+            "MEETING_COPILOT_PROVIDER_DEEP_MAX_CONNECTIONS",
+            2,
+        ),
+        "correction": _positive_provider_lane_setting(
+            "MEETING_COPILOT_PROVIDER_CORRECTION_MAX_CONNECTIONS",
+            1,
+        ),
+    }
+    app.state.provider_lane_client_config = {
+        lane: {
+            "max_connections": max_connections,
+            "config_source": f"MEETING_COPILOT_PROVIDER_{lane.upper()}_MAX_CONNECTIONS",
+        }
+        for lane, max_connections in provider_lane_client_limits.items()
+    }
+
+    def _provider_client_for_lane(lane: Literal["general", "realtime", "deep", "correction"]) -> Any:
+        if (
+            lane != "general"
+            and getattr(app.state, "provider_lane_legacy_client_injection", False)
+        ):
+            legacy_client = getattr(app.state, "streaming_llm_client", None)
+            if legacy_client is not None:
+                return legacy_client
+        attribute = {
+            "general": "streaming_llm_client",
+            "realtime": "realtime_llm_client",
+            "deep": "deep_llm_client",
+            "correction": "correction_llm_client",
+        }[lane]
+        client = getattr(app.state, attribute, None)
+        if client is not None:
+            return client
+        # Before lifespan startup, focused unit tests may inject only the
+        # legacy client. Production startup always creates all three pools.
+        return getattr(app.state, "streaming_llm_client", None)
+
+    app.state.provider_client_for_lane = _provider_client_for_lane
+
+    def _sync_realtime_provider_reservations() -> set[str]:
+        """Mirror open delta intelligence jobs into realtime lane state."""
+
+        if v2_persistence is None:
+            provider_lane_registry.sync_realtime_work(set())
+            return set()
+        now_ms = time.time_ns() // 1_000_000
+        open_jobs = [
+            job
+            for job in v2_persistence.list_jobs(lane="intelligence")
+            if str(job.get("id") or "")
+            and str(job.get("status") or "") in {"pending", "running", "retry_wait"}
+            and str(job.get("trigger_type") or "delta") not in {"task_due", "user_request"}
+            and (
+                str(job.get("status") or "") == "running"
+                or job.get("deadline_at_ms") is None
+                or int(job.get("deadline_at_ms") or 0) > now_ms
+            )
+        ]
+        open_job_ids = {
+            str(job.get("id") or "")
+            for job in open_jobs
+        }
+        provider_lane_registry.sync_realtime_work(open_job_ids)
+        return open_job_ids
+
+    def _sync_deep_provider_reservations() -> set[str]:
+        """Mirror open explicit/deferred jobs into the independent deep lane."""
+
+        if v2_persistence is None:
+            provider_lane_registry.sync_deep_work(set())
+            return set()
+        now_ms = time.time_ns() // 1_000_000
+        open_job_ids = {
+            str(job.get("id") or "")
+            for job in v2_persistence.list_jobs(lane="intelligence")
+            if str(job.get("id") or "")
+            and str(job.get("status") or "") in {"pending", "running", "retry_wait"}
+            and str(job.get("trigger_type") or "") in {"task_due", "user_request"}
+            # Keep a running job reserved even after its realtime deadline.
+            # Its in-process Provider call cannot be forcefully interrupted;
+            # pruning the reservation here would let correction overlap that
+            # call before the intelligence handler's ``finally`` releases it.
+            and (
+                str(job.get("status") or "") == "running"
+                or job.get("deadline_at_ms") is None
+                or int(job.get("deadline_at_ms") or 0) > now_ms
+            )
+        }
+        provider_lane_registry.sync_deep_work(open_job_ids)
+        return open_job_ids
+
+    app.state.sync_realtime_provider_reservations = _sync_realtime_provider_reservations
+    app.state.sync_deep_provider_reservations = _sync_deep_provider_reservations
 
     def _current_settings() -> dict[str, Any]:
         return SettingsPayload.model_validate(settings_usage_repo.get_settings()).model_dump(mode="json")
@@ -2615,7 +3562,12 @@ def create_app(
             completion_rate = float(completion_raw)
         except ValueError:
             return None
-        if prompt_rate < 0 or completion_rate < 0:
+        if (
+            not math.isfinite(prompt_rate)
+            or not math.isfinite(completion_rate)
+            or prompt_rate < 0
+            or completion_rate < 0
+        ):
             return None
         return prompt_rate, completion_rate
 
@@ -2754,6 +3706,15 @@ def create_app(
         if config is None:
             return
         if config.is_mock:
+            return
+        # A test/acceptance gateway may be explicitly declared unmetered. The
+        # correction lane still remains bounded by its own timeout and strict
+        # revision validator, but it does not need synthetic cost rates.
+        if (
+            purpose == "realtime_transcript_correction"
+            and str(os.environ.get("LLM_CORRECTION_PRICING_MODE") or "").strip().lower()
+            == correction_budget_policy.PRICING_MODE_UNMETERED
+        ):
             return
         rates = _llm_cost_rates()
         if rates is None:
@@ -3478,6 +4439,82 @@ def create_app(
         diagnostics["transcript_backfill"] = dict(live_record.get("transcript_backfill") or {}) or None
         return {**snapshot, "diagnostics": diagnostics}
 
+    @app.get("/v2/meetings/{meeting_id}/work-items")
+    def list_v2_agent_work_items(
+        meeting_id: str,
+        state: str | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """Expose the durable PI business state separately from event history."""
+
+        try:
+            items = _require_v2_persistence().list_agent_work_items(
+                meeting_id,
+                state=state,
+                limit=limit,
+            )
+        except MeetingDeletedError as exc:
+            raise HTTPException(status_code=410, detail=str(exc)) from exc
+        except KeyError:
+            raise HTTPException(status_code=404, detail="meeting not found") from None
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"meeting_id": meeting_id, "items": items}
+
+    @app.patch("/v2/meetings/{meeting_id}/work-items/{work_item_id}")
+    def update_v2_agent_work_item(
+        meeting_id: str,
+        work_item_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            item = _require_v2_persistence().update_agent_work_item_state(
+                meeting_id=meeting_id,
+                work_item_id=work_item_id,
+                state=str(payload.get("state") or payload.get("action") or "").strip().lower(),
+                now_ms=time.time_ns() // 1_000_000,
+                expected_version=(
+                    int(payload["expected_version"])
+                    if payload.get("expected_version") is not None
+                    else None
+                ),
+                failure_reason=(
+                    str(payload.get("failure_reason") or "").strip() or None
+                ),
+            )
+        except MeetingDeletedError as exc:
+            raise HTTPException(status_code=410, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"work_item": item}
+
+    @app.get("/v2/meetings/{meeting_id}/acceptance-evidence")
+    def get_v2_meeting_acceptance_evidence(
+        meeting_id: str,
+        max_segments: int = 10_000,
+        max_events: int = 10_000,
+    ) -> dict[str, Any]:
+        """Return one revision-pinned bundle for acceptance and replay tools."""
+
+        try:
+            capture = _require_v2_persistence().capture_acceptance_evidence(
+                meeting_id,
+                max_segments=max_segments,
+                max_events=max_events,
+            )
+        except KeyError:
+            raise HTTPException(status_code=404, detail="meeting not found") from None
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        # Return the captured payload unchanged: mutating or enriching rows
+        # after the read transaction would invalidate ``capture_sha256`` and
+        # could mix a newer job/Provider view into the pinned revision.
+        return capture
+
     @app.get("/v2/meetings/{meeting_id}/transcript")
     def get_v2_meeting_transcript(
         meeting_id: str,
@@ -3728,6 +4765,61 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {"message": message}
+
+    @app.post("/v2/meetings/{meeting_id}/coach/request", status_code=202)
+    async def request_v2_realtime_coach(
+        meeting_id: str,
+        payload: dict[str, Any],
+        request: Request,
+    ) -> dict[str, Any]:
+        """Queue an explicit Pi coach request against the current live evidence."""
+
+        user_request = " ".join(str(payload.get("request") or payload.get("user_request") or "").split())
+        if not user_request:
+            raise HTTPException(status_code=422, detail="request must not be empty")
+        if len(user_request) > 4_000:
+            raise HTTPException(status_code=422, detail="request must not exceed 4000 characters")
+        request_key = str(request.headers.get("idempotency-key") or "").strip()
+        if not request_key:
+            request_key = f"generated:{uuid.uuid4().hex}"
+        idempotency_key = f"api.coach.request:{meeting_id}:{request_key}"
+        try:
+            config = llm_service.LlmConfig.from_env()
+        except (TypeError, ValueError):
+            config = None
+        if config is None:
+            raise HTTPException(status_code=409, detail="实时教练尚未连接模型 Provider")
+        try:
+            job = await asyncio.to_thread(
+                _require_v2_persistence().enqueue_user_coach_request,
+                meeting_id=meeting_id,
+                user_request=user_request,
+                idempotency_key=idempotency_key,
+                now_ms=time.time_ns() // 1_000_000,
+            )
+        except KeyError:
+            raise HTTPException(status_code=404, detail="meeting not found") from None
+        except ValueError as exc:
+            detail = str(exc)
+            status_code = 409 if any(
+                marker in detail
+                for marker in (
+                    "not live",
+                    "还没有可供教练分析",
+                    "尚未形成可验证的语义段落",
+                    "requires llm_first",
+                )
+            ) else 422
+            raise HTTPException(status_code=status_code, detail=detail) from exc
+        executor = getattr(app.state, "v2_executor", None)
+        if executor is not None:
+            executor.wake("intelligence")
+        return {
+            "job": job,
+            "meeting_id": meeting_id,
+            "trigger_type": "user_request",
+            "accepted": True,
+        }
 
     @app.post("/v2/meetings/{meeting_id}/ask/stream")
     async def stream_v2_ask_ai(meeting_id: str, payload: dict[str, Any]) -> StreamingResponse:
@@ -4214,9 +5306,26 @@ def create_app(
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         jobs = persistence.list_jobs(meeting_id=meeting_id)
+        ended_intelligence_ids = {
+            str(job["id"])
+            for job in jobs
+            if job.get("kind") == "intelligence"
+        }
+        running_intelligence_ids = {
+            str(job["id"])
+            for job in jobs
+            if job.get("kind") == "intelligence"
+            and job.get("status") == "running"
+        }
+        for job_id in ended_intelligence_ids - running_intelligence_ids:
+            provider_lane_registry.release_realtime_reservation(job_id)
+        _sync_realtime_provider_reservations()
         executor = getattr(app.state, "v2_executor", None)
         if executor is not None:
             executor.wake()
+            # The end transaction may have cancelled the realtime lane while
+            # the correction consumer is asleep on its lane-specific event.
+            executor.wake("correction")
         return {
             "meeting": meeting,
             "snapshot": _decorate_v2_snapshot(persistence.get_snapshot(meeting_id), meeting_id),
@@ -4921,10 +6030,31 @@ def create_app(
 
     @app.get("/providers/status")
     def provider_status() -> dict[str, Any]:
-        return provider_config_runtime.get_status().to_dict()
+        llm_config = llm_service.LlmConfig.from_env()
+        runtime_status = provider_config_runtime.get_status(llm_config).to_dict()
+        circuit = realtime_provider_circuit.snapshot(
+            _realtime_provider_identity(llm_config)
+        ).to_dict()
+        probe_ready = runtime_status.get("realtime_ready")
+        circuit_open = circuit.get("state") != "closed"
+        runtime_status["realtime_probe_ready"] = probe_ready
+        runtime_status["realtime_ready"] = (
+            bool(probe_ready) and not circuit_open
+            if probe_ready is not None
+            else probe_ready
+        )
+        runtime_status["realtime_readiness_reason"] = (
+            str(circuit.get("reason") or "realtime_provider_unavailable")
+            if circuit_open
+            else "probe_ready"
+            if probe_ready is True
+            else "probe_not_ready"
+        )
+        return {**runtime_status, "realtime_circuit": circuit}
 
     def _web_provider_config_response(*, errors: list[str] | None = None) -> dict[str, Any]:
         config = llm_service.LlmConfig.from_env()
+        provider_meta = llm_service.provider_metadata(config)
         runtime_status = provider_config_runtime.get_status(config).to_dict()
         response_errors = list(errors or [])
         configured_error = getattr(app.state, "web_provider_config_error", None)
@@ -4937,6 +6067,13 @@ def create_app(
             "base_url": config.base_url if config is not None else None,
             "model": config.model if config is not None else None,
             "realtime_model": config.realtime_model if config is not None else None,
+            "realtime_model_source": provider_meta["realtime_model_source"],
+            "realtime_model_explicit": provider_meta["realtime_model_explicit"],
+            "realtime_model_warning": provider_meta["realtime_model_warning"],
+            "correction_model": config.correction_model if config is not None else None,
+            "correction_model_source": provider_meta["correction_model_source"],
+            "correction_model_explicit": provider_meta["correction_model_explicit"],
+            "correction_model_warning": provider_meta["correction_model_warning"],
             "api_style": config.api_style if config is not None else None,
             "provider_label": (
                 llm_service.provider_identifier(config)
@@ -4966,14 +6103,22 @@ def create_app(
                 },
             )
         current = llm_service.LlmConfig.from_env()
+        supplied_key = payload.api_key.get_secret_value().strip() if payload.api_key is not None else ""
         try:
             stored = store.load()
         except (OSError, ValueError) as exc:
-            raise HTTPException(
-                status_code=422,
-                detail={"error": "invalid_provider_config", "message": "本地 AI 配置无效，请重新保存"},
-            ) from exc
-        supplied_key = payload.api_key.get_secret_value().strip() if payload.api_key is not None else ""
+            # A previous version could persist provider metadata without the
+            # secret. An explicit replacement key is sufficient to repair that
+            # record; callers that omit a key still receive the actionable
+            # validation error instead of silently falling back to an invalid
+            # stored record.
+            if supplied_key:
+                stored = None
+            else:
+                raise HTTPException(
+                    status_code=422,
+                    detail={"error": "invalid_provider_config", "message": "本地 AI 配置无效，请重新保存"},
+                ) from exc
         api_key = supplied_key or (
             str(stored["api_key"]) if stored is not None else (current.api_key if current is not None else "")
         )
@@ -4983,11 +6128,22 @@ def create_app(
                 detail={"error": "api_key_required", "message": "请输入 API Key"},
             )
         try:
+            correction_model = payload.correction_model
+            # Older Web clients do not know this field. Preserve an existing
+            # explicit correction selection when such a client edits only the
+            # general/realtime settings; an explicit JSON null still clears it.
+            if (
+                "correction_model" not in getattr(payload, "model_fields_set", set())
+                and stored is not None
+                and stored.get("correction_model")
+            ):
+                correction_model = str(stored["correction_model"])
             metadata = llm_service.configure_runtime(
                 base_url=payload.base_url,
                 api_key=api_key,
                 model=payload.model,
                 realtime_model=payload.realtime_model,
+                correction_model=correction_model,
                 provider_label=payload.provider_label,
                 api_style=payload.api_style,
             )
@@ -4999,7 +6155,20 @@ def create_app(
                     "base_url": config.base_url,
                     "api_key": config.api_key,
                     "model": config.model,
-                    "realtime_model": config.realtime_model,
+                    "realtime_model": (
+                        config.realtime_model
+                        if config.realtime_model_source
+                        != llm_service.REALTIME_MODEL_SOURCE_FALLBACK
+                        else None
+                    ),
+                    "realtime_model_source": config.realtime_model_source,
+                    "correction_model": (
+                        config.correction_model
+                        if config.correction_model_source
+                        != llm_service.CORRECTION_MODEL_SOURCE_FALLBACK
+                        else None
+                    ),
+                    "correction_model_source": config.correction_model_source,
                     "provider_label": config.provider_label,
                     "api_style": config.api_style,
                 }
@@ -5014,6 +6183,9 @@ def create_app(
                 status_code=422,
                 detail={"error": "invalid_provider_config", "message": "AI 配置保存失败，请检查地址、模型和密钥"},
             ) from None
+        executor = getattr(app.state, "v2_executor", None)
+        if executor is not None:
+            executor.resume()
         return {**_web_provider_config_response(), **metadata, "command_status": "ok"}
 
     @app.delete("/providers/config")
@@ -5042,10 +6214,33 @@ def create_app(
     def providers_health() -> dict[str, Any]:
         llm_config = llm_service.LlmConfig.from_env()
         llm_meta = llm_service.provider_metadata(llm_config)
+        llm_runtime_status = provider_config_runtime.get_status(llm_config).to_dict()
+        realtime_circuit = realtime_provider_circuit.snapshot(
+            _realtime_provider_identity(llm_config)
+        ).to_dict()
+        probe_realtime_ready = llm_runtime_status.get("realtime_ready")
+        circuit_open = realtime_circuit.get("state") != "closed"
+        effective_realtime_ready = (
+            bool(probe_realtime_ready) and not circuit_open
+            if probe_realtime_ready is not None
+            else probe_realtime_ready
+        )
         realtime_asr_providers = _realtime_asr_providers()
         batch_file_asr_available = batch_transcribe.is_available()
         resident_file_asr_available = asr_refiner.refinement_capability().get("status") == "ready"
         file_asr_available = batch_file_asr_available or resident_file_asr_available
+        degradation_status = get_degradation_controller().to_status_dict()
+        if realtime_circuit.get("state") != "closed":
+            degradation_status = {
+                **degradation_status,
+                "level": max(1, int(degradation_status.get("level") or 0)),
+                "label": "AI 实时通道暂不可用",
+                "reason": str(
+                    realtime_circuit.get("reason") or "realtime_provider_unavailable"
+                ),
+                "can_generate_suggestions": False,
+                "can_call_llm": False,
+            }
         return {
             "schema_version": "provider_health.v1",
             "llm": {
@@ -5053,10 +6248,48 @@ def create_app(
                 "provider": str(llm_meta.get("provider") or "not_configured"),
                 "model": str(llm_meta.get("model") or "not_called"),
                 "realtime_model": str(llm_meta.get("realtime_model") or "not_called"),
+                "realtime_model_source": str(
+                    llm_meta.get("realtime_model_source") or "not_configured"
+                ),
+                "realtime_model_explicit": bool(
+                    llm_meta.get("realtime_model_explicit", False)
+                ),
+                "realtime_model_warning": llm_meta.get("realtime_model_warning"),
+                "correction_model": str(llm_meta.get("correction_model") or "not_called"),
+                "correction_model_source": str(
+                    llm_meta.get("correction_model_source") or "not_configured"
+                ),
+                "correction_model_explicit": bool(
+                    llm_meta.get("correction_model_explicit", False)
+                ),
+                "correction_model_warning": llm_meta.get("correction_model_warning"),
                 "api_style": str(llm_meta.get("api_style") or "not_configured"),
                 "is_mock": bool(llm_meta.get("is_mock", False)),
                 "credential_configured": llm_config is not None,
+                # Keep health self-contained for preflight clients that cannot
+                # reach the separate status route during a transient startup.
+                "runtime_synced": bool(llm_runtime_status.get("runtime_synced")),
+                "probe_status": llm_runtime_status.get("probe_status", "not_run"),
+                "operational": llm_runtime_status.get("operational"),
+                # A successful tiny probe is not enough to claim the shared
+                # realtime lane is usable after its circuit has opened.
+                "realtime_ready": effective_realtime_ready,
+                "realtime_probe_ready": probe_realtime_ready,
+                "realtime_readiness_reason": (
+                    str(realtime_circuit.get("reason") or "realtime_provider_unavailable")
+                    if circuit_open
+                    else "probe_ready"
+                    if probe_realtime_ready is True
+                    else "probe_not_ready"
+                ),
+                "probe_latency_ms": llm_runtime_status.get("probe_latency_ms"),
+                "probe_usage": llm_runtime_status.get("probe_usage"),
+                "realtime_cutoff_ms": llm_runtime_status.get(
+                    "realtime_cutoff_ms",
+                    REALTIME_COACH_SOFT_CUTOFF_MS,
+                ),
             },
+            "realtime_circuit": realtime_circuit,
             "asr": {
                 "file_provider": (
                     "local_funasr_batch"
@@ -5080,7 +6313,7 @@ def create_app(
                 "remote_asr_default_enabled": False,
                 "raw_audio_uploaded_by_default": False,
             },
-            "degradation": get_degradation_controller().to_status_dict(),
+            "degradation": degradation_status,
         }
 
     @app.get("/v2/diagnostics/bundle")
@@ -5205,6 +6438,81 @@ def create_app(
             },
         }
 
+    @app.post("/providers/asr/prewarm")
+    def prewarm_asr_refiner(request: Request) -> dict[str, Any]:
+        """Explicitly restore the configured offline refiner for local replay.
+
+        The refiner may be unloaded after a long idle period even when the
+        policy is ``prewarm``. This endpoint is deliberately local-only and
+        verification-gated so a replay harness can restore the declared
+        runtime contract without exposing a remote process-control API.
+        """
+
+        verification_header = request.headers.get("x-meeting-copilot-verification")
+        origin = request.headers.get("origin")
+        origin_host = str(urlsplit(origin).hostname or "") if origin else ""
+        if verification_header != "1" or origin_host not in {"127.0.0.1", "localhost", "::1", ""}:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "ok": False,
+                    "error": "local_verification_required",
+                    "message": "需要本地验证头",
+                },
+            )
+
+        policy = asr_refiner.realtime_refiner_policy()
+        if not bool(policy.get("prewarm_enabled")):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "ok": False,
+                    "error": "refiner_prewarm_disabled",
+                    "message": "当前 ASR 精修策略未启用预热",
+                    "policy": policy,
+                },
+            )
+        capability = asr_refiner.refinement_capability()
+        if capability.get("status") != "ready":
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "ok": False,
+                    "error": "refiner_unavailable",
+                    "message": "离线 ASR 精修组件不可用",
+                },
+            )
+        try:
+            started = bool(asr_refiner.prewarm_refiner_worker())
+        except Exception as exc:  # pragma: no cover - defensive process boundary
+            _log.warning("asr.refiner.prewarm.failed", error_type=type(exc).__name__)
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "ok": False,
+                    "error": "refiner_prewarm_failed",
+                    "message": "离线 ASR 精修进程启动失败",
+                },
+            ) from None
+        worker = asr_refiner.refiner_worker_status()
+        healthy = all(bool(worker.get(field)) for field in ("spawned", "process_running", "process_ready"))
+        if not healthy:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "ok": False,
+                    "error": "refiner_not_ready",
+                    "message": "离线 ASR 精修进程未达到 ready 状态",
+                    "started": started,
+                },
+            )
+        return {
+            "ok": True,
+            "started": started,
+            "policy": policy,
+            "worker": worker,
+        }
+
     @app.get("/degradation/status")
     def degradation_status() -> dict[str, Any]:
         return get_degradation_controller().to_status_dict()
@@ -5244,12 +6552,15 @@ def create_app(
                     "message": "Mock LLM不被接受，请使用真实LLM配置",
                 },
             )
+        # The live coach circuit is keyed by the effective realtime config.
+        # Probing the general model identity used to leave the realtime-model
+        # identity open after a successful probe, so the next Pi job was
+        # incorrectly protected-silent despite the probe passing.
+        probe_config = llm_service.realtime_config(config)
+        realtime_provider_identity = _realtime_provider_identity(probe_config)
         cache_key = (
-            config.base_url,
-            config.model,
-            config.realtime_model,
-            llm_service.provider_identifier(config),
-            llm_service.runtime_config_generation(),
+            *realtime_provider_identity,
+            str(llm_service.runtime_config_generation()),
         )
         lane_lease = llm_lane_locks.try_acquire("provider_probe", "probe")
         if lane_lease is None:
@@ -5265,32 +6576,46 @@ def create_app(
         try:
             now = time.monotonic()
             _enforce_llm_budget("provider_probe", purpose="provider_probe", config=config)
+            circuit_before_probe = realtime_provider_circuit.snapshot(
+                realtime_provider_identity
+            )
             if (
                 provider_probe_cache.get("key") == cache_key
                 and float(provider_probe_cache.get("expires_at_monotonic") or 0.0) > now
                 and isinstance(provider_probe_cache.get("result"), dict)
+                and circuit_before_probe.state == "closed"
+                and circuit_before_probe.failure_count == 0
+                and provider_probe_cache.get("circuit_identity_generation")
+                == circuit_before_probe.identity_generation
             ):
                 cached_result = dict(provider_probe_cache["result"])
                 cached_result["ok"] = True
                 cached_result["cached"] = True
-                provider_config_runtime.mark_probe_succeeded(config)
+                _mark_provider_probe_succeeded(config, cached_result)
                 return cached_result
-            probe_config = llm_service.realtime_config(config)
-            result = llm_service.probe_gateway(probe_config)
+            probe_started_at_ns = time.monotonic_ns()
+            result = _provider_probe_result_with_readiness(
+                llm_service.probe_gateway(probe_config),
+                fallback_latency_ms=_elapsed_milliseconds(probe_started_at_ns),
+            )
             _record_llm_usage(
                 "provider_probe",
                 purpose="provider_probe",
                 config=probe_config,
                 usage=dict(result.get("usage") or {}),
             )
+            circuit_after_probe = realtime_provider_circuit.record_probe_success(
+                realtime_provider_identity
+            )
             provider_probe_cache.update(
                 {
                     "key": cache_key,
                     "expires_at_monotonic": now + 60.0,
                     "result": dict(result),
+                    "circuit_identity_generation": circuit_after_probe.identity_generation,
                 }
             )
-            provider_config_runtime.mark_probe_succeeded(config)
+            _mark_provider_probe_succeeded(config, result)
             return {
                 "ok": True,
                 **result,
@@ -5299,6 +6624,13 @@ def create_app(
             provider_config_runtime.mark_probe_failed(config)
             if isinstance(exc, HTTPException):
                 raise
+            failure_class = classify_realtime_provider_failure(exc)
+            if failure_class is not None:
+                realtime_provider_circuit.record_probe_failure(
+                    realtime_provider_identity,
+                    failure_class,
+                    retry_after_ms=_realtime_retry_after_ms(exc),
+                )
             status_code = getattr(exc, "status_code", None)
             provider_code = getattr(exc, "provider_code", None)
             _log.warning(
@@ -5354,6 +6686,9 @@ def create_app(
                 api_key=payload.api_key.get_secret_value(),
                 model=payload.model,
                 realtime_model=payload.realtime_model,
+                realtime_model_source=payload.realtime_model_source,
+                correction_model=payload.correction_model,
+                correction_model_source=payload.correction_model_source,
                 provider_label=payload.provider_label,
                 api_style=payload.api_style,
             )
@@ -5363,6 +6698,9 @@ def create_app(
                 detail={"error": "invalid_provider_config", "message": str(exc)},
             ) from None
         runtime_status = provider_config_runtime.get_status().to_dict()
+        executor = getattr(app.state, "v2_executor", None)
+        if executor is not None:
+            executor.resume()
         return {
             **runtime_status,
             "runtime_override": True,
@@ -5479,6 +6817,7 @@ def create_app(
             native_capture_epoch = int(websocket.query_params.get("capture_epoch") or 0)
         except (TypeError, ValueError):
             native_capture_epoch = -1
+        emit_transport_ready = websocket.query_params.get("transport_handshake") == "1"
         native_source = str(audio_source or "").strip().lower() in {
             "tauri_native_mic",
             "native_microphone_streaming",
@@ -5595,6 +6934,25 @@ def create_app(
             capture_started = False
             capture_recording = None
 
+        def seal_capture(metadata: dict[str, Any]) -> dict[str, Any] | None:
+            """Stop lease heartbeats before sealing the terminal recording row.
+
+            The audio writer is sealed in a worker thread while the heartbeat
+            task remains on the websocket event loop. Marking the capture
+            inactive first closes the small race where a heartbeat wakes after
+            a successful END seal and mistakes the already-released lease for
+            an active capture failure. Keep ``capture_recording`` intact so
+            later transcript commits retain the epoch/timeline metadata.
+            """
+
+            nonlocal capture_started
+            capture_started = False
+            return _seal_v2_recording(
+                session_id,
+                metadata,
+                lease_owner=capture_lease_owner,
+            )
+
         async def heartbeat_capture() -> None:
             while True:
                 await asyncio.sleep(recording_capture_lease_ms / 3 / 1_000)
@@ -5608,6 +6966,11 @@ def create_app(
                     track_id=(str(capture_recording.get("track")) if capture_recording else native_track_id),
                     epoch=(int(capture_recording.get("epoch") or 0) if capture_recording else int(native_capture_epoch or 0)),
                 )
+                # END seals the recording in a worker thread. That callback
+                # can finish while this heartbeat is in flight; the false
+                # result then describes a terminal row, not a lost lease.
+                if not capture_started:
+                    return
                 if not renewed:
                     _log.error(
                         "meeting.recording.capture_lease_lost",
@@ -5640,11 +7003,7 @@ def create_app(
                 ),
                 "on_audio_recording_started": begin_capture,
                 "on_audio_recording_setup_failed": abort_capture_setup,
-                "on_audio_recording_sealed": lambda metadata: _seal_v2_recording(
-                    session_id,
-                    metadata,
-                    lease_owner=capture_lease_owner,
-                ),
+                "on_audio_recording_sealed": seal_capture,
                 "audio_asset_lock": _recording_asset_lock(session_id),
             }
             if not degradation.can_run_asr():
@@ -5658,6 +7017,7 @@ def create_app(
                     pcm_protocol=pcm_protocol,
                     native_track_id=native_track_id,
                     native_capture_epoch=native_capture_epoch,
+                    emit_transport_ready=emit_transport_ready,
                     **common_recording_callbacks,
                 )
                 return
@@ -5699,6 +7059,7 @@ def create_app(
                 pcm_protocol=pcm_protocol,
                 native_track_id=native_track_id,
                 native_capture_epoch=native_capture_epoch,
+                emit_transport_ready=emit_transport_ready,
                 **common_recording_callbacks,
             )
         finally:
@@ -6638,10 +7999,11 @@ def create_app(
         finally:
             lane_lease.release()
 
-    @app.post("/live/asr/sessions/{session_id}/realtime-corrections/run-once")
-    def run_asr_live_session_realtime_corrections_once(
+    async def _run_asr_live_session_realtime_corrections_async(
         session_id: str,
         payload: RunRealtimeCorrectionsRequest,
+        *,
+        provider_runner: Any | None = None,
     ) -> dict[str, Any]:
         record = _get_asr_live_record_for_derivation(session_id)
         if not _current_settings()["asr"]["l2_correction_enabled"]:
@@ -6674,25 +8036,67 @@ def create_app(
                 "transcript_revisions": [],
                 "no_revision_segment_ids": [],
             }
+        provider_lease = provider_lane_registry.try_acquire_correction()
+        if provider_lease is None:
+            lane_lease.release()
+            record = _get_asr_live_record_for_derivation(session_id)
+            return {
+                "session_id": session_id,
+                "called": False,
+                "gate": {
+                    "eligible": False,
+                    "reason": "correction_lane_at_capacity",
+                    "policy_version": realtime_transcript_correction.POLICY_VERSION,
+                },
+                "status": dict(record.get("realtime_transcript_correction") or {}),
+                "revision_count": 0,
+                "transcript_revisions": [],
+                "no_revision_segment_ids": [],
+            }
         try:
             record = _get_asr_live_record_for_derivation(session_id)
             blockers = _realtime_correction_blockers(record)
             if blockers:
-                raise HTTPException(
+                blocker_error = HTTPException(
                     status_code=409,
                     detail=f"ASR live session {session_id} is not eligible for realtime correction; blockers: {', '.join(blockers)}",
                 )
+                # Keep the route's existing 409 detail, while giving the
+                # durable handler a bounded, secret-free classification.
+                blocker_error.blockers = tuple(blockers)
+                blocker_error.durable_error_class = _correction_blocker_error_code_for_blockers(blockers)
+                raise blocker_error
             config = llm_service.LlmConfig.from_env()
             if config is None:
                 raise HTTPException(
                     status_code=422,
                     detail="Realtime correction requires LLM_GATEWAY_BASE_URL / LLM_GATEWAY_API_KEY",
                 )
-            config = llm_service.realtime_config(config)
+            config = llm_service.correction_config(config)
             _ensure_llm_provider_allowed_for_derivation(config, allow_non_acceptance_execution=False)
+            correction_pricing = correction_budget_policy.correction_pricing_decision(
+                is_mock=config.is_mock
+            )
+            if not correction_pricing.allowed:
+                _log.warning(
+                    "realtime.correction.disabled",
+                    session_id=session_id,
+                    reason=correction_pricing.reason,
+                    pricing_mode=correction_pricing.pricing_mode,
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "error": correction_pricing.reason,
+                        "purpose": "realtime_transcript_correction",
+                        "pricingMode": correction_pricing.pricing_mode,
+                    },
+                )
             audit_metadata = llm_service.provider_audit_metadata(
                 config,
                 purpose="realtime_transcript_correction",
+                provider_lane="correction",
+                model_source=str(config.correction_model_source),
             )
             _enforce_llm_budget(
                 session_id,
@@ -7008,12 +8412,40 @@ def create_app(
             final_events = realtime_transcript_correction.final_events_for_segment_ids(record, segment_ids)
             indexed_batch = realtime_transcript_correction.encode_indexed_batch(final_events)
             _metrics.metrics.inc("llm_calls", 1)
+            abort_handle = llm_service.ProviderAbortHandle()
             try:
-                corrected_batch, usage, degraded = asr_correct.correct_transcript(
-                    indexed_batch,
-                    replace(config, timeout_seconds=min(config.timeout_seconds, 25.0), max_retries=0),
-                    raise_on_failure=True,
+                correction_config = replace(
+                    config,
+                    timeout_seconds=min(
+                        config.timeout_seconds,
+                        REALTIME_CORRECTION_PROVIDER_TIMEOUT_SECONDS,
+                    ),
+                    max_retries=0,
                 )
+                if provider_runner is None:
+                    async_provider_client = llm_service.AsyncHttpxLlmClient(
+                        client=_provider_client_for_lane("correction"),
+                        api_style=correction_config.api_style,
+                    )
+                    try:
+                        corrected_batch, usage, degraded = await asr_correct.async_correct_transcript(
+                            indexed_batch,
+                            correction_config,
+                            client=async_provider_client,
+                            abort=abort_handle,
+                            raise_on_failure=True,
+                        )
+                    finally:
+                        await async_provider_client.aclose()
+                else:
+                    legacy_result = provider_runner(
+                        indexed_batch,
+                        correction_config,
+                        raise_on_failure=True,
+                    )
+                    if inspect.isawaitable(legacy_result):
+                        legacy_result = await legacy_result
+                    corrected_batch, usage, degraded = legacy_result
                 if degraded:
                     raise RuntimeError("strict realtime correction returned a degraded fallback")
                 _record_llm_usage(
@@ -7022,10 +8454,22 @@ def create_app(
                     config=config,
                     usage=usage,
                 )
+            except asyncio.CancelledError:
+                # A durable supersede/deadline cancellation must not release
+                # the shared Provider lease until the async transport confirms
+                # that its local request context has unwound. This is a local
+                # ACK, not a claim that the remote gateway stopped billing.
+                abort_handle.request_abort("job_cancelled")
+                try:
+                    await asyncio.shield(abort_handle.wait_abort_ack(timeout=1.0))
+                except (asyncio.CancelledError, TimeoutError):
+                    pass
+                raise
             except Exception as exc:
                 completed_at_ms = int(time.time() * 1_000)
                 provider_retryable = bool(getattr(exc, "retryable", False))
                 terminal_failure_threshold = 2 if provider_retryable else 1
+                provider_error_code = _realtime_correction_provider_error_code(exc)
 
                 def commit_provider_failure(latest: dict[str, Any]) -> dict[str, Any]:
                     existing = dict(latest.get("realtime_transcript_correction") or {})
@@ -7060,7 +8504,7 @@ def create_app(
                         status="provider_failed",
                         completed_at_ms=completed_at_ms,
                         usage={},
-                        error_code="realtime_correction_provider_failed",
+                        error_code=provider_error_code,
                         **audit_metadata,
                         degraded=True,
                         fallback=True,
@@ -7072,6 +8516,7 @@ def create_app(
                 terminal_segment_ids = set(failed_status.get("terminal_failed_segment_ids") or [])
                 raise RealtimeCorrectionProviderError(
                     retryable=(provider_retryable and not set(segment_ids).issubset(terminal_segment_ids)),
+                    durable_error_class=provider_error_code,
                 ) from exc
             decoded = realtime_transcript_correction.decode_indexed_batch(corrected_batch, final_events)
             batch_at_ms = max((int(event.get("at_ms") or 0) for event in final_events), default=0)
@@ -7276,9 +8721,32 @@ def create_app(
                 "no_revision_segment_ids": no_revision_segment_ids,
             }
         finally:
+            provider_lease.release()
             lane_lease.release()
 
+    def run_asr_live_session_realtime_corrections_once(
+        session_id: str,
+        payload: RunRealtimeCorrectionsRequest,
+    ) -> dict[str, Any]:
+        """Compatibility facade for synchronous API/tests and old callers."""
+
+        return _run_coroutine_sync(
+            _run_asr_live_session_realtime_corrections_async(
+                session_id,
+                payload,
+                provider_runner=asr_correct.correct_transcript,
+            )
+        )
+
+    @app.post("/live/asr/sessions/{session_id}/realtime-corrections/run-once")
+    def run_asr_live_session_realtime_corrections_once_route(
+        session_id: str,
+        payload: RunRealtimeCorrectionsRequest,
+    ) -> dict[str, Any]:
+        return run_asr_live_session_realtime_corrections_once(session_id, payload)
+
     app.state.run_asr_live_session_realtime_corrections_once = run_asr_live_session_realtime_corrections_once
+    app.state.run_asr_live_session_realtime_corrections_once_async = _run_asr_live_session_realtime_corrections_async
 
     def _get_asr_live_record_for_derivation(session_id: str) -> dict[str, Any]:
         try:
@@ -8841,6 +10309,67 @@ def create_app(
             attributes=attributes,
         )
 
+    def _record_v2_provenance_stage(
+        job: Mapping[str, Any],
+        stage: str,
+        *,
+        status: str = "observed",
+        reason: str | None = None,
+        monotonic_ns: int | None = None,
+        attributes: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Record one content-free W0 stage without affecting product work."""
+
+        job_id = str(job.get("id") or "").strip()
+        meeting_id = str(job.get("meeting_id") or "").strip()
+        if not job_id or not meeting_id:
+            return
+        try:
+            trace = pipeline_traces.create(
+                trace_id=job_id,
+                meeting_id=meeting_id,
+                job_id=job_id,
+                generation_id=str(job.get("generation_id") or "") or None,
+            )
+            trace.record_provenance_stage(
+                stage,
+                status=status,
+                reason=reason,
+                monotonic_ns=monotonic_ns,
+                attributes=attributes,
+            )
+        except (KeyError, TypeError, ValueError):
+            _log.debug(
+                "meeting.v2.provenance_stage_update_skipped",
+                job_id=job_id,
+                stage=stage,
+                error_class="trace_update_rejected",
+            )
+
+    async def _enqueue_latest_v2_intelligence_after_supersession(
+        job: dict[str, Any],
+    ) -> None:
+        if v2_persistence is None:
+            return
+        meeting_id = str(job["meeting_id"])
+        replacement = await asyncio.to_thread(
+            v2_persistence.enqueue_latest_intelligence,
+            meeting_id=meeting_id,
+            superseded_job_id=str(job["id"]),
+            now_ms=time.time_ns() // 1_000_000,
+        )
+        executor = getattr(app.state, "v2_executor", None)
+        if replacement is not None and executor is not None:
+            executor.wake("intelligence")
+        _log.info(
+            "meeting.v2.intelligence_evidence_superseded",
+            meeting_id=meeting_id,
+            job_id=str(job["id"]),
+            replacement_job_id=(
+                str(replacement["id"]) if replacement is not None else None
+            ),
+        )
+
     def _bounded_v2_correction_job_output(
         job: dict[str, Any],
         result: dict[str, Any],
@@ -8877,32 +10406,86 @@ def create_app(
             "v2_reconciliation": reconciliation,
         }
 
-    async def _default_v2_intelligence_job_handler(job: dict[str, Any]) -> dict[str, Any]:
-        """Run the single LLM-first semantic lane for the packaged runtime."""
+    async def _default_v2_intelligence_job_handler_core(
+        job: dict[str, Any],
+        *,
+        provider_lane_acquired: bool,
+    ) -> dict[str, Any] | None:
+        """Run local preflight or the Provider continuation for one job.
+
+        ``None`` is the private sentinel indicating that the caller must
+        acquire the realtime Provider lane. The continuation rebuilds this
+        request after waiting, so it never relies on pre-lane evidence.
+        """
 
         if v2_persistence is None:
             raise RuntimeError("V2 persistence is unavailable")
-        config = llm_service.LlmConfig.from_env()
-        if config is None:
-            raise ProviderRuntimeNotConfiguredDeferred()
-        config = llm_service.realtime_config(config)
-        _ensure_llm_provider_allowed_for_derivation(
-            config,
-            allow_non_acceptance_execution=False,
-        )
         meeting_id = str(job["meeting_id"])
+        job_id = str(job.get("id") or "").strip()
+        pipeline_traces.create(
+            trace_id=job_id,
+            meeting_id=meeting_id,
+            job_id=job_id,
+            generation_id=str(job.get("generation_id") or "") or None,
+        )
         target_id = str(job.get("evidence_segment_id") or "")
+        trigger_type = str(job.get("trigger_type") or "delta").strip()
+        if trigger_type not in {
+            "delta",
+            "transcript_delta",
+            "task_due",
+            "user_request",
+        }:
+            raise RuntimeError("intelligence job trigger type is unsupported")
         new_segments, context = _v2_intelligence_batch_segments(v2_persistence, job)
         target = next(
             (
                 segment
-                for segment in new_segments
+                for segment in (*new_segments, *context)
                 if str(segment.get("segment_id") or "") == target_id
             ),
             None,
         )
-        if not new_segments or target is None:
+        if target is None:
+            target = next(
+                (
+                    segment
+                    for segment in _v2_complete_transcript(v2_persistence, meeting_id)
+                    if str(segment.get("segment_id") or "") == target_id
+                ),
+                None,
+            )
+        if (
+            trigger_type in {"delta", "transcript_delta"} and not new_segments
+        ) or target is None:
             raise RuntimeError("intelligence evidence segment no longer exists")
+        target_transcript_seq = int(target.get("transcript_seq") or 0)
+        target_evidence_hash = str(target.get("evidence_hash") or "")
+        expected_evidence_hash = str(job.get("evidence_hash") or "")
+        target_paragraph = next(
+            (
+                paragraph
+                for paragraph in v2_persistence.list_semantic_paragraphs(
+                    meeting_id
+                ).get("paragraphs", [])
+                if target_id in {
+                    str(checkpoint_id)
+                    for checkpoint_id in paragraph.get("checkpoint_ids") or []
+                }
+            ),
+            None,
+        )
+        if (
+            target_transcript_seq != int(job.get("input_transcript_seq") or 0)
+            or not target_evidence_hash
+            or target_evidence_hash != expected_evidence_hash
+            or target_paragraph is None
+            or int(target_paragraph.get("revision") or 0)
+            != int(job.get("input_version") or 0)
+        ):
+            raise IntelligenceEvidenceSuperseded(
+                "intelligence job evidence changed before execution"
+            )
         snapshot = v2_persistence.get_snapshot(meeting_id, segment_limit=100)
         topic = snapshot.get("current_topic") or {}
         rolling_state = {
@@ -8948,6 +10531,9 @@ def create_app(
         request = RealtimeIntelligenceRequest.from_payload(
             meeting_id=meeting_id,
             state_revision=int(job.get("input_transcript_seq") or job.get("input_version") or 1),
+            trigger_type=trigger_type,
+            work_item_id=job.get("work_item_id"),
+            user_request=job.get("user_request"),
             new_paragraphs=[
                 {
                     "id": str(segment.get("segment_id") or ""),
@@ -8959,6 +10545,7 @@ def create_app(
                     "speaker_confidence": segment.get("speaker_confidence"),
                     "source_track": _v2_intelligence_source_track(segment.get("source_track")),
                     "role_hint": _v2_intelligence_role_hint(segment.get("source_track")),
+                    "correction_status": segment.get("correction_status") or "unknown",
                 }
                 for segment in new_segments
             ],
@@ -8973,6 +10560,7 @@ def create_app(
                     "speaker_confidence": segment.get("speaker_confidence"),
                     "source_track": _v2_intelligence_source_track(segment.get("source_track")),
                     "role_hint": _v2_intelligence_role_hint(segment.get("source_track")),
+                    "correction_status": segment.get("correction_status") or "unknown",
                 }
                 for segment in context
             ],
@@ -8987,6 +10575,7 @@ def create_app(
                     "speaker_confidence": segment.get("speaker_confidence"),
                     "source_track": _v2_intelligence_source_track(segment.get("source_track")),
                     "role_hint": _v2_intelligence_role_hint(segment.get("source_track")),
+                    "correction_status": segment.get("correction_status") or "unknown",
                 }
                 for segment in retrieval_segments
                 if str(segment.get("normalized_text") or segment.get("text") or "").strip()
@@ -9011,21 +10600,594 @@ def create_app(
             coach_skill_id=(preparation.preset_id if preparation is not None else "general"),
             allow_paragraph_revisions=False,
         )
+        coach_priority_mode = (
+            "deep" if trigger_type in {"user_request", "task_due"} else "realtime"
+        )
+        coach_enabled = str(
+            os.environ.get("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
+        ).strip().lower() not in {"0", "false", "off", "no"}
+        coach_runtime_requested = configured_coach_runtime()
+        local_reflex_started_at_ms = time.time_ns() // 1_000_000
+        # A coalesced job keeps the first final's hard deadline, but a local
+        # reflex must be timed from the target evidence that made the pattern
+        # actionable. FunASR can split one utterance across finals after the
+        # first 2.5-second product window has elapsed; using the job's original
+        # clock would then skip a zero-cost reflex over fresh, complete evidence.
+        local_reflex_soft_deadline_at_ms = (
+            _realtime_coach_soft_deadline_at_ms(
+                final_committed_at_ms=target.get("created_at_ms"),
+                fallback_created_at_ms=job.get("final_committed_at_ms"),
+            )
+            if coach_priority_mode == "realtime"
+            else None
+        )
+        local_reflex_candidates = (
+            realtime_coach_candidate_events(request)
+            if not provider_lane_acquired
+            and coach_enabled
+            and coach_runtime_requested == "pi"
+            and coach_priority_mode == "realtime"
+            and _pi_local_reflex_first_enabled()
+            and should_run_realtime_coach(request, requested_runtime="pi")
+            and (
+                local_reflex_soft_deadline_at_ms is None
+                or local_reflex_started_at_ms < local_reflex_soft_deadline_at_ms
+            )
+            else ()
+        )
+        local_reflex_result = (
+            build_local_reflex_intervention(
+                request,
+                local_reflex_candidates,
+                now_ms=local_reflex_started_at_ms,
+            )
+            if not provider_lane_acquired
+            else None
+        )
+        if local_reflex_result is not None:
+            local_reflex_kind = str(
+                local_reflex_result.get("local_reflex_kind") or ""
+            ).strip()
+            active_local_reflex_kind = v2_persistence.active_local_reflex_kind(
+                meeting_id,
+                now_ms=local_reflex_started_at_ms,
+            )
+            if active_local_reflex_kind == local_reflex_kind:
+                _mark_v2_job_stage(
+                    job,
+                    "validated",
+                    attributes={
+                        "revision_count": 0,
+                        "state_change_count": 0,
+                        "runtime_used": "local_reflex",
+                        "suppression_reason": "same_kind_active",
+                    },
+                )
+                return {
+                    "schema_version": "v2_realtime_intelligence_job_output.v1",
+                    "applied": False,
+                    "formal_event_context": None,
+                    "transport_mode": "local_reflex_cooldown_suppressed",
+                    "ttft_ms": None,
+                    "repair_ttft_ms": None,
+                    "provider_attempt_count": 0,
+                    "repair_attempted": False,
+                    "usage": None,
+                    "model": "deterministic_local_reflex.v1",
+                    "coach": {
+                        "enabled": True,
+                        "triggered": False,
+                        "status": "suppressed",
+                        "suppression_reason": "same_kind_active",
+                        "runtime_requested": "local_reflex",
+                        "runtime_used": "local_reflex",
+                        "local_reflex_kind": local_reflex_kind,
+                        "pi_provider_attempted": False,
+                        "intervention": None,
+                    },
+                    "semantic": {
+                        "status": "suppressed_by_active_local_reflex",
+                        "error_class": None,
+                    },
+                }
+            if active_local_reflex_kind != local_reflex_kind:
+                local_reflex_completed_at_ms = time.time_ns() // 1_000_000
+                local_reflex_result["timings"] = {
+                    "clock": "unix_epoch_ms",
+                    "started_at_ms": local_reflex_started_at_ms,
+                    "completed_at_ms": local_reflex_completed_at_ms,
+                }
+                local_reflex_result["decision_latency_ms"] = max(
+                    0.0,
+                    float(local_reflex_completed_at_ms - local_reflex_started_at_ms),
+                )
+                local_reflex_timing = _coach_decision_timing_envelope(
+                    local_reflex_result,
+                    fallback_started_at_ms=local_reflex_started_at_ms,
+                    fallback_completed_at_ms=local_reflex_completed_at_ms,
+                )
+                local_reflex_intervention = local_reflex_result.get("intervention")
+                if local_reflex_intervention is None:
+                    raise RuntimeError("local reflex result is missing its intervention")
+                intervention_payload = local_reflex_intervention.to_dict()
+                valid_until_ms = int(local_reflex_result["valid_until_ms"])
+                candidate_payloads = [
+                    candidate.to_dict() for candidate in local_reflex_candidates
+                ]
+                local_reflex_decision = {
+                    key: local_reflex_result.get(key)
+                    for key in (
+                        "provenance_version",
+                        "origin",
+                        "run_id",
+                        "decision_id",
+                        "evidence_revision",
+                        "status",
+                        "status_reason",
+                    )
+                    if local_reflex_result.get(key) is not None
+                }
+                local_reflex_decision.update(
+                    {
+                        "decision_reason": intervention_payload["why_now"],
+                        "meeting_id": meeting_id,
+                        "job_id": str(job["id"]),
+                        "runtime_requested": "local_reflex",
+                        "runtime_used": "local_reflex",
+                        "local_reflex_kind": local_reflex_kind,
+                        "fallback_error_code": None,
+                        "fallback_reason": None,
+                        "triggered": True,
+                        "pi_provider_attempted": False,
+                        "provider_reservation": None,
+                        "detected_candidate_events": candidate_payloads,
+                        "eligible_candidate_events": candidate_payloads,
+                        "cooldown_suppressed_candidate_keys": [],
+                        "candidate_events": candidate_payloads,
+                        "candidate_event": (
+                            local_reflex_candidates[0].event_type
+                            if local_reflex_candidates
+                            else None
+                        ),
+                        "candidate_key": (
+                            local_reflex_candidates[0].candidate_key
+                            if local_reflex_candidates
+                            else None
+                        ),
+                        **local_reflex_timing,
+                        "deadline_at_ms": job.get("deadline_at_ms"),
+                        "soft_deadline_at_ms": local_reflex_soft_deadline_at_ms,
+                        "delivery_status": "on_time",
+                        "late_result_discarded": False,
+                        "valid_until_ms": valid_until_ms,
+                        "lifecycle_action": "retain",
+                        "supersedes_decision_id": None,
+                        "superseded_by": None,
+                        "agent_metrics": {
+                            "decision_latency_ms": local_reflex_result[
+                                "decision_latency_ms"
+                            ],
+                        },
+                    }
+                )
+                projected_intervention = {
+                    **intervention_payload,
+                    "trigger": intervention_payload["event_type"],
+                    "next_move": intervention_payload["say_this"],
+                    **local_reflex_decision,
+                }
+                projection_response = {
+                    **RealtimeIntelligenceResponse((), None, (), None).to_dict(),
+                    "coach_intervention": projected_intervention,
+                    "coach_decision": local_reflex_decision,
+                }
+                local_reflex_event_context = {
+                    "schema_version": "local_reflex_formal_event_context.v1",
+                    "source": "local_reflex",
+                    "job_id": str(job["id"]),
+                    "batch_id": realtime_intelligence_batch_id(request),
+                    "provider": "local_reflex",
+                    "model": "deterministic_local_reflex.v1",
+                    "llm_called": False,
+                    "llm_call_status": "not_called",
+                    "origin": "local_reflex",
+                    "runtime_used": "local_reflex",
+                    "local_reflex_kind": local_reflex_kind,
+                    "pi_provider_attempted": False,
+                    "evidence": {
+                        "segment_ids": intervention_payload[
+                            "evidence_segment_ids"
+                        ],
+                        "quote": intervention_payload["evidence_quote"],
+                        "state_revision": request.state_revision,
+                        "evidence_hash": str(target.get("evidence_hash") or "")
+                        or None,
+                    },
+                }
+
+                def apply_local_reflex_in_worker() -> dict[str, Any]:
+                    return v2_persistence.apply_intelligence_response(
+                        meeting_id=meeting_id,
+                        job_id=str(job["id"]),
+                        response=projection_response,
+                        now_ms=time.time_ns() // 1_000_000,
+                        event_context=local_reflex_event_context,
+                    )
+
+                applied = await asyncio.to_thread(apply_local_reflex_in_worker)
+                applied_decision = (
+                    dict(applied["coach_decision"])
+                    if isinstance(applied.get("coach_decision"), Mapping)
+                    else local_reflex_decision
+                )
+                applied_intervention = (
+                    dict(applied["coach_intervention"])
+                    if isinstance(applied.get("coach_intervention"), Mapping)
+                    else projected_intervention
+                )
+                _mark_v2_job_stage(
+                    job,
+                    "validated",
+                    attributes={
+                        "revision_count": 0,
+                        "state_change_count": 0,
+                        "runtime_used": "local_reflex",
+                    },
+                )
+                _mark_v2_job_stage(
+                    job,
+                    "event_emitted",
+                    attributes={
+                        "state_change_count": 0,
+                        "runtime_used": "local_reflex",
+                    },
+                )
+                return {
+                    "schema_version": "v2_realtime_intelligence_job_output.v1",
+                    "applied": applied,
+                    "formal_event_context": local_reflex_event_context,
+                    "transport_mode": "local_reflex",
+                    "ttft_ms": None,
+                    "repair_ttft_ms": None,
+                    "provider_attempt_count": 0,
+                    "repair_attempted": False,
+                    "usage": None,
+                    "model": "deterministic_local_reflex.v1",
+                    "coach": {
+                        "enabled": True,
+                        "triggered": True,
+                        "status": "intervention",
+                        "ttft_ms": None,
+                        "decision_latency_ms": local_reflex_result[
+                            "decision_latency_ms"
+                        ],
+                        "usage": None,
+                        "model": "deterministic_local_reflex.v1",
+                        "runtime_requested": "local_reflex",
+                        "runtime_used": "local_reflex",
+                        "local_reflex_kind": local_reflex_kind,
+                        "fallback_error_code": None,
+                        "fallback_reason": None,
+                        "decision_reason": intervention_payload["why_now"],
+                        "agent_metrics": local_reflex_decision["agent_metrics"],
+                        "intervention": applied_intervention,
+                        **applied_decision,
+                    },
+                    "semantic": {
+                        "status": "suppressed_by_local_reflex",
+                        "error_class": None,
+                    },
+                }
+
+        if not provider_lane_acquired:
+            return None
+
+        config = llm_service.LlmConfig.from_env()
+        if config is None:
+            raise ProviderRuntimeNotConfiguredDeferred()
+        config = llm_service.realtime_config(config)
+        _ensure_llm_provider_allowed_for_derivation(
+            config,
+            allow_non_acceptance_execution=False,
+        )
+        raw_deadline_at_ms = job.get("deadline_at_ms")
+        job_deadline_at_ms = (
+            int(raw_deadline_at_ms) if raw_deadline_at_ms is not None else None
+        )
+        soft_deadline_at_ms = (
+            _realtime_coach_soft_deadline_at_ms(
+                final_committed_at_ms=job.get("final_committed_at_ms"),
+                fallback_created_at_ms=job.get("created_at_ms"),
+            )
+            if coach_priority_mode == "realtime"
+            else None
+        )
+        budget_sampled_at_ms = time.time_ns() // 1_000_000
+        initial_budget_remaining_ms, initial_provider_budget_ms = _realtime_coach_budget_ms(
+            deadline_at_ms=job_deadline_at_ms,
+            now_ms=budget_sampled_at_ms,
+            configured_timeout_seconds=min(config.timeout_seconds, 25.0),
+        )
+        if initial_budget_remaining_ms is not None and initial_budget_remaining_ms <= 0:
+            raise IntelligenceDeadlineExceeded(
+                "intelligence job reached its realtime deadline before provider work"
+            )
+        provider_timeout_seconds = max(
+            0.001,
+            min(
+                float(config.timeout_seconds),
+                initial_provider_budget_ms / 1_000,
+            ),
+        )
         provider = OpenAICompatibleStreamingProvider(
             base_url=config.base_url,
             api_key=config.api_key,
             model=config.model,
-            client=app.state.streaming_llm_client,
-            timeout_seconds=min(config.timeout_seconds, 25.0),
+            client=_provider_client_for_lane(
+                "deep" if coach_priority_mode == "deep" else "realtime"
+            ),
+            timeout_seconds=provider_timeout_seconds,
             api_style=config.api_style,
         )
 
+        # Keep one monotonic Provider-attempt sequence for the complete
+        # handler execution. Durable job retry numbers are intentionally not
+        # reused here: semantic repair, Pi, and direct fallback may each make
+        # more than one handoff inside the same durable attempt.
+        existing_attempts = pipeline_traces.get(job_id).execution_snapshot().get(
+            "provider_attempts",
+            [],
+        )
+        provider_attempt_sequence = max(
+            (
+                int(attempt.get("attempt_index") or 0)
+                for attempt in existing_attempts
+                if isinstance(attempt, Mapping)
+            ),
+            default=0,
+        )
+        provider_attempt_records: dict[int, dict[str, Any]] = {}
+        provider_attempt_context: ContextVar[tuple[int, str, str] | None] = ContextVar(
+            f"provider_attempt_context_{job_id}",
+            default=None,
+        )
+
+        def _provider_attempt_error_class(error: BaseException) -> str:
+            durable_error_class = str(
+                getattr(error, "durable_error_class", "") or ""
+            ).strip()
+            return durable_error_class or type(error).__name__ or "provider_error"
+
+        def _start_provider_attempt(branch: str, runtime: str) -> int:
+            nonlocal provider_attempt_sequence
+            provider_attempt_sequence += 1
+            attempt_index = provider_attempt_sequence
+            normalized_branch = str(branch or "unknown").strip() or "unknown"
+            normalized_runtime = str(runtime or "").strip() or None
+            pipeline_traces.record_provider_attempt(
+                job_id,
+                attempt_index,
+                branch=normalized_branch,
+                runtime=normalized_runtime,
+                monotonic_ns=time.monotonic_ns(),
+            )
+            provider_attempt_records[attempt_index] = {
+                "branch": normalized_branch,
+                "runtime": normalized_runtime,
+                "outcome": None,
+            }
+            provider_attempt_context.set(
+                (attempt_index, normalized_branch, normalized_runtime or "unknown")
+            )
+            return attempt_index
+
+        def _finish_provider_attempt(
+            attempt_index: int,
+            *,
+            error: BaseException | None = None,
+        ) -> None:
+            record = provider_attempt_records.get(attempt_index)
+            if record is None or record.get("outcome") is not None:
+                return
+            if error is None:
+                outcome = "success"
+                error_class = None
+                http_status = None
+            else:
+                outcome = classify_pipeline_failure(
+                    error,
+                    deadline_reached=isinstance(error, IntelligenceDeadlineExceeded),
+                )
+                error_class = _provider_attempt_error_class(error)
+                raw_status = getattr(error, "status_code", None)
+                http_status = raw_status if type(raw_status) is int else None
+            branch = str(record["branch"])
+            runtime = record.get("runtime")
+            pipeline_traces.record_provider_attempt_outcome(
+                job_id,
+                attempt_index,
+                outcome,
+                branch=branch,
+                runtime=runtime,
+                http_status=http_status,
+                error_class=error_class,
+                monotonic_ns=time.monotonic_ns(),
+            )
+            record["outcome"] = outcome
+
+        def _revise_validation_attempt(branch: str, *, prefer_first: bool = False) -> None:
+            candidates = [
+                (index, record)
+                for index, record in provider_attempt_records.items()
+                if record.get("branch") == branch and record.get("outcome") == "success"
+            ]
+            if not candidates:
+                return
+            index, record = candidates[0] if prefer_first else candidates[-1]
+            pipeline_traces.revise_provider_attempt_validation(
+                job_id,
+                index,
+                branch=str(record["branch"]),
+                runtime=record.get("runtime"),
+                error_class="IntelligenceResponseValidationError",
+            )
+            record["outcome"] = "validation_error"
+
+        def _finish_provider_branch(
+            branch: str,
+            *,
+            result: Mapping[str, Any] | None = None,
+            error: BaseException | None = None,
+        ) -> None:
+            if error is not None:
+                if classify_pipeline_failure(
+                    error,
+                    deadline_reached=isinstance(error, IntelligenceDeadlineExceeded),
+                ) == "validation_error":
+                    _revise_validation_attempt(branch)
+                return
+            if (
+                branch == "semantic"
+                and isinstance(result, Mapping)
+                and bool(result.get("repair_attempted"))
+            ):
+                _revise_validation_attempt(branch, prefer_first=True)
+
+        class _TracedProvider:
+            def __init__(self, delegate: Any) -> None:
+                self._delegate = delegate
+
+            async def complete(self, *args: Any, **kwargs: Any) -> Any:
+                context = provider_attempt_context.get()
+                try:
+                    result = await self._delegate.complete(*args, **kwargs)
+                except BaseException as exc:
+                    if context is not None:
+                        _finish_provider_attempt(context[0], error=exc)
+                    raise
+                if context is not None:
+                    _finish_provider_attempt(context[0])
+                return result
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._delegate, name)
+
+        class _TracedPiRuntime:
+            def __init__(self, delegate: Any) -> None:
+                self._delegate = delegate
+
+            async def evaluate(self, *args: Any, **kwargs: Any) -> Any:
+                context = provider_attempt_context.get()
+                try:
+                    result = await self._delegate.evaluate(*args, **kwargs)
+                except BaseException as exc:
+                    if context is not None:
+                        _finish_provider_attempt(context[0], error=exc)
+                    failure_metrics = (
+                        dict(getattr(exc, "metrics"))
+                        if isinstance(getattr(exc, "metrics", None), Mapping)
+                        else {}
+                    )
+                    loop_attributes: dict[str, Any] = {}
+                    for metric_name in ("turns", "tool_calls"):
+                        metric_value = failure_metrics.get(metric_name)
+                        if type(metric_value) is int and metric_value >= 0:
+                            loop_attributes[metric_name] = metric_value
+                    _record_v2_provenance_stage(
+                        job,
+                        "agent_tool_loop",
+                        status=("failed" if loop_attributes else "unavailable"),
+                        reason=(
+                            "pi_runtime_failed"
+                            if loop_attributes
+                            else "bridge_response_unavailable"
+                        ),
+                        attributes=loop_attributes,
+                    )
+                    validation_ms = failure_metrics.get("response_validation_ms")
+                    validation_attributes = (
+                        {"duration_ms": float(validation_ms)}
+                        if isinstance(validation_ms, (int, float))
+                        and not isinstance(validation_ms, bool)
+                        and math.isfinite(float(validation_ms))
+                        and float(validation_ms) >= 0
+                        else None
+                    )
+                    validation_failure = classify_pipeline_failure(exc) == "validation_error"
+                    _record_v2_provenance_stage(
+                        job,
+                        "response_validation",
+                        status=(
+                            "failed"
+                            if validation_failure
+                            else "unavailable"
+                        ),
+                        reason=(
+                            "response_rejected"
+                            if validation_failure
+                            else "bridge_response_unavailable"
+                        ),
+                        attributes=validation_attributes,
+                    )
+                    raise
+                if context is not None:
+                    _finish_provider_attempt(context[0])
+                metrics = (
+                    dict(result.get("metrics"))
+                    if isinstance(result, Mapping)
+                    and isinstance(result.get("metrics"), Mapping)
+                    else {}
+                )
+                loop_attributes = {}
+                for metric_name in ("turns", "tool_calls"):
+                    metric_value = metrics.get(metric_name)
+                    if type(metric_value) is int and metric_value >= 0:
+                        loop_attributes[metric_name] = metric_value
+                _record_v2_provenance_stage(
+                    job,
+                    "agent_tool_loop",
+                    attributes=loop_attributes,
+                )
+                validation_ms = metrics.get("response_validation_ms")
+                validation_attributes = (
+                    {"duration_ms": float(validation_ms)}
+                    if isinstance(validation_ms, (int, float))
+                    and not isinstance(validation_ms, bool)
+                    and math.isfinite(float(validation_ms))
+                    and float(validation_ms) >= 0
+                    else None
+                )
+                _record_v2_provenance_stage(
+                    job,
+                    "response_validation",
+                    attributes=validation_attributes,
+                )
+                return result
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._delegate, name)
+
+        traced_provider = _TracedProvider(provider)
+        traced_pi_runtime = _TracedPiRuntime(app.state.pi_coach_runtime)
+
+        semantic_provider_attempt_count = 0
+
         def before_intelligence_attempt(_attempt: int) -> None:
+            nonlocal semantic_provider_attempt_count
+            if (
+                job_deadline_at_ms is not None
+                and time.time_ns() // 1_000_000 >= job_deadline_at_ms
+            ):
+                raise IntelligenceDeadlineExceeded(
+                    "intelligence job reached its realtime deadline before a provider attempt"
+                )
             _enforce_llm_budget(
                 meeting_id,
                 purpose="realtime_intelligence",
                 config=config,
             )
+            _start_provider_attempt("semantic", "direct")
+            semantic_provider_attempt_count += 1
 
         def record_intelligence_attempt_usage(usage: dict[str, Any] | None, _attempt: int) -> None:
             _record_llm_usage(
@@ -9035,12 +11197,44 @@ def create_app(
                 usage=usage,
             )
 
+        coach_provider_attempt_count = 0
+        pi_coach_attempt_count = 0
+        # Preserve sanitized Pi bridge metrics when the app-level soft cutoff
+        # wins the race and projects an explicit timeout envelope. Without
+        # this buffer, the durable fallback records only ``provider_timeout``
+        # and loses queue/TTFT/tool/schema evidence needed for W0 diagnosis.
+        coach_runtime_failure_metrics: dict[str, Any] = {}
+
         def before_coach_attempt(_attempt: int) -> None:
+            nonlocal coach_provider_attempt_count, pi_coach_attempt_count
+            if (
+                job_deadline_at_ms is not None
+                and time.time_ns() // 1_000_000 >= job_deadline_at_ms
+            ):
+                raise IntelligenceDeadlineExceeded(
+                    "intelligence job reached its realtime deadline before a coach attempt"
+                )
             _enforce_llm_budget(
                 meeting_id,
                 purpose="realtime_coach",
                 config=config,
             )
+            attempt_runtime = (
+                "pi"
+                if (
+                    coach_runtime_requested == "pi"
+                    and pi_coach_attempt_count == 0
+                    and hasattr(app.state.pi_coach_runtime, "evaluate")
+                )
+                else "direct"
+            )
+            _start_provider_attempt("coach", attempt_runtime)
+            coach_provider_attempt_count += 1
+            # This callback runs immediately before Pi hands work to its
+            # runtime. Circuit, deadline-budget, and trigger-gate suppression
+            # paths never reach it, so they cannot consume episode cooldown.
+            if coach_runtime_requested == "pi":
+                pi_coach_attempt_count += 1
 
         def record_coach_attempt_usage(usage: dict[str, Any] | None, _attempt: int) -> None:
             _record_llm_usage(
@@ -9050,47 +11244,1078 @@ def create_app(
                 usage=usage,
             )
 
-        intelligence_call = run_realtime_intelligence(
-            request=request,
-            provider=provider,
-            before_attempt=before_intelligence_attempt,
-            on_usage=record_intelligence_attempt_usage,
-        )
-        coach_enabled = str(
-            os.environ.get("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
-        ).strip().lower() not in {"0", "false", "off", "no"}
-        coach_runtime_requested = configured_coach_runtime()
-        coach_triggered = coach_enabled and should_run_realtime_coach(
-            request,
-            requested_runtime=coach_runtime_requested,
-        )
-        coach_result: dict[str, Any] | None = None
-        coach_status = "not_triggered" if coach_enabled else "disabled"
-        if coach_triggered:
-            intelligence_outcome, coach_outcome = await asyncio.gather(
-                intelligence_call,
-                run_realtime_coach_routed(
+        async def build_intelligence_call() -> Any:
+            try:
+                result = await run_realtime_intelligence(
                     request=request,
-                    provider=provider,
+                    provider=traced_provider,
+                    before_attempt=before_intelligence_attempt,
+                    on_usage=record_intelligence_attempt_usage,
+                )
+            except BaseException as exc:
+                _finish_provider_branch("semantic", error=exc)
+                _record_v2_provenance_stage(
+                    job,
+                    "agent_tool_loop",
+                    status="not_required",
+                    reason="direct_provider_path",
+                )
+                _record_v2_provenance_stage(
+                    job,
+                    "response_validation",
+                    status=(
+                        "failed"
+                        if classify_pipeline_failure(exc) == "validation_error"
+                        else "unavailable"
+                    ),
+                    reason=(
+                        "response_rejected"
+                        if classify_pipeline_failure(exc) == "validation_error"
+                        else "provider_response_unavailable"
+                    ),
+                )
+                raise
+            _finish_provider_branch("semantic", result=result)
+            _record_v2_provenance_stage(
+                job,
+                "agent_tool_loop",
+                status="not_required",
+                reason="direct_provider_path",
+            )
+            _record_v2_provenance_stage(job, "response_validation")
+            return result
+
+        async def build_coach_call() -> Any:
+            try:
+                result = await run_realtime_coach_routed(
+                    request=request,
+                    provider=traced_provider,
                     requested_runtime=coach_runtime_requested,
-                    pi_runtime=app.state.pi_coach_runtime,
+                    pi_runtime=traced_pi_runtime,
                     pi_provider_config={
                         "base_url": config.base_url,
                         "api_key": config.api_key,
                         "model": config.model,
                         "api_style": config.api_style,
-                        "timeout_seconds": min(config.timeout_seconds, 25.0),
+                        "timeout_seconds": coach_provider_timeout_ms / 1_000,
                     },
+                    candidate_events=eligible_coach_candidate_payloads,
                     before_attempt=before_coach_attempt,
                     on_usage=record_coach_attempt_usage,
-                ),
-                return_exceptions=True,
+                    soft_deadline_at_ms=soft_deadline_at_ms,
+                    max_provider_timeout_ms=coach_provider_timeout_ms,
+                    priority_mode=coach_priority_mode,
+                )
+            except BaseException as exc:
+                _finish_provider_branch("coach", error=exc)
+                raw_failure_metrics = getattr(exc, "metrics", None)
+                if isinstance(raw_failure_metrics, Mapping):
+                    coach_runtime_failure_metrics.update(
+                        _public_coach_agent_metrics(raw_failure_metrics)
+                    )
+                trace_provenance = pipeline_traces.get(job_id).execution_snapshot().get(
+                    "provenance",
+                    {},
+                )
+                if "response_validation" not in trace_provenance:
+                    _record_v2_provenance_stage(
+                        job,
+                        "response_validation",
+                        status=(
+                            "failed"
+                            if classify_pipeline_failure(exc) == "validation_error"
+                            else "unavailable"
+                        ),
+                        reason=(
+                            "response_rejected"
+                            if classify_pipeline_failure(exc) == "validation_error"
+                            else "provider_response_unavailable"
+                        ),
+                    )
+                raise
+            _finish_provider_branch("coach", result=result)
+            effective_runtime = str(result.get("runtime_used") or "").strip().lower()
+            if effective_runtime != "pi":
+                _record_v2_provenance_stage(
+                    job,
+                    "agent_tool_loop",
+                    status="not_required",
+                    reason="direct_provider_path",
+                )
+                _record_v2_provenance_stage(job, "response_validation")
+            return result
+        coach_gate_open = coach_enabled and should_run_realtime_coach(
+            request,
+            requested_runtime=coach_runtime_requested,
+        )
+        detected_coach_candidates = (
+            realtime_coach_candidate_events(request) if coach_gate_open else ()
+        )
+        # A resolving utterance is deliberately a negative result for the
+        # ordinary candidate detector.  When it closes the latest still-active
+        # Pi card, however, we need one bounded Provider decision to record
+        # the lifecycle transition and supersede that card.  Evaluate this
+        # signal even when the detector also emits a new action candidate:
+        # natural answers often contain an action-shaped sentence, and that
+        # candidate must not send an already-resolved episode down the slower
+        # semantic path.
+        lifecycle_refresh = False
+        lifecycle_previous_decision: dict[str, Any] | None = None
+        if (
+            provider_lane_acquired
+            and coach_enabled
+            and coach_runtime_requested == "pi"
+        ):
+            active_lifecycle = _latest_active_pi_coach_intervention(
+                v2_persistence,
+                meeting_id,
+                now_ms=time.time_ns() // 1_000_000,
             )
+            if active_lifecycle is not None:
+                candidate_decision, candidate_intervention = active_lifecycle
+                if _pi_lifecycle_resolution_signal(request, candidate_intervention):
+                    lifecycle_refresh = True
+                    lifecycle_previous_decision = candidate_decision
+                    lifecycle_candidate_key = (
+                        "lifecycle-resolution:"
+                        + hashlib.sha256(
+                            "|".join(
+                                [
+                                    str(candidate_decision.get("decision_id") or ""),
+                                    *(paragraph.id for paragraph in request.new_paragraphs),
+                                ]
+                            ).encode("utf-8")
+                        ).hexdigest()[:32]
+                    )
+                    # A lifecycle refresh supersedes ordinary candidates for
+                    # this evidence batch.  Keeping both would allow the
+                    # resolved action to create a second visible card.
+                    detected_coach_candidates = (
+                        CoachCandidateEvent(
+                            event_type="missing_next_step",
+                            evidence_segment_ids=tuple(
+                                paragraph.id for paragraph in request.new_paragraphs
+                            ),
+                            reason="新证据可能已关闭此前 Pi 干预，需要记录生命周期变化。",
+                            candidate_key=lifecycle_candidate_key,
+                        ),
+                    )
+                    coach_gate_open = True
+        coach_episode_sampled_at_ms = time.time_ns() // 1_000_000
+        recent_coach_episode_descriptors = (
+            v2_persistence.recent_coach_episode_descriptors(
+                meeting_id,
+                since_ms=max(
+                    0,
+                    coach_episode_sampled_at_ms - COACH_CANDIDATE_COOLDOWN_MS,
+                ),
+                now_ms=coach_episode_sampled_at_ms,
+            )
+            if coach_runtime_requested == "pi" and detected_coach_candidates
+            else []
+        )
+        coach_candidate_payloads = _coach_candidate_payloads(
+            detected_coach_candidates,
+            request=request,
+            recent_episode_descriptors=recent_coach_episode_descriptors,
+        )
+        coach_candidates = detected_coach_candidates
+        cooled_episode_priorities: dict[str, int] = {}
+        cooldown_suppressed_candidate_keys: tuple[str, ...] = ()
+        if coach_runtime_requested == "pi" and coach_candidates and not lifecycle_refresh:
+            now_ms = coach_episode_sampled_at_ms
+            cooled_episode_priorities = v2_persistence.recent_coach_episode_priorities(
+                meeting_id,
+                since_ms=max(0, now_ms - COACH_CANDIDATE_COOLDOWN_MS),
+                now_ms=now_ms,
+            )
+            coach_candidates, cooldown_suppressed_candidate_keys = _partition_coach_candidates(
+                detected_coach_candidates,
+                candidate_payloads=coach_candidate_payloads,
+                cooled_episode_priorities=cooled_episode_priorities,
+            )
+        eligible_coach_candidate_payloads = [
+            coach_candidate_payloads[item.candidate_key] for item in coach_candidates
+        ]
+        eligible_coach_audit_payloads = list(eligible_coach_candidate_payloads)
+        if request.trigger_type == "user_request" and not eligible_coach_audit_payloads:
+            # Keep the model input candidate-free: this is an explicit request,
+            # not a host-detected lexical event. The audit envelope still
+            # records which bounded evidence scope and physical track the
+            # request was evaluated against.
+            audit_paragraph = (
+                request.context_paragraphs[-1]
+                if request.context_paragraphs
+                else request.retrieval_paragraphs[-1]
+                if request.retrieval_paragraphs
+                else None
+            )
+            if audit_paragraph is not None:
+                eligible_coach_audit_payloads = [
+                    {
+                        "trigger_type": "user_request",
+                        "request_scope": "current_context",
+                        "candidate_key": f"user-request:{meeting_id}:{job_id}",
+                        "evidence_segment_ids": [audit_paragraph.id],
+                        "episode_source_track": audit_paragraph.source_track,
+                        "episode_speaker": audit_paragraph.speaker,
+                        "episode_id": f"user-request:{meeting_id}:{job_id}",
+                        "candidate_priority": 0,
+                    }
+                ]
+        if lifecycle_refresh:
+            # Keep lifecycle metadata on the host-side audit envelope.  The
+            # bridge validates and intentionally strips unknown candidate
+            # fields before sending them to the model.
+            for candidate_payload in eligible_coach_candidate_payloads:
+                candidate_payload["lifecycle_refresh"] = True
+                candidate_payload["lifecycle_previous_decision_id"] = str(
+                    (lifecycle_previous_decision or {}).get("decision_id") or ""
+                )
+        # Explicit user requests are already a coaching decision. They must
+        # enter the requested Pi lane even when there is no fresh lexical
+        # candidate; the normal delta path remains candidate-gated.
+        coach_would_trigger = coach_gate_open and (
+            coach_runtime_requested != "pi"
+            or bool(coach_candidates)
+            or request.trigger_type in {"user_request", "task_due"}
+        )
+        coach_evaluation_started_at_ms = time.time_ns() // 1_000_000
+        (
+            job_budget_remaining_at_coach_start_ms,
+            hard_coach_provider_timeout_ms,
+        ) = _realtime_coach_budget_ms(
+            deadline_at_ms=job_deadline_at_ms,
+            now_ms=coach_evaluation_started_at_ms,
+            configured_timeout_seconds=min(config.timeout_seconds, 25.0),
+        )
+        (
+            soft_budget_remaining_at_coach_start_ms,
+            soft_provider_budget_ms,
+        ) = _realtime_coach_soft_budget_ms(
+            soft_deadline_at_ms=soft_deadline_at_ms,
+            now_ms=coach_evaluation_started_at_ms,
+        )
+        # A Pi turn must fit both contracts: the existing hard job deadline
+        # and the shorter product usefulness window.  Keep the old hard
+        # budget untouched for semantic/direct paths, while constraining every
+        # Pi invocation (including a direct fallback) to this effective cap.
+        coach_provider_timeout_ms = (
+            min(hard_coach_provider_timeout_ms, soft_provider_budget_ms)
+            if soft_deadline_at_ms is not None
+            else hard_coach_provider_timeout_ms
+        )
+        hard_budget_exhausted = bool(
+            coach_would_trigger
+            and coach_runtime_requested == "pi"
+            and hard_coach_provider_timeout_ms < REALTIME_COACH_MIN_PROVIDER_BUDGET_MS
+        )
+        soft_budget_exhausted = bool(
+            coach_would_trigger
+            and coach_runtime_requested == "pi"
+            and soft_deadline_at_ms is not None
+            and soft_provider_budget_ms < REALTIME_COACH_MIN_PROVIDER_BUDGET_MS
+        )
+        correction_lane_active_at_coach_start = llm_lane_locks.is_active(
+            meeting_id,
+            "correction",
+        )
+        realtime_circuit_identity = _realtime_provider_identity(config)
+        provider_access_scope = (
+            "pi_deep"
+            if (
+                coach_would_trigger
+                and coach_runtime_requested == "pi"
+                and coach_priority_mode == "deep"
+            )
+            else "pi_coach"
+            if coach_would_trigger and coach_runtime_requested == "pi"
+            else "direct_semantic"
+        )
+        coach_circuit_admission = None
+        coach_circuit_permit = None
+        coach_circuit_suppressed = False
+        coach_circuit_reason: str | None = None
+        coach_reservation: dict[str, Any] | None = None
+        coach_reservation_audit: dict[str, Any] = {}
+        coach_reservation_suppressed = False
+        coach_reservation_reason: str | None = None
+        coach_reservation_conflict: dict[str, Any] | None = None
+        if provider_access_scope == "direct_semantic":
+            coach_circuit_admission = _acquire_direct_semantic_provider_admission(
+                realtime_provider_circuit,
+                realtime_circuit_identity,
+            )
+        elif hard_coach_provider_timeout_ms >= REALTIME_COACH_MIN_PROVIDER_BUDGET_MS:
+            # Admit a bounded Pi recovery trial using the hard budget even when
+            # the soft window has already closed. This preserves the specific
+            # circuit reason without starting Provider work after the cutoff.
+            coach_circuit_admission = realtime_provider_circuit.acquire(realtime_circuit_identity)
+        if coach_circuit_admission is not None:
+            if coach_circuit_admission.admitted:
+                coach_circuit_permit = coach_circuit_admission.permit
+            else:
+                coach_circuit_suppressed = True
+                coach_circuit_reason = str(coach_circuit_admission.snapshot.reason)
+        coach_budget_exhausted = hard_budget_exhausted or soft_budget_exhausted
+        coach_triggered = (
+            coach_would_trigger
+            and not coach_budget_exhausted
+            and not coach_circuit_suppressed
+        )
+        if (
+            coach_circuit_permit is not None
+            and provider_access_scope in {"pi_coach", "pi_deep"}
+            and not coach_triggered
+        ):
+            # Admission happens before the soft-window decision so an open
+            # circuit can still report its more useful suppression reason.
+            # When that decision leaves no viable Pi budget, however, no
+            # Provider attempt owns this permit. Releasing it is essential for
+            # half-open circuits: otherwise their single probe remains marked
+            # in-flight indefinitely and every later caller is suppressed.
+            coach_circuit_permit.release()
+            coach_circuit_permit = None
+
+        candidate_outcome = (
+            "disabled"
+            if not coach_enabled
+            else "lifecycle_refresh"
+            if lifecycle_refresh
+            else "cooldown_suppressed"
+            if cooldown_suppressed_candidate_keys
+            else "eligible"
+            if detected_coach_candidates
+            else "none"
+        )
+        circuit_outcome = (
+            "not_checked"
+            if coach_circuit_admission is None
+            else "admitted"
+            if coach_circuit_admission.admitted
+            else "denied"
+        )
+        try:
+            pipeline_traces.record_route(
+                job_id,
+                "pi_coach"
+                if coach_would_trigger and coach_runtime_requested == "pi"
+                else "direct_coach"
+                if coach_would_trigger
+                else "direct_semantic",
+                candidate_outcome=candidate_outcome,
+                circuit_outcome=circuit_outcome,
+                monotonic_ns=time.monotonic_ns(),
+            )
+        except ValueError:
+            # A durable retry reuses the same trace and may reach a different
+            # admission result. Preserve the first route decision rather than
+            # letting a diagnostic-only update fail product execution.
+            pass
+
+        # The circuit only protects the Provider lane. A durable reservation
+        # additionally protects the discourse episode while the Pi request is
+        # in flight and across a worker restart before projection commits.
+        if coach_triggered and coach_runtime_requested == "pi" and v2_persistence is not None:
+            reservation_now_ms = time.time_ns() // 1_000_000
+            reservation_id = f"realtime-provider:{job['id']}"
+            reservation_episode_ids = [
+                str(item.get("episode_id") or "").strip()
+                for item in eligible_coach_candidate_payloads
+                if str(item.get("episode_id") or "").strip()
+            ]
+            reservation_candidate_keys = [
+                str(item.get("candidate_key") or "").strip()
+                for item in eligible_coach_candidate_payloads
+                if str(item.get("candidate_key") or "").strip()
+            ]
+            # An explicit user request is itself the durable discourse unit.
+            # It intentionally has no lexical candidate event, but it still
+            # needs the same cross-worker Provider reservation fence. Keep the
+            # synthetic key scoped to this job and label it as a request so it
+            # cannot be mistaken for host-detected evidence later.
+            if request.trigger_type in {"user_request", "task_due"} and not reservation_candidate_keys:
+                reservation_candidate_keys = [
+                    (
+                        f"user-request:{meeting_id}:{job['id']}"
+                        if request.trigger_type == "user_request"
+                        else f"task-due:{meeting_id}:{request.work_item_id or job['id']}"
+                    )
+                ]
+            reservation_episode_descriptors = (
+                _coach_episode_descriptors_for_reservation(
+                    eligible_coach_candidate_payloads
+                )
+            )
+            reservation_priority = max(
+                (
+                    int(item.get("candidate_priority") or 0)
+                    for item in eligible_coach_candidate_payloads
+                ),
+                default=0,
+            )
+            try:
+                reservation_result = v2_persistence.reserve_realtime_provider_attempt(
+                    meeting_id=meeting_id,
+                    job_id=str(job["id"]),
+                    reservation_id=reservation_id,
+                    episode_ids=reservation_episode_ids,
+                    episode_descriptors=reservation_episode_descriptors,
+                    candidate_keys=reservation_candidate_keys,
+                    priority=reservation_priority,
+                    reserved_at_ms=reservation_now_ms,
+                    expires_at_ms=reservation_now_ms + REALTIME_COACH_RESERVATION_TTL_MS,
+                )
+            except Exception as exc:
+                # Do not call a Provider when the safety reservation cannot be
+                # written. The next durable worker pass can retry the job.
+                coach_reservation_suppressed = True
+                coach_reservation_reason = "realtime_provider_reservation_unavailable"
+                _log.error(
+                    "meeting.v2.realtime_coach_reservation_failed",
+                    meeting_id=meeting_id,
+                    job_id=str(job["id"]),
+                    error_class=type(exc).__name__,
+                )
+                reservation_result = {
+                    "reserved": False,
+                    "reason": coach_reservation_reason,
+                }
+            if bool(reservation_result.get("reserved")):
+                coach_reservation = dict(reservation_result)
+                coach_reservation_audit = {
+                    "reservation_id": str(reservation_result.get("reservation_id") or reservation_id),
+                    "status": "reserved",
+                    "idempotent": bool(reservation_result.get("idempotent")),
+                    "priority": int(reservation_result.get("priority") or reservation_priority),
+                    "attempt_generation": reservation_result.get("attempt_generation"),
+                    "attempt_token": reservation_result.get("attempt_token"),
+                    "expires_at_ms": int(
+                        reservation_result.get("expires_at_ms")
+                        or reservation_now_ms + REALTIME_COACH_RESERVATION_TTL_MS
+                    ),
+                }
+            else:
+                coach_reservation_suppressed = True
+                coach_reservation_reason = str(
+                    reservation_result.get("reason")
+                    or "realtime_provider_episode_reserved"
+                )
+                raw_conflict = reservation_result.get("conflict")
+                coach_reservation_conflict = (
+                    dict(raw_conflict) if isinstance(raw_conflict, Mapping) else None
+                )
+                coach_triggered = False
+                if coach_circuit_permit is not None:
+                    # No Provider work starts when an episode reservation loses
+                    # the race, so this admission cannot consume circuit state.
+                    coach_circuit_permit.release()
+                    coach_circuit_permit = None
+
+        async def finish_coach_reservation(
+            status: str,
+            reason: str,
+        ) -> dict[str, Any] | None:
+            """Release/commit a reservation while retaining TTL on write failure."""
+
+            nonlocal coach_reservation
+            if coach_reservation is None or v2_persistence is None:
+                return None
+            reservation_id = str(coach_reservation.get("reservation_id") or "").strip()
+            if not reservation_id:
+                coach_reservation = None
+                return None
+            attempt_token = str(coach_reservation.get("attempt_token") or "").strip() or None
+            attempt_generation = coach_reservation.get("attempt_generation")
+            try:
+                finished = await asyncio.to_thread(
+                    v2_persistence.finish_realtime_provider_attempt,
+                    meeting_id=meeting_id,
+                    reservation_id=reservation_id,
+                    status=status,
+                    reason=reason,
+                    attempt_token=attempt_token,
+                    attempt_generation=attempt_generation,
+                    finished_at_ms=time.time_ns() // 1_000_000,
+                )
+            except Exception as exc:
+                # Leaving the reservation event untouched is intentional: a
+                # restarted worker will still see its bounded TTL and suppress
+                # a duplicate Provider call during this uncertain window.
+                _log.error(
+                    "meeting.v2.realtime_coach_reservation_finish_failed",
+                    meeting_id=meeting_id,
+                    job_id=str(job["id"]),
+                    reservation_id=reservation_id,
+                    status=status,
+                    error_class=type(exc).__name__,
+                )
+                return None
+            if not isinstance(finished, Mapping):
+                return None
+            finished_status = str(finished.get("status") or status)
+            coach_reservation_audit.update(
+                {
+                    "reservation_id": reservation_id,
+                    "status": finished_status,
+                    "finish_reason": str(
+                        finished.get("finish_reason") or finished.get("reason") or reason
+                    ),
+                    "attempt_generation": finished.get(
+                        "attempt_generation",
+                        coach_reservation_audit.get("attempt_generation"),
+                    ),
+                    "attempt_token": finished.get(
+                        "attempt_token",
+                        coach_reservation_audit.get("attempt_token"),
+                    ),
+                }
+            )
+            # A stale token means another worker owns a newer lifecycle. This
+            # worker must drop its local handle even though the durable state
+            # remains reserved for that newer attempt.
+            coach_reservation = None
+            return dict(finished)
+
+        async def within_job_deadline(awaitable: Any) -> Any:
+            if job_deadline_at_ms is None:
+                return await awaitable
+            remaining_seconds = (
+                job_deadline_at_ms - time.time_ns() // 1_000_000
+            ) / 1_000
+            if remaining_seconds <= 0:
+                if isinstance(awaitable, asyncio.Future):
+                    awaitable.cancel()
+                elif hasattr(awaitable, "close"):
+                    awaitable.close()
+                raise IntelligenceDeadlineExceeded(
+                    "intelligence job reached its realtime deadline before execution"
+                )
+            try:
+                async with asyncio.timeout(remaining_seconds):
+                    return await awaitable
+            except TimeoutError as exc:
+                raise IntelligenceDeadlineExceeded(
+                    "intelligence job exceeded its realtime execution deadline"
+                ) from exc
+
+        async def within_soft_deadline(awaitable: Any) -> Any:
+            """Bound the whole Pi turn by the product usefulness cutoff."""
+
+            if soft_deadline_at_ms is None:
+                return await within_job_deadline(awaitable)
+            remaining_seconds = (
+                soft_deadline_at_ms - time.time_ns() // 1_000_000
+            ) / 1_000
+            if remaining_seconds <= 0:
+                if isinstance(awaitable, asyncio.Future):
+                    awaitable.cancel()
+                elif hasattr(awaitable, "close"):
+                    awaitable.close()
+                error = IntelligenceDeadlineExceeded(
+                    "realtime coach crossed its soft delivery cutoff before execution"
+                )
+                error.code = "soft_deadline_exceeded"
+                raise error
+            try:
+                async with asyncio.timeout(remaining_seconds):
+                    return await awaitable
+            except TimeoutError as exc:
+                error = IntelligenceDeadlineExceeded(
+                    "realtime coach exceeded its soft delivery cutoff"
+                )
+                error.code = "soft_deadline_exceeded"
+                error.late_result_discarded = True
+                raise error from exc
+
+        def finish_provider_circuit(outcome: Any) -> None:
+            """Settle this job's shared admission from an observed outcome."""
+
+            nonlocal coach_circuit_permit
+            permit = coach_circuit_permit
+            if permit is None:
+                return
+            provider_attempted = (
+                semantic_provider_attempt_count + coach_provider_attempt_count
+            ) > 0
+            failure_class = classify_realtime_provider_failure(outcome)
+            if (
+                failure_class is None
+                and provider_attempted
+                and isinstance(outcome, IntelligenceDeadlineExceeded)
+            ):
+                failure_class = "timeout"
+            if failure_class is not None:
+                permit.record_failure(
+                    failure_class,
+                    retry_after_ms=_realtime_retry_after_ms(outcome),
+                )
+            elif isinstance(outcome, BaseException):
+                # Cancellation or an orchestration/schema failure is not a
+                # reliable Provider health observation.
+                permit.release()
+            elif isinstance(outcome, Mapping) and str(outcome.get("status") or "") == "failed":
+                permit.record_failure(None)
+            elif provider_attempted:
+                permit.record_success()
+            else:
+                permit.release()
+            coach_circuit_permit = None
+
+        def build_soft_timeout_result(
+            *,
+            error_code: str = "soft_deadline_exceeded",
+            late_result_discarded: bool = True,
+        ) -> dict[str, Any]:
+            """Build a silent Pi decision that is explicit about late delivery."""
+
+            result = build_realtime_coach_provenance_decision(
+                request=request,
+                origin="pi",
+                status="timed_out",
+                status_reason="soft_deadline_exceeded",
+                decision_reason="本轮未在实时窗口内形成可验证建议，已停止等待；迟到结果不会显示。",
+            )
+            timeout_metrics = dict(coach_runtime_failure_metrics)
+            timeout_metrics.update(
+                {
+                    "soft_deadline_at_ms": soft_deadline_at_ms,
+                    "soft_cutoff_triggered": True,
+                    "late_result_discarded": bool(late_result_discarded),
+                }
+            )
+            result.update(
+                {
+                    "runtime_requested": "pi",
+                    "runtime_used": "pi",
+                    "fallback_error_code": str(error_code)[:120],
+                    "fallback_reason": "soft_deadline_exceeded",
+                    "delivery_status": "too_late",
+                    "soft_deadline_at_ms": soft_deadline_at_ms,
+                    "soft_cutoff_triggered": True,
+                    "late_result_discarded": bool(late_result_discarded),
+                    "agent_metrics": timeout_metrics,
+                }
+            )
+            return result
+
+        def maybe_build_timeout_local_reflex(
+            timeout_result: Mapping[str, Any],
+            *,
+            allow_without_provider_attempt: bool = False,
+        ) -> dict[str, Any]:
+            """Add an honest deterministic hint after a failed/suppressed Pi attempt.
+
+            A Provider timeout must remain visible in provenance and scoring. A
+            narrow owner-gap or explicit pending-question reflex may still be
+            useful inside the same window, but it is explicitly marked as a
+            local fallback and never counted as a Pi intervention. The circuit
+            path is also allowed to use this reflex before a Provider attempt;
+            the admission denial remains visible in ``fallback_reason``.
+            """
+
+            if (
+                coach_priority_mode != "realtime"
+                or lifecycle_refresh
+                or (
+                    not allow_without_provider_attempt
+                    and pi_coach_attempt_count <= 0
+                )
+            ):
+                return dict(timeout_result)
+            allowed_statuses = {"timed_out", "failed"}
+            if allow_without_provider_attempt:
+                allowed_statuses.add("protected_silent")
+            result_status = str(timeout_result.get("status") or "")
+            if result_status not in allowed_statuses:
+                return dict(timeout_result)
+            fallback_error_code = str(
+                timeout_result.get("fallback_error_code") or ""
+            ).strip()
+            # A failed Pi response is eligible for a local hint only when the
+            # Provider was actually called and the response was rejected by
+            # our bounded schema/safety validator. Other orchestration errors
+            # remain silent so an arbitrary exception cannot become advice.
+            validation_fallback_codes = {
+                "IntelligenceResponseValidationError",
+                "response_validation_error",
+            }
+            if (
+                result_status == "failed"
+                and fallback_error_code not in validation_fallback_codes
+            ):
+                return dict(timeout_result)
+            fallback_candidates = [
+                candidate
+                for candidate in eligible_coach_candidate_payloads
+                if str(candidate.get("event_type") or "")
+                in {"missing_next_step", "question_pending"}
+            ]
+            if not fallback_candidates:
+                return dict(timeout_result)
+            reflex = build_local_reflex_intervention(
+                request,
+                fallback_candidates,
+                now_ms=time.time_ns() // 1_000_000,
+                allow_pending_question=True,
+            )
+            if not isinstance(reflex, Mapping) or reflex.get("intervention") is None:
+                return dict(timeout_result)
+            intervention = reflex["intervention"]
+            if not isinstance(intervention, CoachIntervention):
+                return dict(timeout_result)
+            provider_late_result_discarded = bool(
+                timeout_result.get("late_result_discarded")
+            )
+            merged = dict(timeout_result)
+            merged.update(
+                {
+                    "origin": "local_reflex",
+                    "runtime_requested": "pi",
+                    "runtime_used": "local_reflex",
+                    "local_reflex_kind": str(reflex.get("local_reflex_kind") or "missing_next_step"),
+                    "status": "intervention",
+                    "status_reason": (
+                        "realtime_provider_circuit_local_reflex"
+                        if allow_without_provider_attempt
+                        else "response_validation_local_reflex"
+                        if result_status == "failed"
+                        else "provider_timeout_local_reflex"
+                    ),
+                    "decision_reason": intervention.reason,
+                    "intervention": intervention,
+                    "fallback_error_code": str(
+                        timeout_result.get("fallback_error_code")
+                        or "provider_timeout"
+                    ),
+                    "fallback_reason": str(
+                        "response_validation"
+                        if result_status == "failed"
+                        else timeout_result.get("fallback_reason")
+                        if allow_without_provider_attempt
+                        else "provider_timeout"
+                    ),
+                    "delivery_status": "on_time_fallback",
+                    # Preserve whether the deadline guard actually discarded a
+                    # late result. A Provider-side timeout may fail without ever
+                    # producing a result, even when a local hint is delivered.
+                    "late_result_discarded": provider_late_result_discarded,
+                    "agent_metrics": {
+                        **(
+                            dict(timeout_result.get("agent_metrics"))
+                            if isinstance(timeout_result.get("agent_metrics"), Mapping)
+                            else {}
+                        ),
+                        "fallback_runtime": "local_reflex",
+                        "fallback_after_provider_failure": not allow_without_provider_attempt,
+                        "fallback_after_circuit_suppression": allow_without_provider_attempt,
+                        "fallback_after_response_validation": result_status == "failed",
+                        "pi_intervention": False,
+                        "provider_late_result_discarded": provider_late_result_discarded,
+                    },
+                }
+            )
+            return merged
+
+        coach_result: dict[str, Any]
+        semantic_branch_status = "completed"
+        semantic_branch_error_class: str | None = None
+        if coach_triggered and coach_runtime_requested == "pi":
+            # Pi is the user-visible realtime contract. Starting semantic
+            # extraction in parallel makes two requests compete for the same
+            # gateway and lets a slow semantic response cancel a valid card.
+            # Run Pi first, then project a schema-valid empty semantic result;
+            # post-meeting/retry lanes can fill entities without this deadline.
+            deadline_timeout_projected = False
+            coach_call = build_coach_call()
+            try:
+                coach_outcome = await within_soft_deadline(coach_call)
+            except IntelligenceDeadlineExceeded as deadline_error:
+                finish_provider_circuit(deadline_error)
+                # A provider call can outlive the absolute job window even
+                # after the task-level timeout has cancelled its coroutine.
+                # Do not let that exception escape to DurableJobExecutor:
+                # escaping marks the job cancelled and leaves the user with no
+                # durable coach decision to explain the missing card. Project
+                # an explicit, evidence-free timeout envelope instead. The
+                # transport's own cancellation/finally path still owns socket
+                # cleanup; this projection is only the user-visible audit
+                # record and cannot revive a late result.
+                timeout_code = str(
+                    getattr(deadline_error, "code", "")
+                    or "agent_deadline_exceeded"
+                )[:120]
+                late_result_discarded = bool(
+                    getattr(deadline_error, "late_result_discarded", False)
+                )
+                if timeout_code == "soft_deadline_exceeded":
+                    coach_result = build_soft_timeout_result(
+                        error_code=timeout_code,
+                        late_result_discarded=late_result_discarded,
+                    )
+                else:
+                    coach_result = build_realtime_coach_provenance_decision(
+                        request=request,
+                        origin="pi",
+                        status="timed_out",
+                        status_reason="provider_timeout",
+                        decision_reason="实时教练本轮超出响应预算，迟到结果不会显示。",
+                    )
+                    coach_result.update(
+                        {
+                            "runtime_requested": "pi",
+                            "runtime_used": "pi",
+                            "fallback_error_code": timeout_code,
+                            "fallback_reason": "provider_timeout",
+                            "delivery_status": "too_late",
+                            "soft_deadline_at_ms": soft_deadline_at_ms,
+                            "soft_cutoff_triggered": bool(
+                                soft_deadline_at_ms is not None
+                                and time.time_ns() // 1_000_000 >= soft_deadline_at_ms
+                            ),
+                            "late_result_discarded": late_result_discarded,
+                            "agent_metrics": {
+                                "fallback_suppressed": True,
+                                "deadline_exceeded": True,
+                                "deadline_error_code": timeout_code,
+                                "soft_deadline_at_ms": soft_deadline_at_ms,
+                                "soft_cutoff_triggered": bool(
+                                    soft_deadline_at_ms is not None
+                                    and time.time_ns() // 1_000_000 >= soft_deadline_at_ms
+                                ),
+                                "late_result_discarded": late_result_discarded,
+                            },
+                        }
+                    )
+                # Keep the common post-branch bookkeeping on the same mapping
+                # while preventing it from replacing the explicit timeout
+                # status with the normal deferred-success status below.
+                coach_outcome = coach_result
+                deadline_timeout_projected = True
+                semantic_branch_status = "suppressed_by_realtime_deadline"
+                result = _pi_priority_intelligence_result(
+                    coach_result=coach_result,
+                    model=config.model,
+                )
+                result.update(
+                    {
+                        "fallback_reason": semantic_branch_status,
+                        "finish_reason": semantic_branch_status,
+                        "semantic_branch_status": semantic_branch_status,
+                    }
+                )
+            except asyncio.CancelledError:
+                finish_provider_circuit(asyncio.CancelledError())
+                if pi_coach_attempt_count == 0:
+                    # Cancellation before Pi hands work to its runtime is a
+                    # known no-attempt path, so it is safe to release now.
+                    try:
+                        await asyncio.shield(
+                            finish_coach_reservation("released", "cancelled_before_provider_attempt")
+                        )
+                    except asyncio.CancelledError:
+                        pass
+                raise
+            except Exception as exc:
+                finish_provider_circuit(exc)
+                if (
+                    soft_deadline_at_ms is not None
+                    and time.time_ns() // 1_000_000 >= soft_deadline_at_ms
+                ):
+                    # A transport/sidecar error that surfaces only after the
+                    # product window is already closed is still a too-late
+                    # result. Keep the error class private and project the
+                    # same explicit silent envelope as a task timeout.
+                    coach_outcome = build_soft_timeout_result(
+                        error_code=str(getattr(exc, "code", type(exc).__name__))[:120],
+                    )
+                    deadline_timeout_projected = True
+                else:
+                    coach_outcome = exc
+            else:
+                finish_provider_circuit(coach_outcome)
+
+            # Preserve the failed Pi attempt while giving a high-confidence
+            # owner-gap candidate a fact-grounded local hint in the same turn.
+            if not isinstance(coach_outcome, Exception):
+                coach_outcome = maybe_build_timeout_local_reflex(coach_outcome)
+
+            if coach_reservation is not None and (
+                pi_coach_attempt_count == 0
+                or (
+                    not isinstance(coach_outcome, Exception)
+                    and str(coach_outcome.get("runtime_used") or "").strip().lower() == "direct"
+                )
+            ):
+                # Pi can return a direct fallback before its Provider is ever
+                # touched. That path must release the reservation and must not
+                # consume Pi episode cooldown.
+                await finish_coach_reservation(
+                    "released",
+                    "direct_fallback" if not isinstance(coach_outcome, Exception) else "before_provider_attempt",
+                )
+
+            provider_timeout_result = (
+                not isinstance(coach_outcome, Exception)
+                and pi_coach_attempt_count > 0
+                and str(coach_outcome.get("runtime_used") or "").strip().lower()
+                == "local_reflex"
+                and (
+                    str(coach_outcome.get("fallback_reason") or "").strip().lower()
+                    == "provider_timeout"
+                    or str(coach_outcome.get("fallback_error_code") or "")
+                    in {"soft_deadline_exceeded", "agent_deadline_exceeded", "provider_timeout"}
+                    or str(
+                        (
+                            coach_outcome.get("agent_metrics")
+                            if isinstance(coach_outcome.get("agent_metrics"), Mapping)
+                            else {}
+                        ).get("provider_availability_terminal_reason")
+                        or ""
+                    ).strip().lower()
+                    == "provider_timeout"
+                )
+            )
+            if (
+                coach_reservation is not None
+                and pi_coach_attempt_count > 0
+                and (deadline_timeout_projected or provider_timeout_result)
+            ):
+                # The realtime cutoff is an explicit terminal decision for the
+                # Provider attempt: the request is cancelled/ignored and any
+                # late result is durably discarded. Release the reservation
+                # now so the next eligible episode is not blocked by the
+                # crash-window TTL. Projection failures intentionally skip
+                # this branch and retain the reservation for recovery.
+                await finish_coach_reservation("released", "provider_timeout")
+
+            if isinstance(coach_outcome, Exception):
+                coach_result = build_realtime_coach_provenance_decision(
+                    request=request,
+                    origin="pi",
+                    status="failed",
+                    status_reason="orchestration_failure",
+                    decision_reason="实时教练本轮未能形成可靠建议，已保持静默。",
+                )
+                _log.warning(
+                    "meeting.v2.realtime_coach_failed_open",
+                    meeting_id=meeting_id,
+                    job_id=str(job["id"]),
+                    error_class=type(coach_outcome).__name__,
+                    error_detail=str(coach_outcome),
+                )
+                semantic_branch_status = "deferred_after_pi_failure"
+                semantic_branch_error_class = type(coach_outcome).__name__
+            else:
+                coach_result = coach_outcome
+                if lifecycle_refresh and str(
+                    coach_result.get("runtime_used") or ""
+                ).strip().lower() == "pi":
+                    # The lifecycle refresh is a state transition, never a
+                    # second user-facing card.  Even if the model mistakenly
+                    # submits an intervention for already-resolved evidence,
+                    # retain the real Pi attempt/latency metrics while forcing
+                    # a durable protected-silent decision.  Persistence will
+                    # link this fresh decision to the prior card through
+                    # ``supersedes_decision_id``.
+                    original_coach_result = dict(coach_result)
+                    lifecycle_silent = build_realtime_coach_provenance_decision(
+                        request=request,
+                        origin="pi",
+                        status="protected_silent",
+                        status_reason="lifecycle_resolved",
+                        decision_reason="最新证据已补齐此前干预涉及的条件，旧卡已降级并保持静默。",
+                    )
+                    lifecycle_silent.update(
+                        {
+                            key: original_coach_result.get(key)
+                            for key in (
+                                "transport_mode",
+                                "ttft_ms",
+                                "decision_latency_ms",
+                                "timings",
+                                "usage",
+                                "model",
+                                "response_id",
+                                "finish_reason",
+                                "agent_metrics",
+                                "runtime_requested",
+                                "runtime_used",
+                                "fallback_error_code",
+                                "fallback_reason",
+                            )
+                            if original_coach_result.get(key) is not None
+                        }
+                    )
+                    lifecycle_silent.update(
+                        {
+                            "intervention": None,
+                            "lifecycle_refresh": True,
+                            "lifecycle_refresh_previous_decision_id": str(
+                                (lifecycle_previous_decision or {}).get("decision_id") or ""
+                            ),
+                            "lifecycle_refresh_evidence_segment_ids": [
+                                paragraph.id for paragraph in request.new_paragraphs
+                            ],
+                            "lifecycle_refresh_evidence_quote": "\n".join(
+                                paragraph.text for paragraph in request.new_paragraphs
+                            )[:2_000],
+                            "lifecycle_action": "deprioritize",
+                        }
+                    )
+                    coach_result = lifecycle_silent
+                if coach_result.get("fallback_error_code"):
+                    _log.warning(
+                        "meeting.v2.realtime_coach_pi_fallback",
+                        meeting_id=meeting_id,
+                        job_id=str(job["id"]),
+                        error_code=str(coach_result["fallback_error_code"]),
+                    )
+                if not deadline_timeout_projected:
+                    semantic_branch_status = REALTIME_COACH_PI_PRIORITY_SEMANTIC_STATUS
+            result = _pi_priority_intelligence_result(
+                coach_result=coach_result,
+                model=config.model,
+            )
+            result["semantic_branch_status"] = semantic_branch_status
+            _log.info(
+                "meeting.v2.semantic_deferred_for_pi_priority",
+                meeting_id=meeting_id,
+                job_id=str(job["id"]),
+                status=semantic_branch_status,
+            )
+        elif coach_triggered:
+            try:
+                intelligence_outcome, coach_outcome = await within_job_deadline(
+                    asyncio.gather(
+                        build_intelligence_call(),
+                        build_coach_call(),
+                        return_exceptions=True,
+                    ),
+                )
+            except BaseException as exc:
+                finish_provider_circuit(exc)
+                raise
+            circuit_outcome = next(
+                (
+                    item
+                    for item in (intelligence_outcome, coach_outcome)
+                    if classify_realtime_provider_failure(item) is not None
+                ),
+                intelligence_outcome,
+            )
+            finish_provider_circuit(circuit_outcome)
             if isinstance(intelligence_outcome, BaseException):
                 raise intelligence_outcome
             result = intelligence_outcome
             if isinstance(coach_outcome, BaseException):
-                coach_status = "failed_open"
+                coach_result = build_realtime_coach_provenance_decision(
+                    request=request,
+                    origin="direct_intelligence",
+                    status="failed",
+                    status_reason="orchestration_failure",
+                    decision_reason="实时教练本轮未能形成可靠建议，已保持静默。",
+                )
                 _log.warning(
                     "meeting.v2.realtime_coach_failed_open",
                     meeting_id=meeting_id,
@@ -9100,7 +12325,6 @@ def create_app(
                 )
             else:
                 coach_result = coach_outcome
-                coach_status = "intervention" if coach_result.get("intervention") is not None else "silent"
                 if coach_result.get("fallback_error_code"):
                     _log.warning(
                         "meeting.v2.realtime_coach_pi_fallback",
@@ -9108,12 +12332,522 @@ def create_app(
                         job_id=str(job["id"]),
                         error_code=str(coach_result["fallback_error_code"]),
                     )
-                result["response"] = apply_coach_intervention(
-                    result["response"],
-                    coach_result.get("intervention"),
-                )
         else:
-            result = await intelligence_call
+            if (
+                not coach_circuit_suppressed
+                and not coach_reservation_suppressed
+                and not coach_budget_exhausted
+            ):
+                try:
+                    result = await within_job_deadline(build_intelligence_call())
+                except BaseException as exc:
+                    finish_provider_circuit(exc)
+                    raise
+                else:
+                    finish_provider_circuit(result)
+            coach_result = build_realtime_coach_provenance_decision(
+                request=request,
+                origin=(
+                    "pi"
+                    if coach_budget_exhausted
+                    or (
+                        coach_circuit_suppressed
+                        and provider_access_scope in {"pi_coach", "pi_deep"}
+                    )
+                    or coach_reservation_suppressed
+                    else "direct_intelligence"
+                ),
+                status=(
+                    "protected_silent"
+                    if coach_circuit_suppressed or coach_reservation_suppressed
+                    else "timed_out"
+                    if coach_budget_exhausted
+                    else "not_triggered"
+                ),
+                status_reason=(
+                    coach_reservation_reason
+                    if coach_reservation_suppressed
+                    else str(coach_circuit_reason or "realtime_provider_circuit_open")
+                    if coach_circuit_suppressed
+                    else "deadline_budget_exhausted"
+                    if hard_budget_exhausted
+                    else "soft_deadline_exceeded"
+                    if coach_budget_exhausted
+                    else "candidate_cooldown"
+                    if coach_gate_open and cooldown_suppressed_candidate_keys
+                    else "trigger_gate"
+                    if coach_enabled
+                    else "coach_disabled"
+                ),
+                decision_reason=(
+                    "同一表达片段已有正在执行的实时教练请求，本轮保持静默，等待已有结果。"
+                    if coach_reservation_suppressed
+                    else "共享实时 Provider 尚未通过恢复探测，本轮未发起 direct semantic 请求。"
+                    if coach_circuit_suppressed
+                    and coach_circuit_reason == "realtime_provider_recovery_probe_required"
+                    else "实时 Provider 已返回限流，本轮快速静默，等待限流冷却后再试。"
+                    if coach_circuit_suppressed
+                    and coach_circuit_admission is not None
+                    and coach_circuit_admission.snapshot.last_failure_class
+                    == "rate_limit"
+                    else "实时 Provider 连续失败，已在本轮快速静默，等待冷却后再试。"
+                    if coach_circuit_suppressed
+                    else "本轮已超过 2.5 秒实时窗口，未发起必然迟到的 Pi 请求。"
+                    if soft_budget_exhausted and not hard_budget_exhausted
+                    else "实时教练剩余预算不足，未发起必然迟到的 Pi 请求。"
+                    if coach_budget_exhausted
+                    else "同一表达片段刚完成同级或更高优先级评估，本轮不重复请求。"
+                    if coach_gate_open and cooldown_suppressed_candidate_keys
+                    else "本轮未达到实时教练介入门槛。"
+                    if coach_enabled
+                    else "实时教练已关闭，本轮未执行介入判断。"
+                ),
+            )
+            if coach_circuit_suppressed:
+                circuit_reason = str(coach_circuit_reason or "realtime_provider_circuit_open")
+                coach_result.update(
+                    {
+                        "runtime_requested": "pi",
+                        "runtime_used": None,
+                        "fallback_error_code": circuit_reason,
+                        "fallback_reason": circuit_reason,
+                        "agent_metrics": {
+                            "realtime_circuit_state": coach_circuit_admission.snapshot.state,
+                            "realtime_circuit_reason": circuit_reason,
+                            "realtime_circuit_failure_count": coach_circuit_admission.snapshot.failure_count,
+                            "realtime_circuit_retry_after_ms": coach_circuit_admission.snapshot.retry_after_ms,
+                            "realtime_circuit_half_open": coach_circuit_admission.snapshot.half_open,
+                            "realtime_circuit_identity_generation": coach_circuit_admission.snapshot.identity_generation,
+                            "realtime_circuit_last_failure_class": coach_circuit_admission.snapshot.last_failure_class,
+                            "realtime_circuit_admitted": False,
+                            "provider_availability_policy": REALTIME_PROVIDER_AVAILABILITY_POLICY_VERSION,
+                            "provider_access_scope": provider_access_scope,
+                            "provider_attempted": False,
+                            "provider_attempt_count": 0,
+                            "provider_availability_terminal": "denied",
+                            "provider_availability_terminal_reason": circuit_reason,
+                        },
+                    }
+                )
+                # Keep a useful, deterministic card available for high-signal
+                # owner/question gaps even while the shared Provider is open.
+                # This path never claims a Pi attempt and retains the circuit
+                # reason in the fallback envelope for audit/replay.
+                coach_result = maybe_build_timeout_local_reflex(
+                    coach_result,
+                    allow_without_provider_attempt=True,
+                )
+                # Pi and direct semantic share this admission. No fallback path
+                # may reach the same unavailable gateway after a denial.
+                semantic_branch_status = "suppressed_by_realtime_provider_circuit"
+                result = _pi_priority_intelligence_result(
+                    coach_result=coach_result,
+                    model=config.model,
+                )
+                result.update(
+                    {
+                        "fallback_reason": semantic_branch_status,
+                        "finish_reason": semantic_branch_status,
+                        "semantic_branch_status": semantic_branch_status,
+                    }
+                )
+            elif coach_reservation_suppressed:
+                coach_result.update(
+                    {
+                        "runtime_requested": "pi",
+                        "runtime_used": None,
+                        "fallback_error_code": coach_reservation_reason,
+                        "fallback_reason": coach_reservation_reason,
+                        "agent_metrics": {
+                            "realtime_provider_reservation_suppressed": True,
+                            "realtime_provider_reservation_reason": coach_reservation_reason,
+                            "realtime_provider_reservation_conflict": coach_reservation_conflict,
+                            "realtime_circuit_admitted": bool(
+                                coach_circuit_admission.admitted
+                                if coach_circuit_admission is not None
+                                else False
+                            ),
+                        },
+                    }
+                )
+                semantic_branch_status = "suppressed_by_realtime_provider_reservation"
+                result = _pi_priority_intelligence_result(
+                    coach_result=coach_result,
+                    model=config.model,
+                )
+                result.update(
+                    {
+                        "fallback_reason": semantic_branch_status,
+                        "finish_reason": semantic_branch_status,
+                        "semantic_branch_status": semantic_branch_status,
+                    }
+                )
+            elif coach_budget_exhausted:
+                if soft_budget_exhausted and not hard_budget_exhausted:
+                    coach_result = build_soft_timeout_result(
+                        error_code="soft_deadline_exceeded",
+                        late_result_discarded=False,
+                    )
+                    coach_result.update(
+                        {
+                            "runtime_used": None,
+                            "fallback_error_code": "soft_deadline_exceeded",
+                            "fallback_reason": "soft_deadline_exceeded",
+                        }
+                    )
+                else:
+                    coach_result.update(
+                        {
+                            "runtime_requested": "pi",
+                            "runtime_used": None,
+                            "fallback_error_code": "deadline_budget_exhausted",
+                            "fallback_reason": "deadline_budget_exhausted",
+                            "delivery_status": "too_late",
+                            "soft_deadline_at_ms": soft_deadline_at_ms,
+                            "soft_cutoff_triggered": bool(soft_budget_exhausted),
+                            "late_result_discarded": False,
+                            "agent_metrics": {
+                                "deadline_budget_exhausted": True,
+                                "provider_timeout_ms": coach_provider_timeout_ms,
+                                "job_budget_remaining_at_coach_start_ms": job_budget_remaining_at_coach_start_ms,
+                                "soft_deadline_at_ms": soft_deadline_at_ms,
+                                "soft_cutoff_triggered": bool(soft_budget_exhausted),
+                                "late_result_discarded": False,
+                            },
+                        }
+                    )
+                # Once a Pi candidate is detected but the absolute deadline
+                # leaves less than the minimum safe Provider budget, neither
+                # Pi nor the same-gateway semantic lane may start. Emit the
+                # schema-valid empty semantic envelope directly so the normal
+                # durable projection and worker completion path still run.
+                semantic_branch_status = "suppressed_by_realtime_deadline"
+                result = _pi_priority_intelligence_result(
+                    coach_result=coach_result,
+                    model=config.model,
+                )
+                result.update(
+                    {
+                        "fallback_reason": semantic_branch_status,
+                        "finish_reason": semantic_branch_status,
+                        "semantic_branch_status": semantic_branch_status,
+                    }
+                )
+
+        # A result that reaches orchestration after the product window must
+        # never become a visible intervention. Convert it to the same silent
+        # timeout envelope before building the durable response.
+        soft_cutoff_reached_before_projection = bool(
+            soft_deadline_at_ms is not None
+            and time.time_ns() // 1_000_000 >= soft_deadline_at_ms
+        )
+        if (
+            coach_runtime_requested == "pi"
+            and coach_would_trigger
+            and soft_cutoff_reached_before_projection
+            and str(coach_result.get("status") or "") == "intervention"
+            and str(coach_result.get("runtime_used") or "").strip().lower()
+            != "local_reflex"
+        ):
+            coach_result = build_soft_timeout_result(error_code="soft_deadline_exceeded")
+            deadline_timeout_projected = True
+
+        agent_metrics = (
+            dict(coach_result.get("agent_metrics"))
+            if isinstance(coach_result.get("agent_metrics"), Mapping)
+            else {}
+        )
+        agent_metrics.update(
+            {
+                "job_queue_latency_ms": max(
+                    0,
+                    coach_evaluation_started_at_ms - int(job.get("created_at_ms") or coach_evaluation_started_at_ms),
+                ),
+                "job_budget_remaining_at_coach_start_ms": job_budget_remaining_at_coach_start_ms,
+                "soft_budget_remaining_at_coach_start_ms": soft_budget_remaining_at_coach_start_ms,
+                "soft_provider_budget_ms": soft_provider_budget_ms,
+                "soft_deadline_at_ms": soft_deadline_at_ms,
+                "soft_cutoff_triggered": bool(
+                    coach_result.get("soft_cutoff_triggered")
+                    or soft_cutoff_reached_before_projection
+                ),
+                "late_result_discarded": bool(
+                    coach_result.get("late_result_discarded")
+                ),
+                "provider_timeout_ms": coach_provider_timeout_ms,
+                "correction_lane_active_at_coach_start": correction_lane_active_at_coach_start,
+                "semantic_branch_status": semantic_branch_status,
+                "semantic_branch_error_class": semantic_branch_error_class,
+                "provider_availability_policy": REALTIME_PROVIDER_AVAILABILITY_POLICY_VERSION,
+                "provider_access_scope": provider_access_scope,
+                "provider_attempted": bool(
+                    semantic_provider_attempt_count + coach_provider_attempt_count
+                ),
+                "provider_attempt_count": (
+                    semantic_provider_attempt_count + coach_provider_attempt_count
+                ),
+            }
+        )
+        if coach_reservation_audit:
+            agent_metrics.update(
+                {
+                    "realtime_provider_reservation_id": coach_reservation_audit.get("reservation_id"),
+                    "realtime_provider_reservation_status": coach_reservation_audit.get("status"),
+                    "realtime_provider_reservation_idempotent": bool(
+                        coach_reservation_audit.get("idempotent")
+                    ),
+                    "realtime_provider_reservation_attempt_generation": coach_reservation_audit.get(
+                        "attempt_generation"
+                    ),
+                    "realtime_provider_reservation_attempt_token": coach_reservation_audit.get(
+                        "attempt_token"
+                    ),
+                    "realtime_provider_reservation_priority": coach_reservation_audit.get("priority"),
+                    "realtime_provider_reservation_expires_at_ms": coach_reservation_audit.get(
+                        "expires_at_ms"
+                    ),
+                    "realtime_provider_reservation_reason": coach_reservation_audit.get(
+                        "finish_reason"
+                    ),
+                }
+            )
+        if coach_circuit_admission is not None:
+            circuit_snapshot = realtime_provider_circuit.snapshot(
+                realtime_circuit_identity
+            )
+            agent_metrics.update(
+                {
+                    "realtime_circuit_state": circuit_snapshot.state,
+                    "realtime_circuit_reason": (
+                        str(coach_circuit_reason or coach_circuit_admission.snapshot.reason)
+                        if coach_circuit_suppressed
+                        else circuit_snapshot.reason
+                    ),
+                    "realtime_circuit_failure_count": circuit_snapshot.failure_count,
+                    "realtime_circuit_retry_after_ms": circuit_snapshot.retry_after_ms,
+                    "realtime_circuit_half_open": circuit_snapshot.half_open,
+                    "realtime_circuit_identity_generation": circuit_snapshot.identity_generation,
+                    "realtime_circuit_last_failure_class": circuit_snapshot.last_failure_class,
+                    "realtime_circuit_admitted": bool(
+                        coach_circuit_admission.admitted
+                        if coach_circuit_admission is not None
+                        else False
+                    ),
+                }
+            )
+        provider_attempt_count = (
+            semantic_provider_attempt_count + coach_provider_attempt_count
+        )
+        provider_attempted = provider_attempt_count > 0
+        provider_failure_class = classify_realtime_provider_failure(coach_result)
+        if coach_circuit_suppressed:
+            provider_terminal_status = "denied"
+            provider_terminal_reason = str(
+                coach_circuit_reason or "realtime_provider_circuit_open"
+            )
+        elif provider_attempted and provider_failure_class is not None:
+            provider_terminal_status = "failed"
+            provider_terminal_reason = f"provider_{provider_failure_class}"
+        elif provider_attempted and str(coach_result.get("status") or "") == "failed":
+            provider_terminal_status = "failed"
+            provider_terminal_reason = str(
+                coach_result.get("status_reason") or "provider_result_failed"
+            )[:128]
+        elif provider_attempted:
+            provider_terminal_status = "completed"
+            provider_terminal_reason = "provider_completed"
+        else:
+            provider_terminal_status = "not_attempted"
+            provider_terminal_reason = str(
+                coach_reservation_reason
+                or coach_result.get("status_reason")
+                or "provider_not_required"
+            )[:128]
+        provider_circuit_snapshot = realtime_provider_circuit.snapshot(
+            realtime_circuit_identity
+        )
+        provider_availability = {
+            "policy_version": REALTIME_PROVIDER_AVAILABILITY_POLICY_VERSION,
+            "scope": provider_access_scope,
+            "admitted": bool(
+                coach_circuit_admission.admitted
+                if coach_circuit_admission is not None
+                else False
+            ),
+            "provider_attempted": provider_attempted,
+            "provider_attempt_count": provider_attempt_count,
+            "circuit_scope_bypassed": None,
+            "admission_state": (
+                coach_circuit_admission.snapshot.state
+                if coach_circuit_admission is not None
+                else None
+            ),
+            "admission_reason": (
+                str(coach_circuit_reason or coach_circuit_admission.snapshot.reason)
+                if coach_circuit_admission is not None
+                else None
+            ),
+            "terminal_status": provider_terminal_status,
+            "terminal_reason": provider_terminal_reason,
+            "final_circuit_state": provider_circuit_snapshot.state,
+            "final_failure_count": provider_circuit_snapshot.failure_count,
+            "final_failure_class": provider_circuit_snapshot.last_failure_class,
+        }
+        agent_metrics.update(
+            {
+                "provider_availability_terminal": provider_terminal_status,
+                "provider_availability_terminal_reason": provider_terminal_reason,
+            }
+        )
+        coach_result["agent_metrics"] = agent_metrics
+
+        completed_at_ms = time.time_ns() // 1_000_000
+        soft_cutoff_elapsed_ms = None
+        if soft_deadline_at_ms is not None:
+            soft_origin_at_ms = soft_deadline_at_ms - REALTIME_COACH_SOFT_CUTOFF_MS
+            soft_cutoff_elapsed_ms = max(0, completed_at_ms - soft_origin_at_ms)
+            agent_metrics["soft_cutoff_elapsed_ms"] = soft_cutoff_elapsed_ms
+            if coach_result.get("soft_cutoff_triggered"):
+                agent_metrics["soft_timeout_projection_at_ms"] = None
+            coach_result["agent_metrics"] = agent_metrics
+        coach_timing = _coach_decision_timing_envelope(
+            coach_result,
+            fallback_started_at_ms=coach_evaluation_started_at_ms,
+            fallback_completed_at_ms=completed_at_ms,
+        )
+        intervention = coach_result.get("intervention")
+        intervention_payload = intervention.to_dict() if intervention is not None else None
+        # A direct fallback does not prove that Pi reached its Provider. All
+        # other Pi outcomes with a completed pre-attempt callback (including
+        # Provider errors/timeouts) consumed an actual Pi attempt.
+        pi_provider_attempted = bool(
+            coach_runtime_requested == "pi"
+            and pi_coach_attempt_count > 0
+            and str(coach_result.get("runtime_used") or "").strip().lower() != "direct"
+        )
+        provenance_keys = (
+            "provenance_version",
+            "origin",
+            "run_id",
+            "decision_id",
+            "evidence_revision",
+            "provider_lane",
+            "status",
+            "status_reason",
+            "decision_reason",
+        )
+        coach_decision = {
+            key: coach_result.get(key)
+            for key in provenance_keys
+            if coach_result.get(key) is not None
+        }
+        coach_decision.update(
+            {
+                "meeting_id": meeting_id,
+                "job_id": str(job["id"]),
+                "runtime_requested": (
+                    coach_result.get("runtime_requested") or coach_runtime_requested
+                ),
+                "runtime_used": coach_result.get("runtime_used"),
+                "fallback_error_code": coach_result.get("fallback_error_code"),
+                "fallback_reason": coach_result.get("fallback_reason"),
+                "triggered": coach_triggered,
+                "pi_provider_attempted": pi_provider_attempted,
+                "llm_called": provider_attempted,
+                "llm_call_status": "called" if provider_attempted else "not_called",
+                "provider_access_scope": provider_access_scope,
+                "circuit_scope_bypassed": None,
+                "provider_availability": dict(provider_availability),
+                "durable_terminal_status": provider_terminal_status,
+                "durable_terminal_reason": provider_terminal_reason,
+                "provider_reservation": dict(coach_reservation_audit) if coach_reservation_audit else None,
+                "detected_candidate_events": list(coach_candidate_payloads.values()),
+                "eligible_candidate_events": eligible_coach_audit_payloads,
+                "cooldown_suppressed_candidate_keys": list(
+                    cooldown_suppressed_candidate_keys
+                ),
+                # Compatibility alias for consumers that predate the complete
+                # detected/eligible/suppressed cooldown audit envelope.
+                "candidate_events": eligible_coach_candidate_payloads,
+                "candidate_event": coach_candidates[0].event_type if coach_candidates else None,
+                "candidate_key": coach_candidates[0].candidate_key if coach_candidates else None,
+                "candidate_episode_id": (
+                    eligible_coach_candidate_payloads[0]["episode_id"]
+                    if eligible_coach_candidate_payloads
+                    else None
+                ),
+                "candidate_priority": (
+                    eligible_coach_candidate_payloads[0]["candidate_priority"]
+                    if eligible_coach_candidate_payloads
+                    else None
+                ),
+                **coach_timing,
+                "deadline_at_ms": job.get("deadline_at_ms"),
+                "soft_deadline_at_ms": soft_deadline_at_ms,
+                "soft_cutoff_elapsed_ms": soft_cutoff_elapsed_ms,
+                "soft_timeout_projection_at_ms": (
+                    completed_at_ms
+                    if coach_result.get("soft_cutoff_triggered")
+                    else None
+                ),
+                "delivery_status": (
+                    str(coach_result.get("delivery_status") or "too_late")
+                    if coach_result.get("soft_cutoff_triggered")
+                    else "on_time"
+                    if str(coach_result.get("status") or "") == "intervention"
+                    else "not_applicable"
+                ),
+                "late_result_discarded": bool(coach_result.get("late_result_discarded")),
+                # Keep the safe phase metrics in the formal decision so the
+                # public snapshot/event/replay path can explain latency and
+                # budget outcomes without opening private job output.
+                "agent_metrics": _public_coach_agent_metrics(agent_metrics),
+                # Validity belongs to the decision envelope, including an
+                # explicit silent decision. This makes audit/replay consumers
+                # able to distinguish an active silence from an old one.
+                "valid_until_ms": coach_timing["completed_at_ms"] + COACH_INTERVENTION_VALIDITY_MS,
+                "lifecycle_action": {
+                    "intervention": "retain",
+                    "stale": "retract",
+                    "timed_out": "deprioritize",
+                    "failed": "deprioritize",
+                    "protected_silent": "deprioritize",
+                    "not_triggered": "deprioritize",
+                }.get(str(coach_result.get("status") or "protected_silent"), "deprioritize"),
+                "supersedes_decision_id": None,
+                "superseded_by": None,
+                "lifecycle_refresh": bool(coach_result.get("lifecycle_refresh")),
+                "lifecycle_refresh_previous_decision_id": (
+                    str(coach_result.get("lifecycle_refresh_previous_decision_id") or "")
+                    or None
+                ),
+                "lifecycle_refresh_evidence_segment_ids": list(
+                    coach_result.get("lifecycle_refresh_evidence_segment_ids") or []
+                ),
+                "lifecycle_refresh_evidence_quote": (
+                    str(coach_result.get("lifecycle_refresh_evidence_quote") or "")[:2_000]
+                    or None
+                ),
+            }
+        )
+        coach_intervention = (
+            {
+                **intervention_payload,
+                "trigger": intervention_payload["event_type"],
+                "next_move": intervention_payload.get("say_this") or intervention_payload["recommendation"],
+                "say_this": intervention_payload.get("say_this") or intervention_payload["recommendation"],
+                "why_now": intervention_payload.get("why_now") or intervention_payload["reason"],
+                **coach_decision,
+            }
+            if intervention_payload is not None
+            else None
+        )
+        projection_response = {
+            **result["response"].to_dict(),
+            "coach_intervention": coach_intervention,
+            "coach_decision": coach_decision,
+            "host_evidence": coach_result.get("host_evidence", []) if coach_intervention is not None else [],
+        }
         formal_event_context = build_llm_first_event_context(
             request=request,
             response=result["response"],
@@ -9123,48 +12857,141 @@ def create_app(
             model=str(result.get("model") or config.model),
             evidence_hash=str(target.get("evidence_hash") or "") or None,
         )
+        formal_event_context["semantic_branch_status"] = semantic_branch_status
+        formal_event_context["llm_called"] = provider_attempted
+        formal_event_context["llm_call_status"] = (
+            "called" if provider_attempted else "not_called"
+        )
+        formal_event_context["provider_availability"] = dict(provider_availability)
         app.state.llm_first_event_contexts[str(job["id"])] = formal_event_context
-        for stage, field in (
-            ("provider_connected", "connected_at"),
-            ("first_token", "first_token_at"),
-            ("provider_completed", "completed_at"),
-        ):
-            timestamp = (result.get("timings") or {}).get(field)
-            if isinstance(timestamp, (int, float)):
-                pipeline_traces.observe(
-                    str(job["id"]),
-                    stage,
+        observe_provider_timing(
+            pipeline_traces,
+            trace_id=str(job["id"]),
+            meeting_id=meeting_id,
+            job_id=str(job["id"]),
+            generation_id=str(job.get("generation_id") or "") or None,
+            timings=result.get("timings"),
+            provider_attempt_count=max(
+                1,
+                int(result.get("provider_attempt_count") or provider_attempt_count or 1),
+            ),
+        )
+        # Both direct and Pi paths have completed their schema/evidence
+        # validation before entering the durable projection transaction. Pi's
+        # sidecar records its more precise validation duration earlier; this
+        # call only fills a missing stage and keeps first-write-wins semantics.
+        _record_v2_provenance_stage(job, "response_validation")
+        try:
+            # Evaluate the production wall clock inside the worker thread that
+            # owns the SQLite transaction. Computing this argument before
+            # ``to_thread`` leaves a small but real late-projection window when
+            # the event loop is busy.
+            def apply_projection_in_worker() -> dict[str, Any]:
+                return v2_persistence.apply_intelligence_response(
                     meeting_id=meeting_id,
                     job_id=str(job["id"]),
-                    generation_id=str(job.get("generation_id") or "") or None,
-                    monotonic_ns=int(float(timestamp) * 1_000_000_000),
+                    response=projection_response,
+                    now_ms=time.time_ns() // 1_000_000,
                 )
-        try:
-            applied = await asyncio.to_thread(
-                v2_persistence.apply_intelligence_response,
-                meeting_id=meeting_id,
-                job_id=str(job["id"]),
-                response=result["response"].to_dict(),
-                now_ms=time.time_ns() // 1_000_000,
+
+            applied = await asyncio.to_thread(apply_projection_in_worker)
+            projection_committed_at_ns = time.monotonic_ns()
+            _record_v2_provenance_stage(
+                job,
+                "persistence_commit",
+                monotonic_ns=projection_committed_at_ns,
+                attributes={"event": "meeting.intelligence.applied"},
             )
+            _record_v2_provenance_stage(
+                job,
+                "projection_commit",
+                monotonic_ns=projection_committed_at_ns,
+                attributes={"projection": "coach_and_semantic"},
+            )
+            _record_v2_provenance_stage(
+                job,
+                "late_result_guard",
+                monotonic_ns=projection_committed_at_ns,
+                attributes={
+                    "outcome": (
+                        "discarded"
+                        if bool(coach_decision.get("late_result_discarded"))
+                        else "on_time"
+                        if str(coach_decision.get("delivery_status") or "") == "on_time"
+                        else "not_applicable"
+                    )
+                },
+            )
+            if coach_reservation is not None:
+                # Only a successfully committed intelligence event completes
+                # the crash-protection reservation. A late/failed projection
+                # leaves its bounded reservation visible for the next worker.
+                finished_reservation = await finish_coach_reservation(
+                    "committed",
+                    "meeting.intelligence.applied",
+                )
+                # ``meeting.intelligence.applied`` is emitted before the
+                # reservation finish event by design. Keep the synchronous
+                # handler response consistent with the durable read model by
+                # overlaying the authoritative finish state here; historical
+                # events remain append-only and are corrected on read.
+                if isinstance(finished_reservation, Mapping):
+                    for field in ("coach_decision", "coach_intervention", "follow_up"):
+                        if field in applied:
+                            applied[field] = _overlay_realtime_provider_reservation(
+                                applied.get(field),
+                                finished_reservation,
+                            )
         except IntelligenceEvidenceSuperseded:
-            replacement = await asyncio.to_thread(
-                v2_persistence.enqueue_latest_intelligence,
-                meeting_id=meeting_id,
-                superseded_job_id=str(job["id"]),
-                now_ms=time.time_ns() // 1_000_000,
+            rejected_at_ns = time.monotonic_ns()
+            _record_v2_provenance_stage(
+                job,
+                "persistence_commit",
+                status="failed",
+                reason="evidence_superseded",
+                monotonic_ns=rejected_at_ns,
             )
-            executor = getattr(app.state, "v2_executor", None)
-            if replacement is not None and executor is not None:
-                executor.wake("intelligence")
-            _log.info(
-                "meeting.v2.intelligence_evidence_superseded",
-                meeting_id=meeting_id,
-                job_id=str(job["id"]),
-                replacement_job_id=(str(replacement["id"]) if replacement is not None else None),
+            _record_v2_provenance_stage(
+                job,
+                "projection_commit",
+                status="not_required",
+                reason="persistence_rejected",
+                monotonic_ns=rejected_at_ns,
             )
+            _record_v2_provenance_stage(
+                job,
+                "late_result_guard",
+                monotonic_ns=rejected_at_ns,
+                attributes={"outcome": "discarded_stale"},
+            )
+            if pi_coach_attempt_count == 0:
+                await finish_coach_reservation("released", "evidence_superseded_before_provider_attempt")
             raise
         except Exception as exc:
+            failed_at_ns = time.monotonic_ns()
+            _record_v2_provenance_stage(
+                job,
+                "persistence_commit",
+                status="failed",
+                reason="transaction_failed",
+                monotonic_ns=failed_at_ns,
+            )
+            _record_v2_provenance_stage(
+                job,
+                "projection_commit",
+                status="failed",
+                reason="projection_failed",
+                monotonic_ns=failed_at_ns,
+            )
+            _record_v2_provenance_stage(
+                job,
+                "late_result_guard",
+                status="unavailable",
+                reason="projection_failed",
+                monotonic_ns=failed_at_ns,
+            )
+            if pi_coach_attempt_count == 0:
+                await finish_coach_reservation("released", "projection_failed_before_provider_attempt")
             _log.error(
                 "meeting.v2.intelligence_projection_failed",
                 meeting_id=meeting_id,
@@ -9187,6 +13014,16 @@ def create_app(
             "event_emitted",
             attributes={"state_change_count": applied["state_change_count"]},
         )
+        applied_coach_decision = (
+            dict(applied["coach_decision"])
+            if isinstance(applied.get("coach_decision"), Mapping)
+            else coach_decision
+        )
+        applied_coach_intervention = (
+            dict(applied["coach_intervention"])
+            if isinstance(applied.get("coach_intervention"), Mapping)
+            else coach_intervention
+        )
         return {
             "schema_version": "v2_realtime_intelligence_job_output.v1",
             "applied": applied,
@@ -9198,39 +13035,215 @@ def create_app(
             "repair_attempted": result.get("repair_attempted", False),
             "usage": result.get("usage"),
             "model": result.get("model"),
+            "provider_availability": provider_availability,
             "coach": {
                 "enabled": coach_enabled,
                 "triggered": coach_triggered,
-                "status": coach_status,
-                "ttft_ms": coach_result.get("ttft_ms") if coach_result is not None else None,
-                "usage": coach_result.get("usage") if coach_result is not None else None,
-                "model": coach_result.get("model") if coach_result is not None else None,
+                "status": coach_result.get("status"),
+                "ttft_ms": coach_result.get("ttft_ms"),
+                "decision_latency_ms": coach_result.get("decision_latency_ms"),
+                "usage": coach_result.get("usage"),
+                "model": coach_result.get("model"),
                 "runtime_requested": (
-                    coach_result.get("runtime_requested") if coach_result is not None else coach_runtime_requested
+                    coach_result.get("runtime_requested") or coach_runtime_requested
                 ),
-                "runtime_used": coach_result.get("runtime_used") if coach_result is not None else None,
-                "fallback_error_code": (
-                    coach_result.get("fallback_error_code") if coach_result is not None else None
-                ),
-                "fallback_reason": coach_result.get("fallback_reason") if coach_result is not None else None,
-                "decision_reason": coach_result.get("decision_reason") if coach_result is not None else None,
-                "agent_metrics": coach_result.get("agent_metrics") if coach_result is not None else None,
+                "runtime_used": coach_result.get("runtime_used"),
+                "fallback_error_code": coach_result.get("fallback_error_code"),
+                "fallback_reason": coach_result.get("fallback_reason"),
+                "decision_reason": coach_result.get("decision_reason"),
+                "agent_metrics": coach_result.get("agent_metrics"),
+                "intervention": applied_coach_intervention,
+                **applied_coach_decision,
+            },
+            "semantic": {
+                "status": semantic_branch_status,
+                "error_class": semantic_branch_error_class,
             },
         }
 
-    def _default_v2_correction_job_handler(job: dict[str, Any]) -> dict[str, Any]:
-        if llm_service.LlmConfig.from_env() is None:
+    def _open_realtime_intelligence_jobs_for_correction(
+        meeting_id: str,
+        *,
+        now_ms: int,
+    ) -> list[dict[str, Any]]:
+        """Return live Pi jobs that still own a viable realtime window.
+
+        Correction and intelligence have independent durable consumers. The
+        correction worker therefore needs an explicit admission barrier before
+        it starts a Provider request; otherwise a slow correction can consume
+        the shared upstream budget while Pi is still waiting for its first
+        token. Running intelligence is always a blocker until its handler
+        settles. Pending/retry-wait intelligence only blocks while its durable
+        deadline is still viable. Meeting-end correction bypasses this helper
+        because ``end_meeting`` cancels pending Pi work and creates the final
+        correction job that must be allowed to finish.
+        """
+
+        if v2_persistence is None:
+            return []
+        normalized_now_ms = max(0, int(now_ms))
+        blockers: list[dict[str, Any]] = []
+        for candidate in v2_persistence.list_jobs(
+            meeting_id=str(meeting_id),
+            lane="intelligence",
+        ):
+            status = str(candidate.get("status") or "")
+            if status == "running":
+                blockers.append(candidate)
+                continue
+            if status not in {"pending", "retry_wait"}:
+                continue
+            deadline_at_ms = candidate.get("deadline_at_ms")
+            if deadline_at_ms is None:
+                # Rows from before the deadline column was introduced are
+                # backfilled by ``claim_next_job``. Use the same derivation
+                # here so an old, never-claimed row cannot block correction
+                # forever when the intelligence worker is not running.
+                deadline_at_ms = int(candidate.get("created_at_ms") or 0) + INTELLIGENCE_REALTIME_BUDGET_MS
+            if int(deadline_at_ms) > normalized_now_ms:
+                blockers.append(candidate)
+        return blockers
+
+    def _defer_correction_for_realtime_priority(job: Mapping[str, Any]) -> None:
+        """Raise a retryable priority defer before any correction Provider call."""
+
+        meeting_id = str(job.get("meeting_id") or "").strip()
+        if not meeting_id:
+            return
+        if str(job.get("idempotency_key") or "").endswith("meeting.ended"):
+            return
+        if v2_persistence is not None:
+            try:
+                if v2_persistence.get_meeting(meeting_id).get("state") == "ended":
+                    return
+            except KeyError:
+                # Let the normal correction path report a missing meeting.
+                pass
+        blockers = _open_realtime_intelligence_jobs_for_correction(
+            meeting_id,
+            now_ms=time.time_ns() // 1_000_000,
+        )
+        if blockers:
+            raise CorrectionProviderPriorityDeferred(
+                blocking_job_ids=[str(candidate["id"]) for candidate in blockers]
+            )
+
+    async def _default_v2_correction_job_handler_async(
+        job: dict[str, Any],
+        *,
+        run_once: Any,
+    ) -> dict[str, Any]:
+        # A durable correction row is created together with every final, even
+        # when the user has disabled L2 correction. Treat that row as a
+        # successful no-op before consulting Provider configuration or billing
+        # gates; otherwise a disabled feature can incorrectly fail the whole
+        # meeting job set (and can never be enabled in a provider-less test).
+        correction_enabled = bool(_current_settings()["asr"]["l2_correction_enabled"])
+        if not correction_enabled:
+            return _bounded_v2_correction_job_output(
+                job,
+                {
+                    "session_id": str(job["meeting_id"]),
+                    "called": False,
+                    "gate": {
+                        "eligible": False,
+                        "reason": "disabled_by_setting",
+                    },
+                    "status": {"status": "disabled_by_setting"},
+                    "revision_count": 0,
+                    "transcript_revisions": [],
+                    "no_revision_segment_ids": [],
+                },
+                {
+                    "revision_count": 0,
+                    "event_count": 0,
+                    "segment_ids": [],
+                    "superseded_job_count": 0,
+                },
+            )
+
+        _defer_correction_for_realtime_priority(job)
+
+        config = llm_service.LlmConfig.from_env()
+        if config is None:
             raise ProviderRuntimeNotConfiguredDeferred()
-        force = str(job.get("idempotency_key") or "").endswith("meeting.ended") or int(job.get("attempts") or 0) > 1
+        config = llm_service.correction_config(config)
+        correction_pricing = correction_budget_policy.correction_pricing_decision(
+            is_mock=config.is_mock
+        )
+        if not correction_pricing.allowed:
+            _log.warning(
+                "meeting.v2.correction.disabled",
+                meeting_id=str(job["meeting_id"]),
+                job_id=str(job["id"]),
+                reason=correction_pricing.reason,
+                pricing_mode=correction_pricing.pricing_mode,
+            )
+            raise CorrectionProviderTerminalDegraded(
+                str(correction_pricing.reason)
+            )
         try:
-            result = app.state.run_asr_live_session_realtime_corrections_once(
+            _enforce_llm_budget(
+                str(job["meeting_id"]),
+                purpose="realtime_transcript_correction",
+                config=config,
+            )
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {}
+            if (
+                exc.status_code == 429
+                and detail.get("error") == "llm_budget_exceeded"
+            ):
+                _log.warning(
+                    "meeting.v2.correction.disabled",
+                    meeting_id=str(job["meeting_id"]),
+                    job_id=str(job["id"]),
+                    reason="budget_exhausted",
+                )
+                raise CorrectionProviderTerminalDegraded(
+                    "correction_provider_budget_exhausted"
+                ) from None
+            raise
+        meeting_ended = str(job.get("idempotency_key") or "").endswith(
+            "meeting.ended"
+        )
+        if not meeting_ended and v2_persistence is not None:
+            try:
+                meeting_ended = (
+                    v2_persistence.get_meeting(str(job["meeting_id"])).get("state")
+                    == "ended"
+                )
+            except KeyError:
+                meeting_ended = False
+        force = meeting_ended or int(job.get("attempts") or 0) > 1
+        try:
+            result = run_once(
                 str(job["meeting_id"]),
                 RunRealtimeCorrectionsRequest(force=force),
             )
+            if inspect.isawaitable(result):
+                result = await result
         except HTTPException as exc:
+            blocker_error_code = _realtime_correction_blocker_error_code(exc)
+            if blocker_error_code:
+                _log.warning(
+                    "meeting.v2.correction.blocked",
+                    meeting_id=str(job["meeting_id"]),
+                    job_id=str(job["id"]),
+                    reason=blocker_error_code,
+                )
+                # ASR eligibility is a local terminal gate for this durable
+                # job. Retrying cannot improve the already-persisted evidence;
+                # the original transcript remains available for later repair.
+                raise CorrectionProviderTerminalDegraded(blocker_error_code) from None
             if exc.status_code in {422, 503} and llm_service.LlmConfig.from_env() is None:
                 raise ProviderRuntimeNotConfiguredDeferred() from None
             raise
+        if not result.get("called") and (result.get("gate") or {}).get("reason") == "correction_lane_at_capacity":
+            # The durable job must remain retryable. Completing it here would
+            # lose the correction because the next ASR final may never arrive
+            # to enqueue another batch.
+            raise CorrectionLaneCapacityDeferred()
         persisted_revisions = [
             dict(event)
             for event in (_get_asr_live_record_for_derivation(str(job["meeting_id"])).get("events") or [])
@@ -9313,6 +13326,24 @@ def create_app(
                 attributes={"event_count": reconciliation["event_count"]},
             )
         return _bounded_v2_correction_job_output(job, result, reconciliation)
+
+    def _default_v2_correction_job_handler(job: dict[str, Any]) -> dict[str, Any]:
+        """Synchronous compatibility facade for tests and legacy callers."""
+
+        return _run_coroutine_sync(
+            _default_v2_correction_job_handler_async(
+                job,
+                run_once=app.state.run_asr_live_session_realtime_corrections_once,
+            )
+        )
+
+    async def _default_v2_correction_job_handler_realtime(
+        job: dict[str, Any],
+    ) -> dict[str, Any]:
+        return await _default_v2_correction_job_handler_async(
+            job,
+            run_once=app.state.run_asr_live_session_realtime_corrections_once_async,
+        )
 
     def _preview_segment_ids(preview: dict[str, Any]) -> set[str]:
         segment_ids = {
@@ -9435,7 +13466,7 @@ def create_app(
                 gap=preview.get("suggested_prompt") or preview.get("input_summary"),
                 evidence=evidence_context,
             )
-            streaming_client = getattr(app.state, "streaming_llm_client", None)
+            streaming_client = _provider_client_for_lane("realtime")
             if streaming_client is None:
                 raise RuntimeError("streaming LLM client is not started")
             provider = OpenAICompatibleStreamingProvider(
@@ -9480,22 +13511,18 @@ def create_app(
                 asr_live_repo.update(session_id, release_failed_claim)
                 raise
 
-            timings = dict(result.get("timings") or {})
-            for stage, field in (
-                ("provider_connected", "connected_at"),
-                ("first_token", "first_token_at"),
-                ("provider_completed", "completed_at"),
-            ):
-                timestamp = timings.get(field)
-                if isinstance(timestamp, (int, float)):
-                    pipeline_traces.observe(
-                        str(job["id"]),
-                        stage,
-                        meeting_id=session_id,
-                        job_id=str(job["id"]),
-                        generation_id=str(job.get("generation_id") or "") or None,
-                        monotonic_ns=int(float(timestamp) * 1_000_000_000),
-                    )
+            observe_provider_timing(
+                pipeline_traces,
+                trace_id=str(job["id"]),
+                meeting_id=session_id,
+                job_id=str(job["id"]),
+                generation_id=str(job.get("generation_id") or "") or None,
+                timings=result.get("timings"),
+                provider_attempt_count=max(
+                    1,
+                    int(result.get("provider_attempt_count") or 1),
+                ),
+            )
 
             suggestion = dict(result["suggestion"])
             suggestion_text = str(suggestion["text"])
@@ -9570,8 +13597,139 @@ def create_app(
         finally:
             lane_lease.release()
 
+    def _with_v2_intelligence_result_contract(result: Mapping[str, Any]) -> dict[str, Any]:
+        """Separate execution outcome from the coach's product decision."""
+
+        output = dict(result)
+        coach = output.get("coach") if isinstance(output.get("coach"), Mapping) else {}
+        availability = (
+            output.get("provider_availability")
+            if isinstance(output.get("provider_availability"), Mapping)
+            else {}
+        )
+        status = str(coach.get("status") or "").strip().lower()
+        reason = str(
+            coach.get("fallback_reason")
+            or coach.get("status_reason")
+            or availability.get("terminal_reason")
+            or output.get("fallback_reason")
+            or ""
+        ).strip().lower()
+        runtime_used = str(coach.get("runtime_used") or "").strip().lower()
+        fallback_runtime = runtime_used == "local_reflex" and bool(
+            coach.get("fallback_error_code") or coach.get("fallback_reason")
+        )
+        if status == "intervention" and fallback_runtime:
+            execution_status, decision = "runtime_fallback", "recommendation"
+        elif status == "intervention":
+            execution_status, decision = "succeeded", "recommendation"
+        elif status in {"timed_out"} or any(
+            marker in reason for marker in ("timeout", "soft_deadline", "deadline_budget")
+        ):
+            execution_status, decision = "timeout", "watching"
+        elif (
+            str(availability.get("terminal_status") or "").strip().lower() == "failed"
+            or status in {"failed", "provider_error"}
+            or any(marker in reason for marker in ("provider", "transport", "rate_limit", "circuit"))
+        ):
+            execution_status, decision = "provider_error", "no_change"
+        elif status in {"invalid", "invalid_output"} or "validation" in reason:
+            execution_status, decision = "invalid_output", "no_change"
+        elif status in {"stale", "evidence_stale"} or "stale" in reason or "superseded" in reason:
+            execution_status, decision = "evidence_stale", "no_change"
+        elif status in {"suppressed", "protected_silent", "silent", "no_change", "not_triggered", ""}:
+            execution_status, decision = "succeeded", "no_change"
+        else:
+            execution_status, decision = "succeeded", "finding" if output.get("semantic") else "no_change"
+        output.setdefault("schema_version", "v2_realtime_intelligence_job_output.v1")
+        output["result_contract"] = "talktrace.assistance.result.v2"
+        output["execution_status"] = execution_status
+        output["decision"] = decision
+        return output
+
+    async def _default_v2_intelligence_job_handler(job: dict[str, Any]) -> dict[str, Any]:
+        """Run local preflight before entering the dedicated Provider lane."""
+
+        job_id = str(job.get("id") or "").strip()
+        if not job_id:
+            raise ValueError("intelligence job is missing id")
+        deep_job = str(job.get("trigger_type") or "").strip() in {
+            "task_due",
+            "user_request",
+        }
+        release_lane_reservation = (
+            provider_lane_registry.release_deep
+            if deep_job
+            else provider_lane_registry.release_realtime_reservation
+        )
+        try:
+            preflight = await _default_v2_intelligence_job_handler_core(
+                job,
+                provider_lane_acquired=False,
+            )
+        except IntelligenceEvidenceSuperseded:
+            release_lane_reservation(job_id)
+            await _enqueue_latest_v2_intelligence_after_supersession(job)
+            raise
+        except BaseException:
+            release_lane_reservation(job_id)
+            raise
+        if preflight is not None:
+            release_lane_reservation(job_id)
+            return _with_v2_intelligence_result_contract(preflight)
+        # Existing databases may contain jobs created before the in-memory
+        # lane registry existed. Reconcile those rows before reserving this worker.
+        if deep_job:
+            _sync_deep_provider_reservations()
+            provider_lane_registry.reserve_deep(job_id)
+        else:
+            _sync_realtime_provider_reservations()
+            provider_lane_registry.reserve_realtime(job_id)
+        lease = None
+        raw_deadline = job.get("deadline_at_ms")
+        deadline_at_ms = int(raw_deadline) if raw_deadline is not None else None
+        try:
+            while lease is None:
+                lease = (
+                    provider_lane_registry.try_acquire_deep(job_id)
+                    if deep_job
+                    else provider_lane_registry.try_acquire_realtime(job_id)
+                )
+                if lease is not None:
+                    break
+                now_ms = time.time_ns() // 1_000_000
+                if deadline_at_ms is not None and now_ms >= deadline_at_ms:
+                    raise IntelligenceDeadlineExceeded(
+                        "intelligence job reached its provider lane deadline while waiting for lane capacity"
+                    )
+                sleep_seconds = 0.01
+                if deadline_at_ms is not None:
+                    sleep_seconds = min(
+                        sleep_seconds,
+                        max(0.001, (deadline_at_ms - now_ms) / 1_000),
+                    )
+                await asyncio.sleep(sleep_seconds)
+            result = await _default_v2_intelligence_job_handler_core(
+                job,
+                provider_lane_acquired=True,
+            )
+            if result is None:
+                raise RuntimeError(
+                    "Provider continuation returned a preflight sentinel"
+                )
+            return _with_v2_intelligence_result_contract(result)
+        except IntelligenceEvidenceSuperseded:
+            await _enqueue_latest_v2_intelligence_after_supersession(job)
+            raise
+        finally:
+            if lease is not None:
+                lease.release()
+            release_lane_reservation(job_id)
+
     app.state.v2_intelligence_job_handler_impl = _default_v2_intelligence_job_handler
     app.state.v2_correction_job_handler_impl = _default_v2_correction_job_handler
+    app.state.v2_correction_job_handler_async_impl = _default_v2_correction_job_handler_realtime
+    app.state._v2_default_correction_job_handler = _default_v2_correction_job_handler
     app.state.v2_suggestion_job_handler_impl = _default_v2_suggestion_job_handler
 
     def _completed_realtime_correction_covers_jobs(
@@ -9639,9 +13797,26 @@ def create_app(
                     correction_jobs,
                 )
                 degraded = not correction_jobs or (not succeeded and not completed_projection)
+                terminal_degraded_error = next(
+                    (
+                        str(item.get("error_class") or "")
+                        for item in correction_jobs
+                        if item["status"] == "failed"
+                        and str(item.get("error_class") or "")
+                        in {
+                            "correction_provider_rates_not_configured",
+                            "correction_provider_budget_exhausted",
+                        }
+                    ),
+                    None,
+                )
                 reason = (
                     f"{lane}_jobs_missing"
                     if not correction_jobs
+                    else terminal_degraded_error
+                    if terminal_degraded_error is not None
+                    and not succeeded
+                    and not completed_projection
                     else f"{lane}_has_no_successful_job"
                     if not succeeded and not completed_projection
                     else None
@@ -9846,17 +14021,644 @@ def create_app(
         )
     app.state.recording_export_executor = recording_export_executor
 
-    def _run_v2_correction_job(job: dict[str, Any]) -> dict[str, Any]:
+    async def _run_v2_correction_job(job: dict[str, Any]) -> dict[str, Any]:
         _mark_v2_job_stage(job, "job_claimed", attributes={"lane": "correction"})
-        return app.state.v2_correction_job_handler_impl(job)
+        # Preserve the established injection seam used by import/replay tests
+        # and local integrations. Only the built-in handler uses the native
+        # async transport; an explicitly replaced handler keeps its own
+        # sync/async contract.
+        handler = app.state.v2_correction_job_handler_impl
+        if handler is not app.state._v2_default_correction_job_handler:
+            result = handler(job)
+            if inspect.isawaitable(result):
+                return await result
+            return result
+        return await app.state.v2_correction_job_handler_async_impl(job)
 
     async def _run_v2_intelligence_job(job: dict[str, Any]) -> dict[str, Any]:
-        _mark_v2_job_stage(job, "job_claimed", attributes={"lane": "intelligence"})
+        claimed_at_ms = time.time_ns() // 1_000_000
+        _mark_v2_job_stage(
+            job,
+            "job_claimed",
+            attributes={
+                "lane": (
+                    "pi_deep"
+                    if str(job.get("trigger_type") or "").strip()
+                    in {"task_due", "user_request"}
+                    else "intelligence"
+                ),
+                "job_queue_latency_ms": max(
+                    0,
+                    claimed_at_ms - int(job.get("created_at_ms") or claimed_at_ms),
+                ),
+            },
+        )
         return await app.state.v2_intelligence_job_handler_impl(job)
 
     def _run_v2_suggestion_job(job: dict[str, Any]) -> Any:
         _mark_v2_job_stage(job, "job_claimed", attributes={"lane": "suggestion"})
         return app.state.v2_suggestion_job_handler_impl(job)
+
+    def _record_v2_job_lifecycle(event: Mapping[str, Any]) -> None:
+        """Project content-free durable lifecycle facts into the trace/SLO sink."""
+
+        job_id = str(event.get("job_id") or "").strip()
+        meeting_id = str(event.get("meeting_id") or "").strip()
+        if not job_id or not meeting_id:
+            return
+        try:
+            trace = pipeline_traces.create(
+                trace_id=job_id,
+                meeting_id=meeting_id,
+                job_id=job_id,
+            )
+        except (KeyError, TypeError, ValueError):
+            # A malformed observer event must never block a durable worker.
+            return
+
+        event_name = str(event.get("event") or "unknown").strip() or "unknown"
+        error_class = str(event.get("error_class") or "").strip() or None
+        event_http_status = event.get("http_status")
+        http_status = (
+            event_http_status
+            if type(event_http_status) is int and 100 <= event_http_status <= 599
+            else None
+        )
+        lane = str(event.get("lane") or "unknown").strip() or "unknown"
+
+        # Keep the per-input coverage ledger independent from the latest-job
+        # projection. This makes coalescing observable without changing the
+        # user-facing event payload.
+        if v2_persistence is not None and lane == "intelligence":
+            coverage_status: str | None = None
+            coverage_reason: str | None = None
+            if event_name == "job_claimed":
+                coverage_status = "in_flight"
+            elif event_name == "terminal":
+                terminal_outcome = str(event.get("terminal_outcome") or "").strip()
+                if terminal_outcome == "success":
+                    coverage_status = "processed"
+                elif terminal_outcome in {"timeout", "cancelled", "superseded"}:
+                    coverage_status = "retryable_error"
+                    coverage_reason = terminal_outcome or None
+                else:
+                    coverage_status = "terminal_error"
+                    coverage_reason = str(event.get("error_class") or "terminal_failure")
+            elif event_name == "attempt_failed":
+                coverage_status = "retryable_error"
+                coverage_reason = str(event.get("error_class") or "attempt_failed")
+            if coverage_status is not None:
+                try:
+                    v2_persistence.update_intelligence_input_coverage_for_job(
+                        job_id=job_id,
+                        status=coverage_status,
+                        run_id=job_id,
+                        failure_reason=coverage_reason,
+                        now_ms=time.time_ns() // 1_000_000,
+                    )
+                except (KeyError, OSError, sqlite3.Error, TypeError, ValueError):
+                    _log.debug(
+                        "meeting.v2.input_coverage_update_skipped",
+                        job_id=job_id,
+                        status=coverage_status,
+                    )
+
+        def _safe(call: Any, *args: Any, **kwargs: Any) -> Any:
+            """Keep telemetry fail-open while retaining a bounded log marker."""
+
+            try:
+                return call(*args, **kwargs)
+            except (KeyError, TypeError, ValueError):
+                _log.debug(
+                    "meeting.v2.lifecycle_trace_update_skipped",
+                    job_id=job_id,
+                    event_name=event_name,
+                    error_class="trace_update_rejected",
+                )
+                return None
+
+        lifecycle_at_ns = event.get("lifecycle_at_monotonic_ns")
+        if type(lifecycle_at_ns) is not int or lifecycle_at_ns < 0:
+            lifecycle_at_ns = time.monotonic_ns()
+        _safe(
+            trace.record_provenance_stage,
+            "lifecycle_lookup",
+            monotonic_ns=lifecycle_at_ns,
+            attributes={"event": event_name},
+        )
+
+        job: Mapping[str, Any] = {}
+        if v2_persistence is not None:
+            try:
+                loaded_job = v2_persistence.get_job(job_id)
+                if isinstance(loaded_job, Mapping):
+                    job = loaded_job
+            except (KeyError, OSError, TypeError, ValueError):
+                # The event itself remains sufficient for terminal/result
+                # accounting.  Missing output only lowers provenance detail.
+                pass
+
+        # ``speech_endpoint`` is observed when an ASR final creates the job.
+        # Explicit non-speech triggers must account for the stage as
+        # not-required; otherwise their terminal trace would look like a
+        # missing ASR boundary rather than a correctly classified input.
+        try:
+            provenance_snapshot = trace.execution_snapshot().get("provenance") or {}
+            if "speech_endpoint" not in provenance_snapshot:
+                trigger_type = str(job.get("trigger_type") or "").strip()
+                if trigger_type in {"task_due", "user_request"}:
+                    _safe(
+                        trace.record_provenance_stage,
+                        "speech_endpoint",
+                        status="not_required",
+                        reason=f"speech_endpoint_not_required_for_{trigger_type}",
+                        monotonic_ns=lifecycle_at_ns,
+                    )
+        except (KeyError, TypeError, ValueError):
+            _log.debug(
+                "meeting.v2.speech_endpoint_provenance_skipped",
+                job_id=job_id,
+                event_name=event_name,
+            )
+        raw_output = job.get("output") if isinstance(job, Mapping) else None
+        output = raw_output if isinstance(raw_output, Mapping) else {}
+        raw_coach = output.get("coach")
+        coach_output = raw_coach if isinstance(raw_coach, Mapping) else {}
+        raw_metrics = output.get("agent_metrics")
+        if not isinstance(raw_metrics, Mapping):
+            raw_metrics = coach_output.get("agent_metrics")
+        agent_metrics = raw_metrics if isinstance(raw_metrics, Mapping) else {}
+        raw_availability = output.get("provider_availability")
+        if not isinstance(raw_availability, Mapping):
+            raw_context = output.get("formal_event_context")
+            raw_context = raw_context if isinstance(raw_context, Mapping) else {}
+            raw_availability = raw_context.get("provider_availability")
+        availability = raw_availability if isinstance(raw_availability, Mapping) else {}
+
+        availability_terminal_status = str(
+            availability.get("terminal_status") or ""
+        ).strip()
+        availability_terminal_reason = str(
+            availability.get("terminal_reason") or ""
+        ).strip()
+        availability_failure_outcome = {
+            "provider_timeout": "timeout",
+            "provider_rate_limit": "rate_limit",
+            "provider_provider_5xx": "provider_5xx",
+            "provider_transport_error": "transport_error",
+            "provider_validation_error": "validation_error",
+        }.get(availability_terminal_reason)
+        raw_result_outcome = (
+            availability_failure_outcome
+            if availability_terminal_status == "failed"
+            else event.get("result_outcome")
+            or availability.get("terminal_reason")
+            or output.get("fallback_reason")
+        )
+        result_outcome = str(raw_result_outcome or "failed").strip()
+        # Durable terminal outcomes and Provider attempt outcomes have
+        # intentionally different taxonomies.  Keep their intersection
+        # explicit so ``superseded`` never gets written as a Provider outcome.
+        if result_outcome not in {
+            "success",
+            "timeout",
+            "rate_limit",
+            "provider_5xx",
+            "transport_error",
+            "cancelled",
+            "validation_error",
+            "failed",
+            "circuit_denied",
+        }:
+            result_outcome = "failed"
+        terminal_outcome = str(event.get("terminal_outcome") or "failed").strip()
+        if terminal_outcome not in {"success", "timeout", "cancelled", "superseded", "failed"}:
+            terminal_outcome = "failed"
+
+        provider_attempted_value = availability.get("provider_attempted")
+        provider_attempted = (
+            provider_attempted_value
+            if isinstance(provider_attempted_value, bool)
+            else bool(availability.get("provider_attempt_count"))
+        )
+        if not provider_attempted and isinstance(agent_metrics.get("provider_attempted"), bool):
+            provider_attempted = bool(agent_metrics.get("provider_attempted"))
+        route_name = str(
+            availability.get("scope")
+            or (
+                "unknown"
+                if event_name != "terminal" and lane == "intelligence" and not availability
+                else "intelligence"
+                if lane == "intelligence"
+                else lane
+            )
+            or "unknown"
+        ).strip() or "unknown"
+        if route_name == "pi_coach":
+            route_name = "pi_coach"
+        elif (
+            lane == "intelligence"
+            and route_name != "unknown"
+            and route_name not in {"direct_semantic", "direct_coach"}
+        ):
+            route_name = "direct_semantic"
+        candidate_outcome = str(
+            availability.get("candidate_outcome")
+            or output.get("candidate_outcome")
+            or ("eligible" if provider_attempted else "unknown")
+        ).strip() or "unknown"
+        circuit_admitted = availability.get("admitted")
+        if circuit_admitted is True:
+            circuit_outcome = "admitted"
+        elif circuit_admitted is False and availability:
+            circuit_outcome = "denied"
+        else:
+            circuit_outcome = "not_checked"
+        # ``job_claimed`` is emitted before the durable handler has produced
+        # provider availability metadata, so it may bind an explicit
+        # ``unknown`` placeholder.  Always submit the later lifecycle fact:
+        # PipelineTrace permits one-way refinement of that placeholder while
+        # still rejecting conflicting concrete routes.
+        route_kwargs = {
+            "monotonic_ns": lifecycle_at_ns,
+        }
+        if lane == "intelligence":
+            route_kwargs.update(
+                {
+                    "candidate_outcome": candidate_outcome,
+                    "circuit_outcome": circuit_outcome,
+                }
+            )
+        _safe(trace.record_route, route_name, **route_kwargs)
+
+        # A candidate/circuit/reservation decision is required only on the
+        # intelligence lane.  Generic correction/suggestion jobs explicitly
+        # mark those stages not_required instead of looking like missing data.
+        if lane == "intelligence":
+            _safe(
+                trace.record_provenance_stage,
+                "candidate_gate",
+                status=("observed" if candidate_outcome != "unknown" else "not_observed"),
+                reason=(None if candidate_outcome != "unknown" else "candidate_gate_not_in_lifecycle_event"),
+                monotonic_ns=lifecycle_at_ns,
+                attributes={"outcome": candidate_outcome},
+            )
+            _safe(
+                trace.record_provenance_stage,
+                "circuit_admission",
+                status=("observed" if circuit_outcome != "not_checked" else "not_observed"),
+                reason=(None if circuit_outcome != "not_checked" else "circuit_not_checked"),
+                monotonic_ns=lifecycle_at_ns,
+                attributes={"outcome": circuit_outcome},
+            )
+            reservation_status = (
+                agent_metrics.get("realtime_provider_reservation_status")
+                or availability.get("reservation_status")
+            )
+            if reservation_status:
+                _safe(
+                    trace.record_provenance_stage,
+                    "reservation",
+                    monotonic_ns=lifecycle_at_ns,
+                    attributes={"status": str(reservation_status)},
+                )
+            elif not provider_attempted and candidate_outcome in {
+                "none",
+                "disabled",
+                "cooldown_suppressed",
+                "unknown",
+            }:
+                _safe(
+                    trace.record_provenance_stage,
+                    "reservation",
+                    status=("not_required" if event_name == "terminal" else "not_observed"),
+                    reason=(
+                        "provider_attempt_not_required"
+                        if event_name == "terminal"
+                        else "reservation_pending_provider_gate"
+                    ),
+                    monotonic_ns=lifecycle_at_ns,
+                )
+            else:
+                _safe(
+                    trace.record_provenance_stage,
+                    "reservation",
+                    status="not_observed",
+                    reason="reservation_not_in_lifecycle_event",
+                    monotonic_ns=lifecycle_at_ns,
+                )
+        else:
+            for provenance_stage in ("candidate_gate", "reservation"):
+                _safe(
+                    trace.record_provenance_stage,
+                    provenance_stage,
+                    status="not_required",
+                    reason=f"{provenance_stage}_not_required_for_{lane}",
+                    monotonic_ns=lifecycle_at_ns,
+                )
+            _safe(
+                trace.record_provenance_stage,
+                "circuit_admission",
+                status="not_required",
+                reason=f"circuit_not_required_for_{lane}",
+                monotonic_ns=lifecycle_at_ns,
+            )
+
+        attempt_outcome = result_outcome
+        if attempt_outcome == "circuit_denied":
+            attempt_outcome = "failed"
+        open_attempts = trace.open_provider_attempt_indices()
+        if event_name in {"attempt_failed", "terminal"}:
+            for attempt_index in open_attempts:
+                attempts = trace.execution_snapshot().get("provider_attempts") or []
+                attempt = next(
+                    (
+                        item
+                        for item in attempts
+                        if int(item.get("attempt_index") or 0) == attempt_index
+                    ),
+                    {},
+                )
+                branch = str(
+                    attempt.get("branch") or event.get("branch") or "unknown"
+                ).strip() or "unknown"
+                runtime = str(
+                    attempt.get("runtime") or event.get("runtime") or ""
+                ).strip() or None
+                _safe(
+                    trace.record_provider_attempt_outcome,
+                    attempt_index,
+                    attempt_outcome,
+                    branch=branch,
+                    runtime=runtime,
+                    http_status=http_status,
+                    error_class=error_class,
+                    monotonic_ns=lifecycle_at_ns,
+                )
+
+        current_attempts = trace.execution_snapshot().get("provider_attempts") or []
+        if current_attempts:
+            # record_provider_attempt()/outcome() already writes the start and
+            # completion provenance.  Fill missing timing boundaries explicitly
+            # without manufacturing timestamps for successful latency metrics.
+            for provider_stage in ("provider_connected", "first_token"):
+                if provider_stage in trace.stage_marks:
+                    _safe(
+                        trace.record_provenance_stage,
+                        provider_stage,
+                        monotonic_ns=trace.stage_marks[provider_stage].monotonic_ns,
+                        attributes={"source": "legacy_stage_mark"},
+                    )
+                elif any(
+                    str(item.get("runtime") or "").strip().lower() == "pi"
+                    for item in current_attempts
+                ):
+                    _safe(
+                        trace.record_provenance_stage,
+                        provider_stage,
+                        status="unavailable",
+                        reason="bridge_response_unavailable",
+                        monotonic_ns=lifecycle_at_ns,
+                    )
+                elif any(item.get("outcome") not in {None, "success"} for item in current_attempts):
+                    _safe(
+                        trace.record_provenance_stage,
+                        provider_stage,
+                        status="failed",
+                        reason=attempt_outcome,
+                        monotonic_ns=lifecycle_at_ns,
+                    )
+                else:
+                    _safe(
+                        trace.record_provenance_stage,
+                        provider_stage,
+                        status="not_observed",
+                        reason="provider_timing_not_reported",
+                        monotonic_ns=lifecycle_at_ns,
+                    )
+        else:
+            no_attempt_reason = str(
+                availability.get("terminal_reason")
+                or output.get("fallback_reason")
+                or "provider_not_attempted"
+            )[:120]
+            no_attempt_status = (
+                "not_required" if event_name == "terminal" else "not_observed"
+            )
+            if event_name != "terminal":
+                no_attempt_reason = "provider_attempt_not_started"
+            for provider_stage in (
+                "provider_attempt_start",
+                "provider_connected",
+                "first_token",
+                "provider_completed",
+            ):
+                _safe(
+                    trace.record_provenance_stage,
+                    provider_stage,
+                    status=no_attempt_status,
+                    reason=no_attempt_reason,
+                    monotonic_ns=lifecycle_at_ns,
+                )
+
+        provenance_snapshot = trace.execution_snapshot().get("provenance") or {}
+        pi_attempted = any(
+            str(item.get("runtime") or "").strip().lower() == "pi"
+            for item in current_attempts
+        )
+        tool_loop_attributes: dict[str, Any] = {}
+        for metric_name in ("turns", "tool_calls"):
+            metric_value = agent_metrics.get(metric_name)
+            if type(metric_value) is int and metric_value >= 0:
+                tool_loop_attributes[metric_name] = metric_value
+        if "agent_tool_loop" not in provenance_snapshot:
+            if pi_attempted and tool_loop_attributes:
+                _safe(
+                    trace.record_provenance_stage,
+                    "agent_tool_loop",
+                    monotonic_ns=lifecycle_at_ns,
+                    attributes=tool_loop_attributes,
+                )
+            elif pi_attempted:
+                _safe(
+                    trace.record_provenance_stage,
+                    "agent_tool_loop",
+                    status="unavailable",
+                    reason="bridge_response_unavailable",
+                    monotonic_ns=lifecycle_at_ns,
+                )
+            else:
+                _safe(
+                    trace.record_provenance_stage,
+                    "agent_tool_loop",
+                    status="not_required",
+                    reason="non_pi_path",
+                    monotonic_ns=lifecycle_at_ns,
+                )
+
+        provenance_snapshot = trace.execution_snapshot().get("provenance") or {}
+        if "response_validation" not in provenance_snapshot:
+            if event_name == "terminal" and terminal_outcome == "success":
+                _safe(
+                    trace.record_provenance_stage,
+                    "response_validation",
+                    monotonic_ns=lifecycle_at_ns,
+                )
+            else:
+                _safe(
+                    trace.record_provenance_stage,
+                    "response_validation",
+                    status="unavailable",
+                    reason=(
+                        "bridge_response_unavailable"
+                        if pi_attempted
+                        else "provider_response_unavailable"
+                    ),
+                    monotonic_ns=lifecycle_at_ns,
+                )
+
+        provenance_snapshot = trace.execution_snapshot().get("provenance") or {}
+        applied_output = output.get("applied")
+        if "persistence_commit" not in provenance_snapshot:
+            if isinstance(applied_output, Mapping):
+                _safe(
+                    trace.record_provenance_stage,
+                    "persistence_commit",
+                    monotonic_ns=lifecycle_at_ns,
+                    attributes={"event": "meeting.intelligence.applied"},
+                )
+            else:
+                _safe(
+                    trace.record_provenance_stage,
+                    "persistence_commit",
+                    status="not_required",
+                    reason="no_formal_projection",
+                    monotonic_ns=lifecycle_at_ns,
+                )
+        if "projection_commit" not in provenance_snapshot:
+            if isinstance(applied_output, Mapping):
+                _safe(
+                    trace.record_provenance_stage,
+                    "projection_commit",
+                    monotonic_ns=lifecycle_at_ns,
+                    attributes={"projection": "coach_and_semantic"},
+                )
+            else:
+                _safe(
+                    trace.record_provenance_stage,
+                    "projection_commit",
+                    status="not_required",
+                    reason="no_formal_projection",
+                    monotonic_ns=lifecycle_at_ns,
+                )
+        if "late_result_guard" not in provenance_snapshot:
+            late_discarded = bool(
+                coach_output.get("late_result_discarded")
+                or agent_metrics.get("late_result_discarded")
+            )
+            delivery_status = str(
+                coach_output.get("delivery_status") or ""
+            ).strip()
+            _safe(
+                trace.record_provenance_stage,
+                "late_result_guard",
+                status=(
+                    "observed"
+                    if late_discarded or delivery_status
+                    else "not_required"
+                ),
+                reason=(None if late_discarded or delivery_status else "no_coach_result"),
+                monotonic_ns=lifecycle_at_ns,
+                attributes=(
+                    {
+                        "outcome": (
+                            "discarded"
+                            if late_discarded
+                            else "on_time"
+                            if delivery_status == "on_time"
+                            else "not_applicable"
+                        )
+                    }
+                    if late_discarded or delivery_status
+                    else None
+                ),
+            )
+
+        if event_name == "terminal":
+            terminal_result_outcome = (
+                "cancelled"
+                if result_outcome == "circuit_denied"
+                and terminal_outcome in {"timeout", "cancelled", "superseded"}
+                else result_outcome
+            )
+            if terminal_outcome in {"timeout", "cancelled", "superseded"}:
+                _safe(
+                    trace.record_cancellation_requested,
+                    result_outcome=terminal_result_outcome,
+                    terminal_outcome=terminal_outcome,
+                    error_class=error_class,
+                    monotonic_ns=lifecycle_at_ns,
+                )
+            else:
+                _safe(
+                    trace.record_provenance_stage,
+                    "cancel_requested",
+                    status="not_required",
+                    reason="terminal_not_cancelled",
+                    monotonic_ns=lifecycle_at_ns,
+                )
+            _safe(
+                trace.record_terminal,
+                terminal_outcome,
+                result_outcome=terminal_result_outcome,
+                error_class=error_class,
+                http_status=http_status,
+                monotonic_ns=lifecycle_at_ns,
+            )
+            if terminal_outcome in {"timeout", "cancelled", "superseded"}:
+                _safe(
+                    trace.record_abort_ack,
+                    local=True,
+                    # The Provider/sidecar contract currently has no remote
+                    # abort ACK.  Keep this capability gap explicit.
+                    remote_unavailable=True,
+                )
+            else:
+                _safe(
+                    trace.record_provenance_stage,
+                    "abort_ack",
+                    status="not_required",
+                    reason="terminal_not_cancelled",
+                    monotonic_ns=lifecycle_at_ns,
+                )
+            if "ui_rendered" in trace.stage_marks:
+                _safe(
+                    trace.record_provenance_stage,
+                    "ui_render_ack",
+                    monotonic_ns=trace.stage_marks["ui_rendered"].monotonic_ns,
+                    attributes={"source": "legacy_ui_rendered_stage"},
+                )
+            else:
+                _safe(
+                    trace.record_provenance_stage,
+                    "ui_render_ack",
+                    status="not_observed",
+                    reason="ui_render_ack_not_received",
+                    monotonic_ns=lifecycle_at_ns,
+                )
+        elif event_name == "attempt_failed":
+            _safe(
+                trace.record_provenance_stage,
+                "durable_terminal",
+                status="not_required",
+                reason="job_retry_pending",
+                monotonic_ns=lifecycle_at_ns,
+            )
+
+    # Expose the projection hook for replay/diagnostic harnesses.  It is
+    # intentionally the same callback wired into the durable executor, so a
+    # synthetic lifecycle event cannot exercise a different telemetry path.
+    app.state.record_v2_job_lifecycle = _record_v2_job_lifecycle
 
     v2_executor: DurableJobExecutor | None = None
     if v2_persistence is not None:
@@ -9866,24 +14668,205 @@ def create_app(
             suggestion_handler=_run_v2_suggestion_job,
             additional_handlers={
                 "intelligence": _run_v2_intelligence_job,
+                "pi_deep": _run_v2_intelligence_job,
                 "minutes": lambda job: _dispatch_v2_post_job("minutes", job),
                 "approach": lambda job: _dispatch_v2_post_job("approach", job),
                 "index": lambda job: _dispatch_v2_post_job("index", job),
             },
             retry_observer=pipeline_traces.record_retry,
             cancellation_observer=pipeline_traces.record_cancelled,
+            lifecycle_observer=_record_v2_job_lifecycle,
+            include_lifecycle_metadata=True,
         )
     app.state.v2_executor = v2_executor
+
+    async def _refresh_due_coach_items() -> int:
+        """Enqueue due Pi follow-ups; the handler handles no-new-evidence locally."""
+        if v2_persistence is None or v2_executor is None:
+            return 0
+        if v2_persistence.semantic_projection_mode != "llm_first":
+            return 0
+        coach_enabled = str(
+            os.environ.get("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
+        ).strip().lower() not in {"0", "false", "off", "no"}
+        if not coach_enabled:
+            return 0
+        try:
+            provider_configured = llm_service.LlmConfig.from_env() is not None
+        except (TypeError, ValueError):
+            provider_configured = False
+        if not provider_configured:
+            return 0
+        now_ms = time.time_ns() // 1_000_000
+        try:
+            live_page = await asyncio.to_thread(
+                v2_persistence.list_meetings_page,
+                status="live",
+                limit=100,
+            )
+        except (OSError, sqlite3.Error, TypeError, ValueError):
+            return 0
+        enqueued = 0
+        for meeting in live_page.get("meetings") or []:
+            meeting_id = str(meeting.get("id") or "").strip()
+            if not meeting_id:
+                continue
+            try:
+                # Use the same bounded pagination and formal-event filtering as
+                # the meeting snapshot. ``list_events`` rejects pages above
+                # MAX_EVENT_PAGE_LIMIT, so asking it for an oversized page
+                # made every production scheduler tick fail before it could
+                # inspect a due work item.
+                events = await asyncio.to_thread(_all_v2_formal_events, meeting_id)
+                durable_items = await asyncio.to_thread(
+                    v2_persistence.list_agent_work_items,
+                    meeting_id,
+                    state="ready",
+                    limit=24,
+                )
+                due_items = _coach_due_work_items(
+                    events,
+                    now_ms=now_ms,
+                    durable_items=durable_items,
+                )
+                for item in due_items:
+                    decision_id = str(item.get("item_id") or "").strip()
+                    if not decision_id:
+                        continue
+                    job = await asyncio.to_thread(
+                        v2_persistence.enqueue_due_coach_refresh,
+                        meeting_id=meeting_id,
+                        decision_id=decision_id,
+                        now_ms=now_ms,
+                    )
+                    if job is not None:
+                        enqueued += 1
+            except (OSError, sqlite3.Error, TypeError, ValueError, KeyError) as exc:
+                _log.warning(
+                    "meeting.coach_due_refresh.scan_failed",
+                    meeting_id=meeting_id,
+                    error_class=type(exc).__name__,
+                )
+        if enqueued:
+            v2_executor.wake("intelligence")
+        return enqueued
+
+    due_refresh_scheduler: DueCoachRefreshScheduler | None = None
+    if v2_persistence is not None and v2_executor is not None:
+        try:
+            due_refresh_interval_ms = max(
+                250,
+                min(
+                    10_000,
+                    int(os.environ.get("MEETING_COPILOT_COACH_DUE_REFRESH_INTERVAL_MS", "1000")),
+                ),
+            )
+        except (TypeError, ValueError):
+            due_refresh_interval_ms = 1_000
+        due_refresh_scheduler = DueCoachRefreshScheduler(
+            _refresh_due_coach_items,
+            interval_ms=due_refresh_interval_ms,
+            logger=_log,
+        )
+    app.state.coach_due_refresh_scheduler = due_refresh_scheduler
+    # Keep the exact production callback available to focused integration
+    # tests and diagnostics without starting a second scheduler loop.
+    app.state.refresh_due_coach_items = _refresh_due_coach_items
+
     async def _start_v2_executor() -> None:
-        if getattr(app.state, "streaming_llm_client", None) is None:
-            app.state.streaming_llm_client = httpx.AsyncClient(
-                timeout=60.0,
-                trust_env=False,
+        # Preserve the pre-lifespan injection contract used by replay and
+        # integration callers. Such callers set only the legacy client before
+        # entering ``TestClient``/ASGI lifespan, so creating fresh lane pools
+        # would bypass their transport. This is an explicit compatibility
+        # mode; production startup without an injected client remains fully
+        # lane-isolated.
+        legacy_client_injected = (
+            getattr(app.state, "streaming_llm_client", None) is not None
+            and getattr(app.state, "realtime_llm_client", None) is None
+            and getattr(app.state, "correction_llm_client", None) is None
+        )
+        if legacy_client_injected:
+            app.state.provider_lane_legacy_client_injection = True
+        for lane, attribute in (
+            ("general", "streaming_llm_client"),
+            ("realtime", "realtime_llm_client"),
+            ("deep", "deep_llm_client"),
+            ("correction", "correction_llm_client"),
+        ):
+            if legacy_client_injected and lane != "general":
+                continue
+            if getattr(app.state, attribute, None) is not None:
+                continue
+            max_connections = provider_lane_client_limits[lane]
+            setattr(
+                app.state,
+                attribute,
+                httpx.AsyncClient(
+                    timeout=60.0,
+                    trust_env=False,
+                    limits=httpx.Limits(
+                        max_connections=max_connections,
+                        max_keepalive_connections=max_connections,
+                    ),
+                ),
             )
         if v2_executor is not None:
             if recording_export_executor is not None:
                 await recording_export_executor.start()
             await v2_executor.start()
+            if due_refresh_scheduler is not None:
+                await due_refresh_scheduler.start()
+
+    async def _start_pi_bridge_runtime() -> None:
+        """Optionally warm the local Pi bridge before the first live turn.
+
+        This only starts Node and waits for the bridge ``ready`` handshake. It
+        never probes or calls the configured Provider; Provider readiness is a
+        separate explicit operation. The prewarm switch remains opt-in so
+        safe/demo and provider-free desktop launches keep their current
+        process footprint.
+        """
+
+        enabled = pi_bridge_prewarm_enabled()
+        status: dict[str, Any] = {
+            "attempted": False,
+            "enabled": enabled,
+            "ready": False,
+        }
+        if not enabled:
+            status["reason"] = "disabled_by_environment"
+            app.state.pi_coach_prewarm = status
+            return
+        if configured_coach_runtime() != "pi":
+            status["reason"] = "runtime_not_pi"
+            app.state.pi_coach_prewarm = status
+            return
+        coach_enabled = str(
+            os.environ.get("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
+        ).strip().lower() not in {"0", "false", "off", "no"}
+        if not coach_enabled:
+            status["reason"] = "coach_disabled"
+            app.state.pi_coach_prewarm = status
+            return
+        try:
+            provider_configured = llm_service.LlmConfig.from_env() is not None
+        except (TypeError, ValueError):
+            provider_configured = False
+        if not provider_configured:
+            status["reason"] = "provider_not_configured"
+            app.state.pi_coach_prewarm = status
+            return
+
+        status["attempted"] = True
+        result = await asyncio.to_thread(app.state.pi_coach_runtime.prewarm)
+        if isinstance(result, Mapping):
+            status.update(dict(result))
+        if not status.get("ready"):
+            _log.warning(
+                "meeting.pi_coach.bridge_prewarm_failed",
+                error_code=str(status.get("error_code") or "unknown"),
+            )
+        app.state.pi_coach_prewarm = status
 
     async def _start_data_governance() -> None:
         if data_governance_service is None or v2_persistence is None:
@@ -9951,15 +14934,49 @@ def create_app(
         )
 
     async def _start_funasr_resident_worker() -> None:
-        if prewarm_funasr:
-            realtime_ready, refiner_ready = await asyncio.gather(
-                asyncio.to_thread(asr_stream.prewarm_funasr_resident_manager),
-                asyncio.to_thread(asr_refiner.prewarm_refiner_worker),
-            )
-            app.state.funasr_resident_prewarm_ready = realtime_ready
-            app.state.funasr_refiner_prewarm_ready = refiner_ready
-            if os.environ.get("MEETING_COPILOT_DESKTOP_RUNTIME") == "1" and not realtime_ready:
-                raise RuntimeError("packaged desktop FunASR resident worker failed to become ready")
+        # Realtime FunASR remains prewarmed for full desktop compatibility.
+        # The much larger offline refiner has its own fail-closed policy so it
+        # cannot consume several GiB merely because components are installed.
+        refiner_policy = asr_refiner.realtime_refiner_policy()
+        refiner_available = asr_refiner.refinement_capability().get("status") == "ready"
+        realtime_task = (
+            asyncio.to_thread(asr_stream.prewarm_funasr_resident_manager)
+            if prewarm_funasr
+            else None
+        )
+        refiner_task = (
+            asyncio.to_thread(asr_refiner.prewarm_refiner_worker)
+            if refiner_available and refiner_policy["prewarm_enabled"]
+            else None
+        )
+        tasks = [task for task in (realtime_task, refiner_task) if task is not None]
+        results = await asyncio.gather(*tasks) if tasks else []
+        result_index = 0
+        realtime_ready = False
+        refiner_ready = False
+        if realtime_task is not None:
+            realtime_ready = bool(results[result_index])
+            result_index += 1
+        if refiner_task is not None:
+            refiner_ready = bool(results[result_index])
+        app.state.funasr_resident_prewarm_ready = realtime_ready
+        app.state.funasr_refiner_prewarm_ready = refiner_ready
+        app.state.funasr_refiner_policy = refiner_policy
+        _log.info(
+            "asr.refiner.startup_policy",
+            mode=refiner_policy["mode"],
+            source=refiner_policy["source"],
+            prewarm_enabled=refiner_policy["prewarm_enabled"],
+            refiner_available=refiner_available,
+            degradation_reason=refiner_policy["degradation_reason"],
+            warning=refiner_policy["warning"],
+        )
+        if (
+            prewarm_funasr
+            and os.environ.get("MEETING_COPILOT_DESKTOP_RUNTIME") == "1"
+            and not realtime_ready
+        ):
+            raise RuntimeError("packaged desktop FunASR resident worker failed to become ready")
 
     async def _recover_abandoned_desktop_recordings() -> None:
         if os.environ.get("MEETING_COPILOT_DESKTOP_RUNTIME") != "1" or v2_persistence is None or data_dir_path is None:
@@ -10001,6 +15018,8 @@ def create_app(
         await asyncio.gather(task, return_exceptions=True)
 
     async def _stop_v2_executor() -> None:
+        if due_refresh_scheduler is not None:
+            await due_refresh_scheduler.stop()
         if v2_executor is not None:
             await v2_executor.stop()
 
@@ -10008,11 +15027,21 @@ def create_app(
         if recording_export_executor is not None:
             await recording_export_executor.stop()
 
-    async def _close_streaming_llm_client() -> None:
-        client = app.state.streaming_llm_client
-        app.state.streaming_llm_client = None
-        if client is not None and not client.is_closed:
-            await client.aclose()
+    async def _close_provider_lane_clients() -> None:
+        clients: list[Any] = []
+        for attribute in (
+            "streaming_llm_client",
+            "realtime_llm_client",
+            "deep_llm_client",
+            "correction_llm_client",
+        ):
+            client = getattr(app.state, attribute, None)
+            setattr(app.state, attribute, None)
+            if client is not None and all(client is not existing for existing in clients):
+                clients.append(client)
+        for client in clients:
+            if not client.is_closed:
+                await client.aclose()
 
     async def _close_pi_coach_runtime() -> None:
         runtime = app.state.pi_coach_runtime
@@ -10035,6 +15064,7 @@ def create_app(
     app.router.add_event_handler("startup", _start_funasr_resident_worker)
     app.router.add_event_handler("startup", _start_desktop_parent_watchdog)
     app.router.add_event_handler("startup", _start_data_governance)
+    app.router.add_event_handler("startup", _start_pi_bridge_runtime)
     app.router.add_event_handler("startup", _start_v2_executor)
     app.router.add_event_handler("startup", _start_recording_import_runtime)
     app.router.add_event_handler("shutdown", _stop_desktop_parent_watchdog)
@@ -10044,7 +15074,7 @@ def create_app(
     app.router.add_event_handler("shutdown", _stop_recording_export_executor)
     app.router.add_event_handler("shutdown", _checkpoint_realtime_slo)
     app.router.add_event_handler("shutdown", _close_pi_coach_runtime)
-    app.router.add_event_handler("shutdown", _close_streaming_llm_client)
+    app.router.add_event_handler("shutdown", _close_provider_lane_clients)
     app.router.add_event_handler("shutdown", _stop_funasr_resident_worker)
     app.router.add_event_handler("shutdown", _close_created_sqlite_repositories)
 
@@ -10633,6 +15663,15 @@ def _asr_live_input_source(
     return "unknown"
 
 
+# ``online_only`` is an intentional resource policy: the realtime recognizer's
+# authoritative final is persisted without starting the offline refiner. Keep
+# the reason in the audit record, but do not turn it into a safety blocker.
+# Other degradation reasons continue to fail closed for acceptance and LLM use.
+_NON_BLOCKING_ASR_RESOURCE_POLICY_REASONS = {
+    asr_refiner.ONLINE_ONLY_REFINEMENT_REASON,
+}
+
+
 def _asr_live_acceptance_blockers(
     *,
     provider_mode: str,
@@ -10654,9 +15693,14 @@ def _asr_live_acceptance_blockers(
         blockers.append("asr_provider_not_real")
     if asr_fallback_used:
         blockers.append("asr_fallback_used")
-    if "asr_semantic_quality_blocked" in degradation_reasons:
+    safety_degradation_reasons = [
+        reason
+        for reason in degradation_reasons
+        if reason not in _NON_BLOCKING_ASR_RESOURCE_POLICY_REASONS
+    ]
+    if "asr_semantic_quality_blocked" in safety_degradation_reasons:
         blockers.append("asr_semantic_quality_blocked")
-    if degradation_reasons:
+    if safety_degradation_reasons:
         blockers.append("degraded_asr_session")
     if input_source not in {
         "real_mic",
@@ -10691,9 +15735,702 @@ _RECOVERABLE_TRANSCRIPT_DEGRADATION_REASONS = {
     "stream_interrupted",
     "offline_refinement_unavailable",
     "offline_refinement_text_too_short",
+    # A resident worker can still produce an authoritative offline final when
+    # its online boundary ACK arrives late. Once that final is persisted,
+    # correction and post-meeting derivations can safely use the evidence.
+    "funasr_boundary_ack_timeout",
 }
 COACH_HISTORY_LIMIT = 12
+COACH_INTERVENTION_VALIDITY_MS = 90_000
+COACH_CANDIDATE_COOLDOWN_MS = 30_000
+COACH_EPISODE_CONTIGUOUS_GAP_MS = 8_000
 RECENT_CONTEXT_HISTORY_LIMIT = 10
+
+_COACH_CANDIDATE_PRIORITIES = {
+    "question_pending": 100,
+    "commitment_without_condition": 95,
+    "objection_detected": 90,
+    "goal_at_risk": 85,
+    "missing_next_step": 80,
+    "topic_drift": 75,
+    "repetition": 70,
+    "monologue_duration": 65,
+}
+_COACH_EPISODE_DESCRIPTOR_KEYS = (
+    "episode_id",
+    "episode_anchor_id",
+    "episode_source_track",
+    "episode_speaker",
+    "episode_speaker_key",
+    "episode_anchor_start_ms",
+    "episode_anchor_end_ms",
+    "episode_latest_start_ms",
+    "episode_latest_end_ms",
+)
+_COACH_EPISODE_DESCRIPTOR_TIME_KEYS = (
+    "episode_anchor_start_ms",
+    "episode_anchor_end_ms",
+    "episode_latest_start_ms",
+    "episode_latest_end_ms",
+)
+
+# Metrics are deliberately copied through a small allow-list before they are
+# placed in the durable coach decision. This keeps queue/latency evidence
+# replayable without ever promoting prompt text, provider responses, or other
+# transport details into the public meeting event.
+_PUBLIC_COACH_METRIC_NUMBERS = frozenset(
+    {
+        "elapsed_ms",
+        "decision_latency_ms",
+        "ttft_ms",
+        "turns",
+        "tool_calls",
+        "context_reads",
+        "checklist_reviews",
+        "history_searches",
+        "history_results",
+        "decision_latency_budget_ms",
+        "decision_timeout_ms",
+        "prompt_characters",
+        "system_prompt_characters",
+        "tool_schema_characters",
+        "request_characters",
+        "session_message_count_before",
+        "sidecar_queue_ms",
+        "bridge_startup_ms",
+        "bridge_round_trip_ms",
+        "provider_connect_ms",
+        "job_queue_latency_ms",
+        "job_budget_remaining_at_coach_start_ms",
+        "soft_budget_remaining_at_coach_start_ms",
+        "soft_provider_budget_ms",
+        "soft_deadline_at_ms",
+        "soft_cutoff_elapsed_ms",
+        "soft_timeout_projection_at_ms",
+        "late_result_completed_at_ms",
+        "provider_timeout_ms",
+        "provider_status_code",
+        "coach_skill_version",
+        "realtime_circuit_failure_count",
+        "realtime_circuit_retry_after_ms",
+        "realtime_circuit_identity_generation",
+        "provider_attempt_count",
+        "realtime_provider_reservation_attempt_generation",
+    }
+)
+_PUBLIC_COACH_METRIC_BOOLEANS = frozenset(
+    {
+        "checklist_reviewed",
+        "within_latency_budget",
+        "session_reused",
+        "bridge_process_reused",
+        "correction_lane_active_at_coach_start",
+        "intervention_suppressed",
+        "fallback_suppressed",
+        "fallback_after_provider_failure",
+        "fallback_after_circuit_suppression",
+        "fallback_after_response_validation",
+        "provider_late_result_discarded",
+        "pi_intervention",
+        "realtime_circuit_half_open",
+        "realtime_circuit_admitted",
+        "provider_attempted",
+        "deadline_budget_exhausted",
+        "deadline_exceeded",
+        "soft_cutoff_triggered",
+        "late_result_discarded",
+    }
+)
+_PUBLIC_COACH_METRIC_STRINGS = frozenset(
+    {
+        "coach_skill_id",
+        "suppression_reason",
+        "realtime_circuit_state",
+        "realtime_circuit_reason",
+        "realtime_circuit_last_failure_class",
+        "provider_availability_policy",
+        "provider_access_scope",
+        "provider_availability_terminal",
+        "provider_availability_terminal_reason",
+        "semantic_branch_status",
+        "semantic_branch_error_class",
+        "deadline_error_code",
+        "prompt_profile",
+        "realtime_provider_reservation_attempt_token",
+        "response_validation_category",
+        "response_validation_error",
+    }
+)
+_PUBLIC_COACH_METRIC_LISTS = frozenset(
+    {
+        "checklist_item_ids",
+        "tool_names",
+        "tool_errors",
+        "available_tool_names",
+    }
+)
+
+
+def _public_coach_agent_metrics(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Return safe, bounded Agent metrics for formal events and snapshots."""
+
+    if not isinstance(value, Mapping):
+        return {}
+    result: dict[str, Any] = {}
+    for key in _PUBLIC_COACH_METRIC_NUMBERS:
+        raw = value.get(key)
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool) and math.isfinite(float(raw)):
+            result[key] = raw
+    for key in _PUBLIC_COACH_METRIC_BOOLEANS:
+        raw = value.get(key)
+        if isinstance(raw, bool):
+            result[key] = raw
+    for key in _PUBLIC_COACH_METRIC_STRINGS:
+        raw = value.get(key)
+        if isinstance(raw, str) and raw.strip():
+            result[key] = raw.strip()[:128]
+    for key in _PUBLIC_COACH_METRIC_LISTS:
+        raw = value.get(key)
+        if isinstance(raw, (list, tuple)):
+            bounded: list[Any] = []
+            for item in raw[:24]:
+                if isinstance(item, str):
+                    bounded.append(item[:128])
+                elif isinstance(item, Mapping):
+                    name = item.get("tool") or item.get("name")
+                    code = item.get("code")
+                    if isinstance(name, str) or isinstance(code, str):
+                        bounded.append(
+                            {
+                                **({"tool": name[:128]} if isinstance(name, str) else {}),
+                                **({"code": code[:128]} if isinstance(code, str) else {}),
+                            }
+                        )
+            result[key] = bounded
+    timings = value.get("timings")
+    if isinstance(timings, Mapping):
+        timing_payload: dict[str, Any] = {}
+        clock = timings.get("clock")
+        if isinstance(clock, str) and clock in {"unix_epoch_ms", "monotonic_ms"}:
+            timing_payload["clock"] = clock
+        for key in ("started_at_ms", "first_token_at_ms", "completed_at_ms"):
+            raw = timings.get(key)
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool) and math.isfinite(float(raw)):
+                timing_payload[key] = raw
+        if timing_payload:
+            result["timings"] = timing_payload
+    usage = value.get("usage")
+    if isinstance(usage, Mapping):
+        usage_payload = {
+            key: usage[key]
+            for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+            if isinstance(usage.get(key), (int, float))
+            and not isinstance(usage.get(key), bool)
+            and math.isfinite(float(usage[key]))
+        }
+        if usage_payload:
+            result["usage"] = usage_payload
+    return result
+
+
+def _coach_candidate_payloads(
+    detected: tuple[CoachCandidateEvent, ...],
+    *,
+    request: RealtimeIntelligenceRequest,
+    recent_episode_descriptors: Sequence[Mapping[str, Any]] = (),
+) -> dict[str, dict[str, Any]]:
+    """Attach one cross-event episode identity to every detected candidate.
+
+    The detector intentionally owns event semantics. Cooldown instead follows
+    the contiguous discourse episode: source track, speaker, and its earliest
+    adjacent paragraph anchor. Event type is excluded so stronger evidence can
+    upgrade an episode once without weaker cross-type triggers spending more
+    Provider calls.
+    """
+
+    paragraphs = []
+    seen_ids: set[str] = set()
+    for paragraph in (
+        *request.retrieval_paragraphs,
+        *request.context_paragraphs,
+        *request.new_paragraphs,
+    ):
+        if paragraph.id in seen_ids:
+            continue
+        seen_ids.add(paragraph.id)
+        paragraphs.append(paragraph)
+    original_positions = {item.id: index for index, item in enumerate(paragraphs)}
+    paragraphs.sort(
+        key=lambda item: (
+            item.start_ms is None,
+            item.start_ms if item.start_ms is not None else 0,
+            item.end_ms if item.end_ms is not None else 0,
+            original_positions[item.id],
+        )
+    )
+    paragraphs_by_id = {item.id: item for item in paragraphs}
+
+    payloads: dict[str, dict[str, Any]] = {}
+    for candidate in detected:
+        evidence = [
+            paragraphs_by_id[segment_id]
+            for segment_id in candidate.evidence_segment_ids
+            if segment_id in paragraphs_by_id
+        ]
+        anchor = evidence[0] if evidence else request.new_paragraphs[0]
+        try:
+            anchor_index = next(
+                index for index, item in enumerate(paragraphs) if item.id == anchor.id
+            )
+        except StopIteration:  # pragma: no cover - request validation keeps this unreachable
+            anchor_index = 0
+        for previous in reversed(paragraphs[:anchor_index]):
+            if previous.source_track != anchor.source_track:
+                break
+            if (previous.speaker or "").casefold() != (anchor.speaker or "").casefold():
+                break
+            if previous.end_ms is None or anchor.start_ms is None:
+                break
+            if anchor.start_ms - previous.end_ms > COACH_EPISODE_CONTIGUOUS_GAP_MS:
+                break
+            anchor = previous
+
+        anchor_position = next(
+            (
+                index
+                for index, item in enumerate(paragraphs)
+                if item.id == anchor.id
+            ),
+            0,
+        )
+        latest = anchor
+        for following in paragraphs[anchor_position + 1 :]:
+            if following.source_track != anchor.source_track:
+                break
+            if (following.speaker or "").casefold() != (anchor.speaker or "").casefold():
+                break
+            if latest.end_ms is None or following.start_ms is None:
+                break
+            if latest.start_ms is not None and following.start_ms < latest.start_ms:
+                break
+            if following.start_ms - latest.end_ms > COACH_EPISODE_CONTIGUOUS_GAP_MS:
+                break
+            latest = following
+        canonical_episode = {
+            "anchor_id": anchor.id,
+            "source_track": anchor.source_track,
+            "speaker": (anchor.speaker or "").casefold(),
+        }
+        digest = hashlib.sha256(
+            json.dumps(
+                canonical_episode,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        episode_id = f"coach-episode:{digest[:24]}"
+        episode_anchor_id = anchor.id
+        episode_anchor_start_ms = anchor.start_ms
+        episode_anchor_end_ms = anchor.end_ms
+        speaker_key = (
+            hashlib.sha256(
+                " ".join(str(anchor.speaker or "").split()).casefold().encode("utf-8")
+            ).hexdigest()[:24]
+            if str(anchor.speaker or "").strip()
+            else ""
+        )
+        # The visible request may have rolled its original anchor out of both
+        # context and retrieval. Inherit only a recently attempted lineage
+        # whose physical track, known speaker and time interval are adjacent.
+        if (
+            speaker_key
+            and anchor.start_ms is not None
+            and latest.end_ms is not None
+        ):
+            for recent in recent_episode_descriptors:
+                if str(recent.get("episode_source_track") or "") != anchor.source_track:
+                    continue
+                if str(recent.get("episode_speaker_key") or "") != speaker_key:
+                    continue
+                try:
+                    recent_start_ms = int(recent["episode_anchor_start_ms"])
+                    recent_end_ms = int(recent["episode_latest_end_ms"])
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    continue
+                if recent_end_ms < int(anchor.start_ms):
+                    gap_ms = int(anchor.start_ms) - recent_end_ms
+                elif int(latest.end_ms) < recent_start_ms:
+                    gap_ms = recent_start_ms - int(latest.end_ms)
+                else:
+                    gap_ms = 0
+                inherited_episode_id = str(recent.get("episode_id") or "").strip()
+                inherited_anchor_id = str(
+                    recent.get("episode_anchor_id") or ""
+                ).strip()
+                if (
+                    gap_ms <= COACH_EPISODE_CONTIGUOUS_GAP_MS
+                    and inherited_episode_id
+                    and inherited_anchor_id
+                ):
+                    episode_id = inherited_episode_id
+                    episode_anchor_id = inherited_anchor_id
+                    episode_anchor_start_ms = recent_start_ms
+                    raw_anchor_end_ms = recent.get("episode_anchor_end_ms")
+                    episode_anchor_end_ms = (
+                        int(raw_anchor_end_ms)
+                        if raw_anchor_end_ms is not None
+                        else recent_start_ms
+                    )
+                    break
+        payloads[candidate.candidate_key] = {
+            **candidate.to_dict(),
+            "episode_id": episode_id,
+            "episode_anchor_id": episode_anchor_id,
+            "episode_source_track": anchor.source_track,
+            "episode_speaker": anchor.speaker,
+            "episode_speaker_key": speaker_key,
+            "episode_anchor_start_ms": episode_anchor_start_ms,
+            "episode_anchor_end_ms": episode_anchor_end_ms,
+            "episode_latest_start_ms": latest.start_ms,
+            "episode_latest_end_ms": latest.end_ms,
+            "candidate_priority": _COACH_CANDIDATE_PRIORITIES[candidate.event_type],
+        }
+    return payloads
+
+
+def _latest_active_pi_coach_intervention(
+    persistence: Any,
+    meeting_id: str,
+    *,
+    now_ms: int,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Return the latest still-active Pi episode for lifecycle reconciliation.
+
+    Coach events are append-only.  The first decision-bearing applied event
+    therefore represents the current lifecycle state: an explicit silent,
+    stale, or failed decision closes any earlier card.  Keeping this lookup in
+    the host avoids teaching the generic candidate detector to spend a costly
+    Provider turn for every ordinary resolution sentence.  A deterministic
+    local fallback is included only when it was produced *after* a real Pi
+    attempt; a pre-provider local reflex remains a separate fast-path hint and
+    must not become a fake Pi lifecycle item.
+    """
+
+    if persistence is None:
+        return None
+    try:
+        events = persistence.list_events(str(meeting_id), limit=DEFAULT_EVENT_PAGE_LIMIT)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+    normalized_now_ms = max(0, int(now_ms))
+    for event in reversed(events):
+        if not isinstance(event, Mapping) or event.get("type") != "meeting.intelligence.applied":
+            continue
+        payload = event.get("payload")
+        if not isinstance(payload, Mapping):
+            continue
+        decision = payload.get("coach_decision")
+        if not isinstance(decision, Mapping):
+            # Semantic-only historical events do not establish coach
+            # lifecycle state; continue until a provenance decision is found.
+            continue
+        decision_origin = str(decision.get("origin") or "").strip()
+        decision_runtime = str(decision.get("runtime_used") or "").strip()
+        is_pi_intervention = (
+            decision_origin == "pi"
+            and decision_runtime == "pi"
+            and decision.get("pi_provider_attempted") is True
+        )
+        is_pi_timeout_fallback = (
+            decision_origin == "local_reflex"
+            and decision_runtime == "local_reflex"
+            and decision.get("runtime_requested") == "pi"
+            and decision.get("pi_provider_attempted") is True
+            and str(decision.get("fallback_reason") or "").strip()
+            and str(decision.get("status_reason") or "").startswith(
+                "provider_timeout_local_reflex"
+            )
+        )
+        if (
+            str(decision.get("status") or "") != "intervention"
+            or not (is_pi_intervention or is_pi_timeout_fallback)
+            or str(decision.get("lifecycle_action") or "") != "retain"
+            or decision.get("superseded_by") is not None
+        ):
+            return None
+        intervention = payload.get("coach_intervention")
+        if not isinstance(intervention, Mapping):
+            return None
+        intervention_origin = str(intervention.get("origin") or "").strip()
+        intervention_runtime = str(intervention.get("runtime_used") or "").strip()
+        if (
+            intervention_origin != decision_origin
+            or intervention_runtime != decision_runtime
+            or intervention.get("pi_provider_attempted") is not True
+            or str(intervention.get("status") or "") != "intervention"
+            or str(intervention.get("lifecycle_action") or "") != "retain"
+            or intervention.get("superseded_by") is not None
+        ):
+            return None
+        valid_until_raw = decision.get("valid_until_ms")
+        try:
+            valid_until_ms = int(valid_until_raw) if valid_until_raw is not None else None
+        except (TypeError, ValueError, OverflowError):
+            valid_until_ms = None
+        if valid_until_ms is not None and valid_until_ms <= normalized_now_ms:
+            return None
+        return dict(decision), dict(intervention)
+    return None
+
+
+def _pi_lifecycle_resolution_signal(
+    request: RealtimeIntelligenceRequest,
+    previous_intervention: Mapping[str, Any],
+) -> bool:
+    """Recognize fresh, substantive closure evidence for one active Pi card.
+
+    People rarely say the literal ``已解决`` after answering a coach card.
+    Keep that explicit path for compatibility, but also accept a natural
+    answer when it supplies at least two independently useful facts (for
+    example owner + deadline, or owner + validation) and addresses the old
+    card's material topic.  A generic completion sentence or an unrelated
+    module must never wake the Provider.
+    """
+
+    if not request.new_paragraphs or not isinstance(previous_intervention, Mapping):
+        return False
+    fresh_text = " ".join(
+        str(paragraph.text or "").strip()
+        for paragraph in request.new_paragraphs
+        if str(paragraph.text or "").strip()
+    ).casefold()
+    if not fresh_text:
+        return False
+    closure_terms = (
+        "已经解决",
+        "已解决",
+        "问题解决",
+        "已经明确",
+        "已明确",
+        "已经补齐",
+        "已补齐",
+        "已经完成",
+        "已完成",
+        "已经通过",
+        "已通过",
+        "已经确认",
+        "已确认",
+        "已经关闭",
+        "已关闭",
+    )
+    prior_text = " ".join(
+        str(previous_intervention.get(key) or "")
+        for key in ("title", "recommendation", "say_this", "reason", "why_now", "evidence_quote")
+    ).casefold()
+    previous_quote = str(previous_intervention.get("evidence_quote") or "").strip()
+    # FunASR can emit the same endpoint twice while an utterance boundary is
+    # being reconciled. Re-running lifecycle closure on an identical quote
+    # would hide the still-open card before the participant has supplied an
+    # owner/deadline answer. Require genuinely new evidence for the refresh.
+    compact_fresh_text = "".join(fresh_text.split())
+    compact_previous_quote = "".join(previous_quote.casefold().split())
+    if previous_quote and compact_fresh_text == compact_previous_quote:
+        return False
+    # If the old card names a concrete topic, require a modest lexical overlap
+    # so an unrelated completed task cannot close it.  Chinese text is not
+    # whitespace-tokenized, therefore compare bounded material terms instead
+    # of attempting a general tokenizer.
+    material_terms = tuple(
+        term
+        for term in (
+            "监控",
+            "回滚",
+            "压测",
+            "安全",
+            "验收",
+            "测试",
+            "发布",
+            "上线",
+            "交付",
+            "阈值",
+            "标准",
+            "截止",
+            "条件",
+            "下一步",
+        )
+        if term in prior_text
+    )
+    topic_matches = not material_terms or any(term in fresh_text for term in material_terms)
+    if not topic_matches:
+        return False
+
+    # These signals deliberately describe different kinds of closure.  Merely
+    # mentioning "负责人" or "今天" is insufficient; there must be an
+    # assignment/action, a concrete time bound, or a verification/control step.
+    owner_signal = bool(
+        re.search(
+            r"(?:由|让|请由)[^，。；;]{1,32}(?:负责|修改|复核|跟进|处理|确认)"
+            r"|(?:负责人|责任人)(?:是|为|定为|改为)[^，。；;]{1,24}"
+            r"|(?:负责人|责任人|值班负责人)[^，。；;]{0,20}(?:负责|修改|复核|跟进|处理|确认)"
+            r"|(?:我|本人)(?:来|会|将)?(?:负责|复核|跟进|处理|确认)",
+            fresh_text,
+        )
+    )
+    deadline_signal = bool(
+        re.search(
+            r"(?:截止|期限|日期|今天|明天|后天|本周|下周|周[一二三四五六日天]|"
+            r"星期[一二三四五六日天]).{0,24}(?:前|后|之前|以后|完成|修改|处理|确认|复核|验收)?"
+            r"|(?:上午|中午|下午|晚上|凌晨)?[一二三四五六七八九十两0-9]{1,3}点"
+            r"(?:半|[一二三四五六七八九十0-9]{1,3}分)?(?:前|后|之前|以后)?",
+            fresh_text,
+        )
+    )
+    validation_signal = bool(
+        re.search(
+            r"(?:验收|验证|复核|复盘|检查|确认|测试|压测|安全测试|通过|不受影响|"
+            r"符合|达标).{0,20}(?:完成|通过|确认|复核|验收|不受影响|达标)?",
+            fresh_text,
+        )
+    )
+    control_signal = bool(
+        re.search(
+            r"(?:阈值|门槛|标准|指标|回滚|回退|下一步|条件).{0,24}"
+            r"(?:设为|调整|修改|确认|明确|满足|具备|保留|执行|完成|通过)",
+            fresh_text,
+        )
+    )
+    detail_classes = sum(
+        (owner_signal, deadline_signal, validation_signal, control_signal)
+    )
+
+    # Explicit closure keeps the historical behavior: one concrete detail is
+    # enough, provided the detail is tied to this card's topic.
+    explicit_closure = any(term in fresh_text for term in closure_terms)
+    if explicit_closure:
+        return detail_classes >= 1
+
+    # Natural answers need two classes to avoid firing on a single vague fact.
+    return detail_classes >= 2
+
+
+def _partition_coach_candidates(
+    detected: tuple[CoachCandidateEvent, ...],
+    *,
+    candidate_payloads: Mapping[str, Mapping[str, Any]],
+    cooled_episode_priorities: Mapping[str, int],
+) -> tuple[tuple[CoachCandidateEvent, ...], tuple[str, ...]]:
+    """Suppress only same-episode candidates that cannot raise priority."""
+
+    eligible: list[CoachCandidateEvent] = []
+    suppressed: list[str] = []
+    for candidate in detected:
+        payload = candidate_payloads.get(candidate.candidate_key, {})
+        episode_id = str(payload.get("episode_id") or candidate.candidate_key)
+        priority = int(
+            payload.get("candidate_priority")
+            or _COACH_CANDIDATE_PRIORITIES[candidate.event_type]
+        )
+        prior_priority = cooled_episode_priorities.get(episode_id)
+        if prior_priority is not None and priority <= int(prior_priority):
+            suppressed.append(candidate.candidate_key)
+        else:
+            eligible.append(candidate)
+    return tuple(eligible), tuple(suppressed)
+
+
+def _coach_episode_descriptors_for_reservation(
+    candidate_payloads: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep missing timestamps from turning a valid Pi attempt into silence."""
+
+    return [
+        {
+            key: item.get(key)
+            for key in _COACH_EPISODE_DESCRIPTOR_KEYS
+        }
+        for item in candidate_payloads
+        if all(
+            item.get(key) is not None
+            for key in _COACH_EPISODE_DESCRIPTOR_TIME_KEYS
+        )
+    ]
+
+
+def _coach_decision_timing_envelope(
+    coach_result: Mapping[str, Any],
+    *,
+    fallback_started_at_ms: int,
+    fallback_completed_at_ms: int,
+) -> dict[str, int | float | None]:
+    """Return one auditable wall-clock chain without fabricating first-token data."""
+
+    raw_timing = coach_result.get("timings")
+    if not isinstance(raw_timing, Mapping):
+        raw_metrics = coach_result.get("agent_metrics")
+        raw_timing = raw_metrics.get("timings") if isinstance(raw_metrics, Mapping) else {}
+    if not isinstance(raw_timing, Mapping):
+        raw_timing = {}
+
+    def non_negative(value: Any) -> float | None:
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return None
+        normalized = float(value)
+        if not math.isfinite(normalized) or normalized < 0:
+            return None
+        return normalized
+
+    timing_clock_is_wall = raw_timing.get("clock") == "unix_epoch_ms"
+    observed_started_number = (
+        non_negative(raw_timing.get("started_at_ms")) if timing_clock_is_wall else None
+    )
+    observed_completed_number = (
+        non_negative(raw_timing.get("completed_at_ms")) if timing_clock_is_wall else None
+    )
+    observed_started = (
+        int(observed_started_number) if observed_started_number is not None else None
+    )
+    observed_completed = (
+        int(observed_completed_number) if observed_completed_number is not None else None
+    )
+    started = (
+        observed_started
+        if observed_started is not None
+        else max(0, int(fallback_started_at_ms))
+    )
+    completed = (
+        observed_completed
+        if observed_completed is not None
+        else max(started, int(fallback_completed_at_ms))
+    )
+    completed = max(started, completed)
+    first_token_number = (
+        non_negative(raw_timing.get("first_token_at_ms"))
+        if timing_clock_is_wall
+        else None
+    )
+    first_token = int(first_token_number) if first_token_number is not None else None
+    if first_token is not None and not started <= first_token <= completed:
+        first_token = None
+    ttft_ms = non_negative(coach_result.get("ttft_ms"))
+    decision_latency_ms = non_negative(coach_result.get("decision_latency_ms"))
+    if (
+        ttft_ms is not None
+        and decision_latency_ms is not None
+        and ttft_ms > decision_latency_ms
+    ):
+        ttft_ms = None
+    return {
+        "created_at_ms": started,
+        "first_token_at_ms": first_token,
+        "completed_at_ms": completed,
+        "projected_at_ms": None,
+        "dropped_at_ms": None,
+        "ttft_ms": float(ttft_ms) if ttft_ms is not None else None,
+        "decision_latency_ms": (
+            float(decision_latency_ms) if decision_latency_ms is not None else None
+        ),
+    }
 
 
 def _normalized_history_text(*values: Any) -> str:
@@ -10706,15 +16443,120 @@ def _normalized_history_text(*values: Any) -> str:
 
 def _formal_projection_metadata(event: dict[str, Any]) -> dict[str, Any]:
     payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    decision = payload.get("coach_decision") if isinstance(payload.get("coach_decision"), Mapping) else {}
     return {
         "source": payload.get("source"),
         "job_id": payload.get("job_id"),
         "batch_id": payload.get("batch_id"),
         "provider": payload.get("provider"),
         "model": payload.get("model"),
-        "llm_called": payload.get("llm_called"),
+        # Explicit Pi silence is a valid formal outcome even when no Provider
+        # request was admitted.  Fall back to the decision envelope so read
+        # models retain the attempted/not-attempted distinction.
+        "llm_called": payload.get("llm_called", decision.get("llm_called")),
         "formal_evidence": payload.get("evidence"),
     }
+
+
+def _coach_follow_up_from_event_payload(payload: Mapping[str, Any]) -> dict[str, Any] | None:
+    intervention = payload.get("coach_intervention")
+    decision = payload.get("coach_decision") if isinstance(payload.get("coach_decision"), Mapping) else {}
+    if isinstance(intervention, Mapping):
+        # ``say_this`` and ``why_now`` are the product card names.  Keep the
+        # historical recommendation/reason aliases as a fallback so old
+        # persisted events remain readable during migrations.
+        recommendation = str(
+            intervention.get("say_this")
+            or intervention.get("recommendation")
+            or ""
+        ).strip()
+        reason = str(
+            intervention.get("why_now")
+            or intervention.get("reason")
+            or ""
+        ).strip()
+        if not recommendation or not reason:
+            return None
+        return {
+            "question": recommendation,
+            "say_this": recommendation,
+            "reason": reason,
+            "why_now": reason,
+            "evidence_segment_ids": [
+                str(item).strip()
+                for item in intervention.get("evidence_segment_ids") or []
+                if str(item).strip()
+            ],
+            "evidence_quote": str(intervention.get("evidence_quote") or "").strip(),
+            "urgency": str(intervention.get("urgency") or "medium"),
+            "coach_event_type": str(intervention.get("event_type") or "").strip() or None,
+            "title": str(intervention.get("title") or "").strip() or None,
+            "confidence": intervention.get("confidence"),
+            **{
+                key: value
+                for key in (
+                    "provenance_version",
+                    "origin",
+                    "local_reflex_kind",
+                    "run_id",
+                    "decision_id",
+                    "evidence_revision",
+                    "status",
+                    "status_reason",
+                    "decision_reason",
+                    "created_at_ms",
+                    "first_token_at_ms",
+                    "completed_at_ms",
+                    "projected_at_ms",
+                    "dropped_at_ms",
+                    "ttft_ms",
+                    "decision_latency_ms",
+                    "deadline_at_ms",
+                    "soft_deadline_at_ms",
+                    "soft_cutoff_elapsed_ms",
+                    "soft_timeout_projection_at_ms",
+                    "delivery_status",
+                    "late_result_discarded",
+                    "valid_until_ms",
+                    "lifecycle_action",
+                    "supersedes_decision_id",
+                    "superseded_by",
+                )
+                if (value := intervention.get(key, decision.get(key))) is not None
+            },
+        }
+    if decision:
+        return None
+    legacy_follow_up = payload.get("follow_up")
+    if not isinstance(legacy_follow_up, Mapping) or not legacy_follow_up.get("coach_event_type"):
+        return None
+    question = str(legacy_follow_up.get("question") or "").strip()
+    reason = str(legacy_follow_up.get("reason") or "").strip()
+    return dict(legacy_follow_up) if question and reason else None
+
+
+def _coach_supersession_index(
+    formal_events: list[dict[str, Any]],
+) -> dict[str, tuple[str, Literal["retract", "deprioritize"]]]:
+    """Project append-only decision links onto the intervention history."""
+
+    supersessions: dict[str, tuple[str, Literal["retract", "deprioritize"]]] = {}
+    for event in formal_events:
+        if event.get("type") != "meeting.intelligence.applied":
+            continue
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        decision = payload.get("coach_decision")
+        if not isinstance(decision, Mapping):
+            continue
+        supersedes = str(decision.get("supersedes_decision_id") or "").strip()
+        replacement = str(decision.get("decision_id") or "").strip()
+        if not supersedes or not replacement or supersedes == replacement:
+            continue
+        action: Literal["retract", "deprioritize"] = (
+            "retract" if decision.get("lifecycle_action") == "retract" else "deprioritize"
+        )
+        supersessions[supersedes] = (replacement, action)
+    return supersessions
 
 
 def _bounded_formal_coach_history(
@@ -10727,8 +16569,8 @@ def _bounded_formal_coach_history(
         if event.get("type") != "meeting.intelligence.applied":
             continue
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-        follow_up = payload.get("follow_up")
-        if not isinstance(follow_up, dict):
+        follow_up = _coach_follow_up_from_event_payload(payload)
+        if follow_up is None:
             continue
         question = str(follow_up.get("question") or "").strip()
         reason = str(follow_up.get("reason") or "").strip()
@@ -10743,31 +16585,252 @@ def _bounded_formal_coach_history(
             ),
             "created_at_ms": int(event.get("occurred_at_ms") or 0),
         }
-        key = _normalized_history_text(follow_up.get("coach_event_type"), question)
+        # A real coach decision is an immutable identity even when the model
+        # repeats the same wording. Use its ID for lifecycle/supersession
+        # history; only legacy payloads without an ID fall back to text.
+        key = str(follow_up.get("decision_id") or "").strip() or _normalized_history_text(
+            follow_up.get("coach_event_type"), question
+        )
         if history and history[-1]["_dedupe_key"] == key:
             history[-1] = {**entry, "_dedupe_key": key}
         else:
             history.append({**entry, "_dedupe_key": key})
-    return [
+    bounded = [
         {key: value for key, value in entry.items() if key != "_dedupe_key"}
         for entry in history[-max(0, limit):]
     ]
+    supersessions = _coach_supersession_index(formal_events)
+    replacement_decisions: dict[str, Mapping[str, Any]] = {}
+    for event in formal_events:
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        decision = payload.get("coach_decision")
+        if isinstance(decision, Mapping):
+            decision_id = str(decision.get("decision_id") or "").strip()
+            if decision_id:
+                replacement_decisions[decision_id] = decision
+    projected: list[dict[str, Any]] = []
+    for entry in bounded:
+        decision_id = str(entry.get("decision_id") or "").strip()
+        link = supersessions.get(decision_id)
+        if link is None:
+            projected.append(entry)
+            continue
+        replacement, action = link
+        replacement_decision = replacement_decisions.get(replacement, {})
+        lifecycle_status = (
+            "resolved"
+            if replacement_decision.get("status_reason") == "lifecycle_resolved"
+            else "retracted"
+            if action == "retract"
+            else "superseded"
+        )
+        projected.append(
+            {
+                **entry,
+                "superseded_by": replacement,
+                "lifecycle_action": action,
+                "lifecycle_status": lifecycle_status,
+            }
+        )
+    return projected
+
+
+def _bounded_coach_runtime_history(
+    formal_events: list[dict[str, Any]],
+    *,
+    limit: int = COACH_HISTORY_LIMIT,
+) -> list[dict[str, Any]]:
+    """Keep terminal coach provenance for historical diagnostics.
+
+    ``coach_history`` intentionally contains only renderable interventions so
+    it cannot resurrect a stale card. Diagnostics need a separate, compact
+    audit lane for timed-out/failed Pi runs and local-reflex fallbacks after a
+    meeting has ended.
+    """
+
+    entries: list[dict[str, Any]] = []
+    for event in formal_events:
+        if event.get("type") != "meeting.intelligence.applied":
+            continue
+        payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+        decision = payload.get("coach_decision")
+        if not isinstance(decision, Mapping):
+            continue
+        status = str(decision.get("status") or "").strip()
+        if status not in {"intervention", "not_triggered", "protected_silent", "timed_out", "failed", "stale"}:
+            continue
+        entry = {
+            "decision_id": str(decision.get("decision_id") or "").strip() or None,
+            "status": status,
+            "status_reason": str(decision.get("status_reason") or "").strip() or None,
+            "decision_reason": str(decision.get("decision_reason") or "").strip() or None,
+            "origin": str(decision.get("origin") or payload.get("origin") or "").strip() or None,
+            "runtime_requested": str(decision.get("runtime_requested") or "").strip() or None,
+            "runtime_used": str(decision.get("runtime_used") or "").strip() or None,
+            "pi_provider_attempted": decision.get("pi_provider_attempted"),
+            "llm_called": decision.get("llm_called", payload.get("llm_called")),
+            "llm_call_status": decision.get("llm_call_status", payload.get("llm_call_status")),
+            "fallback_error_code": str(decision.get("fallback_error_code") or "").strip() or None,
+            "fallback_reason": str(decision.get("fallback_reason") or "").strip() or None,
+            "delivery_status": str(decision.get("delivery_status") or "").strip() or None,
+            "late_result_discarded": decision.get("late_result_discarded"),
+            "job_id": str(decision.get("job_id") or payload.get("job_id") or "").strip() or None,
+            "run_id": str(decision.get("run_id") or "").strip() or None,
+            "created_at_ms": decision.get("created_at_ms") or event.get("occurred_at_ms") or 0,
+            "completed_at_ms": decision.get("completed_at_ms"),
+            "provider": str(payload.get("provider") or "").strip() or None,
+            "model": str(payload.get("model") or "").strip() or None,
+        }
+        if status in {"timed_out", "failed", "stale"}:
+            entry["outcome"] = "failure"
+        elif entry["origin"] == "local_reflex" or entry["runtime_used"] == "local_reflex":
+            entry["outcome"] = "local_reflex_fallback"
+        elif status == "intervention":
+            entry["outcome"] = "intervention"
+        else:
+            entry["outcome"] = "silent"
+        entries.append(entry)
+    return entries[-max(0, limit):]
+
+
+def _coach_due_work_items(
+    formal_events: list[dict[str, Any]],
+    *,
+    now_ms: int,
+    limit: int = 24,
+    durable_items: list[Mapping[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Rebuild bounded task_due candidates from durable coach events.
+
+    This is deliberately a read-only gate: an expired card becomes eligible
+    for a host refresh without fabricating a new transcript paragraph or
+    forcing a Provider call. A scheduler can inspect this list and decide
+    whether new evidence exists before enqueueing work.
+    """
+    if isinstance(now_ms, bool) or not isinstance(now_ms, int):
+        raise TypeError("now_ms must be an integer")
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+        raise ValueError("limit must be between 1 and 100")
+    if durable_items is not None:
+        durable_due: list[dict[str, Any]] = []
+        for item in durable_items:
+            if not isinstance(item, Mapping) or str(item.get("state") or "") != "ready":
+                continue
+            valid_until = item.get("next_check_at_ms")
+            if not isinstance(valid_until, int) or valid_until > now_ms:
+                continue
+            decision_id = str(item.get("latest_decision_id") or "").strip()
+            if not decision_id:
+                continue
+            evidence_links = item.get("evidence_links")
+            evidence_ids = list(item.get("evidence_segment_ids") or [])
+            quote = ""
+            if isinstance(evidence_links, list) and evidence_links:
+                quote = str(evidence_links[-1].get("quote") or "")
+            durable_due.append(
+                {
+                    "item_id": decision_id,
+                    "work_item_id": item.get("work_item_id"),
+                    "status": "due",
+                    "next_check_at_ms": valid_until,
+                    "coach_event_type": item.get("kind"),
+                    "title": item.get("title"),
+                    "evidence_segment_ids": evidence_ids,
+                    "evidence_quote": quote,
+                    "created_at_ms": int(item.get("created_at_ms") or 0),
+                }
+            )
+            if len(durable_due) >= limit:
+                break
+        if durable_due:
+            return list(reversed(durable_due))
+
+    due: list[dict[str, Any]] = []
+    for item in reversed(_bounded_formal_coach_history(formal_events, limit=limit)):
+        if item.get("lifecycle_status") is not None:
+            continue
+        if item.get("lifecycle_action") != "retain":
+            continue
+        valid_until = item.get("valid_until_ms")
+        if not isinstance(valid_until, int) or valid_until > now_ms:
+            continue
+        decision_id = str(item.get("decision_id") or "").strip()
+        if not decision_id:
+            continue
+        due.append({
+            "item_id": decision_id,
+            "status": "due",
+            "next_check_at_ms": valid_until,
+            "coach_event_type": item.get("coach_event_type"),
+            "title": item.get("title"),
+            "evidence_segment_ids": list(item.get("evidence_segment_ids") or []),
+            "evidence_quote": str(item.get("evidence_quote") or ""),
+            "created_at_ms": int(item.get("created_at_ms") or 0),
+        })
+        if len(due) >= limit:
+            break
+    return list(reversed(due))
 
 
 def _latest_formal_coach_follow_up(
     formal_events: list[dict[str, Any]],
+    *,
+    now_ms: int | None = None,
 ) -> dict[str, Any] | None:
+    effective_now_ms = time.time_ns() // 1_000_000 if now_ms is None else max(0, int(now_ms))
     for event in reversed(formal_events):
         if event.get("type") != "meeting.intelligence.applied":
             continue
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-        follow_up = payload.get("follow_up")
-        if not isinstance(follow_up, dict):
-            continue
+        follow_up = _coach_follow_up_from_event_payload(payload)
+        if follow_up is None:
+            return None
+        valid_until_ms = follow_up.get("valid_until_ms")
+        if valid_until_ms is not None and effective_now_ms >= int(valid_until_ms):
+            return None
         question = str(follow_up.get("question") or "").strip()
         reason = str(follow_up.get("reason") or "").strip()
         if question and reason:
             return {**follow_up, **_formal_projection_metadata(event)}
+        return None
+    return None
+
+
+def _latest_formal_coach_decision(formal_events: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for event in reversed(formal_events):
+        if event.get("type") != "meeting.intelligence.applied":
+            continue
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        decision = payload.get("coach_decision")
+        if isinstance(decision, Mapping):
+            return {**dict(decision), **_formal_projection_metadata(event)}
+        follow_up = _coach_follow_up_from_event_payload(payload)
+        if follow_up is not None:
+            return {
+                "status": "intervention",
+                "origin": "direct_intelligence",
+                "decision_reason": None,
+                **_formal_projection_metadata(event),
+            }
+        return None
+    return None
+
+
+def _latest_formal_semantic_follow_up(formal_events: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for event in reversed(formal_events):
+        if event.get("type") != "meeting.intelligence.applied":
+            continue
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        follow_up = payload.get("semantic_follow_up")
+        if not isinstance(follow_up, Mapping):
+            return None
+        question = str(follow_up.get("question") or "").strip()
+        reason = str(follow_up.get("reason") or "").strip()
+        return (
+            {**dict(follow_up), **_formal_projection_metadata(event)}
+            if question and reason
+            else None
+        )
     return None
 
 
@@ -10848,7 +16911,11 @@ def _realtime_correction_blockers(record: dict[str, Any]) -> list[str]:
     if (
         persisted_final_available
         and degradation_reasons
-        and degradation_reasons <= _RECOVERABLE_TRANSCRIPT_DEGRADATION_REASONS
+        and degradation_reasons
+        <= (
+            _RECOVERABLE_TRANSCRIPT_DEGRADATION_REASONS
+            | _NON_BLOCKING_ASR_RESOURCE_POLICY_REASONS
+        )
     ):
         allowed.add("degraded_asr_session")
     return [blocker for blocker in blockers if blocker not in allowed]
@@ -10911,10 +16978,18 @@ def _ensure_enabled_llm_allowed(
         and str((event.get("payload") or {}).get("text") or event.get("text") or "").strip()
         for event in record.get("events") or []
     )
+    # ``online_only`` is an explicit resource policy, not a transcript safety
+    # failure.  A real final remains eligible when that policy is combined
+    # with a recoverable boundary/refinement tail (for example the resident
+    # FunASR ACK arriving after the browser boundary timeout).
+    recoverable_degradation_reasons = (
+        _RECOVERABLE_TRANSCRIPT_DEGRADATION_REASONS
+        | _NON_BLOCKING_ASR_RESOURCE_POLICY_REASONS
+    )
     if (
         persisted_final_available
         and degradation_reasons
-        and degradation_reasons <= _RECOVERABLE_TRANSCRIPT_DEGRADATION_REASONS
+        and degradation_reasons <= recoverable_degradation_reasons
     ):
         blockers = [blocker for blocker in blockers if blocker != "degraded_asr_session"]
     if blockers:

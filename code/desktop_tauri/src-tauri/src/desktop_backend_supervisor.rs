@@ -104,6 +104,9 @@ pub struct RuntimeProviderConfig {
     pub api_key: String,
     pub model: String,
     pub realtime_model: String,
+    pub realtime_model_source: String,
+    pub correction_model: String,
+    pub correction_model_source: String,
     pub api_style: String,
     pub provider_label: String,
 }
@@ -407,6 +410,9 @@ impl BackendSupervisor {
             "api_key": config.api_key,
             "model": config.model,
             "realtime_model": config.realtime_model,
+            "realtime_model_source": config.realtime_model_source,
+            "correction_model": config.correction_model,
+            "correction_model_source": config.correction_model_source,
             "api_style": config.api_style,
             "provider_label": config.provider_label,
         }))
@@ -1610,6 +1616,8 @@ fn spawn_backend(config: &BackendLaunchConfig) -> Result<Child, String> {
             .arg(config.port.to_string())
             .arg("--log-level")
             .arg("warning")
+            .arg("--ws")
+            .arg("websockets-sansio")
             .arg("--timeout-graceful-shutdown")
             .arg("8")
             .env("PYTHONNOUSERSITE", "1")
@@ -3220,6 +3228,9 @@ mod tests {
                 api_key: "sk-test-only-secret".to_string(),
                 model: "test-model".to_string(),
                 realtime_model: "test-realtime-model".to_string(),
+                realtime_model_source: "runtime_realtime_model".to_string(),
+                correction_model: "test-correction-model".to_string(),
+                correction_model_source: "runtime_correction_model".to_string(),
                 api_style: "chat_completions".to_string(),
                 provider_label: "openai_compatible_gateway".to_string(),
             })
@@ -3230,6 +3241,9 @@ mod tests {
         assert!(request.contains("sk-test-only-secret"));
         assert!(request.contains("\"model\":\"test-model\""));
         assert!(request.contains("\"realtime_model\":\"test-realtime-model\""));
+        assert!(request.contains("\"realtime_model_source\":\"runtime_realtime_model\""));
+        assert!(request.contains("\"correction_model\":\"test-correction-model\""));
+        assert!(request.contains("\"correction_model_source\":\"runtime_correction_model\""));
         assert!(!serde_json::to_string(&supervisor.snapshot())
             .unwrap()
             .contains("sk-test-only-secret"));

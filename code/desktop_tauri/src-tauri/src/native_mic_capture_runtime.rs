@@ -13,7 +13,10 @@ use std::time::{Duration, Instant};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const STOP_TIMEOUT: Duration = Duration::from_secs(15);
-const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+// The frontend abandons a native probe after five seconds. Keep the helper
+// deadline below that budget so its process and coordinator lease are gone
+// before the user can retry formal capture.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 const PROBE_DURATION_SECONDS: &str = "2.5";
 const AUDIBLE_RMS_THRESHOLD: f64 = 0.002;
 
@@ -411,6 +414,10 @@ impl NativeMicCaptureSupervisor {
     }
 
     pub fn probe(&self) -> NativeMicProbeResponse {
+        self.probe_with_timeout(PROBE_TIMEOUT)
+    }
+
+    fn probe_with_timeout(&self, probe_timeout: Duration) -> NativeMicProbeResponse {
         if !self.helper_path.is_file() {
             return self.probe_error(
                 "device_unavailable",
@@ -466,6 +473,11 @@ impl NativeMicCaptureSupervisor {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
         let mut child = match command.spawn() {
             Ok(value) => value,
             Err(error) => {
@@ -476,7 +488,7 @@ impl NativeMicCaptureSupervisor {
                 )
             }
         };
-        let deadline = Instant::now() + PROBE_TIMEOUT;
+        let deadline = Instant::now() + probe_timeout;
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
@@ -484,7 +496,7 @@ impl NativeMicCaptureSupervisor {
                     thread::sleep(Duration::from_millis(25));
                 }
                 Ok(None) => {
-                    let _ = child.kill();
+                    kill_process_group_now(&mut child);
                     let _ = child.wait();
                     return self.probe_error(
                         "error",
@@ -493,7 +505,7 @@ impl NativeMicCaptureSupervisor {
                     );
                 }
                 Err(error) => {
-                    let _ = child.kill();
+                    kill_process_group_now(&mut child);
                     let _ = child.wait();
                     return self.probe_error(
                         "error",
@@ -1265,6 +1277,14 @@ fn stop_process_group(child: &mut Child, timeout: Duration) {
     let _ = child.wait();
 }
 
+fn kill_process_group_now(child: &mut Child) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
+}
+
 fn display_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
@@ -1538,6 +1558,27 @@ while :; do sleep 1; done
                 .any(|error| error.contains(diagnostic)));
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn probe_timeout_stops_helper_before_the_frontend_request_budget() {
+        let root = test_root("probe-timeout");
+        let helper = probe_helper(&root, "exec /bin/sleep 10");
+        let supervisor =
+            NativeMicCaptureSupervisor::new(helper, root.join("runtime"), root.join("logs"));
+        let started_at = Instant::now();
+
+        let response = supervisor.probe_with_timeout(Duration::from_millis(100));
+
+        assert_eq!(response.command_status, "blocked");
+        assert_eq!(response.probe_status, "error");
+        assert!(response.spawns_process);
+        assert!(response
+            .errors
+            .iter()
+            .any(|error| error.contains("native microphone probe timed out")));
+        assert!(started_at.elapsed() < Duration::from_secs(2));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

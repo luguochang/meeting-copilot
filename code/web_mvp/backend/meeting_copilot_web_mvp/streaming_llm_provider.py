@@ -10,7 +10,9 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import math
 import time
+from email.utils import parsedate_to_datetime
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -55,6 +57,7 @@ class StreamingProviderError(RuntimeError):
         status_code: int | None = None,
         provider_code: str | None = None,
         detail: str | None = None,
+        retry_after_ms: int | None = None,
     ) -> None:
         message = detail or "LLM provider request failed"
         super().__init__(f"{category.value}: {message}")
@@ -62,6 +65,7 @@ class StreamingProviderError(RuntimeError):
         self.retryable = retryable
         self.status_code = status_code
         self.provider_code = _safe_provider_code(provider_code)
+        self.retry_after_ms = _normalize_retry_after_ms(retry_after_ms)
 
 
 @dataclass(frozen=True)
@@ -277,7 +281,11 @@ class OpenAICompatibleStreamingProvider:
                             started_at=started_at,
                             connected_at=connected_at,
                         )
-                    raise _http_error(response.status_code, error_payload)
+                    raise _http_error(
+                        response.status_code,
+                        error_payload,
+                        retry_after_ms=_retry_after_ms_from_headers(response.headers),
+                    )
 
                 content_type = response.headers.get("content-type", "").lower()
                 if "text/event-stream" in content_type:
@@ -352,7 +360,11 @@ class OpenAICompatibleStreamingProvider:
             ) as response:
                 connected_at = self._clock()
                 if response.status_code >= 400:
-                    raise _http_error(response.status_code, await _response_json(response))
+                    raise _http_error(
+                        response.status_code,
+                        await _response_json(response),
+                        retry_after_ms=_retry_after_ms_from_headers(response.headers),
+                    )
 
                 content_type = response.headers.get("content-type", "").lower()
                 if "text/event-stream" in content_type:
@@ -827,7 +839,12 @@ async def _response_json(response: httpx.Response) -> Any | None:
         return None
 
 
-def _http_error(status_code: int, payload: Any) -> StreamingProviderError:
+def _http_error(
+    status_code: int,
+    payload: Any,
+    *,
+    retry_after_ms: int | None = None,
+) -> StreamingProviderError:
     provider_code = _provider_code(payload)
     if status_code in {401, 403}:
         category = ProviderErrorCategory.AUTHENTICATION
@@ -849,6 +866,7 @@ def _http_error(status_code: int, payload: Any) -> StreamingProviderError:
         retryable=retryable,
         status_code=status_code,
         provider_code=provider_code,
+        retry_after_ms=retry_after_ms,
     )
 
 
@@ -875,7 +893,56 @@ def _stream_error(payload: Mapping[str, Any]) -> StreamingProviderError:
         category,
         retryable=retryable,
         provider_code=provider_code,
+        retry_after_ms=(
+            error.get("retry_after_ms")
+            if error.get("retry_after_ms") is not None
+            else error.get("retry_after")
+        ),
     )
+
+
+def _normalize_retry_after_ms(value: Any) -> int | None:
+    """Keep provider backoff hints finite before exposing them to admission."""
+
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if normalized < 0:
+        return None
+    return min(normalized, 300_000)
+
+
+def _retry_after_ms_from_headers(headers: Any) -> int | None:
+    """Parse Retry-After seconds or HTTP-date without trusting arbitrary input."""
+
+    if headers is None:
+        return None
+    try:
+        raw = headers.get("retry-after")
+    except (AttributeError, TypeError):
+        return None
+    value = str(raw or "").strip()
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError, OverflowError):
+        seconds = None
+    if seconds is not None:
+        if not math.isfinite(seconds) or seconds < 0:
+            return None
+        return _normalize_retry_after_ms(round(seconds * 1_000))
+    try:
+        retry_at = parsedate_to_datetime(value)
+        if retry_at.tzinfo is None:
+            return None
+        delay_ms = round((retry_at.timestamp() - time.time()) * 1_000)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+    return _normalize_retry_after_ms(max(0, delay_ms))
 
 
 def _is_stream_unsupported(status_code: int, payload: Any) -> bool:
@@ -936,4 +1003,7 @@ def _validated_base_url(value: str) -> str:
         parsed.port
     except ValueError as exc:
         raise ValueError("base_url contains an invalid port") from exc
-    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
+    normalized_path = parsed.path.rstrip("/")
+    if normalized_path == "/v1":
+        normalized_path = ""
+    return urlunsplit((parsed.scheme, parsed.netloc, normalized_path, "", ""))

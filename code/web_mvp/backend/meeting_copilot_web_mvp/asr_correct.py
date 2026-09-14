@@ -14,11 +14,18 @@ L2 on partials (speed) and run L2 only on finals, or skip entirely for latency.
 """
 from __future__ import annotations
 
+import asyncio
+
 from meeting_copilot_web_mvp.llm_service import (
+    AsyncHttpxLlmClient,
+    AsyncLlmClient,
     HttpxLlmClient,
     LlmClient,
     LlmConfig,
+    ProviderAbortHandle,
     _call_with_retry,
+    _completion_token_parameter,
+    _reasoning_compatibility_parameters,
 )
 from meeting_copilot_web_mvp.logging_config import get_logger
 
@@ -66,7 +73,8 @@ def correct_transcript(
         ],
         "temperature": 0,
         "reasoning_effort": "low",
-        "max_completion_tokens": 4096,
+        **_reasoning_compatibility_parameters(config),
+        **_completion_token_parameter(config, 4096),
     }
     headers = {"Authorization": f"Bearer {config.api_key}", "Content-Type": "application/json"}
     url = f"{config.base_url}/v1/chat/completions"
@@ -93,4 +101,69 @@ def correct_transcript(
         "total_tokens": int(usage.get("total_tokens", 0)),
     }
     _log.info("asr_correct.end", tokens=usage_record["total_tokens"], chars_out=len(content))
+    return content, usage_record, False
+
+
+async def async_correct_transcript(
+    raw_text: str,
+    config: LlmConfig,
+    client: AsyncLlmClient | None = None,
+    *,
+    abort: ProviderAbortHandle | None = None,
+    raise_on_failure: bool = False,
+) -> tuple[str, dict[str, int], bool]:
+    """Run one realtime correction through an async, cancellable transport.
+
+    The synchronous ``correct_transcript`` API remains unchanged for file
+    conversion and existing callers. Durable realtime work uses this one-shot
+    path; retry policy stays in the durable job so each retry has a distinct
+    job attempt and the Provider lease is not released during a live request.
+    """
+
+    if not raw_text:
+        return raw_text, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}, False
+    if client is None:
+        client = AsyncHttpxLlmClient(api_style=config.api_style)
+    body = {
+        "model": config.model,
+        "messages": [
+            {"role": "system", "content": _SYSTEM},
+            {"role": "user", "content": raw_text},
+        ],
+        "temperature": 0,
+        "reasoning_effort": "low",
+        **_reasoning_compatibility_parameters(config),
+        **_completion_token_parameter(config, 4096),
+    }
+    headers = {"Authorization": f"Bearer {config.api_key}", "Content-Type": "application/json"}
+    url = f"{config.base_url}/v1/chat/completions"
+    _log.info("asr_correct.async_start", chars=len(raw_text))
+    try:
+        data = await client.post_json(
+            url,
+            headers,
+            body,
+            max(0.001, float(config.timeout_seconds)),
+            abort=abort,
+        )
+        content = data["choices"][0]["message"]["content"].strip()
+        usage = data.get("usage", {})
+    except asyncio.CancelledError:
+        # Task cancellation is control flow for the durable executor. Let the
+        # app await transport unwind/ACK instead of converting it to a degraded
+        # provider result.
+        raise
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as exc:
+        _log.error("asr_correct.async_failed", error_class=type(exc).__name__)
+        if raise_on_failure:
+            raise
+        return raw_text, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}, True
+    usage_record = {
+        "prompt_tokens": int(usage.get("prompt_tokens", 0)),
+        "completion_tokens": int(usage.get("completion_tokens", 0)),
+        "total_tokens": int(usage.get("total_tokens", 0)),
+    }
+    _log.info("asr_correct.async_end", tokens=usage_record["total_tokens"], chars_out=len(content))
     return content, usage_record, False

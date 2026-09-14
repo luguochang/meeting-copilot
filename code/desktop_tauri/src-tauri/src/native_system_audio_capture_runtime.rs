@@ -76,6 +76,17 @@ pub struct DualTrackCaptureCoordinator {
     state: Mutex<DualTrackCoordinatorState>,
 }
 
+#[must_use = "hold the lease for the duration of the microphone probe"]
+pub struct MicrophoneProbeLease<'a> {
+    coordinator: &'a DualTrackCaptureCoordinator,
+}
+
+impl Drop for MicrophoneProbeLease<'_> {
+    fn drop(&mut self) {
+        self.coordinator.release_microphone_probe();
+    }
+}
+
 impl DualTrackCaptureCoordinator {
     pub fn claim_track(
         &self,
@@ -182,6 +193,11 @@ impl DualTrackCaptureCoordinator {
         }
         state.microphone_probe_active = true;
         Ok(())
+    }
+
+    pub fn acquire_microphone_probe(&self) -> Result<MicrophoneProbeLease<'_>, String> {
+        self.claim_microphone_probe()?;
+        Ok(MicrophoneProbeLease { coordinator: self })
     }
 
     pub fn release_microphone_probe(&self) {
@@ -1925,6 +1941,24 @@ while :; do sleep 1; done"#,
         coordinator.release_microphone_probe();
         assert!(coordinator
             .claim_track(CaptureTrack::Microphone, "meeting_01")
+            .is_ok());
+    }
+
+    #[test]
+    fn coordinator_scoped_probe_lease_releases_on_drop() {
+        let coordinator = DualTrackCaptureCoordinator::default();
+
+        {
+            let _probe_lease = coordinator.acquire_microphone_probe().unwrap();
+            assert!(coordinator.snapshot().microphone_probe_active);
+            assert!(coordinator
+                .claim_track(CaptureTrack::Microphone, "meeting_lease")
+                .is_err());
+        }
+
+        assert!(!coordinator.snapshot().microphone_probe_active);
+        assert!(coordinator
+            .claim_track(CaptureTrack::Microphone, "meeting_lease")
             .is_ok());
     }
 }

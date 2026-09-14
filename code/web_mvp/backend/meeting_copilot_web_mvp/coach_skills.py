@@ -91,7 +91,7 @@ _SKILLS: Mapping[str, Mapping[str, Any]] = MappingProxyType(
         },
         "brainstorm": {
             "id": "brainstorm",
-            "version": 1,
+            "version": 2,
             "name": "Brainstorm convergence coach",
             "objective": (
                 "Preserve useful divergence, then help convert a promising idea into a falsifiable "
@@ -105,8 +105,11 @@ _SKILLS: Mapping[str, Mapping[str, Any]] = MappingProxyType(
                     "id": "experiment_readiness",
                     "event_type": "experiment_gap",
                     "question": (
-                        "Has a promising idea reached a point where the key assumption, smallest "
-                        "experiment, or success signal should be made explicit?"
+                        "Is a promising idea being accepted before a runnable minimum experiment "
+                        "or a measurable success/failure signal is explicit? Keep silent when the "
+                        "latest evidence already names a bounded prototype, target sample, test "
+                        "period or method, metrics or thresholds, and the next decision; do not "
+                        "demand optional protocol detail merely to make a complete experiment finer."
                     ),
                 },
             ),

@@ -9,7 +9,9 @@ is base64 encoded in ``audio`` commands to keep boundaries recoverable.
 from __future__ import annotations
 
 import base64
+from collections import deque
 import json
+import math
 import queue
 import subprocess
 import threading
@@ -19,13 +21,19 @@ from typing import Any, Callable, Mapping, Sequence
 
 
 WRITE_QUEUE_MAX_COMMANDS = 256
+WRITE_QUEUE_CONTROL_RESERVE = 4
+WRITE_QUEUE_MAX_AUDIO_COMMANDS = WRITE_QUEUE_MAX_COMMANDS - WRITE_QUEUE_CONTROL_RESERVE
 PROCESS_WAIT_TIMEOUT_S = 5.0
 SESSION_ABORT_TIMEOUT_S = 2.0
 SESSION_FINALIZE_MAX_TIMEOUT_S = 30.0
+FUNASR_BOUNDARY_ACK_TIMEOUT_S = 1.25
 DEFAULT_RESIDENT_WORKER_COUNT = 2
 MAX_RESIDENT_WORKER_COUNT = 2
 MAX_SESSION_HOTWORDS = 50
 MAX_SESSION_HOTWORD_CHARACTERS = 64
+MAX_BOUNDARY_DIAGNOSTICS = 128
+FUNASR_CONFIDENCE_SOURCE_REPORTED = "funasr_worker_reported_score"
+FUNASR_CONFIDENCE_SOURCE_UNAVAILABLE = "funasr_worker_no_score"
 
 
 class FunasrResidentBusyError(RuntimeError):
@@ -34,6 +42,10 @@ class FunasrResidentBusyError(RuntimeError):
 
 class FunasrResidentUnavailableError(RuntimeError):
     """Raised when the resident worker cannot safely accept more audio."""
+
+
+class FunasrResidentBoundaryTimeoutError(FunasrResidentUnavailableError):
+    """Raised when a worker does not acknowledge an utterance boundary in time."""
 
 
 @dataclass
@@ -52,6 +64,26 @@ class _WorkerGeneration:
     exit_code: int | None = None
 
 
+@dataclass
+class _BoundaryAttempt:
+    """State for one enqueued boundary command.
+
+    A timeout is only a caller-side wait expiry.  The worker may still be
+    draining the command, so the attempt must remain addressable until its
+    matching ACK (or a terminal worker failure) arrives.  Keeping this state
+    separate from the bounded ACK cache prevents a retry from accidentally
+    issuing a second command for the same boundary token.
+    """
+
+    waiter: threading.Event
+    enqueued_at_monotonic: float | None = None
+    command_enqueued: bool = False
+    timed_out_count: int = 0
+    acknowledged_at_monotonic: float | None = None
+    consumed_at_monotonic: float | None = None
+    ack_event_sequence: int | None = None
+
+
 class FunasrResidentSession:
     """StreamRecognizer-compatible view of one resident-worker session."""
 
@@ -65,7 +97,11 @@ class FunasrResidentSession:
         self._manager = manager
         self.session_id = session_id
         self.worker_id = manager.worker_id
-        self._events: "queue.Queue[dict[str, Any]]" = queue.Queue()
+        self._started_at_monotonic = time.monotonic()
+        self._events: "queue.Queue[tuple[int, dict[str, Any]]]" = queue.Queue()
+        self._deferred_events: "deque[tuple[int, dict[str, Any]]]" = deque()
+        self._event_drain_lock = threading.Lock()
+        self._receive_sequence = 0
         self._ready_event = threading.Event()
         self._ended_event = threading.Event()
         self._aborted_event = threading.Event()
@@ -75,8 +111,150 @@ class FunasrResidentSession:
         self._abort_started = False
         self._error: str | None = None
         self._seq = 0
+        self._audio_chunk_attempts = 0
+        self._audio_chunks_dropped = 0
+        self._preview_bytes_dropped = 0
+        # Boundary commands are causal barriers.  Serialize calls on one
+        # session so two producers cannot enqueue the same token while the
+        # first caller is still waiting for its ACK.  An attempt remains
+        # inflight after a timeout: the command may still be in the worker
+        # FIFO, and a retry must wait on the same waiter rather than enqueue a
+        # duplicate command.
+        self._boundary_flush_lock = threading.Lock()
+        self._boundary_inflight: dict[str, _BoundaryAttempt] = {}
+        # Keep the event map as a small compatibility/debug view.  Events in
+        # this map intentionally survive timeout and are removed only after a
+        # matching ACK is consumed or enqueue fails.
+        self._boundary_waiters: dict[str, threading.Event] = {}
+        self._boundary_acks: dict[str, dict[str, Any]] = {}
+        self._completed_boundaries: dict[str, None] = {}
+        self._boundary_diagnostics: dict[str, dict[str, Any]] = {}
         self.worker_diagnostics: dict[str, Any] = {}
         self.shutdown_diagnostics: dict[str, Any] = {}
+
+    @property
+    def boundary_diagnostics(self) -> list[dict[str, Any]]:
+        """Return a bounded, content-free snapshot of boundary lifecycle data."""
+
+        with self._state_lock:
+            return self._boundary_diagnostics_snapshot_locked()
+
+    def _boundary_diagnostics_snapshot_locked(self) -> list[dict[str, Any]]:
+        return [dict(item) for item in self._boundary_diagnostics.values()]
+
+    def _boundary_timestamp_ms(self, timestamp: float | None) -> float | None:
+        if timestamp is None:
+            return None
+        return round(max(0.0, timestamp - self._started_at_monotonic) * 1_000, 2)
+
+    def _get_boundary_diagnostic_locked(self, boundary_id: str) -> dict[str, Any]:
+        diagnostic = self._boundary_diagnostics.get(boundary_id)
+        if diagnostic is not None:
+            return diagnostic
+        # Keep this cache bounded even when a worker sends an unsolicited ACK.
+        # Insert the new item after evicting the oldest entry so the current
+        # boundary is never immediately removed from the returned snapshot.
+        while len(self._boundary_diagnostics) >= MAX_BOUNDARY_DIAGNOSTICS:
+            self._boundary_diagnostics.pop(next(iter(self._boundary_diagnostics)))
+        diagnostic = {
+            "boundary_id": boundary_id,
+            "status": "pending",
+            "enqueued_at_ms": None,
+            "ack_received_at_ms": None,
+            "ack_consumed_at_ms": None,
+            "ack_latency_ms": None,
+            "timeout_count": 0,
+            "duplicate": None,
+            "utterance_index": None,
+            "drain_ms": None,
+            "skipped_preview_bytes": 0,
+            "skipped_silence_bytes": 0,
+        }
+        self._boundary_diagnostics[boundary_id] = diagnostic
+        return diagnostic
+
+    def _refresh_boundary_latency_locked(
+        self,
+        diagnostic: dict[str, Any],
+        attempt: _BoundaryAttempt | None,
+    ) -> None:
+        if attempt is not None:
+            diagnostic["enqueued_at_ms"] = self._boundary_timestamp_ms(
+                attempt.enqueued_at_monotonic
+            )
+            if attempt.acknowledged_at_monotonic is not None:
+                diagnostic["ack_received_at_ms"] = self._boundary_timestamp_ms(
+                    attempt.acknowledged_at_monotonic
+                )
+                if attempt.enqueued_at_monotonic is not None:
+                    diagnostic["ack_latency_ms"] = round(
+                        max(
+                            0.0,
+                            attempt.acknowledged_at_monotonic
+                            - attempt.enqueued_at_monotonic,
+                        )
+                        * 1_000,
+                        2,
+                    )
+
+    def _record_boundary_ack_locked(
+        self,
+        boundary_id: str,
+        event: Mapping[str, Any],
+        attempt: _BoundaryAttempt | None,
+        received_at: float,
+    ) -> None:
+        diagnostic = self._boundary_diagnostics.get(boundary_id)
+        # An ACK for a boundary this session never issued is stale or
+        # malformed. Keep it in the bounded ACK compatibility cache, but do
+        # not let worker-controlled tokens create misleading diagnostics.
+        if diagnostic is None and attempt is None:
+            return
+        if diagnostic is None:
+            diagnostic = self._get_boundary_diagnostic_locked(boundary_id)
+        diagnostic["status"] = "acknowledged"
+        if attempt is not None and attempt.acknowledged_at_monotonic is None:
+            attempt.acknowledged_at_monotonic = received_at
+        if attempt is not None:
+            self._refresh_boundary_latency_locked(diagnostic, attempt)
+        elif diagnostic["ack_received_at_ms"] is None:
+            diagnostic["ack_received_at_ms"] = self._boundary_timestamp_ms(received_at)
+        duplicate = event.get("duplicate")
+        if isinstance(duplicate, bool):
+            diagnostic["duplicate"] = duplicate
+        utterance_index = event.get("utterance_index")
+        if (
+            isinstance(utterance_index, int)
+            and not isinstance(utterance_index, bool)
+            and utterance_index >= 0
+        ):
+            diagnostic["utterance_index"] = utterance_index
+        drain_ms = event.get("drain_ms")
+        if (
+            isinstance(drain_ms, (int, float))
+            and not isinstance(drain_ms, bool)
+            and math.isfinite(float(drain_ms))
+            and drain_ms >= 0
+        ):
+            diagnostic["drain_ms"] = round(float(drain_ms), 2)
+        skipped_silence_bytes = event.get("skipped_silence_bytes")
+        if (
+            isinstance(skipped_silence_bytes, int)
+            and not isinstance(skipped_silence_bytes, bool)
+            and skipped_silence_bytes >= 0
+        ):
+            diagnostic["skipped_silence_bytes"] = skipped_silence_bytes
+        skipped_preview_bytes = event.get("skipped_preview_bytes")
+        if (
+            isinstance(skipped_preview_bytes, int)
+            and not isinstance(skipped_preview_bytes, bool)
+            and skipped_preview_bytes >= 0
+        ):
+            diagnostic["skipped_preview_bytes"] = skipped_preview_bytes
+
+    def _snapshot_boundary_diagnostics(self) -> list[dict[str, Any]]:
+        with self._state_lock:
+            return self._boundary_diagnostics_snapshot_locked()
 
     def _receive(self, event: dict[str, Any]) -> None:
         event_type = str(event.get("event_type") or "")
@@ -96,17 +274,73 @@ class FunasrResidentSession:
         if event_type == "session_aborted":
             self._aborted_event.set()
             return
+        if event_type == "utterance_boundary_complete":
+            boundary_id = str(event.get("boundary_id") or "").strip()
+            if not boundary_id:
+                return
+            received_at = time.monotonic()
+            with self._state_lock:
+                self._receive_sequence += 1
+                ack_event_sequence = self._receive_sequence
+                attempt = self._boundary_inflight.get(boundary_id)
+                if attempt is None:
+                    # A legitimate ACK can only follow a command whose attempt
+                    # was registered before enqueue.  Do not let an unsolicited
+                    # or stale worker token satisfy a future boundary request.
+                    # A duplicate ACK for an already consumed token may still
+                    # enrich its bounded diagnostics, but it is never cached as
+                    # consumable evidence again.
+                    if boundary_id in self._completed_boundaries:
+                        self._record_boundary_ack_locked(
+                            boundary_id,
+                            event,
+                            None,
+                            received_at,
+                        )
+                    return
+                # The first ACK is the causal one. A duplicate event for the
+                # same token must not overwrite its payload (or turn a
+                # successful non-duplicate into a later duplicate) before the
+                # waiting caller consumes it.
+                first_ack = boundary_id not in self._boundary_acks
+                if first_ack:
+                    self._boundary_acks[boundary_id] = dict(event)
+                    attempt.ack_event_sequence = ack_event_sequence
+                self._record_boundary_ack_locked(
+                    boundary_id,
+                    event,
+                    attempt,
+                    received_at,
+                )
+                attempt.waiter.set()
+                # Boundary tokens are unique per utterance. Keep only a small
+                # bounded cache so a late ACK after timeout can satisfy a safe
+                # retry without allowing unbounded worker-controlled growth.
+                if len(self._boundary_acks) > 128:
+                    oldest = next(iter(self._boundary_acks))
+                    self._boundary_acks.pop(oldest, None)
+            return
         if event_type == "error":
             self._fail(str(event.get("message") or event.get("error_code") or "resident worker error"))
             return
         if event_type in {"partial", "final"}:
-            self._events.put(event)
+            with self._state_lock:
+                self._receive_sequence += 1
+                event_sequence = self._receive_sequence
+            self._events.put((event_sequence, event))
 
     def _fail(self, message: str) -> None:
         with self._state_lock:
             if self._error is None:
                 self._error = message
             self._terminal = True
+            for boundary_id, attempt in self._boundary_inflight.items():
+                if boundary_id not in self._boundary_acks:
+                    diagnostic = self._get_boundary_diagnostic_locked(boundary_id)
+                    diagnostic["status"] = "failed"
+                    diagnostic["timeout_count"] = attempt.timed_out_count
+                    self._refresh_boundary_latency_locked(diagnostic, attempt)
+                attempt.waiter.set()
         self._ready_event.set()
         self._ended_event.set()
         self._aborted_event.set()
@@ -128,10 +362,16 @@ class FunasrResidentSession:
         with self._state_lock:
             if self._terminal or self._finalize_started or self._abort_started:
                 raise FunasrResidentUnavailableError("FunASR resident session is closed")
-            self._seq += 1
-            sequence = self._seq
-        self._manager.send_audio(self, pcm)
-        events = self._drain_events(default_confidence=0.8)
+            self._audio_chunk_attempts += 1
+            sequence = self._audio_chunk_attempts
+        accepted = self._manager.send_audio(self, pcm)
+        with self._state_lock:
+            if accepted:
+                self._seq += 1
+            else:
+                self._audio_chunks_dropped += 1
+                self._preview_bytes_dropped += len(pcm)
+        events = self._drain_events()
         if events:
             return events
         return [{
@@ -140,8 +380,159 @@ class FunasrResidentSession:
             "text": "",
             "start_ms": (sequence - 1) * 300,
             "end_ms": sequence * 300,
-            "confidence": 0.7,
+            "confidence": None,
+            "confidence_source": FUNASR_CONFIDENCE_SOURCE_UNAVAILABLE,
         }]
+
+    def flush_utterance(
+        self,
+        boundary_id: str,
+        timeout: float = FUNASR_BOUNDARY_ACK_TIMEOUT_S,
+    ) -> list[dict[str, Any]]:
+        """Drain one worker utterance and wait for its causal boundary ACK.
+
+        The worker emits any residual incremental partial before the ACK. A
+        timeout is fail-closed: no text is promoted and the session remains
+        usable so a later ``END`` can retry over the retained PCM.
+        """
+
+        if (
+            not isinstance(boundary_id, str)
+            or not boundary_id
+            or len(boundary_id) > 192
+            or any(ord(character) < 33 or ord(character) > 126 for character in boundary_id)
+        ):
+            raise ValueError("boundary_id must be printable ASCII and <= 192 characters")
+        try:
+            timeout_s = float(timeout)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("timeout must be a positive number") from exc
+        if not math.isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("timeout must be a finite positive number")
+        timeout_s = max(0.001, timeout_s)
+
+        # The lock covers the enqueue/wait/consume sequence.  It is separate
+        # from ``_state_lock`` so the reader thread can deliver the ACK while
+        # this call is blocked.  A second caller therefore waits for the first
+        # attempt and observes the completed token instead of issuing a second
+        # flush concurrently.
+        with self._boundary_flush_lock:
+            with self._state_lock:
+                if self._terminal or self._finalize_started or self._abort_started:
+                    raise FunasrResidentUnavailableError("FunASR resident session is closed")
+                if self._error:
+                    raise FunasrResidentUnavailableError(self._error)
+                if boundary_id in self._completed_boundaries:
+                    return []
+                if self._boundary_inflight and boundary_id not in self._boundary_inflight:
+                    raise FunasrResidentUnavailableError(
+                        "FunASR resident session has an unresolved utterance boundary"
+                    )
+                attempt = self._boundary_inflight.get(boundary_id)
+                if attempt is None:
+                    attempt = _BoundaryAttempt(waiter=threading.Event())
+                    self._boundary_inflight[boundary_id] = attempt
+                    self._boundary_waiters[boundary_id] = attempt.waiter
+                    self._get_boundary_diagnostic_locked(boundary_id)
+                waiter = attempt.waiter
+                # A late ACK can arrive after a previous timeout.  Consume it
+                # without enqueueing a duplicate command.
+                already_acknowledged = boundary_id in self._boundary_acks
+
+            if not already_acknowledged:
+                # ``enqueued_at_monotonic`` is initialized when the attempt is
+                # created.  Only the first caller writes the worker command;
+                # retries reuse the persistent attempt state.
+                should_enqueue = not attempt.command_enqueued
+            else:
+                should_enqueue = False
+
+            if should_enqueue:
+                # Register the command as enqueuing before handing control to
+                # the manager. A synchronous test double, or an exceptionally
+                # fast writer/reader pair, may deliver the ACK before the
+                # manager call returns; the ACK must already have an attempt
+                # and a causal enqueue timestamp to attach to.
+                with self._state_lock:
+                    attempt.command_enqueued = True
+                    attempt.enqueued_at_monotonic = time.monotonic()
+                    diagnostic = self._get_boundary_diagnostic_locked(boundary_id)
+                    if diagnostic["status"] == "pending":
+                        diagnostic["status"] = "enqueuing"
+                    self._refresh_boundary_latency_locked(diagnostic, attempt)
+                try:
+                    self._manager.flush_utterance(self, boundary_id)
+                    with self._state_lock:
+                        diagnostic = self._get_boundary_diagnostic_locked(boundary_id)
+                        if diagnostic["status"] == "enqueuing":
+                            diagnostic["status"] = "enqueued"
+                        self._refresh_boundary_latency_locked(diagnostic, attempt)
+                except Exception:
+                    with self._state_lock:
+                        self._boundary_inflight.pop(boundary_id, None)
+                        self._boundary_waiters.pop(boundary_id, None)
+                        # If a synchronous manager delivered an ACK and then
+                        # reported enqueue failure, that ACK is not safe to
+                        # reuse for a future command.
+                        self._boundary_acks.pop(boundary_id, None)
+                        attempt.command_enqueued = False
+                        diagnostic = self._get_boundary_diagnostic_locked(boundary_id)
+                        diagnostic["status"] = "enqueue_failed"
+                        diagnostic["timeout_count"] = attempt.timed_out_count
+                    raise
+
+            if not already_acknowledged:
+                waiter.wait(timeout_s)
+
+            with self._state_lock:
+                error = self._error
+                ack = self._boundary_acks.get(boundary_id)
+                ack_event_sequence = attempt.ack_event_sequence
+                diagnostic = self._get_boundary_diagnostic_locked(boundary_id)
+                if ack is not None:
+                    self._boundary_inflight.pop(boundary_id, None)
+                    self._boundary_waiters.pop(boundary_id, None)
+                    self._boundary_acks.pop(boundary_id, None)
+                    attempt.consumed_at_monotonic = time.monotonic()
+                    diagnostic["ack_consumed_at_ms"] = self._boundary_timestamp_ms(
+                        attempt.consumed_at_monotonic
+                    )
+                    diagnostic["timeout_count"] = attempt.timed_out_count
+                    diagnostic["status"] = "acknowledged"
+                    self._completed_boundaries[boundary_id] = None
+                    if len(self._completed_boundaries) > 128:
+                        oldest = next(iter(self._completed_boundaries))
+                        self._completed_boundaries.pop(oldest, None)
+                elif error:
+                    # A failure wake-up is not an ACK. Remove terminal state so
+                    # diagnostics remain truthful, but never stamp it as
+                    # consumed or completed.
+                    self._boundary_inflight.pop(boundary_id, None)
+                    self._boundary_waiters.pop(boundary_id, None)
+                    diagnostic["status"] = "failed"
+                    diagnostic["timeout_count"] = attempt.timed_out_count
+                    self._refresh_boundary_latency_locked(diagnostic, attempt)
+                else:
+                    # Check under the same lock used by the reader. An ACK that
+                    # races the waiter deadline is therefore observed as
+                    # success; a genuine timeout keeps the attempt addressable
+                    # for a later ACK and idempotent retry.
+                    attempt.timed_out_count += 1
+                    diagnostic["status"] = "timeout"
+                    diagnostic["timeout_count"] = attempt.timed_out_count
+                    self._refresh_boundary_latency_locked(diagnostic, attempt)
+                    waiter.clear()
+            if ack is None and error:
+                raise FunasrResidentUnavailableError(error)
+            if ack is None:
+                raise FunasrResidentBoundaryTimeoutError(
+                    f"FunASR utterance boundary ACK timed out: {boundary_id}"
+                )
+            if error:
+                raise FunasrResidentUnavailableError(error)
+            # Reader dispatch is ordered: all partials written before the ACK
+            # have already entered ``_events`` by this point.
+            return self._drain_events(max_sequence=ack_event_sequence)
 
     def finalize(self) -> list[dict[str, Any]]:
         with self._state_lock:
@@ -151,13 +542,14 @@ class FunasrResidentSession:
         started_at = time.monotonic()
         self._manager.end_session(self)
         self._raise_if_failed()
-        events = self._drain_events(default_confidence=0.9)
+        events = self._drain_events()
         if not events:
             events.append({
                 "event_type": "final",
                 "segment_id": f"stream_seg_{self.session_id}",
                 "text": "",
-                "confidence": 0.9,
+                "confidence": None,
+                "confidence_source": FUNASR_CONFIDENCE_SOURCE_UNAVAILABLE,
             })
         with self._state_lock:
             self._terminal = True
@@ -165,7 +557,11 @@ class FunasrResidentSession:
             "abort": False,
             "process_reused": True,
             "audio_chunks_enqueued": self._seq,
+            "audio_chunks_attempted": self._audio_chunk_attempts,
+            "audio_chunks_dropped": self._audio_chunks_dropped,
+            "preview_bytes_dropped": self._preview_bytes_dropped,
             "total_ms": round((time.monotonic() - started_at) * 1_000, 2),
+            "boundary_diagnostics": self._snapshot_boundary_diagnostics(),
             **({"worker": dict(self.worker_diagnostics)} if self.worker_diagnostics else {}),
         }
         return events
@@ -176,33 +572,66 @@ class FunasrResidentSession:
                 return
             self._abort_started = True
         started_at = time.monotonic()
-        self._manager.abort_session(self)
-        with self._state_lock:
-            self._terminal = True
-        self.shutdown_diagnostics = {
-            "abort": True,
-            "process_reused": True,
-            "audio_chunks_enqueued": self._seq,
-            "total_ms": round((time.monotonic() - started_at) * 1_000, 2),
-        }
+        abort_error: Exception | None = None
+        process_reused = False
+        try:
+            process_reused = self._manager.abort_session(self)
+        except Exception as exc:  # cleanup remains terminal even if transport fails
+            abort_error = exc
+        finally:
+            with self._state_lock:
+                self._terminal = True
+            self.shutdown_diagnostics = {
+                "abort": True,
+                "process_reused": abort_error is None and process_reused,
+                "audio_chunks_enqueued": self._seq,
+                "audio_chunks_attempted": self._audio_chunk_attempts,
+                "audio_chunks_dropped": self._audio_chunks_dropped,
+                "preview_bytes_dropped": self._preview_bytes_dropped,
+                "total_ms": round((time.monotonic() - started_at) * 1_000, 2),
+                "boundary_diagnostics": self._snapshot_boundary_diagnostics(),
+                **(
+                    {"abort_error": type(abort_error).__name__}
+                    if abort_error is not None
+                    else {}
+                ),
+            }
 
-    def _drain_events(self, *, default_confidence: float) -> list[dict[str, Any]]:
+    def _drain_events(self, *, max_sequence: int | None = None) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
-        while True:
-            try:
-                event = dict(self._events.get_nowait())
-            except queue.Empty:
-                return events
-            raw_segment_id = str(event.get("segment_id") or "").strip()
-            if raw_segment_id.startswith(f"{self.session_id}_"):
-                segment_id = raw_segment_id
-            elif raw_segment_id:
-                segment_id = f"{self.session_id}_{raw_segment_id}"
-            else:
-                segment_id = f"stream_seg_{self.session_id}"
-            event["segment_id"] = segment_id
-            event.setdefault("confidence", default_confidence)
-            events.append(event)
+        with self._event_drain_lock:
+            while True:
+                if self._deferred_events:
+                    event_sequence, raw_event = self._deferred_events.popleft()
+                else:
+                    try:
+                        event_sequence, raw_event = self._events.get_nowait()
+                    except queue.Empty:
+                        return events
+                if max_sequence is not None and event_sequence >= max_sequence:
+                    self._deferred_events.appendleft((event_sequence, raw_event))
+                    return events
+                event = dict(raw_event)
+                raw_segment_id = str(event.get("segment_id") or "").strip()
+                if raw_segment_id.startswith(f"{self.session_id}_"):
+                    segment_id = raw_segment_id
+                elif raw_segment_id:
+                    segment_id = f"{self.session_id}_{raw_segment_id}"
+                else:
+                    segment_id = f"stream_seg_{self.session_id}"
+                event["segment_id"] = segment_id
+                if event.get("confidence") is None:
+                    event["confidence"] = None
+                    event.setdefault(
+                        "confidence_source",
+                        FUNASR_CONFIDENCE_SOURCE_UNAVAILABLE,
+                    )
+                else:
+                    event.setdefault(
+                        "confidence_source",
+                        FUNASR_CONFIDENCE_SOURCE_REPORTED,
+                    )
+                events.append(event)
 
 
 class _FunasrResidentWorkerSlot:
@@ -312,15 +741,34 @@ class _FunasrResidentWorkerSlot:
                 raise
             return session
 
-    def send_audio(self, session: FunasrResidentSession, pcm: bytes) -> None:
+    def send_audio(self, session: FunasrResidentSession, pcm: bytes) -> bool:
         if not pcm:
-            return
+            return True
         with self._lock:
             generation = self._require_active_generation_locked(session)
+            # Audio is a lossy preview plane; the backend retains complete raw
+            # PCM for authoritative refinement. Keep capacity for FLUSH/abort so
+            # sustained input cannot make lifecycle control itself fail.
+            if generation.write_queue.qsize() >= WRITE_QUEUE_MAX_AUDIO_COMMANDS:
+                return False
             self._enqueue_locked(generation, {
                 "command": "audio",
                 "session_id": session.session_id,
                 "pcm_base64": base64.b64encode(pcm).decode("ascii"),
+            })
+            return True
+
+    def flush_utterance(
+        self,
+        session: FunasrResidentSession,
+        boundary_id: str,
+    ) -> None:
+        with self._lock:
+            generation = self._require_active_generation_locked(session)
+            self._enqueue_locked(generation, {
+                "command": "flush_utterance",
+                "session_id": session.session_id,
+                "boundary_id": boundary_id,
             })
 
     def end_session(self, session: FunasrResidentSession) -> None:
@@ -343,23 +791,30 @@ class _FunasrResidentWorkerSlot:
                 self.completed_session_count += 1
                 self._automatic_restart_used = False
 
-    def abort_session(self, session: FunasrResidentSession) -> None:
+    def abort_session(self, session: FunasrResidentSession) -> bool:
+        recycle = False
         with self._lock:
             if self._active_session is not session:
-                return
+                return True
             generation = self._generation
             if generation is None or generation.terminal:
                 self._active_session = None
-                return
-            self._enqueue_locked(generation, {
-                "command": "abort_session",
-                "session_id": session.session_id,
-            })
-        if not session._aborted_event.wait(SESSION_ABORT_TIMEOUT_S):
+                return False
+            try:
+                self._enqueue_locked(generation, {
+                    "command": "abort_session",
+                    "session_id": session.session_id,
+                })
+            except FunasrResidentUnavailableError:
+                recycle = True
+        if not recycle and not session._aborted_event.wait(SESSION_ABORT_TIMEOUT_S):
+            recycle = True
+        if recycle:
             self._recycle_unresponsive_generation(generation, session)
         with self._lock:
             if self._active_session is session:
                 self._active_session = None
+        return not recycle
 
     def shutdown(self) -> None:
         with self._lock:
@@ -481,7 +936,24 @@ class _FunasrResidentWorkerSlot:
                 process.stdin.write(payload)
                 process.stdin.flush()
         except Exception:
-            return
+            self._handle_writer_failure(generation)
+
+    def _handle_writer_failure(self, generation: _WorkerGeneration) -> None:
+        active: FunasrResidentSession | None = None
+        with self._lock:
+            if self._generation is not generation or generation.terminal:
+                return
+            generation.terminal = True
+            self._last_error = "worker_stdin_write_failed"
+            active = self._active_session
+            self._active_session = None
+            try:
+                generation.write_queue.put_nowait(None)
+            except queue.Full:
+                pass
+        if active is not None:
+            active._fail("FunASR resident worker stdin write failed")
+        self._terminate_process(generation.process)
 
     def _reader_loop(self, generation: _WorkerGeneration) -> None:
         process = generation.process
@@ -578,11 +1050,9 @@ class _FunasrResidentWorkerSlot:
             if self._active_session is session:
                 self._active_session = None
             self._terminate_process(generation.process)
-            if not self._shutdown:
-                try:
-                    self._start_generation_locked(generation.number + 1)
-                except Exception:
-                    pass
+            # Leave the dead generation attached to this slot. The next
+            # explicit create_session call starts a replacement lazily; abort
+            # itself must not create a second process behind the user's back.
 
     def _join_and_reap(self, generation: _WorkerGeneration) -> None:
         writer = generation.writer

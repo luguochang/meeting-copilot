@@ -28,6 +28,11 @@ _FILE_CHUNK_MIN_SAMPLES = 20 * 16_000
 _FILE_CHUNK_MAX_SAMPLES = 30 * 16_000
 _FILE_CHUNK_SEARCH_STEP_SAMPLES = 1_600
 _FILE_CHUNK_ENERGY_WINDOW_SAMPLES = 3_200
+DEFAULT_REFINER_IDLE_UNLOAD_SECONDS = 120.0
+REALTIME_REFINER_POLICY_ENV = "MEETING_COPILOT_REALTIME_REFINER_POLICY"
+DEFAULT_REALTIME_REFINER_POLICY = "online_only"
+REALTIME_REFINER_POLICY_MODES = frozenset({"online_only", "on_demand", "prewarm"})
+ONLINE_ONLY_REFINEMENT_REASON = "offline_refinement_bypassed_by_resource_policy"
 
 
 @dataclass(frozen=True)
@@ -42,15 +47,59 @@ class RefinementResult:
         return self.status == "refined" and bool(self.text.strip())
 
 
+def realtime_refiner_policy(
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Resolve the realtime-only resource policy without changing file ASR."""
+
+    effective_env = os.environ if environ is None else environ
+    configured_value = str(effective_env.get(REALTIME_REFINER_POLICY_ENV) or "").strip()
+    normalized = configured_value.casefold().replace("-", "_")
+    if not normalized:
+        mode = DEFAULT_REALTIME_REFINER_POLICY
+        source = "default_resource_guard"
+        warning = None
+    elif normalized in REALTIME_REFINER_POLICY_MODES:
+        mode = normalized
+        source = "environment"
+        warning = (
+            "offline_refiner_cold_start_deferred_to_first_final"
+            if mode == "on_demand"
+            else None
+        )
+    else:
+        mode = DEFAULT_REALTIME_REFINER_POLICY
+        source = "invalid_environment_fallback"
+        warning = "invalid_realtime_refiner_policy_fell_back_to_online_only"
+    return {
+        "schema_version": "realtime_refiner_policy.v1",
+        "mode": mode,
+        "source": source,
+        "environment_variable": REALTIME_REFINER_POLICY_ENV,
+        "configured_value": configured_value or None,
+        "realtime_refinement_enabled": mode != "online_only",
+        "prewarm_enabled": mode == "prewarm",
+        "cold_start_deferred": mode == "on_demand",
+        "degradation_reason": (
+            ONLINE_ONLY_REFINEMENT_REASON if mode == "online_only" else None
+        ),
+        "warning": warning,
+    }
+
+
 def _path_env(
     *names: str,
     environ: Mapping[str, str] | None = None,
+    preserve_symlink: bool = False,
 ) -> Path | None:
     effective_env = os.environ if environ is None else environ
     for name in names:
         value = str(effective_env.get(name) or "").strip()
         if value:
-            return Path(value).expanduser().resolve(strict=False)
+            path = Path(value).expanduser()
+            if preserve_symlink:
+                return Path(os.path.abspath(path))
+            return path.resolve(strict=False)
     return None
 
 
@@ -67,8 +116,13 @@ def _configured_components(
         expected_kind: str,
         mirrored_fields: tuple[tuple[str, ...], ...],
         default: Path | None = None,
+        preserve_symlink: bool = False,
     ) -> Path | None:
-        configured = _path_env(*env_names, environ=effective_env)
+        configured = _path_env(
+            *env_names,
+            environ=effective_env,
+            preserve_symlink=preserve_symlink,
+        )
         if configured is not None:
             return configured
         if not manifest.configured:
@@ -88,6 +142,7 @@ def _configured_components(
             ("runtimes", "funasr", "venv_executable"),
             ("file_asr", "runtime", "executable"),
         ),
+        preserve_symlink=True,
     )
     worker = component(
         ("MEETING_COPILOT_REALTIME_REFINER_WORKER",),
@@ -138,6 +193,7 @@ def _component_missing(name: str, path: Path | None) -> bool:
 
 
 def refinement_capability() -> dict[str, Any]:
+    policy = realtime_refiner_policy()
     python, worker, model, vad, punc = _configured_components()
     missing = [
         name
@@ -157,6 +213,7 @@ def refinement_capability() -> dict[str, Any]:
         "process_resident": True,
         "remote_asr_used": False,
         "model_download_performed": False,
+        "realtime_policy": policy,
     }
 
 
@@ -222,8 +279,91 @@ class _ResidentOfflineRefiner:
         self._ready = threading.Event()
         self._responses: queue.Queue[dict[str, Any]] = queue.Queue()
         self._ready_metadata: dict[str, Any] = {}
+        self._idle_timer: threading.Timer | None = None
+        self._last_activity_monotonic: float | None = None
+        self._idle_unload_count = 0
+        self._last_stop_reason: str | None = None
+        self._active_meeting_leases: set[str] = set()
         self.process_start_count = 0
         self.completed_request_count = 0
+
+    @staticmethod
+    def _idle_unload_seconds() -> float | None:
+        raw = str(
+            os.environ.get("MEETING_COPILOT_REALTIME_REFINER_IDLE_UNLOAD_SECONDS")
+            or DEFAULT_REFINER_IDLE_UNLOAD_SECONDS
+        ).strip()
+        if raw.casefold() in {"0", "false", "no", "off", "disabled"}:
+            return None
+        try:
+            seconds = float(raw)
+        except ValueError:
+            return DEFAULT_REFINER_IDLE_UNLOAD_SECONDS
+        if not math.isfinite(seconds) or seconds <= 0:
+            return DEFAULT_REFINER_IDLE_UNLOAD_SECONDS
+        return max(0.01, seconds)
+
+    def _cancel_idle_timer_locked(self) -> None:
+        timer = self._idle_timer
+        self._idle_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def _schedule_idle_unload_locked(self, *, delay_seconds: float | None = None) -> None:
+        self._cancel_idle_timer_locked()
+        seconds = self._idle_unload_seconds() if delay_seconds is None else delay_seconds
+        running = self._process is not None and self._process.poll() is None
+        if (
+            seconds is None
+            or not running
+            or not self._ready_metadata
+            or self._active_meeting_leases
+        ):
+            return
+        self._last_activity_monotonic = time.monotonic()
+        timer = threading.Timer(seconds, self._idle_unload_if_due)
+        timer.daemon = True
+        timer.name = "funasr-offline-refiner-idle-unload"
+        self._idle_timer = timer
+        timer.start()
+
+    def _idle_unload_if_due(self) -> None:
+        with self._lock:
+            self._idle_timer = None
+            seconds = self._idle_unload_seconds()
+            running = self._process is not None and self._process.poll() is None
+            if seconds is None or not running or self._active_meeting_leases:
+                return
+            last_activity = self._last_activity_monotonic
+            remaining = (
+                seconds
+                if last_activity is None
+                else (last_activity + seconds) - time.monotonic()
+            )
+            if remaining > 0.005:
+                self._schedule_idle_unload_locked(delay_seconds=remaining)
+                return
+            self._idle_unload_count += 1
+            self._stop_locked(reason="idle_timeout")
+
+    def retain_for_meeting(self, meeting_id: str) -> None:
+        """Prevent idle unload while one live meeting can still need refinement."""
+
+        normalized = str(meeting_id or "").strip()
+        if not normalized:
+            raise ValueError("meeting_id is required")
+        with self._lock:
+            self._active_meeting_leases.add(normalized)
+            self._cancel_idle_timer_locked()
+
+    def release_for_meeting(self, meeting_id: str) -> None:
+        normalized = str(meeting_id or "").strip()
+        if not normalized:
+            raise ValueError("meeting_id is required")
+        with self._lock:
+            self._active_meeting_leases.discard(normalized)
+            if not self._active_meeting_leases:
+                self._schedule_idle_unload_locked()
 
     def _command(self) -> list[str]:
         python, worker, model, vad, punc = self.components
@@ -261,7 +401,7 @@ class _ResidentOfflineRefiner:
         with self._lock:
             if self._process is not None and self._process.poll() is None and self._ready_metadata:
                 return True
-            self._stop_locked()
+            self._stop_locked(reason="restart")
             self._ready.clear()
             self._ready_metadata = {}
             self._responses = queue.Queue()
@@ -280,6 +420,7 @@ class _ResidentOfflineRefiner:
             except OSError:
                 self._process = None
                 return False
+            self._last_stop_reason = None
             self.process_start_count += 1
             self._reader = threading.Thread(
                 target=self._read_stdout,
@@ -289,63 +430,91 @@ class _ResidentOfflineRefiner:
             )
             self._reader.start()
         if not self._ready.wait(timeout_s):
-            self.shutdown()
+            with self._lock:
+                self._stop_locked(
+                    reason="worker_start_timeout",
+                    graceful_timeout_s=min(0.05, max(0.0, timeout_s)),
+                )
             return False
         with self._lock:
-            return bool(
+            ready = bool(
                 self._process is not None
                 and self._process.poll() is None
                 and self._ready_metadata
             )
+            if ready:
+                self._schedule_idle_unload_locked()
+            return ready
 
     def refine(self, pcm16: bytes, *, timeout_s: float) -> RefinementResult:
         with self._lock:
-            startup_timeout = max(1.0, float(os.environ.get("MEETING_COPILOT_REALTIME_REFINER_PREWARM_TIMEOUT_SECONDS") or 60.0))
+            request_budget = max(0.01, float(timeout_s))
+            deadline = time.monotonic() + request_budget
+            try:
+                configured_startup_timeout = float(
+                    os.environ.get("MEETING_COPILOT_REALTIME_REFINER_PREWARM_TIMEOUT_SECONDS")
+                    or 60.0
+                )
+            except (TypeError, ValueError):
+                configured_startup_timeout = 60.0
+            startup_timeout = min(
+                max(0.01, configured_startup_timeout),
+                request_budget,
+            )
             if not self.start(timeout_s=startup_timeout):
                 return RefinementResult(text="", status="failed", reason="offline_worker_not_ready")
-            process = self._process
-            assert process is not None and process.stdin is not None
-            request_id = uuid.uuid4().hex
-            request = {
-                "command": "refine",
-                "request_id": request_id,
-                "sample_rate": 16_000,
-                "pcm16_base64": base64.b64encode(pcm16).decode("ascii"),
-            }
+            self._cancel_idle_timer_locked()
             try:
-                process.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
-                process.stdin.flush()
-            except (OSError, ValueError):
-                self._stop_locked()
-                return RefinementResult(text="", status="failed", reason="offline_worker_write_failed")
-            deadline = time.monotonic() + timeout_s
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    self._stop_locked()
-                    return RefinementResult(text="", status="failed", reason="offline_worker_timeout")
+                process = self._process
+                assert process is not None and process.stdin is not None
+                request_id = uuid.uuid4().hex
+                request = {
+                    "command": "refine",
+                    "request_id": request_id,
+                    "sample_rate": 16_000,
+                    "pcm16_base64": base64.b64encode(pcm16).decode("ascii"),
+                }
                 try:
-                    response = self._responses.get(timeout=remaining)
-                except queue.Empty:
-                    self._stop_locked()
-                    return RefinementResult(text="", status="failed", reason="offline_worker_timeout")
-                if response.get("event_type") == "worker_exit":
-                    self._stop_locked()
-                    return RefinementResult(text="", status="failed", reason="offline_worker_exited")
-                if response.get("request_id") != request_id:
-                    continue
-                self.completed_request_count += 1
-                if response.get("status") != "ok":
-                    return RefinementResult(text="", status="failed", reason="offline_worker_failed")
-                text = str(response.get("text") or "").strip()
-                model_id = str(response.get("model_id") or self.components[2].name)
-                if not text:
-                    return RefinementResult(text="", status="empty", model_id=model_id, reason="offline_text_empty")
-                return RefinementResult(text=text, status="refined", model_id=model_id)
+                    process.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
+                    process.stdin.flush()
+                except (OSError, ValueError):
+                    self._stop_locked(reason="worker_write_failed")
+                    return RefinementResult(text="", status="failed", reason="offline_worker_write_failed")
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self._stop_locked(reason="worker_timeout")
+                        return RefinementResult(text="", status="failed", reason="offline_worker_timeout")
+                    try:
+                        response = self._responses.get(timeout=remaining)
+                    except queue.Empty:
+                        self._stop_locked(reason="worker_timeout")
+                        return RefinementResult(text="", status="failed", reason="offline_worker_timeout")
+                    if response.get("event_type") == "worker_exit":
+                        self._stop_locked(reason="worker_exit")
+                        return RefinementResult(text="", status="failed", reason="offline_worker_exited")
+                    if response.get("request_id") != request_id:
+                        continue
+                    self.completed_request_count += 1
+                    if response.get("status") != "ok":
+                        return RefinementResult(text="", status="failed", reason="offline_worker_failed")
+                    text = str(response.get("text") or "").strip()
+                    model_id = str(response.get("model_id") or self.components[2].name)
+                    if not text:
+                        return RefinementResult(text="", status="empty", model_id=model_id, reason="offline_text_empty")
+                    return RefinementResult(text=text, status="refined", model_id=model_id)
+            finally:
+                self._schedule_idle_unload_locked()
 
     def status(self) -> dict[str, Any]:
         with self._lock:
             running = self._process is not None and self._process.poll() is None
+            idle_seconds = self._idle_unload_seconds()
+            idle_age = (
+                max(0.0, time.monotonic() - self._last_activity_monotonic)
+                if self._last_activity_monotonic is not None
+                else None
+            )
             return {
                 "spawned": self._process is not None,
                 "process_running": running,
@@ -353,13 +522,29 @@ class _ResidentOfflineRefiner:
                 "pid": self._process.pid if running and self._process is not None else None,
                 "process_start_count": self.process_start_count,
                 "completed_request_count": self.completed_request_count,
+                "idle_unload_seconds": idle_seconds,
+                "idle_age_seconds": round(idle_age, 3) if idle_age is not None else None,
+                "idle_unload_scheduled": self._idle_timer is not None,
+                "idle_unload_count": self._idle_unload_count,
+                "active_meeting_lease_count": len(self._active_meeting_leases),
+                "idle_unload_blocked_by_active_meeting": bool(
+                    self._active_meeting_leases
+                ),
+                "last_stop_reason": self._last_stop_reason,
                 **self._ready_metadata,
             }
 
-    def _stop_locked(self) -> None:
+    def _stop_locked(
+        self,
+        *,
+        reason: str,
+        graceful_timeout_s: float = 2.0,
+    ) -> None:
+        self._cancel_idle_timer_locked()
         process = self._process
         self._process = None
         self._ready_metadata = {}
+        self._last_stop_reason = reason
         if process is None:
             return
         if process.poll() is None:
@@ -367,18 +552,18 @@ class _ResidentOfflineRefiner:
                 assert process.stdin is not None
                 process.stdin.write('{"command":"shutdown"}\n')
                 process.stdin.flush()
-                process.wait(timeout=2.0)
+                process.wait(timeout=max(0.0, graceful_timeout_s))
             except (OSError, ValueError, subprocess.TimeoutExpired):
                 process.terminate()
                 try:
-                    process.wait(timeout=2.0)
+                    process.wait(timeout=min(0.5, max(0.0, graceful_timeout_s)))
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=2.0)
 
     def shutdown(self) -> None:
         with self._lock:
-            self._stop_locked()
+            self._stop_locked(reason="shutdown")
 
 
 _REFINER_LOCK = threading.Lock()
@@ -388,7 +573,11 @@ _REFINER: _ResidentOfflineRefiner | None = None
 def _get_resident_refiner() -> _ResidentOfflineRefiner:
     global _REFINER
     components = _configured_components()
-    assert all(path is not None for path in components)
+    if any(path is None for path in components):
+        # Capability checks normally guard this path, but startup/prewarm can
+        # be raced or deliberately stubbed in tests. Do not turn a missing
+        # optional local runtime into an application-wide AssertionError.
+        raise RuntimeError("offline_refinement_components_missing")
     typed_components = tuple(components)
     with _REFINER_LOCK:
         if _REFINER is None or _REFINER.components != typed_components:
@@ -399,23 +588,64 @@ def _get_resident_refiner() -> _ResidentOfflineRefiner:
 
 
 def prewarm_refiner_worker() -> bool:
+    if not realtime_refiner_policy()["prewarm_enabled"]:
+        return False
     if refinement_capability()["status"] != "ready":
+        return False
+    # Keep prewarm defensive when capability reporting is supplied by a
+    # feature flag, a test double, or a stale runtime manifest. The actual
+    # refinement call still returns a structured unavailable result.
+    components = _configured_components()
+    if any(path is None for path in components):
         return False
     timeout_s = max(1.0, float(os.environ.get("MEETING_COPILOT_REALTIME_REFINER_PREWARM_TIMEOUT_SECONDS") or 60.0))
     return _get_resident_refiner().start(timeout_s=timeout_s)
 
 
+def retain_refiner_for_meeting(meeting_id: str) -> bool:
+    """Hold the resident model for the lifetime of a live meeting stream."""
+
+    if not realtime_refiner_policy()["realtime_refinement_enabled"]:
+        return False
+    if refinement_capability()["status"] != "ready":
+        return False
+    try:
+        resident = _get_resident_refiner()
+    except RuntimeError:
+        return False
+    resident.retain_for_meeting(meeting_id)
+    return True
+
+
+def release_refiner_for_meeting(meeting_id: str) -> None:
+    """Release a meeting lease without creating or starting a worker."""
+
+    with _REFINER_LOCK:
+        resident = _REFINER
+    if resident is not None:
+        resident.release_for_meeting(meeting_id)
+
+
 def refiner_worker_status() -> dict[str, Any]:
+    policy = realtime_refiner_policy()
     with _REFINER_LOCK:
         worker = _REFINER
-    return worker.status() if worker is not None else {
+    status = worker.status() if worker is not None else {
         "spawned": False,
         "process_running": False,
         "process_ready": False,
         "pid": None,
         "process_start_count": 0,
         "completed_request_count": 0,
+        "idle_unload_seconds": _ResidentOfflineRefiner._idle_unload_seconds(),
+        "idle_age_seconds": None,
+        "idle_unload_scheduled": False,
+        "idle_unload_count": 0,
+        "active_meeting_lease_count": 0,
+        "idle_unload_blocked_by_active_meeting": False,
+        "last_stop_reason": None,
     }
+    return {**status, "realtime_policy": policy}
 
 
 def shutdown_refiner_worker() -> None:
@@ -446,6 +676,13 @@ def refine_pcm_f32(payload: bytes, *, timeout_s: float = 30.0) -> RefinementResu
         pcm16 = _pcm_f32_to_pcm16(payload)
     except ValueError as exc:
         return RefinementResult(text="", status="invalid_audio", reason=str(exc))
+    policy = realtime_refiner_policy()
+    if not policy["realtime_refinement_enabled"]:
+        return RefinementResult(
+            text="",
+            status="bypassed",
+            reason=str(policy["degradation_reason"]),
+        )
     capability = refinement_capability()
     if capability["status"] != "ready":
         return RefinementResult(
@@ -507,6 +744,19 @@ def _join_refined_file_chunks(parts: list[str]) -> str:
     return joined
 
 
+def _pcm16_is_exact_silence(pcm16: bytes) -> bool:
+    """Identify a chunk that contains no PCM signal at all.
+
+    File refinement may split a recording at a long trailing silence. An empty
+    FunASR result for that final all-zero chunk is a valid no-op, while an
+    empty result for non-silent audio must remain fail-closed.
+    """
+
+    if not pcm16 or len(pcm16) % 2:
+        return False
+    return not any(memoryview(pcm16).cast("h"))
+
+
 def refine_wav_file(audio_path: Path, *, timeout_s: float = 180.0) -> RefinementResult:
     """Transcribe one normalized 16 kHz mono PCM WAV with the resident model."""
     try:
@@ -550,6 +800,12 @@ def refine_wav_file(audio_path: Path, *, timeout_s: float = 180.0) -> Refinement
         result = resident.refine(chunk, timeout_s=remaining)
         model_id = result.model_id or model_id
         if not result.authoritative:
+            if (
+                index == len(chunks)
+                and result.reason == "offline_text_empty"
+                and _pcm16_is_exact_silence(chunk)
+            ):
+                continue
             return RefinementResult(
                 text="",
                 status=result.status,

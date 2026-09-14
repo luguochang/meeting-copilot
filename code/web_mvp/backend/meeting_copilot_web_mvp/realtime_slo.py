@@ -12,11 +12,21 @@ import tempfile
 from threading import RLock
 from typing import Any
 
-from .pipeline_trace import PIPELINE_STAGES
+from .pipeline_trace import (
+    PIPELINE_STAGES,
+    PROVENANCE_ACCOUNTED_STATUSES,
+    PROVENANCE_STATUSES,
+    PROVIDER_ATTEMPT_OUTCOMES,
+    REQUIRED_PROVENANCE_STAGES,
+    RESULT_OUTCOMES,
+    TERMINAL_OUTCOMES,
+    TIMING_CONTRACT_STATUSES,
+)
 
 
-SCHEMA_VERSION = "meeting_copilot.realtime_ai_slo.v1"
-STORE_SCHEMA_VERSION = "meeting_copilot.realtime_ai_slo_store.v1"
+SCHEMA_VERSION = "meeting_copilot.realtime_ai_slo.v2"
+STORE_SCHEMA_VERSION = "meeting_copilot.realtime_ai_slo_store.v2"
+LEGACY_STORE_SCHEMA_VERSIONS = frozenset({"meeting_copilot.realtime_ai_slo_store.v1"})
 DEFAULT_MAX_SAMPLES_PER_METRIC = 2_048
 DEFAULT_MAX_MEETINGS = 256
 DEFAULT_MAX_CHECKPOINT_TRACES = 2_048
@@ -83,6 +93,121 @@ def _non_negative_int(value: Any, field: str) -> int:
     return value
 
 
+def _optional_non_negative_int(value: Any, field: str) -> int | None:
+    if value is None:
+        return None
+    return _non_negative_int(value, field)
+
+
+def _bounded_token(value: Any, field: str, *, max_length: int = 120) -> str:
+    normalized = _required(value, field)
+    if len(normalized) > max_length:
+        raise ValueError(f"{field} must not exceed {max_length} characters")
+    if not all(character.isalnum() or character in "._:-" for character in normalized):
+        raise ValueError(f"{field} must be a content-free identifier")
+    return normalized
+
+
+def _optional_bool(value: Any, field: str) -> bool | None:
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise TypeError(f"{field} must be a boolean")
+    return value
+
+
+def _normalized_provenance(
+    raw_provenance: Any,
+) -> tuple[dict[str, dict[str, Any]] | None, dict[str, Any] | None]:
+    """Normalize the content-free provenance extension.
+
+    ``None`` means the trace predates the extension and keeps legacy SLO
+    semantics.  Once the key is present, omitted required stages are treated
+    as ``not_observed`` so a telemetry gap cannot silently become success.
+    """
+
+    if raw_provenance is None:
+        return None, None
+    if not isinstance(raw_provenance, Mapping):
+        raise TypeError("trace provenance must be a mapping")
+    provenance: dict[str, dict[str, Any]] = {}
+    for raw_stage, raw_entry in raw_provenance.items():
+        stage = _bounded_token(raw_stage, "provenance stage")
+        if stage not in REQUIRED_PROVENANCE_STAGES:
+            raise ValueError(f"unsupported provenance stage: {stage!r}")
+        if not isinstance(raw_entry, Mapping):
+            raise TypeError("provenance stage must be a mapping")
+        status = _bounded_token(raw_entry.get("status"), "provenance status")
+        if status not in PROVENANCE_STATUSES:
+            raise ValueError(f"unsupported provenance status: {status!r}")
+        reason = (
+            _bounded_token(raw_entry.get("reason"), "provenance reason")
+            if raw_entry.get("reason") is not None
+            else None
+        )
+        at_monotonic_ns = _optional_non_negative_int(
+            raw_entry.get("at_monotonic_ns"),
+            "provenance at_monotonic_ns",
+        )
+        raw_attributes = raw_entry.get("attributes", {})
+        if raw_attributes is None:
+            raw_attributes = {}
+        if not isinstance(raw_attributes, Mapping):
+            raise TypeError("provenance attributes must be a mapping")
+        # Validate and retain only bounded scalar values.  This mirrors the
+        # writer-side allowlist and ensures an imported snapshot cannot inject
+        # transcript content or arbitrary nested data into diagnostics.
+        attributes: dict[str, Any] = {}
+        for raw_key, raw_value in raw_attributes.items():
+            key = _bounded_token(raw_key, "provenance attribute key")
+            if raw_value is None or isinstance(raw_value, bool):
+                attributes[key] = raw_value
+            elif isinstance(raw_value, int) and not isinstance(raw_value, bool):
+                if raw_value < 0:
+                    raise ValueError("provenance integer attributes must be non-negative")
+                attributes[key] = raw_value
+            elif isinstance(raw_value, float):
+                if not math.isfinite(raw_value) or raw_value < 0:
+                    raise ValueError("provenance numeric attributes must be finite and non-negative")
+                attributes[key] = round(raw_value, 6)
+            elif isinstance(raw_value, str):
+                attributes[key] = _bounded_token(raw_value, "provenance attribute value")
+            else:
+                raise TypeError("provenance attributes must be scalar")
+        provenance[stage] = {
+            "status": status,
+            "reason": reason,
+            "at_monotonic_ns": at_monotonic_ns,
+            "attributes": attributes,
+        }
+
+    statuses = {
+        stage: str(provenance.get(stage, {}).get("status") or "not_observed")
+        for stage in REQUIRED_PROVENANCE_STAGES
+    }
+    missing = [stage for stage, status in statuses.items() if status == "not_observed"]
+    failed = [stage for stage, status in statuses.items() if status == "failed"]
+    unavailable = [stage for stage, status in statuses.items() if status == "unavailable"]
+    not_required = [stage for stage, status in statuses.items() if status == "not_required"]
+    observed = [stage for stage, status in statuses.items() if status == "observed"]
+    required_count = len(REQUIRED_PROVENANCE_STAGES)
+    accounted_count = sum(
+        1 for status in statuses.values() if status in PROVENANCE_ACCOUNTED_STATUSES
+    )
+    completeness = {
+        "required_count": required_count,
+        "observed_count": len(observed),
+        "accounted_count": accounted_count,
+        "completeness_ratio": round(accounted_count / required_count, 6),
+        "complete": not missing,
+        "missing_stages": missing,
+        "failed_stages": failed,
+        "unavailable_stages": unavailable,
+        "not_required_stages": not_required,
+    }
+    return provenance, completeness
+
+
 def _milliseconds(duration_ns: int) -> float:
     return round(duration_ns / 1_000_000, 6)
 
@@ -99,6 +224,58 @@ def _percentile(values: Iterable[float], quantile: float) -> float | None:
     fraction = rank - lower
     interpolated = ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
     return round(float(interpolated), 6)
+
+
+def _outcome_rates(
+    counts: Mapping[str, int],
+    denominator: int,
+) -> dict[str, float | None]:
+    """Return bounded per-outcome rates without turning an empty sample into 0."""
+
+    if denominator <= 0:
+        return {str(outcome): None for outcome in counts}
+    return {
+        str(outcome): round(float(count) / float(denominator), 6)
+        for outcome, count in counts.items()
+    }
+
+
+def _named_outcome_rates(
+    counts: Mapping[str, int],
+    denominator: int,
+    *,
+    incomplete_count: int = 0,
+) -> dict[str, Any]:
+    """Expose stable rate aliases alongside the complete outcome map.
+
+    The denominator is always the corresponding request/attempt count.  For
+    attempts this means an unfinished attempt is still part of the failure
+    rate, with its own explicit ``incomplete_rate`` field.
+    """
+
+    rates = _outcome_rates(counts, denominator)
+    if denominator <= 0:
+        success_rate = failure_rate = None
+        incomplete_rate = None
+    else:
+        success_count = int(counts.get("success", 0))
+        success_rate = round(float(success_count) / float(denominator), 6)
+        failure_rate = round(
+            float(max(0, denominator - success_count)) / float(denominator),
+            6,
+        )
+        incomplete_rate = round(float(incomplete_count) / float(denominator), 6)
+    return {
+        "rates": rates,
+        "success_rate": success_rate,
+        "failure_rate": failure_rate,
+        "timeout_rate": rates.get("timeout"),
+        "rate_limit_rate": rates.get("rate_limit"),
+        "provider_5xx_rate": rates.get("provider_5xx"),
+        "transport_error_rate": rates.get("transport_error"),
+        "cancelled_rate": rates.get("cancelled"),
+        "incomplete_rate": incomplete_rate,
+    }
 
 
 def _normalized_trace(trace: Any) -> dict[str, Any]:
@@ -135,6 +312,7 @@ def _normalized_trace(trace: Any) -> dict[str, Any]:
     cancelled = trace.get("cancelled", False)
     if not isinstance(cancelled, bool):
         raise TypeError("cancelled must be a boolean")
+    execution = _normalized_execution(trace.get("execution"), stages=stages, cancelled=cancelled)
     return {
         "trace_id": trace_id,
         "meeting_id": meeting_id,
@@ -142,6 +320,219 @@ def _normalized_trace(trace: Any) -> dict[str, Any]:
         "stages": stages,
         "retry_count": retry_count,
         "cancelled": cancelled,
+        "execution": execution,
+    }
+
+
+def _normalized_execution(
+    raw_execution: Any,
+    *,
+    stages: Mapping[str, int],
+    cancelled: bool,
+) -> dict[str, Any]:
+    if raw_execution is None:
+        raw_execution = {}
+    if not isinstance(raw_execution, Mapping):
+        raise TypeError("trace execution must be a mapping")
+
+    raw_route = raw_execution.get("route")
+    route: dict[str, Any] | None = None
+    if raw_route is not None:
+        if not isinstance(raw_route, Mapping):
+            raise TypeError("trace route must be a mapping")
+        route = {
+            "name": _bounded_token(raw_route.get("name"), "route name"),
+            "candidate_outcome": (
+                _bounded_token(raw_route.get("candidate_outcome"), "candidate outcome")
+                if raw_route.get("candidate_outcome") is not None
+                else None
+            ),
+            "circuit_outcome": (
+                _bounded_token(raw_route.get("circuit_outcome"), "circuit outcome")
+                if raw_route.get("circuit_outcome") is not None
+                else None
+            ),
+        }
+
+    raw_attempts = raw_execution.get("provider_attempts", [])
+    if not isinstance(raw_attempts, list):
+        raise TypeError("provider_attempts must be a list")
+    attempts: list[dict[str, Any]] = []
+    seen_attempts: set[int] = set()
+    for raw_attempt in raw_attempts:
+        if not isinstance(raw_attempt, Mapping):
+            raise TypeError("Provider attempt must be a mapping")
+        attempt_index = _non_negative_int(raw_attempt.get("attempt_index"), "attempt_index")
+        if attempt_index <= 0:
+            raise ValueError("attempt_index must be positive")
+        if attempt_index in seen_attempts:
+            raise ValueError("Provider attempt indexes must be unique")
+        seen_attempts.add(attempt_index)
+        raw_outcome = raw_attempt.get("outcome")
+        outcome = None
+        if raw_outcome is not None:
+            outcome = _bounded_token(raw_outcome, "Provider attempt outcome")
+            if outcome not in PROVIDER_ATTEMPT_OUTCOMES:
+                raise ValueError(f"unsupported Provider attempt outcome: {outcome!r}")
+        raw_status = raw_attempt.get("http_status")
+        http_status = _optional_non_negative_int(raw_status, "Provider HTTP status")
+        if http_status is not None and not 100 <= http_status <= 599:
+            raise ValueError("Provider HTTP status must be between 100 and 599")
+        attempts.append(
+            {
+                "attempt_index": attempt_index,
+                "branch": _bounded_token(raw_attempt.get("branch") or "unknown", "attempt branch"),
+                "runtime": (
+                    _bounded_token(raw_attempt.get("runtime"), "attempt runtime")
+                    if raw_attempt.get("runtime") is not None
+                    else None
+                ),
+                "outcome": outcome,
+                "http_status": http_status,
+                "error_class": (
+                    _bounded_token(raw_attempt.get("error_class"), "attempt error class")
+                    if raw_attempt.get("error_class") is not None
+                    else None
+                ),
+            }
+        )
+    attempts.sort(key=lambda item: item["attempt_index"])
+
+    raw_terminal = raw_execution.get("terminal")
+    terminal: dict[str, Any] | None = None
+    if raw_terminal is not None:
+        if not isinstance(raw_terminal, Mapping):
+            raise TypeError("trace terminal must be a mapping")
+        outcome = _bounded_token(raw_terminal.get("outcome"), "terminal outcome")
+        if outcome not in TERMINAL_OUTCOMES:
+            raise ValueError(f"unsupported terminal outcome: {outcome!r}")
+        raw_result = raw_terminal.get("result_outcome")
+        result_outcome = None
+        if raw_result is not None:
+            result_outcome = _bounded_token(raw_result, "result outcome")
+            if result_outcome not in RESULT_OUTCOMES:
+                raise ValueError(f"unsupported result outcome: {result_outcome!r}")
+        raw_terminal_status = raw_terminal.get("http_status")
+        terminal_status = _optional_non_negative_int(
+            raw_terminal_status,
+            "terminal HTTP status",
+        )
+        if terminal_status is not None and not 100 <= terminal_status <= 599:
+            raise ValueError("terminal HTTP status must be between 100 and 599")
+        terminal = {
+            "outcome": outcome,
+            # A terminal failure without a separate result taxonomy is still
+            # a failed request and must enter the availability denominator.
+            "result_outcome": result_outcome
+            or (
+                outcome
+                if outcome in RESULT_OUTCOMES
+                else "cancelled"
+                if outcome in {"cancelled", "superseded"}
+                else None
+            ),
+            "error_class": (
+                _bounded_token(raw_terminal.get("error_class"), "terminal error class")
+                if raw_terminal.get("error_class") is not None
+                else None
+            ),
+            "http_status": terminal_status,
+        }
+
+    raw_cancellation = raw_execution.get("cancellation")
+    cancellation: dict[str, Any] | None = None
+    if raw_cancellation is not None:
+        if not isinstance(raw_cancellation, Mapping):
+            raise TypeError("trace cancellation must be a mapping")
+        cancellation = {
+            "requested": bool(raw_cancellation.get("requested", False)),
+            "local_abort_ack": _optional_bool(
+                raw_cancellation.get("local_abort_ack"),
+                "local_abort_ack",
+            ),
+            "remote_abort_ack": _optional_bool(
+                raw_cancellation.get("remote_abort_ack"),
+                "remote_abort_ack",
+            ),
+            "remote_ack_unavailable": _optional_bool(
+                raw_cancellation.get("remote_ack_unavailable"),
+                "remote_ack_unavailable",
+            ),
+        }
+        if cancellation["remote_abort_ack"] and cancellation["remote_ack_unavailable"]:
+            raise ValueError(
+                "remote abort acknowledgement and unavailable are mutually exclusive"
+            )
+
+    provenance, required_stage_completeness = _normalized_provenance(
+        raw_execution.get("provenance")
+    )
+
+    raw_timing = raw_execution.get("timing_contract")
+    timing_contract: dict[str, Any] | None = None
+    if raw_timing is not None:
+        if not isinstance(raw_timing, Mapping):
+            raise TypeError("timing_contract must be a mapping")
+        status = _bounded_token(raw_timing.get("status"), "timing contract status")
+        if status not in TIMING_CONTRACT_STATUSES:
+            raise ValueError(f"unsupported timing contract status: {status!r}")
+        raw_reasons = raw_timing.get("invalid_reasons", [])
+        if not isinstance(raw_reasons, list):
+            raise TypeError("timing invalid_reasons must be a list")
+        timing_contract = {
+            "status": status,
+            "source_clock": (
+                _bounded_token(raw_timing.get("source_clock"), "timing source clock")
+                if raw_timing.get("source_clock") is not None
+                else None
+            ),
+            "invalid_reasons": [
+                _bounded_token(reason, "timing invalid reason") for reason in raw_reasons
+            ],
+        }
+
+    # Old snapshots predate execution outcomes. A cancellation flag does not
+    # distinguish deadline, supersession, user cancellation, or shutdown, so
+    # keep it as an unclassified counter. Only infer success when both Provider
+    # completion and durable event projection were already observed.
+    if terminal is None and {"provider_completed", "event_emitted"} <= set(stages):
+        terminal = {"outcome": "success", "result_outcome": "success"}
+    if not attempts and {"provider_connected", "provider_completed"} <= set(stages):
+        attempts = [
+            {
+                "attempt_index": 1,
+                "branch": "legacy",
+                "runtime": None,
+                "outcome": "success",
+                "http_status": None,
+                "error_class": None,
+            }
+        ]
+    if timing_contract is None:
+        observed_provider_stages = set(stages).intersection(
+            {"provider_connected", "first_token", "provider_completed"}
+        )
+        if len(observed_provider_stages) == 3:
+            timing_contract = {
+                "status": "complete",
+                "source_clock": "legacy_monotonic_ns",
+                "invalid_reasons": [],
+            }
+        elif observed_provider_stages:
+            timing_contract = {
+                "status": "partial",
+                "source_clock": "legacy_monotonic_ns",
+                "invalid_reasons": ["legacy_partial_provider_timing"],
+            }
+
+    return {
+        "route": route,
+        "provider_attempts": attempts,
+        "cancellation": cancellation,
+        "terminal": terminal,
+        "timing_contract": timing_contract,
+        "provenance": provenance,
+        "required_stage_completeness": required_stage_completeness,
     }
 
 
@@ -224,6 +615,29 @@ class _LaneAccumulator:
         self.missing_stage_counts = {stage: 0 for stage in PIPELINE_STAGES}
         self.cancelled_count = 0
         self.retry_count = 0
+        self.job_terminal_count = 0
+        self.job_outcome_counts = {outcome: 0 for outcome in TERMINAL_OUTCOMES}
+        self.result_outcome_counts = {outcome: 0 for outcome in RESULT_OUTCOMES}
+        self.provider_attempt_count = 0
+        self.provider_attempt_outcome_counts = {
+            outcome: 0 for outcome in PROVIDER_ATTEMPT_OUTCOMES
+        }
+        self.provider_attempt_incomplete_count = 0
+        self.timing_contract_counts = {
+            status: 0 for status in TIMING_CONTRACT_STATUSES
+        }
+        self.cancel_ack_required_count = 0
+        self.local_abort_ack_count = 0
+        self.remote_abort_ack_count = 0
+        self.remote_abort_ack_unavailable_count = 0
+        self.required_provenance_trace_count = 0
+        self.required_provenance_complete_count = 0
+        self.required_provenance_incomplete_count = 0
+        self.provenance_stage_counts = {
+            stage: {status: 0 for status in PROVENANCE_STATUSES}
+            for stage in REQUIRED_PROVENANCE_STAGES
+        }
+        self.uncategorized_failure_count = 0
         self.metrics = {metric: _MetricAccumulator(max_samples) for metric in METRIC_STAGE_PAIRS}
 
     def add_trace(self, trace: Mapping[str, Any]) -> None:
@@ -238,6 +652,56 @@ class _LaneAccumulator:
             self.cancelled_count += 1
         self.retry_count += trace["retry_count"]
 
+        execution = trace["execution"]
+        provenance = execution.get("provenance")
+        completeness = execution.get("required_stage_completeness")
+        if provenance is not None:
+            self.required_provenance_trace_count += 1
+            if isinstance(completeness, Mapping) and bool(completeness.get("complete")):
+                self.required_provenance_complete_count += 1
+            else:
+                self.required_provenance_incomplete_count += 1
+            for stage in REQUIRED_PROVENANCE_STAGES:
+                status = (
+                    str((provenance.get(stage) or {}).get("status") or "not_observed")
+                    if isinstance(provenance, Mapping)
+                    else "not_observed"
+                )
+                if status not in PROVENANCE_STATUSES:
+                    status = "not_observed"
+                self.provenance_stage_counts[stage][status] += 1
+
+        terminal = execution.get("terminal")
+        if terminal is not None:
+            self.job_terminal_count += 1
+            self.job_outcome_counts[terminal["outcome"]] += 1
+            result_outcome = terminal.get("result_outcome")
+            if result_outcome is not None:
+                self.result_outcome_counts[result_outcome] += 1
+            if terminal["outcome"] != "success" and not result_outcome:
+                self.uncategorized_failure_count += 1
+        for attempt in execution.get("provider_attempts", []):
+            self.provider_attempt_count += 1
+            attempt_outcome = attempt.get("outcome")
+            if attempt_outcome is None:
+                self.provider_attempt_incomplete_count += 1
+            else:
+                self.provider_attempt_outcome_counts[attempt_outcome] += 1
+                if attempt_outcome != "success" and not attempt.get("error_class"):
+                    self.uncategorized_failure_count += 1
+        timing_contract = execution.get("timing_contract")
+        if timing_contract is not None:
+            self.timing_contract_counts[timing_contract["status"]] += 1
+        cancellation = execution.get("cancellation")
+        if cancellation is not None and cancellation.get("requested"):
+            self.cancel_ack_required_count += 1
+            if cancellation.get("local_abort_ack") is True:
+                self.local_abort_ack_count += 1
+            if cancellation.get("remote_abort_ack") is True:
+                self.remote_abort_ack_count += 1
+            if cancellation.get("remote_ack_unavailable") is True:
+                self.remote_abort_ack_unavailable_count += 1
+
         for metric, (start_stage, end_stage) in METRIC_STAGE_PAIRS.items():
             if start_stage not in stages or end_stage not in stages:
                 continue
@@ -251,8 +715,32 @@ class _LaneAccumulator:
         self.missing_trace_count += other.missing_trace_count
         self.cancelled_count += other.cancelled_count
         self.retry_count += other.retry_count
+        self.job_terminal_count += other.job_terminal_count
+        self.provider_attempt_count += other.provider_attempt_count
+        self.provider_attempt_incomplete_count += other.provider_attempt_incomplete_count
+        self.cancel_ack_required_count += other.cancel_ack_required_count
+        self.local_abort_ack_count += other.local_abort_ack_count
+        self.remote_abort_ack_count += other.remote_abort_ack_count
+        self.remote_abort_ack_unavailable_count += other.remote_abort_ack_unavailable_count
+        self.required_provenance_trace_count += other.required_provenance_trace_count
+        self.required_provenance_complete_count += other.required_provenance_complete_count
+        self.required_provenance_incomplete_count += other.required_provenance_incomplete_count
+        self.uncategorized_failure_count += other.uncategorized_failure_count
+        for outcome in TERMINAL_OUTCOMES:
+            self.job_outcome_counts[outcome] += other.job_outcome_counts[outcome]
+        for outcome in RESULT_OUTCOMES:
+            self.result_outcome_counts[outcome] += other.result_outcome_counts[outcome]
+        for outcome in PROVIDER_ATTEMPT_OUTCOMES:
+            self.provider_attempt_outcome_counts[outcome] += other.provider_attempt_outcome_counts[outcome]
+        for status in TIMING_CONTRACT_STATUSES:
+            self.timing_contract_counts[status] += other.timing_contract_counts[status]
         for stage in PIPELINE_STAGES:
             self.missing_stage_counts[stage] += other.missing_stage_counts[stage]
+        for stage in REQUIRED_PROVENANCE_STAGES:
+            for status in PROVENANCE_STATUSES:
+                self.provenance_stage_counts[stage][status] += (
+                    other.provenance_stage_counts[stage][status]
+                )
         for metric in METRIC_STAGE_PAIRS:
             self.metrics[metric].merge(other.metrics[metric])
 
@@ -263,6 +751,25 @@ class _LaneAccumulator:
             "missing_stage_counts": dict(self.missing_stage_counts),
             "cancelled_count": self.cancelled_count,
             "retry_count": self.retry_count,
+            "job_terminal_count": self.job_terminal_count,
+            "job_outcome_counts": dict(self.job_outcome_counts),
+            "result_outcome_counts": dict(self.result_outcome_counts),
+            "provider_attempt_count": self.provider_attempt_count,
+            "provider_attempt_outcome_counts": dict(self.provider_attempt_outcome_counts),
+            "provider_attempt_incomplete_count": self.provider_attempt_incomplete_count,
+            "timing_contract_counts": dict(self.timing_contract_counts),
+            "cancel_ack_required_count": self.cancel_ack_required_count,
+            "local_abort_ack_count": self.local_abort_ack_count,
+            "remote_abort_ack_count": self.remote_abort_ack_count,
+            "remote_abort_ack_unavailable_count": self.remote_abort_ack_unavailable_count,
+            "required_provenance_trace_count": self.required_provenance_trace_count,
+            "required_provenance_complete_count": self.required_provenance_complete_count,
+            "required_provenance_incomplete_count": self.required_provenance_incomplete_count,
+            "provenance_stage_counts": {
+                stage: dict(counts)
+                for stage, counts in self.provenance_stage_counts.items()
+            },
+            "uncategorized_failure_count": self.uncategorized_failure_count,
             "metrics": {metric: accumulator.to_state() for metric, accumulator in self.metrics.items()},
         }
 
@@ -278,16 +785,103 @@ class _LaneAccumulator:
         )
         lane.cancelled_count = _non_negative_int(value.get("cancelled_count", 0), "cancelled_count")
         lane.retry_count = _non_negative_int(value.get("retry_count", 0), "retry_count")
+        lane.job_terminal_count = _non_negative_int(
+            value.get("job_terminal_count", 0),
+            "job_terminal_count",
+        )
+        lane.provider_attempt_count = _non_negative_int(
+            value.get("provider_attempt_count", 0),
+            "provider_attempt_count",
+        )
+        lane.provider_attempt_incomplete_count = _non_negative_int(
+            value.get("provider_attempt_incomplete_count", 0),
+            "provider_attempt_incomplete_count",
+        )
+        lane.cancel_ack_required_count = _non_negative_int(
+            value.get("cancel_ack_required_count", 0),
+            "cancel_ack_required_count",
+        )
+        lane.local_abort_ack_count = _non_negative_int(
+            value.get("local_abort_ack_count", 0),
+            "local_abort_ack_count",
+        )
+        lane.remote_abort_ack_count = _non_negative_int(
+            value.get("remote_abort_ack_count", 0),
+            "remote_abort_ack_count",
+        )
+        lane.remote_abort_ack_unavailable_count = _non_negative_int(
+            value.get("remote_abort_ack_unavailable_count", 0),
+            "remote_abort_ack_unavailable_count",
+        )
+        lane.required_provenance_trace_count = _non_negative_int(
+            value.get("required_provenance_trace_count", 0),
+            "required_provenance_trace_count",
+        )
+        lane.required_provenance_complete_count = _non_negative_int(
+            value.get("required_provenance_complete_count", 0),
+            "required_provenance_complete_count",
+        )
+        lane.required_provenance_incomplete_count = _non_negative_int(
+            value.get("required_provenance_incomplete_count", 0),
+            "required_provenance_incomplete_count",
+        )
+        lane.uncategorized_failure_count = _non_negative_int(
+            value.get("uncategorized_failure_count", 0),
+            "uncategorized_failure_count",
+        )
         missing = value.get("missing_stage_counts", {})
+        raw_provenance_stage_counts = value.get("provenance_stage_counts", {})
         metrics = value.get("metrics", {})
-        if not isinstance(missing, Mapping) or not isinstance(metrics, Mapping):
+        raw_job_outcomes = value.get("job_outcome_counts", {})
+        raw_result_outcomes = value.get("result_outcome_counts", {})
+        raw_attempt_outcomes = value.get("provider_attempt_outcome_counts", {})
+        raw_timing_contracts = value.get("timing_contract_counts", {})
+        if not all(
+            isinstance(item, Mapping)
+            for item in (
+                missing,
+                metrics,
+                raw_job_outcomes,
+                raw_result_outcomes,
+                raw_attempt_outcomes,
+                raw_timing_contracts,
+            )
+        ):
             raise TypeError("persisted lane counters and metrics must be mappings")
+        if not isinstance(raw_provenance_stage_counts, Mapping):
+            raise TypeError("persisted provenance stage counts must be a mapping")
         lane.missing_stage_counts = {
             stage: _non_negative_int(missing.get(stage, 0), f"missing {stage} count") for stage in PIPELINE_STAGES
+        }
+        lane.provenance_stage_counts = {
+            stage: {
+                status: _non_negative_int(
+                    (raw_provenance_stage_counts.get(stage, {}) or {}).get(status, 0),
+                    f"provenance {stage} {status} count",
+                )
+                for status in PROVENANCE_STATUSES
+            }
+            for stage in REQUIRED_PROVENANCE_STAGES
         }
         lane.metrics = {
             metric: _MetricAccumulator.from_state(metrics.get(metric, {}), max_samples=max_samples)
             for metric in METRIC_STAGE_PAIRS
+        }
+        lane.job_outcome_counts = {
+            outcome: _non_negative_int(raw_job_outcomes.get(outcome, 0), f"job {outcome} count")
+            for outcome in TERMINAL_OUTCOMES
+        }
+        lane.result_outcome_counts = {
+            outcome: _non_negative_int(raw_result_outcomes.get(outcome, 0), f"result {outcome} count")
+            for outcome in RESULT_OUTCOMES
+        }
+        lane.provider_attempt_outcome_counts = {
+            outcome: _non_negative_int(raw_attempt_outcomes.get(outcome, 0), f"attempt {outcome} count")
+            for outcome in PROVIDER_ATTEMPT_OUTCOMES
+        }
+        lane.timing_contract_counts = {
+            status: _non_negative_int(raw_timing_contracts.get(status, 0), f"timing {status} count")
+            for status in TIMING_CONTRACT_STATUSES
         }
         return lane
 
@@ -401,45 +995,116 @@ def _lane_verdict(
     lane_name: str,
     metrics: Mapping[str, Mapping[str, Any]],
     thresholds: Mapping[str, Mapping[str, float]],
+    *,
+    job_terminal_count: int,
+    result_outcome_counts: Mapping[str, int],
+    provider_attempt_count: int,
+    provider_attempt_outcome_counts: Mapping[str, int],
+    provider_attempt_incomplete_count: int,
+    timing_contract_counts: Mapping[str, int],
+    required_provenance_trace_count: int = 0,
+    required_provenance_incomplete_count: int = 0,
+    uncategorized_failure_count: int = 0,
 ) -> dict[str, Any]:
     lane_thresholds = thresholds.get(lane_name)
     if lane_thresholds is None:
-        return {
+        latency_verdict = {
             "status": "not_configured",
             "basis": "p95_ms",
             "metrics": {},
         }
+    else:
+        metric_verdicts: dict[str, dict[str, Any]] = {}
+        statuses: list[str] = []
+        for metric in METRIC_STAGE_PAIRS:
+            threshold = lane_thresholds.get(metric)
+            observed = metrics[metric]["p95_ms"]
+            if threshold is None:
+                metric_status = "not_configured"
+            elif observed is None:
+                metric_status = "no_data"
+            else:
+                metric_status = "pass" if observed <= threshold else "fail"
+            metric_verdicts[metric] = {
+                "status": metric_status,
+                "threshold_ms": threshold,
+                "observed_p95_ms": observed,
+            }
+            statuses.append(metric_status)
 
-    metric_verdicts: dict[str, dict[str, Any]] = {}
-    statuses: list[str] = []
-    for metric in METRIC_STAGE_PAIRS:
-        threshold = lane_thresholds.get(metric)
-        observed = metrics[metric]["p95_ms"]
-        if threshold is None:
-            status = "not_configured"
-        elif observed is None:
-            status = "no_data"
+        if "fail" in statuses:
+            latency_status = "fail"
+        elif all(item == "no_data" for item in statuses):
+            latency_status = "no_data"
+        elif "no_data" in statuses or "not_configured" in statuses:
+            latency_status = "insufficient_data"
         else:
-            status = "pass" if observed <= threshold else "fail"
-        metric_verdicts[metric] = {
-            "status": status,
-            "threshold_ms": threshold,
-            "observed_p95_ms": observed,
+            latency_status = "pass"
+        latency_verdict = {
+            "status": latency_status,
+            "basis": "p95_ms",
+            "metrics": metric_verdicts,
         }
-        statuses.append(status)
 
-    if "fail" in statuses:
+    failed_result_count = sum(
+        count for outcome, count in result_outcome_counts.items() if outcome != "success"
+    )
+    failed_attempt_count = sum(
+        count for outcome, count in provider_attempt_outcome_counts.items() if outcome != "success"
+    )
+    invalid_timing_count = timing_contract_counts.get("invalid", 0)
+    partial_timing_count = timing_contract_counts.get("partial", 0)
+    if (
+        failed_result_count
+        or failed_attempt_count
+        or provider_attempt_incomplete_count
+        or invalid_timing_count
+        or uncategorized_failure_count
+        or (
+            required_provenance_trace_count > 0
+            and required_provenance_incomplete_count > 0
+            and (failed_result_count or failed_attempt_count)
+        )
+    ):
+        availability_status = "fail"
+    elif job_terminal_count == 0 and provider_attempt_count == 0:
+        availability_status = "no_data"
+    elif partial_timing_count:
+        availability_status = "insufficient_data"
+    else:
+        availability_status = "pass"
+
+    latency_status = latency_verdict["status"]
+    if availability_status == "fail" or latency_status == "fail":
         status = "fail"
-    elif all(item == "no_data" for item in statuses):
+    elif availability_status == "no_data" and latency_status == "no_data":
         status = "no_data"
-    elif "no_data" in statuses or "not_configured" in statuses:
+    elif availability_status in {"no_data", "insufficient_data"} or latency_status in {
+        "no_data",
+        "insufficient_data",
+        "not_configured",
+    }:
         status = "insufficient_data"
     else:
         status = "pass"
     return {
         "status": status,
-        "basis": "p95_ms",
-        "metrics": metric_verdicts,
+        "basis": "latency_and_outcomes",
+        "metrics": latency_verdict["metrics"],
+        "latency_status": latency_status,
+        "availability_status": availability_status,
+        "required_stage_completeness": {
+            "trace_count": required_provenance_trace_count,
+            "incomplete_count": required_provenance_incomplete_count,
+            "status": (
+                "not_available"
+                if required_provenance_trace_count == 0
+                else "pass"
+                if required_provenance_incomplete_count == 0
+                else "fail"
+            ),
+        },
+        "uncategorized_failure_count": uncategorized_failure_count,
     }
 
 
@@ -454,7 +1119,34 @@ def _report_from_accumulator(
     lane_statuses: dict[str, str] = {}
     for lane_name, lane in lanes.items():
         metrics = {metric: metric_accumulator.summary() for metric, metric_accumulator in lane.metrics.items()}
-        verdict = _lane_verdict(lane_name, metrics, thresholds)
+        verdict = _lane_verdict(
+            lane_name,
+            metrics,
+            thresholds,
+            job_terminal_count=lane.job_terminal_count,
+            result_outcome_counts=lane.result_outcome_counts,
+            provider_attempt_count=lane.provider_attempt_count,
+            provider_attempt_outcome_counts=lane.provider_attempt_outcome_counts,
+            provider_attempt_incomplete_count=lane.provider_attempt_incomplete_count,
+            timing_contract_counts=lane.timing_contract_counts,
+            required_provenance_trace_count=lane.required_provenance_trace_count,
+            required_provenance_incomplete_count=lane.required_provenance_incomplete_count,
+            uncategorized_failure_count=lane.uncategorized_failure_count,
+        )
+        result_count = sum(lane.result_outcome_counts.values())
+        job_rates = _named_outcome_rates(
+            lane.job_outcome_counts,
+            lane.job_terminal_count,
+        )
+        result_rates = _named_outcome_rates(
+            lane.result_outcome_counts,
+            result_count,
+        )
+        attempt_rates = _named_outcome_rates(
+            lane.provider_attempt_outcome_counts,
+            lane.provider_attempt_count,
+            incomplete_count=lane.provider_attempt_incomplete_count,
+        )
         lane_statuses[lane_name] = verdict["status"]
         lane_reports[lane_name] = {
             "count": lane.count,
@@ -463,6 +1155,65 @@ def _report_from_accumulator(
             "missing_stage_counts": dict(lane.missing_stage_counts),
             "cancelled_count": lane.cancelled_count,
             "retry_count": lane.retry_count,
+            "job_outcomes": {
+                "count": lane.job_terminal_count,
+                "counts": dict(lane.job_outcome_counts),
+                "result_counts": dict(lane.result_outcome_counts),
+                **job_rates,
+            },
+            "result_outcomes": {
+                "count": result_count,
+                "counts": dict(lane.result_outcome_counts),
+                **result_rates,
+            },
+            "provider_attempts": {
+                "count": lane.provider_attempt_count,
+                "counts": dict(lane.provider_attempt_outcome_counts),
+                "incomplete_count": lane.provider_attempt_incomplete_count,
+                **attempt_rates,
+            },
+            "timing_contracts": {
+                "count": sum(lane.timing_contract_counts.values()),
+                "counts": dict(lane.timing_contract_counts),
+            },
+            "required_stage_completeness": {
+                "trace_count": lane.required_provenance_trace_count,
+                "complete_count": lane.required_provenance_complete_count,
+                "incomplete_count": lane.required_provenance_incomplete_count,
+                "ratio": (
+                    round(
+                        lane.required_provenance_complete_count
+                        / lane.required_provenance_trace_count,
+                        6,
+                    )
+                    if lane.required_provenance_trace_count
+                    else None
+                ),
+                "status": (
+                    "not_available"
+                    if lane.required_provenance_trace_count == 0
+                    else "pass"
+                    if lane.required_provenance_incomplete_count == 0
+                    else "fail"
+                ),
+            },
+            "provenance_stage_counts": {
+                stage: dict(counts)
+                for stage, counts in lane.provenance_stage_counts.items()
+            },
+            "uncategorized_failure_count": lane.uncategorized_failure_count,
+            "cancellation_acknowledgements": {
+                "required_count": lane.cancel_ack_required_count,
+                "local_ack_count": lane.local_abort_ack_count,
+                "remote_ack_count": lane.remote_abort_ack_count,
+                "remote_ack_unavailable_count": lane.remote_abort_ack_unavailable_count,
+                "unaccounted_count": max(
+                    0,
+                    lane.cancel_ack_required_count
+                    - lane.remote_abort_ack_count
+                    - lane.remote_abort_ack_unavailable_count,
+                ),
+            },
             "metrics": metrics,
             "slo_verdict": verdict,
         }
@@ -656,7 +1407,11 @@ class RealtimeSLOStore:
             value = json.loads(self._state_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError("realtime SLO state is unreadable") from exc
-        if not isinstance(value, Mapping) or value.get("schema_version") != STORE_SCHEMA_VERSION:
+        if (
+            not isinstance(value, Mapping)
+            or value.get("schema_version")
+            not in {STORE_SCHEMA_VERSION, *LEGACY_STORE_SCHEMA_VERSIONS}
+        ):
             raise ValueError("unsupported realtime SLO state schema")
         archived = _SLOAccumulator.from_state(
             value.get("archived", {}),

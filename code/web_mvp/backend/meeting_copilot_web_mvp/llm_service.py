@@ -7,6 +7,7 @@ records usage, and creates a real suggestion card (card_status='new').
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import ipaddress
 import os
@@ -37,6 +38,36 @@ _PROVIDER_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _RUNTIME_CONFIG_LOCK = threading.RLock()
 _RUNTIME_CONFIG_PAYLOAD: dict[str, Any] | None = None
 _RUNTIME_CONFIG_GENERATION = 0
+REALTIME_MODEL_ENV = "LLM_GATEWAY_REALTIME_MODEL"
+REALTIME_MODEL_SOURCE_ENV = "llm_gateway_realtime_model"
+REALTIME_MODEL_SOURCE_RUNTIME = "runtime_realtime_model"
+REALTIME_MODEL_SOURCE_DIRECT = "direct_realtime_model"
+REALTIME_MODEL_SOURCE_FALLBACK = "general_model_fallback"
+REALTIME_MODEL_INHERITED_WARNING = "realtime_model_inherits_general_model"
+_REALTIME_MODEL_SOURCES = frozenset(
+    {
+        REALTIME_MODEL_SOURCE_ENV,
+        REALTIME_MODEL_SOURCE_RUNTIME,
+        REALTIME_MODEL_SOURCE_DIRECT,
+        REALTIME_MODEL_SOURCE_FALLBACK,
+    }
+)
+_REALTIME_MODEL_WARNING_LOCK = threading.Lock()
+_REALTIME_MODEL_WARNING_FINGERPRINTS: set[tuple[int, str, str, str]] = set()
+CORRECTION_MODEL_ENV = "LLM_GATEWAY_CORRECTION_MODEL"
+CORRECTION_MODEL_SOURCE_ENV = "llm_gateway_correction_model"
+CORRECTION_MODEL_SOURCE_RUNTIME = "runtime_correction_model"
+CORRECTION_MODEL_SOURCE_DIRECT = "direct_correction_model"
+CORRECTION_MODEL_SOURCE_FALLBACK = "general_model_fallback"
+CORRECTION_MODEL_INHERITED_WARNING = "correction_model_inherits_general_model"
+_CORRECTION_MODEL_SOURCES = frozenset(
+    {
+        CORRECTION_MODEL_SOURCE_ENV,
+        CORRECTION_MODEL_SOURCE_RUNTIME,
+        CORRECTION_MODEL_SOURCE_DIRECT,
+        CORRECTION_MODEL_SOURCE_FALLBACK,
+    }
+)
 _AUDIT_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$")
 _SAFE_PROVIDER_ERROR_CODES = frozenset(
     {
@@ -66,6 +97,84 @@ class LlmClient(Protocol):
         headers: dict[str, str],
         body: dict[str, Any],
         timeout: float,
+    ) -> dict[str, Any]: ...
+
+
+class ProviderAbortHandle:
+    """Transport-level cancellation state for a single Provider attempt.
+
+    ``abort_requested`` is only local intent.  ``abort_acknowledged`` is set
+    after the bound request task has unwound its HTTP context, so callers can
+    keep a shared Provider lease until the underlying socket/stream is no
+    longer active.  This deliberately does not claim that a remote gateway
+    stopped billing or inference; it only establishes a safe local boundary.
+    """
+
+    def __init__(self) -> None:
+        self._requested = False
+        self._acknowledged = False
+        self._reason: str | None = None
+        self._ack_event = asyncio.Event()
+        self._task: asyncio.Task[Any] | None = None
+
+    @property
+    def abort_requested(self) -> bool:
+        return self._requested
+
+    @property
+    def abort_acknowledged(self) -> bool:
+        return self._acknowledged
+
+    @property
+    def reason(self) -> str | None:
+        return self._reason
+
+    def bind_current_task(self) -> None:
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("ProviderAbortHandle requires an active asyncio task")
+        self._task = task
+        if self._requested and not task.done():
+            task.cancel()
+
+    def request_abort(self, reason: str = "deadline") -> None:
+        self._requested = True
+        self._reason = str(reason or "deadline")[:64]
+        task = self._task
+        current = asyncio.current_task()
+        if task is not None and task is not current and not task.done():
+            task.cancel()
+
+    def acknowledge_abort(self) -> None:
+        self._acknowledged = True
+        self._ack_event.set()
+
+    async def abort(self, reason: str = "deadline", *, timeout: float | None = None) -> bool:
+        self.request_abort(reason)
+        return await self.wait_abort_ack(timeout=timeout)
+
+    async def wait_abort_ack(self, *, timeout: float | None = None) -> bool:
+        if not self._acknowledged:
+            if timeout is None:
+                await self._ack_event.wait()
+            else:
+                try:
+                    async with asyncio.timeout(max(0.001, float(timeout))):
+                        await self._ack_event.wait()
+                except TimeoutError:
+                    return False
+        return self._acknowledged
+
+
+class AsyncLlmClient(Protocol):
+    async def post_json(
+        self,
+        url: str,
+        headers: dict[str, str],
+        body: dict[str, Any],
+        timeout: float,
+        *,
+        abort: ProviderAbortHandle | None = None,
     ) -> dict[str, Any]: ...
 
 
@@ -130,6 +239,79 @@ class HttpxLlmClient:
             )
 
 
+class AsyncHttpxLlmClient:
+    """OpenAI-compatible JSON client with transport-native local cancellation.
+
+    The production app injects its lifespan-scoped ``httpx.AsyncClient``.  A
+    caller that owns this client may close it explicitly; injected clients are
+    never closed here.  When cancellation is requested, the bound task is
+    cancelled and the request context acknowledges only after it has unwound.
+    """
+
+    def __init__(
+        self,
+        *,
+        client: httpx.AsyncClient | None = None,
+        api_style: str = "chat_completions",
+    ) -> None:
+        self.api_style = _validated_api_style(api_style)
+        self._owns_client = client is None
+        self._client = client or httpx.AsyncClient(trust_env=False)
+
+    async def aclose(self) -> None:
+        if self._owns_client and not self._client.is_closed:
+            await self._client.aclose()
+
+    async def post_json(
+        self,
+        url: str,
+        headers: dict[str, str],
+        body: dict[str, Any],
+        timeout: float,
+        *,
+        abort: ProviderAbortHandle | None = None,
+    ) -> dict[str, Any]:
+        handle = abort or ProviderAbortHandle()
+        handle.bind_current_task()
+        try:
+            request_url = (
+                responses_url_for_chat_url(url)
+                if self.api_style == "responses"
+                else url
+            )
+            request_body = (
+                chat_body_to_responses(body, stream=False)
+                if self.api_style == "responses"
+                else body
+            )
+            response = await _provider_post_async(
+                self._client,
+                request_url,
+                headers,
+                request_body,
+                timeout,
+            )
+            payload = _response_payload(response)
+            normalized = _require_success_payload(
+                response,
+                payload,
+                api_style=self.api_style,
+            )
+            return (
+                responses_payload_to_chat(normalized)
+                if self.api_style == "responses"
+                else normalized
+            )
+        except asyncio.CancelledError:
+            # The response context is no longer usable after cancellation. The
+            # ACK is local transport completion, not a remote billing claim.
+            handle.acknowledge_abort()
+            raise
+        finally:
+            if handle.abort_requested and not handle.abort_acknowledged:
+                handle.acknowledge_abort()
+
+
 def provider_failure_message(error: Exception) -> str:
     """Return an actionable message without reflecting provider response text."""
 
@@ -173,6 +355,26 @@ def _provider_post(
 ) -> Any:
     try:
         return client.post(url, headers=headers, json=body)
+    except httpx.TimeoutException:
+        raise LlmProviderTransportError("timeout") from None
+    except httpx.RequestError:
+        raise LlmProviderTransportError("transport") from None
+
+
+async def _provider_post_async(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: Mapping[str, str],
+    body: Mapping[str, Any],
+    timeout: float,
+) -> Any:
+    try:
+        return await client.post(
+            url,
+            headers=headers,
+            json=body,
+            timeout=timeout,
+        )
     except httpx.TimeoutException:
         raise LlmProviderTransportError("timeout") from None
     except httpx.RequestError:
@@ -241,6 +443,9 @@ class LlmConfig:
     api_key: str
     model: str
     realtime_model: str | None = None
+    realtime_model_source: str | None = None
+    correction_model: str | None = None
+    correction_model_source: str | None = None
     timeout_seconds: float = 60.0
     provider_label: str = "openai_compatible_gateway"
     is_mock: bool = False
@@ -248,10 +453,37 @@ class LlmConfig:
     api_style: str = "chat_completions"
 
     def __post_init__(self) -> None:
+        realtime_model_was_explicit = bool(str(self.realtime_model or "").strip())
+        correction_model_was_explicit = bool(str(self.correction_model or "").strip())
         self.base_url = _validated_base_url(self.base_url)
         self.api_style = _validated_api_style(self.api_style)
         self.model = _validated_model_name(self.model)
         self.realtime_model = _validated_model_name(self.realtime_model or self.model)
+        source = str(self.realtime_model_source or "").strip() or (
+            REALTIME_MODEL_SOURCE_DIRECT
+            if realtime_model_was_explicit
+            else REALTIME_MODEL_SOURCE_FALLBACK
+        )
+        if source not in _REALTIME_MODEL_SOURCES:
+            raise ValueError("LLM realtime_model_source is unsupported")
+        if source == REALTIME_MODEL_SOURCE_FALLBACK:
+            self.realtime_model = self.model
+        elif not realtime_model_was_explicit:
+            raise ValueError("explicit LLM realtime model is missing")
+        self.realtime_model_source = source
+        self.correction_model = _validated_model_name(self.correction_model or self.model)
+        correction_source = str(self.correction_model_source or "").strip() or (
+            CORRECTION_MODEL_SOURCE_DIRECT
+            if correction_model_was_explicit
+            else CORRECTION_MODEL_SOURCE_FALLBACK
+        )
+        if correction_source not in _CORRECTION_MODEL_SOURCES:
+            raise ValueError("LLM correction_model_source is unsupported")
+        if correction_source == CORRECTION_MODEL_SOURCE_FALLBACK:
+            self.correction_model = self.model
+        elif not correction_model_was_explicit:
+            raise ValueError("explicit LLM correction model is missing")
+        self.correction_model_source = correction_source
 
     def __repr__(self) -> str:
         return (
@@ -260,6 +492,9 @@ class LlmConfig:
             "api_key='<redacted>', "
             f"model={self.model!r}, "
             f"realtime_model={self.realtime_model!r}, "
+            f"realtime_model_source={self.realtime_model_source!r}, "
+            f"correction_model={self.correction_model!r}, "
+            f"correction_model_source={self.correction_model_source!r}, "
             f"timeout_seconds={self.timeout_seconds!r}, "
             f"provider_label={self.provider_label!r}, "
             f"is_mock={self.is_mock!r}, "
@@ -285,11 +520,24 @@ class LlmConfig:
         if not base or not key:
             return None
         model = os.environ.get("LLM_GATEWAY_MODEL", "gpt-5.5")
+        realtime_model = os.environ.get(REALTIME_MODEL_ENV)
+        correction_model = os.environ.get(CORRECTION_MODEL_ENV)
         return cls(
             base_url=base.rstrip("/"),
             api_key=key,
             model=model,
-            realtime_model=os.environ.get("LLM_GATEWAY_REALTIME_MODEL") or model,
+            realtime_model=realtime_model,
+            realtime_model_source=(
+                REALTIME_MODEL_SOURCE_ENV
+                if str(realtime_model or "").strip()
+                else REALTIME_MODEL_SOURCE_FALLBACK
+            ),
+            correction_model=correction_model,
+            correction_model_source=(
+                CORRECTION_MODEL_SOURCE_ENV
+                if str(correction_model or "").strip()
+                else CORRECTION_MODEL_SOURCE_FALLBACK
+            ),
             timeout_seconds=float(os.environ.get("LLM_GATEWAY_TIMEOUT_SECONDS", "60")),
             provider_label=os.environ.get("LLM_GATEWAY_PROVIDER_LABEL", "openai_compatible_gateway"),
             is_mock=_env_bool(os.environ.get("LLM_GATEWAY_IS_MOCK"), default=False),
@@ -303,6 +551,9 @@ def configure_runtime(
     api_key: str,
     model: str,
     realtime_model: str | None = None,
+    realtime_model_source: str | None = None,
+    correction_model: str | None = None,
+    correction_model_source: str | None = None,
     provider_label: str = "openai_compatible_gateway",
     api_style: str = "chat_completions",
 ) -> dict[str, Any]:
@@ -312,6 +563,19 @@ def configure_runtime(
         api_key=api_key,
         model=model,
         realtime_model=realtime_model,
+        realtime_model_source=realtime_model_source
+        or (
+            REALTIME_MODEL_SOURCE_RUNTIME
+            if str(realtime_model or "").strip()
+            else REALTIME_MODEL_SOURCE_FALLBACK
+        ),
+        correction_model=correction_model,
+        correction_model_source=correction_model_source
+        or (
+            CORRECTION_MODEL_SOURCE_RUNTIME
+            if str(correction_model or "").strip()
+            else CORRECTION_MODEL_SOURCE_FALLBACK
+        ),
         provider_label=provider_label,
         is_mock=False,
         api_style=api_style,
@@ -321,6 +585,9 @@ def configure_runtime(
         "api_key": config.api_key,
         "model": config.model,
         "realtime_model": config.realtime_model,
+        "realtime_model_source": config.realtime_model_source,
+        "correction_model": config.correction_model,
+        "correction_model_source": config.correction_model_source,
         "timeout_seconds": config.timeout_seconds,
         "provider_label": config.provider_label,
         "is_mock": False,
@@ -365,14 +632,26 @@ def provider_metadata(config: LlmConfig | None) -> dict[str, Any]:
             "provider": "not_configured",
             "model": "not_called",
             "realtime_model": "not_called",
+            "realtime_model_source": "not_configured",
+            "realtime_model_explicit": False,
+            "realtime_model_warning": None,
+            "correction_model": "not_called",
+            "correction_model_source": "not_configured",
+            "correction_model_explicit": False,
+            "correction_model_warning": None,
             "is_mock": False,
             "configured_from_env": False,
             "api_style": "not_configured",
         }
+    provenance = realtime_model_provenance(config)
+    correction_provenance = correction_model_provenance(config)
     return {
         "provider": provider_identifier(config),
         "model": config.model,
         "realtime_model": config.realtime_model,
+        **provenance,
+        "correction_model": config.correction_model,
+        **correction_provenance,
         "is_mock": bool(config.is_mock),
         "configured_from_env": True,
         "api_style": config.api_style,
@@ -386,14 +665,79 @@ def provider_identifier(config: LlmConfig) -> str:
     return _gateway_host(config.base_url)
 
 
+def realtime_model_provenance(config: LlmConfig) -> dict[str, Any]:
+    """Describe realtime model selection without exposing credentials or content."""
+
+    source = str(config.realtime_model_source or REALTIME_MODEL_SOURCE_FALLBACK)
+    inherited = source == REALTIME_MODEL_SOURCE_FALLBACK
+    return {
+        "realtime_model_source": source,
+        "realtime_model_explicit": not inherited,
+        "realtime_model_warning": REALTIME_MODEL_INHERITED_WARNING if inherited else None,
+    }
+
+
+def _warn_if_realtime_model_is_inherited(config: LlmConfig) -> None:
+    provenance = realtime_model_provenance(config)
+    warning = provenance["realtime_model_warning"]
+    if warning is None:
+        return
+    fingerprint = (
+        runtime_config_generation(),
+        provider_identifier(config),
+        str(config.model),
+        str(config.api_style),
+    )
+    with _REALTIME_MODEL_WARNING_LOCK:
+        if fingerprint in _REALTIME_MODEL_WARNING_FINGERPRINTS:
+            return
+        _REALTIME_MODEL_WARNING_FINGERPRINTS.add(fingerprint)
+    _log.warning(
+        "llm.realtime_model.inherits_general_model",
+        diagnostic_code=warning,
+        provider=_safe_audit_value(provider_identifier(config), fallback="redacted_provider"),
+        selected_model=_safe_audit_value(config.model, fallback="redacted_model"),
+        realtime_model_source=provenance["realtime_model_source"],
+    )
+
+
 def realtime_config(config: LlmConfig) -> LlmConfig:
     """Return the same Provider credentials routed to the low-latency model."""
 
+    _warn_if_realtime_model_is_inherited(config)
     return replace(
         config,
         model=str(config.realtime_model or config.model),
         realtime_model=str(config.realtime_model or config.model),
     )
+
+
+def correction_config(config: LlmConfig) -> LlmConfig:
+    """Route correction to its explicit model namespace or the general model.
+
+    Correction deliberately does not inherit ``realtime_model``. This keeps a
+    low-latency Pi model choice from silently changing transcript refinement.
+    Credentials and upstream quota remain shared unless separately provisioned
+    outside this process.
+    """
+
+    return replace(
+        config,
+        model=str(config.correction_model or config.model),
+        correction_model=str(config.correction_model or config.model),
+    )
+
+
+def correction_model_provenance(config: LlmConfig) -> dict[str, Any]:
+    source = str(config.correction_model_source or CORRECTION_MODEL_SOURCE_FALLBACK)
+    inherited = source == CORRECTION_MODEL_SOURCE_FALLBACK
+    return {
+        "correction_model_source": source,
+        "correction_model_explicit": not inherited,
+        "correction_model_warning": (
+            CORRECTION_MODEL_INHERITED_WARNING if inherited else None
+        ),
+    }
 
 
 def gateway_base_url_kind(base_url: str | None) -> str:
@@ -406,12 +750,29 @@ def gateway_base_url_kind(base_url: str | None) -> str:
     return "remote"
 
 
-def provider_audit_metadata(config: LlmConfig, *, purpose: str) -> dict[str, str]:
-    return {
+def provider_audit_metadata(
+    config: LlmConfig,
+    *,
+    purpose: str,
+    provider_lane: str | None = None,
+    model_source: str | None = None,
+) -> dict[str, str]:
+    metadata = {
         "provider": _safe_audit_value(provider_identifier(config), fallback="redacted_provider"),
         "model": _safe_audit_value(config.model, fallback="redacted_model"),
         "purpose": _safe_audit_value(purpose, fallback="llm_request"),
     }
+    if provider_lane is not None:
+        metadata["provider_lane"] = _safe_audit_value(
+            provider_lane,
+            fallback="unclassified",
+        )
+    if model_source is not None:
+        metadata["model_source"] = _safe_audit_value(
+            model_source,
+            fallback="unknown_model_source",
+        )
+    return metadata
 
 
 def provider_error_payload(*, error_code: str, message: str) -> dict[str, str]:
@@ -425,10 +786,18 @@ def probe_gateway(
     config: LlmConfig,
     client: LlmClient | None = None,
 ) -> dict[str, Any]:
-    """Make one minimal production-shaped request to verify gateway operability."""
+    """Make one realtime-budgeted request to verify gateway operability.
+
+    This probe feeds the realtime coach readiness gate, so waiting for the
+    general LLM timeout would make the preflight UI block long after the
+    product has already decided that the provider is too slow. A slow provider
+    is still recorded as a transport failure; it is never converted into a
+    successful readiness result.
+    """
     if config.is_mock:
         raise ValueError("mock LLM provider cannot pass production verification")
     client = client or _configured_httpx_client(config)
+    started_at_ns = time.monotonic_ns()
     data = client.post_json(
         f"{config.base_url}/v1/chat/completions",
         {
@@ -440,9 +809,10 @@ def probe_gateway(
             "messages": [{"role": "user", "content": "只回复 OK"}],
             "temperature": 0,
             "reasoning_effort": "low",
-            "max_completion_tokens": 16,
+            **_reasoning_compatibility_parameters(config),
+            **_completion_token_parameter(config, 16),
         },
-        min(float(config.timeout_seconds), 15.0),
+        min(float(config.timeout_seconds), 2.5),
     )
     choices = data.get("choices") if isinstance(data, dict) else None
     content = (
@@ -469,10 +839,13 @@ def probe_gateway(
     prompt_tokens, completion_tokens, total_tokens = raw_usage
     if total_tokens <= 0 or total_tokens != prompt_tokens + completion_tokens:
         raise ValueError("gateway response reported inconsistent token usage")
+    elapsed_ns = max(0, time.monotonic_ns() - started_at_ns)
+    probe_latency_ms = (elapsed_ns + 999_999) // 1_000_000
     return {
         "operational": True,
         "provider": provider_identifier(config),
         "model": config.model,
+        "probe_latency_ms": probe_latency_ms,
         "usage": {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
@@ -518,6 +891,8 @@ def _validated_base_url(value: str) -> str:
     except ValueError as exc:
         raise ValueError("LLM gateway base_url contains an invalid port") from exc
     normalized_path = parsed.path.rstrip("/")
+    if normalized_path == "/v1":
+        normalized_path = ""
     return urlunsplit((parsed.scheme, parsed.netloc, normalized_path, "", ""))
 
 
@@ -554,6 +929,43 @@ def _gateway_host(base_url: str) -> str:
     except ValueError:
         port = None
     return f"{host}:{port}" if port is not None else host
+
+
+def _is_deepseek_provider(config: LlmConfig) -> bool:
+    """Return whether a config targets DeepSeek's OpenAI-compatible wire format.
+
+    DeepSeek's Chat Completions API uses ``max_tokens`` rather than the newer
+    OpenAI ``max_completion_tokens`` field.  The provider label is checked as
+    well as the hostname so a private relay can opt into the same contract
+    without exposing or rewriting its URL.
+    """
+
+    label = str(config.provider_label or "").strip().lower()
+    if label == "deepseek":
+        return True
+    host = str(urlsplit(config.base_url).hostname or "").strip().lower().rstrip(".")
+    return host == "deepseek.com" or host.endswith(".deepseek.com")
+
+
+def _completion_token_parameter(config: LlmConfig, limit: int) -> dict[str, int]:
+    """Build the provider-compatible output-token parameter for one request."""
+
+    field = "max_tokens" if _is_deepseek_provider(config) else "max_completion_tokens"
+    return {field: int(limit)}
+
+
+def _reasoning_compatibility_parameters(config: LlmConfig) -> dict[str, Any]:
+    """Disable DeepSeek V4's implicit reasoning for short JSON/text calls.
+
+    DeepSeek V4 enables thinking when this field is omitted. That is useful
+    for long-form reasoning, but it can consume a small realtime token budget
+    before any assistant content is emitted. Other OpenAI-compatible
+    gateways must not receive a provider-specific field.
+    """
+
+    if _is_deepseek_provider(config):
+        return {"thinking": {"type": "disabled"}}
+    return {}
 
 
 _SYSTEM_PROMPT = (
@@ -622,7 +1034,8 @@ def execute_candidate(
         ],
         "temperature": 0,
         "reasoning_effort": "low",
-        "max_completion_tokens": 512,
+        **_reasoning_compatibility_parameters(config),
+        **_completion_token_parameter(config, 512),
     }
     headers = {
         "Authorization": f"Bearer {config.api_key}",
@@ -824,7 +1237,8 @@ def build_approach_cards(
         ],
         "temperature": 0,
         "reasoning_effort": "low",
-        "max_completion_tokens": 768,
+        **_reasoning_compatibility_parameters(config),
+        **_completion_token_parameter(config, 768),
     }
     headers = {
         "Authorization": f"Bearer {config.api_key}",
@@ -1005,7 +1419,8 @@ def build_minutes_json(
         ],
         "temperature": 0,
         "reasoning_effort": "low",
-        "max_completion_tokens": 1_024,
+        **_reasoning_compatibility_parameters(config),
+        **_completion_token_parameter(config, 1_024),
     }
     headers = {"Authorization": f"Bearer {config.api_key}", "Content-Type": "application/json"}
     url = f"{config.base_url}/v1/chat/completions"

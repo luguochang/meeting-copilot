@@ -287,7 +287,14 @@ class ManagedRotatingLogStream:
         self.last_error: OSError | None = None
 
     def write(self, payload: str) -> int:
-        written = self._mirror.write(payload)
+        # Pytest, a desktop host, or a process supervisor can close its
+        # captured stdout before an app-lifespan teardown has emitted its last
+        # log line. The managed file remains authoritative; a dead mirror must
+        # not turn cleanup into a deadlock or a secondary application error.
+        try:
+            written = self._mirror.write(payload)
+        except (OSError, ValueError):
+            written = len(payload)
         if payload:
             try:
                 self.rotator.append(payload)
@@ -297,7 +304,10 @@ class ManagedRotatingLogStream:
         return written
 
     def flush(self) -> None:
-        self._mirror.flush()
+        try:
+            self._mirror.flush()
+        except (OSError, ValueError):
+            pass
 
     def isatty(self) -> bool:
         return False

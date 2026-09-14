@@ -354,9 +354,8 @@ async fn mic_adapter_probe(
             app.state::<native_system_audio_capture_runtime::DualTrackCaptureCoordinator>();
         let audio = app.state::<desktop_audio_adapter_runtime::DesktopAudioCaptureAdapters>();
         reconcile_capture_coordinator(&coordinator, &audio);
-        coordinator.claim_microphone_probe()?;
+        let _probe_lease = coordinator.acquire_microphone_probe()?;
         let response = audio.microphone_probe(device_id.as_deref());
-        coordinator.release_microphone_probe();
         Ok(response)
     })
     .await
@@ -749,11 +748,19 @@ async fn provider_config_save(
     api_key: String,
     model: String,
     realtime_model: Option<String>,
+    correction_model: Option<String>,
     api_style: String,
 ) -> Result<provider_config_runtime::ProviderConfigResponse, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let provider = app.state::<provider_config_runtime::ProviderConfigSupervisor>();
-        provider.save(base_url, api_key, model, realtime_model, api_style)
+        provider.save(
+            base_url,
+            api_key,
+            model,
+            realtime_model,
+            correction_model,
+            api_style,
+        )
     })
     .await
     .map_err(|error| format!("AI 配置后台保存失败: {error}"))

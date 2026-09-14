@@ -5,12 +5,13 @@ from difflib import SequenceMatcher
 import hashlib
 import json
 import math
+import os
 from pathlib import Path, PurePosixPath
 import re
 import sqlite3
 from threading import RLock
 import time
-from typing import Any, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping
 import unicodedata
 
 from .application_schema import bootstrap_application_schema, fallback_meeting_title
@@ -32,8 +33,33 @@ JOB_STATUSES = (
     "cancelled",
 )
 
+AGENT_WORK_ITEM_STATES = frozenset(
+    {
+        "proposed",
+        "investigating",
+        "waiting_for_evidence",
+        "ready",
+        "resolved",
+        "dismissed",
+        "expired",
+        "failed",
+        "superseded",
+    }
+)
+AGENT_WORK_ITEM_EVIDENCE_RELATIONS = frozenset({"supporting", "contradicting", "trigger"})
+
 DEFAULT_EVENT_PAGE_LIMIT = 200
 MAX_EVENT_PAGE_LIMIT = 1_000
+# A reservation protects the short crash window between handing work to the
+# Pi runtime and committing ``meeting.intelligence.applied``. It is deliberately
+# bounded so a crashed worker cannot suppress a meeting indefinitely.
+MAX_REALTIME_PROVIDER_RESERVATION_TTL_MS = 300_000
+REALTIME_PROVIDER_RESERVATION_EVENT_TYPE = "meeting.realtime_provider.reservation"
+REALTIME_PROVIDER_RESERVATION_FINISHED_EVENT_TYPE = "meeting.realtime_provider.reservation_finished"
+# Episode inheritance is deliberately narrower than semantic topic matching.
+# Only adjacent evidence from the same physical track and normalized speaker
+# can share a realtime Provider cooldown identity.
+REALTIME_COACH_EPISODE_CONTIGUOUS_GAP_MS = 8_000
 MAX_REVIEW_DOCUMENT_BYTES = 2 * 1024 * 1024
 MAX_NOTE_TITLE_CHARACTERS = 200
 MAX_NOTE_BODY_BYTES = 256 * 1024
@@ -41,8 +67,32 @@ MAX_NOTE_EVIDENCE_ITEMS = 64
 MAX_NOTE_EVIDENCE_QUOTE_CHARACTERS = 4_000
 REVIEW_JOB_KINDS = frozenset({"minutes", "approach", "index"})
 REVIEW_DOCUMENT_KINDS = frozenset({"minutes", "decisions", "action_items", "risks", "transcript"})
-INTELLIGENCE_DEBOUNCE_MS = 2_000
+# Keep a short coalescing window for bursty ASR finals without spending the
+# majority of the ten-second realtime budget before the first worker claim.
+# The absolute deadline and minimum execution reserve remain the hard guards.
+INTELLIGENCE_DEBOUNCE_MS = 750
+INTELLIGENCE_REALTIME_BUDGET_MS = 10_000
+# Post-meeting derivations must not keep a durable row running forever when a
+# gateway stalls.  The executor applies this deadline to the handler and the
+# persistence claim path closes expired pending/retry rows after restarts.
+REVIEW_JOB_DEADLINE_MS = 45_000
+# Product-level coach usefulness cutoff. The application owns the timer; the
+# persistence layer repeats the value only to enforce the late-card barrier.
+def _coach_soft_delivery_cutoff_ms() -> int:
+    raw = str(os.environ.get("MEETING_COPILOT_REALTIME_READY_CUTOFF_MS") or "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 2_500
+    return value if 1_000 <= value <= 10_000 else 2_500
+
+
+COACH_SOFT_DELIVERY_CUTOFF_MS = _coach_soft_delivery_cutoff_ms()
+# Keep enough wall-clock time for a provider response, evidence validation,
+# and the SQLite projection after a coalesced batch becomes runnable.
+INTELLIGENCE_MIN_EXECUTION_BUDGET_MS = 5_000
 INTELLIGENCE_MAX_BATCH_SEGMENTS = 8
+INTELLIGENCE_TIMING_SCHEMA_VERSION = "meeting_copilot.realtime_intelligence_timing.v1"
 SEMANTIC_PARAGRAPH_PROJECTION_VERSION = 2
 SEMANTIC_PARAGRAPH_GAP_MS = 3_500
 SEMANTIC_PARAGRAPH_MIN_DURATION_MS = 15_000
@@ -90,16 +140,38 @@ _TITLE_FORBIDDEN_PATTERN = re.compile(r"[\x00-\x1f\x7f/\\]")
 _MANAGED_MEETING_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _SPEAKER_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _SPEAKER_LABEL_FORBIDDEN_PATTERN = re.compile(r"[\x00-\x1f\x7f]")
+_REALTIME_PROVIDER_IDENTITY_PATTERN = re.compile(r"[0-9a-f]{64}")
+_REALTIME_PROVIDER_CIRCUIT_COLUMNS = (
+    "state",
+    "failure_count",
+    "last_failure_class",
+    "opened_at_ms",
+    "open_until_ms",
+    "backoff_source",
+    "half_open_permit_token",
+    "half_open_lease_until_ms",
+    "epoch",
+    "revision",
+    "updated_at_ms",
+)
 PUBLIC_JOB_ERROR_CLASSES = frozenset(
     {
         "ConnectionError",
         "CorrectionProjectionFailed",
+        "CorrectionProviderPriorityDeferred",
+        "CorrectionLaneCapacityDeferred",
         "DeferredCorrection",
+        "meeting_ended",
         "NonRetryableProviderError",
         "ProviderRuntimeNotConfiguredDeferred",
+        "correction_provider_budget_exhausted",
+        "correction_provider_rates_not_configured",
+        "correction_blocked_by_asr_quality",
+        "degraded_asr_session",
         "ReservationChanged",
         "TranscriptRevisionIdentityConflict",
         "TimeoutError",
+        "deadline_exceeded",
         "evidence_superseded",
         "intelligence_validation_evidence",
         "intelligence_validation_semantic_safety",
@@ -109,6 +181,9 @@ PUBLIC_JOB_ERROR_CLASSES = frozenset(
         "job_failed",
         "lease_expired",
         "provider_429",
+        "provider_502",
+        "provider_timeout",
+        "provider_transport",
         "provider_not_synced",
     }
 )
@@ -121,6 +196,323 @@ def _required(value: str, field: str) -> str:
     if not normalized:
         raise ValueError(f"{field} must not be empty")
     return normalized
+
+
+def _intelligence_event_context(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Normalize the provenance contract for one applied intelligence event.
+
+    Existing callers omit the context and retain the historical ``llm_first``
+    event shape. The local reflex lane must opt in explicitly and cannot claim
+    a Provider call or a remote runtime.
+    """
+
+    if value is None:
+        return {"source": "llm_first"}
+    if not isinstance(value, Mapping):
+        raise IntelligenceProjectionError("intelligence event context must be an object")
+    context = dict(value)
+    source = str(context.get("source") or "").strip()
+    if source != "local_reflex":
+        raise IntelligenceProjectionError("intelligence event context source is unsupported")
+    expected = {
+        "source": "local_reflex",
+        "llm_called": False,
+        "llm_call_status": "not_called",
+        "origin": "local_reflex",
+        "runtime_used": "local_reflex",
+        "pi_provider_attempted": False,
+    }
+    for field, expected_value in expected.items():
+        if context.get(field) != expected_value:
+            raise IntelligenceProjectionError(
+                f"local_reflex event context requires {field}={expected_value!r}"
+            )
+    local_reflex_kind = str(context.get("local_reflex_kind") or "").strip()
+    if local_reflex_kind not in _LOCAL_REFLEX_EVENT_TYPES:
+        raise IntelligenceProjectionError("local_reflex event context kind is unsupported")
+    evidence = context.get("evidence")
+    if not isinstance(evidence, Mapping):
+        raise IntelligenceProjectionError("local_reflex event context requires evidence")
+    evidence_ids = evidence.get("segment_ids")
+    if (
+        not isinstance(evidence_ids, list)
+        or not any(str(item).strip() for item in evidence_ids)
+        or not str(evidence.get("quote") or "").strip()
+    ):
+        raise IntelligenceProjectionError(
+            "local_reflex event context requires transcript evidence"
+        )
+    return context
+
+
+def _require_local_reflex_provenance(
+    value: Mapping[str, Any],
+    *,
+    field: str,
+) -> None:
+    expected = {
+        "origin": "local_reflex",
+        "runtime_used": "local_reflex",
+        "pi_provider_attempted": False,
+    }
+    for key, expected_value in expected.items():
+        if value.get(key) != expected_value:
+            raise IntelligenceProjectionError(
+                f"local_reflex {field} requires {key}={expected_value!r}"
+            )
+
+
+_LOCAL_REFLEX_EVENT_TYPES = {
+    "missing_next_step": "execution_gap",
+    "communication_clarity": "communication_clarity",
+    "strong_objection": "discovery_gap",
+    "pending_question": "question_to_user",
+}
+
+
+def _coach_decision_has_pi_provider_attempt(decision: Mapping[str, Any]) -> bool:
+    """Return whether a durable coach decision consumed a Pi Provider call."""
+
+    explicit = decision.get("pi_provider_attempted")
+    if isinstance(explicit, bool):
+        return explicit
+    # Compatibility for decisions written before the explicit marker existed.
+    # Circuit/deadline/detected-only paths used ``runtime_used = None``; a Pi
+    # runtime result is therefore the narrowest durable legacy evidence.
+    return (
+        str(decision.get("runtime_requested") or "").strip().lower() == "pi"
+        and str(decision.get("runtime_used") or "").strip().lower() == "pi"
+    )
+
+
+def _eligible_coach_candidate_events(decision: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    raw_candidates = decision.get("eligible_candidate_events")
+    if not isinstance(raw_candidates, list):
+        raw_candidates = decision.get("candidate_events")
+    if not isinstance(raw_candidates, list):
+        return []
+    return [item for item in raw_candidates if isinstance(item, Mapping)]
+
+
+def _timing_ms(value: Any) -> int | None:
+    """Normalize one persisted wall-clock timestamp without inventing it."""
+
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return normalized if normalized >= 0 else None
+
+
+def _normalized_coach_episode_speaker_key(value: Any) -> str:
+    normalized = " ".join(str(value or "").split()).casefold()[:160]
+    if not normalized:
+        return ""
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
+
+
+def _normalized_coach_episode_descriptor(value: Any) -> dict[str, Any] | None:
+    """Return a bounded, text-free episode descriptor or fail closed."""
+
+    if not isinstance(value, Mapping):
+        return None
+    episode_id = str(value.get("episode_id") or "").strip()
+    anchor_id = str(value.get("episode_anchor_id") or "").strip()
+    source_track = str(value.get("episode_source_track") or "").strip()
+    if (
+        not episode_id
+        or len(episode_id) > 256
+        or not anchor_id
+        or len(anchor_id) > 256
+        or source_track not in {"microphone", "system_audio"}
+    ):
+        return None
+    anchor_start_ms = _timing_ms(value.get("episode_anchor_start_ms"))
+    anchor_end_ms = _timing_ms(value.get("episode_anchor_end_ms"))
+    latest_start_ms = _timing_ms(value.get("episode_latest_start_ms"))
+    latest_end_ms = _timing_ms(value.get("episode_latest_end_ms"))
+    if (
+        anchor_start_ms is None
+        or anchor_end_ms is None
+        or latest_start_ms is None
+        or latest_end_ms is None
+        or anchor_end_ms < anchor_start_ms
+        or latest_end_ms < latest_start_ms
+        or latest_end_ms < anchor_start_ms
+    ):
+        return None
+    raw_speaker = value.get("episode_speaker")
+    speaker = (
+        str(raw_speaker).strip()[:160]
+        if raw_speaker is not None and str(raw_speaker).strip()
+        else None
+    )
+    speaker_key = _normalized_coach_episode_speaker_key(speaker)
+    provided_speaker_key = str(value.get("episode_speaker_key") or "").strip().lower()
+    if provided_speaker_key and provided_speaker_key != speaker_key:
+        return None
+    return {
+        "episode_id": episode_id,
+        "episode_anchor_id": anchor_id,
+        "episode_source_track": source_track,
+        "episode_speaker": speaker,
+        "episode_speaker_key": speaker_key,
+        "episode_anchor_start_ms": anchor_start_ms,
+        "episode_anchor_end_ms": anchor_end_ms,
+        "episode_latest_start_ms": latest_start_ms,
+        "episode_latest_end_ms": latest_end_ms,
+    }
+
+
+def _coach_episode_descriptors_are_contiguous(
+    left: Mapping[str, Any],
+    right: Mapping[str, Any],
+) -> bool:
+    """Match only the same source/speaker with overlapping or adjacent time."""
+
+    normalized_left = _normalized_coach_episode_descriptor(left)
+    normalized_right = _normalized_coach_episode_descriptor(right)
+    if normalized_left is None or normalized_right is None:
+        return False
+    if (
+        normalized_left["episode_source_track"]
+        != normalized_right["episode_source_track"]
+        or normalized_left["episode_speaker_key"]
+        != normalized_right["episode_speaker_key"]
+    ):
+        return False
+    # An empty speaker is not an identity. The current request can still group
+    # paragraphs whose shared anchor is visible, but durable cross-window
+    # inheritance must fail closed when diarization cannot establish a person.
+    if not normalized_left["episode_speaker_key"]:
+        return False
+    left_start = int(normalized_left["episode_anchor_start_ms"])
+    left_end = int(normalized_left["episode_latest_end_ms"])
+    right_start = int(normalized_right["episode_anchor_start_ms"])
+    right_end = int(normalized_right["episode_latest_end_ms"])
+    if left_end < right_start:
+        return right_start - left_end <= REALTIME_COACH_EPISODE_CONTIGUOUS_GAP_MS
+    if right_end < left_start:
+        return left_start - right_end <= REALTIME_COACH_EPISODE_CONTIGUOUS_GAP_MS
+    return True
+
+
+def _intelligence_timing_envelope(
+    job: Mapping[str, Any],
+    *,
+    decision_completed_at_ms: Any = None,
+    projected_at_ms: Any = None,
+) -> dict[str, Any]:
+    """Build the durable first-card timing chain and fail closed on bad data.
+
+    The envelope is deliberately derived only from timestamps owned by the
+    same job and evidence segment. Missing values, clock reversals, and
+    superseded work remain visible in ``invalid_reasons`` but never enter a
+    latency distribution.
+    """
+
+    raw_values = {
+        "final_committed_at_ms": job.get("final_committed_at_ms"),
+        "job_created_at_ms": job.get("job_created_at_ms", job.get("created_at_ms")),
+        "job_started_at_ms": job.get("job_started_at_ms"),
+        "decision_completed_at_ms": (
+            decision_completed_at_ms
+            if decision_completed_at_ms is not None
+            else job.get("decision_completed_at_ms")
+        ),
+        "projected_at_ms": (
+            projected_at_ms if projected_at_ms is not None else job.get("projected_at_ms")
+        ),
+    }
+    values = {key: _timing_ms(value) for key, value in raw_values.items()}
+    reasons: list[str] = []
+    for key, raw in raw_values.items():
+        if raw is not None and values[key] is None:
+            reasons.append(f"invalid_{key}")
+        elif values[key] is None:
+            reasons.append(f"missing_{key}")
+
+    ordered_fields = (
+        "job_created_at_ms",
+        "final_committed_at_ms",
+        "job_started_at_ms",
+        "decision_completed_at_ms",
+        "projected_at_ms",
+    )
+    for current_index, current in enumerate(ordered_fields):
+        current_value = values[current]
+        if current_value is None:
+            continue
+        for previous in ordered_fields[:current_index]:
+            previous_value = values[previous]
+            if previous_value is not None and current_value < previous_value:
+                reasons.append(f"{current}_before_{previous}")
+
+    superseded = (
+        str(job.get("status") or "") == "cancelled"
+        and str(job.get("error_class") or "").strip().casefold() == "evidence_superseded"
+    )
+    if superseded:
+        reasons.append("evidence_superseded")
+    reasons = list(dict.fromkeys(reasons))
+    valid = not reasons
+    final_to_projection_ms = (
+        values["projected_at_ms"] - values["final_committed_at_ms"]
+        if valid
+        and values["projected_at_ms"] is not None
+        and values["final_committed_at_ms"] is not None
+        else None
+    )
+    return {
+        "schema_version": INTELLIGENCE_TIMING_SCHEMA_VERSION,
+        "job_id": str(job.get("id") or "") or None,
+        "evidence_segment_id": str(job.get("evidence_segment_id") or "") or None,
+        **values,
+        "valid": valid,
+        "excluded": superseded,
+        "invalid_reasons": reasons,
+        "final_to_projection_ms": final_to_projection_ms,
+        # Keep the replay/tool vocabulary as a compatibility alias while the
+        # production contract uses the more explicit final_to_projection name.
+        "e2e_latency_ms": final_to_projection_ms,
+    }
+
+
+def intelligence_deadline_at_ms(finalized_at_ms: int) -> int:
+    """Return the one absolute realtime deadline for an intelligence turn.
+
+    ``finalized_at_ms`` is the durable commit time of the ASR final.  A
+    coalesced job intentionally retains this value rather than receiving a new
+    budget for each additional final, so continuous speech cannot postpone a
+    realtime decision indefinitely.
+    """
+
+    return max(0, int(finalized_at_ms)) + INTELLIGENCE_REALTIME_BUDGET_MS
+
+
+def intelligence_next_attempt_at_ms(
+    *,
+    now_ms: int,
+    deadline_at_ms: int,
+    debounce_ms: int = INTELLIGENCE_DEBOUNCE_MS,
+) -> int:
+    """Choose a debounce time without scheduling past a viable start.
+
+    A late final may arrive after the viable-start boundary; in that case the
+    job is claimable immediately.  The absolute deadline is never extended.
+    """
+
+    now_ms = max(0, int(now_ms))
+    deadline_at_ms = max(0, int(deadline_at_ms))
+    # Keep the public helper backwards compatible while allowing the live
+    # ``llm_first`` application to shorten only its coalescing window. The
+    # viable-start guard remains authoritative regardless of this hint.
+    debounce_ms = max(0, int(debounce_ms))
+    desired = now_ms + debounce_ms
+    latest_viable_start = deadline_at_ms - INTELLIGENCE_MIN_EXECUTION_BUDGET_MS
+    return max(now_ms, min(desired, latest_viable_start))
 
 
 def _validated_speaker_id(value: str | None) -> str | None:
@@ -329,11 +721,21 @@ def _public_job_error_message(value: Any) -> str | None:
         return None
     messages = {
         "ProviderRuntimeNotConfiguredDeferred": "AI 模型尚未连接，连接后可重试。",
+        "correction_provider_rates_not_configured": "转写精修未配置价格费率，已保留原始文字。",
+        "correction_provider_budget_exhausted": "转写精修预算已用尽，已保留原始文字。",
+        "correction_blocked_by_asr_quality": "转写质量未达到精修安全门槛，已保留原始文字。",
+        "degraded_asr_session": "实时转写链路存在质量降级，未执行精修，已保留原始文字。",
+        "CorrectionProviderPriorityDeferred": "实时教练优先处理中，转写精修将在其结束后继续。",
+        "CorrectionLaneCapacityDeferred": "转写精修通道正在处理其他精修任务，将在通道空闲后继续。",
         "provider_not_synced": "AI 配置尚未同步到本地运行时。",
         "provider_429": "AI 服务当前限流，请稍后重试。",
+        "provider_502": "AI 中转站暂时不可用，已保留原始文字。",
+        "provider_timeout": "AI 中转站响应超时，已保留原始文字。",
+        "provider_transport": "无法连接 AI 中转站，已保留原始文字。",
         "ConnectionError": "无法连接 AI 服务，请检查网络后重试。",
         "TimeoutError": "AI 服务响应超时，请重试。",
         "deadline_exceeded": "任务等待时间过长，已停止本轮处理。",
+        "meeting_ended": "会议已结束，未开始的实时教练任务已停止。",
         "job_failed": "本轮 AI 处理失败，原始录音和文字已保留。",
     }
     if error_class.startswith("intelligence_validation_"):
@@ -413,6 +815,29 @@ def _stable_id(prefix: str, *parts: str) -> str:
     return f"{prefix}_{digest}"
 
 
+def _normalized_realtime_provider_attempt_token(value: Any) -> str | None:
+    """Normalize the opaque token that fences one reservation attempt."""
+
+    normalized = str(value or "").strip()
+    if not normalized:
+        return None
+    if len(normalized) > 256:
+        raise ValueError("attempt_token must be at most 256 characters")
+    return normalized
+
+
+def _normalized_realtime_provider_attempt_generation(value: Any) -> int | None:
+    """Normalize a persisted reservation generation without accepting bools."""
+
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return normalized if normalized > 0 else None
+
+
 def transcript_evidence_hash(segment_id: str, normalized_text: str) -> str:
     """Return the canonical evidence identity for one transcript revision."""
 
@@ -463,6 +888,12 @@ class IntelligenceEvidenceSuperseded(IntelligenceProjectionError):
     superseded = True
 
 
+class IntelligenceDeadlineExceeded(IntelligenceProjectionError):
+    """An intelligence response arrived after its realtime usefulness window."""
+
+    superseded = True
+
+
 class ReviewDocumentConflict(RuntimeError):
     def __init__(self, *, expected_revision: int, current_document: Mapping[str, Any] | None) -> None:
         current_revision = int(current_document["revision"]) if current_document is not None else 0
@@ -497,11 +928,25 @@ class V2Persistence:
         database_path: str | Path,
         *,
         semantic_projection_mode: str = "legacy",
+        projection_clock_ms: Callable[[], int] | None = None,
+        intelligence_debounce_ms: int | None = None,
     ) -> None:
         normalized_semantic_projection_mode = str(semantic_projection_mode or "").strip().lower()
         if normalized_semantic_projection_mode not in {"legacy", "llm_first"}:
             raise ValueError("semantic_projection_mode must be legacy or llm_first")
         self.semantic_projection_mode = normalized_semantic_projection_mode
+        resolved_intelligence_debounce_ms = (
+            INTELLIGENCE_DEBOUNCE_MS
+            if intelligence_debounce_ms is None
+            else int(intelligence_debounce_ms)
+        )
+        if not 0 <= resolved_intelligence_debounce_ms <= INTELLIGENCE_DEBOUNCE_MS:
+            raise ValueError(
+                "intelligence_debounce_ms must be between 0 and "
+                f"{INTELLIGENCE_DEBOUNCE_MS}"
+            )
+        self.intelligence_debounce_ms = resolved_intelligence_debounce_ms
+        self._projection_clock_ms = projection_clock_ms
         self.database_path = Path(database_path).expanduser().resolve()
         ensure_private_directory(self.database_path.parent)
         self._lock = RLock()
@@ -559,6 +1004,770 @@ class V2Persistence:
                 if self._conn.in_transaction:
                     self._conn.execute("ROLLBACK")
                 raise
+
+    def transact_realtime_provider_circuit(
+        self,
+        identity_key: str,
+        mutation: Callable[
+            [dict[str, Any] | None],
+            tuple[Mapping[str, Any], Any],
+        ],
+    ) -> Any:
+        """Atomically read, mutate, and persist one Provider circuit row.
+
+        The synchronous callback runs while ``BEGIN IMMEDIATE`` owns SQLite's
+        write reservation. Half-open admission and permit completion therefore
+        share one compare-and-swap boundary across repository instances.
+        """
+
+        normalized_identity = str(identity_key or "").strip().lower()
+        if _REALTIME_PROVIDER_IDENTITY_PATTERN.fullmatch(normalized_identity) is None:
+            raise ValueError("realtime Provider identity must be a full SHA-256 digest")
+        if not callable(mutation):
+            raise TypeError("realtime Provider circuit mutation must be callable")
+
+        with self._write_transaction():
+            row = self._conn.execute(
+                "SELECT * FROM realtime_provider_circuits WHERE identity_key = ?",
+                (normalized_identity,),
+            ).fetchone()
+            next_state, result = mutation(dict(row) if row is not None else None)
+            if not isinstance(next_state, Mapping):
+                raise TypeError("realtime Provider circuit mutation must return a state mapping")
+            values = dict(next_state)
+            try:
+                parameters = [
+                    normalized_identity,
+                    *(values[column] for column in _REALTIME_PROVIDER_CIRCUIT_COLUMNS),
+                ]
+            except KeyError as exc:
+                raise ValueError(
+                    f"realtime Provider circuit state is missing {exc.args[0]}"
+                ) from exc
+            self._conn.execute(
+                "INSERT INTO realtime_provider_circuits ("
+                "identity_key, state, failure_count, last_failure_class, opened_at_ms, "
+                "open_until_ms, backoff_source, half_open_permit_token, "
+                "half_open_lease_until_ms, epoch, revision, updated_at_ms"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(identity_key) DO UPDATE SET "
+                "state = excluded.state, failure_count = excluded.failure_count, "
+                "last_failure_class = excluded.last_failure_class, "
+                "opened_at_ms = excluded.opened_at_ms, "
+                "open_until_ms = excluded.open_until_ms, "
+                "backoff_source = excluded.backoff_source, "
+                "half_open_permit_token = excluded.half_open_permit_token, "
+                "half_open_lease_until_ms = excluded.half_open_lease_until_ms, "
+                "epoch = excluded.epoch, revision = excluded.revision, "
+                "updated_at_ms = excluded.updated_at_ms",
+                parameters,
+            )
+        return result
+
+    @staticmethod
+    def _realtime_provider_attempt_token(
+        *,
+        meeting_id: str,
+        reservation_id: str,
+        job_id: str,
+        attempt_generation: int,
+        reserved_at_ms: int,
+        expires_at_ms: int,
+    ) -> str:
+        """Derive a stable opaque fence for one reservation lifecycle.
+
+        The generation is included in the digest so reusing an id after its
+        TTL always yields a different token, even when every other request
+        field is identical.  A deterministic token also lets a worker recover
+        the same active reservation after a response-loss/retry window.
+        """
+
+        return hashlib.sha256(
+            "\x1f".join(
+                (
+                    meeting_id,
+                    reservation_id,
+                    job_id,
+                    str(attempt_generation),
+                    str(reserved_at_ms),
+                    str(expires_at_ms),
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+
+    def _next_realtime_provider_attempt_generation_locked(
+        self,
+        meeting_id: str,
+        reservation_id: str,
+    ) -> int:
+        """Return the next lifecycle generation for one reusable id.
+
+        Older databases did not persist a generation. Counting their reserve
+        events keeps the first migrated attempt fenced as generation one and
+        still makes every subsequent reuse strictly newer.
+        """
+
+        rows = self._conn.execute(
+            "SELECT payload_json FROM meeting_events "
+            "WHERE meeting_id = ? AND type = ? ORDER BY seq",
+            (meeting_id, REALTIME_PROVIDER_RESERVATION_EVENT_TYPE),
+        ).fetchall()
+        generation = 0
+        reserve_count = 0
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, Mapping):
+                continue
+            if str(payload.get("reservation_id") or "").strip() != reservation_id:
+                continue
+            reserve_count += 1
+            parsed = _normalized_realtime_provider_attempt_generation(
+                payload.get("attempt_generation")
+            )
+            if parsed is not None:
+                generation = max(generation, parsed)
+        return max(generation, reserve_count) + 1
+
+    def _realtime_provider_reservation_states_locked(
+        self,
+        meeting_id: str,
+    ) -> dict[str, dict[str, Any]]:
+        """Replay reservation events into the latest state for each reservation."""
+
+        rows = self._conn.execute(
+            "SELECT seq, type, payload_json FROM meeting_events "
+            "WHERE meeting_id = ? AND type IN (?, ?) ORDER BY seq",
+            (
+                meeting_id,
+                REALTIME_PROVIDER_RESERVATION_EVENT_TYPE,
+                REALTIME_PROVIDER_RESERVATION_FINISHED_EVENT_TYPE,
+            ),
+        ).fetchall()
+        states: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, Mapping):
+                continue
+            reservation_id = str(payload.get("reservation_id") or "").strip()
+            if not reservation_id:
+                continue
+            if row["type"] == REALTIME_PROVIDER_RESERVATION_EVENT_TYPE:
+                if str(payload.get("status") or "reserved") != "reserved":
+                    continue
+                states[reservation_id] = {
+                    **dict(payload),
+                    "status": "reserved",
+                    "event_seq": int(row["seq"]),
+                }
+                continue
+            current = states.get(reservation_id)
+            try:
+                current_token = (
+                    _normalized_realtime_provider_attempt_token(current.get("attempt_token"))
+                    if isinstance(current, Mapping)
+                    else None
+                )
+                finish_token = _normalized_realtime_provider_attempt_token(
+                    payload.get("attempt_token")
+                )
+            except ValueError:
+                # A malformed historical payload must not make the entire
+                # meeting snapshot unreadable. Treat that finish as stale.
+                continue
+            # A reservation id may be reused after its TTL. A finish from the
+            # old provider call must never close the newer lifecycle. Legacy
+            # finish events without a token are accepted only while the latest
+            # lifecycle is also legacy; tokenized lifecycles are fenced.
+            if current_token is not None and finish_token != current_token:
+                continue
+            if current_token is None and finish_token is not None:
+                continue
+            current = dict(current or {})
+            current.update(
+                {
+                    "reservation_id": reservation_id,
+                    "status": str(payload.get("status") or "finished"),
+                    "finish_reason": str(payload.get("reason") or ""),
+                    "finished_at_ms": payload.get("finished_at_ms"),
+                    "event_seq": int(row["seq"]),
+                }
+            )
+            # Preserve the identifying fields even when a finish event is the
+            # only event visible after an interrupted migration.
+            for key in (
+                "job_id",
+                "episode_ids",
+                "episode_descriptors",
+                "candidate_keys",
+                "priority",
+                "reserved_at_ms",
+                "expires_at_ms",
+                "attempt_generation",
+                "attempt_token",
+                "superseded_by",
+            ):
+                if key in payload:
+                    current[key] = payload[key]
+            states[reservation_id] = current
+        return states
+
+    def _active_realtime_provider_reservations_locked(
+        self,
+        meeting_id: str,
+        *,
+        now_ms: int,
+    ) -> dict[str, dict[str, Any]]:
+        active: dict[str, dict[str, Any]] = {}
+        for reservation_id, payload in self._realtime_provider_reservation_states_locked(meeting_id).items():
+            if str(payload.get("status") or "") != "reserved":
+                continue
+            try:
+                expires_at_ms = int(payload.get("expires_at_ms"))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if expires_at_ms > now_ms:
+                active[reservation_id] = payload
+        return active
+
+    @staticmethod
+    def _public_realtime_provider_reservation(
+        payload: Mapping[str, Any],
+        *,
+        now_ms: int,
+    ) -> dict[str, Any]:
+        """Expose a bounded reservation view with a derived terminal state."""
+
+        result = {
+            key: payload.get(key)
+            for key in (
+                "reservation_id",
+                "job_id",
+                "episode_ids",
+                "candidate_keys",
+                "priority",
+                "attempt_generation",
+                "attempt_token",
+                "reserved_at_ms",
+                "expires_at_ms",
+                "finished_at_ms",
+                "finish_reason",
+                "superseded_by",
+                "event_seq",
+            )
+            if key in payload
+        }
+        status = str(payload.get("status") or "unknown")
+        result["status"] = status
+        result["active"] = status == "reserved"
+        result["expired"] = False
+        if status == "reserved":
+            try:
+                expires_at_ms = int(payload.get("expires_at_ms"))
+            except (TypeError, ValueError, OverflowError):
+                expires_at_ms = None
+            if expires_at_ms is not None and expires_at_ms <= now_ms:
+                result.update(
+                    {
+                        "status": "expired",
+                        "active": False,
+                        "expired": True,
+                        "finish_reason": str(payload.get("finish_reason") or "ttl_expired"),
+                    }
+                )
+        return result
+
+    def realtime_provider_reservation_snapshot(
+        self,
+        meeting_id: str,
+        *,
+        now_ms: int | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Return latest reservation state for the public read model.
+
+        The returned status is replay-derived, rather than copied from an
+        earlier ``coach_decision.provider_reservation`` envelope. In
+        particular, a finish event appended after ``meeting.intelligence.applied``
+        is visible immediately, and an un-finished reservation past its TTL is
+        reported as ``expired``.
+        """
+
+        meeting_id = _required(meeting_id, "meeting_id")
+        normalized_now_ms = (
+            max(0, int(now_ms))
+            if now_ms is not None
+            else time.time_ns() // 1_000_000
+        )
+        with self._lock:
+            states = self._realtime_provider_reservation_states_locked(meeting_id)
+            return {
+                reservation_id: self._public_realtime_provider_reservation(
+                    payload,
+                    now_ms=normalized_now_ms,
+                )
+                for reservation_id, payload in states.items()
+            }
+
+    @staticmethod
+    def _realtime_provider_reservation_ids(
+        values: Any,
+        *,
+        field: str,
+    ) -> list[str]:
+        if values is None:
+            return []
+        if isinstance(values, (str, bytes)):
+            values = [values]
+        try:
+            iterator = iter(values)
+        except TypeError as exc:
+            raise ValueError(f"{field} must be a sequence of strings") from exc
+        normalized: list[str] = []
+        for value in iterator:
+            item = str(value or "").strip()
+            if not item:
+                continue
+            if len(item) > 256:
+                raise ValueError(f"{field} values must be at most 256 characters")
+            if item not in normalized:
+                normalized.append(item)
+        return sorted(normalized)
+
+    def reserve_realtime_provider_attempt(
+        self,
+        *,
+        meeting_id: str,
+        job_id: str,
+        reservation_id: str,
+        episode_ids: Any,
+        episode_descriptors: Any = None,
+        candidate_keys: Any,
+        priority: int,
+        reserved_at_ms: int,
+        expires_at_ms: int,
+    ) -> dict[str, Any]:
+        """Atomically reserve a Pi attempt for a discourse episode.
+
+        Reservations are represented as ordinary meeting outbox events so they
+        survive a process restart without another schema migration. The
+        transaction replays the current reservation state before deciding, which
+        prevents two independent workers from both starting the same episode.
+        """
+
+        meeting_id = _required(meeting_id, "meeting_id")
+        job_id = _required(job_id, "job_id")
+        reservation_id = _required(reservation_id, "reservation_id")
+        if len(reservation_id) > 256:
+            raise ValueError("reservation_id must be at most 256 characters")
+        normalized_episode_ids = self._realtime_provider_reservation_ids(
+            episode_ids,
+            field="episode_ids",
+        )
+        normalized_candidate_keys = self._realtime_provider_reservation_ids(
+            candidate_keys,
+            field="candidate_keys",
+        )
+        if episode_descriptors is None:
+            normalized_episode_descriptors: list[dict[str, Any]] = []
+        elif isinstance(episode_descriptors, Mapping) or isinstance(
+            episode_descriptors, (str, bytes)
+        ):
+            raise ValueError("episode_descriptors must be a sequence of objects")
+        else:
+            try:
+                raw_episode_descriptors = list(episode_descriptors)
+            except TypeError as exc:
+                raise ValueError(
+                    "episode_descriptors must be a sequence of objects"
+                ) from exc
+            normalized_episode_descriptors = []
+            for raw_descriptor in raw_episode_descriptors:
+                descriptor = _normalized_coach_episode_descriptor(raw_descriptor)
+                if descriptor is None:
+                    raise ValueError("episode_descriptors contains an invalid descriptor")
+                if descriptor["episode_id"] not in normalized_episode_ids:
+                    raise ValueError(
+                        "episode_descriptors must reference one of episode_ids"
+                    )
+                if descriptor not in normalized_episode_descriptors:
+                    normalized_episode_descriptors.append(descriptor)
+            normalized_episode_descriptors.sort(
+                key=lambda item: (item["episode_id"], item["episode_anchor_start_ms"])
+            )
+        if not normalized_episode_ids and not normalized_candidate_keys:
+            raise ValueError("a realtime Provider reservation needs an episode or candidate key")
+        if isinstance(priority, bool):
+            raise ValueError("priority must be an integer")
+        try:
+            normalized_priority = int(priority)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("priority must be an integer") from exc
+        if normalized_priority < 0:
+            raise ValueError("priority must be non-negative")
+        normalized_reserved_at_ms = max(0, int(reserved_at_ms))
+        normalized_expires_at_ms = max(0, int(expires_at_ms))
+        if normalized_expires_at_ms <= normalized_reserved_at_ms:
+            raise ValueError("expires_at_ms must be after reserved_at_ms")
+        if normalized_expires_at_ms - normalized_reserved_at_ms > MAX_REALTIME_PROVIDER_RESERVATION_TTL_MS:
+            raise ValueError(
+                f"realtime Provider reservation TTL must be at most {MAX_REALTIME_PROVIDER_RESERVATION_TTL_MS}ms"
+            )
+
+        requested_payload = {
+            "reservation_id": reservation_id,
+            "job_id": job_id,
+            "episode_ids": normalized_episode_ids,
+            "episode_descriptors": normalized_episode_descriptors,
+            "candidate_keys": normalized_candidate_keys,
+            "priority": normalized_priority,
+            "reserved_at_ms": normalized_reserved_at_ms,
+            "expires_at_ms": normalized_expires_at_ms,
+            "status": "reserved",
+        }
+
+        with self._write_transaction():
+            self._raise_if_tombstoned_locked(meeting_id)
+            if self._conn.execute("SELECT 1 FROM meetings WHERE id = ?", (meeting_id,)).fetchone() is None:
+                raise KeyError(f"meeting not found: {meeting_id}")
+            now_ms = normalized_reserved_at_ms
+            active = self._active_realtime_provider_reservations_locked(
+                meeting_id,
+                now_ms=now_ms,
+            )
+            existing = active.get(reservation_id)
+            if existing is not None:
+                if str(existing.get("job_id") or "") != job_id:
+                    raise ValueError("reservation_id is already owned by another job")
+                try:
+                    existing_priority = int(existing.get("priority") or 0)
+                except (TypeError, ValueError, OverflowError):
+                    existing_priority = 0
+                # A retry of the same job is idempotent. A higher-priority
+                # retry is allowed to replace the payload and extend its TTL.
+                if normalized_priority <= existing_priority:
+                    return {
+                        **dict(existing),
+                        "reserved": True,
+                        "idempotent": True,
+                        "conflict": None,
+                    }
+
+            # Allocate a new lifecycle fence only after the idempotent retry
+            # path above. This keeps retries stable while ensuring a TTL reuse
+            # (or a higher-priority replacement) cannot share the old token.
+            attempt_generation = self._next_realtime_provider_attempt_generation_locked(
+                meeting_id,
+                reservation_id,
+            )
+            requested_payload.update(
+                {
+                    "attempt_generation": attempt_generation,
+                    "attempt_token": self._realtime_provider_attempt_token(
+                        meeting_id=meeting_id,
+                        reservation_id=reservation_id,
+                        job_id=job_id,
+                        attempt_generation=attempt_generation,
+                        reserved_at_ms=normalized_reserved_at_ms,
+                        expires_at_ms=normalized_expires_at_ms,
+                    ),
+                }
+            )
+
+            for other_id, other in active.items():
+                if other_id == reservation_id:
+                    continue
+                if str(other.get("job_id") or "") == job_id:
+                    return {
+                        **dict(other),
+                        "reserved": True,
+                        "idempotent": True,
+                        "conflict": None,
+                    }
+            requested_episodes = set(normalized_episode_ids)
+            requested_candidates = set(normalized_candidate_keys)
+            superseded: list[dict[str, Any]] = []
+            if existing is not None:
+                # This is a higher-priority retry of the same reservation id.
+                # Emit an explicit finish before the replacement reserve event
+                # so replay can distinguish both lifecycles.
+                superseded.append(
+                    {
+                        "reservation_id": reservation_id,
+                        "job_id": str(existing.get("job_id") or ""),
+                        "priority": int(existing.get("priority") or 0),
+                        "attempt_generation": existing.get("attempt_generation"),
+                        "attempt_token": existing.get("attempt_token"),
+                    }
+                )
+            for other_id, other in active.items():
+                if other_id == reservation_id:
+                    continue
+                other_episodes = {
+                    str(item).strip()
+                    for item in (other.get("episode_ids") or [])
+                    if str(item).strip()
+                }
+                other_candidates = {
+                    str(item).strip()
+                    for item in (other.get("candidate_keys") or [])
+                    if str(item).strip()
+                }
+                other_descriptors = [
+                    descriptor
+                    for raw_descriptor in (other.get("episode_descriptors") or [])
+                    if (
+                        descriptor := _normalized_coach_episode_descriptor(
+                            raw_descriptor
+                        )
+                    )
+                    is not None
+                ]
+                descriptors_overlap = any(
+                    _coach_episode_descriptors_are_contiguous(requested, existing)
+                    for requested in normalized_episode_descriptors
+                    for existing in other_descriptors
+                )
+                if not (
+                    requested_episodes.intersection(other_episodes)
+                    or requested_candidates.intersection(other_candidates)
+                    or descriptors_overlap
+                ):
+                    continue
+                try:
+                    other_priority = int(other.get("priority") or 0)
+                except (TypeError, ValueError, OverflowError):
+                    other_priority = 0
+                if other_priority >= normalized_priority:
+                    return {
+                        **requested_payload,
+                        "reserved": False,
+                        "idempotent": False,
+                        "reason": "realtime_provider_episode_reserved",
+                        "conflict": {
+                            "reservation_id": other_id,
+                            "job_id": str(other.get("job_id") or ""),
+                            "priority": other_priority,
+                            "expires_at_ms": other.get("expires_at_ms"),
+                        },
+                    }
+                superseded.append(
+                    {
+                        "reservation_id": other_id,
+                        "job_id": str(other.get("job_id") or ""),
+                        "priority": other_priority,
+                        "attempt_generation": other.get("attempt_generation"),
+                        "attempt_token": other.get("attempt_token"),
+                    }
+                )
+
+            # A stronger candidate may upgrade the episode. Finish lower
+            # priority reservations in this same transaction before publishing
+            # the new reservation event.
+            for other in superseded:
+                old_id = str(other["reservation_id"])
+                finish_reason = f"superseded_by:{reservation_id}"
+                finish_key_digest = hashlib.sha256(
+                    "\x1f".join(
+                        (
+                            old_id,
+                            finish_reason,
+                            str(other.get("attempt_generation") or ""),
+                            str(other.get("attempt_token") or ""),
+                        )
+                    ).encode("utf-8")
+                ).hexdigest()[:24]
+                self._append_event_locked(
+                    meeting_id=meeting_id,
+                    event_type=REALTIME_PROVIDER_RESERVATION_FINISHED_EVENT_TYPE,
+                    aggregate_type="realtime_provider_reservation",
+                    aggregate_id=old_id,
+                    occurred_at_ms=normalized_reserved_at_ms,
+                    idempotency_key=f"realtime_provider.reservation_finished:{old_id}:{finish_key_digest}",
+                    payload={
+                        "reservation_id": old_id,
+                        "job_id": str(other["job_id"]),
+                        "status": "superseded",
+                        "reason": finish_reason,
+                        "superseded_by": reservation_id,
+                        "finished_at_ms": normalized_reserved_at_ms,
+                        **(
+                            {"attempt_generation": other["attempt_generation"]}
+                            if other.get("attempt_generation") is not None
+                            else {}
+                        ),
+                        **(
+                            {"attempt_token": other["attempt_token"]}
+                            if other.get("attempt_token")
+                            else {}
+                        ),
+                    },
+                    correlation_id=job_id,
+                    causation_id=reservation_id,
+                )
+
+            payload_digest = hashlib.sha256(_json_dump(requested_payload).encode("utf-8")).hexdigest()[:24]
+            self._append_event_locked(
+                meeting_id=meeting_id,
+                event_type=REALTIME_PROVIDER_RESERVATION_EVENT_TYPE,
+                aggregate_type="realtime_provider_reservation",
+                aggregate_id=reservation_id,
+                occurred_at_ms=normalized_reserved_at_ms,
+                idempotency_key=f"realtime_provider.reservation:{reservation_id}:{payload_digest}",
+                payload=requested_payload,
+                correlation_id=meeting_id,
+                causation_id=job_id,
+            )
+        return {
+            **requested_payload,
+            "reserved": True,
+            "idempotent": False,
+            "conflict": None,
+        }
+
+    def finish_realtime_provider_attempt(
+        self,
+        *,
+        meeting_id: str,
+        reservation_id: str,
+        status: str,
+        reason: str | None = None,
+        attempt_token: str | None = None,
+        attempt_generation: int | None = None,
+        finished_at_ms: int,
+    ) -> dict[str, Any]:
+        """Commit or release a prior reservation exactly once.
+
+        ``attempt_token`` is the compare-and-swap fence returned by
+        :meth:`reserve_realtime_provider_attempt`. It is optional only for
+        backwards compatibility with pre-fence callers; new callers must pass
+        it so a late completion cannot finish a newer TTL-reused reservation.
+        """
+
+        meeting_id = _required(meeting_id, "meeting_id")
+        reservation_id = _required(reservation_id, "reservation_id")
+        normalized_status = _required(status, "status").strip().lower()
+        if normalized_status not in {"committed", "released", "superseded", "expired"}:
+            raise ValueError("reservation finish status is invalid")
+        normalized_reason = str(reason or "").strip()[:256]
+        normalized_attempt_token = _normalized_realtime_provider_attempt_token(attempt_token)
+        normalized_attempt_generation = _normalized_realtime_provider_attempt_generation(
+            attempt_generation
+        )
+        if attempt_generation is not None and normalized_attempt_generation is None:
+            raise ValueError("attempt_generation must be a positive integer")
+        normalized_finished_at_ms = max(0, int(finished_at_ms))
+        with self._write_transaction():
+            self._raise_if_tombstoned_locked(meeting_id)
+            if self._conn.execute("SELECT 1 FROM meetings WHERE id = ?", (meeting_id,)).fetchone() is None:
+                raise KeyError(f"meeting not found: {meeting_id}")
+            states = self._realtime_provider_reservation_states_locked(meeting_id)
+            current = states.get(reservation_id)
+            if current is None:
+                result = {
+                    "reservation_id": reservation_id,
+                    "status": "unknown",
+                    "finished": False,
+                    "idempotent": True,
+                }
+                if normalized_attempt_token is not None:
+                    result.update(
+                        {
+                            "stale": True,
+                            "ignored": True,
+                            "reason": "reservation_attempt_unknown",
+                        }
+                    )
+                return result
+            try:
+                current_token = _normalized_realtime_provider_attempt_token(
+                    current.get("attempt_token")
+                )
+            except ValueError:
+                current_token = None
+            current_generation = _normalized_realtime_provider_attempt_generation(
+                current.get("attempt_generation")
+            )
+            if (
+                normalized_attempt_token is None
+                and normalized_attempt_generation is None
+                and current_token is not None
+                and current_generation is not None
+                and current_generation > 1
+            ):
+                # Once an id has been reused, a legacy tokenless completion is
+                # inherently ambiguous. Reject it rather than allowing an old
+                # worker to close the newer lifecycle. Generation one remains
+                # compatible with callers written before the fence existed.
+                return {
+                    **dict(current),
+                    "finished": False,
+                    "idempotent": True,
+                    "stale": True,
+                    "ignored": True,
+                    "reason": "reservation_attempt_token_required",
+                }
+            if normalized_attempt_token is not None and normalized_attempt_token != current_token:
+                return {
+                    **dict(current),
+                    "finished": False,
+                    "idempotent": True,
+                    "stale": True,
+                    "ignored": True,
+                    "reason": "reservation_attempt_mismatch",
+                }
+            if (
+                normalized_attempt_generation is not None
+                and current_generation is not None
+                and normalized_attempt_generation != current_generation
+            ):
+                return {
+                    **dict(current),
+                    "finished": False,
+                    "idempotent": True,
+                    "stale": True,
+                    "ignored": True,
+                    "reason": "reservation_attempt_mismatch",
+                }
+            if str(current.get("status") or "") != "reserved":
+                return {
+                    **dict(current),
+                    "finished": True,
+                    "idempotent": True,
+                }
+            payload = {
+                "reservation_id": reservation_id,
+                "job_id": str(current.get("job_id") or ""),
+                "status": normalized_status,
+                "reason": normalized_reason,
+                "finished_at_ms": normalized_finished_at_ms,
+            }
+            if current_generation is not None:
+                payload["attempt_generation"] = current_generation
+            if current_token is not None:
+                payload["attempt_token"] = current_token
+            finish_digest = hashlib.sha256(_json_dump(payload).encode("utf-8")).hexdigest()[:24]
+            self._append_event_locked(
+                meeting_id=meeting_id,
+                event_type=REALTIME_PROVIDER_RESERVATION_FINISHED_EVENT_TYPE,
+                aggregate_type="realtime_provider_reservation",
+                aggregate_id=reservation_id,
+                occurred_at_ms=normalized_finished_at_ms,
+                idempotency_key=f"realtime_provider.reservation_finished:{reservation_id}:{finish_digest}",
+                payload=payload,
+                correlation_id=meeting_id,
+                causation_id=reservation_id,
+            )
+        return {
+            **dict(current),
+            **payload,
+            "finished": True,
+            "idempotent": False,
+        }
 
     def _next_event_seq_locked(self, meeting_id: str) -> int:
         return int(
@@ -2525,6 +3734,29 @@ class V2Persistence:
                     causation_id=causation_id,
                 )
                 if duplicate_of_segment_id is None:
+                    coverage_status = "pending"
+                    coverage_reason = None
+                else:
+                    coverage_status = "excluded"
+                    coverage_reason = "source_duplicate"
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO intelligence_input_coverage ("
+                    "meeting_id, event_seq, segment_id, revision, status, failure_reason, "
+                    "input_transcript_seq, input_text_hash, created_at_ms, updated_at_ms"
+                    ") VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
+                    (
+                        meeting_id,
+                        event_seq,
+                        segment_id,
+                        coverage_status,
+                        coverage_reason,
+                        transcript_seq,
+                        evidence_hash,
+                        now_ms,
+                        now_ms,
+                    ),
+                )
+                if duplicate_of_segment_id is None:
                     self._update_meeting_state_locked(
                         meeting_id=meeting_id,
                         segments=[payload],
@@ -2592,8 +3824,18 @@ class V2Persistence:
                         raise RuntimeError("LLM-first intelligence requires a semantic paragraph")
                     paragraph_id = str(paragraph_projection["paragraph_id"])
                     paragraph_revision = int(paragraph_projection["revision"])
+                    # Older databases may have intelligence rows created before
+                    # absolute deadlines were introduced. Backfill those rows
+                    # from their original creation time before deciding whether
+                    # a new final can coalesce into them.
+                    self._conn.execute(
+                        "UPDATE jobs SET deadline_at_ms = created_at_ms + ? "
+                        "WHERE meeting_id = ? AND kind = 'intelligence' "
+                        "AND deadline_at_ms IS NULL",
+                        (INTELLIGENCE_REALTIME_BUDGET_MS, meeting_id),
+                    )
                     recent_jobs = self._conn.execute(
-                        "SELECT id, status, input_transcript_seq FROM jobs "
+                        "SELECT id, status, input_transcript_seq, deadline_at_ms, created_at_ms FROM jobs "
                         "WHERE meeting_id = ? AND kind = 'intelligence' "
                         "ORDER BY input_transcript_seq DESC, created_at_ms DESC, id DESC LIMIT 2",
                         (meeting_id,),
@@ -2618,6 +3860,8 @@ class V2Persistence:
                         if latest_job is not None
                         and not latest_has_applied_event
                         and str(latest_job["status"]) in {"pending", "retry_wait"}
+                        and latest_job["deadline_at_ms"] is not None
+                        and int(latest_job["deadline_at_ms"]) > now_ms
                         and transcript_seq - previous_batch_end <= INTELLIGENCE_MAX_BATCH_SEGMENTS
                         else None
                     )
@@ -2629,6 +3873,13 @@ class V2Persistence:
                             meeting_id,
                             paragraph_id,
                             str(paragraph_revision),
+                            # A settled intelligence job must never absorb a
+                            # later final just because the semantic paragraph
+                            # revision is unchanged. Reuse the prior ID only
+                            # for an actually coalescible pending job above;
+                            # once it has settled, final_id makes the new
+                            # durable turn independently addressable.
+                            final_id,
                             "intelligence",
                         )
                     )
@@ -2636,12 +3887,16 @@ class V2Persistence:
                         (
                             "intelligence",
                             intelligence_job_id,
-                            110,
+                            120,
                             f"intelligence:{meeting_id}:{paragraph_id}:{paragraph_revision}",
                             paragraph_revision,
                         )
                     )
-                    job_specs.append(("correction", correction_job_id, 120, None, transcript_seq))
+                    # Keep realtime intelligence ahead of live correction in
+                    # the durable metadata as well as at handler admission.
+                    # The executor currently claims lanes independently, so
+                    # the app-level priority gate remains authoritative.
+                    job_specs.append(("correction", correction_job_id, 80, None, transcript_seq))
                 else:
                     job_specs.extend(
                         (
@@ -2650,15 +3905,41 @@ class V2Persistence:
                         )
                     )
                 for kind, job_id, priority, job_generation_id, input_version in job_specs:
-                    next_attempt_at_ms = now_ms + INTELLIGENCE_DEBOUNCE_MS if kind == "intelligence" else now_ms
-                    deadline_at_ms = None
+                    # The budget starts when ASR committed the first final for
+                    # this job. Coalescing later finals must never move it.
+                    deadline_at_ms = (
+                        intelligence_deadline_at_ms(now_ms)
+                        if kind == "intelligence"
+                        else None
+                    )
+                    existing_deadline_at_ms: int | None = None
+                    if kind == "intelligence" and coalescible_job is not None:
+                        existing_deadline_at_ms = (
+                            int(coalescible_job["deadline_at_ms"])
+                            if coalescible_job["deadline_at_ms"] is not None
+                            else intelligence_deadline_at_ms(int(coalescible_job["created_at_ms"]))
+                        )
+                    effective_deadline_at_ms = (
+                        existing_deadline_at_ms
+                        if existing_deadline_at_ms is not None
+                        else deadline_at_ms
+                    )
+                    next_attempt_at_ms = (
+                        intelligence_next_attempt_at_ms(
+                            now_ms=now_ms,
+                            deadline_at_ms=int(effective_deadline_at_ms),
+                            debounce_ms=self.intelligence_debounce_ms,
+                        )
+                        if kind == "intelligence"
+                        else now_ms
+                    )
                     self._conn.execute(
                         "INSERT OR IGNORE INTO jobs ("
                         "id, meeting_id, kind, status, priority, input_transcript_seq, "
                         "input_version, evidence_segment_id, evidence_hash, generation_id, "
                         "idempotency_key, attempts, max_attempts, next_attempt_at_ms, "
-                        "deadline_at_ms, created_at_ms, updated_at_ms"
-                        ") VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)",
+                        "deadline_at_ms, final_committed_at_ms, created_at_ms, updated_at_ms"
+                        ") VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)",
                         (
                             job_id,
                             meeting_id,
@@ -2673,15 +3954,24 @@ class V2Persistence:
                             max_attempts,
                             next_attempt_at_ms,
                             deadline_at_ms,
+                            now_ms if kind == "intelligence" else None,
                             now_ms,
                             now_ms,
                         ),
                     )
                     if kind == "intelligence":
+                        # A replay of an already committed final is idempotent:
+                        # it must not move the original evidence clock or wake
+                        # a job that the first commit already scheduled.
+                        if not created:
+                            continue
                         self._conn.execute(
                             "UPDATE jobs SET input_transcript_seq = ?, input_version = ?, "
                             "evidence_segment_id = ?, evidence_hash = ?, generation_id = ?, "
-                            "next_attempt_at_ms = ?, deadline_at_ms = NULL, updated_at_ms = ? "
+                            "next_attempt_at_ms = ?, deadline_at_ms = COALESCE(deadline_at_ms, ?), "
+                            "final_committed_at_ms = COALESCE(final_committed_at_ms, ?), "
+                            "job_started_at_ms = NULL, decision_completed_at_ms = NULL, "
+                            "projected_at_ms = NULL, updated_at_ms = ? "
                             "WHERE id = ? AND status IN ('pending', 'retry_wait')",
                             (
                                 transcript_seq,
@@ -2690,6 +3980,8 @@ class V2Persistence:
                                 evidence_hash,
                                 job_generation_id,
                                 next_attempt_at_ms,
+                                effective_deadline_at_ms,
+                                now_ms,
                                 now_ms,
                                 job_id,
                             ),
@@ -2717,6 +4009,149 @@ class V2Persistence:
                 else {}
             ),
         }
+
+    def enqueue_user_coach_request(
+        self,
+        *,
+        meeting_id: str,
+        user_request: str,
+        idempotency_key: str,
+        now_ms: int,
+    ) -> dict[str, Any]:
+        """Persist one explicit live-meeting coach request over current evidence."""
+
+        meeting_id = _required(meeting_id, "meeting_id")
+        user_request = " ".join(str(user_request or "").split())
+        if not user_request:
+            raise ValueError("user_request must not be empty")
+        if len(user_request) > 4_000:
+            raise ValueError("user_request must not exceed 4000 characters")
+        idempotency_key = _required(idempotency_key, "idempotency_key")
+        if len(idempotency_key) > 240 or any(ord(character) < 32 for character in idempotency_key):
+            raise ValueError("idempotency_key is invalid")
+        now_ms = max(0, int(now_ms))
+        if self.semantic_projection_mode != "llm_first":
+            raise ValueError("realtime coach requires llm_first semantic projection")
+        with self._write_transaction():
+            meeting = self._conn.execute(
+                "SELECT state FROM meetings WHERE id = ?", (meeting_id,)
+            ).fetchone()
+            if meeting is None:
+                raise KeyError(f"meeting not found: {meeting_id}")
+            if str(meeting["state"]) != "live":
+                raise ValueError("meeting is not live")
+            existing = self._conn.execute(
+                "SELECT * FROM jobs WHERE idempotency_key = ? LIMIT 1",
+                (idempotency_key,),
+            ).fetchone()
+            if existing is not None:
+                if str(existing["meeting_id"]) != meeting_id or str(existing["kind"]) != "intelligence":
+                    raise ValueError("idempotency_key is already used by another job")
+                return self._job_dict(existing)
+            latest = self._conn.execute(
+                "SELECT * FROM transcript_segments WHERE meeting_id = ? "
+                "AND duplicate_of_segment_id IS NULL ORDER BY transcript_seq DESC LIMIT 1",
+                (meeting_id,),
+            ).fetchone()
+            if latest is None:
+                raise ValueError("当前会议还没有可供教练分析的文字")
+            paragraph = self._conn.execute(
+                "SELECT paragraph.revision FROM semantic_paragraph_checkpoints mapping "
+                "JOIN semantic_paragraphs paragraph ON paragraph.meeting_id = mapping.meeting_id "
+                "AND paragraph.paragraph_id = mapping.paragraph_id "
+                "WHERE mapping.meeting_id = ? AND mapping.checkpoint_id = ?",
+                (meeting_id, latest["segment_id"]),
+            ).fetchone()
+            if paragraph is None:
+                raise ValueError("当前会议文字尚未形成可验证的语义段落")
+            request_hash = hashlib.sha256(user_request.encode("utf-8")).hexdigest()[:24]
+            job_id = _stable_id("job", meeting_id, "user_request", idempotency_key)
+            generation_id = f"user-request:{meeting_id}:{request_hash}"
+            deadline_at_ms = intelligence_deadline_at_ms(now_ms)
+            self._conn.execute(
+                "INSERT INTO jobs ("
+                "id, meeting_id, kind, status, priority, input_transcript_seq, input_version, "
+                "evidence_segment_id, evidence_hash, generation_id, trigger_type, work_item_id, "
+                "trigger_reference_seq, user_request, idempotency_key, attempts, max_attempts, "
+                "next_attempt_at_ms, deadline_at_ms, final_committed_at_ms, created_at_ms, updated_at_ms"
+                ") VALUES (?, ?, 'intelligence', 'pending', 130, ?, ?, ?, ?, ?, 'user_request', ?, ?, ?, ?, 0, 3, ?, ?, ?, ?, ?)",
+                (
+                    job_id,
+                    meeting_id,
+                    int(latest["transcript_seq"]),
+                    int(paragraph["revision"]),
+                    str(latest["segment_id"]),
+                    str(latest["evidence_hash"]),
+                    generation_id,
+                    job_id,
+                    int(latest["transcript_seq"]),
+                    user_request,
+                    idempotency_key,
+                    now_ms,
+                    deadline_at_ms,
+                    now_ms,
+                    now_ms,
+                    now_ms,
+                ),
+            )
+            row = self._conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            return self._job_dict(row)
+
+    @staticmethod
+    def _intelligence_input_coverage_dict(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "meeting_id": row["meeting_id"],
+            "event_seq": int(row["event_seq"]),
+            "segment_id": row["segment_id"],
+            "revision": int(row["revision"]),
+            "status": row["status"],
+            "run_id": row["run_id"],
+            "failure_reason": row["failure_reason"],
+            "input_transcript_seq": int(row["input_transcript_seq"]),
+            "input_text_hash": row["input_text_hash"],
+            "created_at_ms": int(row["created_at_ms"]),
+            "updated_at_ms": int(row["updated_at_ms"]),
+        }
+
+    def list_intelligence_input_coverage(self, meeting_id: str) -> list[dict[str, Any]]:
+        meeting_id = _required(meeting_id, "meeting_id")
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM intelligence_input_coverage WHERE meeting_id = ? "
+                "ORDER BY event_seq", (meeting_id,)
+            ).fetchall()
+        return [self._intelligence_input_coverage_dict(row) for row in rows]
+
+    def update_intelligence_input_coverage_for_job(
+        self,
+        *,
+        job_id: str,
+        status: str,
+        now_ms: int,
+        run_id: str | None = None,
+        failure_reason: str | None = None,
+    ) -> int:
+        job_id = _required(job_id, "job_id")
+        allowed = {"in_flight", "processed", "retryable_error", "terminal_error"}
+        if status not in allowed:
+            raise ValueError("unsupported intelligence input coverage status")
+        now_ms = max(0, int(now_ms))
+        with self._write_transaction():
+            job = self._conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            if job is None or str(job["kind"]) != "intelligence":
+                return 0
+            segment_ids = self._job_evidence_segment_ids_locked(job)
+            if not segment_ids:
+                return 0
+            placeholders = ",".join("?" for _ in segment_ids)
+            params: list[Any] = [status, run_id, failure_reason, now_ms, str(job["meeting_id"]), *segment_ids]
+            result = self._conn.execute(
+                "UPDATE intelligence_input_coverage SET status = ?, run_id = COALESCE(?, run_id), "
+                "failure_reason = ?, updated_at_ms = ? WHERE meeting_id = ? AND segment_id IN ("
+                + placeholders + ") AND status NOT IN ('excluded', 'processed')",
+                params,
+            )
+        return int(result.rowcount)
 
     def _job_evidence_segment_ids_locked(self, job_row: sqlite3.Row) -> list[str]:
         evidence_segment_id = str(job_row["evidence_segment_id"])
@@ -2816,34 +4251,66 @@ class V2Persistence:
 
         with self._write_transaction():
             self._recover_expired_leases_locked(now_ms)
-            if lane == "intelligence":
+            if lane in {"intelligence", "pi_deep"}:
                 # Intelligence work is useful only inside its bounded realtime
                 # window. Do not replay an old backlog when a Provider is
                 # configured hours later.
+                # Backfill rows created before ``deadline_at_ms`` was added so
+                # legacy pending work is subject to the same cancellation
+                # barrier as newly committed finals.
+                self._conn.execute(
+                    "UPDATE jobs SET deadline_at_ms = created_at_ms + ? "
+                    "WHERE kind = 'intelligence' AND deadline_at_ms IS NULL",
+                    (INTELLIGENCE_REALTIME_BUDGET_MS,),
+                )
                 self._conn.execute(
                     "UPDATE jobs SET status = 'cancelled', lease_owner = NULL, "
                     "lease_until_ms = NULL, error_class = 'deadline_exceeded', "
                     "completed_at_ms = COALESCE(completed_at_ms, ?), updated_at_ms = ? "
                     "WHERE kind = 'intelligence' "
                     "AND status IN ('pending', 'retry_wait') "
-                    "AND deadline_at_ms IS NOT NULL AND deadline_at_ms < ?",
+                    "AND deadline_at_ms IS NOT NULL AND deadline_at_ms <= ?",
                     (now_ms, now_ms, now_ms),
                 )
+            # Review derivations also carry a durable deadline.  Close rows
+            # that expired while no consumer was available so a restart cannot
+            # leave the meeting projection permanently in an active state.
+            self._conn.execute(
+                "UPDATE jobs SET status = 'cancelled', lease_owner = NULL, "
+                "lease_until_ms = NULL, error_class = 'deadline_exceeded', "
+                "completed_at_ms = COALESCE(completed_at_ms, ?), updated_at_ms = ? "
+                "WHERE kind IN ('minutes', 'approach', 'index') "
+                "AND status IN ('pending', 'retry_wait') "
+                "AND deadline_at_ms IS NOT NULL AND deadline_at_ms <= ?",
+                (now_ms, now_ms, now_ms),
+            )
+            if lane == "pi_deep":
+                kind = "intelligence"
+                trigger_filter = "AND trigger_type IN ('task_due', 'user_request')"
+            elif lane == "intelligence":
+                kind = "intelligence"
+                trigger_filter = "AND (trigger_type IS NULL OR trigger_type NOT IN ('task_due', 'user_request'))"
+            else:
+                kind = lane
+                trigger_filter = ""
             candidate = self._conn.execute(
                 "SELECT id FROM jobs "
                 "WHERE kind = ? "
+                + trigger_filter + " "
                 "AND status IN ('pending', 'retry_wait') "
                 "AND next_attempt_at_ms <= ? "
+                "AND (deadline_at_ms IS NULL OR deadline_at_ms > ?) "
                 "AND attempts < max_attempts "
                 "ORDER BY priority DESC, next_attempt_at_ms, created_at_ms, id "
                 "LIMIT 1",
-                (lane, now_ms),
+                (kind, now_ms, now_ms),
             ).fetchone()
             if candidate is None:
                 return None
             result = self._conn.execute(
                 "UPDATE jobs SET status = 'running', attempts = attempts + 1, "
-                "lease_owner = ?, lease_until_ms = ?, error_class = NULL, updated_at_ms = ? "
+                "lease_owner = ?, lease_until_ms = ?, error_class = NULL, "
+                "job_started_at_ms = ?, updated_at_ms = ? "
                 "WHERE id = ? "
                 "AND status IN ('pending', 'retry_wait') "
                 "AND next_attempt_at_ms <= ? "
@@ -2851,6 +4318,7 @@ class V2Persistence:
                 (
                     worker_id,
                     now_ms + lease_ms,
+                    now_ms,
                     now_ms,
                     candidate["id"],
                     now_ms,
@@ -2928,8 +4396,8 @@ class V2Persistence:
                 "id, meeting_id, kind, status, priority, input_transcript_seq, "
                 "input_version, evidence_segment_id, evidence_hash, generation_id, "
                 "idempotency_key, attempts, max_attempts, next_attempt_at_ms, "
-                "deadline_at_ms, created_at_ms, updated_at_ms"
-                ") VALUES (?, ?, 'intelligence', 'pending', 110, ?, ?, ?, ?, NULL, ?, 0, 3, ?, NULL, ?, ?)",
+                "deadline_at_ms, final_committed_at_ms, created_at_ms, updated_at_ms"
+                ") VALUES (?, ?, 'intelligence', 'pending', 110, ?, ?, ?, ?, NULL, ?, 0, 3, ?, ?, ?, ?, ?)",
                 (
                     job_id,
                     meeting_id,
@@ -2941,7 +4409,160 @@ class V2Persistence:
                         f"intelligence-refresh:{meeting_id}:{latest['segment_id']}:"
                         f"{latest['evidence_hash']}:{paragraph['revision']}"
                     ),
-                    now_ms + INTELLIGENCE_DEBOUNCE_MS,
+                    intelligence_next_attempt_at_ms(
+                        now_ms=now_ms,
+                        deadline_at_ms=intelligence_deadline_at_ms(now_ms),
+                        debounce_ms=self.intelligence_debounce_ms,
+                    ),
+                    intelligence_deadline_at_ms(now_ms),
+                    now_ms,
+                    now_ms,
+                    now_ms,
+                ),
+            )
+            row = self._conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            return self._job_dict(row) if row is not None else None
+
+    def enqueue_due_coach_refresh(
+        self,
+        *,
+        meeting_id: str,
+        decision_id: str,
+        now_ms: int,
+    ) -> dict[str, Any] | None:
+        """Enqueue one due coach item with or without newer transcript.
+
+        The durable decision event is the work-item record. This method keeps
+        the scheduler idempotent across ticks and process restarts, and never
+        manufactures a new paragraph merely to satisfy a model request. The
+        trigger reference sequence separates persisted task evidence from any
+        genuinely newer transcript that may be evaluated by the worker.
+        """
+        meeting_id = _required(meeting_id, "meeting_id")
+        decision_id = _required(decision_id, "decision_id")
+        now_ms = max(0, int(now_ms))
+        if self.semantic_projection_mode != "llm_first":
+            return None
+        with self._write_transaction():
+            meeting = self._conn.execute(
+                "SELECT state FROM meetings WHERE id = ?", (meeting_id,)
+            ).fetchone()
+            if meeting is None or meeting["state"] != "live":
+                return None
+            rows = self._conn.execute(
+                "SELECT seq, payload_json FROM meeting_events WHERE meeting_id = ? "
+                "AND type = 'meeting.intelligence.applied' ORDER BY seq ASC",
+                (meeting_id,),
+            ).fetchall()
+            target: dict[str, Any] | None = None
+            superseded: set[str] = set()
+            for row in rows:
+                try:
+                    payload = json.loads(row["payload_json"] or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if not isinstance(payload, Mapping):
+                    continue
+                decision = payload.get("coach_decision")
+                if not isinstance(decision, Mapping):
+                    continue
+                current_id = str(decision.get("decision_id") or "").strip()
+                previous_id = str(decision.get("supersedes_decision_id") or "").strip()
+                if previous_id:
+                    superseded.add(previous_id)
+                if current_id != decision_id:
+                    continue
+                intervention = payload.get("coach_intervention")
+                if not isinstance(intervention, Mapping):
+                    continue
+                target = {
+                    "decision": dict(decision),
+                    "intervention": dict(intervention),
+                    "event_seq": int(row["seq"]),
+                }
+            if target is None or decision_id in superseded:
+                return None
+            decision = target["decision"]
+            intervention = target["intervention"]
+            if decision.get("status") != "intervention" or decision.get("lifecycle_action") != "retain":
+                return None
+            valid_until = intervention.get("valid_until_ms", decision.get("valid_until_ms"))
+            if isinstance(valid_until, bool) or not isinstance(valid_until, int) or valid_until > now_ms:
+                return None
+            evidence_ids = tuple(
+                str(item).strip()
+                for item in intervention.get("evidence_segment_ids") or []
+                if str(item).strip()
+            )
+            if not evidence_ids:
+                return None
+            placeholders = ",".join("?" for _ in evidence_ids)
+            evidence = self._conn.execute(
+                "SELECT * FROM transcript_segments WHERE meeting_id = ? AND segment_id IN ("
+                + placeholders + ") AND duplicate_of_segment_id IS NULL "
+                "ORDER BY transcript_seq DESC LIMIT 1",
+                (meeting_id, *evidence_ids),
+            ).fetchone()
+            if evidence is None:
+                return None
+            latest = self._conn.execute(
+                "SELECT * FROM transcript_segments WHERE meeting_id = ? "
+                "AND duplicate_of_segment_id IS NULL ORDER BY transcript_seq DESC LIMIT 1",
+                (meeting_id,),
+            ).fetchone()
+            anchor = (
+                latest
+                if latest is not None
+                and int(latest["transcript_seq"] or 0) > int(evidence["transcript_seq"] or 0)
+                else evidence
+            )
+            paragraph = self._conn.execute(
+                "SELECT paragraph.paragraph_id, paragraph.revision "
+                "FROM semantic_paragraph_checkpoints mapping "
+                "JOIN semantic_paragraphs paragraph ON paragraph.meeting_id = mapping.meeting_id "
+                "AND paragraph.paragraph_id = mapping.paragraph_id "
+                "WHERE mapping.meeting_id = ? AND mapping.checkpoint_id = ?",
+                (meeting_id, anchor["segment_id"]),
+            ).fetchone()
+            if paragraph is None:
+                return None
+            idempotency_key = (
+                f"intelligence:task_due:{decision_id}:{anchor['segment_id']}:"
+                f"{anchor['evidence_hash']}:{paragraph['revision']}"
+            )
+            existing = self._conn.execute(
+                "SELECT * FROM jobs WHERE meeting_id = ? AND kind = 'intelligence' "
+                "AND idempotency_key = ? LIMIT 1", (meeting_id, idempotency_key)
+            ).fetchone()
+            if existing is not None:
+                return self._job_dict(existing)
+            job_id = _stable_id("job", meeting_id, idempotency_key)
+            self._conn.execute(
+                "INSERT OR IGNORE INTO jobs ("
+                "id, meeting_id, kind, status, priority, input_transcript_seq, input_version, "
+                "evidence_segment_id, evidence_hash, generation_id, trigger_type, work_item_id, "
+                "trigger_reference_seq, idempotency_key, attempts, "
+                "max_attempts, next_attempt_at_ms, deadline_at_ms, final_committed_at_ms, "
+                "created_at_ms, updated_at_ms"
+                ") VALUES (?, ?, 'intelligence', 'pending', 105, ?, ?, ?, ?, NULL, "
+                "'task_due', ?, ?, ?, 0, 3, ?, ?, ?, ?, ?)",
+                (
+                    job_id,
+                    meeting_id,
+                    int(anchor["transcript_seq"]),
+                    int(paragraph["revision"]),
+                    str(anchor["segment_id"]),
+                    str(anchor["evidence_hash"]),
+                    decision_id,
+                    int(evidence["transcript_seq"]),
+                    idempotency_key,
+                    intelligence_next_attempt_at_ms(
+                        now_ms=now_ms,
+                        deadline_at_ms=intelligence_deadline_at_ms(now_ms),
+                        debounce_ms=self.intelligence_debounce_ms,
+                    ),
+                    intelligence_deadline_at_ms(now_ms),
+                    now_ms,
                     now_ms,
                     now_ms,
                 ),
@@ -3468,6 +5089,27 @@ class V2Persistence:
             )
         return updated
 
+    def _latest_coach_decision_locked(
+        self,
+        meeting_id: str,
+        *,
+        excluding_decision_id: str,
+    ) -> dict[str, Any] | None:
+        rows = self._conn.execute(
+            "SELECT payload_json FROM meeting_events WHERE meeting_id = ? "
+            "AND type = 'meeting.intelligence.applied' ORDER BY seq DESC LIMIT 64",
+            (meeting_id,),
+        ).fetchall()
+        for row in rows:
+            payload = json.loads(row["payload_json"] or "{}")
+            decision = payload.get("coach_decision") if isinstance(payload, Mapping) else None
+            if not isinstance(decision, Mapping):
+                continue
+            decision_id = str(decision.get("decision_id") or "").strip()
+            if decision_id and decision_id != excluding_decision_id:
+                return dict(decision)
+        return None
+
     def apply_intelligence_response(
         self,
         *,
@@ -3475,6 +5117,7 @@ class V2Persistence:
         job_id: str,
         response: Mapping[str, Any],
         now_ms: int,
+        event_context: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Apply one validated LLM-first response exactly once.
 
@@ -3488,20 +5131,146 @@ class V2Persistence:
         if not isinstance(response, Mapping):
             raise IntelligenceProjectionError("intelligence response must be an object")
         now_ms = max(0, int(now_ms))
+        applied_event_context = _intelligence_event_context(event_context)
+        is_local_reflex = applied_event_context["source"] == "local_reflex"
         response_event_key = f"meeting.intelligence.applied:{job_id}"
         raw_revisions = response.get("paragraph_revisions") or []
         raw_changes = response.get("state_changes") or []
         raw_topic = response.get("topic_update")
         raw_follow_up = response.get("follow_up")
+        raw_coach_intervention = response.get("coach_intervention")
+        raw_coach_decision = response.get("coach_decision")
         if not isinstance(raw_revisions, list) or not isinstance(raw_changes, list):
             raise IntelligenceProjectionError("intelligence response arrays are invalid")
+        if raw_coach_intervention is not None and not isinstance(raw_coach_intervention, Mapping):
+            raise IntelligenceProjectionError("coach intervention must be an object or null")
+        if raw_coach_decision is not None and not isinstance(raw_coach_decision, Mapping):
+            raise IntelligenceProjectionError("coach decision must be an object or null")
+        if is_local_reflex:
+            if raw_revisions or raw_changes or raw_topic is not None or raw_follow_up is not None:
+                raise IntelligenceProjectionError(
+                    "local_reflex may only project a coach decision and intervention"
+                )
+            if not isinstance(raw_coach_decision, Mapping):
+                raise IntelligenceProjectionError("local_reflex requires a coach decision")
+            _require_local_reflex_provenance(raw_coach_decision, field="coach decision")
+            local_reflex_kind = str(
+                raw_coach_decision.get("local_reflex_kind") or ""
+            ).strip()
+            if local_reflex_kind != applied_event_context["local_reflex_kind"]:
+                raise IntelligenceProjectionError(
+                    "local_reflex decision kind does not match its event context"
+                )
+            if isinstance(raw_coach_intervention, Mapping):
+                _require_local_reflex_provenance(
+                    raw_coach_intervention,
+                    field="coach intervention",
+                )
+                intervention_kind = str(
+                    raw_coach_intervention.get("local_reflex_kind") or ""
+                ).strip()
+                event_type = str(
+                    raw_coach_intervention.get("event_type") or ""
+                ).strip()
+                if (
+                    intervention_kind != local_reflex_kind
+                    or _LOCAL_REFLEX_EVENT_TYPES.get(intervention_kind) != event_type
+                ):
+                    raise IntelligenceProjectionError(
+                        "local_reflex kind and coach event type do not match"
+                    )
+                valid_until_ms = _timing_ms(raw_coach_intervention.get("valid_until_ms"))
+                if valid_until_ms is None or valid_until_ms <= now_ms:
+                    raise IntelligenceProjectionError(
+                        "local_reflex intervention must have a future valid_until_ms"
+                    )
+                decision_valid_until_ms = _timing_ms(
+                    raw_coach_decision.get("valid_until_ms")
+                )
+                if decision_valid_until_ms != valid_until_ms:
+                    raise IntelligenceProjectionError(
+                        "local_reflex decision and intervention validity must match"
+                    )
         if self.semantic_projection_mode == "llm_first" and raw_revisions:
             raise IntelligenceProjectionError(
                 "transcript revisions must be applied by the independent correction lane"
             )
 
+        def suppress_late_coach_intervention(observed_ms: int) -> bool:
+            """Turn an intervention that crossed the soft cutoff into silence."""
+
+            nonlocal raw_coach_intervention, raw_coach_decision
+            if not isinstance(raw_coach_decision, Mapping):
+                return False
+            if str(raw_coach_decision.get("status") or "") != "intervention":
+                return False
+            if (
+                str(raw_coach_decision.get("runtime_used") or "").strip().lower()
+                == "local_reflex"
+                and raw_coach_decision.get("fallback_error_code")
+            ):
+                # A deterministic fallback is generated after the failed Pi
+                # attempt and is still useful to the user. The Provider result
+                # remains recorded as failed; only this local card is exempt
+                # from the late-Pi suppression barrier.
+                return False
+            soft_deadline = _timing_ms(raw_coach_decision.get("soft_deadline_at_ms"))
+            if soft_deadline is None or int(observed_ms) < soft_deadline:
+                return False
+            origin_ms = soft_deadline - COACH_SOFT_DELIVERY_CUTOFF_MS
+            raw_coach_intervention = None
+            raw_coach_decision = {
+                **dict(raw_coach_decision),
+                "status": "timed_out",
+                "status_reason": "soft_deadline_exceeded",
+                "decision_reason": "本轮未在实时窗口内形成可验证建议，已停止等待；迟到结果不会显示。",
+                "delivery_status": "too_late",
+                "soft_cutoff_triggered": True,
+                "soft_cutoff_elapsed_ms": max(0, int(observed_ms) - origin_ms),
+                "soft_timeout_projection_at_ms": int(observed_ms),
+                "late_result_discarded": True,
+                "fallback_reason": "soft_deadline_exceeded",
+            }
+            return True
+
+        # Catch a response that was already late before any transaction work.
+        # This also makes the hard-deadline exception below recognize the new
+        # soft-timeout reason as an intentional audit projection.
+        suppress_late_coach_intervention(now_ms)
+
+        # A task-level timeout still needs a durable, user-visible audit row so
+        # the UI can explain why no card appeared.  Permit only the empty
+        # timeout envelope created by the orchestration layer after the
+        # realtime deadline; never allow late semantic entities, revisions or
+        # an intervention to bypass the normal deadline barriers below.
+        late_timeout_audit = (
+            isinstance(raw_coach_decision, Mapping)
+            and str(raw_coach_decision.get("status") or "") == "timed_out"
+            and str(raw_coach_decision.get("fallback_reason") or "")
+            in {
+                "provider_timeout",
+                "deadline_budget_exhausted",
+                "soft_deadline_exceeded",
+            }
+            and raw_coach_intervention is None
+            and raw_follow_up is None
+            and raw_topic is None
+            and not raw_revisions
+            and not raw_changes
+        )
+
+        response_decision_completed_at_ms: Any = None
+        for candidate in (raw_coach_decision, raw_coach_intervention, response):
+            if isinstance(candidate, Mapping) and candidate.get("completed_at_ms") is not None:
+                response_decision_completed_at_ms = candidate.get("completed_at_ms")
+                break
+
         def idempotent_result(event_row: sqlite3.Row) -> dict[str, Any]:
             payload = json.loads(event_row["payload_json"] or "{}")
+            if str(payload.get("source") or "llm_first") != applied_event_context["source"]:
+                raise IntelligenceProjectionError(
+                    "intelligence response source conflicts with the applied event"
+                )
             return {
                 "meeting_id": meeting_id,
                 "job_id": job_id,
@@ -3509,6 +5278,12 @@ class V2Persistence:
                 "revision_count": int(payload.get("revision_count") or 0),
                 "state_change_count": int(payload.get("state_change_count") or 0),
                 "follow_up": payload.get("follow_up"),
+                "semantic_follow_up": payload.get("semantic_follow_up"),
+                "coach_intervention": payload.get("coach_intervention"),
+                "coach_decision": payload.get("coach_decision"),
+                "work_item": payload.get("work_item"),
+                "timing": payload.get("timing"),
+                "event_context": payload.get("event_context"),
             }
 
         with self._lock:
@@ -3524,6 +5299,13 @@ class V2Persistence:
             ).fetchone()
             if job_row is None:
                 raise IntelligenceProjectionError("intelligence response references an unknown job")
+            deadline_at_ms = job_row["deadline_at_ms"]
+            if deadline_at_ms is not None and now_ms >= int(deadline_at_ms) and not late_timeout_audit:
+                # This barrier belongs next to the durable projection, rather
+                # than the Provider timeout. A sidecar can finish after its
+                # own timeout or after a new ASR final; neither may put an old
+                # realtime card back into the meeting state.
+                raise IntelligenceDeadlineExceeded("intelligence response arrived after its realtime deadline")
             covered_segment_ids = set(self._job_evidence_segment_ids_locked(job_row))
             own_revision_rows = self._conn.execute(
                 "SELECT aggregate_id, payload_json FROM meeting_events "
@@ -3565,6 +5347,49 @@ class V2Persistence:
             expected_paragraph_revision = int(job_row["input_version"]) + len(own_revisions)
             if paragraph_row is None or int(paragraph_row["revision"]) != expected_paragraph_revision:
                 raise IntelligenceEvidenceSuperseded("intelligence paragraph evidence is stale")
+            if is_local_reflex and isinstance(raw_coach_intervention, Mapping):
+                evidence_ids = raw_coach_intervention.get("evidence_segment_ids")
+                if not isinstance(evidence_ids, list) or not evidence_ids:
+                    raise IntelligenceProjectionError(
+                        "local_reflex intervention requires transcript evidence"
+                    )
+                normalized_ids = [str(item).strip() for item in evidence_ids]
+                if any(not item or item not in covered_segment_ids for item in normalized_ids):
+                    raise IntelligenceProjectionError(
+                        "local_reflex intervention evidence is outside the job evidence"
+                    )
+                quote = _required(
+                    str(raw_coach_intervention.get("evidence_quote") or ""),
+                    "evidence_quote",
+                )
+                normalized_quote = _compact_evidence(quote)
+                context_evidence = applied_event_context["evidence"]
+                context_ids = [
+                    str(item).strip()
+                    for item in context_evidence.get("segment_ids") or []
+                    if str(item).strip()
+                ]
+                if (
+                    context_ids != normalized_ids
+                    or _compact_evidence(context_evidence.get("quote"))
+                    != normalized_quote
+                ):
+                    raise IntelligenceProjectionError(
+                        "local_reflex event context evidence does not match the intervention"
+                    )
+                evidence_rows = self._conn.execute(
+                    "SELECT text, normalized_text FROM transcript_segments "
+                    f"WHERE meeting_id = ? AND segment_id IN ({','.join('?' for _ in normalized_ids)})",
+                    (meeting_id, *normalized_ids),
+                ).fetchall()
+                if not any(
+                    normalized_quote in _compact_evidence(str(row["normalized_text"]))
+                    or normalized_quote in _compact_evidence(str(row["text"]))
+                    for row in evidence_rows
+                ):
+                    raise IntelligenceProjectionError(
+                        "local_reflex intervention evidence quote is not present"
+                    )
 
         # Transcript revisions use their existing CAS implementation. Do this
         # before entity projection so stale evidence can never produce facts.
@@ -3622,6 +5447,12 @@ class V2Persistence:
                 raise IntelligenceProjectionError(f"intelligence revision lost its evidence: {segment_id}")
             revision_count += 1
 
+        def observe_projection_clock(floor_ms: int) -> int:
+            observed_ms = max(0, int(floor_ms))
+            if self._projection_clock_ms is not None:
+                observed_ms = max(observed_ms, int(self._projection_clock_ms()))
+            return observed_ms
+
         with self._write_transaction():
             self._raise_if_tombstoned_locked(meeting_id)
             meeting = self._conn.execute("SELECT 1 FROM meetings WHERE id = ?", (meeting_id,)).fetchone()
@@ -3633,6 +5464,38 @@ class V2Persistence:
             ).fetchone()
             if already_applied is not None:
                 return idempotent_result(already_applied)
+
+            # Re-read the wall clock after this worker has acquired the write
+            # transaction. An asyncio cancellation cannot stop a running
+            # ``to_thread`` call, so this is the authoritative barrier against
+            # a handler that finishes or waits for SQLite after its deadline.
+            projection_now_ms = observe_projection_clock(now_ms)
+            if is_local_reflex and isinstance(raw_coach_intervention, Mapping):
+                valid_until_ms = _timing_ms(raw_coach_intervention.get("valid_until_ms"))
+                if valid_until_ms is None or valid_until_ms <= projection_now_ms:
+                    raise IntelligenceProjectionError(
+                        "local_reflex intervention expired before projection"
+                    )
+            if suppress_late_coach_intervention(projection_now_ms):
+                # The intervention payload has not been assembled yet, so the
+                # transaction can safely emit the timeout decision instead of
+                # publishing a card that crossed the product cutoff while
+                # SQLite was being acquired.
+                late_timeout_audit = True
+            transaction_job = self._conn.execute(
+                "SELECT * FROM jobs WHERE id = ? AND meeting_id = ? AND kind = 'intelligence'",
+                (job_id, meeting_id),
+            ).fetchone()
+            transaction_deadline_at_ms = transaction_job["deadline_at_ms"] if transaction_job else None
+            if (
+                transaction_deadline_at_ms is not None
+                and projection_now_ms >= int(transaction_deadline_at_ms)
+                and not late_timeout_audit
+            ):
+                raise IntelligenceDeadlineExceeded(
+                    "intelligence response crossed its realtime deadline before projection"
+                )
+            now_ms = projection_now_ms
 
             for segment_id, expected_revision in no_change_revisions:
                 result = self._conn.execute(
@@ -3804,7 +5667,211 @@ class V2Persistence:
                     causation_id=job_id,
                 )
 
-            follow_up_payload = dict(raw_follow_up) if isinstance(raw_follow_up, Mapping) else None
+            # Re-sample immediately before the formal applied event. Entity
+            # writes above are in this same transaction and therefore roll
+            # back if the usefulness window expires while projection runs.
+            event_projection_now_ms = observe_projection_clock(now_ms)
+            if is_local_reflex and isinstance(raw_coach_intervention, Mapping):
+                valid_until_ms = _timing_ms(raw_coach_intervention.get("valid_until_ms"))
+                if valid_until_ms is None or valid_until_ms <= event_projection_now_ms:
+                    raise IntelligenceProjectionError(
+                        "local_reflex intervention expired before event projection"
+                    )
+            if (
+                transaction_deadline_at_ms is not None
+                and event_projection_now_ms >= int(transaction_deadline_at_ms)
+                and not late_timeout_audit
+            ):
+                raise IntelligenceDeadlineExceeded(
+                    "intelligence response crossed its realtime deadline before event projection"
+                )
+            now_ms = event_projection_now_ms
+
+            # Persist the decision completion and projection clocks on the
+            # same row that owns the evidence identity. The applied event and
+            # every read model below are then derived from this exact row.
+            self._conn.execute(
+                "UPDATE jobs SET decision_completed_at_ms = ?, projected_at_ms = ?, "
+                "updated_at_ms = ? WHERE id = ? AND meeting_id = ? AND kind = 'intelligence'",
+                (
+                    _timing_ms(response_decision_completed_at_ms),
+                    now_ms,
+                    now_ms,
+                    job_id,
+                    meeting_id,
+                ),
+            )
+            timing_job_row = self._conn.execute(
+                "SELECT * FROM jobs WHERE id = ? AND meeting_id = ? AND kind = 'intelligence'",
+                (job_id, meeting_id),
+            ).fetchone()
+            if timing_job_row is None:
+                raise IntelligenceProjectionError("intelligence timing job disappeared before projection")
+            timing_job = self._job_dict(timing_job_row)
+            timing_envelope = _intelligence_timing_envelope(timing_job)
+
+            semantic_follow_up_payload = dict(raw_follow_up) if isinstance(raw_follow_up, Mapping) else None
+            if raw_coach_intervention is not None and response.get("host_evidence"):
+                self._validate_host_coach_evidence_locked(
+                    meeting_id, response["host_evidence"], raw_coach_intervention,
+                )
+            coach_intervention_payload = (
+                dict(raw_coach_intervention) if isinstance(raw_coach_intervention, Mapping) else None
+            )
+            coach_decision_payload = dict(raw_coach_decision) if isinstance(raw_coach_decision, Mapping) else None
+            if (
+                coach_decision_payload is not None
+                and str(coach_decision_payload.get("status") or "") == "timed_out"
+                and str(coach_decision_payload.get("status_reason") or "")
+                == "soft_deadline_exceeded"
+            ):
+                soft_deadline = _timing_ms(coach_decision_payload.get("soft_deadline_at_ms"))
+                if soft_deadline is not None:
+                    coach_decision_payload["soft_timeout_projection_at_ms"] = now_ms
+                    coach_decision_payload["soft_cutoff_elapsed_ms"] = max(
+                        0,
+                        now_ms - (soft_deadline - COACH_SOFT_DELIVERY_CUTOFF_MS),
+                    )
+                coach_decision_payload["delivery_status"] = "too_late"
+                coach_decision_payload["soft_cutoff_triggered"] = True
+                coach_decision_payload["late_result_discarded"] = bool(
+                    coach_decision_payload.get("late_result_discarded", True)
+                )
+            if coach_decision_payload is not None:
+                decision_id = str(coach_decision_payload.get("decision_id") or "").strip()
+                if decision_id:
+                    previous_decision = self._latest_coach_decision_locked(
+                        meeting_id,
+                        excluding_decision_id=decision_id,
+                    )
+                    previous_decision_id = (
+                        str(previous_decision.get("decision_id") or "").strip()
+                        if previous_decision is not None
+                        else ""
+                    )
+                    coach_decision_payload["supersedes_decision_id"] = (
+                        previous_decision_id or None
+                    )
+                    coach_decision_payload.setdefault("superseded_by", None)
+                    if coach_intervention_payload is not None:
+                        coach_intervention_payload["supersedes_decision_id"] = (
+                            previous_decision_id or None
+                        )
+                        coach_intervention_payload.setdefault("superseded_by", None)
+            if coach_intervention_payload is not None:
+                coach_intervention_payload["projected_at_ms"] = now_ms
+                coach_intervention_payload["dropped_at_ms"] = None
+            if coach_decision_payload is not None:
+                coach_decision_payload["projected_at_ms"] = now_ms
+                coach_decision_payload["dropped_at_ms"] = None
+                # Keep the durable evidence-to-projection chain attached to
+                # the formal decision itself. Consumers that only persist or
+                # transport ``coach_decision`` can still audit latency without
+                # reconstructing it from the surrounding event.
+                coach_decision_payload["timing"] = dict(timing_envelope)
+                for key in (
+                    "final_committed_at_ms",
+                    "job_created_at_ms",
+                    "job_started_at_ms",
+                    "decision_completed_at_ms",
+                    "projected_at_ms",
+                ):
+                    coach_decision_payload[key] = timing_envelope[key]
+            agent_work_item = None
+            if coach_decision_payload is not None:
+                agent_work_item = self._upsert_agent_work_item_locked(
+                    meeting_id=meeting_id,
+                    job_id=job_id,
+                    decision=coach_decision_payload,
+                    intervention=coach_intervention_payload,
+                    now_ms=now_ms,
+                    current_seq=current_seq,
+                    fallback_segment_id=str(transaction_job["evidence_segment_id"]),
+                )
+                coach_decision_payload["work_item_id"] = agent_work_item["work_item_id"]
+                coach_decision_payload["work_item_state"] = agent_work_item["state"]
+                coach_decision_payload["work_item_version"] = agent_work_item["version"]
+                if coach_intervention_payload is not None:
+                    coach_intervention_payload["work_item_id"] = agent_work_item["work_item_id"]
+                    coach_intervention_payload["work_item_state"] = agent_work_item["state"]
+                    coach_intervention_payload["work_item_version"] = agent_work_item["version"]
+            follow_up_payload = (
+                {
+                    "question": str(
+                        coach_intervention_payload.get("say_this")
+                        or coach_intervention_payload.get("recommendation")
+                        or ""
+                    ),
+                    "say_this": str(
+                        coach_intervention_payload.get("say_this")
+                        or coach_intervention_payload.get("recommendation")
+                        or ""
+                    ),
+                    "reason": str(
+                        coach_intervention_payload.get("why_now")
+                        or coach_intervention_payload.get("reason")
+                        or ""
+                    ),
+                    "why_now": str(
+                        coach_intervention_payload.get("why_now")
+                        or coach_intervention_payload.get("reason")
+                        or ""
+                    ),
+                    "evidence_segment_ids": list(
+                        coach_intervention_payload.get("evidence_segment_ids") or []
+                    ),
+                    "evidence_quote": str(coach_intervention_payload.get("evidence_quote") or ""),
+                    "urgency": str(coach_intervention_payload.get("urgency") or "medium"),
+                    "coach_event_type": str(coach_intervention_payload.get("event_type") or ""),
+                    "title": str(coach_intervention_payload.get("title") or ""),
+                    "confidence": coach_intervention_payload.get("confidence"),
+                    **{
+                        key: coach_intervention_payload[key]
+                        for key in (
+                            "provenance_version",
+                            "origin",
+                            "local_reflex_kind",
+                            "run_id",
+                            "decision_id",
+                            "evidence_revision",
+                            "status",
+                            "status_reason",
+                            "decision_reason",
+                            "runtime_requested",
+                            "runtime_used",
+                            "pi_provider_attempted",
+                            "fallback_error_code",
+                            "fallback_reason",
+                            "created_at_ms",
+                            "first_token_at_ms",
+                            "completed_at_ms",
+                            "projected_at_ms",
+                            "dropped_at_ms",
+                            "ttft_ms",
+                            "decision_latency_ms",
+                    "deadline_at_ms",
+                    "soft_deadline_at_ms",
+                    "soft_cutoff_elapsed_ms",
+                    "soft_timeout_projection_at_ms",
+                    "delivery_status",
+                    "late_result_discarded",
+                    "valid_until_ms",
+                            "lifecycle_action",
+                            "supersedes_decision_id",
+                            "superseded_by",
+                        )
+                        if coach_intervention_payload.get(key) is not None
+                    },
+                }
+                if coach_intervention_payload is not None
+                else None
+            )
+            if coach_intervention_payload is None and coach_decision_payload is None:
+                # Preserve the pre-provenance event contract for callers that
+                # still submit only the semantic follow-up. New production
+                # responses always include an explicit coach decision, so the
+                # two lanes remain distinguishable there.
+                follow_up_payload = semantic_follow_up_payload
             self._append_event_locked(
                 meeting_id=meeting_id,
                 event_type="meeting.intelligence.applied",
@@ -3817,7 +5884,22 @@ class V2Persistence:
                     "revision_count": revision_count,
                     "state_change_count": state_change_count,
                     "follow_up": follow_up_payload,
-                    "source": "llm_first",
+                    "semantic_follow_up": semantic_follow_up_payload,
+                    "coach_intervention": coach_intervention_payload,
+                    "coach_decision": coach_decision_payload,
+                    "work_item": agent_work_item,
+                    "timing": timing_envelope,
+                    "final_committed_at_ms": timing_envelope["final_committed_at_ms"],
+                    "job_created_at_ms": timing_envelope["job_created_at_ms"],
+                    "job_started_at_ms": timing_envelope["job_started_at_ms"],
+                    "decision_completed_at_ms": timing_envelope["decision_completed_at_ms"],
+                    "projected_at_ms": timing_envelope["projected_at_ms"],
+                    **applied_event_context,
+                    **(
+                        {"event_context": dict(applied_event_context)}
+                        if is_local_reflex
+                        else {}
+                    ),
                 },
                 correlation_id=meeting_id,
                 causation_id=job_id,
@@ -3829,6 +5911,14 @@ class V2Persistence:
             "revision_count": revision_count,
             "state_change_count": state_change_count,
             "follow_up": follow_up_payload,
+            "semantic_follow_up": semantic_follow_up_payload,
+            "coach_intervention": coach_intervention_payload,
+            "coach_decision": coach_decision_payload,
+            "work_item": agent_work_item,
+            "timing": timing_envelope,
+            "event_context": (
+                dict(applied_event_context) if is_local_reflex else None
+            ),
         }
 
     def upsert_suggestion_draft(
@@ -3969,6 +6059,16 @@ class V2Persistence:
             ).fetchone()
             if row is None:
                 raise KeyError(f"meeting not found: {meeting_id}")
+            # A realtime intelligence request is useful only while the live
+            # meeting is open. Cancel work that has not entered the provider
+            # yet in this transaction so correction can proceed immediately
+            # after end. A running request is deliberately left alone: the
+            # handler owns its provider reservation and releases it in its
+            # ``finally`` block when the synchronous request returns.
+            self._cancel_pending_intelligence_locked(
+                meeting_id=meeting_id,
+                now_ms=now_ms,
+            )
             if row["state"] != "ended":
                 self._conn.execute(
                     "UPDATE meetings SET state = 'ended', ended_at_ms = ?, "
@@ -4024,13 +6124,18 @@ class V2Persistence:
                         if kind == "correction" and existing_correction is not None:
                             continue
                         job_id = _stable_id("job", meeting_id, "meeting.ended", kind)
+                        deadline_at_ms = (
+                            now_ms + REVIEW_JOB_DEADLINE_MS
+                            if kind in REVIEW_JOB_KINDS
+                            else None
+                        )
                         self._conn.execute(
                             "INSERT OR IGNORE INTO jobs ("
                             "id, meeting_id, kind, status, priority, input_transcript_seq, "
                             "input_version, evidence_segment_id, evidence_hash, generation_id, "
                             "idempotency_key, attempts, max_attempts, next_attempt_at_ms, "
-                            "created_at_ms, updated_at_ms"
-                            ") VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, NULL, ?, 0, 3, ?, ?, ?)",
+                            "deadline_at_ms, created_at_ms, updated_at_ms"
+                            ") VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, NULL, ?, 0, 3, ?, ?, ?, ?)",
                             (
                                 job_id,
                                 meeting_id,
@@ -4042,6 +6147,7 @@ class V2Persistence:
                                 str(latest_segment["evidence_hash"]),
                                 f"{kind}:{meeting_id}:meeting.ended",
                                 now_ms,
+                                deadline_at_ms,
                                 now_ms,
                                 now_ms,
                             ),
@@ -4051,6 +6157,40 @@ class V2Persistence:
                 (meeting_id,),
             ).fetchone()
         return self._meeting_dict(ended)
+
+    def _cancel_pending_intelligence_locked(
+        self,
+        *,
+        meeting_id: str,
+        now_ms: int,
+    ) -> list[str]:
+        """Cancel unclaimed realtime intelligence for a meeting.
+
+        This helper must run under ``_write_transaction``. Running jobs are
+        intentionally excluded because their in-process Provider request
+        cannot be forcefully interrupted without risking overlapping work
+        once the correction lane is released.
+        """
+
+        meeting_id = _required(meeting_id, "meeting_id")
+        now_ms = max(0, int(now_ms))
+        rows = self._conn.execute(
+            "SELECT id FROM jobs WHERE meeting_id = ? AND kind = 'intelligence' "
+            "AND status IN ('pending', 'retry_wait') ORDER BY created_at_ms, id",
+            (meeting_id,),
+        ).fetchall()
+        if not rows:
+            return []
+        job_ids = [str(row["id"]) for row in rows]
+        self._conn.execute(
+            "UPDATE jobs SET status = 'cancelled', lease_owner = NULL, "
+            "lease_until_ms = NULL, error_class = 'meeting_ended', "
+            "completed_at_ms = COALESCE(completed_at_ms, ?), updated_at_ms = ? "
+            "WHERE meeting_id = ? AND kind = 'intelligence' "
+            "AND status IN ('pending', 'retry_wait')",
+            (now_ms, now_ms, meeting_id),
+        )
+        return job_ids
 
     def save_suggestion_feedback(
         self,
@@ -6702,8 +8842,8 @@ class V2Persistence:
             self._conn.execute(
                 "INSERT INTO jobs (id, meeting_id, kind, status, priority, input_transcript_seq, "
                 "input_version, evidence_segment_id, evidence_hash, generation_id, idempotency_key, "
-                "attempts, max_attempts, next_attempt_at_ms, created_at_ms, updated_at_ms) "
-                "VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
+                "attempts, max_attempts, next_attempt_at_ms, deadline_at_ms, created_at_ms, updated_at_ms) "
+                "VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)",
                 (
                     job_id,
                     meeting_id,
@@ -6717,6 +8857,7 @@ class V2Persistence:
                     f"review.retry:{meeting_id}:{kind}:{generation}",
                     max_attempts,
                     now_ms,
+                    now_ms + REVIEW_JOB_DEADLINE_MS,
                     now_ms,
                     now_ms,
                 ),
@@ -7067,6 +9208,7 @@ class V2Persistence:
         segment_limit = int(segment_limit)
         if not 1 <= segment_limit <= 1_000:
             raise ValueError("segment_limit must be between 1 and 1000")
+        snapshot_now_ms = time.time_ns() // 1_000_000
         with self._lock:
             last_seq = int(
                 self._conn.execute(
@@ -7144,13 +9286,51 @@ class V2Persistence:
                 "SELECT * FROM recording_import_jobs WHERE meeting_id = ?",
                 (meeting_id,),
             ).fetchone()
+            realtime_provider_reservations = {
+                reservation_id: self._public_realtime_provider_reservation(
+                    payload,
+                    now_ms=snapshot_now_ms,
+                )
+                for reservation_id, payload in self._realtime_provider_reservation_states_locked(
+                    meeting_id
+                ).items()
+            }
         meeting = self._meeting_dict(meeting_row) if meeting_row is not None else None
         follow_up: dict[str, Any] | None = None
+        intelligence_timing: dict[str, Any] | None = None
+        coach_decision: dict[str, Any] | None = None
         if intelligence_event is not None:
             intelligence_payload = json.loads(intelligence_event["payload_json"] or "{}")
             raw_follow_up = intelligence_payload.get("follow_up")
             if isinstance(raw_follow_up, Mapping):
                 follow_up = dict(raw_follow_up)
+            raw_timing = intelligence_payload.get("timing")
+            if isinstance(raw_timing, Mapping):
+                intelligence_timing = dict(raw_timing)
+            raw_decision = intelligence_payload.get("coach_decision")
+            if isinstance(raw_decision, Mapping):
+                coach_decision = dict(raw_decision)
+
+        def project_provider_reservation(value: Any) -> Any:
+            if not isinstance(value, Mapping):
+                return value
+            embedded = value.get("provider_reservation")
+            if not isinstance(embedded, Mapping):
+                return dict(value)
+            reservation_id = str(embedded.get("reservation_id") or "").strip()
+            authoritative = realtime_provider_reservations.get(reservation_id)
+            if authoritative is None:
+                return dict(value)
+            return {
+                **dict(value),
+                "provider_reservation": {
+                    **dict(embedded),
+                    **authoritative,
+                },
+            }
+
+        coach_decision = project_provider_reservation(coach_decision)
+        follow_up = project_provider_reservation(follow_up)
         paragraph_checkpoint_ids: dict[str, list[str]] = {}
         for mapping in paragraph_checkpoint_rows:
             paragraph_checkpoint_ids.setdefault(str(mapping["paragraph_id"]), []).append(str(mapping["checkpoint_id"]))
@@ -7236,6 +9416,9 @@ class V2Persistence:
             "current_topic": state["current_topic"],
             "open_questions": state["open_questions"],
             "follow_up": follow_up,
+            "coach_decision": coach_decision,
+            "realtime_provider_reservations": realtime_provider_reservations,
+            "intelligence_timing": intelligence_timing,
             "decision_candidates": state["decision_candidates"],
             "action_items": state["action_items"],
             "risks": state["risks"],
@@ -7290,6 +9473,310 @@ class V2Persistence:
                 ),
             },
         }
+
+    def capture_acceptance_evidence(
+        self,
+        meeting_id: str,
+        *,
+        max_segments: int = 10_000,
+        max_events: int = 10_000,
+    ) -> dict[str, Any]:
+        """Capture one revision-pinned acceptance view in a SQLite read transaction.
+
+        The live-session and usage tables share the application database but
+        are normally read through separate repository connections. Reading
+        them here prevents an evidence exporter from combining different
+        event, transcript, session, and usage revisions.
+        """
+
+        meeting_id = _required(meeting_id, "meeting_id")
+        max_segments = int(max_segments)
+        max_events = int(max_events)
+        if not 1 <= max_segments <= 100_000:
+            raise ValueError("max_segments must be between 1 and 100000")
+        if not 1 <= max_events <= 100_000:
+            raise ValueError("max_events must be between 1 and 100000")
+        captured_at_ms = time.time_ns() // 1_000_000
+
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("V2Persistence is closed")
+            owns_transaction = not self._conn.in_transaction
+            if owns_transaction:
+                self._conn.execute("BEGIN")
+            try:
+                meeting_row = self._conn.execute(
+                    "SELECT * FROM meetings WHERE id = ?",
+                    (meeting_id,),
+                ).fetchone()
+                if meeting_row is None:
+                    raise KeyError(f"meeting not found: {meeting_id}")
+                event_high_water_mark = int(
+                    self._conn.execute(
+                        "SELECT COALESCE(MAX(seq), 0) FROM meeting_events WHERE meeting_id = ?",
+                        (meeting_id,),
+                    ).fetchone()[0]
+                )
+                transcript_high_water_mark = int(
+                    self._conn.execute(
+                        "SELECT COALESCE(MAX(transcript_seq), 0) FROM transcript_segments "
+                        "WHERE meeting_id = ?",
+                        (meeting_id,),
+                    ).fetchone()[0]
+                )
+                canonical_total = int(
+                    self._conn.execute(
+                        "SELECT COUNT(*) FROM transcript_segments WHERE meeting_id = ? "
+                        "AND duplicate_of_segment_id IS NULL",
+                        (meeting_id,),
+                    ).fetchone()[0]
+                )
+                segment_rows = self._conn.execute(
+                    "SELECT * FROM transcript_segments WHERE meeting_id = ? "
+                    "AND transcript_seq <= ? ORDER BY transcript_seq LIMIT ?",
+                    (meeting_id, transcript_high_water_mark, max_segments + 1),
+                ).fetchall()
+                event_rows = self._conn.execute(
+                    "SELECT * FROM meeting_events WHERE meeting_id = ? AND seq <= ? "
+                    "ORDER BY seq LIMIT ?",
+                    (meeting_id, event_high_water_mark, max_events + 1),
+                ).fetchall()
+                live_row = self._conn.execute(
+                    "SELECT record_json, last_activity_ms FROM asr_live_sessions WHERE session_id = ?",
+                    (meeting_id,),
+                ).fetchone()
+                usage_high_water_id = int(
+                    self._conn.execute(
+                        "SELECT COALESCE(MAX(id), 0) FROM llm_usage_ledger WHERE session_id = ?",
+                        (meeting_id,),
+                    ).fetchone()[0]
+                )
+                usage_rows = self._conn.execute(
+                    "SELECT id, session_id, purpose, provider, model, prompt_tokens, "
+                    "completion_tokens, total_tokens, timestamp_ms FROM llm_usage_ledger "
+                    "WHERE session_id = ? AND id <= ? ORDER BY id",
+                    (meeting_id, usage_high_water_id),
+                ).fetchall()
+                snapshot = self.get_snapshot(
+                    meeting_id,
+                    segment_limit=min(max_segments, 1_000),
+                )
+                transcript_state = self._canonical_transcript_state_locked(meeting_id)
+            except BaseException:
+                if owns_transaction and self._conn.in_transaction:
+                    self._conn.execute("ROLLBACK")
+                raise
+            else:
+                if owns_transaction:
+                    self._conn.execute("COMMIT")
+
+        segment_truncated = len(segment_rows) > max_segments
+        event_truncated = len(event_rows) > max_events
+        segments = [self._segment_dict(row) for row in segment_rows[:max_segments]]
+        events = [self._event_dict(row) for row in event_rows[:max_events]]
+        live_session = json.loads(live_row["record_json"]) if live_row is not None else None
+        usage = [
+            {
+                "id": int(row["id"]),
+                "session_id": row["session_id"],
+                "purpose": row["purpose"],
+                "provider": row["provider"],
+                "model": row["model"],
+                "prompt_tokens": int(row["prompt_tokens"]),
+                "completion_tokens": int(row["completion_tokens"]),
+                "total_tokens": int(row["total_tokens"]),
+                "timestamp_ms": int(row["timestamp_ms"]),
+            }
+            for row in usage_rows
+        ]
+
+        consistency_errors: list[str] = []
+        if int(snapshot.get("last_seq") or 0) != event_high_water_mark:
+            consistency_errors.append("snapshot_event_high_water_mismatch")
+        if int(meeting_row["latest_seq"] or 0) != event_high_water_mark:
+            consistency_errors.append("meeting_event_high_water_mismatch")
+        canonical_segments = [
+            segment for segment in segments if segment.get("duplicate_of_segment_id") is None
+        ]
+        snapshot_transcript_total = int((snapshot.get("transcript_page") or {}).get("total") or 0)
+        # ``get_snapshot`` intentionally caps its inline segment window at
+        # 1,000 rows.  The atomic capture may request a larger bounded export,
+        # so compare the page's authoritative total with the database view and
+        # only require the captured rows to be complete when no truncation was
+        # requested.
+        if snapshot_transcript_total != canonical_total:
+            consistency_errors.append("snapshot_transcript_count_mismatch")
+        if not segment_truncated and len(canonical_segments) != canonical_total:
+            consistency_errors.append("captured_transcript_count_mismatch")
+
+        # A pinned transaction prevents torn reads, but the capture must also
+        # prove that the event-sourced transcript and current segment table
+        # describe the same revisions.  The latest finalized/revised event is
+        # authoritative for text fields; speaker-only revisions intentionally
+        # do not replace that payload.
+        latest_transcript_events: dict[str, Mapping[str, Any]] = {}
+        event_sequences: list[int] = []
+        for event in events:
+            try:
+                event_sequences.append(int(event.get("seq") or 0))
+            except (TypeError, ValueError, OverflowError):
+                consistency_errors.append("event_sequence_invalid")
+            if str(event.get("type") or "") not in {
+                "transcript.segment.finalized",
+                "transcript.segment.revised",
+            }:
+                continue
+            payload = event.get("payload")
+            if not isinstance(payload, Mapping):
+                consistency_errors.append("transcript_event_payload_invalid")
+                continue
+            segment_id = str(
+                payload.get("segment_id") or event.get("aggregate_id") or ""
+            ).strip()
+            if not segment_id:
+                consistency_errors.append("transcript_event_segment_id_missing")
+                continue
+            latest_transcript_events[segment_id] = payload
+        if not event_truncated and event_sequences != list(
+            range(1, event_high_water_mark + 1)
+        ):
+            consistency_errors.append("event_sequence_not_contiguous")
+
+        for segment in segments:
+            segment_id = str(segment.get("segment_id") or "")
+            normalized_text = str(segment.get("normalized_text") or "").strip()
+            if not normalized_text:
+                consistency_errors.append(
+                    f"segment_missing_normalized_text:{segment_id}"
+                )
+                continue
+            expected_hash = transcript_evidence_hash(
+                segment_id,
+                normalized_text,
+            )
+            if str(segment.get("evidence_hash") or "") != expected_hash:
+                consistency_errors.append(
+                    f"segment_evidence_hash_mismatch:{segment_id}"
+                )
+            event_payload = latest_transcript_events.get(segment_id)
+            if event_payload is None:
+                consistency_errors.append(f"segment_event_missing:{segment_id}")
+                continue
+            for field in (
+                "segment_id",
+                "transcript_seq",
+                "revision",
+                "evidence_hash",
+                "normalized_text",
+            ):
+                if event_payload.get(field) != segment.get(field):
+                    consistency_errors.append(
+                        f"segment_event_{field}_mismatch:{segment_id}"
+                    )
+
+        if live_session is not None:
+            if str(live_session.get("session_id") or "") != meeting_id:
+                consistency_errors.append("live_session_meeting_id_mismatch")
+            segments_by_id = {
+                str(segment.get("segment_id") or ""): segment
+                for segment in segments
+                if str(segment.get("segment_id") or "")
+            }
+            for live_event in live_session.get("events") or []:
+                if not isinstance(live_event, Mapping):
+                    continue
+                event_type = str(live_event.get("event_type") or "")
+                if event_type not in {"final", "transcript_final"}:
+                    continue
+                payload = live_event.get("payload")
+                payload = payload if isinstance(payload, Mapping) else live_event
+                if payload.get("authoritative") is False:
+                    continue
+                segment_id = str(payload.get("segment_id") or "").strip()
+                live_text = str(
+                    payload.get("normalized_text") or payload.get("text") or ""
+                ).strip()
+                if not segment_id or not live_text:
+                    continue
+                durable_segment = segments_by_id.get(segment_id)
+                if durable_segment is None:
+                    consistency_errors.append(
+                        f"live_session_segment_missing:{segment_id}"
+                    )
+                elif str(durable_segment.get("normalized_text") or "").strip() != live_text:
+                    consistency_errors.append(
+                        f"live_session_segment_text_mismatch:{segment_id}"
+                    )
+        if segment_truncated:
+            consistency_errors.append("segment_export_truncated")
+        if event_truncated:
+            consistency_errors.append("event_export_truncated")
+
+        job_state = list(snapshot.get("jobs") or [])
+        event_sha256 = hashlib.sha256(_json_dump(events).encode("utf-8")).hexdigest()
+        transcript_segments_sha256 = hashlib.sha256(
+            _json_dump(segments).encode("utf-8")
+        ).hexdigest()
+        live_session_sha256 = (
+            hashlib.sha256(_json_dump(live_session).encode("utf-8")).hexdigest()
+            if live_session is not None
+            else None
+        )
+        usage_sha256 = hashlib.sha256(_json_dump(usage).encode("utf-8")).hexdigest()
+        job_state_sha256 = hashlib.sha256(
+            _json_dump(job_state).encode("utf-8")
+        ).hexdigest()
+
+        capture = {
+            "schema_version": "meeting_copilot.acceptance_evidence.v1",
+            "captured_at_ms": captured_at_ms,
+            "meeting_id": meeting_id,
+            "lineage": {
+                "meeting_revision": int(meeting_row["revision"]),
+                "event_high_water_mark": event_high_water_mark,
+                "transcript_high_water_mark": transcript_high_water_mark,
+                "transcript_revision": int(transcript_state["revision"]),
+                "transcript_sha256": str(transcript_state["hash"]),
+                "transcript_segments_sha256": transcript_segments_sha256,
+                "event_count": len(events),
+                "event_sha256": event_sha256,
+                "live_session_last_activity_ms": (
+                    int(live_row["last_activity_ms"])
+                    if live_row is not None
+                    and live_row["last_activity_ms"] is not None
+                    else None
+                ),
+                "live_session_sha256": live_session_sha256,
+                "usage_high_water_id": usage_high_water_id,
+                "usage_count": len(usage),
+                "usage_sha256": usage_sha256,
+                "job_count": len(job_state),
+                "job_state_sha256": job_state_sha256,
+            },
+            "snapshot": snapshot,
+            "transcript": {
+                "segments": segments,
+                "segment_count": len(segments),
+            },
+            "events": events,
+            "live_session": live_session,
+            "usage_ledger": usage,
+            "consistency": {
+                "acceptance_eligible": not consistency_errors,
+                "errors": consistency_errors,
+            },
+        }
+        # ``captured_at_ms`` records when the exporter observed the pinned
+        # view, but it is not part of the view's identity.  Excluding that
+        # volatile lineage field makes repeated exports of an unchanged
+        # database revision byte-for-byte verifiable while retaining the
+        # timestamp in the returned artifact for audit context.
+        hash_payload = dict(capture)
+        hash_payload.pop("captured_at_ms", None)
+        capture["capture_sha256"] = hashlib.sha256(
+            _json_dump(hash_payload).encode("utf-8")
+        ).hexdigest()
+        return capture
 
     def meeting_exists(self, meeting_id: str) -> bool:
         meeting_id = _required(meeting_id, "meeting_id")
@@ -7372,6 +9859,130 @@ class V2Persistence:
                 for row in rows
             ],
         }
+
+    def _validate_host_coach_evidence_locked(
+        self, meeting_id: str, evidence: Any, intervention: Mapping[str, Any],
+    ) -> None:
+        """Called inside the projection write transaction, never as a preflight."""
+        if not isinstance(evidence, list) or not 1 <= len(evidence) <= 6:
+            raise IntelligenceProjectionError("invalid host evidence snapshot")
+        meeting = self._conn.execute("SELECT state FROM meetings WHERE id = ?", (meeting_id,)).fetchone()
+        if meeting is None or meeting["state"] != "live":
+            raise IntelligenceEvidenceSuperseded("host evidence meeting is no longer live")
+        cited = set(intervention.get("evidence_segment_ids") or [])
+        seen: set[str] = set()
+        fields = ("revision", "evidence_hash", "normalized_text", "source_track", "correction_status",
+                  "transcript_seq", "started_at_ms", "ended_at_ms")
+        for item in evidence:
+            if not isinstance(item, Mapping):
+                raise IntelligenceProjectionError("invalid host evidence item")
+            segment_id = item.get("segment_id")
+            if not isinstance(segment_id, str) or segment_id not in cited or segment_id in seen:
+                raise IntelligenceProjectionError("host evidence must uniquely reference cited segments")
+            seen.add(segment_id)
+            row = self._conn.execute(
+                "SELECT * FROM transcript_segments WHERE meeting_id = ? AND segment_id = ? "
+                "AND duplicate_of_segment_id IS NULL", (meeting_id, segment_id),
+            ).fetchone()
+            if row is None or any(field not in item or row[field] != item[field] for field in fields):
+                raise IntelligenceEvidenceSuperseded("host evidence changed before projection")
+
+    def query_live_coach_evidence(
+        self, meeting_id: str, *, query: str | None = None,
+        segment_ids: tuple[str, ...] = (), limit: int = 6,
+        include_neighbors: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Host-only lookup; callers bind meeting_id, never take it from a tool."""
+        meeting_id = _required(meeting_id, "meeting_id")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 6:
+            raise ValueError("evidence limit must be between 1 and 6")
+        if query is not None:
+            if segment_ids or not isinstance(query, str) or not 2 <= len(query.strip()) <= 160:
+                raise ValueError("evidence query must contain 2 to 160 characters")
+            # Literal phrase matching makes wildcard/SQL-looking input ordinary text.
+            predicate = "instr(lower(normalized_text), lower(?)) > 0"
+            parameters: tuple[Any, ...] = (query.strip(),)
+        else:
+            if not segment_ids or len(segment_ids) > 6 or any(not isinstance(i, str) or not i for i in segment_ids):
+                raise ValueError("evidence lookup requires 1 to 6 segment ids")
+            predicate = "segment_id IN (" + ",".join("?" for _ in segment_ids) + ")"
+            parameters = tuple(segment_ids)
+        with self._lock:
+            self._raise_if_tombstoned_locked(meeting_id)
+            meeting = self._conn.execute(
+                "SELECT state FROM meetings WHERE id = ?", (meeting_id,),
+            ).fetchone()
+            if meeting is None or meeting["state"] != "live":
+                raise ValueError("coach evidence requires a live meeting")
+            rows = self._conn.execute(
+                "SELECT * FROM transcript_segments WHERE meeting_id = ? "
+                "AND duplicate_of_segment_id IS NULL AND " + predicate
+                + " ORDER BY transcript_seq DESC LIMIT ?",
+                (meeting_id, *parameters, limit),
+            ).fetchall()
+            result = [self._segment_dict(row) for row in rows]
+            if include_neighbors and result:
+                ids = {item["segment_id"] for item in result}
+                seqs = [item["transcript_seq"] for item in result]
+                lo, hi = max(0, min(seqs) - 1), max(seqs) + 1
+                nearby = self._conn.execute(
+                    "SELECT * FROM transcript_segments WHERE meeting_id = ? "
+                    "AND duplicate_of_segment_id IS NULL AND transcript_seq BETWEEN ? AND ? "
+                    "ORDER BY transcript_seq ASC LIMIT 12", (meeting_id, lo, hi),
+                ).fetchall()
+                for row in nearby:
+                    item = self._segment_dict(row)
+                    if item["segment_id"] not in ids:
+                        item["evidence_relation"] = "neighbor"
+                        result.append(item)
+            return result
+
+    def read_live_coach_evidence_span(
+        self, meeting_id: str, *, segment_id: str,
+        before: int = 1, after: int = 1,
+    ) -> list[dict[str, Any]]:
+        """Read one live transcript segment and a bounded current neighborhood.
+
+        This is deliberately separate from keyword search: a search result is a
+        locator, while this method is the host-owned read of the exact current
+        revision that can be cited by a Pi run.  The meeting and live-state
+        checks remain inside the persistence lock so a closed/tombstoned
+        meeting cannot leak a late span.
+        """
+        meeting_id = _required(meeting_id, "meeting_id")
+        segment_id = _required(segment_id, "segment_id")
+        if any(isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 3
+               for value in (before, after)):
+            raise ValueError("transcript span bounds must be integers between 0 and 3")
+        with self._lock:
+            self._raise_if_tombstoned_locked(meeting_id)
+            meeting = self._conn.execute(
+                "SELECT state FROM meetings WHERE id = ?", (meeting_id,),
+            ).fetchone()
+            if meeting is None or meeting["state"] != "live":
+                raise ValueError("coach evidence requires a live meeting")
+            target = self._conn.execute(
+                "SELECT transcript_seq FROM transcript_segments "
+                "WHERE meeting_id = ? AND segment_id = ? "
+                "AND duplicate_of_segment_id IS NULL",
+                (meeting_id, segment_id),
+            ).fetchone()
+            if target is None:
+                raise KeyError(f"transcript segment not found: {meeting_id}/{segment_id}")
+            sequence = int(target["transcript_seq"])
+            rows = self._conn.execute(
+                "SELECT * FROM transcript_segments WHERE meeting_id = ? "
+                "AND duplicate_of_segment_id IS NULL AND transcript_seq BETWEEN ? AND ? "
+                "ORDER BY transcript_seq ASC",
+                (meeting_id, max(0, sequence - before), sequence + after),
+            ).fetchall()
+            result: list[dict[str, Any]] = []
+            for row in rows:
+                item = self._segment_dict(row)
+                if item["segment_id"] != segment_id:
+                    item["evidence_relation"] = "neighbor"
+                result.append(item)
+            return result
 
     def get_transcript_segment(
         self,
@@ -7752,6 +10363,333 @@ class V2Persistence:
                 (meeting_id, after_seq, limit),
             ).fetchall()
         return [self._event_dict(row) for row in rows]
+
+    def recent_coach_candidate_keys(
+        self,
+        meeting_id: str,
+        *,
+        since_ms: int,
+        limit: int = 64,
+    ) -> set[str]:
+        """Return durable candidate identities used by the realtime cooldown."""
+
+        meeting_id = _required(meeting_id, "meeting_id")
+        since_ms = max(0, int(since_ms))
+        limit = int(limit)
+        if not 1 <= limit <= 256:
+            raise ValueError("limit must be between 1 and 256")
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT payload_json FROM meeting_events WHERE meeting_id = ? "
+                "AND type = 'meeting.intelligence.applied' AND occurred_at_ms >= ? "
+                "ORDER BY seq DESC LIMIT ?",
+                (meeting_id, since_ms, limit),
+            ).fetchall()
+        keys: set[str] = set()
+        for row in rows:
+            payload = json.loads(row["payload_json"] or "{}")
+            decision = payload.get("coach_decision") if isinstance(payload, Mapping) else None
+            if not isinstance(decision, Mapping) or not _coach_decision_has_pi_provider_attempt(
+                decision
+            ):
+                continue
+            # Only candidates actually sent on that Pi attempt consume
+            # cooldown. Detected and suppressed events remain audit-only.
+            for candidate in _eligible_coach_candidate_events(decision):
+                candidate_key = candidate.get("candidate_key")
+                if isinstance(candidate_key, str) and candidate_key.strip():
+                    keys.add(candidate_key.strip())
+            candidate_key = decision.get("candidate_key")
+            if isinstance(candidate_key, str) and candidate_key.strip():
+                keys.add(candidate_key.strip())
+        return keys
+
+    def recent_local_reflex_kinds(
+        self,
+        meeting_id: str,
+        *,
+        since_ms: int,
+        limit: int = 64,
+    ) -> set[str]:
+        """Return only locally projected intervention kinds for their own cooldown."""
+
+        meeting_id = _required(meeting_id, "meeting_id")
+        since_ms = max(0, int(since_ms))
+        limit = int(limit)
+        if not 1 <= limit <= 256:
+            raise ValueError("limit must be between 1 and 256")
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT payload_json FROM meeting_events WHERE meeting_id = ? "
+                "AND type = 'meeting.intelligence.applied' AND occurred_at_ms >= ? "
+                "ORDER BY seq DESC LIMIT ?",
+                (meeting_id, since_ms, limit),
+            ).fetchall()
+        kinds: set[str] = set()
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, Mapping) or payload.get("source") != "local_reflex":
+                continue
+            decision = payload.get("coach_decision")
+            intervention = payload.get("coach_intervention")
+            if (
+                not isinstance(decision, Mapping)
+                or not isinstance(intervention, Mapping)
+                or decision.get("status") != "intervention"
+                or decision.get("origin") != "local_reflex"
+                or decision.get("pi_provider_attempted") is not False
+            ):
+                continue
+            local_reflex_kind = str(
+                intervention.get("local_reflex_kind")
+                or decision.get("local_reflex_kind")
+                or ""
+            ).strip()
+            event_type = str(intervention.get("event_type") or "").strip()
+            if _LOCAL_REFLEX_EVENT_TYPES.get(local_reflex_kind) == event_type:
+                kinds.add(local_reflex_kind)
+        return kinds
+
+    def active_local_reflex_kind(
+        self,
+        meeting_id: str,
+        *,
+        now_ms: int,
+        limit: int = 64,
+    ) -> str | None:
+        """Return the latest coach decision's active local-reflex kind, if any.
+
+        Historical local cards are append-only, so a time-bounded scan alone
+        cannot tell whether a newer decision superseded one. Cooldown may
+        suppress work only when the latest explicit coach decision is itself
+        a still-valid, retained local intervention.
+        """
+
+        meeting_id = _required(meeting_id, "meeting_id")
+        now_ms = max(0, int(now_ms))
+        limit = int(limit)
+        if not 1 <= limit <= 256:
+            raise ValueError("limit must be between 1 and 256")
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT payload_json FROM meeting_events WHERE meeting_id = ? "
+                "AND type = 'meeting.intelligence.applied' ORDER BY seq DESC LIMIT ?",
+                (meeting_id, limit),
+            ).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return None
+            if not isinstance(payload, Mapping):
+                return None
+            decision = payload.get("coach_decision")
+            if not isinstance(decision, Mapping):
+                continue
+            intervention = payload.get("coach_intervention")
+            if not isinstance(intervention, Mapping):
+                return None
+            local_reflex_kind = str(
+                decision.get("local_reflex_kind") or ""
+            ).strip()
+            intervention_kind = str(
+                intervention.get("local_reflex_kind") or ""
+            ).strip()
+            event_type = str(intervention.get("event_type") or "").strip()
+            valid_until_ms = _timing_ms(decision.get("valid_until_ms"))
+            intervention_valid_until_ms = _timing_ms(
+                intervention.get("valid_until_ms")
+            )
+            if (
+                payload.get("source") != "local_reflex"
+                or payload.get("llm_called") is not False
+                or payload.get("llm_call_status") != "not_called"
+                or payload.get("origin") != "local_reflex"
+                or payload.get("runtime_used") != "local_reflex"
+                or payload.get("pi_provider_attempted") is not False
+                or decision.get("origin") != "local_reflex"
+                or decision.get("runtime_used") != "local_reflex"
+                or decision.get("pi_provider_attempted") is not False
+                or decision.get("status") != "intervention"
+                or decision.get("lifecycle_action") != "retain"
+                or decision.get("superseded_by") is not None
+                or intervention.get("origin") != "local_reflex"
+                or intervention.get("runtime_used") != "local_reflex"
+                or intervention.get("pi_provider_attempted") is not False
+                or intervention.get("status") != "intervention"
+                or intervention.get("lifecycle_action") != "retain"
+                or intervention.get("superseded_by") is not None
+                or not local_reflex_kind
+                or intervention_kind != local_reflex_kind
+                or _LOCAL_REFLEX_EVENT_TYPES.get(local_reflex_kind) != event_type
+                or valid_until_ms is None
+                or intervention_valid_until_ms != valid_until_ms
+                or valid_until_ms <= now_ms
+            ):
+                return None
+            return local_reflex_kind
+        return None
+
+    def recent_coach_episode_priorities(
+        self,
+        meeting_id: str,
+        *,
+        since_ms: int,
+        limit: int = 64,
+        now_ms: int | None = None,
+    ) -> dict[str, int]:
+        """Return the highest attempted priority for each durable Pi episode.
+
+        In-flight reservations are included alongside applied decisions. This
+        matters after a worker restart: a Provider call may have started before
+        its ``meeting.intelligence.applied`` event was committed.
+        """
+
+        meeting_id = _required(meeting_id, "meeting_id")
+        since_ms = max(0, int(since_ms))
+        limit = int(limit)
+        if not 1 <= limit <= 256:
+            raise ValueError("limit must be between 1 and 256")
+        normalized_now_ms = (
+            max(0, int(now_ms))
+            if now_ms is not None
+            else time.time_ns() // 1_000_000
+        )
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT payload_json FROM meeting_events WHERE meeting_id = ? "
+                "AND type = 'meeting.intelligence.applied' AND occurred_at_ms >= ? "
+                "ORDER BY seq DESC LIMIT ?",
+                (meeting_id, since_ms, limit),
+            ).fetchall()
+            active_reservations = self._active_realtime_provider_reservations_locked(
+                meeting_id,
+                now_ms=normalized_now_ms,
+            )
+
+        priorities: dict[str, int] = {}
+        for row in rows:
+            payload = json.loads(row["payload_json"] or "{}")
+            decision = payload.get("coach_decision") if isinstance(payload, Mapping) else None
+            if not isinstance(decision, Mapping) or not _coach_decision_has_pi_provider_attempt(
+                decision
+            ):
+                continue
+            for candidate in _eligible_coach_candidate_events(decision):
+                episode_id = candidate.get("episode_id")
+                raw_priority = candidate.get("candidate_priority")
+                if not isinstance(episode_id, str) or not episode_id.strip():
+                    continue
+                if isinstance(raw_priority, bool):
+                    continue
+                try:
+                    priority = int(raw_priority)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if priority < 0:
+                    continue
+                normalized_episode_id = episode_id.strip()
+                priorities[normalized_episode_id] = max(
+                    priority,
+                    priorities.get(normalized_episode_id, priority),
+                )
+        for reservation in active_reservations.values():
+            raw_priority = reservation.get("priority")
+            if isinstance(raw_priority, bool):
+                continue
+            try:
+                priority = int(raw_priority)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if priority < 0:
+                continue
+            for raw_episode_id in reservation.get("episode_ids") or []:
+                episode_id = str(raw_episode_id or "").strip()
+                if episode_id:
+                    priorities[episode_id] = max(priority, priorities.get(episode_id, priority))
+        return priorities
+
+    def recent_coach_episode_descriptors(
+        self,
+        meeting_id: str,
+        *,
+        since_ms: int,
+        limit: int = 64,
+        now_ms: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return attempted episode lineage for bounded cross-window matching.
+
+        This contains no transcript text. Applied Pi decisions are bounded by
+        ``since_ms``; in-flight reservations additionally remain visible only
+        until their durable TTL, mirroring the cooldown source exactly.
+        """
+
+        meeting_id = _required(meeting_id, "meeting_id")
+        since_ms = max(0, int(since_ms))
+        limit = int(limit)
+        if not 1 <= limit <= 256:
+            raise ValueError("limit must be between 1 and 256")
+        normalized_now_ms = (
+            max(0, int(now_ms))
+            if now_ms is not None
+            else time.time_ns() // 1_000_000
+        )
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT occurred_at_ms, payload_json FROM meeting_events "
+                "WHERE meeting_id = ? AND type = 'meeting.intelligence.applied' "
+                "AND occurred_at_ms >= ? ORDER BY seq DESC LIMIT ?",
+                (meeting_id, since_ms, limit),
+            ).fetchall()
+            active_reservations = self._active_realtime_provider_reservations_locked(
+                meeting_id,
+                now_ms=normalized_now_ms,
+            )
+
+        descriptors: dict[str, dict[str, Any]] = {}
+
+        def retain(raw: Any, *, attempted_at_ms: Any) -> None:
+            descriptor = _normalized_coach_episode_descriptor(raw)
+            normalized_attempted_at_ms = _timing_ms(attempted_at_ms)
+            if descriptor is None or normalized_attempted_at_ms is None:
+                return
+            episode_id = str(descriptor["episode_id"])
+            previous = descriptors.get(episode_id)
+            previous_attempted_at_ms = (
+                int(previous["attempted_at_ms"])
+                if previous is not None
+                else -1
+            )
+            if normalized_attempted_at_ms < previous_attempted_at_ms:
+                return
+            descriptors[episode_id] = {
+                **descriptor,
+                "attempted_at_ms": normalized_attempted_at_ms,
+            }
+
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            decision = payload.get("coach_decision") if isinstance(payload, Mapping) else None
+            if not isinstance(decision, Mapping) or not _coach_decision_has_pi_provider_attempt(
+                decision
+            ):
+                continue
+            for candidate in _eligible_coach_candidate_events(decision):
+                retain(candidate, attempted_at_ms=row["occurred_at_ms"])
+        for reservation in active_reservations.values():
+            for descriptor in reservation.get("episode_descriptors") or []:
+                retain(descriptor, attempted_at_ms=reservation.get("reserved_at_ms"))
+        return sorted(
+            descriptors.values(),
+            key=lambda item: (int(item["attempted_at_ms"]), item["episode_id"]),
+            reverse=True,
+        )
 
     def list_event_page(
         self,
@@ -8335,6 +11273,336 @@ class V2Persistence:
             )
         return self.get_note(note_id)
 
+    def _upsert_agent_work_item_locked(
+        self,
+        *,
+        meeting_id: str,
+        job_id: str,
+        decision: Mapping[str, Any],
+        intervention: Mapping[str, Any] | None,
+        now_ms: int,
+        current_seq: int,
+        fallback_segment_id: str | None = None,
+        expected_version: int | None = None,
+    ) -> dict[str, Any]:
+        """Persist the business item behind one coach decision.
+
+        Coach events are an append-only audit trail, but workers need a small
+        queryable projection that survives a process restart. This method is
+        intentionally called inside the intelligence projection transaction so
+        an item and its formal decision can never diverge.
+        """
+
+        meeting_id = _required(meeting_id, "meeting_id")
+        job_id = _required(job_id, "job_id")
+        if not isinstance(decision, Mapping):
+            raise IntelligenceProjectionError("agent work item requires a coach decision")
+        now_ms = max(0, int(now_ms))
+        current_seq = max(0, int(current_seq))
+        self._raise_if_tombstoned_locked(meeting_id)
+
+        decision_id = str(decision.get("decision_id") or "").strip() or None
+        lifecycle_refresh = bool(decision.get("lifecycle_refresh"))
+        previous_decision_id = (
+            str(decision.get("lifecycle_refresh_previous_decision_id") or "").strip()
+            if lifecycle_refresh
+            else ""
+        )
+        candidates = _eligible_coach_candidate_events(decision)
+        candidate_key = str(decision.get("candidate_key") or "").strip()
+        if not candidate_key and candidates:
+            candidate_key = str(candidates[0].get("candidate_key") or "").strip()
+        if not candidate_key:
+            candidate_key = str(decision.get("candidate_event") or "").strip()
+        if not candidate_key:
+            candidate_key = f"job:{job_id}"
+
+        existing: sqlite3.Row | None = None
+        if previous_decision_id:
+            existing = self._conn.execute(
+                "SELECT * FROM agent_work_items WHERE meeting_id = ? "
+                "AND latest_decision_id = ? ORDER BY updated_at_ms DESC LIMIT 1",
+                (meeting_id, previous_decision_id),
+            ).fetchone()
+        if existing is None:
+            existing = self._conn.execute(
+                "SELECT * FROM agent_work_items WHERE meeting_id = ? AND dedupe_key = ?",
+                (meeting_id, candidate_key),
+            ).fetchone()
+        if expected_version is not None and (
+            existing is None or int(existing["version"]) != int(expected_version)
+        ):
+            raise RuntimeError("agent work item version conflict")
+
+        evidence_specs: list[dict[str, Any]] = []
+        seen_evidence: set[tuple[str, int, str]] = set()
+
+        def add_evidence(raw_ids: Any, *, relation: str, quote: Any) -> None:
+            if relation not in AGENT_WORK_ITEM_EVIDENCE_RELATIONS:
+                raise IntelligenceProjectionError("unsupported agent work item evidence relation")
+            ids = raw_ids if isinstance(raw_ids, list) else []
+            if not ids and fallback_segment_id:
+                ids = [fallback_segment_id]
+            for raw_id in ids[:16]:
+                segment_id = str(raw_id or "").strip()
+                if not segment_id:
+                    continue
+                segment = self._conn.execute(
+                    "SELECT segment_id, revision, text, normalized_text FROM transcript_segments "
+                    "WHERE meeting_id = ? AND segment_id = ?",
+                    (meeting_id, segment_id),
+                ).fetchone()
+                if segment is None:
+                    raise IntelligenceProjectionError(
+                        f"agent work item evidence is outside the meeting: {segment_id}"
+                    )
+                normalized_quote = " ".join(str(quote or "").split())[:4_000]
+                if not normalized_quote:
+                    normalized_quote = " ".join(
+                        str(segment["normalized_text"] or segment["text"] or "").split()
+                    )[:4_000]
+                key = (segment_id, int(segment["revision"]), relation)
+                if key in seen_evidence:
+                    continue
+                seen_evidence.add(key)
+                evidence_specs.append(
+                    {
+                        "segment_id": segment_id,
+                        "revision": int(segment["revision"]),
+                        "relation": relation,
+                        "quote": normalized_quote,
+                    }
+                )
+
+        intervention_ids = intervention.get("evidence_segment_ids") if isinstance(intervention, Mapping) else None
+        intervention_quote = (
+            intervention.get("evidence_quote") if isinstance(intervention, Mapping) else None
+        )
+        if intervention_ids:
+            add_evidence(intervention_ids, relation="supporting", quote=intervention_quote)
+        for candidate in candidates:
+            add_evidence(
+                candidate.get("evidence_segment_ids"),
+                relation="trigger",
+                quote=intervention_quote or candidate.get("reason"),
+            )
+        if not evidence_specs:
+            add_evidence([], relation="trigger", quote=intervention_quote)
+        evidence_ids = list(dict.fromkeys(item["segment_id"] for item in evidence_specs))
+
+        status = str(decision.get("status") or "").strip().lower()
+        resolution = lifecycle_refresh and bool(previous_decision_id)
+        if resolution:
+            state = "resolved"
+        elif isinstance(intervention, Mapping) and status == "intervention":
+            state = "ready"
+        elif status in {"timed_out", "failed", "protected_silent"}:
+            state = "waiting_for_evidence"
+        else:
+            state = "investigating"
+        if existing is not None and str(existing["state"]) in {"dismissed", "expired"} and not resolution:
+            state = str(existing["state"])
+
+        title = ""
+        summary = ""
+        if isinstance(intervention, Mapping):
+            title = str(intervention.get("title") or intervention.get("event_type") or "").strip()
+            summary = str(
+                intervention.get("why_now") or intervention.get("reason") or intervention.get("recommendation") or ""
+            ).strip()
+        if not title and candidates:
+            title = str(candidates[0].get("event_type") or candidates[0].get("candidate_key") or "未闭环事项")
+        if not summary:
+            summary = str(decision.get("decision_reason") or decision.get("status_reason") or "").strip()
+        title = title[:200] or "未闭环事项"
+        summary = summary[:4_000] or title
+        trigger_type = str(decision.get("trigger_type") or "").strip()
+        if not trigger_type and candidates:
+            trigger_type = str(candidates[0].get("trigger_type") or "").strip()
+        trigger_type = trigger_type or "delta"
+        priority = 0
+        for candidate in candidates:
+            try:
+                priority = max(priority, int(candidate.get("candidate_priority") or 0))
+            except (TypeError, ValueError, OverflowError):
+                continue
+        needed_raw = decision.get("needed") or decision.get("needed_fields")
+        if needed_raw is None and isinstance(intervention, Mapping):
+            needed_raw = intervention.get("needed") or intervention.get("needed_fields")
+        needed = [str(item).strip()[:200] for item in (needed_raw if isinstance(needed_raw, list) else []) if str(item).strip()][:32]
+        valid_until = _timing_ms(
+            (intervention or {}).get("valid_until_ms") if isinstance(intervention, Mapping) else decision.get("valid_until_ms")
+        )
+        execution_status = (
+            "resolved"
+            if resolution
+            else "succeeded"
+            if isinstance(intervention, Mapping) and status == "intervention"
+            else "failed"
+            if decision.get("fallback_error_code") or status in {"timed_out", "failed"}
+            else status or "unknown"
+        )
+        failure_reason = None if execution_status in {"succeeded", "resolved"} else str(
+            decision.get("fallback_error_code") or decision.get("status_reason") or ""
+        ).strip() or None
+        work_item_id = str(existing["work_item_id"]) if existing is not None else _stable_id(
+            "work-item", meeting_id, candidate_key
+        )
+        version = int(existing["version"]) + 1 if existing is not None else 1
+        resolved_at_ms = now_ms if resolution else (None if state != "resolved" else existing["resolved_at_ms"] if existing else now_ms)
+        values = (
+            candidate_key,
+            state,
+            priority,
+            title,
+            summary,
+            trigger_type,
+            job_id,
+            decision_id,
+            str(decision.get("run_id") or "").strip() or None,
+            _json_dump(evidence_specs),
+            _json_dump(evidence_ids),
+            _json_dump(needed),
+            current_seq,
+            valid_until,
+            execution_status,
+            failure_reason,
+            version,
+            now_ms,
+            now_ms,
+            resolved_at_ms,
+        )
+        if existing is None:
+            self._conn.execute(
+                "INSERT INTO agent_work_items (work_item_id, meeting_id, dedupe_key, kind, state, priority, "
+                "title, summary, trigger_type, trigger_job_id, latest_decision_id, latest_run_id, evidence_json, "
+                "evidence_segment_ids_json, needed_json, last_checked_seq, next_check_at_ms, last_execution_status, "
+                "failure_reason, version, created_at_ms, updated_at_ms, resolved_at_ms) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (work_item_id, meeting_id, candidate_key, "commitment", *values[1:]),
+            )
+        else:
+            self._conn.execute(
+                "UPDATE agent_work_items SET dedupe_key = ?, state = ?, priority = ?, title = ?, summary = ?, "
+                "trigger_type = ?, trigger_job_id = ?, latest_decision_id = ?, latest_run_id = ?, evidence_json = ?, "
+                "evidence_segment_ids_json = ?, needed_json = ?, last_checked_seq = ?, next_check_at_ms = ?, "
+                "last_execution_status = ?, failure_reason = ?, version = ?, updated_at_ms = ?, resolved_at_ms = ? "
+                "WHERE work_item_id = ? AND meeting_id = ?",
+                (*values[:17], values[18], values[19], work_item_id, meeting_id),
+            )
+        for evidence in evidence_specs:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO agent_work_item_evidence (work_item_id, meeting_id, segment_id, revision, relation, quote, observed_at_ms) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    work_item_id,
+                    meeting_id,
+                    evidence["segment_id"],
+                    evidence["revision"],
+                    evidence["relation"],
+                    evidence["quote"],
+                    now_ms,
+                ),
+            )
+        row = self._conn.execute(
+            "SELECT * FROM agent_work_items WHERE work_item_id = ? AND meeting_id = ?",
+            (work_item_id, meeting_id),
+        ).fetchone()
+        evidence_rows = self._conn.execute(
+            "SELECT * FROM agent_work_item_evidence WHERE work_item_id = ? ORDER BY observed_at_ms, segment_id, revision",
+            (work_item_id,),
+        ).fetchall()
+        return self._agent_work_item_dict(row, evidence_rows=evidence_rows)
+
+    def list_agent_work_items(
+        self,
+        meeting_id: str,
+        *,
+        state: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        meeting_id = _required(meeting_id, "meeting_id")
+        limit = int(limit)
+        if not 1 <= limit <= 256:
+            raise ValueError("limit must be between 1 and 256")
+        normalized_state = str(state or "").strip() or None
+        if normalized_state is not None and normalized_state not in AGENT_WORK_ITEM_STATES:
+            raise ValueError("unsupported agent work item state")
+        with self._lock:
+            self._raise_if_tombstoned_locked(meeting_id)
+            if self._conn.execute("SELECT 1 FROM meetings WHERE id = ?", (meeting_id,)).fetchone() is None:
+                raise KeyError(f"meeting not found: {meeting_id}")
+            clauses = ["meeting_id = ?"]
+            parameters: list[Any] = [meeting_id]
+            if normalized_state is not None:
+                clauses.append("state = ?")
+                parameters.append(normalized_state)
+            parameters.append(limit)
+            rows = self._conn.execute(
+                "SELECT * FROM agent_work_items WHERE " + " AND ".join(clauses) +
+                " ORDER BY CASE state WHEN 'ready' THEN 0 WHEN 'waiting_for_evidence' THEN 1 ELSE 2 END, priority DESC, updated_at_ms DESC LIMIT ?",
+                parameters,
+            ).fetchall()
+            result: list[dict[str, Any]] = []
+            for row in rows:
+                evidence_rows = self._conn.execute(
+                    "SELECT * FROM agent_work_item_evidence WHERE work_item_id = ? ORDER BY observed_at_ms, segment_id, revision",
+                    (row["work_item_id"],),
+                ).fetchall()
+                result.append(self._agent_work_item_dict(row, evidence_rows=evidence_rows))
+            return result
+
+    def get_agent_work_item(self, meeting_id: str, work_item_id: str) -> dict[str, Any]:
+        meeting_id = _required(meeting_id, "meeting_id")
+        work_item_id = _required(work_item_id, "work_item_id")
+        with self._lock:
+            self._raise_if_tombstoned_locked(meeting_id)
+            row = self._conn.execute(
+                "SELECT * FROM agent_work_items WHERE meeting_id = ? AND work_item_id = ?",
+                (meeting_id, work_item_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"agent work item not found: {work_item_id}")
+            evidence_rows = self._conn.execute(
+                "SELECT * FROM agent_work_item_evidence WHERE work_item_id = ? ORDER BY observed_at_ms, segment_id, revision",
+                (work_item_id,),
+            ).fetchall()
+            return self._agent_work_item_dict(row, evidence_rows=evidence_rows)
+
+    def update_agent_work_item_state(
+        self,
+        *,
+        meeting_id: str,
+        work_item_id: str,
+        state: str,
+        now_ms: int,
+        expected_version: int | None = None,
+        failure_reason: str | None = None,
+    ) -> dict[str, Any]:
+        meeting_id = _required(meeting_id, "meeting_id")
+        work_item_id = _required(work_item_id, "work_item_id")
+        state = _required(state, "state")
+        if state not in AGENT_WORK_ITEM_STATES:
+            raise ValueError("unsupported agent work item state")
+        now_ms = max(0, int(now_ms))
+        with self._write_transaction():
+            self._raise_if_tombstoned_locked(meeting_id)
+            row = self._conn.execute(
+                "SELECT * FROM agent_work_items WHERE meeting_id = ? AND work_item_id = ?",
+                (meeting_id, work_item_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"agent work item not found: {work_item_id}")
+            if expected_version is not None and int(row["version"]) != int(expected_version):
+                raise RuntimeError("agent work item version conflict")
+            resolved_at_ms = now_ms if state == "resolved" else None
+            self._conn.execute(
+                "UPDATE agent_work_items SET state = ?, version = version + 1, failure_reason = ?, "
+                "resolved_at_ms = ?, updated_at_ms = ? WHERE meeting_id = ? AND work_item_id = ?",
+                (state, failure_reason, resolved_at_ms, now_ms, meeting_id, work_item_id),
+            )
+        return self.get_agent_work_item(meeting_id, work_item_id)
+
     def list_jobs(
         self,
         *,
@@ -8468,6 +11736,51 @@ class V2Persistence:
         if kind == "risk":
             entity["mitigation"] = row["mitigation"]
         return entity
+
+    @staticmethod
+    def _agent_work_item_dict(row: sqlite3.Row, evidence_rows: list[sqlite3.Row] | None = None) -> dict[str, Any]:
+        """Decode the durable PI work-item projection without model internals."""
+
+        evidence = json.loads(row["evidence_json"] or "[]")
+        evidence_ids = json.loads(row["evidence_segment_ids_json"] or "[]")
+        needed = json.loads(row["needed_json"] or "[]")
+        item = {
+            "work_item_id": row["work_item_id"],
+            "meeting_id": row["meeting_id"],
+            "dedupe_key": row["dedupe_key"],
+            "kind": row["kind"],
+            "state": row["state"],
+            "priority": int(row["priority"]),
+            "title": row["title"],
+            "summary": row["summary"],
+            "trigger_type": row["trigger_type"],
+            "trigger_job_id": row["trigger_job_id"],
+            "latest_decision_id": row["latest_decision_id"],
+            "latest_run_id": row["latest_run_id"],
+            "evidence": evidence if isinstance(evidence, list) else [],
+            "evidence_segment_ids": evidence_ids if isinstance(evidence_ids, list) else [],
+            "needed": needed if isinstance(needed, list) else [],
+            "last_checked_seq": row["last_checked_seq"],
+            "next_check_at_ms": row["next_check_at_ms"],
+            "last_execution_status": row["last_execution_status"],
+            "failure_reason": row["failure_reason"],
+            "version": int(row["version"]),
+            "created_at_ms": int(row["created_at_ms"]),
+            "updated_at_ms": int(row["updated_at_ms"]),
+            "resolved_at_ms": row["resolved_at_ms"],
+        }
+        if evidence_rows is not None:
+            item["evidence_links"] = [
+                {
+                    "segment_id": evidence_row["segment_id"],
+                    "revision": int(evidence_row["revision"]),
+                    "relation": evidence_row["relation"],
+                    "quote": evidence_row["quote"],
+                    "observed_at_ms": int(evidence_row["observed_at_ms"]),
+                }
+                for evidence_row in evidence_rows
+            ]
+        return item
 
     @staticmethod
     def _recording_session_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -8828,7 +12141,7 @@ class V2Persistence:
 
     @staticmethod
     def _job_dict(row: sqlite3.Row) -> dict[str, Any]:
-        return {
+        job = {
             "id": row["id"],
             "meeting_id": row["meeting_id"],
             "kind": row["kind"],
@@ -8839,6 +12152,10 @@ class V2Persistence:
             "evidence_segment_id": row["evidence_segment_id"],
             "evidence_hash": row["evidence_hash"],
             "generation_id": row["generation_id"],
+            "trigger_type": row["trigger_type"],
+            "work_item_id": row["work_item_id"],
+            "trigger_reference_seq": row["trigger_reference_seq"],
+            "user_request": row["user_request"],
             "idempotency_key": row["idempotency_key"],
             "attempts": int(row["attempts"]),
             "max_attempts": int(row["max_attempts"]),
@@ -8852,10 +12169,22 @@ class V2Persistence:
             "updated_at_ms": int(row["updated_at_ms"]),
             "completed_at_ms": row["completed_at_ms"],
         }
+        if str(job["kind"]) == "intelligence":
+            job.update(
+                {
+                    "job_created_at_ms": job["created_at_ms"],
+                    "final_committed_at_ms": row["final_committed_at_ms"],
+                    "job_started_at_ms": row["job_started_at_ms"],
+                    "decision_completed_at_ms": row["decision_completed_at_ms"],
+                    "projected_at_ms": row["projected_at_ms"],
+                }
+            )
+            job["timing"] = _intelligence_timing_envelope(job)
+        return job
 
     @staticmethod
     def _job_status_summary(job: dict[str, Any]) -> dict[str, Any]:
-        return {
+        summary = {
             "id": job["id"],
             "kind": job["kind"],
             "status": job["status"],
@@ -8866,6 +12195,20 @@ class V2Persistence:
             "updated_at_ms": job["updated_at_ms"],
             "completed_at_ms": job["completed_at_ms"],
         }
+        if str(job.get("kind") or "") == "intelligence":
+            summary.update(
+                {
+                    "evidence_segment_id": job.get("evidence_segment_id"),
+                    "deadline_at_ms": job.get("deadline_at_ms"),
+                    "job_created_at_ms": job.get("job_created_at_ms", job.get("created_at_ms")),
+                    "final_committed_at_ms": job.get("final_committed_at_ms"),
+                    "job_started_at_ms": job.get("job_started_at_ms"),
+                    "decision_completed_at_ms": job.get("decision_completed_at_ms"),
+                    "projected_at_ms": job.get("projected_at_ms"),
+                    "timing": job.get("timing"),
+                }
+            )
+        return summary
 
     @staticmethod
     def _ask_message_dict(row: sqlite3.Row) -> dict[str, Any]:

@@ -12,7 +12,9 @@ import contextlib
 import json
 import re
 import sys
+import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 
 _REAL_STDOUT = sys.stdout
@@ -23,10 +25,18 @@ MAX_RESIDENT_COMMAND_LINE_BYTES = 6 * 1024 * 1024
 PREVIEW_VAD_FRAME_SAMPLES = 160
 PREVIEW_VAD_RMS_THRESHOLD = 0.006
 PREVIEW_VAD_PREROLL_SAMPLES = 1_280
+RESIDENT_PENDING_AUDIO_MAX_BYTES = 4 * 1024 * 1024
+RESIDENT_PENDING_AUDIO_MAX_COMMANDS = 64
+RESIDENT_PENDING_CONTROL_MAX_COMMANDS = 64
+# Preserve a short, not-yet-started tail so normal paced input keeps its
+# preview.  Once inference is already running, a boundary discards every
+# queued preview command and waits for at most that one in-flight model call.
+RESIDENT_BOUNDARY_GRACE_AUDIO_BYTES = 32 * 1024
 _SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _RESIDENT_COMMAND_FIELDS = {
     "start_session": frozenset({"command", "session_id"}),
     "audio": frozenset({"command", "session_id", "pcm_base64"}),
+    "flush_utterance": frozenset({"command", "session_id", "boundary_id"}),
     "end_session": frozenset({"command", "session_id"}),
     "abort_session": frozenset({"command", "session_id"}),
     "shutdown": frozenset({"command"}),
@@ -83,6 +93,239 @@ class ResidentCommand:
     session_id: str | None
     pcm_bytes: bytes = b""
     hotwords: tuple[str, ...] = ()
+    boundary_id: str | None = None
+
+
+@dataclass(frozen=True)
+class _BufferedResidentCommand:
+    command: ResidentCommand
+    skipped_preview_bytes: int = 0
+
+
+@dataclass(frozen=True)
+class _ResidentInputTerminal:
+    error: ResidentProtocolError | None = None
+
+
+class _ResidentCommandBuffer:
+    """Bound the audio plane while keeping ordered control commands runnable."""
+
+    def __init__(self, *, preview_stride_bytes: int) -> None:
+        if preview_stride_bytes <= 0 or preview_stride_bytes % 4:
+            raise ValueError("preview_stride_bytes must be positive and frame-aligned")
+        self._condition = threading.Condition()
+        self._preview_stride_bytes = preview_stride_bytes
+        self._boundary_grace_audio_bytes = min(
+            RESIDENT_BOUNDARY_GRACE_AUDIO_BYTES,
+            preview_stride_bytes * 2,
+        )
+        self._items: deque[_BufferedResidentCommand | _ResidentInputTerminal] = deque()
+        self._pending_audio_bytes = 0
+        self._pending_audio_commands = 0
+        self._pending_control_commands = 0
+        self._audio_in_flight_session_id: str | None = None
+        self._overflow_skipped_bytes: dict[str, int] = {}
+        self._seen_boundaries: dict[tuple[str, str], None] = {}
+        self._terminal_enqueued = False
+
+    def put(self, command: ResidentCommand) -> None:
+        with self._condition:
+            if self._terminal_enqueued:
+                return
+            if command.command == "audio":
+                self._put_audio_locked(command)
+            else:
+                self._put_control_locked(command)
+            self._condition.notify()
+
+    def put_terminal(self, error: ResidentProtocolError | None = None) -> None:
+        with self._condition:
+            if self._terminal_enqueued:
+                return
+            self._terminal_enqueued = True
+            # EOF/protocol failure preserves every valid command that appeared
+            # earlier on the wire. Explicit session controls use the bounded
+            # preview-discard path when low-latency termination is required.
+            if self._pending_control_commands >= RESIDENT_PENDING_CONTROL_MAX_COMMANDS:
+                # A hostile stream can otherwise fill the control allowance
+                # and leave no slot for the fatal marker, deadlocking the main
+                # loop after the reader exits.
+                self._items.clear()
+                self._pending_audio_bytes = 0
+                self._pending_audio_commands = 0
+                self._pending_control_commands = 0
+                self._overflow_skipped_bytes.clear()
+            self._append_control_locked(_ResidentInputTerminal(error=error))
+            self._condition.notify()
+
+    def get(self) -> _BufferedResidentCommand | _ResidentInputTerminal:
+        with self._condition:
+            while not self._items:
+                self._condition.wait()
+            item = self._items.popleft()
+            if isinstance(item, _ResidentInputTerminal):
+                self._pending_control_commands -= 1
+                return item
+            if item.command.command == "audio":
+                self._pending_audio_commands -= 1
+                self._pending_audio_bytes -= len(item.command.pcm_bytes)
+                self._audio_in_flight_session_id = item.command.session_id
+            else:
+                self._pending_control_commands -= 1
+            return item
+
+    def command_finished(self, item: _BufferedResidentCommand) -> None:
+        with self._condition:
+            session_id = item.command.session_id
+            if (
+                item.command.command == "audio"
+                and self._audio_in_flight_session_id == session_id
+            ):
+                self._audio_in_flight_session_id = None
+
+    def _put_audio_locked(self, command: ResidentCommand) -> None:
+        session_id = str(command.session_id or "")
+        pcm_bytes = command.pcm_bytes
+        for offset in range(0, len(pcm_bytes), self._preview_stride_bytes):
+            fragment = pcm_bytes[offset : offset + self._preview_stride_bytes]
+            if not self._put_audio_fragment_locked(command, fragment):
+                skipped_bytes = len(pcm_bytes) - offset
+                self._overflow_skipped_bytes[session_id] = (
+                    self._overflow_skipped_bytes.get(session_id, 0) + skipped_bytes
+                )
+                return
+
+    def _put_audio_fragment_locked(
+        self,
+        command: ResidentCommand,
+        pcm_bytes: bytes,
+    ) -> bool:
+        pcm_size = len(pcm_bytes)
+        if (
+            self._pending_audio_commands >= RESIDENT_PENDING_AUDIO_MAX_COMMANDS
+            or self._pending_audio_bytes + pcm_size > RESIDENT_PENDING_AUDIO_MAX_BYTES
+        ):
+            return False
+        fragment_command = ResidentCommand(
+            command="audio",
+            session_id=command.session_id,
+            pcm_bytes=pcm_bytes,
+        )
+        self._items.append(_BufferedResidentCommand(command=fragment_command))
+        self._pending_audio_commands += 1
+        self._pending_audio_bytes += pcm_size
+        return True
+
+    def _put_control_locked(self, command: ResidentCommand) -> None:
+        session_id = str(command.session_id or "")
+        skipped_preview_bytes = 0
+        if command.command == "flush_utterance":
+            boundary_key = (session_id, str(command.boundary_id or ""))
+            if boundary_key in self._seen_boundaries:
+                # A retry token is an idempotent ACK request for the previous
+                # utterance. Place it before the current utterance's trailing
+                # audio without discarding or reclassifying that audio.
+                insert_at = self._trailing_audio_start_locked()
+                self._insert_control_locked(
+                    insert_at,
+                    _BufferedResidentCommand(command=command),
+                )
+                return
+            self._seen_boundaries[boundary_key] = None
+            while len(self._seen_boundaries) > 128:
+                self._seen_boundaries.pop(next(iter(self._seen_boundaries)))
+            overflow_bytes = self._overflow_skipped_bytes.pop(session_id, 0)
+            trailing_bytes = self._trailing_audio_bytes_locked()
+            if (
+                self._audio_in_flight_session_id == command.session_id
+                or overflow_bytes
+                or trailing_bytes > self._boundary_grace_audio_bytes
+            ):
+                skipped_preview_bytes = (
+                    overflow_bytes + self._discard_trailing_audio_locked(session_id)
+                )
+        elif command.command in {"abort_session", "end_session"}:
+            skipped_preview_bytes = self._overflow_skipped_bytes.pop(session_id, 0)
+            # Session controls are never allowed to wait behind a sustained
+            # preview backlog. END may preserve one small tail when no model
+            # call is active so the normal short-utterance path remains useful.
+            trailing_bytes = self._trailing_audio_bytes_locked()
+            must_discard = command.command == "abort_session" or (
+                self._audio_in_flight_session_id == command.session_id
+                or skipped_preview_bytes
+                or trailing_bytes > self._boundary_grace_audio_bytes
+            )
+            if must_discard:
+                skipped_preview_bytes += self._discard_trailing_audio_locked(session_id)
+        self._append_control_locked(
+            _BufferedResidentCommand(
+                command=command,
+                skipped_preview_bytes=skipped_preview_bytes,
+            )
+        )
+
+    def _append_control_locked(
+        self,
+        item: _BufferedResidentCommand | _ResidentInputTerminal,
+    ) -> None:
+        if self._pending_control_commands >= RESIDENT_PENDING_CONTROL_MAX_COMMANDS:
+            raise ResidentProtocolError("command_queue_overflow")
+        self._items.append(item)
+        self._pending_control_commands += 1
+
+    def _insert_control_locked(
+        self,
+        index: int,
+        item: _BufferedResidentCommand,
+    ) -> None:
+        if self._pending_control_commands >= RESIDENT_PENDING_CONTROL_MAX_COMMANDS:
+            raise ResidentProtocolError(
+                "command_queue_overflow",
+                session_id=item.command.session_id,
+            )
+        self._items.insert(index, item)
+        self._pending_control_commands += 1
+
+    def _trailing_audio_start_locked(self) -> int:
+        index = len(self._items)
+        while index > 0:
+            item = self._items[index - 1]
+            if (
+                not isinstance(item, _BufferedResidentCommand)
+                or item.command.command != "audio"
+            ):
+                break
+            index -= 1
+        return index
+
+    def _trailing_audio_bytes_locked(self) -> int:
+        total = 0
+        for item in reversed(self._items):
+            if (
+                not isinstance(item, _BufferedResidentCommand)
+                or item.command.command != "audio"
+            ):
+                break
+            total += len(item.command.pcm_bytes)
+        return total
+
+    def _discard_trailing_audio_locked(self, session_id: str | None = None) -> int:
+        skipped_bytes = 0
+        while self._items:
+            item = self._items[-1]
+            if (
+                not isinstance(item, _BufferedResidentCommand)
+                or item.command.command != "audio"
+            ):
+                break
+            if session_id is not None and item.command.session_id != session_id:
+                break
+            self._items.pop()
+            pcm_size = len(item.command.pcm_bytes)
+            skipped_bytes += pcm_size
+            self._pending_audio_commands -= 1
+            self._pending_audio_bytes -= pcm_size
+        return skipped_bytes
 
 
 @dataclass
@@ -99,6 +342,8 @@ class SessionState:
     inference_max_s: float = 0.0
     hotwords: tuple[str, ...] = ()
     preview_speech_started: bool = False
+    utterance_index: int = 1
+    completed_boundaries: dict[str, int] = field(default_factory=dict)
 
 
 def encode_resident_command(
@@ -107,7 +352,14 @@ def encode_resident_command(
     session_id: str | None = None,
     pcm_bytes: bytes = b"",
     hotwords: list[str] | tuple[str, ...] | None = None,
+    boundary_id: str | None = None,
 ) -> bytes:
+    if command != "audio" and pcm_bytes:
+        raise ResidentProtocolError("invalid_command_fields", session_id=session_id)
+    if command != "start_session" and hotwords is not None:
+        raise ResidentProtocolError("invalid_command_fields", session_id=session_id)
+    if command != "flush_utterance" and boundary_id is not None:
+        raise ResidentProtocolError("invalid_command_fields", session_id=session_id)
     payload: dict[str, object] = {"command": command}
     if session_id is not None:
         payload["session_id"] = session_id
@@ -115,10 +367,11 @@ def encode_resident_command(
         payload["pcm_base64"] = base64.b64encode(pcm_bytes).decode("ascii")
     elif command == "start_session" and hotwords is not None:
         payload["hotwords"] = list(_normalize_session_hotwords(hotwords))
-    elif pcm_bytes:
-        raise ResidentProtocolError("invalid_command_fields", session_id=session_id)
-    elif hotwords is not None:
-        raise ResidentProtocolError("invalid_command_fields", session_id=session_id)
+    elif command == "flush_utterance":
+        payload["boundary_id"] = _normalize_boundary_id(
+            boundary_id,
+            session_id=session_id,
+        )
     decode_resident_command_header(payload)
     if command == "audio":
         _decode_pcm_base64(payload["pcm_base64"], session_id=session_id)
@@ -172,15 +425,22 @@ def decode_resident_command(line: bytes | str) -> ResidentCommand:
     header = decode_resident_command_header(payload)
     pcm_bytes = b""
     hotwords: tuple[str, ...] = ()
+    boundary_id: str | None = None
     if header.command == "audio":
         pcm_bytes = _decode_pcm_base64(payload["pcm_base64"], session_id=header.session_id)
     elif header.command == "start_session" and "hotwords" in payload:
         hotwords = _normalize_session_hotwords(payload["hotwords"], session_id=header.session_id)
+    elif header.command == "flush_utterance":
+        boundary_id = _normalize_boundary_id(
+            payload.get("boundary_id"),
+            session_id=header.session_id,
+        )
     return ResidentCommand(
         command=header.command,
         session_id=header.session_id,
         pcm_bytes=pcm_bytes,
         hotwords=hotwords,
+        boundary_id=boundary_id,
     )
 
 
@@ -242,6 +502,21 @@ def _normalize_session_hotwords(
             seen.add(key)
             normalized.append(item)
     return tuple(normalized)
+
+
+def _normalize_boundary_id(
+    value: object,
+    *,
+    session_id: str | None,
+) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 192
+        or any(ord(character) < 33 or ord(character) > 126 for character in value)
+    ):
+        raise ResidentProtocolError("invalid_boundary_id", session_id=session_id)
+    return value
 
 
 def _merge_hotwords(*groups: list[str] | tuple[str, ...]) -> tuple[str, ...]:
@@ -378,6 +653,33 @@ def _emit_session_started(session_id: str) -> None:
     )
 
 
+def _emit_utterance_boundary_complete(
+    *,
+    session_id: str,
+    boundary_id: str,
+    utterance_index: int,
+    duplicate: bool,
+    drain_ms: float | None = None,
+    skipped_preview_bytes: int = 0,
+    skipped_silence_bytes: int = 0,
+) -> None:
+    payload = {
+        "event_type": "utterance_boundary_complete",
+        "session_id": session_id,
+        "scope": "utterance",
+        "boundary_id": boundary_id,
+        "utterance_index": utterance_index,
+        "duplicate": duplicate,
+    }
+    if drain_ms is not None:
+        payload["drain_ms"] = drain_ms
+    if skipped_preview_bytes:
+        payload["skipped_preview_bytes"] = skipped_preview_bytes
+    if skipped_silence_bytes:
+        payload["skipped_silence_bytes"] = skipped_silence_bytes
+    _write_event(payload)
+
+
 def _emit_session_terminal(
     event_type: str,
     *,
@@ -476,7 +778,12 @@ def _generate_chunk(
         # cumulative transcript. Keep it replaceable and never synthesize a
         # final by concatenating these snapshots.
         state.latest_partial_text = text
-        _emit("partial", text, 1, session_id=state.session_id)
+        _emit(
+            "partial",
+            text,
+            state.utterance_index,
+            session_id=state.session_id,
+        )
         state.last_text = text
 
 
@@ -529,7 +836,16 @@ def _process_resident_audio(
     hotwords: list[str],
     state: SessionState,
     flush: bool,
-) -> None:
+) -> int:
+    """Run preview inference for complete strides and return skipped bytes.
+
+    The server-side VAD owns the authoritative boundary.  A flush commonly
+    leaves a short tail made entirely of silence (the endpoint's pause).  It
+    is safe to discard that tail from the *online preview* path because the
+    backend retains the original PCM for authoritative refinement.  Avoiding
+    an ``is_final`` call for silence removes a frequent 0.5-1s tail stall while
+    preserving the causal ACK and evidence boundary.
+    """
     chunk_stride_bytes = chunk_stride_samples(args.chunk_size) * 4
     # Emit preview inference as soon as one complete stride is available.
     # Authoritative finals come from the independent offline refiner, so holding
@@ -546,19 +862,60 @@ def _process_resident_audio(
             pcm_bytes=chunk_bytes,
             dtype="<f4",
         )
+    skipped_silence_bytes = 0
     if flush and state.audio_buffer:
         tail_bytes = bytes(state.audio_buffer)
-        state.audio_buffer.clear()
-        _generate_chunk(
-            model=model,
-            np_module=np_module,
-            args=args,
-            hotwords=hotwords,
-            state=state,
-            pcm_bytes=tail_bytes,
-            dtype="<f4",
-            is_final=True,
-        )
+        if _pcm_contains_preview_speech(np_module=np_module, pcm_bytes=tail_bytes):
+            state.audio_buffer.clear()
+            _generate_chunk(
+                model=model,
+                np_module=np_module,
+                args=args,
+                hotwords=hotwords,
+                state=state,
+                pcm_bytes=tail_bytes,
+                dtype="<f4",
+                is_final=True,
+            )
+        else:
+            # Keep this accounting explicit in the ACK so diagnostics can
+            # distinguish an intentional silent-tail fast path from dropped
+            # audio.  The backend still owns the complete raw PCM segment.
+            skipped_silence_bytes = len(tail_bytes)
+            state.audio_buffer.clear()
+    return skipped_silence_bytes
+
+
+def _pcm_contains_preview_speech(*, np_module, pcm_bytes: bytes) -> bool:
+    """Return true when any complete/partial VAD frame exceeds the preview floor."""
+
+    if not pcm_bytes:
+        return False
+    samples = np_module.frombuffer(pcm_bytes, dtype="<f4")
+    if len(samples) == 0:
+        return False
+    # A malformed non-finite sample must never make us silently skip a tail.
+    try:
+        if not bool(np_module.isfinite(samples).all()):
+            return True
+    except (AttributeError, TypeError, ValueError):
+        # Test doubles and alternate array implementations may not expose
+        # ``isfinite``; retain the conservative speech path in that case.
+        return True
+    for frame_start in range(0, len(samples), PREVIEW_VAD_FRAME_SAMPLES):
+        frame = samples[frame_start : frame_start + PREVIEW_VAD_FRAME_SAMPLES]
+        if len(frame) and float(np_module.sqrt(np_module.mean(frame * frame))) > PREVIEW_VAD_RMS_THRESHOLD:
+            return True
+    return False
+
+
+def _reset_resident_utterance(state: SessionState) -> None:
+    state.cache = {}
+    state.audio_buffer.clear()
+    state.last_text = ""
+    state.latest_partial_text = ""
+    state.preview_speech_started = False
+    state.utterance_index += 1
 
 
 def _trim_preview_leading_silence(*, np_module, state: SessionState, pcm_bytes: bytes) -> bytes:
@@ -578,6 +935,64 @@ def _trim_preview_leading_silence(*, np_module, state: SessionState, pcm_bytes: 
     return b""
 
 
+def _read_resident_commands(*, stdin, command_buffer: _ResidentCommandBuffer) -> None:
+    """Decode stdin continuously and publish semantically ordered commands."""
+
+    active_session_id: str | None = None
+    try:
+        while True:
+            command = read_resident_command(stdin)
+            if command is None:
+                error = (
+                    ResidentProtocolError(
+                        "unexpected_eof",
+                        session_id=active_session_id,
+                    )
+                    if active_session_id is not None
+                    else None
+                )
+                command_buffer.put_terminal(error)
+                return
+            if command.command == "start_session":
+                if active_session_id is not None:
+                    raise ResidentProtocolError(
+                        "concurrent_session",
+                        session_id=command.session_id,
+                    )
+                active_session_id = command.session_id
+            elif command.command == "shutdown":
+                if active_session_id is not None:
+                    raise ResidentProtocolError(
+                        "shutdown_during_session",
+                        session_id=active_session_id,
+                    )
+                command_buffer.put(command)
+                return
+            else:
+                if active_session_id is None:
+                    raise ResidentProtocolError(
+                        "no_active_session",
+                        session_id=command.session_id,
+                    )
+                if command.session_id != active_session_id:
+                    raise ResidentProtocolError(
+                        "session_mismatch",
+                        session_id=command.session_id,
+                    )
+                if command.command in {"abort_session", "end_session"}:
+                    active_session_id = None
+            command_buffer.put(command)
+    except ResidentProtocolError as exc:
+        command_buffer.put_terminal(exc)
+    except Exception:
+        command_buffer.put_terminal(
+            ResidentProtocolError(
+                "stdin_read_failed",
+                session_id=active_session_id,
+            )
+        )
+
+
 def _run_resident_mode(
     *,
     model,
@@ -587,84 +1002,144 @@ def _run_resident_mode(
     stdin,
 ) -> None:
     state: SessionState | None = None
+    command_buffer = _ResidentCommandBuffer(
+        preview_stride_bytes=chunk_stride_samples(args.chunk_size) * 4,
+    )
+    reader = threading.Thread(
+        target=_read_resident_commands,
+        kwargs={"stdin": stdin, "command_buffer": command_buffer},
+        daemon=True,
+        name="funasr-resident-stdin-reader",
+    )
+    reader.start()
     while True:
-        command = read_resident_command(stdin)
-        if command is None:
-            if state is not None:
-                raise ResidentProtocolError("unexpected_eof", session_id=state.session_id)
+        buffered = command_buffer.get()
+        if isinstance(buffered, _ResidentInputTerminal):
+            if buffered.error is not None:
+                raise buffered.error
             return
-        if command.command == "start_session":
-            if state is not None:
-                raise ResidentProtocolError("concurrent_session", session_id=command.session_id)
-            state = SessionState(
-                session_id=command.session_id,
-                hotwords=_merge_hotwords(tuple(hotwords), command.hotwords),
-            )
-            _emit_session_started(command.session_id)
-            continue
-        if command.command == "shutdown":
-            if state is not None:
-                raise ResidentProtocolError("shutdown_during_session", session_id=state.session_id)
-            return
-        if state is None:
-            raise ResidentProtocolError("no_active_session", session_id=command.session_id)
-        if command.session_id != state.session_id:
-            raise ResidentProtocolError("session_mismatch", session_id=command.session_id)
-        if command.command == "audio":
-            state.input_samples += len(command.pcm_bytes) // 4
-            state.audio_buffer.extend(
-                _trim_preview_leading_silence(
-                    np_module=np_module,
-                    state=state,
-                    pcm_bytes=command.pcm_bytes,
+        command = buffered.command
+        try:
+            if command.command == "start_session":
+                if state is not None:
+                    raise ResidentProtocolError("concurrent_session", session_id=command.session_id)
+                state = SessionState(
+                    session_id=command.session_id,
+                    hotwords=_merge_hotwords(tuple(hotwords), command.hotwords),
                 )
-            )
-            _process_resident_audio(
-                model=model,
-                np_module=np_module,
-                args=args,
-                hotwords=list(state.hotwords),
-                state=state,
-                flush=False,
-            )
-            continue
-        if command.command == "end_session":
-            _process_resident_audio(
-                model=model,
-                np_module=np_module,
-                args=args,
-                hotwords=list(state.hotwords),
-                state=state,
-                flush=True,
-            )
-            # This is a terminal model snapshot for protocol compatibility,
-            # not an authoritative product final. The backend refines it over
-            # raw segment PCM before persistence.
-            final_emitted = bool(state.latest_partial_text)
-            if final_emitted:
-                _emit("final", state.latest_partial_text, 1, session_id=state.session_id)
-            _emit_state_telemetry(state, elapsed_s=time.monotonic() - state.started_at)
-            _emit_session_terminal(
-                "session_ended",
-                session_id=state.session_id,
-                status="completed",
-                reason="end_session",
-                final_emitted=final_emitted,
-            )
-            state = None
-            continue
-        if command.command == "abort_session":
-            _emit_state_telemetry(state, elapsed_s=time.monotonic() - state.started_at)
-            _emit_session_terminal(
-                "session_aborted",
-                session_id=state.session_id,
-                status="aborted",
-                reason="abort_session",
-                final_emitted=False,
-            )
-            state = None
-            continue
-        raise ResidentProtocolError("unknown_command", session_id=command.session_id)
+                _emit_session_started(command.session_id)
+                continue
+            if command.command == "shutdown":
+                if state is not None:
+                    raise ResidentProtocolError("shutdown_during_session", session_id=state.session_id)
+                return
+            if state is None:
+                raise ResidentProtocolError("no_active_session", session_id=command.session_id)
+            if command.session_id != state.session_id:
+                raise ResidentProtocolError("session_mismatch", session_id=command.session_id)
+            if buffered.skipped_preview_bytes:
+                state.input_samples += buffered.skipped_preview_bytes // 4
+            if command.command == "audio":
+                state.input_samples += len(command.pcm_bytes) // 4
+                state.audio_buffer.extend(
+                    _trim_preview_leading_silence(
+                        np_module=np_module,
+                        state=state,
+                        pcm_bytes=command.pcm_bytes,
+                    )
+                )
+                _process_resident_audio(
+                    model=model,
+                    np_module=np_module,
+                    args=args,
+                    hotwords=list(state.hotwords),
+                    state=state,
+                    flush=False,
+                )
+                continue
+            if command.command == "flush_utterance":
+                boundary_id = str(command.boundary_id or "")
+                if boundary_id in state.completed_boundaries:
+                    _emit_utterance_boundary_complete(
+                        session_id=state.session_id,
+                        boundary_id=boundary_id,
+                        utterance_index=state.completed_boundaries[boundary_id],
+                        duplicate=True,
+                    )
+                    continue
+                completed_utterance_index = state.utterance_index
+                started_at = time.monotonic()
+                skipped_silence_bytes = _process_resident_audio(
+                    model=model,
+                    np_module=np_module,
+                    args=args,
+                    hotwords=list(state.hotwords),
+                    state=state,
+                    flush=True,
+                )
+                state.completed_boundaries[boundary_id] = completed_utterance_index
+                if len(state.completed_boundaries) > 128:
+                    oldest_boundary_id = next(iter(state.completed_boundaries))
+                    state.completed_boundaries.pop(oldest_boundary_id, None)
+                _reset_resident_utterance(state)
+                # `_generate_chunk` writes any residual partial synchronously.
+                # The ACK proves that older preview bytes were either processed
+                # or explicitly invalidated and that the next command sees a
+                # fresh cache.
+                _emit_utterance_boundary_complete(
+                    session_id=state.session_id,
+                    boundary_id=boundary_id,
+                    utterance_index=completed_utterance_index,
+                    duplicate=False,
+                    drain_ms=round((time.monotonic() - started_at) * 1_000, 2),
+                    skipped_preview_bytes=buffered.skipped_preview_bytes,
+                    skipped_silence_bytes=skipped_silence_bytes,
+                )
+                continue
+            if command.command == "end_session":
+                _process_resident_audio(
+                    model=model,
+                    np_module=np_module,
+                    args=args,
+                    hotwords=list(state.hotwords),
+                    state=state,
+                    flush=True,
+                )
+                # This is a terminal model snapshot for protocol compatibility,
+                # not an authoritative product final. The backend refines it over
+                # raw segment PCM before persistence.
+                final_emitted = bool(state.latest_partial_text)
+                if final_emitted:
+                    _emit(
+                        "final",
+                        state.latest_partial_text,
+                        state.utterance_index,
+                        session_id=state.session_id,
+                    )
+                _emit_state_telemetry(state, elapsed_s=time.monotonic() - state.started_at)
+                _emit_session_terminal(
+                    "session_ended",
+                    session_id=state.session_id,
+                    status="completed",
+                    reason="end_session",
+                    final_emitted=final_emitted,
+                )
+                state = None
+                continue
+            if command.command == "abort_session":
+                _emit_state_telemetry(state, elapsed_s=time.monotonic() - state.started_at)
+                _emit_session_terminal(
+                    "session_aborted",
+                    session_id=state.session_id,
+                    status="aborted",
+                    reason="abort_session",
+                    final_emitted=False,
+                )
+                state = None
+                continue
+            raise ResidentProtocolError("unknown_command", session_id=command.session_id)
+        finally:
+            command_buffer.command_finished(buffered)
 
 
 def main(argv: list[str] | None = None) -> None:

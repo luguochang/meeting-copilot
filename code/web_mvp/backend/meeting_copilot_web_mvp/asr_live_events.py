@@ -334,6 +334,11 @@ def _partial_event(raw_event: dict[str, Any]) -> dict[str, Any]:
                 else {}
             ),
             "confidence": raw_event.get("confidence"),
+            **(
+                {"confidence_source": str(raw_event["confidence_source"])}
+                if raw_event.get("confidence_source")
+                else {}
+            ),
             "is_final": False,
         },
     }
@@ -561,6 +566,11 @@ def _final_payload(
         ),
         **({"projection_reconciled": True} if raw_event.get("projection_reconciled") else {}),
         "confidence": raw_event.get("confidence"),
+        **(
+            {"confidence_source": str(raw_event["confidence_source"])}
+            if raw_event.get("confidence_source")
+            else {}
+        ),
         "authoritative": bool(raw_event.get("authoritative", True)),
         **(
             {"final_source": str(raw_event["final_source"])}
