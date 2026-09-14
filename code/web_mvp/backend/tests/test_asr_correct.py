@@ -27,6 +27,36 @@ def test_correct_transcript_fixes_misrecognitions():
     assert client.calls[0]["body"]["max_completion_tokens"] == 4096
 
 
+def test_correct_transcript_uses_deepseek_v4_compatibility_fields():
+    config = llm_service.LlmConfig(
+        base_url="https://api.deepseek.com",
+        api_key="sk-test-deepseek",
+        model="deepseek-v4-flash",
+    )
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+
+        def post_json(self, url, headers, body, timeout):
+            self.calls.append(body)
+            return {
+                "choices": [{"message": {"content": "修正后的文本"}}],
+                "usage": {"total_tokens": 3},
+            }
+
+    client = FakeClient()
+    corrected, _usage, degraded = asr_correct.correct_transcript(
+        "原始转写 t九九", config, client=client
+    )
+
+    assert degraded is False
+    assert corrected == "修正后的文本"
+    assert client.calls[0]["thinking"] == {"type": "disabled"}
+    assert client.calls[0]["max_tokens"] == 4096
+    assert "max_completion_tokens" not in client.calls[0]
+
+
 def test_correct_transcript_degrades_to_raw_on_failure(monkeypatch):
     monkeypatch.setattr(llm_service.time, "sleep", lambda *a: None)
     config = llm_service.LlmConfig(base_url="https://gw.example", api_key="sk-x", model="m1")

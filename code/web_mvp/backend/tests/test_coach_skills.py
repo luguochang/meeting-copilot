@@ -18,10 +18,17 @@ def test_all_supported_skills_have_a_bounded_versioned_contract() -> None:
         "interview",
         "brainstorm",
     }
+    expected_versions = {
+        "general": 1,
+        "decision": 1,
+        "project": 1,
+        "interview": 1,
+        "brainstorm": 2,
+    }
     for skill_id in SUPPORTED_COACH_SKILL_IDS:
         skill = coach_skill_payload(skill_id)
         assert skill["id"] == skill_id
-        assert skill["version"] == 1
+        assert skill["version"] == expected_versions[skill_id]
         assert skill["name"]
         assert skill["objective"]
         assert skill["intervention_style"]

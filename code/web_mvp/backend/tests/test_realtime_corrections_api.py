@@ -69,6 +69,8 @@ def _configure_llm(monkeypatch):
     monkeypatch.setenv("LLM_GATEWAY_MODEL", "gpt-5.5")
     monkeypatch.setenv("LLM_GATEWAY_PROVIDER_LABEL", "team_gateway")
     monkeypatch.delenv("LLM_GATEWAY_IS_MOCK", raising=False)
+    monkeypatch.setenv("LLM_PROMPT_CNY_PER_1M_TOKENS", "1")
+    monkeypatch.setenv("LLM_COMPLETION_CNY_PER_1M_TOKENS", "1")
 
 
 def _start_live_session(monkeypatch, client: TestClient, session_id: str, text: str):
@@ -96,6 +98,80 @@ def _enable_l2(client: TestClient) -> None:
     assert client.patch("/settings", json=settings).status_code == 200
 
 
+def test_run_once_fails_closed_before_provider_for_zero_correction_rate(monkeypatch, tmp_path):
+    _configure_llm(monkeypatch)
+    monkeypatch.setenv("LLM_PROMPT_CNY_PER_1M_TOKENS", "0")
+    provider_calls: list[str] = []
+
+    def correct(raw, _config, **_kwargs):
+        provider_calls.append(raw)
+        return raw, {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}, False
+
+    monkeypatch.setattr(asr_correct, "correct_transcript", correct)
+    client = TestClient(create_app(data_dir=tmp_path), raise_server_exceptions=False)
+    _enable_l2(client)
+    context, ws = _start_live_session(
+        monkeypatch,
+        client,
+        "correction-zero-rate",
+        "接口先灰度百分之五。",
+    )
+    try:
+        response = client.post(
+            "/live/asr/sessions/correction-zero-rate/realtime-corrections/run-once",
+            json={"force": True},
+        )
+
+        assert response.status_code == 503
+        assert response.json()["detail"] == {
+            "error": "correction_provider_rates_not_configured",
+            "purpose": "realtime_transcript_correction",
+            "pricingMode": "metered",
+        }
+        assert provider_calls == []
+    finally:
+        ws.send_text("END")
+        context.__exit__(None, None, None)
+
+
+def test_run_once_explicit_unmetered_allows_correction_without_rates(monkeypatch, tmp_path):
+    _configure_llm(monkeypatch)
+    monkeypatch.setenv("LLM_CORRECTION_PRICING_MODE", "unmetered")
+    monkeypatch.setenv("LLM_PROMPT_CNY_PER_1M_TOKENS", "0")
+    monkeypatch.setenv("LLM_COMPLETION_CNY_PER_1M_TOKENS", "0")
+    provider_calls: list[str] = []
+
+    def correct(raw, _config, **_kwargs):
+        provider_calls.append(raw)
+        return raw, {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}, False
+
+    monkeypatch.setattr(asr_correct, "correct_transcript", correct)
+    client = TestClient(create_app(data_dir=tmp_path), raise_server_exceptions=False)
+    _enable_l2(client)
+    context, ws = _start_live_session(
+        monkeypatch,
+        client,
+        "correction-unmetered",
+        "接口先灰度百分之五。",
+    )
+    try:
+        response = client.post(
+            "/live/asr/sessions/correction-unmetered/realtime-corrections/run-once",
+            json={"force": True},
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["called"] is True
+        assert provider_calls == [
+            "<<<MC_SEGMENT:0001:corr_seg_1>>>\n"
+            "接口先灰度百分之五。\n"
+            "<<<MC_END:0001>>>"
+        ]
+    finally:
+        ws.send_text("END")
+        context.__exit__(None, None, None)
+
+
 def test_realtime_correction_allows_persisted_finals_after_stream_tail_interrupt():
     record = {
         "session_id": "interrupted-final",
@@ -120,6 +196,167 @@ def test_realtime_correction_allows_persisted_finals_after_stream_tail_interrupt
     }
 
     assert app_module._realtime_correction_blockers(record) == []
+
+
+def test_realtime_correction_allows_persisted_final_after_boundary_ack_timeout():
+    record = {
+        "session_id": "boundary-timeout-final",
+        "source": "live_asr_stream",
+        "trace_kind": "live_event",
+        "provider": "funasr_realtime",
+        "provider_mode": "real",
+        "is_mock": False,
+        "input_source": "browser_live_mic",
+        "ingest_mode": "live_asr_stream",
+        "asr_fallback_used": False,
+        "degradation_reasons": ["funasr_boundary_ack_timeout"],
+        "events": [
+            {
+                "event_type": "transcript_final",
+                "payload": {
+                    "segment_id": "segment-1",
+                    "text": "已经由离线 refiner 持久化的会议正文。",
+                },
+            }
+        ],
+    }
+
+    assert app_module._realtime_correction_blockers(record) == []
+
+
+def test_online_only_resource_policy_is_audited_without_blocking_correction_or_llm():
+    record = {
+        "session_id": "online-only-policy-final",
+        "source": "live_asr_stream",
+        "trace_kind": "live_event",
+        "provider": "funasr_realtime",
+        "provider_mode": "real",
+        "is_mock": False,
+        "input_source": "browser_live_mic",
+        "ingest_mode": "live_asr_stream",
+        "asr_fallback_used": False,
+        "degradation_reasons": [asr_stream.ONLINE_ONLY_REFINEMENT_REASON],
+        "events": [
+            {
+                "event_type": "transcript_final",
+                "payload": {
+                    "segment_id": "segment-1",
+                    "text": (
+                        "checkout-service周五晚上灰度百分之十先看error_rate和P99"
+                        "如果指标异常我们暂停扩量但回滚脚本还没有准备好，"
+                        "先确认owner和监控阈值。"
+                    ),
+                },
+            }
+        ],
+    }
+
+    # The policy is auditable, but it is not an ASR safety failure. Both
+    # correction and ordinary enabled LLM derivations may use this final.
+    assert app_module._realtime_correction_blockers(record) == []
+    app_module._ensure_enabled_llm_allowed(
+        record,
+        allow_non_acceptance_execution=False,
+    )
+
+
+def test_realtime_correction_does_not_bypass_real_asr_quality_blocker():
+    bad_text = (
+        "下能脱稿画出a卷的全链路能说出每一个组件的位置和作用被属黑准的主循环"
+        "request到contest xt moden downtwo calling to methoc ine ofdel背熟midiwell"
+        "le的六值和位置背书三三状态一个短期机一个常见机一外一个任务状态"
+    )
+    record = {
+        "session_id": "online-only-policy-unsafe-final",
+        "source": "live_asr_stream",
+        "trace_kind": "live_event",
+        "provider": "funasr_realtime",
+        "provider_mode": "real",
+        "is_mock": False,
+        "input_source": "browser_live_mic",
+        "ingest_mode": "live_asr_stream",
+        "asr_fallback_used": False,
+        "degradation_reasons": [
+            asr_stream.ONLINE_ONLY_REFINEMENT_REASON,
+            "asr_semantic_quality_blocked",
+        ],
+        "events": [
+            {
+                "event_type": "transcript_final",
+                "payload": {
+                    "segment_id": "segment-1",
+                    "text": bad_text,
+                },
+            }
+        ],
+    }
+
+    blockers = app_module._realtime_correction_blockers(record)
+    assert "asr_semantic_quality_blocked" in blockers
+    assert "degraded_asr_session" in blockers
+
+
+def test_realtime_correction_executes_with_online_only_resource_policy_bypass(
+    monkeypatch,
+    tmp_path,
+):
+    _configure_llm(monkeypatch)
+    calls = []
+
+    def correct(raw, cfg, **kwargs):
+        del cfg, kwargs
+        calls.append(raw)
+        return (
+            raw.replace("百分之五", "5%").replace("百分之零点一", "0.1%"),
+            {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30},
+            False,
+        )
+
+    monkeypatch.setattr(asr_correct, "correct_transcript", correct)
+    client = TestClient(create_app(data_dir=tmp_path))
+    _enable_l2(client)
+    context, ws = _start_live_session(
+        monkeypatch,
+        client,
+        "correction_online_only_policy",
+        "接口先恢度百分之五，如果错误率超过百分之零点一就回滚，张三今天补回滚脚本并确认监控阈值。",
+    )
+    try:
+        client.app.state.asr_live_repository.update(
+            "correction_online_only_policy",
+            lambda latest: {
+                **latest,
+                "degradation_reasons": [asr_stream.ONLINE_ONLY_REFINEMENT_REASON],
+            },
+        )
+        before = client.get(
+            "/live/asr/sessions/correction_online_only_policy/events"
+        ).json()
+        assert before["event_source"]["degradation_reasons"] == [
+            asr_stream.ONLINE_ONLY_REFINEMENT_REASON
+        ]
+        assert "degraded_asr_session" not in before["event_source"]["acceptance_blockers"]
+        assert before["event_source"]["acceptance_eligible"] is True
+
+        response = client.post(
+            "/live/asr/sessions/correction_online_only_policy/realtime-corrections/run-once",
+            json={"force": True},
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["called"] is True
+        assert body["revision_count"] == 1, body
+        assert len(calls) == 1
+
+        after = client.get(
+            "/live/asr/sessions/correction_online_only_policy/events"
+        ).json()
+        assert after["event_source"]["acceptance_eligible"] is True
+        assert "degraded_asr_session" not in after["event_source"]["acceptance_blockers"]
+    finally:
+        ws.send_text("END")
+        context.__exit__(None, None, None)
 
 
 def test_realtime_correction_setting_fails_closed_before_provider_and_updates_existing_session(
@@ -908,6 +1145,7 @@ def test_semantic_quality_blocker_is_recovered_before_formal_suggestion(
     client = TestClient(create_app(data_dir=tmp_path))
     _enable_l2(client)
     context, ws = _start_live_session(monkeypatch, client, "semantic_quality_recovery", raw_text)
+    stream_ended = False
     try:
         before = client.get("/live/asr/sessions/semantic_quality_recovery/events").json()
         assert before["event_source"]["asr_semantic_quality"]["status"] == "blocked"
@@ -929,7 +1167,19 @@ def test_semantic_quality_blocker_is_recovered_before_formal_suggestion(
         # A later ASR persistence checkpoint must project the accepted revision,
         # rather than reintroducing the raw semantic-quality blocker.
         ws.send_bytes(b"\x00" * 3200)
-        assert _receive_final_events(ws, 1)[0]["event_type"] == "final"
+        # The recognizer repeats the same final/segment identity. Production
+        # deliberately does not emit that duplicate as a UI-only final, so END
+        # is the bounded stream synchronization point for its persistence
+        # checkpoint instead of waiting forever for a final that must not exist.
+        ws.send_text("END")
+        terminal_events = []
+        while True:
+            terminal_event = json.loads(ws.receive_text())
+            terminal_events.append(terminal_event)
+            if terminal_event.get("event_type") == "end_of_stream":
+                break
+        stream_ended = True
+        assert not any(event.get("event_type") == "final" for event in terminal_events)
         recovered = client.get("/live/asr/sessions/semantic_quality_recovery/events").json()
         assert recovered["event_source"]["asr_semantic_quality"]["status"] == "passed"
         assert "asr_semantic_quality_blocked" not in recovered["event_source"]["acceptance_blockers"]
@@ -941,5 +1191,6 @@ def test_semantic_quality_blocker_is_recovered_before_formal_suggestion(
         assert suggestions.json()["generated_card_count"] == 1
         assert suggestions.json()["suggestion_cards"]
     finally:
-        ws.send_text("END")
+        if not stream_ended:
+            ws.send_text("END")
         context.__exit__(None, None, None)

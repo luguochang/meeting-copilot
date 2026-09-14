@@ -39,7 +39,7 @@ def test_fresh_database_bootstraps_legacy_and_v2_schema(tmp_path: Path) -> None:
 
     assert result.source_version == 0
     assert result.final_version == APPLICATION_SCHEMA_VERSION
-    assert result.applied_versions == (1, 2, 3, 4, 5, 6)
+    assert result.applied_versions == tuple(range(1, APPLICATION_SCHEMA_VERSION + 1))
     assert result.backup_path is None
     assert _version(database_path) == APPLICATION_SCHEMA_VERSION
     assert {
@@ -64,6 +64,9 @@ def test_fresh_database_bootstraps_legacy_and_v2_schema(tmp_path: Path) -> None:
             "ask_messages",
             "meeting_notes",
             "meeting_note_evidence",
+            "intelligence_input_coverage",
+            "agent_work_items",
+            "agent_work_item_evidence",
     }.issubset(_objects(database_path, "table"))
     assert {
         "idx_llm_usage_timestamp",
@@ -73,6 +76,10 @@ def test_fresh_database_bootstraps_legacy_and_v2_schema(tmp_path: Path) -> None:
         "idx_recording_import_jobs_claim",
         "idx_recording_import_jobs_expired_lease",
         "idx_deletion_jobs_idempotency",
+            "idx_intelligence_input_coverage_status",
+            "idx_agent_work_items_state",
+            "idx_agent_work_items_decision",
+            "idx_agent_work_item_evidence_meeting",
     }.issubset(_objects(database_path, "index"))
     with sqlite3.connect(database_path) as connection:
         assert connection.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
@@ -83,9 +90,14 @@ def test_fresh_database_bootstraps_legacy_and_v2_schema(tmp_path: Path) -> None:
         (1, "create_legacy_repository_schema"),
         (2, "create_v2_application_schema"),
         (3, "add_native_pcm_source_ranges"),
-        (4, "add_meeting_ask_ai_workspace"),
-        (5, "add_meeting_notes"),
-        (6, "version_semantic_reading_blocks"),
+            (4, "add_meeting_ask_ai_workspace"),
+            (5, "add_meeting_notes"),
+            (6, "version_semantic_reading_blocks"),
+            (7, "add_realtime_intelligence_timing_chain"),
+            (8, "add_realtime_provider_circuit_state"),
+        (9, "add_intelligence_trigger_contract"),
+            (10, "add_intelligence_input_coverage"),
+            (11, "add_durable_pi_work_items"),
     ]
 
 
@@ -105,7 +117,7 @@ def test_existing_legacy_v1_database_is_backed_up_and_upgraded_without_data_loss
 
     assert result.source_version == 1
     assert result.final_version == APPLICATION_SCHEMA_VERSION
-    assert result.applied_versions == (2, 3, 4, 5, 6)
+    assert result.applied_versions == tuple(range(2, APPLICATION_SCHEMA_VERSION + 1))
     assert result.backup_path is not None
     backup_stat = result.backup_path.stat()
     assert stat.S_ISREG(backup_stat.st_mode)
@@ -128,9 +140,14 @@ def test_existing_legacy_v1_database_is_backed_up_and_upgraded_without_data_loss
         ).fetchall() == [
             (2, "create_v2_application_schema"),
                 (3, "add_native_pcm_source_ranges"),
-                (4, "add_meeting_ask_ai_workspace"),
-                (5, "add_meeting_notes"),
-                (6, "version_semantic_reading_blocks"),
+                    (4, "add_meeting_ask_ai_workspace"),
+                    (5, "add_meeting_notes"),
+                    (6, "version_semantic_reading_blocks"),
+                    (7, "add_realtime_intelligence_timing_chain"),
+                    (8, "add_realtime_provider_circuit_state"),
+                    (9, "add_intelligence_trigger_contract"),
+                        (10, "add_intelligence_input_coverage"),
+                        (11, "add_durable_pi_work_items"),
             ]
 
 
@@ -203,7 +220,7 @@ def test_old_v2_partial_schema_at_version_zero_is_completed_and_preserved(tmp_pa
     result = bootstrap_application_schema(database_path)
 
     assert result.source_version == 0
-    assert result.applied_versions == (1, 2, 3, 4, 5, 6)
+    assert result.applied_versions == tuple(range(1, APPLICATION_SCHEMA_VERSION + 1))
     with sqlite3.connect(database_path) as connection:
         meeting_columns = {row[1] for row in connection.execute("PRAGMA table_info(meetings)").fetchall()}
         entity_columns = {row[1] for row in connection.execute("PRAGMA table_info(meeting_entities)").fetchall()}
@@ -281,7 +298,7 @@ def test_safe_schema_migration_report_excludes_database_and_backup_paths(tmp_pat
         "storage": "sqlite",
         "source_version": 1,
         "final_version": APPLICATION_SCHEMA_VERSION,
-        "applied_versions": [2, 3, 4, 5, 6],
+        "applied_versions": list(range(2, APPLICATION_SCHEMA_VERSION + 1)),
         "migrated": True,
         "backup_created": True,
     }
@@ -406,7 +423,7 @@ def test_concurrent_bootstrap_is_serialized_and_idempotent(tmp_path: Path) -> No
     with ThreadPoolExecutor(max_workers=6) as executor:
         results = list(executor.map(lambda _: bootstrap(), range(6)))
 
-    assert results.count((APPLICATION_SCHEMA_VERSION, (1, 2, 3, 4, 5, 6))) == 1
+    assert results.count((APPLICATION_SCHEMA_VERSION, tuple(range(1, APPLICATION_SCHEMA_VERSION + 1)))) == 1
     assert results.count((APPLICATION_SCHEMA_VERSION, ())) == 5
     with sqlite3.connect(database_path) as connection:
         assert connection.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
@@ -448,7 +465,7 @@ def test_v3_migration_preserves_v2_audio_chunks_and_adds_nullable_source_ranges(
     result = bootstrap_application_schema(database_path)
 
     assert result.source_version == 2
-    assert result.applied_versions == (3, 4, 5, 6)
+    assert result.applied_versions == tuple(range(3, APPLICATION_SCHEMA_VERSION + 1))
     with sqlite3.connect(database_path) as connection:
         columns = {row[1] for row in connection.execute("PRAGMA table_info(audio_chunks)")}
         assert {
@@ -463,3 +480,117 @@ def test_v3_migration_preserves_v2_audio_chunks_and_adds_nullable_source_ranges(
             "FROM audio_chunks WHERE meeting_id = ?",
             ("legacy-browser-audio",),
         ).fetchone() == (None, None, None, None)
+
+
+def test_v7_migration_preserves_existing_jobs_and_leaves_new_timing_nullable(
+    tmp_path: Path,
+) -> None:
+    """Upgrade a real v6 database without fabricating timing provenance."""
+
+    database_path = tmp_path / "v6-with-job.db"
+    application_schema.migrate_sqlite_schema(
+        database_path,
+        application_schema.APPLICATION_SCHEMA_MIGRATIONS[:6],
+        current_version=6,
+        max_supported_version=6,
+    )
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "INSERT INTO meetings ("
+            "id, state, title, started_at_ms, latest_seq, revision, created_at_ms, updated_at_ms"
+            ") VALUES (?, 'live', ?, ?, ?, ?, ?, ?)",
+            ("legacy-timing-meeting", "Keep this meeting", 100, 1, 1, 100, 100),
+        )
+        connection.execute(
+            "INSERT INTO transcript_segments ("
+            "meeting_id, segment_id, final_id, transcript_seq, text, normalized_text, "
+            "evidence_hash, created_at_ms, updated_at_ms"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "legacy-timing-meeting",
+                "legacy-timing-segment",
+                "legacy-timing-final",
+                1,
+                "旧版本已持久化的文字",
+                "旧版本已持久化的文字",
+                "legacy-evidence-hash",
+                100,
+                100,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO jobs ("
+            "id, meeting_id, kind, status, priority, input_transcript_seq, input_version, "
+            "evidence_segment_id, evidence_hash, idempotency_key, attempts, max_attempts, "
+            "next_attempt_at_ms, created_at_ms, updated_at_ms"
+            ") VALUES (?, ?, 'intelligence', 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "legacy-timing-job",
+                "legacy-timing-meeting",
+                90,
+                1,
+                1,
+                "legacy-timing-segment",
+                "legacy-evidence-hash",
+                "legacy-timing-idempotency",
+                0,
+                3,
+                500,
+                100,
+                100,
+            ),
+        )
+        assert connection.execute("PRAGMA user_version").fetchone() == (6,)
+        assert {
+            row[1] for row in connection.execute("PRAGMA table_info(jobs)").fetchall()
+        }.isdisjoint(
+            {
+                "final_committed_at_ms",
+                "job_started_at_ms",
+                "decision_completed_at_ms",
+                "projected_at_ms",
+            }
+        )
+
+    result = bootstrap_application_schema(database_path)
+
+    assert result.source_version == 6
+    assert result.final_version == APPLICATION_SCHEMA_VERSION
+    assert result.applied_versions == tuple(range(7, APPLICATION_SCHEMA_VERSION + 1))
+    with sqlite3.connect(database_path) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(jobs)").fetchall()
+        }
+        assert {
+            "final_committed_at_ms",
+            "job_started_at_ms",
+            "decision_completed_at_ms",
+            "projected_at_ms",
+        } <= columns
+        assert connection.execute(
+            "SELECT meeting_id, kind, status, priority, input_transcript_seq, input_version, "
+            "evidence_segment_id, evidence_hash, idempotency_key, attempts, max_attempts, "
+            "next_attempt_at_ms, created_at_ms, updated_at_ms, final_committed_at_ms, "
+            "job_started_at_ms, decision_completed_at_ms, projected_at_ms "
+            "FROM jobs WHERE id = ?",
+            ("legacy-timing-job",),
+        ).fetchone() == (
+            "legacy-timing-meeting",
+            "intelligence",
+            "pending",
+            90,
+            1,
+            1,
+            "legacy-timing-segment",
+            "legacy-evidence-hash",
+            "legacy-timing-idempotency",
+            0,
+            3,
+            500,
+            100,
+            100,
+            None,
+            None,
+            None,
+            None,
+        )

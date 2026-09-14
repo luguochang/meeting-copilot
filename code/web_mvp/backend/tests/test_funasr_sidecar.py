@@ -1,5 +1,6 @@
 """Tests for FunasrSidecarRecognizer (G2, mocked subprocess)."""
 import json
+import os
 import threading
 import time
 import queue
@@ -345,6 +346,11 @@ def test_funasr_sidecar_feeds_chunks_and_reads_final(monkeypatch):
     assert final["event_type"] == "final"
     assert final["segment_id"] == "sess_f_x"
     assert final["text"] == "灰度 5%"
+    assert final["confidence"] is None
+    assert (
+        final["confidence_source"]
+        == asr_stream.ASR_CONFIDENCE_SOURCE_REALTIME_UNAVAILABLE
+    )
     assert len(fake.stdin.written) == 2
     cmd = popen_calls[0][0][0]
     assert cmd[cmd.index("--engine") + 1] == "pytorch"
@@ -496,6 +502,27 @@ def test_explicit_realtime_component_overrides_take_priority_over_manifest(tmp_p
     assert runtime.errors == ()
     assert runtime.worker == worker
     assert asr_stream.funasr_realtime_available(environ) is True
+
+
+def test_explicit_realtime_python_preserves_venv_symlink_for_execution(tmp_path):
+    base_python = tmp_path / "base" / "python3.11"
+    venv_python = tmp_path / "venv" / "bin" / "python"
+    base_python.parent.mkdir(parents=True)
+    venv_python.parent.mkdir(parents=True)
+    base_python.write_text("fixture", encoding="utf-8")
+    try:
+        venv_python.symlink_to(base_python)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symlink privilege is unavailable")
+        raise
+
+    runtime = asr_stream._resolve_funasr_runtime(
+        {"MEETING_COPILOT_FUNASR_PYTHON": str(venv_python)}
+    )
+
+    assert runtime.python == venv_python
+    assert runtime.python.resolve() == base_python.resolve()
 
 
 def test_packaged_realtime_runtime_reports_unavailable_when_required_file_is_missing(

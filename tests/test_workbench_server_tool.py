@@ -31,6 +31,8 @@ def test_build_uvicorn_command_defaults_to_workbench_port():
         "8765",
         "--log-level",
         "warning",
+        "--ws",
+        "websockets-sansio",
         "--timeout-graceful-shutdown",
         "8",
     ]
@@ -69,6 +71,12 @@ def test_build_child_env_uses_data_dir_and_strips_paid_provider_secrets(
     monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://paid.example")
     monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-secret")
     monkeypatch.setenv("LLM_GATEWAY_MODEL", "gpt-paid")
+    monkeypatch.setenv("LLM_GATEWAY_REALTIME_MODEL", "gpt-realtime")
+    monkeypatch.setenv("LLM_GATEWAY_CORRECTION_MODEL", "gpt-correction")
+    monkeypatch.setenv("LLM_GATEWAY_API_STYLE", "responses")
+    monkeypatch.setenv("LLM_GATEWAY_TIMEOUT_SECONDS", "2.5")
+    monkeypatch.setenv("LLM_GATEWAY_PROVIDER_LABEL", "temporary-provider")
+    monkeypatch.setenv("LLM_GATEWAY_IS_MOCK", "1")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
     monkeypatch.setenv("PYTHONPATH", "existing")
 
@@ -82,6 +90,12 @@ def test_build_child_env_uses_data_dir_and_strips_paid_provider_secrets(
         "LLM_GATEWAY_BASE_URL",
         "LLM_GATEWAY_API_KEY",
         "LLM_GATEWAY_MODEL",
+        "LLM_GATEWAY_REALTIME_MODEL",
+        "LLM_GATEWAY_CORRECTION_MODEL",
+        "LLM_GATEWAY_API_STYLE",
+        "LLM_GATEWAY_TIMEOUT_SECONDS",
+        "LLM_GATEWAY_PROVIDER_LABEL",
+        "LLM_GATEWAY_IS_MOCK",
         "OPENAI_API_KEY",
     ):
         assert key not in env
@@ -105,12 +119,68 @@ def test_build_child_env_can_explicitly_inherit_provider_env(monkeypatch, tmp_pa
     monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
     monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-test")
     monkeypatch.setenv("LLM_GATEWAY_MODEL", "m1")
+    monkeypatch.setenv("LLM_GATEWAY_REALTIME_MODEL", "m1-fast")
+    monkeypatch.setenv("LLM_GATEWAY_CORRECTION_MODEL", "m1-correction")
+    monkeypatch.setenv("LLM_GATEWAY_API_STYLE", "chat_completions")
 
     env = tool.build_child_env(data_dir=tmp_path / "data", provider_mode="inherit")
 
     assert env["LLM_GATEWAY_BASE_URL"] == "https://gw.example"
     assert env["LLM_GATEWAY_API_KEY"] == "sk-test"
     assert env["LLM_GATEWAY_MODEL"] == "m1"
+    assert env["LLM_GATEWAY_REALTIME_MODEL"] == "m1-fast"
+    assert env["LLM_GATEWAY_CORRECTION_MODEL"] == "m1-correction"
+    assert env["LLM_GATEWAY_API_STYLE"] == "chat_completions"
+    assert env["MEETING_COPILOT_REALTIME_REFINER_POLICY"] == "prewarm"
+    assert env["MEETING_COPILOT_REALTIME_COACH_RUNTIME"] == "pi"
+    assert env["MEETING_COPILOT_PI_LOCAL_REFLEX_FIRST"] == "0"
+    assert env["MEETING_COPILOT_PI_BRIDGE_PREWARM"] == "1"
+
+
+def test_build_child_env_acceptance_overrides_are_explicit(monkeypatch, tmp_path):
+    tool = _load_tool()
+
+    env = tool.build_child_env(
+        data_dir=tmp_path / "data",
+        provider_mode="inherit",
+        correction_pricing_mode="unmetered",
+        realtime_coach_cutoff_ms=5_000,
+    )
+
+    assert env["LLM_CORRECTION_PRICING_MODE"] == "unmetered"
+    assert env["MEETING_COPILOT_REALTIME_READY_CUTOFF_MS"] == "5000"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"correction_pricing_mode": "unknown"},
+        {"realtime_coach_cutoff_ms": 999},
+        {"realtime_coach_cutoff_ms": 10_001},
+    ],
+)
+def test_build_child_env_rejects_invalid_acceptance_overrides(tmp_path, kwargs):
+    tool = _load_tool()
+
+    with pytest.raises(ValueError):
+        tool.build_child_env(
+            data_dir=tmp_path / "data",
+            provider_mode="inherit",
+            **kwargs,
+        )
+
+
+def test_build_child_env_allows_explicit_realtime_refiner_policy(monkeypatch, tmp_path):
+    tool = _load_tool()
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_REFINER_POLICY", "online_only")
+
+    env = tool.build_child_env(
+        data_dir=tmp_path / "data",
+        provider_mode="inherit",
+        realtime_refiner_policy="on-demand",
+    )
+
+    assert env["MEETING_COPILOT_REALTIME_REFINER_POLICY"] == "on_demand"
 
 
 def test_build_child_env_selects_complete_onnx_preview_runtime(monkeypatch, tmp_path):
@@ -133,6 +203,82 @@ def test_build_child_env_selects_complete_onnx_preview_runtime(monkeypatch, tmp_
     assert env["MEETING_COPILOT_FUNASR_ENGINE"] == "onnx"
     assert env["MEETING_COPILOT_FUNASR_MODEL_DIR"] == str(model_dir)
     assert env["MEETING_COPILOT_FUNASR_PYTHONPATH"] == str(runtime_dir)
+
+
+def _write_cached_file_asr_models(root: Path, *, missing: tuple[str, ...] = ()) -> dict[str, Path]:
+    tool = _load_tool()
+    models = {
+        name: root / directory
+        for name, directory in tool.FILE_ASR_MODEL_CACHE_LAYOUT.items()
+    }
+    for name, path in models.items():
+        path.mkdir(parents=True)
+        if name not in missing:
+            (path / "model.pt").write_bytes(b"model")
+            (path / "config.yaml").write_text("model: local\n", encoding="utf-8")
+    return models
+
+
+def test_managed_env_discovers_complete_modelscope_file_asr_cache(monkeypatch, tmp_path):
+    tool = _load_tool()
+    cache_root = tmp_path / "modelscope" / "hub" / "models" / "iic"
+    models = _write_cached_file_asr_models(cache_root)
+    monkeypatch.setenv(tool.LOCAL_FILE_ASR_MODEL_CACHE_ENV, str(cache_root))
+    monkeypatch.delenv("MEETING_COPILOT_RUNTIME_MANIFEST", raising=False)
+    monkeypatch.delenv("MEETING_COPILOT_REALTIME_REFINER_MODEL", raising=False)
+
+    discovered = tool.discover_cached_file_asr_models()
+
+    assert discovered == models
+
+
+def test_managed_env_leaves_incomplete_modelscope_cache_fail_closed(monkeypatch, tmp_path):
+    tool = _load_tool()
+    cache_root = tmp_path / "modelscope" / "hub" / "models" / "iic"
+    _write_cached_file_asr_models(cache_root, missing=("punc",))
+    monkeypatch.setenv(tool.LOCAL_FILE_ASR_MODEL_CACHE_ENV, str(cache_root))
+    monkeypatch.delenv("MEETING_COPILOT_RUNTIME_MANIFEST", raising=False)
+
+    assert tool.discover_cached_file_asr_models() is None
+
+
+def test_managed_env_does_not_use_user_cache_when_runtime_manifest_is_configured(
+    monkeypatch, tmp_path
+):
+    tool = _load_tool()
+    cache_root = tmp_path / "modelscope" / "hub" / "models" / "iic"
+    _write_cached_file_asr_models(cache_root)
+    monkeypatch.setenv(tool.LOCAL_FILE_ASR_MODEL_CACHE_ENV, str(cache_root))
+    monkeypatch.setenv("MEETING_COPILOT_RUNTIME_MANIFEST", str(tmp_path / "sealed.json"))
+
+    assert tool.discover_cached_file_asr_models() is None
+
+
+def test_build_child_env_wires_cached_file_asr_models_when_staging_dir_is_absent(
+    monkeypatch, tmp_path
+):
+    tool = _load_tool()
+    monkeypatch.setattr(tool, "REPO_ROOT", tmp_path)
+    monkeypatch.delenv("MEETING_COPILOT_RUNTIME_MANIFEST", raising=False)
+    monkeypatch.delenv("MEETING_COPILOT_REALTIME_REFINER_PYTHON", raising=False)
+    monkeypatch.delenv("MEETING_COPILOT_REALTIME_REFINER_WORKER", raising=False)
+    cache_root = tmp_path / "cache" / "models" / "iic"
+    models = _write_cached_file_asr_models(cache_root)
+    monkeypatch.setenv(tool.LOCAL_FILE_ASR_MODEL_CACHE_ENV, str(cache_root))
+    python = tmp_path / "code" / "asr_runtime" / ".venv-funasr" / "bin" / "python"
+    worker = tmp_path / "code" / "asr_runtime" / "scripts" / "funasr_offline_refiner_worker.py"
+    python.parent.mkdir(parents=True)
+    worker.parent.mkdir(parents=True)
+    python.write_text("fixture", encoding="utf-8")
+    worker.write_text("fixture", encoding="utf-8")
+
+    env = tool.build_child_env(data_dir=tmp_path / "data", provider_mode="safe")
+
+    assert env["MEETING_COPILOT_REALTIME_REFINER_PYTHON"] == str(python)
+    assert env["MEETING_COPILOT_REALTIME_REFINER_WORKER"] == str(worker)
+    assert env["MEETING_COPILOT_REALTIME_REFINER_MODEL"] == str(models["offline"])
+    assert env["MEETING_COPILOT_REALTIME_REFINER_VAD_MODEL"] == str(models["vad"])
+    assert env["MEETING_COPILOT_REALTIME_REFINER_PUNC_MODEL"] == str(models["punc"])
 
 
 def test_status_report_rejects_health_without_runtime_identity(monkeypatch, tmp_path):

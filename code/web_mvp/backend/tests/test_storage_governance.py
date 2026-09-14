@@ -232,6 +232,23 @@ def test_runtime_log_stream_mirrors_and_uses_managed_rotation(tmp_path):
     assert stream.last_error is None
 
 
+def test_runtime_log_stream_keeps_managed_log_when_mirror_is_closed(tmp_path):
+    mirror = StringIO()
+    stream = ManagedRotatingLogStream(
+        data_dir=tmp_path,
+        mirror=mirror,
+        max_bytes=128,
+        backup_count=2,
+    )
+    mirror.close()
+
+    assert stream.write("teardown still completes\n") == len("teardown still completes\n")
+    stream.flush()
+
+    assert stream.rotator.path.read_text() == "teardown still completes\n"
+    assert stream.last_error is None
+
+
 def test_structured_log_redaction_hashes_ids_and_removes_content_and_secrets():
     session_id = "rec_sensitive_meeting_123"
     api_key = "sk-this-secret-must-not-appear"

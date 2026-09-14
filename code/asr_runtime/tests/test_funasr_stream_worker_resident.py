@@ -1,7 +1,10 @@
 import base64
 import io
 import json
+import queue
 import sys
+import threading
+import time
 import types
 
 import numpy as np
@@ -44,6 +47,87 @@ class ExplodingResidentAutoModel:
         raise RuntimeError("private provider failure details")
 
 
+class InteractiveResidentStdin:
+    def __init__(self):
+        self._lines: queue.Queue[bytes] = queue.Queue()
+        self._condition = threading.Condition()
+        self.read_count = 0
+
+    def feed(self, payload: bytes) -> None:
+        assert payload.endswith(b"\n")
+        self._lines.put(payload)
+
+    def readline(self, _size: int = -1) -> bytes:
+        line = self._lines.get(timeout=2.0)
+        with self._condition:
+            self.read_count += 1
+            self._condition.notify_all()
+        return line
+
+    def wait_for_reads(self, expected: int, timeout: float = 1.0) -> None:
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while self.read_count < expected:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AssertionError(
+                        f"reader consumed {self.read_count}, expected {expected}"
+                    )
+                self._condition.wait(remaining)
+
+
+class TimestampedEventStream:
+    def __init__(self):
+        self._condition = threading.Condition()
+        self.events: list[tuple[float, dict]] = []
+
+    def write(self, text: str) -> int:
+        parsed = [json.loads(line) for line in text.splitlines() if line]
+        with self._condition:
+            now = time.monotonic()
+            self.events.extend((now, event) for event in parsed)
+            self._condition.notify_all()
+        return len(text)
+
+    def flush(self) -> None:
+        return None
+
+    def wait_for(self, predicate, timeout: float = 1.0) -> list[tuple[float, dict]]:
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while not predicate([event for _, event in self.events]):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AssertionError("worker event was not emitted before timeout")
+                self._condition.wait(remaining)
+            return list(self.events)
+
+
+class GatedResidentModel:
+    def __init__(self):
+        self.first_call_started = threading.Event()
+        self.release_first_call = threading.Event()
+        self.calls: list[dict] = []
+
+    def generate(self, **kwargs):
+        cache = kwargs["cache"]
+        cache["call_number"] = cache.get("call_number", 0) + 1
+        marker = int(round(float(kwargs["input"][0])))
+        self.calls.append(
+            {
+                "cache_id": id(cache),
+                "cache_call_number": cache["call_number"],
+                "marker": marker,
+                "is_final": bool(kwargs["is_final"]),
+            }
+        )
+        if len(self.calls) == 1:
+            self.first_call_started.set()
+            if not self.release_first_call.wait(1.0):
+                raise RuntimeError("test did not release first inference")
+        return [{"text": {1: "旧句预览", 2: "新句预览"}.get(marker, "未知预览")}]
+
+
 def _install_fake_model(monkeypatch):
     FakeResidentAutoModel.init_count = 0
     FakeResidentAutoModel.cache_ids = []
@@ -70,6 +154,33 @@ def _run_worker(monkeypatch, stdin_bytes: bytes, argv: list[str]) -> list[dict]:
 
 def _audio_payload(marker: float, sample_count: int = 960) -> bytes:
     return np.full(sample_count, marker, dtype="<f4").tobytes()
+
+
+def _start_interactive_worker(monkeypatch):
+    stdin = InteractiveResidentStdin()
+    stdout = TimestampedEventStream()
+    model = GatedResidentModel()
+    errors: list[BaseException] = []
+    args = funasr_stream_worker.parse_args(
+        ["--resident", "--chunk-size", "0,1,0"]
+    )
+    monkeypatch.setattr(funasr_stream_worker, "_REAL_STDOUT", stdout)
+
+    def run() -> None:
+        try:
+            funasr_stream_worker._run_resident_mode(
+                model=model,
+                np_module=np,
+                args=args,
+                hotwords=[],
+                stdin=stdin,
+            )
+        except BaseException as exc:  # surfaced in the calling test
+            errors.append(exc)
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    return stdin, stdout, model, worker, errors
 
 
 def test_onnx_adapter_preserves_cache_and_normalizes_online_result_shape():
@@ -153,6 +264,40 @@ def test_resident_command_decoder_rejects_bad_base64_and_extra_fields():
             b'{"command":"start_session","session_id":"session-1","hotwords":["bad\\nword"]}\n'
         )
     assert invalid_hotwords.value.code == "invalid_hotwords"
+
+
+def test_flush_utterance_command_round_trip_and_boundary_validation():
+    encoded = funasr_stream_worker.encode_resident_command(
+        "flush_utterance",
+        session_id="session-1",
+        boundary_id="session-1:utterance:1:boundary-1",
+    )
+
+    decoded = funasr_stream_worker.decode_resident_command(encoded)
+    assert decoded.command == "flush_utterance"
+    assert decoded.session_id == "session-1"
+    assert decoded.boundary_id == "session-1:utterance:1:boundary-1"
+
+    with pytest.raises(funasr_stream_worker.ResidentProtocolError) as missing:
+        funasr_stream_worker.decode_resident_command(
+            b'{"command":"flush_utterance","session_id":"session-1"}\n'
+        )
+    assert missing.value.code == "invalid_command_fields"
+
+    for boundary_id in ("", "bad\nline", "é boundary"):
+        with pytest.raises(funasr_stream_worker.ResidentProtocolError) as invalid:
+            funasr_stream_worker.encode_resident_command(
+                "flush_utterance",
+                session_id="session-1",
+                boundary_id=boundary_id,
+            )
+        assert invalid.value.code == "invalid_boundary_id"
+
+    with pytest.raises(funasr_stream_worker.ResidentProtocolError) as extra:
+        funasr_stream_worker.decode_resident_command(
+            b'{"command":"flush_utterance","session_id":"session-1","boundary_id":"b","pcm_base64":"x"}\n'
+        )
+    assert extra.value.code == "invalid_command_fields"
 
 
 def test_resident_mode_loads_model_once_and_resets_every_session(monkeypatch):
@@ -243,6 +388,501 @@ def test_resident_mode_marks_the_short_tail_as_final_for_funasr(monkeypatch):
 
     assert FakeResidentAutoModel.is_final_flags == [True]
     assert any(event["event_type"] == "final" for event in events)
+
+
+def test_flush_utterance_decodes_residual_as_final_and_acks_after_partial(monkeypatch):
+    commands = b"".join(
+        [
+            funasr_stream_worker.encode_resident_command("start_session", session_id="flush-session"),
+            funasr_stream_worker.encode_resident_command(
+                "audio",
+                session_id="flush-session",
+                pcm_bytes=_audio_payload(1, sample_count=480),
+            ),
+            funasr_stream_worker.encode_resident_command(
+                "flush_utterance",
+                session_id="flush-session",
+                boundary_id="flush-session:utterance:1:boundary-1",
+            ),
+            funasr_stream_worker.encode_resident_command("abort_session", session_id="flush-session"),
+            funasr_stream_worker.encode_resident_command("shutdown"),
+        ]
+    )
+
+    events = _run_worker(
+        monkeypatch,
+        commands,
+        ["--resident", "--chunk-size", "0,1,0"],
+    )
+
+    assert FakeResidentAutoModel.is_final_flags == [True]
+    assert [event["event_type"] for event in events[:4]] == [
+        "ready",
+        "session_started",
+        "partial",
+        "utterance_boundary_complete",
+    ]
+    assert events[2]["text"] == "第一场内容"
+    assert events[3]["boundary_id"] == "flush-session:utterance:1:boundary-1"
+    assert events[3]["utterance_index"] == 1
+    assert events[3]["duplicate"] is False
+
+
+def test_flush_utterance_skips_silent_tail_without_final_inference(monkeypatch):
+    boundary_id = "flush-session:utterance:1:boundary-silent-tail"
+    commands = b"".join(
+        [
+            funasr_stream_worker.encode_resident_command("start_session", session_id="flush-session"),
+            funasr_stream_worker.encode_resident_command(
+                "audio",
+                session_id="flush-session",
+                pcm_bytes=_audio_payload(1, sample_count=960),
+            ),
+            funasr_stream_worker.encode_resident_command(
+                "audio",
+                session_id="flush-session",
+                pcm_bytes=_audio_payload(0, sample_count=480),
+            ),
+            funasr_stream_worker.encode_resident_command(
+                "flush_utterance",
+                session_id="flush-session",
+                boundary_id=boundary_id,
+            ),
+            funasr_stream_worker.encode_resident_command("abort_session", session_id="flush-session"),
+            funasr_stream_worker.encode_resident_command("shutdown"),
+        ]
+    )
+
+    events = _run_worker(
+        monkeypatch,
+        commands,
+        ["--resident", "--chunk-size", "0,1,0"],
+    )
+
+    assert FakeResidentAutoModel.is_final_flags == [False]
+    ack = next(
+        event
+        for event in events
+        if event["event_type"] == "utterance_boundary_complete"
+    )
+    assert ack["boundary_id"] == boundary_id
+    assert ack["duplicate"] is False
+    assert ack["skipped_silence_bytes"] == 480 * 4
+    assert ack["drain_ms"] >= 0
+
+
+@pytest.mark.parametrize(
+    ("pcm_bytes", "expected"),
+    [
+        (_audio_payload(0, sample_count=321), False),
+        (_audio_payload(0.05, sample_count=321), True),
+        (np.array([np.nan], dtype="<f4").tobytes(), True),
+    ],
+)
+def test_preview_speech_detector_is_conservative_for_non_finite_input(
+    pcm_bytes,
+    expected,
+):
+    assert (
+        funasr_stream_worker._pcm_contains_preview_speech(
+            np_module=np,
+            pcm_bytes=pcm_bytes,
+        )
+        is expected
+    )
+
+
+def test_flush_resets_utterance_state_and_next_audio_uses_fresh_cache(monkeypatch):
+    boundary_id = "flush-session:utterance:1:boundary-1"
+    commands = b"".join(
+        [
+            funasr_stream_worker.encode_resident_command("start_session", session_id="flush-session"),
+            funasr_stream_worker.encode_resident_command(
+                "audio", session_id="flush-session", pcm_bytes=_audio_payload(1, 480)
+            ),
+            funasr_stream_worker.encode_resident_command(
+                "flush_utterance", session_id="flush-session", boundary_id=boundary_id
+            ),
+            funasr_stream_worker.encode_resident_command(
+                "audio", session_id="flush-session", pcm_bytes=_audio_payload(2, 480)
+            ),
+            funasr_stream_worker.encode_resident_command(
+                "flush_utterance",
+                session_id="flush-session",
+                boundary_id="flush-session:utterance:2:boundary-2",
+            ),
+            funasr_stream_worker.encode_resident_command("abort_session", session_id="flush-session"),
+            funasr_stream_worker.encode_resident_command("shutdown"),
+        ]
+    )
+
+    events = _run_worker(
+        monkeypatch,
+        commands,
+        ["--resident", "--chunk-size", "0,1,0"],
+    )
+
+    partials = [event for event in events if event["event_type"] == "partial"]
+    acks = [event for event in events if event["event_type"] == "utterance_boundary_complete"]
+    assert [(event["text"], event["segment_id"]) for event in partials] == [
+        ("第一场内容", "funasr_sc_001"),
+        ("第二场内容", "funasr_sc_002"),
+    ]
+    assert [(event["boundary_id"], event["utterance_index"], event["duplicate"]) for event in acks] == [
+        (boundary_id, 1, False),
+        ("flush-session:utterance:2:boundary-2", 2, False),
+    ]
+    assert FakeResidentAutoModel.cache_call_numbers == [1, 1]
+    assert len(set(FakeResidentAutoModel.cache_ids)) == 2
+
+
+def test_duplicate_flush_only_replays_duplicate_ack_without_reinference(monkeypatch):
+    boundary_id = "flush-session:utterance:1:boundary-1"
+    commands = b"".join(
+        [
+            funasr_stream_worker.encode_resident_command("start_session", session_id="flush-session"),
+            funasr_stream_worker.encode_resident_command(
+                "audio", session_id="flush-session", pcm_bytes=_audio_payload(1, 480)
+            ),
+            funasr_stream_worker.encode_resident_command(
+                "flush_utterance", session_id="flush-session", boundary_id=boundary_id
+            ),
+            funasr_stream_worker.encode_resident_command(
+                "flush_utterance", session_id="flush-session", boundary_id=boundary_id
+            ),
+            funasr_stream_worker.encode_resident_command("abort_session", session_id="flush-session"),
+            funasr_stream_worker.encode_resident_command("shutdown"),
+        ]
+    )
+
+    events = _run_worker(
+        monkeypatch,
+        commands,
+        ["--resident", "--chunk-size", "0,1,0"],
+    )
+
+    assert [event["event_type"] for event in events[:5]] == [
+        "ready",
+        "session_started",
+        "partial",
+        "utterance_boundary_complete",
+        "utterance_boundary_complete",
+    ]
+    assert [event["duplicate"] for event in events if event["event_type"] == "utterance_boundary_complete"] == [
+        False,
+        True,
+    ]
+    assert FakeResidentAutoModel.is_final_flags == [True]
+    assert FakeResidentAutoModel.cache_call_numbers == [1]
+
+
+def test_slow_inference_pressure_prioritizes_causal_flush_and_isolates_next_utterance(
+    monkeypatch,
+):
+    stdin, stdout, model, worker, errors = _start_interactive_worker(monkeypatch)
+    session_id = "pressure-flush"
+    boundary_id = f"{session_id}:utterance:1:boundary-1"
+    backlog_chunk = _audio_payload(1, sample_count=96)
+    oversized_backlog_chunk = _audio_payload(1, sample_count=960 * 4)
+    backlog_count = funasr_stream_worker.RESIDENT_PENDING_AUDIO_MAX_COMMANDS + 36
+
+    stdin.feed(
+        funasr_stream_worker.encode_resident_command(
+            "start_session", session_id=session_id
+        )
+    )
+    stdin.feed(
+        funasr_stream_worker.encode_resident_command(
+            "audio",
+            session_id=session_id,
+            pcm_bytes=_audio_payload(1),
+        )
+    )
+    assert model.first_call_started.wait(0.5)
+
+    stdin.feed(
+        funasr_stream_worker.encode_resident_command(
+            "audio",
+            session_id=session_id,
+            pcm_bytes=oversized_backlog_chunk,
+        )
+    )
+    for _ in range(backlog_count):
+        stdin.feed(
+            funasr_stream_worker.encode_resident_command(
+                "audio",
+                session_id=session_id,
+                pcm_bytes=backlog_chunk,
+            )
+        )
+    boundary_sent_at = time.monotonic()
+    stdin.feed(
+        funasr_stream_worker.encode_resident_command(
+            "flush_utterance",
+            session_id=session_id,
+            boundary_id=boundary_id,
+        )
+    )
+    stdin.feed(
+        funasr_stream_worker.encode_resident_command(
+            "audio",
+            session_id=session_id,
+            pcm_bytes=_audio_payload(2),
+        )
+    )
+    # A retry may arrive after current-utterance audio has already been sent.
+    # It must move ahead only as an idempotent ACK and must not discard audio 2.
+    stdin.feed(
+        funasr_stream_worker.encode_resident_command(
+            "flush_utterance",
+            session_id=session_id,
+            boundary_id=boundary_id,
+        )
+    )
+    stdin.wait_for_reads(3 + backlog_count + 3)
+    model.release_first_call.set()
+
+    captured = stdout.wait_for(
+        lambda events: len(
+            [
+                event
+                for event in events
+                if event.get("event_type") == "utterance_boundary_complete"
+            ]
+        )
+        == 2,
+        timeout=0.75,
+    )
+    acknowledgements = [
+        (timestamp, event)
+        for timestamp, event in captured
+        if event.get("event_type") == "utterance_boundary_complete"
+    ]
+    assert acknowledgements[0][0] - boundary_sent_at < 0.75
+    assert [event["duplicate"] for _, event in acknowledgements] == [False, True]
+    assert acknowledgements[0][1]["skipped_preview_bytes"] == (
+        len(oversized_backlog_chunk) + backlog_count * len(backlog_chunk)
+    )
+
+    captured = stdout.wait_for(
+        lambda events: any(event.get("text") == "新句预览" for event in events),
+        timeout=0.5,
+    )
+    ordered_events = [event for _, event in captured]
+    first_ack_index = next(
+        index
+        for index, event in enumerate(ordered_events)
+        if event.get("event_type") == "utterance_boundary_complete"
+    )
+    new_partial_index = next(
+        index for index, event in enumerate(ordered_events) if event.get("text") == "新句预览"
+    )
+    assert first_ack_index < new_partial_index
+    assert [call["marker"] for call in model.calls] == [1, 2]
+    assert [call["cache_call_number"] for call in model.calls] == [1, 1]
+    assert len({call["cache_id"] for call in model.calls}) == 2
+
+    stdin.feed(
+        funasr_stream_worker.encode_resident_command(
+            "abort_session", session_id=session_id
+        )
+    )
+    stdout.wait_for(
+        lambda events: any(event.get("event_type") == "session_aborted" for event in events)
+    )
+    stdin.feed(funasr_stream_worker.encode_resident_command("shutdown"))
+    worker.join(timeout=1.0)
+    assert not worker.is_alive()
+    assert errors == []
+
+
+def test_abort_bypasses_sustained_audio_backlog_and_next_session_starts_clean(
+    monkeypatch,
+):
+    stdin, stdout, model, worker, errors = _start_interactive_worker(monkeypatch)
+    abandoned_session = "pressure-abort"
+    replacement_session = "pressure-replacement"
+    backlog_chunk = _audio_payload(1, sample_count=96)
+    backlog_count = funasr_stream_worker.RESIDENT_PENDING_AUDIO_MAX_COMMANDS + 48
+
+    stdin.feed(
+        funasr_stream_worker.encode_resident_command(
+            "start_session", session_id=abandoned_session
+        )
+    )
+    stdin.feed(
+        funasr_stream_worker.encode_resident_command(
+            "audio",
+            session_id=abandoned_session,
+            pcm_bytes=_audio_payload(1),
+        )
+    )
+    assert model.first_call_started.wait(0.5)
+    for _ in range(backlog_count):
+        stdin.feed(
+            funasr_stream_worker.encode_resident_command(
+                "audio",
+                session_id=abandoned_session,
+                pcm_bytes=backlog_chunk,
+            )
+        )
+    stdin.feed(
+        funasr_stream_worker.encode_resident_command(
+            "abort_session", session_id=abandoned_session
+        )
+    )
+    stdin.feed(
+        funasr_stream_worker.encode_resident_command(
+            "start_session", session_id=replacement_session
+        )
+    )
+    stdin.feed(
+        funasr_stream_worker.encode_resident_command(
+            "audio",
+            session_id=replacement_session,
+            pcm_bytes=_audio_payload(2),
+        )
+    )
+    stdin.feed(
+        funasr_stream_worker.encode_resident_command(
+            "end_session", session_id=replacement_session
+        )
+    )
+    stdin.feed(funasr_stream_worker.encode_resident_command("shutdown"))
+    stdin.wait_for_reads(2 + backlog_count + 5)
+
+    released_at = time.monotonic()
+    model.release_first_call.set()
+    captured = stdout.wait_for(
+        lambda events: any(
+            event.get("event_type") == "session_aborted"
+            and event.get("session_id") == abandoned_session
+            for event in events
+        ),
+        timeout=0.75,
+    )
+    aborted_at = next(
+        timestamp
+        for timestamp, event in captured
+        if event.get("event_type") == "session_aborted"
+        and event.get("session_id") == abandoned_session
+    )
+    assert aborted_at - released_at < 0.75
+
+    worker.join(timeout=1.0)
+    assert not worker.is_alive()
+    assert errors == []
+    events = [event for _, event in stdout.events]
+    abandoned_telemetry = next(
+        event
+        for event in events
+        if event.get("event_type") == "telemetry"
+        and event.get("session_id") == abandoned_session
+    )
+    assert abandoned_telemetry["input_samples"] == 960 + backlog_count * 96
+    assert any(
+        event.get("text") == "新句预览"
+        and event.get("session_id") == replacement_session
+        for event in events
+    )
+    assert [call["marker"] for call in model.calls] == [1, 2]
+    assert [call["cache_call_number"] for call in model.calls] == [1, 1]
+    assert len({call["cache_id"] for call in model.calls}) == 2
+
+
+def test_end_session_bypasses_sustained_audio_backlog(monkeypatch):
+    stdin, stdout, model, worker, errors = _start_interactive_worker(monkeypatch)
+    session_id = "pressure-end"
+    backlog_chunk = _audio_payload(1, sample_count=96)
+    backlog_count = funasr_stream_worker.RESIDENT_PENDING_AUDIO_MAX_COMMANDS + 24
+
+    stdin.feed(
+        funasr_stream_worker.encode_resident_command(
+            "start_session", session_id=session_id
+        )
+    )
+    stdin.feed(
+        funasr_stream_worker.encode_resident_command(
+            "audio", session_id=session_id, pcm_bytes=_audio_payload(1)
+        )
+    )
+    assert model.first_call_started.wait(0.5)
+    for _ in range(backlog_count):
+        stdin.feed(
+            funasr_stream_worker.encode_resident_command(
+                "audio",
+                session_id=session_id,
+                pcm_bytes=backlog_chunk,
+            )
+        )
+    stdin.feed(
+        funasr_stream_worker.encode_resident_command(
+            "end_session", session_id=session_id
+        )
+    )
+    stdin.feed(funasr_stream_worker.encode_resident_command("shutdown"))
+    stdin.wait_for_reads(2 + backlog_count + 2)
+
+    released_at = time.monotonic()
+    model.release_first_call.set()
+    captured = stdout.wait_for(
+        lambda events: any(event.get("event_type") == "session_ended" for event in events),
+        timeout=0.75,
+    )
+    ended_at = next(
+        timestamp
+        for timestamp, event in captured
+        if event.get("event_type") == "session_ended"
+    )
+    assert ended_at - released_at < 0.75
+
+    worker.join(timeout=1.0)
+    assert not worker.is_alive()
+    assert errors == []
+    events = [event for _, event in stdout.events]
+    telemetry = next(event for event in events if event.get("event_type") == "telemetry")
+    assert telemetry["input_samples"] == 960 + backlog_count * 96
+    assert [call["marker"] for call in model.calls] == [1]
+    assert any(
+        event.get("event_type") == "final" and event.get("text") == "旧句预览"
+        for event in events
+    )
+
+
+def test_end_after_successful_flush_does_not_emit_duplicate_final(monkeypatch):
+    commands = b"".join(
+        [
+            funasr_stream_worker.encode_resident_command("start_session", session_id="flush-session"),
+            funasr_stream_worker.encode_resident_command(
+                "audio", session_id="flush-session", pcm_bytes=_audio_payload(1, 480)
+            ),
+            funasr_stream_worker.encode_resident_command(
+                "flush_utterance",
+                session_id="flush-session",
+                boundary_id="flush-session:utterance:1:boundary-1",
+            ),
+            funasr_stream_worker.encode_resident_command("end_session", session_id="flush-session"),
+            funasr_stream_worker.encode_resident_command("shutdown"),
+        ]
+    )
+
+    events = _run_worker(
+        monkeypatch,
+        commands,
+        ["--resident", "--chunk-size", "0,1,0"],
+    )
+
+    assert [event["event_type"] for event in events] == [
+        "ready",
+        "session_started",
+        "partial",
+        "utterance_boundary_complete",
+        "telemetry",
+        "session_ended",
+    ]
+    ended = events[-1]
+    assert ended["final_emitted"] is False
+    assert not [event for event in events if event["event_type"] == "final"]
 
 
 def test_resident_mode_processes_an_exact_stride_without_waiting_for_end(monkeypatch):

@@ -137,6 +137,7 @@ def _asr_stream_events():
             "end_ms": 1200,
             "received_at_ms": 1300,
             "confidence": 0.72,
+            "confidence_source": "realtime_provider_reported_score",
         },
         {
             "event_type": "final",
@@ -146,6 +147,7 @@ def _asr_stream_events():
             "end_ms": 3200,
             "received_at_ms": 3500,
             "confidence": 0.91,
+            "confidence_source": "realtime_provider_reported_score",
         },
         {
             "event_type": "revision",
@@ -205,10 +207,12 @@ def test_build_asr_live_events_maps_streaming_contract_to_live_envelope():
     partial = events[0]
     assert partial["payload"]["segment_id"] == "asr_seg_001"
     assert partial["payload"]["is_final"] is False
+    assert partial["payload"]["confidence_source"] == "realtime_provider_reported_score"
     assert "evidence_spans" not in partial["payload"]
 
     final = events[1]
     assert final["payload"]["is_final"] is True
+    assert final["payload"]["confidence_source"] == "realtime_provider_reported_score"
     assert final["payload"]["evidence_spans"] == [
         {
             "id": "asr_ev_asr_seg_001",

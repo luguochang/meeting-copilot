@@ -266,6 +266,12 @@ def test_public_migration_lock_is_reentrant_and_owner_only(tmp_path: Path) -> No
             assert stat.S_ISREG(lock_stat.st_mode)
             if os.name != "nt":
                 assert stat.S_IMODE(lock_stat.st_mode) == 0o600
+        child_pythonpath = [
+            str(Path(__file__).resolve().parents[1]),
+            str(Path(__file__).resolve().parents[3] / "core"),
+        ]
+        if os.environ.get("PYTHONPATH"):
+            child_pythonpath.extend(os.environ["PYTHONPATH"].split(os.pathsep))
         child = subprocess.run(
             [
                 sys.executable,
@@ -287,5 +293,9 @@ def test_public_migration_lock_is_reentrant_and_owner_only(tmp_path: Path) -> No
             check=False,
             capture_output=True,
             text=True,
+            env={
+                **os.environ,
+                "PYTHONPATH": os.pathsep.join(child_pythonpath),
+            },
         )
         assert child.returncode == 0, child.stderr

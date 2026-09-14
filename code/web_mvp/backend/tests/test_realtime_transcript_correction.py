@@ -365,6 +365,8 @@ def test_batch_audit_records_safe_provider_and_execution_metadata():
         "provider": "team_gateway",
         "model": "gpt-5.5",
         "purpose": "realtime_transcript_correction",
+        "provider_lane": "correction",
+        "model_source": "general_model_fallback",
         "degraded": True,
         "fallback": True,
         "retry": True,

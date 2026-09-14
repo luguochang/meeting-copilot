@@ -209,6 +209,41 @@ def test_existing_v2_meeting_stream_starts_after_recording_notice_acknowledgemen
         assert app.state.v2_persistence.get_snapshot(meeting_id)["segments"]
 
 
+def test_controlled_wav_stream_preserves_recording_and_transcript_provenance(
+    tmp_path,
+) -> None:
+    app = create_app(data_dir=tmp_path, allow_fake_asr_fallback=True)
+    meeting_id = "meeting-controlled-wav-provenance"
+
+    with TestClient(app) as client:
+        assert client.post(
+            "/v2/meetings",
+            json={"meeting_id": meeting_id, "title": "可控 WAV 来源验证"},
+        ).status_code == 201
+        assert client.put(
+            f"/v2/meetings/{meeting_id}/preparation",
+            json={
+                "hotwords": ["P99"],
+                "input_source": "microphone",
+                "notice_acknowledged": True,
+            },
+        ).status_code == 200
+
+        with client.websocket_connect(
+            f"/live/asr/stream/ws/{meeting_id}?audio_source=simulated_realtime_wav"
+        ) as websocket:
+            websocket.send_bytes(b"\x00" * 3_200)
+            websocket.receive_text()
+            websocket.send_text("END")
+            final = json.loads(websocket.receive_text())
+
+        assert final["event_type"] == "final"
+        snapshot = app.state.v2_persistence.get_snapshot(meeting_id)
+        assert snapshot["segments"][0]["source_track"] == "microphone"
+        recording = app.state.v2_persistence.list_recording_sessions(meeting_id)[0]
+        assert recording["source_type"] == "simulated_realtime_wav"
+
+
 def test_stream_without_existing_v2_meeting_keeps_legacy_focused_behavior(
     tmp_path,
 ) -> None:

@@ -1,0 +1,204 @@
+{
+  "schema_version": "meeting_copilot.pi_stage0_asr_entity_fixture.v1",
+  "fixture_id": "physical_mic_asr_entity_safety_20260827_v1",
+  "required_categories": [
+    "number",
+    "negation",
+    "owner",
+    "deadline",
+    "product_name"
+  ],
+  "cases": [
+    {
+      "case_id": "rec_mtb2jeo9_99f8e63d024f",
+      "audio_source": "browser_live_mic_external_playback",
+      "evidence_files": [
+        {
+          "role": "controlled_stimulus_script",
+          "path": "artifacts/tmp/pi-stage0/20260827_cross_batch_mic_8943/stimulus_unresolved_zh.txt",
+          "sha256": "ed30ea98b6b673f430b46952d04f4d6e1ff0bb8914039b92d8f9cd29642ccc50"
+        },
+        {
+          "role": "controlled_stimulus_audio",
+          "path": "artifacts/tmp/pi-stage0/20260827_cross_batch_mic_8943/stimulus_unresolved_zh.aiff",
+          "sha256": "7c151551816363c1af829d889c33b529ae958de1dddfb5c274bf194d7d26b721"
+        },
+        {
+          "role": "physical_microphone_capture",
+          "path": "artifacts/tmp/pi-stage0/20260827_cross_batch_mic_8943/data/audio_assets/rec_mtb2jeo9_99f8e63d024f/tracks/microphone/epoch-1/audio.wav",
+          "sha256": "eab4c47e19be0828585439dd7d87f133aab6b6483e1a5ad7cf0d26b90e9dce78"
+        },
+        {
+          "role": "durable_transcript_snapshot",
+          "path": "artifacts/tmp/pi-stage0/20260827_cross_batch_mic_8943_fixed/evidence/snapshot-final.json",
+          "sha256": "5161611d4604ca74efe2eaad3d27b4f819acdb427e34086ecaa65923820dfa7b"
+        },
+        {
+          "role": "live_event_evidence",
+          "path": "artifacts/tmp/pi-stage0/20260827_cross_batch_mic_8943_fixed/evidence/events-final.json",
+          "sha256": "27446e30aad85fa2c21132e4fa4f042da852573708ee7dc41b825d9238fa2c8e"
+        }
+      ],
+      "hypothesis": {
+        "segments": [
+          "我们先把背景说完",
+          "整这个项目从上个月开始讨论当时大家主要担心上线时间也担心现有流程改动以后会不会影响其他团队今天我还是想先补充背景结论稍后再说我们先把背景说完整现在有几个情况需要一起看第一测试环境的数",
+          "据还没有完全对齐第二有些接口文档还在变化第三业务同学希望尽快看到效果不过我觉得还可以继续补充背景先不下结论这里还有一些历史原因之前类似项目推进的比较慢所以大家现在比较谨慎我再补充",
+          "一个背景上周我们开过一次会会上提到过风险排期合资源但是没有真正收束今天这些内容其实又被重新讲了一遍我们先把背景说完整这件事情还需要再看看结论稍后再说另外还有几条旁之信息有人担心培训成",
+          "本有人担心维护成本也有人担心发布以后反馈太多每一条都可以再展开但现在先不下结论我们可以继续观察也可以再看看其他团队怎么做暂时还没有明确下一步最后我还是再补充一点背景我们已经讨论了时间风",
+          "险资源和历史况不过我暂时不想确定方向也不想明确负责人和截止时间这个事情我们再看看结论稍后再说先"
+        ],
+        "text_sha256": "ead458a120b0b61c1e06603701abc0d418e0ac2e5d5ffbd3e847574208b55314"
+      },
+      "reference": {
+        "status": "controlled_stimulus_script",
+        "human_verified": false,
+        "text": "我们先把背景说完整。这个项目从上个月开始讨论，当时大家主要担心上线时间，也担心现有流程改动以后会不会影响其他团队。今天我还是想先补充背景，结论稍后再说。我们先把背景说完整。\n\n现在有几个情况需要一起看。第一，测试环境的数据还没有完全对齐；第二，有些接口文档还在变化；第三，业务同学希望尽快看到效果。不过我觉得还可以继续补充背景，先不下结论。这里还有一些历史原因，之前类似项目推进得比较慢，所以大家现在比较谨慎。\n\n我再补充一个背景。上周我们开过一次会，会上提到过风险、排期和资源，但是没有真正收束。今天这些内容其实又被重新讲了一遍。我们先把背景说完整，这件事情还需要再看看，结论稍后再说。\n\n另外还有几条旁支信息。有人担心培训成本，有人担心维护成本，也有人担心发布以后反馈太多。每一条都可以再展开，但现在先不下结论。我们可以继续观察，也可以再看看其他团队怎么做，暂时还没有明确下一步。\n\n最后我还是再补充一点背景。我们已经讨论了时间、风险、资源和历史情况，不过我暂时不想确定方向，也不想明确负责人和截止时间。这个事情我们再看看，结论稍后再说，先把背景说完整。\n",
+        "text_sha256": "ed30ea98b6b673f430b46952d04f4d6e1ff0bb8914039b92d8f9cd29642ccc50"
+      },
+      "categories": {
+        "number": {
+          "status": "not_present_in_reference",
+          "entities": []
+        },
+        "negation": {
+          "status": "scored_reference",
+          "entities": [
+            {
+              "entity_id": "negation_not_aligned",
+              "reference_surface": "还没有完全对齐",
+              "accepted_hypothesis_surfaces": ["还没有完全对齐"]
+            },
+            {
+              "entity_id": "negation_no_conclusion",
+              "reference_surface": "先不下结论",
+              "accepted_hypothesis_surfaces": ["先不下结论"]
+            },
+            {
+              "entity_id": "negation_not_converged",
+              "reference_surface": "没有真正收束",
+              "accepted_hypothesis_surfaces": ["没有真正收束"]
+            },
+            {
+              "entity_id": "negation_no_next_step",
+              "reference_surface": "暂时还没有明确下一步",
+              "accepted_hypothesis_surfaces": ["暂时还没有明确下一步"]
+            },
+            {
+              "entity_id": "negation_no_direction",
+              "reference_surface": "暂时不想确定方向",
+              "accepted_hypothesis_surfaces": ["暂时不想确定方向"]
+            },
+            {
+              "entity_id": "negation_no_owner_or_deadline",
+              "reference_surface": "不想明确负责人和截止时间",
+              "accepted_hypothesis_surfaces": ["不想明确负责人和截止时间"]
+            }
+          ]
+        },
+        "owner": {
+          "status": "not_present_in_reference",
+          "entities": []
+        },
+        "deadline": {
+          "status": "not_present_in_reference",
+          "entities": []
+        },
+        "product_name": {
+          "status": "not_present_in_reference",
+          "entities": []
+        }
+      }
+    },
+    {
+      "case_id": "rec_mt9kbjtd_d6630d75e816_near_baseline",
+      "audio_source": "browser_live_mic_external_playback",
+      "evidence_files": [
+        {
+          "role": "durable_transcript_without_independent_reference",
+          "path": "artifacts/tmp/pi-stage0/20260826_real_mic_8935/near_baseline/transcript.json",
+          "sha256": "4c386195787125b62de4567ad2cd5ebfe62944128ef1c5f394bd6147a1a40339"
+        }
+      ],
+      "hypothesis": {
+        "segments": [
+          "弟弟。",
+          "今天我们讨论支付服务上限，当前错误率百分之三。负责人是张三下一步，先确认回滚条件和监控告警。",
+          "风险谁来负责？什么时候给出结论？如果没有明确负责人，我们现在要不要暂停上线？"
+        ],
+        "text_sha256": "ba58a9c428f4c12c8c944e6801fd082db8d5d9d6adc2e831cb8982a223efb32e"
+      },
+      "reference": {
+        "status": "missing_human_reference",
+        "human_verified": false,
+        "reason": "No verbatim human transcript or independently preserved stimulus script exists for this capture."
+      },
+      "categories": {
+        "number": {"status": "unscored_missing_human_reference", "entities": []},
+        "negation": {"status": "unscored_missing_human_reference", "entities": []},
+        "owner": {"status": "unscored_missing_human_reference", "entities": []},
+        "deadline": {"status": "unscored_missing_human_reference", "entities": []},
+        "product_name": {"status": "unscored_missing_human_reference", "entities": []}
+      }
+    },
+    {
+      "case_id": "rec_mt9koy79_bac3efb085e0_external_problem",
+      "audio_source": "browser_live_mic_external_playback",
+      "evidence_files": [
+        {
+          "role": "durable_transcript_without_independent_reference",
+          "path": "artifacts/tmp/pi-stage0/20260826_real_mic_8935/external_problem/transcript.json",
+          "sha256": "bf5d171bacb9c39c2fbb5c2ec8b3e14f3260d5523b4856dbc322a710de7f5a85"
+        }
+      ],
+      "hypothesis": {
+        "segments": ["一复盘报告我们下周一发，但监控阈值谁来改还？", "不一定。", "那个人。", "是的。"],
+        "text_sha256": "dfffe6cabeddd472c12b7f8c1b300e094f71d0a0d7c15b0824d3a81f272a6430"
+      },
+      "reference": {
+        "status": "missing_human_reference",
+        "human_verified": false,
+        "reason": "No verbatim human transcript or independently preserved stimulus script exists for this capture."
+      },
+      "categories": {
+        "number": {"status": "unscored_missing_human_reference", "entities": []},
+        "negation": {"status": "unscored_missing_human_reference", "entities": []},
+        "owner": {"status": "unscored_missing_human_reference", "entities": []},
+        "deadline": {"status": "unscored_missing_human_reference", "entities": []},
+        "product_name": {"status": "unscored_missing_human_reference", "entities": []}
+      }
+    },
+    {
+      "case_id": "rec_mt9kwufu_ea2f9f2cd5e8_external_solution",
+      "audio_source": "browser_live_mic_external_playback",
+      "evidence_files": [
+        {
+          "role": "durable_transcript_without_independent_reference",
+          "path": "artifacts/tmp/pi-stage0/20260826_real_mic_8935/external_solution/transcript.json",
+          "sha256": "48d6856c9289748af1e6168185c4746c9d43c7ba0b3e4dfefa0b0cbfdb093927"
+        }
+      ],
+      "hypothesis": {
+        "segments": [
+          "C复盘报告，我们下周一。",
+          "一发，但监控阈值谁来改？还没定。",
+          "预职由值班负责人金。",
+          "天下午六点前修改，我负责复核，下周一的复盘不受影响。"
+        ],
+        "text_sha256": "b84ca7ccf3631d87ae917d2ceff423ea55aba93bbdfa85ee83185abe566178bb"
+      },
+      "reference": {
+        "status": "missing_human_reference",
+        "human_verified": false,
+        "reason": "No verbatim human transcript or independently preserved stimulus script exists for this capture."
+      },
+      "categories": {
+        "number": {"status": "unscored_missing_human_reference", "entities": []},
+        "negation": {"status": "unscored_missing_human_reference", "entities": []},
+        "owner": {"status": "unscored_missing_human_reference", "entities": []},
+        "deadline": {"status": "unscored_missing_human_reference", "entities": []},
+        "product_name": {"status": "unscored_missing_human_reference", "entities": []}
+      }
+    }
+  ]
+}

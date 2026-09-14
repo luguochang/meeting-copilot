@@ -3,15 +3,51 @@
   "$id": "https://talktrace.local/schemas/realtime-coach-eval-case.v1.json",
   "type": "object",
   "additionalProperties": true,
-  "required": ["case_id", "new_paragraphs", "expected"],
+  "required": ["case_id", "expected"],
+  "allOf": [
+    {
+      "if": { "properties": { "trigger_type": { "const": "task_due" } }, "required": ["trigger_type"] },
+      "then": {
+        "required": ["work_item_id"],
+        "properties": { "work_item_id": { "type": "string", "minLength": 1 } },
+        "anyOf": [
+          { "required": ["context_paragraphs"], "properties": { "context_paragraphs": { "minItems": 1 } } },
+          { "required": ["retrieval_paragraphs"], "properties": { "retrieval_paragraphs": { "minItems": 1 } } }
+        ]
+      }
+    },
+    {
+      "if": { "properties": { "trigger_type": { "const": "user_request" } }, "required": ["trigger_type"] },
+      "then": { "required": ["user_request"], "properties": { "user_request": { "type": "string", "minLength": 1 } } }
+    },
+    {
+      "if": { "properties": { "trigger_type": { "enum": ["delta", "transcript_delta"] } }, "required": ["trigger_type"] },
+      "then": {
+        "required": ["new_paragraphs"],
+        "properties": { "new_paragraphs": { "minItems": 1 } }
+      }
+    }
+  ],
+  "dependentRequired": {
+    "sequence_id": ["turn_index", "sequence_stage"],
+    "turn_index": ["sequence_id", "sequence_stage"],
+    "sequence_stage": ["sequence_id", "turn_index"]
+  },
   "properties": {
     "case_id": { "type": "string", "minLength": 1 },
     "session_id": { "type": "string", "minLength": 1 },
     "state_revision": { "type": "integer", "minimum": 1 },
+    "sequence_id": { "type": "string", "minLength": 1 },
+    "turn_index": { "type": "integer", "minimum": 1 },
+    "sequence_stage": { "enum": ["open", "intervention", "resolving_evidence"] },
+    "trigger_type": { "enum": ["delta", "transcript_delta", "task_due", "user_request"] },
+    "work_item_id": { "type": "string", "minLength": 1 },
+    "user_request": { "type": "string", "minLength": 1 },
     "difficulty": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
     "coach_skill_id": { "enum": ["general", "decision", "project", "interview", "brainstorm"] },
-    "new_paragraphs": { "type": "array", "minItems": 1, "maxItems": 8 },
+    "new_paragraphs": { "type": "array", "minItems": 0, "maxItems": 8 },
     "context_paragraphs": { "type": "array", "maxItems": 3 },
+    "retrieval_paragraphs": { "type": "array", "maxItems": 8 },
     "semantic_windows": { "type": "array", "maxItems": 8 },
     "rolling_state": { "type": "object" },
     "meeting_goal": { "type": ["string", "null"] },
@@ -27,7 +63,9 @@
           "uniqueItems": true
         },
         "required_evidence_ids": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
-        "deadline_ms": { "type": "number", "exclusiveMinimum": 0 }
+        "deadline_ms": { "type": "number", "exclusiveMinimum": 0 },
+        "lifecycle_action": { "enum": ["retain", "retract", "deprioritize"] },
+        "supersedes_case_id": { "type": "string", "minLength": 1 }
       }
     }
   }

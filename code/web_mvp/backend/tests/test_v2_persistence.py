@@ -1,20 +1,32 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import json
 import os
 import sqlite3
 import stat
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from meeting_copilot_web_mvp.v2_persistence import (
+    INTELLIGENCE_DEBOUNCE_MS,
+    INTELLIGENCE_MIN_EXECUTION_BUDGET_MS,
+    INTELLIGENCE_REALTIME_BUDGET_MS,
+    REVIEW_JOB_DEADLINE_MS,
+    REVIEW_JOB_KINDS,
+    COACH_SOFT_DELIVERY_CUTOFF_MS,
+    IntelligenceDeadlineExceeded,
     IntelligenceEvidenceSuperseded,
     IntelligenceProjectionError,
     JobLeaseLostError,
     TranscriptRevisionIdentityConflict,
     V2Persistence,
+    intelligence_deadline_at_ms,
+    intelligence_next_attempt_at_ms,
+    transcript_evidence_hash,
 )
 
 
@@ -44,6 +56,68 @@ def persistence(tmp_path):
     instance = V2Persistence(tmp_path / "meeting_copilot.db")
     yield instance
     instance.close()
+
+
+@pytest.fixture
+def llm_persistence(tmp_path):
+    instance = V2Persistence(tmp_path / "meeting_copilot_llm.db", semantic_projection_mode="llm_first")
+    yield instance
+    instance.close()
+
+
+def _local_reflex_projection(
+    *,
+    valid_until_ms: int = 90_000,
+    local_reflex_kind: str = "missing_next_step",
+    event_type: str = "execution_gap",
+) -> tuple[dict, dict]:
+    evidence_ids = ["local-reflex-segment"]
+    evidence_quote = "今天先到这里"
+    shared = {
+        "origin": "local_reflex",
+        "runtime_used": "local_reflex",
+        "local_reflex_kind": local_reflex_kind,
+        "pi_provider_attempted": False,
+        "valid_until_ms": valid_until_ms,
+    }
+    response = {
+        "paragraph_revisions": [],
+        "topic_update": None,
+        "state_changes": [],
+        "follow_up": None,
+        "coach_intervention": {
+            "event_type": event_type,
+            "title": "收口前补齐执行信息",
+            "recommendation": "先确认一下：下一步是什么、谁来负责、什么时候回看？",
+            "say_this": "先确认一下：下一步是什么、谁来负责、什么时候回看？",
+            "reason": "对话正在收尾，但还没有明确下一步。",
+            "why_now": "对话正在收尾，但还没有明确下一步。",
+            "evidence_segment_ids": evidence_ids,
+            "evidence_quote": evidence_quote,
+            "urgency": "high",
+            "confidence": 1.0,
+            **shared,
+        },
+        "coach_decision": {
+            "status": "intervention",
+            "decision_id": "local-reflex-decision",
+            **shared,
+        },
+    }
+    event_context = {
+        "source": "local_reflex",
+        "llm_called": False,
+        "llm_call_status": "not_called",
+        "origin": "local_reflex",
+        "runtime_used": "local_reflex",
+        "local_reflex_kind": local_reflex_kind,
+        "pi_provider_attempted": False,
+        "evidence": {
+            "segment_ids": evidence_ids,
+            "quote": evidence_quote,
+        },
+    }
+    return response, event_context
 
 
 def test_schema_is_additive_and_does_not_use_record_json(tmp_path):
@@ -78,6 +152,147 @@ def test_schema_is_additive_and_does_not_use_record_json(tmp_path):
             for row in connection.execute("PRAGMA table_info(meeting_entities)").fetchall()
         }
         assert {"version", "first_seen_seq", "last_updated_seq"} <= entity_columns
+
+
+def test_user_request_is_durable_idempotent_and_anchored_to_current_evidence(llm_persistence):
+    _commit_final(llm_persistence)
+
+    first = llm_persistence.enqueue_user_coach_request(
+        meeting_id="meeting-1",
+        user_request="请检查发布前还缺哪些条件",
+        idempotency_key="api.coach.request:meeting-1:req-1",
+        now_ms=2_000,
+    )
+    replay = llm_persistence.enqueue_user_coach_request(
+        meeting_id="meeting-1",
+        user_request="请检查发布前还缺哪些条件",
+        idempotency_key="api.coach.request:meeting-1:req-1",
+        now_ms=2_100,
+    )
+
+    assert replay["id"] == first["id"]
+    assert first["trigger_type"] == "user_request"
+    assert first["user_request"] == "请检查发布前还缺哪些条件"
+    assert first["input_transcript_seq"] == 1
+    assert first["evidence_segment_id"] == "segment-1"
+    assert first["input_version"] == 1
+    assert first["status"] == "pending"
+
+
+def test_deep_executor_claims_explicit_jobs_without_claiming_realtime_delta(llm_persistence):
+    _commit_final(llm_persistence)
+    initial_delta = llm_persistence.claim_next_job(
+        worker_id="initial-realtime-worker",
+        lane="intelligence",
+        now_ms=3_001,
+        lease_ms=10_000,
+    )
+    assert initial_delta is not None
+    llm_persistence.complete_job(
+        job_id=initial_delta["id"],
+        worker_id="initial-realtime-worker",
+        now_ms=3_002,
+        output={"coach": {"status": "not_triggered"}},
+    )
+    user_job = llm_persistence.enqueue_user_coach_request(
+        meeting_id="meeting-1",
+        user_request="请检查当前会议还有哪些未闭环事项",
+        idempotency_key="api.coach.request:meeting-1:deep-claim",
+        now_ms=4_000,
+    )
+
+    deep_claim = llm_persistence.claim_next_job(
+        worker_id="deep-worker",
+        lane="pi_deep",
+        now_ms=4_001,
+        lease_ms=10_000,
+    )
+    assert deep_claim is not None
+    assert deep_claim["id"] == user_job["id"]
+    assert deep_claim["trigger_type"] == "user_request"
+    assert llm_persistence.claim_next_job(
+        worker_id="realtime-worker",
+        lane="intelligence",
+        now_ms=4_001,
+        lease_ms=10_000,
+    ) is None
+
+    llm_persistence.complete_job(
+        job_id=deep_claim["id"],
+        worker_id="deep-worker",
+        now_ms=4_002,
+        output={"coach": {"status": "protected_silent"}},
+    )
+    _commit_final(
+        llm_persistence,
+        final_id="final-2",
+        segment_id="segment-2",
+        now_ms=5_000,
+    )
+    realtime_claim = llm_persistence.claim_next_job(
+        worker_id="realtime-worker",
+        lane="intelligence",
+        # The second final opens a fresh 2.5s absolute realtime window. Claim
+        # inside that window so this assertion checks lane isolation rather
+        # than the intentional deadline cancellation barrier.
+        now_ms=6_501,
+        lease_ms=10_000,
+    )
+    assert realtime_claim is not None
+    assert realtime_claim["trigger_type"] in {"delta", "transcript_delta"}
+
+
+def test_input_coverage_records_pending_and_source_duplicate_excluded(llm_persistence):
+    llm_persistence.commit_final_and_enqueue(
+        meeting_id="meeting-1",
+        final_id="final-1",
+        segment_id="segment-1",
+        text="这是一段完全相同的会议话术",
+        normalized_text="这是一段完全相同的会议话术",
+        started_at_ms=100,
+        ended_at_ms=900,
+        evidence_hash="hash-1",
+        now_ms=1_000,
+        source_track="microphone",
+    )
+    llm_persistence.commit_final_and_enqueue(
+        meeting_id="meeting-1",
+        final_id="final-2",
+        segment_id="segment-2",
+        text="这是一段完全相同的会议话术",
+        normalized_text="这是一段完全相同的会议话术",
+        started_at_ms=100,
+        ended_at_ms=900,
+        evidence_hash="hash-2",
+        now_ms=1_100,
+        source_track="system_audio",
+    )
+
+    coverage = llm_persistence.list_intelligence_input_coverage("meeting-1")
+    assert [item["status"] for item in coverage] == ["pending", "excluded"]
+    assert coverage[1]["failure_reason"] == "source_duplicate"
+
+
+def test_input_coverage_lifecycle_is_explicit(llm_persistence):
+    _commit_final(llm_persistence)
+    job = next(
+        item for item in llm_persistence.list_jobs(meeting_id="meeting-1")
+        if item["kind"] == "intelligence"
+    )
+    assert llm_persistence.update_intelligence_input_coverage_for_job(
+        job_id=job["id"],
+        status="in_flight",
+        run_id=job["id"],
+        now_ms=2_000,
+    ) == 1
+    assert llm_persistence.list_intelligence_input_coverage("meeting-1")[0]["status"] == "in_flight"
+    assert llm_persistence.update_intelligence_input_coverage_for_job(
+        job_id=job["id"],
+        status="processed",
+        run_id=job["id"],
+        now_ms=2_100,
+    ) == 1
+    assert llm_persistence.list_intelligence_input_coverage("meeting-1")[0]["status"] == "processed"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Windows uses inherited per-user ACLs")
@@ -300,6 +515,710 @@ def test_llm_first_mode_does_not_project_keywords_and_applies_structured_respons
         assert second["idempotent"] is True
         event_keys = [event["idempotency_key"] for event in persistence.list_events("meeting-1")]
         assert event_keys.count(f"meeting.intelligence.applied:{committed['job_ids']['intelligence']}") == 1
+    finally:
+        persistence.close()
+
+
+def test_recent_coach_candidate_keys_are_durable_and_time_bounded(tmp_path):
+    persistence = V2Persistence(
+        tmp_path / "llm-first-coach-cooldown.db",
+        semantic_projection_mode="llm_first",
+    )
+    try:
+        committed = persistence.commit_final_and_enqueue(
+            meeting_id="meeting-1",
+            final_id="coach-cooldown-final",
+            segment_id="coach-cooldown-segment",
+            text="周五一定上线吗？",
+            normalized_text="周五一定上线吗？",
+            started_at_ms=100,
+            ended_at_ms=900,
+            evidence_hash="coach-cooldown-hash",
+            now_ms=1_000,
+        )
+        applied = persistence.apply_intelligence_response(
+            meeting_id="meeting-1",
+            job_id=committed["job_ids"]["intelligence"],
+            response={
+                "paragraph_revisions": [],
+                "topic_update": None,
+                "state_changes": [],
+                "follow_up": None,
+                "coach_intervention": None,
+                "coach_decision": {
+                    "origin": "pi",
+                    "status": "protected_silent",
+                    "runtime_requested": "pi",
+                    "runtime_used": "pi",
+                    "pi_provider_attempted": True,
+                    "agent_metrics": {
+                        "job_queue_latency_ms": 120,
+                        "provider_timeout_ms": 4_250,
+                        "correction_lane_active_at_coach_start": True,
+                    },
+                    "decision_id": "coach-decision-cooldown",
+                    "candidate_event": "question_pending",
+                    "candidate_key": "coach-candidate:question_pending:stable",
+                    "detected_candidate_events": [
+                        {
+                            "event_type": "question_pending",
+                            "candidate_key": "coach-candidate:question_pending:stable",
+                            "episode_id": "coach-episode:meeting-1-speaker-a",
+                            "candidate_priority": 100,
+                        },
+                        {
+                            "event_type": "commitment_without_condition",
+                            "candidate_key": "coach-candidate:commitment:stable",
+                            "episode_id": "coach-episode:meeting-1-speaker-a",
+                            "candidate_priority": 95,
+                        },
+                        {
+                            "event_type": "goal_at_risk",
+                            "candidate_key": "coach-candidate:suppressed:stable",
+                        },
+                    ],
+                    "eligible_candidate_events": [
+                        {
+                            "event_type": "question_pending",
+                            "candidate_key": "coach-candidate:question_pending:stable",
+                            "episode_id": "coach-episode:meeting-1-speaker-a",
+                            "candidate_priority": 100,
+                        },
+                        {
+                            "event_type": "commitment_without_condition",
+                            "candidate_key": "coach-candidate:commitment:stable",
+                            "episode_id": "coach-episode:meeting-1-speaker-a",
+                            "candidate_priority": 95,
+                        },
+                    ],
+                    "cooldown_suppressed_candidate_keys": [
+                        "coach-candidate:suppressed:stable"
+                    ],
+                    "created_at_ms": 1_100,
+                    "first_token_at_ms": 1_250,
+                    "completed_at_ms": 1_900,
+                },
+            },
+            now_ms=2_000,
+        )
+
+        expected_coach_decision = {
+            "origin": "pi",
+            "status": "protected_silent",
+            "runtime_requested": "pi",
+            "runtime_used": "pi",
+            "pi_provider_attempted": True,
+            "agent_metrics": {
+                "job_queue_latency_ms": 120,
+                "provider_timeout_ms": 4_250,
+                "correction_lane_active_at_coach_start": True,
+            },
+            "decision_id": "coach-decision-cooldown",
+            "candidate_event": "question_pending",
+            "candidate_key": "coach-candidate:question_pending:stable",
+            "detected_candidate_events": [
+                {
+                    "event_type": "question_pending",
+                    "candidate_key": "coach-candidate:question_pending:stable",
+                    "episode_id": "coach-episode:meeting-1-speaker-a",
+                    "candidate_priority": 100,
+                },
+                {
+                    "event_type": "commitment_without_condition",
+                    "candidate_key": "coach-candidate:commitment:stable",
+                    "episode_id": "coach-episode:meeting-1-speaker-a",
+                    "candidate_priority": 95,
+                },
+                {
+                    "event_type": "goal_at_risk",
+                    "candidate_key": "coach-candidate:suppressed:stable",
+                },
+            ],
+            "eligible_candidate_events": [
+                {
+                    "event_type": "question_pending",
+                    "candidate_key": "coach-candidate:question_pending:stable",
+                    "episode_id": "coach-episode:meeting-1-speaker-a",
+                    "candidate_priority": 100,
+                },
+                {
+                    "event_type": "commitment_without_condition",
+                    "candidate_key": "coach-candidate:commitment:stable",
+                    "episode_id": "coach-episode:meeting-1-speaker-a",
+                    "candidate_priority": 95,
+                },
+            ],
+            "cooldown_suppressed_candidate_keys": [
+                "coach-candidate:suppressed:stable"
+            ],
+            "created_at_ms": 1_100,
+            "first_token_at_ms": 1_250,
+            "completed_at_ms": 1_900,
+            "supersedes_decision_id": None,
+            "superseded_by": None,
+            "projected_at_ms": 2_000,
+            "dropped_at_ms": None,
+        }
+        assert all(
+            applied["coach_decision"].get(key) == value
+            for key, value in expected_coach_decision.items()
+        )
+        assert applied["coach_decision"]["timing"] == applied["timing"]
+        assert applied["coach_decision"]["final_committed_at_ms"] == 1_000
+        assert applied["coach_decision"]["job_created_at_ms"] == 1_000
+        assert applied["coach_decision"]["job_started_at_ms"] is None
+        assert applied["coach_decision"]["decision_completed_at_ms"] == 1_900
+        assert applied["coach_decision"]["projected_at_ms"] == 2_000
+        assert persistence.recent_coach_candidate_keys("meeting-1", since_ms=1_999) == {
+            "coach-candidate:question_pending:stable",
+            "coach-candidate:commitment:stable",
+        }
+        assert persistence.recent_coach_episode_priorities(
+            "meeting-1", since_ms=1_999
+        ) == {"coach-episode:meeting-1-speaker-a": 100}
+        assert persistence.recent_coach_candidate_keys("meeting-1", since_ms=2_001) == set()
+        applied_event = next(
+            event
+            for event in persistence.list_events("meeting-1")
+            if event["type"] == "meeting.intelligence.applied"
+        )
+        assert applied_event["payload"]["coach_decision"]["agent_metrics"] == {
+            "job_queue_latency_ms": 120,
+            "provider_timeout_ms": 4_250,
+            "correction_lane_active_at_coach_start": True,
+        }
+    finally:
+        persistence.close()
+
+
+def test_local_reflex_projection_has_strict_provenance_and_separate_cooldown(tmp_path):
+    persistence = V2Persistence(
+        tmp_path / "local-reflex.db",
+        semantic_projection_mode="llm_first",
+    )
+    try:
+        committed = persistence.commit_final_and_enqueue(
+            meeting_id="meeting-1",
+            final_id="local-reflex-final",
+            segment_id="local-reflex-segment",
+            text="今天先到这里。",
+            normalized_text="今天先到这里。",
+            started_at_ms=100,
+            ended_at_ms=900,
+            evidence_hash="local-reflex-hash",
+            now_ms=1_000,
+        )
+        response, event_context = _local_reflex_projection()
+
+        applied = persistence.apply_intelligence_response(
+            meeting_id="meeting-1",
+            job_id=committed["job_ids"]["intelligence"],
+            response=response,
+            event_context=event_context,
+            now_ms=2_000,
+        )
+
+        assert applied["event_context"] == event_context
+        assert applied["coach_intervention"]["local_reflex_kind"] == "missing_next_step"
+        events = persistence.list_events("meeting-1")
+        event = next(
+            item for item in events if item["type"] == "meeting.intelligence.applied"
+        )
+        assert event["payload"]["source"] == "local_reflex"
+        assert event["payload"]["llm_called"] is False
+        assert event["payload"]["llm_call_status"] == "not_called"
+        assert event["payload"]["pi_provider_attempted"] is False
+        assert event["payload"]["evidence"]["quote"] == "今天先到这里"
+        assert persistence.recent_local_reflex_kinds(
+            "meeting-1", since_ms=0
+        ) == {"missing_next_step"}
+        assert persistence.recent_local_reflex_kinds(
+            "meeting-1", since_ms=2_001
+        ) == set()
+        assert persistence.recent_coach_candidate_keys(
+            "meeting-1", since_ms=0
+        ) == set()
+        assert persistence.recent_coach_episode_priorities(
+            "meeting-1", since_ms=0
+        ) == {}
+    finally:
+        persistence.close()
+
+
+def test_active_local_reflex_kind_ignores_expired_and_superseded_history(tmp_path):
+    persistence = V2Persistence(
+        tmp_path / "active-local-reflex.db",
+        semantic_projection_mode="llm_first",
+    )
+    try:
+        committed = persistence.commit_final_and_enqueue(
+            meeting_id="meeting-1",
+            final_id="local-reflex-final",
+            segment_id="local-reflex-segment",
+            text="今天先到这里。",
+            normalized_text="今天先到这里。",
+            started_at_ms=100,
+            ended_at_ms=900,
+            evidence_hash="local-reflex-hash",
+            now_ms=1_000,
+        )
+        response, event_context = _local_reflex_projection(
+            valid_until_ms=90_000,
+        )
+        for field in ("coach_decision", "coach_intervention"):
+            response[field].update(
+                {
+                    "status": "intervention",
+                    "lifecycle_action": "retain",
+                    "superseded_by": None,
+                }
+            )
+        persistence.apply_intelligence_response(
+            meeting_id="meeting-1",
+            job_id=committed["job_ids"]["intelligence"],
+            response=response,
+            event_context=event_context,
+            now_ms=2_000,
+        )
+
+        assert persistence.active_local_reflex_kind(
+            "meeting-1",
+            now_ms=89_999,
+        ) == "missing_next_step"
+        assert persistence.active_local_reflex_kind(
+            "meeting-1",
+            now_ms=90_000,
+        ) is None
+
+        superseding = persistence.commit_final_and_enqueue(
+            meeting_id="meeting-1",
+            final_id="superseding-final",
+            segment_id="superseding-segment",
+            text="我们继续讨论发布方案。",
+            normalized_text="我们继续讨论发布方案。",
+            started_at_ms=1_000,
+            ended_at_ms=1_900,
+            evidence_hash="superseding-hash",
+            now_ms=3_000,
+        )
+        persistence.apply_intelligence_response(
+            meeting_id="meeting-1",
+            job_id=superseding["job_ids"]["intelligence"],
+            response={
+                "paragraph_revisions": [],
+                "topic_update": None,
+                "state_changes": [],
+                "follow_up": None,
+                "coach_intervention": None,
+                "coach_decision": {
+                    "origin": "pi",
+                    "status": "protected_silent",
+                    "runtime_requested": "pi",
+                    "runtime_used": "pi",
+                    "pi_provider_attempted": False,
+                    "decision_id": "superseding-pi-decision",
+                },
+            },
+            now_ms=4_000,
+        )
+
+        assert persistence.active_local_reflex_kind(
+            "meeting-1",
+            now_ms=4_001,
+        ) is None
+        assert persistence.recent_local_reflex_kinds(
+            "meeting-1",
+            since_ms=0,
+        ) == {"missing_next_step"}
+    finally:
+        persistence.close()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("provider_attempted", "pi_provider_attempted"),
+        ("kind_mismatch", "kind and coach event type"),
+        ("context_evidence_mismatch", "context evidence does not match"),
+    ],
+)
+def test_local_reflex_projection_rejects_forged_contract(
+    tmp_path,
+    mutation,
+    message,
+):
+    persistence = V2Persistence(
+        tmp_path / f"local-reflex-{mutation}.db",
+        semantic_projection_mode="llm_first",
+    )
+    try:
+        committed = persistence.commit_final_and_enqueue(
+            meeting_id="meeting-1",
+            final_id="local-reflex-final",
+            segment_id="local-reflex-segment",
+            text="今天先到这里。",
+            normalized_text="今天先到这里。",
+            started_at_ms=100,
+            ended_at_ms=900,
+            evidence_hash="local-reflex-hash",
+            now_ms=1_000,
+        )
+        response, event_context = _local_reflex_projection()
+        if mutation == "provider_attempted":
+            event_context["pi_provider_attempted"] = True
+        elif mutation == "kind_mismatch":
+            response["coach_intervention"]["event_type"] = "discovery_gap"
+        else:
+            event_context["evidence"]["quote"] = "伪造证据"
+
+        with pytest.raises(IntelligenceProjectionError, match=message):
+            persistence.apply_intelligence_response(
+                meeting_id="meeting-1",
+                job_id=committed["job_ids"]["intelligence"],
+                response=response,
+                event_context=event_context,
+                now_ms=2_000,
+            )
+        assert not any(
+            event["type"] == "meeting.intelligence.applied"
+            for event in persistence.list_events("meeting-1")
+        )
+    finally:
+        persistence.close()
+
+
+def test_local_reflex_projection_rechecks_validity_after_sqlite_wait(tmp_path):
+    observed_times = iter((2_000, 5_000))
+    persistence = V2Persistence(
+        tmp_path / "local-reflex-expired.db",
+        semantic_projection_mode="llm_first",
+        projection_clock_ms=lambda: next(observed_times),
+    )
+    try:
+        committed = persistence.commit_final_and_enqueue(
+            meeting_id="meeting-1",
+            final_id="local-reflex-final",
+            segment_id="local-reflex-segment",
+            text="今天先到这里。",
+            normalized_text="今天先到这里。",
+            started_at_ms=100,
+            ended_at_ms=900,
+            evidence_hash="local-reflex-hash",
+            now_ms=1_000,
+        )
+        response, event_context = _local_reflex_projection(valid_until_ms=4_000)
+
+        with pytest.raises(
+            IntelligenceProjectionError,
+            match="expired before event projection",
+        ):
+            persistence.apply_intelligence_response(
+                meeting_id="meeting-1",
+                job_id=committed["job_ids"]["intelligence"],
+                response=response,
+                event_context=event_context,
+                now_ms=1_500,
+            )
+        assert not any(
+            event["type"] == "meeting.intelligence.applied"
+            for event in persistence.list_events("meeting-1")
+        )
+    finally:
+        persistence.close()
+
+
+def test_coach_episode_attempt_cooldown_survives_reopen_and_skips_audit_only_events(
+    tmp_path,
+):
+    database_path = tmp_path / "coach-episode-reopen.db"
+    persistence = V2Persistence(database_path, semantic_projection_mode="llm_first")
+
+    def project_decision(
+        *,
+        meeting_id: str,
+        suffix: str,
+        provider_attempted: bool,
+    ) -> None:
+        committed = persistence.commit_final_and_enqueue(
+            meeting_id=meeting_id,
+            final_id=f"final-{suffix}",
+            segment_id=f"segment-{suffix}",
+            text="不过周五一定上线吗？",
+            normalized_text="不过周五一定上线吗？",
+            started_at_ms=0,
+            ended_at_ms=1_000,
+            evidence_hash=f"hash-{suffix}",
+            now_ms=1_000,
+        )
+        persistence.apply_intelligence_response(
+            meeting_id=meeting_id,
+            job_id=committed["job_ids"]["intelligence"],
+            response={
+                "paragraph_revisions": [],
+                "topic_update": None,
+                "state_changes": [],
+                "follow_up": None,
+                "coach_intervention": None,
+                "coach_decision": {
+                    "origin": "pi",
+                    "status": "protected_silent",
+                    "runtime_requested": "pi",
+                    "runtime_used": None,
+                    "pi_provider_attempted": provider_attempted,
+                    "candidate_key": f"candidate-{suffix}",
+                    "detected_candidate_events": [
+                        {
+                            "event_type": "question_pending",
+                            "candidate_key": f"candidate-{suffix}",
+                            "episode_id": f"episode-{suffix}",
+                            "candidate_priority": 100,
+                        }
+                    ],
+                    "eligible_candidate_events": [
+                        {
+                            "event_type": "question_pending",
+                            "candidate_key": f"candidate-{suffix}",
+                            "episode_id": f"episode-{suffix}",
+                            "candidate_priority": 100,
+                        }
+                    ],
+                },
+            },
+            now_ms=2_000,
+        )
+
+    try:
+        project_decision(
+            meeting_id="attempted-meeting",
+            suffix="attempted",
+            provider_attempted=True,
+        )
+        project_decision(
+            meeting_id="audit-only-meeting",
+            suffix="audit-only",
+            provider_attempted=False,
+        )
+    finally:
+        persistence.close()
+
+    reopened = V2Persistence(database_path, semantic_projection_mode="llm_first")
+    try:
+        assert reopened.recent_coach_episode_priorities(
+            "attempted-meeting", since_ms=1_999
+        ) == {"episode-attempted": 100}
+        assert reopened.recent_coach_candidate_keys(
+            "attempted-meeting", since_ms=1_999
+        ) == {"candidate-attempted"}
+        assert reopened.recent_coach_episode_priorities(
+            "audit-only-meeting", since_ms=1_999
+        ) == {}
+        assert reopened.recent_coach_candidate_keys(
+            "audit-only-meeting", since_ms=1_999
+        ) == set()
+    finally:
+        reopened.close()
+
+
+def test_coach_episode_descriptor_survives_reopen_and_expires_with_cooldown(
+    tmp_path,
+):
+    database_path = tmp_path / "coach-episode-descriptor.db"
+    persistence = V2Persistence(database_path, semantic_projection_mode="llm_first")
+    descriptor = {
+        "episode_id": "coach-episode:durable-lineage",
+        "episode_anchor_id": "segment-lineage",
+        "episode_source_track": "microphone",
+        "episode_speaker": "Alice",
+        "episode_speaker_key": hashlib.sha256(b"alice").hexdigest()[:24],
+        "episode_anchor_start_ms": 100,
+        "episode_anchor_end_ms": 900,
+        "episode_latest_start_ms": 100,
+        "episode_latest_end_ms": 900,
+    }
+    try:
+        committed = persistence.commit_final_and_enqueue(
+            meeting_id="descriptor-meeting",
+            final_id="descriptor-final",
+            segment_id="segment-lineage",
+            text="我目前担心发布风险。",
+            normalized_text="我目前担心发布风险。",
+            started_at_ms=100,
+            ended_at_ms=900,
+            evidence_hash="descriptor-hash",
+            now_ms=1_000,
+        )
+        persistence.apply_intelligence_response(
+            meeting_id="descriptor-meeting",
+            job_id=committed["job_ids"]["intelligence"],
+            response={
+                "paragraph_revisions": [],
+                "topic_update": None,
+                "state_changes": [],
+                "follow_up": None,
+                "coach_intervention": None,
+                "coach_decision": {
+                    "origin": "pi",
+                    "status": "protected_silent",
+                    "runtime_requested": "pi",
+                    "runtime_used": "pi",
+                    "pi_provider_attempted": True,
+                    "eligible_candidate_events": [
+                        {
+                            **descriptor,
+                            "event_type": "objection_detected",
+                            "candidate_key": "candidate-lineage",
+                            "candidate_priority": 90,
+                        }
+                    ],
+                },
+            },
+            now_ms=2_000,
+        )
+    finally:
+        persistence.close()
+
+    reopened = V2Persistence(database_path, semantic_projection_mode="llm_first")
+    try:
+        assert reopened.recent_coach_episode_descriptors(
+            "descriptor-meeting",
+            since_ms=1_999,
+            now_ms=2_100,
+        ) == [{**descriptor, "attempted_at_ms": 2_000}]
+        assert reopened.recent_coach_episode_descriptors(
+            "descriptor-meeting",
+            since_ms=2_001,
+            now_ms=32_001,
+        ) == []
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize("damage", [None, "revision", "evidence_hash", "source_track", "missing"])
+def test_host_evidence_snapshot_is_checked_inside_projection(tmp_path, damage, request):
+    persistence = V2Persistence(tmp_path / "host-projection.db", semantic_projection_mode="llm_first")
+    request.addfinalizer(persistence.close)
+    committed = _commit_final(persistence)
+    segment = persistence.get_transcript_segment("meeting-1", "segment-1")
+    fields = ("segment_id", "revision", "evidence_hash", "normalized_text", "source_track",
+              "correction_status", "transcript_seq", "started_at_ms", "ended_at_ms")
+    evidence = {key: segment[key] for key in fields}
+    if damage == "revision":
+        evidence[damage] -= 1
+    elif damage in {"evidence_hash", "source_track"}:
+        evidence[damage] = "stale"
+    elif damage == "missing":
+        del evidence["evidence_hash"]
+    response = {
+        "paragraph_revisions": [], "state_changes": [], "follow_up": None,
+        "topic_update": {"operation": "update", "title": "Release", "summary": "Review release."},
+        "coach_intervention": {"event_type": "commitment_risk", "recommendation": "请先确认负责人。",
+                               "reason": "需要确认负责人。", "evidence_segment_ids": ["segment-1"],
+                               "evidence_quote": segment["normalized_text"], "urgency": "high"},
+        "host_evidence": [evidence],
+    }
+    before = persistence.get_snapshot("meeting-1")
+    if damage:
+        with pytest.raises(IntelligenceEvidenceSuperseded, match="host evidence changed"):
+            persistence.apply_intelligence_response(
+                meeting_id="meeting-1", job_id=committed["job_ids"]["intelligence"],
+                response=response, now_ms=2000,
+            )
+        assert persistence.get_snapshot("meeting-1") == before
+    else:
+        result = persistence.apply_intelligence_response(
+            meeting_id="meeting-1", job_id=committed["job_ids"]["intelligence"],
+            response=response, now_ms=2000,
+        )
+        assert result["coach_intervention"] is not None
+
+
+def test_coach_decisions_form_an_append_only_supersession_chain(tmp_path):
+    persistence = V2Persistence(
+        tmp_path / "llm-first-coach-supersession.db",
+        semantic_projection_mode="llm_first",
+    )
+    try:
+        first_commit = persistence.commit_final_and_enqueue(
+            meeting_id="meeting-1",
+            final_id="coach-first-final",
+            segment_id="coach-first-segment",
+            text="周五上线，但还没有明确回滚负责人。",
+            normalized_text="周五上线，但还没有明确回滚负责人。",
+            started_at_ms=100,
+            ended_at_ms=900,
+            evidence_hash="coach-first-hash",
+            now_ms=1_000,
+        )
+        first = persistence.apply_intelligence_response(
+            meeting_id="meeting-1",
+            job_id=first_commit["job_ids"]["intelligence"],
+            response={
+                "paragraph_revisions": [],
+                "topic_update": None,
+                "state_changes": [],
+                "follow_up": None,
+                "coach_intervention": {
+                    "event_type": "commitment_risk",
+                    "recommendation": "先确认回滚负责人。",
+                    "reason": "当前承诺缺少负责人。",
+                    "evidence_segment_ids": ["coach-first-segment"],
+                    "evidence_quote": "还没有明确回滚负责人",
+                    "urgency": "high",
+                    "decision_id": "coach-decision-1",
+                    "status": "intervention",
+                    "lifecycle_action": "retain",
+                },
+                "coach_decision": {
+                    "decision_id": "coach-decision-1",
+                    "status": "intervention",
+                    "lifecycle_action": "retain",
+                },
+            },
+            now_ms=2_000,
+        )
+        assert first["coach_decision"]["supersedes_decision_id"] is None
+
+        second_commit = persistence.commit_final_and_enqueue(
+            meeting_id="meeting-1",
+            final_id="coach-second-final",
+            segment_id="coach-second-segment",
+            text="回滚负责人已经确认是李明。",
+            normalized_text="回滚负责人已经确认是李明。",
+            started_at_ms=4_000,
+            ended_at_ms=4_900,
+            evidence_hash="coach-second-hash",
+            now_ms=5_000,
+        )
+        second = persistence.apply_intelligence_response(
+            meeting_id="meeting-1",
+            job_id=second_commit["job_ids"]["intelligence"],
+            response={
+                "paragraph_revisions": [],
+                "topic_update": None,
+                "state_changes": [],
+                "follow_up": None,
+                "coach_intervention": None,
+                "coach_decision": {
+                    "decision_id": "coach-decision-2",
+                    "status": "stale",
+                    "decision_reason": "负责人已经确认，旧建议不再成立。",
+                    "lifecycle_action": "retract",
+                },
+            },
+            now_ms=6_000,
+        )
+
+        assert second["coach_decision"]["supersedes_decision_id"] == "coach-decision-1"
+        assert second["coach_decision"]["superseded_by"] is None
+        applied_events = [
+            event
+            for event in persistence.list_events("meeting-1")
+            if event["type"] == "meeting.intelligence.applied"
+        ]
+        assert applied_events[0]["payload"]["coach_decision"]["superseded_by"] is None
+        assert applied_events[1]["payload"]["coach_decision"]["supersedes_decision_id"] == (
+            "coach-decision-1"
+        )
     finally:
         persistence.close()
 
@@ -700,21 +1619,718 @@ def test_llm_first_coalesces_finals_into_one_debounced_paragraph_job(tmp_path):
         assert second["job_ids"]["intelligence"] == first["job_ids"]["intelligence"]
         assert intelligence_jobs[0]["evidence_segment_id"] == "batch-segment-2"
         assert intelligence_jobs[0]["input_version"] == 2
-        assert intelligence_jobs[0]["deadline_at_ms"] is None
+        assert intelligence_jobs[0]["deadline_at_ms"] == intelligence_deadline_at_ms(1_000)
         assert persistence.claim_next_job(
             worker_id="worker-1",
             lane="intelligence",
-            now_ms=3_999,
+            now_ms=2_749,
             lease_ms=5_000,
         ) is None
         claimed = persistence.claim_next_job(
             worker_id="worker-1",
             lane="intelligence",
-            now_ms=4_000,
+            now_ms=2_750,
             lease_ms=5_000,
         )
         assert claimed is not None
         assert claimed["evidence_segment_id"] == "batch-segment-2"
+    finally:
+        persistence.close()
+
+
+def test_llm_first_custom_debounce_makes_realtime_job_claimable_early(tmp_path):
+    persistence = V2Persistence(
+        tmp_path / "llm-first-realtime-debounce.db",
+        semantic_projection_mode="llm_first",
+        intelligence_debounce_ms=250,
+    )
+    try:
+        committed = persistence.commit_final_and_enqueue(
+            meeting_id="meeting-1",
+            final_id="realtime-debounce-final",
+            segment_id="realtime-debounce-segment",
+            text="对方问了上线时间，但条件还没有确认。",
+            normalized_text="对方问了上线时间，但条件还没有确认。",
+            started_at_ms=100,
+            ended_at_ms=900,
+            evidence_hash="realtime-debounce-hash",
+            now_ms=1_000,
+        )
+
+        job = persistence.get_job(committed["job_ids"]["intelligence"])
+        assert persistence.intelligence_debounce_ms == 250
+        assert job["next_attempt_at_ms"] == 1_250
+        assert persistence.claim_next_job(
+            worker_id="realtime-debounce-worker",
+            lane="intelligence",
+            now_ms=1_249,
+            lease_ms=5_000,
+        ) is None
+        claimed = persistence.claim_next_job(
+            worker_id="realtime-debounce-worker",
+            lane="intelligence",
+            now_ms=1_250,
+            lease_ms=5_000,
+        )
+        assert claimed is not None
+        assert claimed["id"] == committed["job_ids"]["intelligence"]
+    finally:
+        persistence.close()
+
+
+def test_llm_first_zero_debounce_makes_realtime_job_immediately_claimable(tmp_path):
+    persistence = V2Persistence(
+        tmp_path / "llm-first-zero-debounce.db",
+        semantic_projection_mode="llm_first",
+        intelligence_debounce_ms=0,
+    )
+    try:
+        committed = persistence.commit_final_and_enqueue(
+            meeting_id="meeting-1",
+            final_id="zero-debounce-final",
+            segment_id="zero-debounce-segment",
+            text="上线时间还缺少验收条件。",
+            normalized_text="上线时间还缺少验收条件。",
+            started_at_ms=100,
+            ended_at_ms=900,
+            evidence_hash="zero-debounce-hash",
+            now_ms=1_000,
+        )
+
+        job = persistence.get_job(committed["job_ids"]["intelligence"])
+        assert persistence.intelligence_debounce_ms == 0
+        assert job["next_attempt_at_ms"] == 1_000
+        claimed = persistence.claim_next_job(
+            worker_id="zero-debounce-worker",
+            lane="intelligence",
+            now_ms=1_000,
+            lease_ms=5_000,
+        )
+        assert claimed is not None
+        assert claimed["id"] == committed["job_ids"]["intelligence"]
+    finally:
+        persistence.close()
+
+
+def test_intelligence_debounce_setting_is_bounded(tmp_path):
+    with pytest.raises(ValueError, match="intelligence_debounce_ms"):
+        V2Persistence(
+            tmp_path / "negative-debounce.db",
+            intelligence_debounce_ms=-1,
+        )
+    with pytest.raises(ValueError, match="intelligence_debounce_ms"):
+        V2Persistence(
+            tmp_path / "long-debounce.db",
+            intelligence_debounce_ms=INTELLIGENCE_DEBOUNCE_MS + 1,
+        )
+
+
+def test_intelligence_timing_chain_is_durable_across_job_event_and_snapshot(tmp_path):
+    persistence = V2Persistence(
+        tmp_path / "intelligence-timing-chain.db",
+        semantic_projection_mode="llm_first",
+    )
+    try:
+        committed = _commit_final(persistence, now_ms=1_000)
+        job_id = committed["job_ids"]["intelligence"]
+        queued = persistence.get_job(job_id)
+        assert queued["final_committed_at_ms"] == 1_000
+        assert queued["job_created_at_ms"] == 1_000
+        assert queued["job_started_at_ms"] is None
+        assert queued["timing"]["valid"] is False
+        assert queued["timing"]["final_to_projection_ms"] is None
+        assert "missing_job_started_at_ms" in queued["timing"]["invalid_reasons"]
+
+        claimed = persistence.claim_next_job(
+            worker_id="timing-worker",
+            lane="intelligence",
+            now_ms=3_000,
+            lease_ms=5_000,
+        )
+        assert claimed is not None
+        assert claimed["job_started_at_ms"] == 3_000
+
+        applied = persistence.apply_intelligence_response(
+            meeting_id="meeting-1",
+            job_id=job_id,
+            response={
+                "paragraph_revisions": [],
+                "topic_update": None,
+                "state_changes": [],
+                "follow_up": None,
+                "coach_intervention": None,
+                "coach_decision": {
+                    "status": "protected_silent",
+                    "decision_id": "timing-decision-1",
+                    "created_at_ms": 3_000,
+                    "completed_at_ms": 4_000,
+                },
+            },
+            now_ms=4_500,
+        )
+        timing = applied["timing"]
+        assert timing == {
+            "schema_version": "meeting_copilot.realtime_intelligence_timing.v1",
+            "job_id": job_id,
+            "evidence_segment_id": "segment-1",
+            "final_committed_at_ms": 1_000,
+            "job_created_at_ms": 1_000,
+            "job_started_at_ms": 3_000,
+            "decision_completed_at_ms": 4_000,
+            "projected_at_ms": 4_500,
+            "valid": True,
+            "excluded": False,
+            "invalid_reasons": [],
+            "final_to_projection_ms": 3_500,
+            "e2e_latency_ms": 3_500,
+        }
+        durable_job = persistence.get_job(job_id)
+        assert durable_job["timing"] == timing
+        event = next(
+            event
+            for event in persistence.list_events("meeting-1")
+            if event["idempotency_key"] == f"meeting.intelligence.applied:{job_id}"
+        )
+        assert event["payload"]["timing"] == timing
+        snapshot = persistence.get_snapshot("meeting-1")
+        snapshot_job = next(job for job in snapshot["jobs"] if job["id"] == job_id)
+        assert snapshot_job["timing"] == timing
+        assert snapshot["intelligence_timing"] == timing
+    finally:
+        persistence.close()
+
+
+def test_intelligence_timing_chain_fails_closed_for_missing_reversed_and_superseded_jobs(tmp_path):
+    persistence = V2Persistence(
+        tmp_path / "intelligence-timing-invalid.db",
+        semantic_projection_mode="llm_first",
+    )
+    try:
+        missing = _commit_final(
+            persistence,
+            final_id="missing-timing-final",
+            segment_id="missing-timing-segment",
+            now_ms=1_000,
+        )
+        missing_job = persistence.get_job(missing["job_ids"]["intelligence"])
+        assert missing_job["timing"]["valid"] is False
+        assert missing_job["timing"]["final_to_projection_ms"] is None
+        assert persistence.claim_next_job(
+            worker_id="missing-worker",
+            lane="intelligence",
+            now_ms=3_000,
+            lease_ms=5_000,
+        )["id"] == missing["job_ids"]["intelligence"]
+        assert persistence.cancel_job(
+            job_id=missing["job_ids"]["intelligence"],
+            worker_id="missing-worker",
+            now_ms=3_500,
+            error_class="evidence_superseded",
+        ) is not None
+
+        reversed_commit = _commit_final(
+            persistence,
+            final_id="reversed-timing-final",
+            segment_id="reversed-timing-segment",
+            text="第二段不同证据，触发时钟回拨测试。",
+            now_ms=4_000,
+        )
+        reversed_job_id = reversed_commit["job_ids"]["intelligence"]
+        claimed = persistence.claim_next_job(
+            worker_id="reversed-worker",
+            lane="intelligence",
+            now_ms=6_000,
+            lease_ms=5_000,
+        )
+        assert claimed is not None
+        assert claimed["id"] == reversed_job_id
+        reversed_applied = persistence.apply_intelligence_response(
+            meeting_id="meeting-1",
+            job_id=reversed_job_id,
+            response={
+                "paragraph_revisions": [],
+                "topic_update": None,
+                "state_changes": [],
+                "follow_up": None,
+                "coach_decision": {
+                    "status": "timed_out",
+                    "completed_at_ms": 4_000,
+                },
+            },
+            now_ms=5_500,
+        )
+        assert reversed_applied["timing"]["valid"] is False
+        assert reversed_applied["timing"]["final_to_projection_ms"] is None
+        assert "decision_completed_at_ms_before_job_started_at_ms" in reversed_applied["timing"]["invalid_reasons"]
+        assert "projected_at_ms_before_job_started_at_ms" in reversed_applied["timing"]["invalid_reasons"]
+
+        superseded = _commit_final(
+            persistence,
+            final_id="superseded-timing-final",
+            segment_id="superseded-timing-segment",
+            text="第三段不同证据，用于 superseded timing。",
+            now_ms=8_000,
+        )
+        superseded_job_id = superseded["job_ids"]["intelligence"]
+        assert persistence.claim_next_job(
+            worker_id="superseded-worker",
+            lane="intelligence",
+            now_ms=10_000,
+            lease_ms=5_000,
+        )["id"] == superseded_job_id
+        cancelled = persistence.cancel_job(
+            job_id=superseded_job_id,
+            worker_id="superseded-worker",
+            now_ms=10_500,
+            error_class="evidence_superseded",
+        )
+        assert cancelled is not None
+        assert cancelled["timing"]["valid"] is False
+        assert cancelled["timing"]["excluded"] is True
+        assert cancelled["timing"]["final_to_projection_ms"] is None
+    finally:
+        persistence.close()
+
+
+def test_late_timeout_audit_is_projected_without_allowing_late_content(tmp_path):
+    persistence = V2Persistence(
+        tmp_path / "late-timeout-audit.db",
+        semantic_projection_mode="llm_first",
+    )
+    try:
+        committed = _commit_final(
+            persistence,
+            final_id="late-timeout-final",
+            segment_id="late-timeout-segment",
+            text="我们一定周五上线。",
+            now_ms=1_000,
+        )
+        job_id = committed["job_ids"]["intelligence"]
+        # The normal response deadline is 11_000ms; this timeout audit is
+        # intentionally persisted after that point so the UI can explain the
+        # missing card instead of leaving an apparently pending job forever.
+        applied = persistence.apply_intelligence_response(
+            meeting_id="meeting-1",
+            job_id=job_id,
+            response={
+                "paragraph_revisions": [],
+                "topic_update": None,
+                "state_changes": [],
+                "follow_up": None,
+                "coach_intervention": None,
+                "coach_decision": {
+                    "origin": "pi",
+                    "status": "timed_out",
+                    "status_reason": "provider_timeout",
+                    "fallback_reason": "provider_timeout",
+                    "fallback_error_code": "agent_deadline_exceeded",
+                    "decision_id": "coach-decision-late-timeout",
+                    "completed_at_ms": 11_200,
+                },
+            },
+            now_ms=11_500,
+        )
+        assert applied["coach_decision"]["status"] == "timed_out"
+        assert applied["coach_decision"]["fallback_reason"] == "provider_timeout"
+        assert applied["coach_intervention"] is None
+        events = [
+            event
+            for event in persistence.list_events("meeting-1")
+            if event["type"] == "meeting.intelligence.applied"
+        ]
+        assert len(events) == 1
+
+        # A late timeout marker must not become a loophole for semantic writes.
+        second = _commit_final(
+            persistence,
+            final_id="late-timeout-content-final",
+            segment_id="late-timeout-content-segment",
+            text="尚未确认回滚条件。",
+            now_ms=12_000,
+        )
+        with pytest.raises(IntelligenceDeadlineExceeded):
+            persistence.apply_intelligence_response(
+                meeting_id="meeting-1",
+                job_id=second["job_ids"]["intelligence"],
+                response={
+                    "paragraph_revisions": [],
+                    "topic_update": None,
+                    "state_changes": [
+                        {
+                            "type": "risk",
+                            "operation": "add",
+                            "item_id": "risk:late-content",
+                            "content": "回滚条件未确认",
+                            "owner": None,
+                            "deadline": None,
+                            "status": "candidate",
+                            "evidence_segment_ids": ["late-timeout-content-segment"],
+                            "evidence_quote": "尚未确认回滚条件",
+                            "confidence": 0.9,
+                        }
+                    ],
+                    "follow_up": None,
+                    "coach_intervention": None,
+                    "coach_decision": {
+                        "origin": "pi",
+                        "status": "timed_out",
+                        "fallback_reason": "provider_timeout",
+                    },
+                },
+                now_ms=22_500,
+            )
+    finally:
+        persistence.close()
+
+
+def test_soft_cutoff_converts_late_intervention_to_durable_timeout(tmp_path):
+    persistence = V2Persistence(
+        tmp_path / "soft-cutoff-late-intervention.db",
+        semantic_projection_mode="llm_first",
+    )
+    try:
+        committed = _commit_final(
+            persistence,
+            final_id="soft-cutoff-final",
+            segment_id="soft-cutoff-segment",
+            text="我们一定周五上线，但回滚负责人还没定。",
+            now_ms=1_000,
+        )
+        job_id = committed["job_ids"]["intelligence"]
+        soft_deadline = 1_000 + COACH_SOFT_DELIVERY_CUTOFF_MS
+        applied = persistence.apply_intelligence_response(
+            meeting_id="meeting-1",
+            job_id=job_id,
+            response={
+                "paragraph_revisions": [],
+                "topic_update": None,
+                "state_changes": [],
+                "follow_up": None,
+                "coach_intervention": {
+                    "event_type": "commitment_risk",
+                    "recommendation": "先确认回滚负责人。",
+                    "reason": "当前承诺缺少负责人。",
+                    "evidence_segment_ids": ["soft-cutoff-segment"],
+                    "evidence_quote": "回滚负责人还没定",
+                    "urgency": "high",
+                    "confidence": 0.99,
+                },
+                "coach_decision": {
+                    "decision_id": "coach-decision-soft-cutoff",
+                    "origin": "pi",
+                    "status": "intervention",
+                    "status_reason": "intervention_submitted",
+                    "soft_deadline_at_ms": soft_deadline,
+                    "completed_at_ms": soft_deadline + 10,
+                },
+            },
+            # The job is still inside the ten-second hard deadline, but its
+            # 2.5-second usefulness window has already closed.
+            now_ms=4_000,
+        )
+        decision = applied["coach_decision"]
+        assert applied["coach_intervention"] is None
+        assert decision["status"] == "timed_out"
+        assert decision["status_reason"] == "soft_deadline_exceeded"
+        assert decision["delivery_status"] == "too_late"
+        assert decision["late_result_discarded"] is True
+        assert decision["soft_cutoff_triggered"] is True
+        assert decision["soft_timeout_projection_at_ms"] == 4_000
+        assert decision["soft_cutoff_elapsed_ms"] == 3_000
+
+        events = [
+            event
+            for event in persistence.list_events("meeting-1")
+            if event["type"] == "meeting.intelligence.applied"
+        ]
+        assert len(events) == 1
+        payload = events[0]["payload"]
+        assert payload["coach_intervention"] is None
+        assert payload["coach_decision"]["delivery_status"] == "too_late"
+    finally:
+        persistence.close()
+
+
+def test_llm_first_coalescing_preserves_the_first_final_absolute_deadline(tmp_path):
+    persistence = V2Persistence(
+        tmp_path / "llm-first-absolute-deadline.db",
+        semantic_projection_mode="llm_first",
+    )
+    try:
+        first = persistence.commit_final_and_enqueue(
+            meeting_id="meeting-1",
+            final_id="deadline-final-1",
+            segment_id="deadline-segment-1",
+            text="先确认发布窗口。",
+            normalized_text="先确认发布窗口。",
+            started_at_ms=100,
+            ended_at_ms=900,
+            evidence_hash="deadline-hash-1",
+            now_ms=1_000,
+        )
+        second = persistence.commit_final_and_enqueue(
+            meeting_id="meeting-1",
+            final_id="deadline-final-2",
+            segment_id="deadline-segment-2",
+            text="再确认回滚负责人。",
+            normalized_text="再确认回滚负责人。",
+            started_at_ms=1_000,
+            ended_at_ms=1_700,
+            evidence_hash="deadline-hash-2",
+            now_ms=9_000,
+        )
+
+        assert second["job_ids"]["intelligence"] == first["job_ids"]["intelligence"]
+        job = persistence.get_job(first["job_ids"]["intelligence"])
+        assert job["deadline_at_ms"] == 1_000 + INTELLIGENCE_REALTIME_BUDGET_MS
+        assert job["next_attempt_at_ms"] == 9_000
+        assert intelligence_deadline_at_ms(-1) == INTELLIGENCE_REALTIME_BUDGET_MS
+        assert INTELLIGENCE_MIN_EXECUTION_BUDGET_MS == 5_000
+        assert intelligence_next_attempt_at_ms(now_ms=1_000, deadline_at_ms=11_000) == 1_750
+    finally:
+        persistence.close()
+
+
+def test_llm_first_duplicate_final_replay_preserves_original_intelligence_clock(tmp_path):
+    persistence = V2Persistence(
+        tmp_path / "llm-first-duplicate-final-clock.db",
+        semantic_projection_mode="llm_first",
+    )
+    try:
+        first = _commit_final(
+            persistence,
+            final_id="duplicate-clock-final",
+            segment_id="duplicate-clock-segment",
+            now_ms=1_000,
+        )
+        original = persistence.get_job(first["job_ids"]["intelligence"])
+
+        replay = _commit_final(
+            persistence,
+            final_id="duplicate-clock-final",
+            segment_id="duplicate-clock-segment",
+            now_ms=9_000,
+        )
+        assert replay["created"] is False
+        assert replay["job_ids"] == first["job_ids"]
+
+        current = persistence.get_job(first["job_ids"]["intelligence"])
+        assert current["final_committed_at_ms"] == original["final_committed_at_ms"] == 1_000
+        assert current["deadline_at_ms"] == original["deadline_at_ms"] == intelligence_deadline_at_ms(1_000)
+        assert current["next_attempt_at_ms"] == original["next_attempt_at_ms"] == 1_750
+        assert current["updated_at_ms"] == original["updated_at_ms"]
+    finally:
+        persistence.close()
+
+
+def test_llm_first_retry_wait_coalescing_clears_old_attempt_timing(tmp_path):
+    persistence = V2Persistence(
+        tmp_path / "llm-first-retry-coalescing-timing.db",
+        semantic_projection_mode="llm_first",
+    )
+    try:
+        first = _commit_final(
+            persistence,
+            final_id="retry-coalesce-final-1",
+            segment_id="retry-coalesce-segment-1",
+            now_ms=1_000,
+        )
+        job_id = first["job_ids"]["intelligence"]
+        claimed = persistence.claim_next_job(
+            worker_id="retry-coalesce-worker",
+            lane="intelligence",
+            now_ms=1_750,
+            lease_ms=5_000,
+        )
+        assert claimed is not None
+        assert claimed["job_started_at_ms"] == 1_750
+        retried = persistence.retry_job(
+            job_id=job_id,
+            worker_id="retry-coalesce-worker",
+            now_ms=2_000,
+            next_attempt_at_ms=2_500,
+            error_class="provider_timeout",
+        )
+        assert retried is not None
+        assert retried["status"] == "retry_wait"
+        assert retried["job_started_at_ms"] == 1_750
+
+        second = _commit_final(
+            persistence,
+            final_id="retry-coalesce-final-2",
+            segment_id="retry-coalesce-segment-2",
+            text="补充新的回滚负责人和验证窗口。",
+            now_ms=3_000,
+        )
+        assert second["job_ids"]["intelligence"] == job_id
+        coalesced = persistence.get_job(job_id)
+        assert coalesced["evidence_segment_id"] == "retry-coalesce-segment-2"
+        assert coalesced["final_committed_at_ms"] == 1_000
+        assert coalesced["job_started_at_ms"] is None
+        assert coalesced["decision_completed_at_ms"] is None
+        assert coalesced["projected_at_ms"] is None
+        assert coalesced["timing"]["valid"] is False
+        assert "missing_job_started_at_ms" in coalesced["timing"]["invalid_reasons"]
+
+        claimed_again = persistence.claim_next_job(
+            worker_id="retry-coalesce-worker-2",
+            lane="intelligence",
+            now_ms=3_749,
+            lease_ms=5_000,
+        )
+        assert claimed_again is None
+        claimed_again = persistence.claim_next_job(
+            worker_id="retry-coalesce-worker-2",
+            lane="intelligence",
+            now_ms=3_750,
+            lease_ms=5_000,
+        )
+        assert claimed_again is not None
+        assert claimed_again["id"] == job_id
+        assert claimed_again["job_started_at_ms"] == 3_750
+    finally:
+        persistence.close()
+
+
+def test_llm_first_rejects_response_that_arrives_at_its_absolute_deadline(tmp_path):
+    persistence = V2Persistence(
+        tmp_path / "llm-first-late-response.db",
+        semantic_projection_mode="llm_first",
+    )
+    try:
+        committed = persistence.commit_final_and_enqueue(
+            meeting_id="meeting-1",
+            final_id="late-response-final",
+            segment_id="late-response-segment",
+            text="发布前还需要确认回滚负责人。",
+            normalized_text="发布前还需要确认回滚负责人。",
+            started_at_ms=100,
+            ended_at_ms=900,
+            evidence_hash="late-response-hash",
+            now_ms=1_000,
+        )
+        job_id = committed["job_ids"]["intelligence"]
+        with pytest.raises(IntelligenceDeadlineExceeded, match="realtime deadline"):
+            persistence.apply_intelligence_response(
+                meeting_id="meeting-1",
+                job_id=job_id,
+                response={
+                    "paragraph_revisions": [],
+                    "topic_update": None,
+                    "state_changes": [],
+                    "follow_up": {"question": "确认回滚负责人"},
+                },
+                now_ms=intelligence_deadline_at_ms(1_000),
+            )
+
+        snapshot = persistence.get_snapshot("meeting-1")
+        assert snapshot["follow_up"] is None
+        assert all(
+            event["idempotency_key"] != f"meeting.intelligence.applied:{job_id}"
+            for event in persistence.list_events("meeting-1")
+        )
+    finally:
+        persistence.close()
+
+
+def test_llm_first_rechecks_production_clock_inside_projection_transaction(tmp_path):
+    deadline_ms = intelligence_deadline_at_ms(1_000)
+    persistence = V2Persistence(
+        tmp_path / "llm-first-thread-late-response.db",
+        semantic_projection_mode="llm_first",
+        projection_clock_ms=lambda: deadline_ms,
+    )
+    try:
+        committed = persistence.commit_final_and_enqueue(
+            meeting_id="meeting-1",
+            final_id="thread-late-final",
+            segment_id="thread-late-segment",
+            text="发布前还需要确认回滚负责人。",
+            normalized_text="发布前还需要确认回滚负责人。",
+            started_at_ms=100,
+            ended_at_ms=900,
+            evidence_hash="thread-late-hash",
+            now_ms=1_000,
+        )
+        job_id = committed["job_ids"]["intelligence"]
+
+        with pytest.raises(IntelligenceDeadlineExceeded, match="before projection"):
+            persistence.apply_intelligence_response(
+                meeting_id="meeting-1",
+                job_id=job_id,
+                response={
+                    "paragraph_revisions": [],
+                    "topic_update": None,
+                    "state_changes": [],
+                    "follow_up": {"question": "确认回滚负责人", "reason": "承诺条件缺失"},
+                },
+                now_ms=deadline_ms - 1,
+            )
+
+        assert all(
+            event["idempotency_key"] != f"meeting.intelligence.applied:{job_id}"
+            for event in persistence.list_events("meeting-1")
+        )
+    finally:
+        persistence.close()
+
+
+def test_llm_first_rechecks_deadline_immediately_before_applied_event(tmp_path):
+    deadline_ms = intelligence_deadline_at_ms(1_000)
+    observed_times = iter((deadline_ms - 1, deadline_ms))
+    persistence = V2Persistence(
+        tmp_path / "llm-first-deadline-crossed-during-projection.db",
+        semantic_projection_mode="llm_first",
+        projection_clock_ms=lambda: next(observed_times),
+    )
+    try:
+        committed = persistence.commit_final_and_enqueue(
+            meeting_id="meeting-1",
+            final_id="event-deadline-final",
+            segment_id="event-deadline-segment",
+            text="发布前还需要确认回滚负责人。",
+            normalized_text="发布前还需要确认回滚负责人。",
+            started_at_ms=100,
+            ended_at_ms=900,
+            evidence_hash="event-deadline-hash",
+            now_ms=1_000,
+        )
+        job_id = committed["job_ids"]["intelligence"]
+
+        with pytest.raises(IntelligenceDeadlineExceeded, match="before event projection"):
+            persistence.apply_intelligence_response(
+                meeting_id="meeting-1",
+                job_id=job_id,
+                response={
+                    "paragraph_revisions": [],
+                    "topic_update": None,
+                    "state_changes": [
+                        {
+                            "type": "risk",
+                            "operation": "add",
+                            "item_id": "risk:missing-rollback-owner",
+                            "content": "回滚负责人尚未确认",
+                            "status": "candidate",
+                            "evidence_segment_ids": ["event-deadline-segment"],
+                            "evidence_quote": "发布前还需要确认回滚负责人",
+                            "confidence": 0.92,
+                        }
+                    ],
+                    "follow_up": {
+                        "question": "确认回滚负责人",
+                        "reason": "回滚责任尚未闭环",
+                    },
+                },
+                now_ms=deadline_ms - 2,
+            )
+
+        snapshot = persistence.get_snapshot("meeting-1")
+        assert snapshot["risks"] == []
+        assert snapshot["follow_up"] is None
+        assert all(
+            event["idempotency_key"] != f"meeting.intelligence.applied:{job_id}"
+            for event in persistence.list_events("meeting-1")
+        )
     finally:
         persistence.close()
 
@@ -744,18 +2360,21 @@ def test_llm_first_debounce_coalesces_without_expiring_before_provider_can_respo
         intelligence_job = persistence.get_job(str(intelligence_job_id))
         assert intelligence_job["input_transcript_seq"] == 6
         assert intelligence_job["input_version"] == 6
-        assert intelligence_job["deadline_at_ms"] is None
-        assert intelligence_job["next_attempt_at_ms"] == 10_500
+        assert intelligence_job["deadline_at_ms"] == intelligence_deadline_at_ms(1_000)
+        assert intelligence_job["next_attempt_at_ms"] == 8_500
+        # At the viable-start boundary, the coalesced job must already be
+        # claimable with the full minimum execution window still available.
+        assert intelligence_next_attempt_at_ms(now_ms=5_500, deadline_at_ms=11_000) <= 6_000
         assert persistence.claim_next_job(
             worker_id="max-wait-worker",
             lane="intelligence",
-            now_ms=10_499,
+            now_ms=8_499,
             lease_ms=5_000,
         ) is None
         claimed = persistence.claim_next_job(
             worker_id="max-wait-worker",
             lane="intelligence",
-            now_ms=10_500,
+            now_ms=8_500,
             lease_ms=5_000,
         )
         assert claimed is not None
@@ -764,7 +2383,83 @@ def test_llm_first_debounce_coalesces_without_expiring_before_provider_can_respo
         persistence.close()
 
 
-def test_llm_first_keeps_intelligence_job_claimable_after_old_eight_second_window(tmp_path):
+def test_llm_first_late_final_starts_a_fresh_deadline_after_old_job_expires(tmp_path):
+    persistence = V2Persistence(
+        tmp_path / "llm-first-late-final-fresh-window.db",
+        semantic_projection_mode="llm_first",
+    )
+    try:
+        first = _commit_final(
+            persistence,
+            final_id="late-window-final-1",
+            segment_id="late-window-segment-1",
+            text="第一轮先确认发布窗口。",
+            now_ms=1_000,
+        )
+        first_job_id = first["job_ids"]["intelligence"]
+        second = _commit_final(
+            persistence,
+            final_id="late-window-final-2",
+            segment_id="late-window-segment-2",
+            text="第二轮在旧窗口结束后补充回滚负责人。",
+            now_ms=12_000,
+        )
+        second_job_id = second["job_ids"]["intelligence"]
+
+        assert second_job_id != first_job_id
+        old_job = persistence.get_job(first_job_id)
+        new_job = persistence.get_job(second_job_id)
+        assert old_job["deadline_at_ms"] == intelligence_deadline_at_ms(1_000)
+        assert new_job["deadline_at_ms"] == intelligence_deadline_at_ms(12_000)
+        assert old_job["status"] in {"pending", "retry_wait"}
+        assert persistence.claim_next_job(
+            worker_id="late-window-worker",
+            lane="intelligence",
+            now_ms=12_000,
+            lease_ms=5_000,
+        ) is None
+        assert persistence.claim_next_job(
+            worker_id="late-window-worker",
+            lane="intelligence",
+            now_ms=14_000,
+            lease_ms=5_000,
+        )["id"] == second_job_id
+        assert persistence.get_job(first_job_id)["status"] == "cancelled"
+    finally:
+        persistence.close()
+
+
+def test_llm_first_claim_backfills_legacy_null_deadline_before_cancelling(tmp_path):
+    persistence = V2Persistence(
+        tmp_path / "llm-first-legacy-null-deadline.db",
+        semantic_projection_mode="llm_first",
+    )
+    try:
+        committed = _commit_final(
+            persistence,
+            final_id="legacy-null-deadline-final",
+            segment_id="legacy-null-deadline-segment",
+            now_ms=1_000,
+        )
+        job_id = committed["job_ids"]["intelligence"]
+        persistence._conn.execute("UPDATE jobs SET deadline_at_ms = NULL WHERE id = ?", (job_id,))
+        persistence._conn.commit()
+
+        assert persistence.claim_next_job(
+            worker_id="legacy-deadline-worker",
+            lane="intelligence",
+            now_ms=20_000,
+            lease_ms=5_000,
+        ) is None
+        job = persistence.get_job(job_id)
+        assert job["deadline_at_ms"] == intelligence_deadline_at_ms(1_000)
+        assert job["status"] == "cancelled"
+        assert job["error_class"] == "deadline_exceeded"
+    finally:
+        persistence.close()
+
+
+def test_llm_first_cancels_intelligence_job_after_realtime_deadline(tmp_path):
     persistence = V2Persistence(
         tmp_path / "llm-first-expired.db",
         semantic_projection_mode="llm_first",
@@ -782,7 +2477,7 @@ def test_llm_first_keeps_intelligence_job_claimable_after_old_eight_second_windo
             now_ms=1_000,
         )
         job_id = committed["job_ids"]["intelligence"]
-        assert persistence.get_job(job_id)["deadline_at_ms"] is None
+        assert persistence.get_job(job_id)["deadline_at_ms"] == intelligence_deadline_at_ms(1_000)
 
         claimed = persistence.claim_next_job(
             worker_id="expired-worker",
@@ -791,9 +2486,10 @@ def test_llm_first_keeps_intelligence_job_claimable_after_old_eight_second_windo
             lease_ms=5_000,
         )
 
-        assert claimed is not None
-        assert claimed["id"] == job_id
-        assert claimed["status"] == "running"
+        assert claimed is None
+        expired = persistence.get_job(job_id)
+        assert expired["status"] == "cancelled"
+        assert expired["error_class"] == "deadline_exceeded"
     finally:
         persistence.close()
 
@@ -1563,6 +3259,22 @@ def test_final_enqueues_independent_correction_and_suggestion_lanes(persistence)
     assert jobs[1]["generation_id"] == "suggestion:meeting-1:final-1"
 
 
+def test_llm_first_marks_realtime_intelligence_above_live_correction_priority(tmp_path):
+    persistence = V2Persistence(
+        tmp_path / "llm-first-priority.db",
+        semantic_projection_mode="llm_first",
+    )
+    try:
+        committed = _commit_final(persistence)
+        intelligence = persistence.get_job(committed["job_ids"]["intelligence"])
+        correction = persistence.get_job(committed["job_ids"]["correction"])
+
+        assert intelligence["priority"] > correction["priority"]
+        assert correction["priority"] == 80
+    finally:
+        persistence.close()
+
+
 def test_running_correction_for_superseded_evidence_cannot_complete(persistence):
     committed = _commit_final(persistence)
     claimed = persistence.claim_next_job(
@@ -1914,6 +3626,186 @@ def test_stale_intelligence_can_enqueue_one_refresh_over_latest_evidence(tmp_pat
         assert replacement["input_transcript_seq"] == 1
         assert replacement["input_version"] == 2
         assert replacement["evidence_hash"] == revised["evidence_hash"]
+        assert replacement["deadline_at_ms"] == intelligence_deadline_at_ms(4_200)
+        assert replacement["next_attempt_at_ms"] == intelligence_next_attempt_at_ms(
+            now_ms=4_200,
+            deadline_at_ms=intelligence_deadline_at_ms(4_200),
+        )
+    finally:
+        persistence.close()
+
+
+def test_due_coach_refresh_supports_no_new_evidence_and_is_restart_idempotent(tmp_path):
+    database_path = tmp_path / "due-refresh.db"
+    persistence = V2Persistence(database_path, semantic_projection_mode="llm_first")
+    try:
+        persistence.commit_final_and_enqueue(
+            meeting_id="due-meeting",
+            final_id="due-final-1",
+            segment_id="due-segment-1",
+            text="周五上线，但回滚负责人待确认。",
+            normalized_text="周五上线，但回滚负责人待确认。",
+            started_at_ms=0,
+            ended_at_ms=1_000,
+            evidence_hash="due-hash-1",
+            now_ms=1_000,
+        )
+        with persistence._write_transaction():
+            persistence._append_event_locked(
+                meeting_id="due-meeting",
+                event_type="meeting.intelligence.applied",
+                aggregate_type="meeting_intelligence",
+                aggregate_id="due-job-1",
+                occurred_at_ms=1_100,
+                idempotency_key="due-event-1",
+                payload={
+                    "coach_decision": {
+                        "decision_id": "due-decision-1",
+                        "status": "intervention",
+                        "lifecycle_action": "retain",
+                    },
+                    "coach_intervention": {
+                        "event_type": "commitment_risk",
+                        "title": "回滚负责人",
+                        "evidence_segment_ids": ["due-segment-1"],
+                        "valid_until_ms": 1_500,
+                    },
+                },
+            )
+
+        no_new_evidence = persistence.enqueue_due_coach_refresh(
+            meeting_id="due-meeting",
+            decision_id="due-decision-1",
+            now_ms=2_000,
+        )
+        assert no_new_evidence is not None
+        assert no_new_evidence["trigger_type"] == "task_due"
+        assert no_new_evidence["work_item_id"] == "due-decision-1"
+        assert no_new_evidence["trigger_reference_seq"] == 1
+        assert no_new_evidence["input_transcript_seq"] == 1
+        assert no_new_evidence["evidence_segment_id"] == "due-segment-1"
+
+        persistence.commit_final_and_enqueue(
+            meeting_id="due-meeting",
+            final_id="due-final-2",
+            segment_id="due-segment-2",
+            text="回滚负责人改为王工。",
+            normalized_text="回滚负责人改为王工。",
+            started_at_ms=2_000,
+            ended_at_ms=3_000,
+            evidence_hash="due-hash-2",
+            now_ms=2_000,
+        )
+        queued = persistence.enqueue_due_coach_refresh(
+            meeting_id="due-meeting",
+            decision_id="due-decision-1",
+            now_ms=2_100,
+        )
+        assert queued is not None
+        assert queued["priority"] == 105
+        assert queued["id"] != no_new_evidence["id"]
+        assert queued["trigger_type"] == "task_due"
+        assert queued["work_item_id"] == "due-decision-1"
+        assert queued["trigger_reference_seq"] == 1
+        assert queued["input_transcript_seq"] == 2
+        assert queued["evidence_segment_id"] == "due-segment-2"
+        repeated = persistence.enqueue_due_coach_refresh(
+            meeting_id="due-meeting",
+            decision_id="due-decision-1",
+            now_ms=2_200,
+        )
+        assert repeated is not None
+        assert repeated["id"] == queued["id"]
+    finally:
+        persistence.close()
+
+    reopened = V2Persistence(database_path, semantic_projection_mode="llm_first")
+    try:
+        repeated_after_restart = reopened.enqueue_due_coach_refresh(
+            meeting_id="due-meeting",
+            decision_id="due-decision-1",
+            now_ms=2_300,
+        )
+        assert repeated_after_restart is not None
+        assert repeated_after_restart["id"] == queued["id"]
+    finally:
+        reopened.close()
+
+
+def test_due_coach_refresh_rejects_resolved_or_ended_items(tmp_path):
+    persistence = V2Persistence(tmp_path / "due-refresh-terminal.db", semantic_projection_mode="llm_first")
+    try:
+        persistence.commit_final_and_enqueue(
+            meeting_id="terminal-meeting",
+            final_id="terminal-final-1",
+            segment_id="terminal-segment-1",
+            text="待确认事项。",
+            normalized_text="待确认事项。",
+            started_at_ms=0,
+            ended_at_ms=1_000,
+            evidence_hash="terminal-hash-1",
+            now_ms=1_000,
+        )
+        with persistence._write_transaction():
+            persistence._append_event_locked(
+                meeting_id="terminal-meeting",
+                event_type="meeting.intelligence.applied",
+                aggregate_type="meeting_intelligence",
+                aggregate_id="terminal-job-1",
+                occurred_at_ms=1_100,
+                idempotency_key="terminal-event-1",
+                payload={
+                    "coach_decision": {
+                        "decision_id": "terminal-decision-1",
+                        "status": "intervention",
+                        "lifecycle_action": "retain",
+                    },
+                    "coach_intervention": {
+                        "evidence_segment_ids": ["terminal-segment-1"],
+                        "valid_until_ms": 1,
+                    },
+                },
+            )
+        persistence.commit_final_and_enqueue(
+            meeting_id="terminal-meeting",
+            final_id="terminal-final-2",
+            segment_id="terminal-segment-2",
+            text="事项已解决。",
+            normalized_text="事项已解决。",
+            started_at_ms=2_000,
+            ended_at_ms=3_000,
+            evidence_hash="terminal-hash-2",
+            now_ms=2_000,
+        )
+        with persistence._write_transaction():
+            persistence._append_event_locked(
+                meeting_id="terminal-meeting",
+                event_type="meeting.intelligence.applied",
+                aggregate_type="meeting_intelligence",
+                aggregate_id="terminal-job-2",
+                occurred_at_ms=2_100,
+                idempotency_key="terminal-event-2",
+                payload={
+                    "coach_decision": {
+                        "decision_id": "terminal-decision-2",
+                        "status": "protected_silent",
+                        "lifecycle_action": "deprioritize",
+                        "supersedes_decision_id": "terminal-decision-1",
+                    },
+                    "coach_intervention": None,
+                },
+            )
+        assert persistence.enqueue_due_coach_refresh(
+            meeting_id="terminal-meeting",
+            decision_id="terminal-decision-1",
+            now_ms=3_000,
+        ) is None
+        persistence.end_meeting(meeting_id="terminal-meeting", now_ms=3_100)
+        assert persistence.enqueue_due_coach_refresh(
+            meeting_id="terminal-meeting",
+            decision_id="terminal-decision-1",
+            now_ms=4_000,
+        ) is None
     finally:
         persistence.close()
 
@@ -2628,13 +4520,24 @@ def test_meeting_end_and_suggestion_feedback_are_durable_events(persistence):
     assert feedback["feedback"] == "kept"
     assert ended["state"] == "ended"
     assert duplicate_end["ended_at_ms"] == ended["ended_at_ms"]
-    assert {job["kind"] for job in persistence.list_jobs(meeting_id="meeting-1")} == {
+    all_jobs = persistence.list_jobs(meeting_id="meeting-1")
+    assert {job["kind"] for job in all_jobs} == {
         "correction",
         "suggestion",
         "minutes",
         "approach",
         "index",
     }
+    review_jobs = {job["kind"]: job for job in all_jobs if job["kind"] in REVIEW_JOB_KINDS}
+    assert {
+        kind: job["deadline_at_ms"]
+        for kind, job in review_jobs.items()
+    } == {
+        "minutes": 2_300 + REVIEW_JOB_DEADLINE_MS,
+        "approach": 2_300 + REVIEW_JOB_DEADLINE_MS,
+        "index": 2_300 + REVIEW_JOB_DEADLINE_MS,
+    }
+    assert next(job for job in all_jobs if job["kind"] == "correction")["deadline_at_ms"] is None
     correction_jobs = persistence.list_jobs(meeting_id="meeting-1", lane="correction")
     assert [job["id"] for job in correction_jobs] == [committed["job_ids"]["correction"]]
     snapshot = persistence.get_snapshot("meeting-1")
@@ -2672,6 +4575,65 @@ def test_meeting_end_enqueues_one_replacement_after_terminal_correction_failure(
     assert persistence.get_job(committed["job_ids"]["correction"])["status"] == "failed"
     assert len(active) == 1
     assert active[0]["idempotency_key"].endswith("meeting.ended")
+
+
+def test_meeting_end_cancels_pending_realtime_intelligence_without_consuming_attempts(tmp_path):
+    persistence = V2Persistence(
+        tmp_path / "meeting-end-intelligence.db",
+        semantic_projection_mode="llm_first",
+    )
+    try:
+        committed = _commit_final(
+            persistence,
+            text="我们需要确认发布负责人。上线前完成回滚演练。",
+        )
+        intelligence_id = committed["job_ids"]["intelligence"]
+        intelligence = persistence.get_job(intelligence_id)
+        assert intelligence["status"] == "pending"
+        ended = persistence.end_meeting(meeting_id="meeting-1", now_ms=2_000)
+
+        assert ended["state"] == "ended"
+        cancelled = persistence.get_job(intelligence_id)
+        assert cancelled["status"] == "cancelled"
+        assert cancelled["error_class"] == "meeting_ended"
+        assert cancelled["attempts"] == 0
+        assert cancelled["lease_owner"] is None
+        assert cancelled["lease_until_ms"] is None
+        correction = persistence.get_job(committed["job_ids"]["correction"])
+        assert correction["status"] == "pending"
+    finally:
+        persistence.close()
+
+
+def test_meeting_end_leaves_running_realtime_intelligence_for_handler_cleanup(tmp_path):
+    persistence = V2Persistence(
+        tmp_path / "meeting-end-running-intelligence.db",
+        semantic_projection_mode="llm_first",
+    )
+    try:
+        committed = _commit_final(
+            persistence,
+            text="我们需要确认发布负责人。上线前完成回滚演练。",
+        )
+        intelligence_id = committed["job_ids"]["intelligence"]
+        queued = persistence.get_job(intelligence_id)
+        worker_id = "meeting-end-running-intelligence"
+        running = persistence.claim_next_job(
+            worker_id=worker_id,
+            lane="intelligence",
+            now_ms=int(queued["next_attempt_at_ms"]),
+            lease_ms=30_000,
+        )
+        assert running is not None
+
+        persistence.end_meeting(meeting_id="meeting-1", now_ms=2_000)
+
+        preserved = persistence.get_job(intelligence_id)
+        assert preserved["status"] == "running"
+        assert preserved["lease_owner"] == worker_id
+        assert preserved["error_class"] is None
+    finally:
+        persistence.close()
 
 
 def test_transcript_revision_rebuilds_the_durable_semantic_paragraph(persistence):
@@ -2802,6 +4764,163 @@ def test_live_meeting_without_capture_session_reports_waiting_for_recording(pers
     assert snapshot["runtime"]["phase"] == "live"
     assert snapshot["runtime"]["recording"]["state"] == "unknown"
     assert snapshot["audio"]["status"] == "unknown"
+
+
+def _seed_atomic_acceptance_meeting(persistence: V2Persistence) -> dict[str, Any]:
+    """Create one minimally valid meeting for acceptance-capture tests."""
+
+    text = "发布负责人需要在周五前确认回滚条件。"
+    segment_id = "acceptance-segment-1"
+    committed = persistence.commit_final_and_enqueue(
+        meeting_id="acceptance-meeting",
+        final_id="acceptance-final-1",
+        segment_id=segment_id,
+        text=text,
+        normalized_text=text,
+        started_at_ms=100,
+        ended_at_ms=900,
+        evidence_hash=transcript_evidence_hash(segment_id, text),
+        now_ms=1_000,
+    )
+    assert committed["segment_id"] == segment_id
+    return committed
+
+
+def _insert_acceptance_sidecars(persistence: V2Persistence) -> None:
+    """Populate the legacy sidecar tables that share the application DB."""
+
+    with sqlite3.connect(persistence.database_path) as connection:
+        connection.execute(
+            "INSERT INTO asr_live_sessions "
+            "(session_id, record_json, created_at_ms, last_activity_ms, source, has_audio) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "acceptance-meeting",
+                json.dumps(
+                    {
+                        "session_id": "acceptance-meeting",
+                        "events": [{"event_type": "transcript_final", "text": "发布负责人"}],
+                        "acceptance_eligible": True,
+                    },
+                    ensure_ascii=False,
+                ),
+                1_000,
+                1_100,
+                "browser_live_mic",
+                1,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO llm_usage_ledger "
+            "(session_id, purpose, provider, model, prompt_tokens, completion_tokens, total_tokens, timestamp_ms) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            # Deliberately future-dated: the atomic boundary is the ledger ID,
+            # not an application-supplied wall-clock timestamp.
+            (
+                "acceptance-meeting",
+                "coach",
+                "deepseek",
+                "deepseek-v4-flash",
+                12,
+                8,
+                20,
+                9_999_999_999_999,
+            ),
+        )
+
+
+def test_acceptance_evidence_is_revision_pinned_and_self_verifiable(persistence):
+    _seed_atomic_acceptance_meeting(persistence)
+    _insert_acceptance_sidecars(persistence)
+
+    capture = persistence.capture_acceptance_evidence("acceptance-meeting")
+
+    assert capture["schema_version"] == "meeting_copilot.acceptance_evidence.v1"
+    assert capture["consistency"] == {"acceptance_eligible": True, "errors": []}
+    lineage = capture["lineage"]
+    assert lineage["event_high_water_mark"] == capture["snapshot"]["last_seq"]
+    assert lineage["transcript_high_water_mark"] == 1
+    assert lineage["transcript_revision"] == 1
+    assert lineage["usage_high_water_id"] == capture["usage_ledger"][-1]["id"]
+    assert capture["usage_ledger"][-1]["timestamp_ms"] == 9_999_999_999_999
+    assert capture["live_session"]["session_id"] == "acceptance-meeting"
+    assert capture["transcript"]["segments"][0]["evidence_hash"] == transcript_evidence_hash(
+        "acceptance-segment-1",
+        "发布负责人需要在周五前确认回滚条件。",
+    )
+
+    unhashed = dict(capture)
+    unhashed.pop("capture_sha256")
+    unhashed.pop("captured_at_ms")
+    assert capture["capture_sha256"] == hashlib.sha256(
+        json.dumps(unhashed, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+    repeated = persistence.capture_acceptance_evidence("acceptance-meeting")
+    assert repeated["captured_at_ms"] >= capture["captured_at_ms"]
+    assert repeated["capture_sha256"] == capture["capture_sha256"]
+
+
+def test_acceptance_evidence_truncation_is_fail_closed(persistence):
+    _seed_atomic_acceptance_meeting(persistence)
+    second_text = "第二项承诺需要补充验收人。"
+    persistence.commit_final_and_enqueue(
+        meeting_id="acceptance-meeting",
+        final_id="acceptance-final-2",
+        segment_id="acceptance-segment-2",
+        text=second_text,
+        normalized_text=second_text,
+        started_at_ms=1_000,
+        ended_at_ms=1_900,
+        evidence_hash=transcript_evidence_hash("acceptance-segment-2", second_text),
+        now_ms=2_000,
+    )
+
+    capture = persistence.capture_acceptance_evidence(
+        "acceptance-meeting",
+        max_segments=1,
+        max_events=1,
+    )
+
+    assert capture["consistency"]["acceptance_eligible"] is False
+    assert "segment_export_truncated" in capture["consistency"]["errors"]
+    assert "event_export_truncated" in capture["consistency"]["errors"]
+
+
+def test_acceptance_evidence_does_not_include_write_after_pinned_transaction(tmp_path):
+    database_path = tmp_path / "acceptance-pinned.db"
+    reader = V2Persistence(database_path)
+    writer = None
+    try:
+        _seed_atomic_acceptance_meeting(reader)
+        # Establish the read snapshot before a second connection commits a
+        # newer final.  capture_acceptance_evidence reuses this transaction.
+        reader._conn.execute("BEGIN")
+        reader._conn.execute("SELECT COUNT(*) FROM meetings").fetchone()
+        writer = V2Persistence(database_path)
+        newer_text = "这条在捕获事务开始后才写入。"
+        writer.commit_final_and_enqueue(
+            meeting_id="acceptance-meeting",
+            final_id="acceptance-final-2",
+            segment_id="acceptance-segment-2",
+            text=newer_text,
+            normalized_text=newer_text,
+            started_at_ms=2_000,
+            ended_at_ms=2_900,
+            evidence_hash=transcript_evidence_hash("acceptance-segment-2", newer_text),
+            now_ms=2_000,
+        )
+        capture = reader.capture_acceptance_evidence("acceptance-meeting")
+        assert capture["lineage"]["transcript_high_water_mark"] == 1
+        assert [item["segment_id"] for item in capture["transcript"]["segments"]] == [
+            "acceptance-segment-1"
+        ]
+    finally:
+        if reader._conn.in_transaction:
+            reader._conn.execute("ROLLBACK")
+        if writer is not None:
+            writer.close()
+        reader.close()
 
 
 def test_native_audio_chunk_source_range_is_durable_and_part_of_idempotency(persistence):
@@ -3386,6 +5505,28 @@ def test_create_meeting_is_idempotent_and_history_is_normalized(persistence):
             "review_jobs": {},
         }
     ]
+
+
+def test_review_jobs_have_deadline_and_expired_pending_rows_are_cancelled(persistence):
+    _commit_final(persistence, now_ms=1_000)
+
+    created = persistence.enqueue_review_job(
+        meeting_id="meeting-1",
+        kind="approach",
+        now_ms=2_000,
+    )
+    job = created["job"]
+    assert job["deadline_at_ms"] == 2_000 + REVIEW_JOB_DEADLINE_MS
+
+    assert persistence.claim_next_job(
+        worker_id="review-expiry-test",
+        lane="approach",
+        now_ms=2_000 + REVIEW_JOB_DEADLINE_MS,
+        lease_ms=30_000,
+    ) is None
+    expired = persistence.get_job(job["id"])
+    assert expired["status"] == "cancelled"
+    assert expired["error_class"] == "deadline_exceeded"
 
 
 def test_history_search_status_and_cursor_are_database_backed(persistence):

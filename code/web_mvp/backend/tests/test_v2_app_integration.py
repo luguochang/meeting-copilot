@@ -1,5 +1,7 @@
 import asyncio
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
+import hashlib
 import httpx
 from io import BytesIO
 import json
@@ -21,6 +23,14 @@ from meeting_copilot_web_mvp import app as app_module
 from meeting_copilot_web_mvp import llm_service
 from meeting_copilot_web_mvp import realtime_transcript_correction
 from meeting_copilot_web_mvp.audio_assets import RealtimeWavAssetWriter
+
+
+@pytest.fixture(autouse=True)
+def _configured_correction_budget_rates(monkeypatch):
+    """Keep integration fixtures on the explicitly configured provider path."""
+
+    monkeypatch.setenv("LLM_PROMPT_CNY_PER_1M_TOKENS", "1")
+    monkeypatch.setenv("LLM_COMPLETION_CNY_PER_1M_TOKENS", "1")
 
 
 def _final_event(segment_id: str = "segment-1", text: str = "需要确认发布负责人。"):
@@ -61,6 +71,46 @@ def _revision_event(
     }
 
 
+def test_realtime_correction_provider_failures_keep_a_safe_error_provenance():
+    assert app_module._realtime_correction_provider_error_code(
+        llm_service.LlmProviderTransportError("timeout")
+    ) == "provider_timeout"
+    assert app_module._realtime_correction_provider_error_code(
+        llm_service.LlmProviderTransportError("transport")
+    ) == "provider_transport"
+    assert app_module._realtime_correction_provider_error_code(
+        llm_service.LlmProviderHttpError(502)
+    ) == "provider_502"
+
+
+@pytest.mark.parametrize(
+    ("detail", "expected"),
+    [
+        (
+            "ASR live session meeting-1 is not eligible for realtime correction; blockers: degraded_asr_session",
+            app_module.DEGRADED_ASR_SESSION,
+        ),
+        (
+            "ASR live session meeting-1 is not eligible for realtime correction; blockers: asr_semantic_quality_blocked, degraded_asr_session",
+            app_module.CORRECTION_BLOCKED_BY_ASR_QUALITY,
+        ),
+    ],
+)
+def test_realtime_correction_asr_blocker_409_maps_to_terminal_code(detail, expected):
+    error = HTTPException(status_code=409, detail=detail)
+
+    assert app_module._realtime_correction_blocker_error_code(error) == expected
+
+
+def test_realtime_correction_non_blocker_409_is_not_classified_as_asr_quality():
+    error = HTTPException(
+        status_code=409,
+        detail="Realtime correction reservation no longer matches persisted final segments",
+    )
+
+    assert app_module._realtime_correction_blocker_error_code(error) is None
+
+
 def test_final_commit_creates_normalized_snapshot_and_two_durable_jobs(tmp_path):
     app = create_app(data_dir=tmp_path)
 
@@ -75,6 +125,570 @@ def test_final_commit_creates_normalized_snapshot_and_two_durable_jobs(tmp_path)
         "correction",
         "suggestion",
     ]
+    app.state.v2_persistence.close()
+
+
+def test_realtime_coach_request_endpoint_is_idempotent_and_uses_user_request_trigger(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_GATEWAY_MODEL", "gpt-5.5")
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    app.state.commit_v2_final("coach-request", _final_event(text="发布前还需要确认负责人和回滚时间。"))
+
+    client = TestClient(app)
+    first = client.post(
+        "/v2/meetings/coach-request/coach/request",
+        headers={"Idempotency-Key": "request-1"},
+        json={"request": "请检查发布前还缺哪些条件"},
+    )
+    replay = client.post(
+        "/v2/meetings/coach-request/coach/request",
+        headers={"Idempotency-Key": "request-1"},
+        json={"request": "内容不同也应该复用原请求"},
+    )
+
+    assert first.status_code == 202
+    assert replay.status_code == 202
+    assert first.json()["trigger_type"] == "user_request"
+    assert replay.json()["job"]["id"] == first.json()["job"]["id"]
+    assert replay.json()["job"]["user_request"] == "请检查发布前还缺哪些条件"
+    app.state.v2_persistence.close()
+
+
+def test_realtime_coach_request_requires_current_transcript_and_live_meeting(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_GATEWAY_MODEL", "gpt-5.5")
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    client = TestClient(app)
+    empty = client.post(
+        "/v2/meetings/no-text/coach/request",
+        headers={"Idempotency-Key": "request-empty"},
+        json={"request": "请帮我判断"},
+    )
+    assert empty.status_code == 404
+
+    created = client.post("/v2/meetings", json={"meeting_id": "empty-live"})
+    assert created.status_code == 201
+    no_transcript = client.post(
+        "/v2/meetings/empty-live/coach/request",
+        headers={"Idempotency-Key": "request-no-transcript"},
+        json={"request": "请帮我判断"},
+    )
+    assert no_transcript.status_code == 409
+
+    app.state.commit_v2_final("no-text", _final_event())
+    app.state.v2_persistence.end_meeting(
+        meeting_id="no-text", now_ms=2_000
+    )
+    ended = client.post(
+        "/v2/meetings/no-text/coach/request",
+        headers={"Idempotency-Key": "request-ended"},
+        json={"request": "请帮我判断"},
+    )
+    assert ended.status_code == 409
+    app.state.v2_persistence.close()
+
+
+def test_provider_lane_clients_are_independent_and_have_bounded_pools(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEETING_COPILOT_PROVIDER_REALTIME_MAX_CONNECTIONS", "2")
+    monkeypatch.setenv("MEETING_COPILOT_PROVIDER_CORRECTION_MAX_CONNECTIONS", "1")
+    app = create_app(data_dir=tmp_path)
+
+    with TestClient(app):
+        general = app.state.streaming_llm_client
+        realtime = app.state.realtime_llm_client
+        correction = app.state.correction_llm_client
+
+        assert general is not None
+        assert realtime is not None
+        assert correction is not None
+        assert len({id(general), id(realtime), id(correction)}) == 3
+        assert general._transport._pool._max_connections == 8
+        assert realtime._transport._pool._max_connections == 2
+        assert correction._transport._pool._max_connections == 1
+        assert app.state.provider_lane_registry.realtime_max_active == 1
+        assert app.state.provider_lane_registry.correction_max_active == 1
+
+
+def test_pending_realtime_work_defers_correction_before_provider_call(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_GATEWAY_MODEL", "gpt-5.5")
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    meeting_id = "provider-priority-defer"
+    committed = app.state.commit_v2_final(meeting_id, _final_event())
+    app.state.asr_live_repository.create(
+        {
+            "session_id": meeting_id,
+            "source": "live_asr_stream",
+            "trace_kind": "live_event",
+            "provider": "funasr_realtime",
+            "provider_mode": "real",
+            "is_mock": False,
+            "input_source": "browser_live_mic",
+            "ingest_mode": "live_asr_stream",
+            "asr_fallback_used": False,
+            "degradation_reasons": [],
+            "events": [
+                {
+                    "event_type": "transcript_final",
+                    "payload": {
+                        "segment_id": "segment-1",
+                        "text": "需要确认发布负责人。",
+                        "normalized_text": "需要确认发布负责人。",
+                    },
+                }
+            ],
+        }
+    )
+    provider_calls: list[dict[str, object]] = []
+
+    def correction_provider_call(raw, config, *, raise_on_failure=False):
+        provider_calls.append(
+            {
+                "raw": raw,
+                "model": config.model,
+                "active_correction": app.state.provider_lane_registry.active_correction_count,
+                "pending_realtime": app.state.provider_lane_registry.pending_realtime_count,
+                "raise_on_failure": raise_on_failure,
+            }
+        )
+        return raw, {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}, False
+
+    monkeypatch.setattr(
+        app_module.asr_correct,
+        "correct_transcript",
+        correction_provider_call,
+    )
+    correction_job = dict(app.state.v2_persistence.get_job(committed["job_ids"]["correction"]))
+
+    with pytest.raises(app_module.CorrectionProviderPriorityDeferred) as deferred:
+        app.state.v2_correction_job_handler_impl(correction_job)
+
+    assert deferred.value.preserve_attempt is True
+    assert deferred.value.retry_after_ms == app_module.REALTIME_CORRECTION_PRIORITY_RETRY_MS
+    assert deferred.value.blocking_job_ids == (committed["job_ids"]["intelligence"],)
+    assert provider_calls == []
+    assert app.state.provider_lane_registry.active_correction_count == 0
+    app.state.v2_persistence.close()
+
+
+def test_meeting_end_correction_bypasses_realtime_priority_gate(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_GATEWAY_MODEL", "gpt-5.5")
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    meeting_id = "provider-priority-end-bypass"
+    committed = app.state.commit_v2_final(meeting_id, _final_event())
+    app.state.asr_live_repository.create(
+        {
+            "session_id": meeting_id,
+            "source": "live_asr_stream",
+            "trace_kind": "live_event",
+            "provider": "funasr_realtime",
+            "provider_mode": "real",
+            "is_mock": False,
+            "input_source": "browser_live_mic",
+            "ingest_mode": "live_asr_stream",
+            "asr_fallback_used": False,
+            "degradation_reasons": [],
+            "events": [
+                {
+                    "event_type": "transcript_final",
+                    "payload": {
+                        "segment_id": "segment-1",
+                        "text": "需要确认发布负责人。",
+                        "normalized_text": "需要确认发布负责人。",
+                    },
+                }
+            ],
+        }
+    )
+    provider_calls: list[str] = []
+
+    def correction_provider_call(raw, config, *, raise_on_failure=False):
+        provider_calls.append(config.model)
+        return raw, {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}, False
+
+    monkeypatch.setattr(
+        app_module.asr_correct,
+        "correct_transcript",
+        correction_provider_call,
+    )
+    app.state.v2_persistence.end_meeting(
+        meeting_id=meeting_id,
+        now_ms=int(time.time() * 1_000),
+    )
+    correction_job = dict(app.state.v2_persistence.get_job(committed["job_ids"]["correction"]))
+
+    result = app.state.v2_correction_job_handler_impl(correction_job)
+
+    assert result["called"] is True
+    assert provider_calls == ["gpt-5.5"]
+    app.state.v2_persistence.close()
+
+
+def test_running_realtime_work_defers_correction_before_provider_call(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_GATEWAY_MODEL", "gpt-5.5")
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    meeting_id = "provider-priority-running"
+    committed = app.state.commit_v2_final(meeting_id, _final_event())
+    intelligence_id = committed["job_ids"]["intelligence"]
+    queued_intelligence = app.state.v2_persistence.get_job(intelligence_id)
+    running_intelligence = app.state.v2_persistence.claim_next_job(
+        worker_id="priority-running-intelligence",
+        lane="intelligence",
+        now_ms=int(queued_intelligence["next_attempt_at_ms"]),
+        lease_ms=30_000,
+    )
+    assert running_intelligence is not None
+    correction_job = dict(app.state.v2_persistence.get_job(committed["job_ids"]["correction"]))
+
+    with pytest.raises(app_module.CorrectionProviderPriorityDeferred) as deferred:
+        app.state.v2_correction_job_handler_impl(correction_job)
+
+    assert deferred.value.blocking_job_ids == (intelligence_id,)
+    assert deferred.value.preserve_attempt is True
+    app.state.v2_persistence.close()
+
+
+def test_expired_pending_realtime_work_does_not_defer_correction(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_GATEWAY_MODEL", "gpt-5.5")
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    meeting_id = "provider-priority-expired"
+    committed = app.state.commit_v2_final(meeting_id, _final_event())
+    now_ms = int(time.time() * 1_000)
+    with app.state.v2_persistence._write_transaction():
+        app.state.v2_persistence._conn.execute(
+            "UPDATE jobs SET deadline_at_ms = ?, status = 'pending' WHERE id = ?",
+            (now_ms - 1, committed["job_ids"]["intelligence"]),
+        )
+    app.state.asr_live_repository.create(
+        {
+            "session_id": meeting_id,
+            "source": "live_asr_stream",
+            "trace_kind": "live_event",
+            "provider": "funasr_realtime",
+            "provider_mode": "real",
+            "is_mock": False,
+            "input_source": "browser_live_mic",
+            "ingest_mode": "live_asr_stream",
+            "asr_fallback_used": False,
+            "degradation_reasons": [],
+            "events": [],
+        }
+    )
+    monkeypatch.setattr(
+        app.state,
+        "run_asr_live_session_realtime_corrections_once",
+        lambda *_args, **_kwargs: {
+            "session_id": meeting_id,
+            "called": False,
+            "gate": {"eligible": False, "reason": "no_unrevised_final"},
+            "status": {},
+            "revision_count": 0,
+            "transcript_revisions": [],
+            "no_revision_segment_ids": [],
+        },
+    )
+
+    result = app.state.v2_correction_job_handler_impl(
+        dict(app.state.v2_persistence.get_job(committed["job_ids"]["correction"]))
+    )
+
+    assert result["called"] is False
+    assert result["gate"]["reason"] == "no_unrevised_final"
+    app.state.v2_persistence.close()
+
+
+def test_realtime_correction_caps_async_provider_timeout_without_releasing_lane_early(
+    tmp_path,
+    monkeypatch,
+):
+    """The short cap bounds correction while its own lane lease is real."""
+
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_GATEWAY_MODEL", "gpt-5.5")
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    meeting_id = "provider-priority-timeout-cap"
+    committed = app.state.commit_v2_final(meeting_id, _final_event())
+    app.state.asr_live_repository.create(
+        {
+            "session_id": meeting_id,
+            "source": "live_asr_stream",
+            "trace_kind": "live_event",
+            "provider": "funasr_realtime",
+            "provider_mode": "real",
+            "is_mock": False,
+            "input_source": "browser_live_mic",
+            "ingest_mode": "live_asr_stream",
+            "asr_fallback_used": False,
+            "degradation_reasons": [],
+            "events": [
+                {
+                    "event_type": "transcript_final",
+                    "payload": {
+                        "segment_id": "segment-1",
+                        "text": "需要确认发布负责人。",
+                        "normalized_text": "需要确认发布负责人。",
+                    },
+                }
+            ],
+        }
+    )
+    persistence = app.state.v2_persistence
+    intelligence_job = persistence.claim_next_job(
+        worker_id="timeout-cap-intelligence",
+        lane="intelligence",
+        now_ms=max(
+            int(time.time() * 1_000),
+            int(persistence.get_job(committed["job_ids"]["intelligence"])["next_attempt_at_ms"]),
+        ),
+        lease_ms=30_000,
+    )
+    assert intelligence_job is not None
+    persistence.cancel_job(
+        job_id=intelligence_job["id"],
+        worker_id="timeout-cap-intelligence",
+        now_ms=int(time.time() * 1_000),
+        error_class="deadline_exceeded",
+    )
+    app.state.sync_realtime_provider_reservations()
+
+    captured: dict[str, object] = {}
+
+    def fake_correct(indexed_batch, config, *, raise_on_failure=False):
+        captured.update(
+            {
+                "indexed_batch": indexed_batch,
+                "timeout_seconds": config.timeout_seconds,
+                "max_retries": config.max_retries,
+                "raise_on_failure": raise_on_failure,
+            }
+        )
+        return indexed_batch, {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}, False
+
+    monkeypatch.setattr(app_module.asr_correct, "correct_transcript", fake_correct)
+    correction_job = dict(persistence.get_job(committed["job_ids"]["correction"]))
+    # Force the post-meeting correction path past the normal 15s batch debounce
+    # so this test exercises the Provider timeout contract itself.
+    correction_job["idempotency_key"] = "meeting.ended"
+    result = app.state.v2_correction_job_handler_impl(correction_job)
+
+    assert result["called"] is True
+    assert captured["timeout_seconds"] == app_module.REALTIME_CORRECTION_PROVIDER_TIMEOUT_SECONDS
+    assert captured["max_retries"] == 0
+    assert captured["raise_on_failure"] is True
+    # The lease is released only after the async provider call and all
+    # projection bookkeeping have returned.
+    assert app.state.provider_lane_registry.active_correction_count == 0
+    persistence.close()
+
+
+def test_correction_lane_releases_after_work_completes(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_GATEWAY_MODEL", "gpt-5.5")
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    meeting_id = "provider-priority-recovery"
+    committed = app.state.commit_v2_final(meeting_id, _final_event())
+    app.state.asr_live_repository.create(
+        {
+            "session_id": meeting_id,
+            "source": "live_asr_stream",
+            "trace_kind": "live_event",
+            "provider": "funasr_realtime",
+            "provider_mode": "real",
+            "is_mock": False,
+            "input_source": "browser_live_mic",
+            "ingest_mode": "live_asr_stream",
+            "asr_fallback_used": False,
+            "degradation_reasons": [],
+            "events": [],
+        }
+    )
+    intelligence_job = app.state.v2_persistence.claim_next_job(
+        worker_id="priority-recovery-intelligence",
+        lane="intelligence",
+        now_ms=max(
+            int(time.time() * 1_000),
+            int(
+                app.state.v2_persistence.get_job(
+                    committed["job_ids"]["intelligence"]
+                )["next_attempt_at_ms"]
+            ),
+        ),
+        lease_ms=30_000,
+    )
+    assert intelligence_job is not None
+    app.state.v2_persistence.cancel_job(
+        job_id=intelligence_job["id"],
+        worker_id="priority-recovery-intelligence",
+        now_ms=int(time.time() * 1_000),
+        error_class="deadline_exceeded",
+    )
+    app.state.sync_realtime_provider_reservations()
+    assert app.state.provider_lane_registry.pending_realtime_count == 0
+
+    calls: list[tuple[str, bool]] = []
+
+    def recovered_provider_path(session_id, request):
+        calls.append((session_id, request.force))
+        return {
+            "session_id": session_id,
+            "called": False,
+            "gate": {"eligible": False, "reason": "no_unrevised_final"},
+            "status": {},
+            "revision_count": 0,
+            "transcript_revisions": [],
+            "no_revision_segment_ids": [],
+        }
+
+    app.state.run_asr_live_session_realtime_corrections_once = recovered_provider_path
+    correction_job = app.state.v2_persistence.get_job(committed["job_ids"]["correction"])
+    result = app.state.v2_correction_job_handler_impl(correction_job)
+
+    assert calls == [(meeting_id, False)]
+    assert result["called"] is False
+    assert result["gate"]["reason"] == "no_unrevised_final"
+    assert app.state.provider_lane_registry.active_correction_count == 0
+    app.state.v2_persistence.close()
+
+
+def test_end_meeting_releases_pending_pi_reservation_and_wakes_correction(
+    tmp_path,
+):
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    meeting_id = "end-meeting-pi-priority"
+    committed = app.state.commit_v2_final(
+        meeting_id,
+        _final_event(
+            text="我们需要确认发布负责人。上线前完成回滚演练。",
+        ),
+    )
+    intelligence_id = committed["job_ids"]["intelligence"]
+    assert app.state.provider_lane_registry.pending_realtime_count == 1
+
+    class WakeRecorder:
+        def __init__(self):
+            self.lanes: list[str | None] = []
+
+        def wake(self, lane: str | None = None):
+            self.lanes.append(lane)
+
+    recorder = WakeRecorder()
+    app.state.v2_executor = recorder
+    end_route = next(
+        route
+        for route in app.routes
+        if getattr(route, "path", None) == "/v2/meetings/{meeting_id}/end"
+    )
+    response = end_route.endpoint(
+        meeting_id,
+        {"action": "end_and_review"},
+    )
+
+    cancelled = app.state.v2_persistence.get_job(intelligence_id)
+    assert response["meeting"]["state"] == "ended"
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["error_class"] == "meeting_ended"
+    assert app.state.provider_lane_registry.pending_realtime_count == 0
+    assert None in recorder.lanes
+    assert "correction" in recorder.lanes
+    assert app.state.v2_persistence.get_job(committed["job_ids"]["correction"])["status"] == "pending"
+    app.state.v2_persistence.close()
+
+
+def test_realtime_lane_sync_retains_running_intelligence_past_deadline(
+    tmp_path,
+):
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    committed = app.state.commit_v2_final(
+        "running-past-deadline",
+        _final_event(
+            text="我们需要确认发布负责人。上线前完成回滚演练。",
+        ),
+    )
+    persistence = app.state.v2_persistence
+    intelligence_id = committed["job_ids"]["intelligence"]
+    queued = persistence.get_job(intelligence_id)
+    running = persistence.claim_next_job(
+        worker_id="running-past-deadline-worker",
+        lane="intelligence",
+        now_ms=int(queued["next_attempt_at_ms"]),
+        lease_ms=30_000,
+    )
+    assert running is not None
+
+    # Force the durable deadline into the past while retaining a valid lease.
+    with persistence._write_transaction():
+        persistence._conn.execute(
+            "UPDATE jobs SET deadline_at_ms = ? WHERE id = ?",
+            (int(time.time() * 1_000) - 1, intelligence_id),
+        )
+
+    open_ids = app.state.sync_realtime_provider_reservations()
+
+    assert intelligence_id in open_ids
+    assert app.state.provider_lane_registry.pending_realtime_count == 1
+    persistence.close()
+
+
+def test_realtime_lane_capacity_wait_does_not_extend_intelligence_deadline(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "0")
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    occupied = app.state.provider_lane_registry.try_acquire_realtime("occupied-realtime-lane")
+    assert occupied is not None
+    committed = app.state.commit_v2_final(
+        "provider-priority-deadline",
+        _final_event(),
+    )
+    intelligence_id = committed["job_ids"]["intelligence"]
+    job = app.state.v2_persistence.get_job(intelligence_id)
+    original_deadline = int(job["deadline_at_ms"])
+    job["deadline_at_ms"] = int(time.time() * 1_000) + 20
+    test_deadline = int(job["deadline_at_ms"])
+
+    # The persisted deadline is authoritative; mutate only this test copy so
+    # the wrapper must use the durable value and never extend it.
+    with pytest.raises(app_module.IntelligenceDeadlineExceeded):
+        asyncio.run(app.state.v2_intelligence_job_handler_impl(job))
+
+    occupied.release()
+    app.state.provider_lane_registry.release_realtime_reservation("occupied-realtime-lane")
+    assert job["deadline_at_ms"] == test_deadline
+    assert app.state.v2_persistence.get_job(intelligence_id)["deadline_at_ms"] == original_deadline
+    assert original_deadline > 0
     app.state.v2_persistence.close()
 
 
@@ -471,6 +1085,13 @@ def test_batched_no_change_correction_settles_every_covered_segment(
         },
     )
 
+    # Batch reconciliation is a post-meeting operation here. Ending the
+    # meeting cancels the pending Pi window and exercises the real bypass
+    # rather than mutating the job's idempotency key in the test.
+    app.state.v2_persistence.end_meeting(
+        meeting_id="meeting-1",
+        now_ms=int(time.time() * 1_000),
+    )
     job = app.state.v2_persistence.get_job(second["job_ids"]["correction"])
     output = app.state.v2_correction_job_handler_impl(job)
 
@@ -508,7 +1129,7 @@ def test_semantic_quality_blocked_suggestion_waits_for_same_segment_correction(
                 "provider": "funasr_realtime",
                 "provider_mode": "real",
                 "is_mock": False,
-                "input_source": "browser_live_mic",
+                "input_source": "microphone",
                 "degradation_reasons": ["asr_semantic_quality_blocked"],
                 "asr_semantic_quality": {
                     "status": "blocked",
@@ -646,6 +1267,56 @@ def test_v2_snapshot_and_event_endpoints_use_normalized_tables(tmp_path):
     assert "id: 1\n" in stream.text
     assert "event: transcript.segment.finalized\n" in stream.text
     assert '"segment_id":"segment-1"' in stream.text
+
+
+def test_v2_acceptance_evidence_endpoint_returns_one_hash_verified_database_view(tmp_path):
+    app = create_app(data_dir=tmp_path)
+    app.state.commit_v2_final("meeting-1", _final_event())
+    app.state.asr_live_repository.create(
+        {
+            "session_id": "meeting-1",
+            "source": "live_asr_stream",
+            "provider": "funasr_realtime",
+            "provider_mode": "real",
+            "is_mock": False,
+            "input_source": "browser_live_mic",
+            "events": [{"event_type": "transcript_final", "text": "需要确认发布负责人。"}],
+        }
+    )
+    app.state.settings_usage_repository.record_usage(
+        session_id="meeting-1",
+        purpose="coach",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        prompt_tokens=10,
+        completion_tokens=5,
+        total_tokens=15,
+        timestamp_ms=1_100,
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/v2/meetings/meeting-1/acceptance-evidence")
+        missing = client.get("/v2/meetings/missing/acceptance-evidence")
+        invalid = client.get(
+            "/v2/meetings/meeting-1/acceptance-evidence",
+            params={"max_segments": 0},
+        )
+
+    assert response.status_code == 200
+    capture = response.json()
+    assert capture["schema_version"] == "meeting_copilot.acceptance_evidence.v1"
+    assert capture["consistency"] == {"acceptance_eligible": True, "errors": []}
+    assert capture["lineage"]["event_high_water_mark"] == capture["snapshot"]["last_seq"]
+    assert capture["live_session"]["session_id"] == "meeting-1"
+    assert capture["usage_ledger"][0]["total_tokens"] == 15
+    unhashed = dict(capture)
+    unhashed.pop("capture_sha256")
+    unhashed.pop("captured_at_ms")
+    assert capture["capture_sha256"] == hashlib.sha256(
+        json.dumps(unhashed, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    assert missing.status_code == 404
+    assert invalid.status_code == 422
 
 
 def test_v2_entity_confirmation_endpoint_persists_candidate_status(tmp_path):
@@ -1155,6 +1826,444 @@ def test_app_lifecycle_runs_durable_jobs_without_browser_trigger(tmp_path):
             assert "final_committed" in trace["stages"]
             assert "job_queued" in trace["stages"]
             assert "job_claimed" in trace["stages"]
+            assert trace["execution"]["provenance"]["speech_endpoint"]["status"] == "observed"
+            assert "source_track" in trace["execution"]["provenance"]["speech_endpoint"]["attributes"]
+            assert trace["execution"]["required_stage_completeness"]["missing_stages"] == []
+
+
+def test_correction_budget_rates_missing_is_terminal_and_not_retryable(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_GATEWAY_MODEL", "gpt-test")
+    monkeypatch.delenv("LLM_GATEWAY_IS_MOCK", raising=False)
+    monkeypatch.delenv("LLM_PROMPT_CNY_PER_1M_TOKENS", raising=False)
+    monkeypatch.delenv("LLM_COMPLETION_CNY_PER_1M_TOKENS", raising=False)
+    app = create_app(data_dir=tmp_path)
+    committed = app.state.commit_v2_final("meeting-rates-missing", _final_event())
+    persistence = app.state.v2_persistence
+    provider_calls: list[object] = []
+    app.state.run_asr_live_session_realtime_corrections_once = (
+        lambda *_args, **_kwargs: provider_calls.append(object())
+    )
+    app.state.v2_suggestion_job_handler_impl = lambda _job: {"generated_card_count": 0}
+
+    with TestClient(app):
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            terminal = persistence.get_job(committed["job_ids"]["correction"])
+            if terminal["status"] == "failed":
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError(f"correction job did not become terminal: {terminal}")
+        assert terminal["status"] == "failed"
+        assert terminal["attempts"] == 1
+        assert terminal["error_class"] == "correction_provider_rates_not_configured"
+        assert terminal["max_attempts"] == 3
+        assert committed["job_ids"]["correction"] == terminal["id"]
+        assert provider_calls == []
+        quality = app.state.wait_for_v2_correction_jobs("meeting-rates-missing", timeout_seconds=0.1)
+        assert quality["correction_degraded"] is True
+        assert quality["reason"] == "correction_provider_rates_not_configured"
+
+
+def test_durable_correction_zero_rate_matches_run_once_fail_closed_policy(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_GATEWAY_MODEL", "gpt-test")
+    monkeypatch.delenv("LLM_GATEWAY_IS_MOCK", raising=False)
+    monkeypatch.setenv("LLM_PROMPT_CNY_PER_1M_TOKENS", "0")
+    monkeypatch.setenv("LLM_COMPLETION_CNY_PER_1M_TOKENS", "1")
+    app = create_app(data_dir=tmp_path)
+    committed = app.state.commit_v2_final("meeting-rates-zero", _final_event())
+    provider_calls: list[object] = []
+    app.state.run_asr_live_session_realtime_corrections_once = (
+        lambda *_args, **_kwargs: provider_calls.append(object())
+    )
+    job = app.state.v2_persistence.get_job(committed["job_ids"]["correction"])
+
+    with pytest.raises(app_module.CorrectionProviderTerminalDegraded) as degraded:
+        app.state.v2_correction_job_handler_impl(job)
+
+    assert degraded.value.durable_error_class == "correction_provider_rates_not_configured"
+    assert provider_calls == []
+    app.state.v2_persistence.close()
+
+
+def test_durable_correction_asr_blocker_409_is_terminal_on_first_attempt(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_GATEWAY_MODEL", "gpt-test")
+    monkeypatch.delenv("LLM_GATEWAY_IS_MOCK", raising=False)
+    app = create_app(data_dir=tmp_path)
+    meeting_id = "meeting-asr-blocker-terminal"
+    committed = app.state.commit_v2_final(meeting_id, _final_event())
+    provider_calls: list[object] = []
+
+    def blocked_run_once(*_args, **_kwargs):
+        provider_calls.append(object())
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"ASR live session {meeting_id} is not eligible for realtime correction; "
+                "blockers: degraded_asr_session"
+            ),
+        )
+
+    app.state.run_asr_live_session_realtime_corrections_once = blocked_run_once
+    job = dict(app.state.v2_persistence.get_job(committed["job_ids"]["correction"]))
+    # A meeting-ended correction bypasses the live Pi priority deferral so the
+    # test reaches the ASR eligibility branch deterministically.
+    job["idempotency_key"] = "meeting.ended"
+
+    with pytest.raises(app_module.CorrectionProviderTerminalDegraded) as blocked:
+        app.state.v2_correction_job_handler_impl(job)
+
+    assert blocked.value.durable_error_class == app_module.DEGRADED_ASR_SESSION
+    assert len(provider_calls) == 1
+    app.state.v2_persistence.close()
+
+
+def test_durable_executor_persists_asr_blocker_without_retry_or_job_failed(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_GATEWAY_MODEL", "gpt-test")
+    monkeypatch.delenv("LLM_GATEWAY_IS_MOCK", raising=False)
+    app = create_app(data_dir=tmp_path)
+    meeting_id = "meeting-asr-blocker-durable"
+    committed = app.state.commit_v2_final(meeting_id, _final_event())
+
+    def blocked_run_once(*_args, **_kwargs):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"ASR live session {meeting_id} is not eligible for realtime correction; "
+                "blockers: asr_semantic_quality_blocked, degraded_asr_session"
+            ),
+        )
+
+    app.state.run_asr_live_session_realtime_corrections_once = blocked_run_once
+    app.state.run_asr_live_session_realtime_corrections_once_async = blocked_run_once
+    persistence = app.state.v2_persistence
+    persistence.end_meeting(meeting_id=meeting_id, now_ms=int(time.time() * 1_000))
+
+    with TestClient(app):
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            job = persistence.get_job(committed["job_ids"]["correction"])
+            if job["status"] == "failed":
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError(f"correction job did not become terminal: {job}")
+
+        assert job["status"] == "failed"
+        assert job["attempts"] == 1
+        assert job["error_class"] == app_module.CORRECTION_BLOCKED_BY_ASR_QUALITY
+        time.sleep(0.05)
+        assert persistence.get_job(job["id"])["attempts"] == 1
+
+    app.state.v2_persistence.close()
+
+
+def test_disabled_correction_is_a_successful_noop_without_provider_or_rates(
+    tmp_path,
+    monkeypatch,
+):
+    """A disabled L2 lane must not be blocked by Provider billing/config gates."""
+
+    for name in (
+        "LLM_GATEWAY_BASE_URL",
+        "LLM_GATEWAY_API_KEY",
+        "LLM_GATEWAY_MODEL",
+        "LLM_GATEWAY_IS_MOCK",
+        "LLM_PROMPT_CNY_PER_1M_TOKENS",
+        "LLM_COMPLETION_CNY_PER_1M_TOKENS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    app = create_app(data_dir=tmp_path)
+    settings = app.state.settings_usage_repository.get_settings()
+    settings["asr"]["l2_correction_enabled"] = False
+    app.state.settings_usage_repository.replace_settings(settings)
+    committed = app.state.commit_v2_final("meeting-correction-disabled", _final_event())
+    job = app.state.v2_persistence.get_job(committed["job_ids"]["correction"])
+
+    result = app.state.v2_correction_job_handler_impl(job)
+
+    assert result["called"] is False
+    assert result["gate"]["reason"] == "disabled_by_setting"
+    app.state.v2_persistence.close()
+
+
+def test_async_durable_correction_uses_abort_capable_provider_path_and_releases_lease(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_GATEWAY_MODEL", "gpt-test")
+    monkeypatch.setenv("LLM_PROMPT_CNY_PER_1M_TOKENS", "1")
+    monkeypatch.setenv("LLM_COMPLETION_CNY_PER_1M_TOKENS", "1")
+    app = create_app(data_dir=tmp_path)
+    meeting_id = "meeting-async-correction"
+    text = (
+        "接口先灰度百分之五，如果错误率超过百分之零点一就回滚，"
+        "负责人今天补齐监控看板和告警阈值，并确认发布窗口与回滚脚本。"
+    )
+    committed = app.state.commit_v2_final(meeting_id, _final_event(text=text))
+    app.state.asr_live_repository.create(
+        {
+            "session_id": meeting_id,
+            "source": "live_asr_stream",
+            "trace_kind": "live_event",
+            "provider": "funasr_realtime",
+            "provider_mode": "real",
+            "is_mock": False,
+            "input_source": "browser_live_mic",
+            "ingest_mode": "live_asr_stream",
+            "asr_fallback_used": False,
+            "degradation_reasons": [],
+            "events": [
+                {
+                    "event_type": "transcript_final",
+                    "payload": {
+                        "segment_id": "segment-1",
+                        "text": text,
+                        "normalized_text": text,
+                    },
+                }
+            ],
+        }
+    )
+    seen: dict[str, object] = {}
+
+    async def fake_async_correct(raw, config, *, client, abort, raise_on_failure):
+        seen.update(
+            {
+                "raw": raw,
+                "model": config.model,
+                "client_type": type(client).__name__,
+                "abort_type": type(abort).__name__,
+                "raise_on_failure": raise_on_failure,
+            }
+        )
+        return raw, {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}, False
+
+    monkeypatch.setattr(app_module.asr_correct, "async_correct_transcript", fake_async_correct)
+    job = dict(app.state.v2_persistence.get_job(committed["job_ids"]["correction"]))
+    job["idempotency_key"] = "meeting.ended"
+
+    result = asyncio.run(app.state.v2_correction_job_handler_async_impl(job))
+
+    assert result["called"] is True
+    assert result["no_revision_segment_count"] == 1
+    assert seen["client_type"] == "AsyncHttpxLlmClient"
+    assert seen["abort_type"] == "ProviderAbortHandle"
+    assert seen["raise_on_failure"] is True
+    assert app.state.provider_priority_arbiter.active_background_count == 0
+    app.state.v2_persistence.close()
+
+
+def test_cancelled_async_correction_waits_for_transport_unwind_before_releasing_provider_lease(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_GATEWAY_MODEL", "gpt-test")
+    monkeypatch.setenv("LLM_PROMPT_CNY_PER_1M_TOKENS", "1")
+    monkeypatch.setenv("LLM_COMPLETION_CNY_PER_1M_TOKENS", "1")
+    async def run():
+        app = create_app(data_dir=tmp_path)
+        meeting_id = "meeting-async-correction-cancel"
+        text = (
+            "接口先灰度百分之五，如果错误率超过百分之零点一就回滚，"
+            "负责人今天补齐监控看板和告警阈值，并确认发布窗口与回滚脚本。"
+        )
+        committed = app.state.commit_v2_final(meeting_id, _final_event(text=text))
+        app.state.asr_live_repository.create(
+            {
+                "session_id": meeting_id,
+                "source": "live_asr_stream",
+                "trace_kind": "live_event",
+                "provider": "funasr_realtime",
+                "provider_mode": "real",
+                "is_mock": False,
+                "input_source": "browser_live_mic",
+                "ingest_mode": "live_asr_stream",
+                "asr_fallback_used": False,
+                "degradation_reasons": [],
+                "events": [
+                    {
+                        "event_type": "transcript_final",
+                        "payload": {
+                            "segment_id": "segment-1",
+                            "text": text,
+                            "normalized_text": text,
+                        },
+                    }
+                ],
+            }
+        )
+
+        class HangingAsyncTransport:
+            def __init__(self):
+                self.started = asyncio.Event()
+                self.unwound = asyncio.Event()
+                self.is_closed = False
+
+            async def post(self, *_args, **_kwargs):
+                self.started.set()
+                try:
+                    await asyncio.Future()
+                finally:
+                    self.unwound.set()
+
+            async def aclose(self):
+                self.is_closed = True
+
+        transport = HangingAsyncTransport()
+        app.state.streaming_llm_client = transport
+        job = dict(app.state.v2_persistence.get_job(committed["job_ids"]["correction"]))
+        job["idempotency_key"] = "meeting.ended"
+        task = asyncio.create_task(app.state.v2_correction_job_handler_async_impl(job))
+        async with asyncio.timeout(2.0):
+            await transport.started.wait()
+        # The hanging request owns the shared background lease until its
+        # transport context unwinds. Cancellation must not release it early.
+        assert app.state.provider_priority_arbiter.active_background_count == 1
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert transport.unwound.is_set()
+        assert app.state.provider_priority_arbiter.active_background_count == 0
+        app.state.v2_persistence.close()
+
+    asyncio.run(run())
+
+
+def test_correction_budget_rates_configured_reaches_provider_path(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_GATEWAY_MODEL", "gpt-test")
+    monkeypatch.delenv("LLM_GATEWAY_IS_MOCK", raising=False)
+    monkeypatch.setenv("LLM_PROMPT_CNY_PER_1M_TOKENS", "1")
+    monkeypatch.setenv("LLM_COMPLETION_CNY_PER_1M_TOKENS", "1")
+    app = create_app(data_dir=tmp_path)
+    meeting_id = "meeting-rates-configured"
+    committed = app.state.commit_v2_final(meeting_id, _final_event())
+    app.state.asr_live_repository.create(
+        {
+            "session_id": meeting_id,
+            "source": "live_asr_stream",
+            "trace_kind": "live_event",
+            "provider": "funasr_realtime",
+            "provider_mode": "real",
+            "is_mock": False,
+            "input_source": "browser_live_mic",
+            "ingest_mode": "live_asr_stream",
+            "asr_fallback_used": False,
+            "degradation_reasons": [],
+            "events": [],
+        }
+    )
+    calls: list[tuple[str, bool]] = []
+
+    def provider_path(session_id, request):
+        calls.append((session_id, request.force))
+        return {
+            "session_id": session_id,
+            "called": False,
+            "gate": {"eligible": False, "reason": "no_unrevised_final"},
+            "status": {},
+            "revision_count": 0,
+            "transcript_revisions": [],
+            "no_revision_segment_ids": [],
+        }
+
+    app.state.run_asr_live_session_realtime_corrections_once = provider_path
+    job = app.state.v2_persistence.get_job(committed["job_ids"]["correction"])
+
+    result = app.state.v2_correction_job_handler_impl(job)
+
+    assert calls == [(meeting_id, False)]
+    assert result["called"] is False
+    assert result["gate"]["reason"] == "no_unrevised_final"
+    app.state.v2_persistence.close()
+
+
+def test_correction_explicit_unmetered_reaches_durable_provider_path_without_rates(
+    tmp_path,
+    monkeypatch,
+):
+    """An explicit free test/local policy must not trip the paid-rate guard."""
+
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_GATEWAY_MODEL", "gpt-test")
+    monkeypatch.delenv("LLM_GATEWAY_IS_MOCK", raising=False)
+    monkeypatch.setenv("LLM_CORRECTION_PRICING_MODE", "unmetered")
+    monkeypatch.delenv("LLM_PROMPT_CNY_PER_1M_TOKENS", raising=False)
+    monkeypatch.delenv("LLM_COMPLETION_CNY_PER_1M_TOKENS", raising=False)
+    app = create_app(data_dir=tmp_path)
+    meeting_id = "meeting-unmetered-correction"
+    committed = app.state.commit_v2_final(meeting_id, _final_event())
+    app.state.asr_live_repository.create(
+        {
+            "session_id": meeting_id,
+            "source": "live_asr_stream",
+            "trace_kind": "live_event",
+            "provider": "funasr_realtime",
+            "provider_mode": "real",
+            "is_mock": False,
+            "input_source": "browser_live_mic",
+            "ingest_mode": "live_asr_stream",
+            "asr_fallback_used": False,
+            "degradation_reasons": [],
+            "events": [],
+        }
+    )
+    calls: list[tuple[str, bool]] = []
+
+    def provider_path(session_id, request):
+        calls.append((session_id, request.force))
+        return {
+            "session_id": session_id,
+            "called": False,
+            "gate": {"eligible": False, "reason": "no_unrevised_final"},
+            "status": {},
+            "revision_count": 0,
+            "transcript_revisions": [],
+            "no_revision_segment_ids": [],
+        }
+
+    app.state.run_asr_live_session_realtime_corrections_once = provider_path
+    job = app.state.v2_persistence.get_job(committed["job_ids"]["correction"])
+
+    result = app.state.v2_correction_job_handler_impl(job)
+
+    assert calls == [(meeting_id, False)]
+    assert result["called"] is False
+    assert result["gate"]["reason"] == "no_unrevised_final"
+    app.state.v2_persistence.close()
 
 
 def test_post_meeting_jobs_degrade_without_blocking_when_correction_is_terminally_failed(tmp_path):

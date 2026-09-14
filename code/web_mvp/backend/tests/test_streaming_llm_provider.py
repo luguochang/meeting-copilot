@@ -36,6 +36,7 @@ def _async_test(function):
 def _provider(
     handler,
     *,
+    base_url: str = "https://gateway.example/openai",
     allow_non_streaming_fallback: bool = True,
     clock=None,
     model: str = "test-model",
@@ -43,7 +44,7 @@ def _provider(
 ) -> OpenAICompatibleStreamingProvider:
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler), trust_env=False)
     return OpenAICompatibleStreamingProvider(
-        base_url="https://gateway.example/openai",
+        base_url=base_url,
         api_key="sk-test-secret",
         model=model,
         client=client,
@@ -114,6 +115,60 @@ async def test_streams_real_sse_deltas_usage_and_timings() -> None:
             "max_completion_tokens": 64,
         }
     ]
+    await provider.aclose()
+
+
+@_async_test
+@pytest.mark.parametrize(
+    ("base_url", "api_style", "expected_url"),
+    [
+        (
+            "https://gateway.example/v1",
+            "chat_completions",
+            "https://gateway.example/v1/chat/completions",
+        ),
+        (
+            "https://gateway.example/v1/",
+            "responses",
+            "https://gateway.example/v1/responses",
+        ),
+        (
+            "https://gateway.example/v1-root/",
+            "chat_completions",
+            "https://gateway.example/v1-root/v1/chat/completions",
+        ),
+    ],
+)
+async def test_versioned_base_url_does_not_duplicate_v1(
+    base_url: str,
+    api_style: str,
+    expected_url: str,
+) -> None:
+    urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        urls.append(str(request.url))
+        if api_style == "responses":
+            content = (
+                'data: {"type":"response.output_text.delta","delta":"OK"}\n\n'
+                'data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}\n\n'
+            )
+        else:
+            content = (
+                'data: {"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]}\n\n'
+                "data: [DONE]\n\n"
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=content,
+        )
+
+    provider = _provider(handler, base_url=base_url, api_style=api_style)
+    result = await provider.complete([{"role": "user", "content": "x"}])
+
+    assert result.content == "OK"
+    assert urls == [expected_url]
     await provider.aclose()
 
 

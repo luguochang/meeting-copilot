@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import sqlite3
 import subprocess
+import time
 import urllib.request
 
 from fastapi.testclient import TestClient
@@ -17,11 +18,37 @@ from meeting_copilot_web_mvp.app import create_app
 from meeting_copilot_web_mvp.asr_live_repository import JsonFileAsrLiveSessionRepository
 from meeting_copilot_web_mvp.degradation_controller import get_degradation_controller
 from meeting_copilot_web_mvp.repository import JsonFileSessionRepository
+from meeting_copilot_web_mvp.realtime_intelligence import (
+    CoachIntervention,
+    RealtimeIntelligenceResponse,
+    build_realtime_coach_provenance_decision,
+)
+from meeting_copilot_web_mvp.realtime_provider_circuit import RealtimeProviderCircuit
 from meeting_copilot_web_mvp.sqlite_repository import SqliteAsrLiveSessionRepository, SqliteSessionRepository
-from meeting_copilot_web_mvp.v2_persistence import V2Persistence
+from meeting_copilot_web_mvp.v2_persistence import (
+    IntelligenceEvidenceSuperseded,
+    V2Persistence,
+)
+from meeting_copilot_web_mvp.v2_pipeline import DurableJobExecutor
+from meeting_copilot_web_mvp.application_schema import APPLICATION_SCHEMA_VERSION
 
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
+
+
+async def _wait_for_v2_job_status(
+    persistence: V2Persistence,
+    job_id: str,
+    status: str,
+    *,
+    timeout_s: float = 3.0,
+) -> dict:
+    async with asyncio.timeout(timeout_s):
+        while True:
+            job = persistence.get_job(job_id)
+            if job["status"] == status:
+                return job
+            await asyncio.sleep(0.005)
 
 
 def test_dedupe_strings_handles_empty_values_and_preserves_order():
@@ -32,6 +59,3010 @@ def test_dedupe_strings_handles_empty_values_and_preserves_order():
         "second",
         "third",
     ]
+
+
+def test_realtime_coach_budget_reserves_projection_time_and_honors_provider_cap():
+    remaining_ms, provider_timeout_ms = app_module._realtime_coach_budget_ms(
+        deadline_at_ms=10_000,
+        now_ms=4_000,
+        configured_timeout_seconds=20,
+    )
+
+    assert remaining_ms == 6_000
+    assert provider_timeout_ms == 5_250
+    assert provider_timeout_ms <= remaining_ms - app_module.REALTIME_COACH_PROJECTION_RESERVE_MS
+
+    remaining_ms, provider_timeout_ms = app_module._realtime_coach_budget_ms(
+        deadline_at_ms=10_000,
+        now_ms=9_500,
+        configured_timeout_seconds=20,
+    )
+    assert remaining_ms == 500
+    assert provider_timeout_ms == 0
+
+
+def test_realtime_intelligence_debounce_defaults_to_immediate_pi_window(monkeypatch):
+    monkeypatch.delenv("MEETING_COPILOT_REALTIME_INTELLIGENCE_DEBOUNCE_MS", raising=False)
+    assert app_module._realtime_intelligence_debounce_ms() == 0
+
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_INTELLIGENCE_DEBOUNCE_MS", "750")
+    assert app_module._realtime_intelligence_debounce_ms() == 750
+
+
+def test_realtime_intelligence_debounce_override_requires_pi_runtime(monkeypatch):
+    monkeypatch.delenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", raising=False)
+    monkeypatch.delenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", raising=False)
+    assert app_module._configured_intelligence_debounce_for_app("llm_first") == 0
+
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "direct")
+    assert app_module._configured_intelligence_debounce_for_app("llm_first") is None
+    assert app_module._configured_intelligence_debounce_for_app("legacy") is None
+
+
+@pytest.mark.parametrize("value", ["-1", "751", "not-an-integer"])
+def test_realtime_intelligence_debounce_rejects_unsafe_configuration(monkeypatch, value):
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_INTELLIGENCE_DEBOUNCE_MS", value)
+    with pytest.raises(RuntimeError, match="MEETING_COPILOT_REALTIME_INTELLIGENCE_DEBOUNCE_MS"):
+        app_module._realtime_intelligence_debounce_ms()
+
+
+def test_realtime_coach_soft_cutoff_is_absolute_and_keeps_projection_reserve():
+    soft_deadline = app_module._realtime_coach_soft_deadline_at_ms(
+        final_committed_at_ms=10_000,
+        fallback_created_at_ms=1,
+    )
+    assert soft_deadline == 10_000 + app_module.REALTIME_COACH_SOFT_CUTOFF_MS
+
+    remaining_ms, provider_budget_ms = app_module._realtime_coach_soft_budget_ms(
+        soft_deadline_at_ms=soft_deadline,
+        now_ms=10_500,
+    )
+    assert remaining_ms == app_module.REALTIME_COACH_SOFT_CUTOFF_MS - 500
+    assert provider_budget_ms == remaining_ms - app_module.REALTIME_COACH_SOFT_PROJECTION_RESERVE_MS
+
+    # A malformed final timestamp falls back to job creation, never to an
+    # unbounded provider timeout.
+    assert app_module._realtime_coach_soft_deadline_at_ms(
+        final_committed_at_ms="bad",
+        fallback_created_at_ms=2_000,
+    ) == 2_000 + app_module.REALTIME_COACH_SOFT_CUTOFF_MS
+
+
+def test_v2_local_reflex_projects_without_provider_or_pi_budget(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+
+    def forbidden_provider_config(_cls):
+        raise AssertionError("local reflex must run before Provider configuration")
+
+    async def forbidden_provider_call(**_kwargs):
+        raise AssertionError("local reflex must not start semantic Provider work")
+
+    class ForbiddenPiRuntime:
+        async def evaluate(self, _payload):
+            raise AssertionError("local reflex must not start Pi")
+
+    monkeypatch.setattr(
+        app_module.llm_service.LlmConfig,
+        "from_env",
+        classmethod(forbidden_provider_config),
+    )
+    monkeypatch.setattr(app_module, "run_realtime_intelligence", forbidden_provider_call)
+    app.state.pi_coach_runtime = ForbiddenPiRuntime()
+
+    committed_at_ms = time.time_ns() // 1_000_000
+    committed = app.state.v2_persistence.commit_final_and_enqueue(
+        meeting_id="local-reflex-providerless-meeting",
+        final_id="local-reflex-providerless-final",
+        segment_id="local-reflex-providerless-segment",
+        text="今天先到这里。",
+        normalized_text="今天先到这里。",
+        started_at_ms=0,
+        ended_at_ms=1_000,
+        evidence_hash="local-reflex-providerless-hash",
+        source_track="microphone",
+        now_ms=committed_at_ms,
+    )
+    intelligence_job_id = committed["job_ids"]["intelligence"]
+    job = app.state.v2_persistence.get_job(intelligence_job_id)
+
+    output = asyncio.run(app.state.v2_intelligence_job_handler_impl(job))
+
+    assert output["transport_mode"] == "local_reflex"
+    assert output["provider_attempt_count"] == 0
+    assert output["usage"] is None
+    assert output["semantic"] == {
+        "status": "suppressed_by_local_reflex",
+        "error_class": None,
+    }
+    coach = output["coach"]
+    assert coach["status"] == "intervention"
+    assert coach["origin"] == "local_reflex"
+    assert coach["runtime_requested"] == "local_reflex"
+    assert coach["runtime_used"] == "local_reflex"
+    assert coach["local_reflex_kind"] == "missing_next_step"
+    assert coach["pi_provider_attempted"] is False
+    assert coach["intervention"]["event_type"] == "execution_gap"
+    assert coach["intervention"]["evidence_quote"] == "今天先到这里"
+    assert coach["intervention"]["evidence_segment_ids"] == [
+        "local-reflex-providerless-segment"
+    ]
+    assert coach["valid_until_ms"] > coach["completed_at_ms"]
+
+    events = app.state.v2_persistence.list_events(
+        "local-reflex-providerless-meeting",
+        limit=1_000,
+    )
+    applied = [
+        event for event in events if event["type"] == "meeting.intelligence.applied"
+    ]
+    assert len(applied) == 1
+    payload = applied[0]["payload"]
+    assert payload["source"] == "local_reflex"
+    assert payload["llm_called"] is False
+    assert payload["llm_call_status"] == "not_called"
+    assert payload["origin"] == "local_reflex"
+    assert payload["runtime_used"] == "local_reflex"
+    assert payload["local_reflex_kind"] == "missing_next_step"
+    assert payload["pi_provider_attempted"] is False
+    assert payload["evidence"]["quote"] == "今天先到这里"
+    assert payload["coach_decision"]["pi_provider_attempted"] is False
+    assert payload["coach_intervention"]["local_reflex_kind"] == "missing_next_step"
+    assert applied[0]["occurred_at_ms"] - committed_at_ms < 2_500
+    assert app.state.v2_persistence.recent_local_reflex_kinds(
+        "local-reflex-providerless-meeting",
+        since_ms=0,
+    ) == {"missing_next_step"}
+    assert app.state.v2_persistence.recent_coach_episode_priorities(
+        "local-reflex-providerless-meeting",
+        since_ms=0,
+    ) == {}
+    assert not any(
+        event["type"].startswith("meeting.realtime_provider.reservation")
+        for event in events
+    )
+    assert app.state.provider_priority_arbiter.active_realtime_count == 0
+    assert app.state.provider_priority_arbiter.pending_realtime_count == 0
+
+    # Snapshot diagnostics may inspect optional configuration after the job is
+    # already complete; keep that unrelated read provider-less for API checks.
+    monkeypatch.setattr(
+        app_module.llm_service.LlmConfig,
+        "from_env",
+        classmethod(lambda _cls: None),
+    )
+    client = TestClient(app)
+    snapshot_response = client.get(
+        "/v2/meetings/local-reflex-providerless-meeting/snapshot"
+    )
+    assert snapshot_response.status_code == 200
+    snapshot = snapshot_response.json()
+    assert snapshot["follow_up"]["origin"] == "local_reflex"
+    assert snapshot["follow_up"]["local_reflex_kind"] == "missing_next_step"
+    assert snapshot["follow_up"]["coach_event_type"] == "execution_gap"
+    assert snapshot["coach_decision"]["origin"] == "local_reflex"
+    event_response = client.get(
+        "/v2/meetings/local-reflex-providerless-meeting/events",
+        params={"after_seq": 0, "limit": 1_000},
+    )
+    assert event_response.status_code == 200
+    public_applied = next(
+        event
+        for event in event_response.json()["events"]
+        if event["type"] == "meeting.intelligence.applied"
+    )
+    assert public_applied["payload"]["source"] == "local_reflex"
+    assert public_applied["payload"]["local_reflex_kind"] == "missing_next_step"
+    assert public_applied["payload"]["llm_called"] is False
+
+
+def test_v2_transcript_delta_reaches_production_handler(
+    tmp_path,
+    monkeypatch,
+):
+    """The production worker accepts the trigger contract used by live ASR."""
+
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    persistence = app.state.v2_persistence
+    committed = persistence.commit_final_and_enqueue(
+        meeting_id="transcript-delta-handler-meeting",
+        final_id="transcript-delta-handler-final",
+        segment_id="transcript-delta-handler-segment",
+        text="今天先到这里。",
+        normalized_text="今天先到这里。",
+        started_at_ms=0,
+        ended_at_ms=1_000,
+        evidence_hash="transcript-delta-handler-hash",
+        source_track="microphone",
+        now_ms=time.time_ns() // 1_000_000,
+    )
+    job_id = committed["job_ids"]["intelligence"]
+    persistence._conn.execute(
+        "UPDATE jobs SET trigger_type = 'transcript_delta' WHERE id = ?",
+        (job_id,),
+    )
+    persistence._conn.commit()
+
+    job = persistence.get_job(job_id)
+    output = asyncio.run(app.state.v2_intelligence_job_handler_impl(job))
+
+    assert output["coach"]["status"] == "intervention"
+    assert output["coach"]["runtime_used"] == "local_reflex"
+    assert output["applied"]
+
+
+def test_v2_real_asr_owner_gap_reaches_local_reflex_production_handler(
+    tmp_path,
+    monkeypatch,
+):
+    """Natural ASR owner-gap wording must yield an evidence-bound action card."""
+
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    persistence = app.state.v2_persistence
+
+    def forbidden_provider_config(_cls):
+        raise AssertionError("owner-gap reflex must not wait for Provider config")
+
+    async def forbidden_provider_call(**_kwargs):
+        raise AssertionError("owner-gap reflex must not start semantic Provider work")
+
+    class ForbiddenPiRuntime:
+        async def evaluate(self, _payload):
+            raise AssertionError("owner-gap reflex must not start Pi")
+
+    monkeypatch.setattr(
+        app_module.llm_service.LlmConfig,
+        "from_env",
+        classmethod(forbidden_provider_config),
+    )
+    monkeypatch.setattr(app_module, "run_realtime_intelligence", forbidden_provider_call)
+    app.state.pi_coach_runtime = ForbiddenPiRuntime()
+
+    text = (
+        "我们计划周五上线，但是回滚负责人还没有确定，"
+        "发布前还需要确认回滚条件和具体负责人。"
+    )
+    committed = persistence.commit_final_and_enqueue(
+        meeting_id="real-asr-owner-gap-handler-meeting",
+        final_id="real-asr-owner-gap-handler-final",
+        segment_id="real-asr-owner-gap-handler-segment",
+        text=text,
+        normalized_text=text,
+        started_at_ms=0,
+        ended_at_ms=4_000,
+        evidence_hash="real-asr-owner-gap-handler-hash",
+        source_track="microphone",
+        now_ms=time.time_ns() // 1_000_000,
+    )
+
+    job = persistence.get_job(committed["job_ids"]["intelligence"])
+    output = asyncio.run(app.state.v2_intelligence_job_handler_impl(job))
+
+    assert output["transport_mode"] == "local_reflex"
+    assert output["provider_attempt_count"] == 0
+    assert output["coach"]["status"] == "intervention"
+    assert output["coach"]["runtime_used"] == "local_reflex"
+    assert output["coach"]["local_reflex_kind"] == "missing_next_step"
+    intervention = output["coach"]["intervention"]
+    assert intervention["event_type"] == "execution_gap"
+    assert intervention["evidence_quote"] == text.rstrip("。")
+    assert intervention["evidence_segment_ids"] == [
+        "real-asr-owner-gap-handler-segment"
+    ]
+
+    applied = next(
+        event
+        for event in persistence.list_events(
+            "real-asr-owner-gap-handler-meeting", limit=1_000
+        )
+        if event["type"] == "meeting.intelligence.applied"
+    )
+    assert applied["payload"]["coach_decision"]["origin"] == "local_reflex"
+    assert applied["payload"]["coach_intervention"]["local_reflex_kind"] == (
+        "missing_next_step"
+    )
+
+
+def test_v2_local_reflex_rechecks_a_vad_split_close_from_latest_evidence(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    persistence = app.state.v2_persistence
+
+    def forbidden_provider_config(_cls):
+        raise AssertionError("fresh split evidence must take the local reflex path")
+
+    async def forbidden_provider_call(**_kwargs):
+        raise AssertionError("split closing reflex must not start semantic Provider work")
+
+    class ForbiddenPiRuntime:
+        async def evaluate(self, _payload):
+            raise AssertionError("split closing reflex must not start Pi")
+
+    monkeypatch.setattr(
+        app_module.llm_service.LlmConfig,
+        "from_env",
+        classmethod(forbidden_provider_config),
+    )
+    monkeypatch.setattr(app_module, "run_realtime_intelligence", forbidden_provider_call)
+    app.state.pi_coach_runtime = ForbiddenPiRuntime()
+
+    observed_at_ms = time.time_ns() // 1_000_000
+    first_committed_at_ms = (
+        observed_at_ms - app_module.REALTIME_COACH_SOFT_CUTOFF_MS - 1_000
+    )
+    second_committed_at_ms = observed_at_ms - 800
+    first = persistence.commit_final_and_enqueue(
+        meeting_id="local-reflex-vad-split-meeting",
+        final_id="local-reflex-vad-split-final-1",
+        segment_id="local-reflex-vad-split-segment-1",
+        text="我们已经把方案讨论",
+        normalized_text="我们已经把方案讨论",
+        started_at_ms=100,
+        ended_at_ms=36_200,
+        evidence_hash="local-reflex-vad-split-hash-1",
+        source_track="microphone",
+        now_ms=first_committed_at_ms,
+    )
+    second = persistence.commit_final_and_enqueue(
+        meeting_id="local-reflex-vad-split-meeting",
+        final_id="local-reflex-vad-split-final-2",
+        segment_id="local-reflex-vad-split-segment-2",
+        text="完了今天先到这里",
+        normalized_text="完了今天先到这里",
+        started_at_ms=36_200,
+        ended_at_ms=37_700,
+        evidence_hash="local-reflex-vad-split-hash-2",
+        source_track="microphone",
+        now_ms=second_committed_at_ms,
+    )
+
+    assert second["job_ids"]["intelligence"] == first["job_ids"]["intelligence"]
+    paragraph = persistence.list_semantic_paragraphs(
+        "local-reflex-vad-split-meeting"
+    )["paragraphs"][0]
+    assert paragraph["revision"] == 2
+    assert paragraph["text"] == "我们已经把方案讨论完了今天先到这里"
+
+    job = persistence.claim_next_job(
+        worker_id="local-reflex-vad-split-worker",
+        lane="intelligence",
+        now_ms=observed_at_ms,
+        lease_ms=30_000,
+    )
+    assert job is not None
+    assert job["id"] == first["job_ids"]["intelligence"]
+    assert job["input_version"] == 2
+    assert job["evidence_segment_id"] == "local-reflex-vad-split-segment-2"
+    assert job["final_committed_at_ms"] == first_committed_at_ms
+    assert job["deadline_at_ms"] == (
+        first_committed_at_ms + app_module.INTELLIGENCE_REALTIME_BUDGET_MS
+    )
+    assert observed_at_ms >= (
+        int(job["final_committed_at_ms"])
+        + app_module.REALTIME_COACH_SOFT_CUTOFF_MS
+    )
+
+    output = asyncio.run(app.state.v2_intelligence_job_handler_impl(job))
+
+    assert output["transport_mode"] == "local_reflex"
+    assert output["provider_attempt_count"] == 0
+    assert output["coach"]["pi_provider_attempted"] is False
+    assert output["coach"]["local_reflex_kind"] == "missing_next_step"
+    assert output["coach"]["intervention"]["evidence_quote"] == "完了今天先到这里"
+    assert output["coach"]["intervention"]["evidence_segment_ids"] == [
+        "local-reflex-vad-split-segment-2"
+    ]
+    assert output["coach"]["soft_deadline_at_ms"] == (
+        second_committed_at_ms + app_module.REALTIME_COACH_SOFT_CUTOFF_MS
+    )
+    completed = persistence.complete_job(
+        job_id=job["id"],
+        worker_id="local-reflex-vad-split-worker",
+        now_ms=time.time_ns() // 1_000_000,
+        output=output,
+    )
+    assert completed is not None
+    assert completed["status"] == "succeeded"
+    events = persistence.list_events("local-reflex-vad-split-meeting", limit=1_000)
+    applied = [
+        event for event in events if event["type"] == "meeting.intelligence.applied"
+    ]
+    assert len(applied) == 1
+    assert applied[0]["payload"]["source"] == "local_reflex"
+    assert applied[0]["payload"]["pi_provider_attempted"] is False
+
+
+def test_v2_local_reflex_durable_executor_bypasses_blocked_provider_lane(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    persistence = app.state.v2_persistence
+    provider_lanes = app.state.provider_lane_registry
+    blocker = provider_lanes.try_acquire_realtime("blocked-provider-lane")
+    assert blocker is not None
+
+    def forbidden_provider_config(_cls):
+        raise AssertionError("local reflex must not read Provider configuration")
+
+    async def forbidden_provider_call(**_kwargs):
+        raise AssertionError("local reflex must not start semantic Provider work")
+
+    def forbidden_lane_call(*_args, **_kwargs):
+        raise AssertionError("local reflex must not reserve or acquire the Provider lane")
+
+    class ForbiddenPiRuntime:
+        async def evaluate(self, _payload):
+            raise AssertionError("local reflex must not start Pi")
+
+    monkeypatch.setattr(
+        app_module.llm_service.LlmConfig,
+        "from_env",
+        classmethod(forbidden_provider_config),
+    )
+    monkeypatch.setattr(app_module, "run_realtime_intelligence", forbidden_provider_call)
+    monkeypatch.setattr(provider_lanes, "reserve_realtime", forbidden_lane_call)
+    monkeypatch.setattr(provider_lanes, "try_acquire_realtime", forbidden_lane_call)
+    app.state.pi_coach_runtime = ForbiddenPiRuntime()
+
+    committed_at_ms = time.time_ns() // 1_000_000
+    committed = persistence.commit_final_and_enqueue(
+        meeting_id="local-reflex-executor-meeting",
+        final_id="local-reflex-executor-final",
+        segment_id="local-reflex-executor-segment",
+        text="今天先到这里。",
+        normalized_text="今天先到这里。",
+        started_at_ms=0,
+        ended_at_ms=1_000,
+        evidence_hash="local-reflex-executor-hash",
+        source_track="microphone",
+        now_ms=committed_at_ms,
+    )
+    intelligence_job_id = committed["job_ids"]["intelligence"]
+    claimed_jobs: list[dict] = []
+
+    async def intelligence_handler(job: dict):
+        durable_job = persistence.get_job(job["id"])
+        assert durable_job["status"] == "running"
+        assert durable_job["attempts"] == 1
+        assert durable_job["lease_owner"]
+        assert durable_job["lease_until_ms"] > time.time_ns() // 1_000_000
+        claimed_jobs.append(durable_job)
+        return await app.state.v2_intelligence_job_handler_impl(job)
+
+    async def scenario() -> dict:
+        executor = DurableJobExecutor(
+            persistence,
+            correction_handler=lambda job: {"job_id": job["id"]},
+            suggestion_handler=lambda job: {"job_id": job["id"]},
+            additional_handlers={"intelligence": intelligence_handler},
+            worker_id="local-reflex-real-executor",
+            poll_interval_ms=5,
+        )
+        try:
+            await executor.start()
+            executor.wake("intelligence")
+            return await _wait_for_v2_job_status(
+                persistence,
+                intelligence_job_id,
+                "succeeded",
+            )
+        finally:
+            await executor.stop()
+
+    try:
+        intelligence_job = asyncio.run(scenario())
+        assert len(claimed_jobs) == 1
+        assert intelligence_job["attempts"] == 1
+        assert intelligence_job["output"]["transport_mode"] == "local_reflex"
+        assert intelligence_job["output"]["provider_attempt_count"] == 0
+        events = persistence.list_events("local-reflex-executor-meeting", limit=1_000)
+        applied = [
+            event
+            for event in events
+            if event["type"] == "meeting.intelligence.applied"
+        ]
+        assert len(applied) == 1
+        timing = applied[0]["payload"]["timing"]
+        assert timing["valid"] is True
+        assert timing["final_to_projection_ms"] == (
+            timing["projected_at_ms"] - timing["final_committed_at_ms"]
+        )
+        assert 0 <= timing["final_to_projection_ms"] < 2_500
+        assert timing["job_started_at_ms"] is not None
+        assert (
+            timing["final_committed_at_ms"]
+            <= timing["job_started_at_ms"]
+            <= timing["decision_completed_at_ms"]
+            <= timing["projected_at_ms"]
+        )
+        assert provider_lanes.active_realtime_count == 1
+        assert not any(
+            event["type"].startswith("meeting.realtime_provider.reservation")
+            for event in events
+        )
+        assert persistence.recent_coach_episode_priorities(
+            "local-reflex-executor-meeting",
+            since_ms=0,
+        ) == {}
+    finally:
+        blocker.release()
+        provider_lanes.release_realtime_reservation("blocked-provider-lane")
+
+
+def test_v2_local_reflex_same_kind_active_card_is_silently_suppressed(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    persistence = app.state.v2_persistence
+    provider_lanes = app.state.provider_lane_registry
+
+    def forbidden_provider_config(_cls):
+        raise AssertionError("cooldown suppression must not read Provider configuration")
+
+    async def forbidden_provider_call(**_kwargs):
+        raise AssertionError("cooldown suppression must not call a Provider")
+
+    def forbidden_lane_call(*_args, **_kwargs):
+        raise AssertionError("cooldown suppression must not enter the Provider lane")
+
+    class ForbiddenPiRuntime:
+        async def evaluate(self, _payload):
+            raise AssertionError("cooldown suppression must not start Pi")
+
+    monkeypatch.setattr(
+        app_module.llm_service.LlmConfig,
+        "from_env",
+        classmethod(forbidden_provider_config),
+    )
+    monkeypatch.setattr(app_module, "run_realtime_intelligence", forbidden_provider_call)
+    monkeypatch.setattr(provider_lanes, "reserve_realtime", forbidden_lane_call)
+    monkeypatch.setattr(provider_lanes, "try_acquire_realtime", forbidden_lane_call)
+    app.state.pi_coach_runtime = ForbiddenPiRuntime()
+
+    apply_calls: list[str] = []
+    original_apply = persistence.apply_intelligence_response
+
+    def tracked_apply(**kwargs):
+        apply_calls.append(str(kwargs["job_id"]))
+        return original_apply(**kwargs)
+
+    monkeypatch.setattr(persistence, "apply_intelligence_response", tracked_apply)
+    historical_commit_ms = time.time_ns() // 1_000_000 - 1_000
+
+    def commit_and_claim(suffix: str) -> dict:
+        committed = persistence.commit_final_and_enqueue(
+            meeting_id="local-reflex-cooldown-meeting",
+            final_id=f"local-reflex-cooldown-final-{suffix}",
+            segment_id=f"local-reflex-cooldown-segment-{suffix}",
+            text="今天先到这里。",
+            normalized_text="今天先到这里。",
+            started_at_ms=0 if suffix == "one" else 1_100,
+            ended_at_ms=1_000 if suffix == "one" else 2_000,
+            evidence_hash=f"local-reflex-cooldown-hash-{suffix}",
+            source_track="microphone",
+            now_ms=historical_commit_ms,
+        )
+        claimed = persistence.claim_next_job(
+            worker_id=f"local-reflex-cooldown-worker-{suffix}",
+            lane="intelligence",
+            now_ms=time.time_ns() // 1_000_000,
+            lease_ms=30_000,
+        )
+        assert claimed is not None
+        assert claimed["id"] == committed["job_ids"]["intelligence"]
+        return claimed
+
+    first_job = commit_and_claim("one")
+    first_output = asyncio.run(app.state.v2_intelligence_job_handler_impl(first_job))
+    assert persistence.complete_job(
+        job_id=first_job["id"],
+        worker_id="local-reflex-cooldown-worker-one",
+        now_ms=time.time_ns() // 1_000_000,
+        output=first_output,
+    ) is not None
+    first_events = persistence.list_events(
+        "local-reflex-cooldown-meeting",
+        limit=1_000,
+    )
+    first_applied = [
+        event
+        for event in first_events
+        if event["type"] == "meeting.intelligence.applied"
+    ]
+    assert len(first_applied) == 1
+    first_decision_id = first_applied[0]["payload"]["coach_decision"]["decision_id"]
+
+    second_job = commit_and_claim("two")
+    second_output = asyncio.run(app.state.v2_intelligence_job_handler_impl(second_job))
+    completed = persistence.complete_job(
+        job_id=second_job["id"],
+        worker_id="local-reflex-cooldown-worker-two",
+        now_ms=time.time_ns() // 1_000_000,
+        output=second_output,
+    )
+
+    assert completed is not None
+    assert completed["status"] == "succeeded"
+    assert completed["output"] == second_output
+    assert second_output["applied"] is False
+    assert second_output["transport_mode"] == "local_reflex_cooldown_suppressed"
+    assert second_output["provider_attempt_count"] == 0
+    assert second_output["coach"]["triggered"] is False
+    assert second_output["coach"]["suppression_reason"] == "same_kind_active"
+    assert second_output["semantic"]["status"] == "suppressed_by_active_local_reflex"
+    assert apply_calls == [first_job["id"]]
+    final_events = persistence.list_events(
+        "local-reflex-cooldown-meeting",
+        limit=1_000,
+    )
+    final_applied = [
+        event
+        for event in final_events
+        if event["type"] == "meeting.intelligence.applied"
+    ]
+    assert len(final_applied) == 1
+    assert final_applied[0]["payload"]["coach_decision"]["decision_id"] == first_decision_id
+    snapshot = persistence.get_snapshot("local-reflex-cooldown-meeting")
+    assert snapshot["coach_decision"]["decision_id"] == first_decision_id
+    assert not any(
+        event["type"].startswith("meeting.realtime_provider.reservation")
+        for event in final_events
+    )
+    assert persistence.recent_coach_episode_priorities(
+        "local-reflex-cooldown-meeting",
+        since_ms=0,
+    ) == {}
+    assert provider_lanes.active_realtime_count == 0
+    assert provider_lanes.pending_realtime_count == 0
+
+
+def test_v2_nonlocal_provider_path_waits_for_lane_and_revalidates_evidence(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    persistence = app.state.v2_persistence
+    provider_lanes = app.state.provider_lane_registry
+    blocker = provider_lanes.try_acquire_realtime("provider-revalidation-blocker")
+    assert blocker is not None
+    provider_config_calls = 0
+
+    def forbidden_provider_config(_cls):
+        nonlocal provider_config_calls
+        provider_config_calls += 1
+        raise AssertionError("stale evidence must fail before Provider configuration")
+
+    monkeypatch.setattr(
+        app_module.llm_service.LlmConfig,
+        "from_env",
+        classmethod(forbidden_provider_config),
+    )
+    committed_at_ms = time.time_ns() // 1_000_000
+    committed = persistence.commit_final_and_enqueue(
+        meeting_id="provider-revalidation-meeting",
+        final_id="provider-revalidation-final",
+        segment_id="provider-revalidation-segment",
+        text="我们继续讨论发布方案。",
+        normalized_text="我们继续讨论发布方案。",
+        started_at_ms=0,
+        ended_at_ms=1_000,
+        evidence_hash="provider-revalidation-hash",
+        source_track="microphone",
+        now_ms=committed_at_ms,
+    )
+    intelligence_job = persistence.get_job(committed["job_ids"]["intelligence"])
+
+    async def scenario() -> None:
+        task = asyncio.create_task(
+            app.state.v2_intelligence_job_handler_impl(intelligence_job)
+        )
+        try:
+            await asyncio.sleep(0.05)
+            assert not task.done()
+            revised = persistence.commit_transcript_revision(
+                meeting_id="provider-revalidation-meeting",
+                segment_id="provider-revalidation-segment",
+                expected_evidence_hash="provider-revalidation-hash",
+                corrected_text="我们继续讨论经过修订的发布方案。",
+                revision_id="provider-revalidation-revision",
+                now_ms=time.time_ns() // 1_000_000,
+                causation_id="external-correction",
+            )
+            assert revised is not None
+            blocker.release()
+            with pytest.raises(
+                IntelligenceEvidenceSuperseded,
+                match="evidence changed before execution",
+            ):
+                await task
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    try:
+        asyncio.run(scenario())
+        assert provider_config_calls == 0
+        assert provider_lanes.active_realtime_count == 0
+        assert provider_lanes.pending_realtime_count == 0
+        replacement_jobs = [
+            job
+            for job in persistence.list_jobs(
+                meeting_id="provider-revalidation-meeting"
+            )
+            if job["kind"] == "intelligence"
+            and job["id"] != intelligence_job["id"]
+            and job["status"] == "pending"
+        ]
+        assert len(replacement_jobs) == 1
+        assert replacement_jobs[0]["evidence_hash"] != intelligence_job[
+            "evidence_hash"
+        ]
+    finally:
+        blocker.release()
+        provider_lanes.release_realtime_reservation(
+            "provider-revalidation-blocker"
+        )
+
+
+def test_public_coach_agent_metrics_are_bounded_and_secret_free():
+    metrics = app_module._public_coach_agent_metrics(
+        {
+            "job_queue_latency_ms": 120,
+            "provider_timeout_ms": 4_250,
+            "correction_lane_active_at_coach_start": True,
+            "bridge_process_reused": False,
+            "prompt_characters": 512,
+            "system_prompt_characters": 1_024,
+            "tool_schema_characters": 2_048,
+            "request_characters": 3_072,
+            "provider_connect_ms": 2_138.4,
+            "prompt_profile": "candidate_fast",
+            "available_tool_names": ["submit_intervention", "keep_silent"],
+            "coach_skill_id": "general",
+            "coach_skill_version": 1,
+            "response_validation_category": "semantic_safety",
+            "response_validation_error": "intervention.evidence_quote is not present",
+            "tool_names": ["read_realtime_context"],
+            "usage": {"prompt_tokens": 90, "completion_tokens": 20, "total_tokens": 110},
+            "timings": {
+                "clock": "unix_epoch_ms",
+                "started_at_ms": 1_000,
+                "completed_at_ms": 1_120,
+            },
+            "prompt": "must never be persisted",
+            "provider_response": "must never be persisted",
+            "api_key": "must never be persisted",
+        }
+    )
+
+    assert metrics["job_queue_latency_ms"] == 120
+    assert metrics["provider_timeout_ms"] == 4_250
+    assert metrics["system_prompt_characters"] == 1_024
+    assert metrics["tool_schema_characters"] == 2_048
+    assert metrics["request_characters"] == 3_072
+    assert metrics["provider_connect_ms"] == 2_138.4
+    assert metrics["prompt_profile"] == "candidate_fast"
+    assert metrics["available_tool_names"] == ["submit_intervention", "keep_silent"]
+    assert metrics["coach_skill_version"] == 1
+    assert metrics["response_validation_category"] == "semantic_safety"
+    assert metrics["response_validation_error"] == "intervention.evidence_quote is not present"
+    assert metrics["correction_lane_active_at_coach_start"] is True
+    assert metrics["usage"] == {"prompt_tokens": 90, "completion_tokens": 20, "total_tokens": 110}
+    assert metrics["timings"]["clock"] == "unix_epoch_ms"
+    assert "prompt" not in metrics
+    assert "provider_response" not in metrics
+    assert "api_key" not in metrics
+
+
+def test_v2_intelligence_skips_pi_when_only_projection_reserve_remains(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
+    config = app_module.llm_service.LlmConfig(
+        base_url="https://provider.example.test/v1",
+        api_key="test-only-key",
+        model="test-model",
+        timeout_seconds=20,
+        is_mock=True,
+    )
+    monkeypatch.setattr(
+        app_module.llm_service.LlmConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(app_module.llm_service, "realtime_config", lambda value: value)
+    monkeypatch.setattr(
+        app_module,
+        "_ensure_llm_provider_allowed_for_derivation",
+        lambda *_args, **_kwargs: None,
+    )
+
+    async def fake_intelligence(**_kwargs):
+        now = time.perf_counter()
+        return {
+            "response": RealtimeIntelligenceResponse((), None, (), None),
+            "transport_mode": "test",
+            "ttft_ms": 1,
+            "timings": {
+                "started_at": now,
+                "connected_at": now,
+                "first_token_at": now,
+                "completed_at": now,
+            },
+            "usage": None,
+            "model": "test-model",
+        }
+
+    monkeypatch.setattr(app_module, "run_realtime_intelligence", fake_intelligence)
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    app.state.streaming_llm_client = object()
+
+    class PiRuntime:
+        calls = 0
+
+        async def evaluate(self, _payload):
+            self.calls += 1
+            raise AssertionError("Pi must not run without a viable provider budget")
+
+    pi_runtime = PiRuntime()
+    app.state.pi_coach_runtime = pi_runtime
+    finalized_at_ms = time.time_ns() // 1_000_000 - 8_500
+    committed = app.state.v2_persistence.commit_final_and_enqueue(
+        meeting_id="deadline-budget-meeting",
+        final_id="deadline-budget-final",
+        segment_id="deadline-budget-segment",
+        text="我们一定周五上线。",
+        normalized_text="我们一定周五上线。",
+        started_at_ms=0,
+        ended_at_ms=1_000,
+        evidence_hash="deadline-budget-hash",
+        source_track="microphone",
+        now_ms=finalized_at_ms,
+    )
+    job = app.state.v2_persistence.get_job(committed["job_ids"]["intelligence"])
+
+    output = asyncio.run(app.state.v2_intelligence_job_handler_impl(job))
+
+    assert pi_runtime.calls == 0
+    assert output["coach"]["status"] == "timed_out"
+    assert output["coach"]["status_reason"] == "deadline_budget_exhausted"
+    assert output["coach"]["agent_metrics"]["provider_timeout_ms"] < 1_000
+    assert output["applied"]["coach_decision"]["pi_provider_attempted"] is False
+    assert app.state.v2_persistence.recent_coach_episode_priorities(
+        "deadline-budget-meeting", since_ms=0
+    ) == {}
+
+
+def test_v2_pi_soft_budget_skip_releases_half_open_circuit_permit(
+    tmp_path,
+    monkeypatch,
+):
+    """Skipping Pi after admission must not strand a half-open circuit trial."""
+
+    class FakeClock:
+        def __init__(self) -> None:
+            self.value = 0.0
+
+        def __call__(self) -> float:
+            return self.value
+
+        def advance(self, seconds: float) -> None:
+            self.value += seconds
+
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
+    config = app_module.llm_service.LlmConfig(
+        base_url="https://provider.example.test/v1",
+        api_key="test-only-key",
+        model="test-model",
+        realtime_model="test-realtime-model",
+        timeout_seconds=20,
+        is_mock=True,
+    )
+    monkeypatch.setattr(
+        app_module.llm_service.LlmConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(app_module.llm_service, "realtime_config", lambda value: value)
+    monkeypatch.setattr(
+        app_module,
+        "_ensure_llm_provider_allowed_for_derivation",
+        lambda *_args, **_kwargs: None,
+    )
+
+    async def forbidden_intelligence(**_kwargs):
+        raise AssertionError("the Pi priority lane must not start semantic Provider work")
+
+    monkeypatch.setattr(app_module, "run_realtime_intelligence", forbidden_intelligence)
+    clock = FakeClock()
+    circuit = RealtimeProviderCircuit(clock=clock)
+    monkeypatch.setattr(
+        app_module,
+        "RealtimeProviderCircuit",
+        lambda **_kwargs: circuit,
+    )
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    app.state.streaming_llm_client = object()
+
+    class PiRuntime:
+        calls = 0
+
+        async def evaluate(self, _payload):
+            self.calls += 1
+            raise AssertionError("Pi must not run after its soft budget is exhausted")
+
+    pi_runtime = PiRuntime()
+    app.state.pi_coach_runtime = pi_runtime
+    identity = app_module._realtime_provider_identity(
+        app_module.llm_service.realtime_config(config)
+    )
+    for failure_class in ("timeout", "provider_server"):
+        admission = circuit.acquire(identity)
+        assert admission.permit is not None
+        admission.permit.record_failure(failure_class)
+    assert circuit.snapshot(identity).state == "open"
+
+    # The handler's next admission becomes the half-open trial. Its final is
+    # already outside the 2.5s product window but remains well within the
+    # independent 10s hard deadline.
+    clock.advance(15.0)
+    finalized_at_ms = time.time_ns() // 1_000_000 - 2_000
+    committed = app.state.v2_persistence.commit_final_and_enqueue(
+        meeting_id="soft-budget-half-open-meeting",
+        final_id="soft-budget-half-open-final",
+        segment_id="soft-budget-half-open-segment",
+        text="我们一定周五上线。",
+        normalized_text="我们一定周五上线。",
+        started_at_ms=0,
+        ended_at_ms=1_000,
+        evidence_hash="soft-budget-half-open-hash",
+        source_track="microphone",
+        now_ms=finalized_at_ms,
+    )
+    job = app.state.v2_persistence.get_job(committed["job_ids"]["intelligence"])
+
+    output = asyncio.run(app.state.v2_intelligence_job_handler_impl(job))
+
+    assert pi_runtime.calls == 0
+    assert output["coach"]["status"] == "timed_out"
+    assert output["coach"]["status_reason"] == "soft_deadline_exceeded"
+    assert output["coach"]["agent_metrics"]["realtime_circuit_admitted"] is True
+    # A release returns the half-open slot to the open circuit and restarts
+    # its cooldown. Without it, this would remain half_open forever.
+    assert circuit.snapshot(identity).state == "open"
+    clock.advance(15.0)
+    retry = circuit.acquire(identity)
+    assert retry.admitted is True
+    assert retry.permit is not None
+    assert retry.permit.half_open is True
+    retry.permit.release()
+
+
+def test_v2_intelligence_deadline_budget_exhaustion_persists_through_real_worker(
+    tmp_path,
+    monkeypatch,
+):
+    """Exercise the durable worker path for a late Pi candidate.
+
+    The handler must emit an explainable silent decision without touching
+    either Provider lane.  The executor then persists that decision exactly as
+    it would in production, while the independent correction lane completes.
+    """
+
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
+    config = app_module.llm_service.LlmConfig(
+        base_url="https://provider.example.test/v1",
+        api_key="test-only-key",
+        model="test-model",
+        timeout_seconds=20,
+        is_mock=True,
+    )
+    monkeypatch.setattr(
+        app_module.llm_service.LlmConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(app_module.llm_service, "realtime_config", lambda value: value)
+    monkeypatch.setattr(
+        app_module,
+        "_ensure_llm_provider_allowed_for_derivation",
+        lambda *_args, **_kwargs: None,
+    )
+
+    semantic_calls = 0
+
+    async def forbidden_intelligence(**_kwargs):
+        nonlocal semantic_calls
+        semantic_calls += 1
+        raise AssertionError("deadline-exhausted Pi jobs must skip semantic Provider work")
+
+    monkeypatch.setattr(app_module, "run_realtime_intelligence", forbidden_intelligence)
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+
+    class PiRuntime:
+        calls = 0
+
+        async def evaluate(self, _payload):
+            self.calls += 1
+            raise AssertionError("deadline-exhausted Pi jobs must not invoke the Pi runtime")
+
+    pi_runtime = PiRuntime()
+    app.state.pi_coach_runtime = pi_runtime
+    correction_calls: list[str] = []
+
+    async def correction_handler(job):
+        correction_calls.append(str(job["id"]))
+        return {"lane": "correction", "job_id": str(job["id"])}
+
+    app.state.v2_correction_job_handler_impl = correction_handler
+
+    meeting_id = "worker-deadline-budget-meeting"
+    now_ms = time.time_ns() // 1_000_000
+    # Leave a ~1.7s absolute deadline so the worker can claim and project, but
+    # the 750ms projection reserve reduces the coach Provider budget below the
+    # 1s minimum.  The timestamp is calculated immediately before enqueueing,
+    # avoiding a sleep-based race in the test itself.
+    finalized_at_ms = now_ms - 8_300
+    committed = app.state.v2_persistence.commit_final_and_enqueue(
+        meeting_id=meeting_id,
+        final_id="worker-deadline-budget-final",
+        segment_id="worker-deadline-budget-segment",
+        text="我们一定周五上线。",
+        normalized_text="我们一定周五上线。",
+        started_at_ms=0,
+        ended_at_ms=1_000,
+        evidence_hash="worker-deadline-budget-hash",
+        source_track="microphone",
+        now_ms=finalized_at_ms,
+    )
+    intelligence_job_id = committed["job_ids"]["intelligence"]
+    correction_job_id = committed["job_ids"]["correction"]
+    executor = app.state.v2_executor
+    assert executor is not None
+
+    async def wait_for_terminal_jobs() -> None:
+        deadline = time.perf_counter() + 2.0
+        while True:
+            intelligence = app.state.v2_persistence.get_job(intelligence_job_id)
+            correction = app.state.v2_persistence.get_job(correction_job_id)
+            if intelligence["status"] == "succeeded" and correction["status"] == "succeeded":
+                return
+            if time.perf_counter() >= deadline:
+                raise AssertionError(
+                    f"worker did not finish jobs: intelligence={intelligence['status']!r}, "
+                    f"correction={correction['status']!r}"
+                )
+            await asyncio.sleep(0.005)
+
+    async def run_worker() -> float:
+        started = time.perf_counter()
+        try:
+            await executor.start()
+            await wait_for_terminal_jobs()
+            return time.perf_counter() - started
+        finally:
+            await executor.stop()
+
+    elapsed_s = asyncio.run(run_worker())
+
+    intelligence_job = app.state.v2_persistence.get_job(intelligence_job_id)
+    correction_job = app.state.v2_persistence.get_job(correction_job_id)
+    output = intelligence_job["output"]
+    coach = output["coach"]
+    assert intelligence_job["status"] == "succeeded"
+    assert correction_job["status"] == "succeeded"
+    assert correction_job["output"] == {"lane": "correction", "job_id": correction_job_id}
+    assert correction_calls == [correction_job_id]
+    assert semantic_calls == 0
+    assert pi_runtime.calls == 0
+    assert output["semantic"] == {
+        "status": "suppressed_by_realtime_deadline",
+        "error_class": None,
+    }
+    timing = intelligence_job["timing"]
+    assert timing["valid"] is True
+    assert timing["excluded"] is False
+    assert timing["final_committed_at_ms"] == finalized_at_ms
+    assert timing["job_created_at_ms"] == finalized_at_ms
+    assert timing["job_started_at_ms"] >= timing["job_created_at_ms"]
+    assert timing["decision_completed_at_ms"] >= timing["job_started_at_ms"]
+    assert timing["projected_at_ms"] >= timing["decision_completed_at_ms"]
+    assert timing["final_to_projection_ms"] == (
+        timing["projected_at_ms"] - timing["final_committed_at_ms"]
+    )
+    assert coach["status"] == "timed_out"
+    assert coach["status_reason"] == "deadline_budget_exhausted"
+    assert coach["fallback_error_code"] == "deadline_budget_exhausted"
+    assert coach["fallback_reason"] == "deadline_budget_exhausted"
+    assert coach["runtime_requested"] == "pi"
+    assert coach["runtime_used"] is None
+    assert coach["intervention"] is None
+    assert coach["agent_metrics"]["deadline_budget_exhausted"] is True
+    assert coach["agent_metrics"]["semantic_branch_status"] == "suppressed_by_realtime_deadline"
+    assert coach["agent_metrics"]["provider_timeout_ms"] < 1_000
+    assert coach["completed_at_ms"] >= coach["created_at_ms"]
+    assert coach["completed_at_ms"] - coach["created_at_ms"] < 1_000
+    assert elapsed_s < 2.0
+
+    snapshot = app.state.v2_persistence.get_snapshot(meeting_id)
+    assert snapshot["jobs"]
+    assert {job["kind"]: job["status"] for job in snapshot["jobs"]} == {
+        "intelligence": "succeeded",
+        "correction": "succeeded",
+    }
+    # The raw persistence snapshot intentionally keeps formal coach decisions
+    # in the append-only event stream; the public route rehydrates that view.
+    response = TestClient(app).get(f"/v2/meetings/{meeting_id}/snapshot")
+    assert response.status_code == 200
+    projected_snapshot = response.json()
+    assert projected_snapshot["coach_decision"]["status_reason"] == "deadline_budget_exhausted"
+    assert projected_snapshot["coach_decision"]["fallback_error_code"] == "deadline_budget_exhausted"
+    assert projected_snapshot["coach_decision"]["runtime_requested"] == "pi"
+    assert projected_snapshot["coach_decision"]["runtime_used"] is None
+
+    events = app.state.v2_persistence.list_events(meeting_id)
+    applied_events = [event for event in events if event["type"] == "meeting.intelligence.applied"]
+    assert applied_events
+    applied_payload = applied_events[-1]["payload"]
+    assert applied_payload["coach_intervention"] is None
+    assert applied_payload["timing"] == timing
+    assert applied_payload["coach_decision"]["status_reason"] == "deadline_budget_exhausted"
+    assert applied_payload["coach_decision"]["fallback_error_code"] == "deadline_budget_exhausted"
+    assert applied_payload["coach_decision"]["runtime_requested"] == "pi"
+
+
+def test_v2_intelligence_provider_deadline_projects_timeout_instead_of_cancelling_job(
+    tmp_path,
+    monkeypatch,
+):
+    """A task-level Pi timeout must leave a durable explainable decision."""
+
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
+    config = app_module.llm_service.LlmConfig(
+        base_url="https://provider.example.test/v1",
+        api_key="test-only-key",
+        model="test-model",
+        timeout_seconds=20,
+        is_mock=True,
+    )
+    monkeypatch.setattr(
+        app_module.llm_service.LlmConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(app_module.llm_service, "realtime_config", lambda value: value)
+    monkeypatch.setattr(
+        app_module,
+        "_ensure_llm_provider_allowed_for_derivation",
+        lambda *_args, **_kwargs: None,
+    )
+
+    async def slow_coach(**_kwargs):
+        # Longer than the job's remaining window; asyncio.timeout will cancel
+        # this coroutine and the handler should project a timeout audit.
+        await asyncio.sleep(3.0)
+
+    monkeypatch.setattr(app_module, "run_realtime_coach_routed", slow_coach)
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    app.state.pi_coach_runtime = object()
+
+    async def correction_handler(job):
+        return {"lane": "correction", "job_id": str(job["id"])}
+
+    app.state.v2_correction_job_handler_impl = correction_handler
+    now_ms = time.time_ns() // 1_000_000
+    committed = app.state.v2_persistence.commit_final_and_enqueue(
+        meeting_id="provider-timeout-worker-meeting",
+        final_id="provider-timeout-worker-final",
+        segment_id="provider-timeout-worker-segment",
+        text="我们一定周五上线。",
+        normalized_text="我们一定周五上线。",
+        started_at_ms=0,
+        ended_at_ms=1_000,
+        evidence_hash="provider-timeout-worker-hash",
+        source_track="microphone",
+        # Keep the hard deadline healthy while the deliberately slow fake
+        # provider crosses the 2.5s product cutoff.
+        now_ms=now_ms,
+    )
+    intelligence_job_id = committed["job_ids"]["intelligence"]
+    executor = app.state.v2_executor
+    assert executor is not None
+
+    async def wait_for_terminal() -> None:
+        deadline = time.perf_counter() + 4.0
+        while True:
+            job = app.state.v2_persistence.get_job(intelligence_job_id)
+            if job["status"] in {"succeeded", "failed", "cancelled"}:
+                return
+            if time.perf_counter() >= deadline:
+                raise AssertionError(f"timeout worker did not settle: {job['status']!r}")
+            await asyncio.sleep(0.01)
+
+    async def run_worker() -> None:
+        try:
+            await executor.start()
+            await wait_for_terminal()
+        finally:
+            await executor.stop()
+
+    asyncio.run(run_worker())
+    job = app.state.v2_persistence.get_job(intelligence_job_id)
+    assert job["status"] == "succeeded"
+    assert job["output"]["coach"]["status"] == "timed_out"
+    assert job["output"]["coach"]["status_reason"] == "soft_deadline_exceeded"
+    assert job["output"]["coach"]["fallback_error_code"] == "soft_deadline_exceeded"
+    assert job["output"]["coach"]["fallback_reason"] == "soft_deadline_exceeded"
+    assert job["output"]["coach"]["delivery_status"] == "too_late"
+    assert job["output"]["coach"]["soft_cutoff_triggered"] is True
+    assert job["output"]["coach"]["late_result_discarded"] is True
+    assert job["output"]["coach"]["intervention"] is None
+
+    snapshot = TestClient(app).get(
+        "/v2/meetings/provider-timeout-worker-meeting/snapshot"
+    )
+    assert snapshot.status_code == 200
+    assert snapshot.json()["coach_decision"]["status"] == "timed_out"
+    assert snapshot.json()["coach_decision"]["fallback_reason"] == "soft_deadline_exceeded"
+    assert snapshot.json()["coach_decision"]["delivery_status"] == "too_late"
+
+
+def test_v2_pi_soft_timeout_preserves_sanitized_bridge_metrics(
+    tmp_path,
+    monkeypatch,
+):
+    """A soft-cutoff projection keeps Pi phase metrics without secrets."""
+
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
+    config = app_module.llm_service.LlmConfig(
+        base_url="https://provider.example.test/v1",
+        api_key="test-only-key",
+        model="test-model",
+        realtime_model="test-realtime-model",
+        timeout_seconds=20,
+        is_mock=True,
+    )
+    monkeypatch.setattr(
+        app_module.llm_service.LlmConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(app_module.llm_service, "realtime_config", lambda value: value)
+    monkeypatch.setattr(
+        app_module,
+        "_ensure_llm_provider_allowed_for_derivation",
+        lambda *_args, **_kwargs: None,
+    )
+
+    original_time_ns = app_module.time.time_ns
+
+    async def fake_coach(**kwargs):
+        kwargs["before_attempt"](1)
+        future_ns = original_time_ns() + (
+            app_module.REALTIME_COACH_SOFT_CUTOFF_MS + 1_000
+        ) * 1_000_000
+        monkeypatch.setattr(app_module.time, "time_ns", lambda: future_ns)
+        error = RuntimeError("bounded Pi timeout")
+        error.code = "agent_deadline_exceeded"
+        error.metrics = {
+            "elapsed_ms": 2_241,
+            "ttft_ms": None,
+            "turns": 1,
+            "tool_calls": 0,
+            "bridge_startup_ms": 0.4,
+            "bridge_round_trip_ms": 2_241.2,
+            "prompt_profile": "candidate_fast",
+            "system_prompt_characters": 2_100,
+            "tool_schema_characters": 640,
+            "request_characters": 3_020,
+            "available_tool_names": ["submit_intervention", "keep_silent"],
+            "api_key": "must-not-persist",
+        }
+        raise error
+
+    monkeypatch.setattr(app_module, "run_realtime_coach_routed", fake_coach)
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    app.state.pi_coach_runtime = object()
+
+    now_ms = original_time_ns() // 1_000_000
+    committed = app.state.v2_persistence.commit_final_and_enqueue(
+        meeting_id="pi-soft-timeout-metrics",
+        final_id="pi-soft-timeout-metrics-final",
+        segment_id="pi-soft-timeout-metrics-segment",
+        text="我们一定周五上线，但是回滚负责人还没有确定。",
+        normalized_text="我们一定周五上线，但是回滚负责人还没有确定。",
+        started_at_ms=0,
+        ended_at_ms=1_000,
+        evidence_hash="pi-soft-timeout-metrics-hash",
+        source_track="microphone",
+        now_ms=now_ms,
+    )
+    job = app.state.v2_persistence.get_job(committed["job_ids"]["intelligence"])
+
+    output = asyncio.run(app.state.v2_intelligence_job_handler_impl(job))
+    coach = output["coach"]
+    metrics = coach["agent_metrics"]
+    # The app may deliver a narrow deterministic hint after a Pi timeout, but
+    # the provenance must remain an explicit local fallback and the Pi timeout
+    # error/metrics must survive the projection.
+    assert coach["status"] in {"timed_out", "intervention"}
+    assert coach["fallback_reason"] in {"soft_deadline_exceeded", "provider_timeout"}
+    assert coach["runtime_used"] in {"pi", "local_reflex"}
+    if coach["runtime_used"] == "local_reflex":
+        assert coach["intervention"]["origin"] == "local_reflex"
+        assert coach["intervention"]["pi_provider_attempted"] is True
+    assert metrics["elapsed_ms"] == 2_241
+    assert metrics["bridge_startup_ms"] == 0.4
+    assert metrics["bridge_round_trip_ms"] == 2_241.2
+    assert metrics["prompt_profile"] == "candidate_fast"
+    assert metrics["available_tool_names"] == ["submit_intervention", "keep_silent"]
+    assert "api_key" not in metrics
+
+
+def test_v2_pi_realtime_circuit_fast_fails_with_durable_explainable_silence(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
+    config = app_module.llm_service.LlmConfig(
+        base_url="https://provider.example.test/v1",
+        api_key="test-only-key",
+        model="test-model",
+        realtime_model="test-realtime-model",
+        timeout_seconds=20,
+        is_mock=True,
+    )
+    monkeypatch.setattr(
+        app_module.llm_service.LlmConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(app_module.llm_service, "realtime_config", lambda value: value)
+    monkeypatch.setattr(
+        app_module,
+        "_ensure_llm_provider_allowed_for_derivation",
+        lambda *_args, **_kwargs: None,
+    )
+
+    intelligence_calls = 0
+
+    async def fake_intelligence(**_kwargs):
+        nonlocal intelligence_calls
+        intelligence_calls += 1
+        raise AssertionError("open realtime circuit must skip all Provider work for this Pi job")
+
+    monkeypatch.setattr(app_module, "run_realtime_intelligence", fake_intelligence)
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    app.state.streaming_llm_client = object()
+
+    class PiRuntime:
+        calls = 0
+
+        async def evaluate(self, _payload):
+            self.calls += 1
+            raise AssertionError("open realtime circuit must fail before Pi/provider work")
+
+    pi_runtime = PiRuntime()
+    app.state.pi_coach_runtime = pi_runtime
+    circuit = app.state.realtime_provider_circuit
+    identity = app_module._realtime_provider_identity(
+        app_module.llm_service.realtime_config(config)
+    )
+    admission = circuit.acquire(identity)
+    assert admission.permit is not None
+    admission.permit.record_failure("rate_limit")
+
+    finalized_at_ms = time.time_ns() // 1_000_000
+    committed = app.state.v2_persistence.commit_final_and_enqueue(
+        meeting_id="circuit-fast-fail-meeting",
+        final_id="circuit-fast-fail-final",
+        segment_id="circuit-fast-fail-segment",
+        text="我们一定周五上线。",
+        normalized_text="我们一定周五上线。",
+        started_at_ms=0,
+        ended_at_ms=1_000,
+        evidence_hash="circuit-fast-fail-hash",
+        source_track="microphone",
+        now_ms=finalized_at_ms,
+    )
+    job = app.state.v2_persistence.get_job(committed["job_ids"]["intelligence"])
+
+    output = asyncio.run(app.state.v2_intelligence_job_handler_impl(job))
+
+    assert pi_runtime.calls == 0
+    assert intelligence_calls == 0
+    assert output["semantic"]["status"] == "suppressed_by_realtime_provider_circuit"
+    coach = output["coach"]
+    assert coach["status"] == "protected_silent"
+    assert coach["status_reason"] == "realtime_provider_rate_limit_backoff"
+    assert coach["fallback_error_code"] == "realtime_provider_rate_limit_backoff"
+    assert coach["fallback_reason"] == "realtime_provider_rate_limit_backoff"
+    assert coach["decision_reason"] == (
+        "实时 Provider 已返回限流，本轮快速静默，等待限流冷却后再试。"
+    )
+    assert coach["runtime_requested"] == "pi"
+    assert coach["runtime_used"] is None
+    assert coach["pi_provider_attempted"] is False
+    assert coach["agent_metrics"]["realtime_circuit_state"] == "open"
+    assert coach["agent_metrics"]["realtime_circuit_failure_count"] == 1
+    assert coach["agent_metrics"]["realtime_circuit_last_failure_class"] == "rate_limit"
+    assert coach["agent_metrics"]["realtime_circuit_admitted"] is False
+    assert output["provider_availability"] == {
+        "policy_version": "shared_realtime_provider.v1",
+        "scope": "pi_coach",
+        "admitted": False,
+        "provider_attempted": False,
+        "provider_attempt_count": 0,
+        "circuit_scope_bypassed": None,
+        "admission_state": "open",
+        "admission_reason": "realtime_provider_rate_limit_backoff",
+        "terminal_status": "denied",
+        "terminal_reason": "realtime_provider_rate_limit_backoff",
+        "final_circuit_state": "open",
+        "final_failure_count": 1,
+        "final_failure_class": "rate_limit",
+    }
+    assert coach["llm_called"] is False
+    assert coach["llm_call_status"] == "not_called"
+    assert coach["provider_access_scope"] == "pi_coach"
+    assert coach["circuit_scope_bypassed"] is None
+    assert coach["durable_terminal_status"] == "denied"
+    assert coach["durable_terminal_reason"] == "realtime_provider_rate_limit_backoff"
+    assert app.state.v2_persistence.recent_coach_episode_priorities(
+        "circuit-fast-fail-meeting",
+        since_ms=0,
+    ) == {}
+
+
+def test_v2_pi_realtime_circuit_keeps_high_signal_local_reflex_available(
+    tmp_path,
+    monkeypatch,
+):
+    """An open Provider circuit may still surface a clearly bounded local hint."""
+
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
+    config = app_module.llm_service.LlmConfig(
+        base_url="https://provider.example.test/v1",
+        api_key="test-only-key",
+        model="test-model",
+        realtime_model="test-realtime-model",
+        timeout_seconds=20,
+        is_mock=True,
+    )
+    monkeypatch.setattr(
+        app_module.llm_service.LlmConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(app_module.llm_service, "realtime_config", lambda value: value)
+    monkeypatch.setattr(
+        app_module,
+        "_ensure_llm_provider_allowed_for_derivation",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        app_module,
+        "run_realtime_intelligence",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("circuit suppression must not start semantic Provider work")
+        ),
+    )
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    app.state.streaming_llm_client = object()
+
+    class PiRuntime:
+        calls = 0
+
+        async def evaluate(self, _payload):
+            self.calls += 1
+            raise AssertionError("circuit suppression must not start Pi Provider work")
+
+    pi_runtime = PiRuntime()
+    app.state.pi_coach_runtime = pi_runtime
+    circuit = app.state.realtime_provider_circuit
+    identity = app_module._realtime_provider_identity(config)
+    for _ in range(2):
+        admission = circuit.acquire(identity)
+        assert admission.permit is not None
+        admission.permit.record_failure("timeout")
+    admission = circuit.acquire(identity)
+    assert admission.admitted is False
+
+    committed = app.state.v2_persistence.commit_final_and_enqueue(
+        meeting_id="circuit-local-reflex-meeting",
+        final_id="circuit-local-reflex-final",
+        segment_id="circuit-local-reflex-segment",
+        text="我还缺少",
+        normalized_text="我还缺少",
+        started_at_ms=0,
+        ended_at_ms=1_000,
+        evidence_hash="circuit-local-reflex-hash",
+        source_track="microphone",
+        now_ms=time.time_ns() // 1_000_000,
+    )
+    job = app.state.v2_persistence.get_job(committed["job_ids"]["intelligence"])
+
+    output = asyncio.run(app.state.v2_intelligence_job_handler_impl(job))
+
+    coach = output["coach"]
+    assert output["semantic"]["status"] == "suppressed_by_realtime_provider_circuit"
+    assert coach["status"] == "intervention"
+    assert coach["origin"] == "local_reflex"
+    assert coach["runtime_used"] == "local_reflex"
+    assert coach["intervention"]["origin"] == "local_reflex"
+    assert coach["pi_provider_attempted"] is False
+    assert coach["llm_called"] is False
+    assert coach["fallback_reason"] in {
+        "realtime_provider_recovery_probe_required",
+        "realtime_provider_circuit_open",
+    }
+    assert coach["agent_metrics"]["fallback_after_circuit_suppression"] is True
+    assert pi_runtime.calls == 0
+
+
+def test_direct_semantic_uses_pi_shared_circuit_and_cannot_take_expired_half_open_trial(
+    tmp_path,
+    monkeypatch,
+):
+    """A non-candidate final must not bypass known Pi gateway failure state."""
+
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
+    config = app_module.llm_service.LlmConfig(
+        base_url="https://provider.example.test/v1",
+        api_key="test-only-key",
+        model="test-model",
+        realtime_model="test-realtime-model",
+        timeout_seconds=20,
+        is_mock=True,
+    )
+    monkeypatch.setattr(
+        app_module.llm_service.LlmConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(app_module.llm_service, "realtime_config", lambda value: value)
+    monkeypatch.setattr(
+        app_module,
+        "_ensure_llm_provider_allowed_for_derivation",
+        lambda *_args, **_kwargs: None,
+    )
+    # Isolate the semantic-only route regardless of product trigger wording.
+    monkeypatch.setattr(
+        app_module,
+        "should_run_realtime_coach",
+        lambda *_args, **_kwargs: False,
+    )
+
+    clock = [0.0]
+    circuit = RealtimeProviderCircuit(
+        failure_threshold=1,
+        cooldown_seconds=1.0,
+        clock=lambda: clock[0],
+    )
+    monkeypatch.setattr(
+        app_module,
+        "RealtimeProviderCircuit",
+        lambda **_kwargs: circuit,
+    )
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+
+    provider_calls = 0
+
+    class ProviderTimeout(RuntimeError):
+        category = "timeout"
+
+    async def failing_direct_semantic(**kwargs):
+        nonlocal provider_calls
+        provider_calls += 1
+        kwargs["before_attempt"](1)
+        raise ProviderTimeout("bounded test timeout")
+
+    monkeypatch.setattr(app_module, "run_realtime_intelligence", failing_direct_semantic)
+    now_ms = time.time_ns() // 1_000_000
+    first = app.state.v2_persistence.commit_final_and_enqueue(
+        meeting_id="shared-circuit-first-direct",
+        final_id="shared-circuit-first-final",
+        segment_id="shared-circuit-first-segment",
+        text="我听到了。",
+        normalized_text="我听到了。",
+        started_at_ms=0,
+        ended_at_ms=1_000,
+        evidence_hash="shared-circuit-first-hash",
+        source_track="microphone",
+        now_ms=now_ms,
+    )
+    first_job = app.state.v2_persistence.get_job(first["job_ids"]["intelligence"])
+
+    with pytest.raises(ProviderTimeout):
+        asyncio.run(app.state.v2_intelligence_job_handler_impl(first_job))
+
+    assert provider_calls == 1
+    assert circuit.snapshot(app_module._realtime_provider_identity(config)).state == "open"
+
+    # The normal cooldown elapsed, but no explicit/short-budget recovery probe
+    # has succeeded. Direct semantic must fail fast instead of taking a new
+    # ten-second half-open request.
+    clock[0] = 2.0
+
+    async def forbidden_direct_semantic(**_kwargs):
+        nonlocal provider_calls
+        provider_calls += 1
+        raise AssertionError("direct semantic must not bypass shared Provider recovery")
+
+    monkeypatch.setattr(app_module, "run_realtime_intelligence", forbidden_direct_semantic)
+    second = app.state.v2_persistence.commit_final_and_enqueue(
+        meeting_id="shared-circuit-second-direct",
+        final_id="shared-circuit-second-final",
+        segment_id="shared-circuit-second-segment",
+        text="我知道了。",
+        normalized_text="我知道了。",
+        started_at_ms=0,
+        ended_at_ms=1_000,
+        evidence_hash="shared-circuit-second-hash",
+        source_track="microphone",
+        now_ms=time.time_ns() // 1_000_000,
+    )
+    second_job = app.state.v2_persistence.get_job(second["job_ids"]["intelligence"])
+
+    started = time.perf_counter()
+    output = asyncio.run(app.state.v2_intelligence_job_handler_impl(second_job))
+    elapsed = time.perf_counter() - started
+
+    assert provider_calls == 1
+    assert elapsed < 0.25
+    assert output["semantic"] == {
+        "status": "suppressed_by_realtime_provider_circuit",
+        "error_class": None,
+    }
+    availability = output["provider_availability"]
+    assert availability == {
+        "policy_version": "shared_realtime_provider.v1",
+        "scope": "direct_semantic",
+        "admitted": False,
+        "provider_attempted": False,
+        "provider_attempt_count": 0,
+        "circuit_scope_bypassed": None,
+        "admission_state": "open",
+        "admission_reason": "realtime_provider_recovery_probe_required",
+        "terminal_status": "denied",
+        "terminal_reason": "realtime_provider_recovery_probe_required",
+        "final_circuit_state": "open",
+        "final_failure_count": 1,
+        "final_failure_class": "timeout",
+    }
+    coach = output["coach"]
+    assert coach["origin"] == "direct_intelligence"
+    assert coach["status"] == "protected_silent"
+    assert coach["status_reason"] == "realtime_provider_recovery_probe_required"
+    assert coach["llm_called"] is False
+    assert coach["llm_call_status"] == "not_called"
+    assert coach["provider_access_scope"] == "direct_semantic"
+    assert coach["circuit_scope_bypassed"] is None
+    assert coach["provider_availability"] == availability
+    assert coach["durable_terminal_status"] == "denied"
+    assert coach["durable_terminal_reason"] == "realtime_provider_recovery_probe_required"
+    assert output["formal_event_context"]["llm_called"] is False
+    assert output["formal_event_context"]["llm_call_status"] == "not_called"
+
+    applied_events = [
+        event
+        for event in app.state.v2_persistence.list_events("shared-circuit-second-direct")
+        if event["type"] == "meeting.intelligence.applied"
+    ]
+    assert len(applied_events) == 1
+    durable_decision = applied_events[0]["payload"]["coach_decision"]
+    assert durable_decision["provider_availability"] == availability
+    assert durable_decision["llm_called"] is False
+    assert durable_decision["durable_terminal_status"] == "denied"
+    assert durable_decision["durable_terminal_reason"] == (
+        "realtime_provider_recovery_probe_required"
+    )
+
+
+def test_successful_direct_semantic_closes_shared_circuit_permit(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
+    config = app_module.llm_service.LlmConfig(
+        base_url="https://provider.example.test/v1",
+        api_key="test-only-key",
+        model="test-model",
+        realtime_model="test-realtime-model",
+        timeout_seconds=20,
+        is_mock=True,
+    )
+    monkeypatch.setattr(
+        app_module.llm_service.LlmConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(app_module.llm_service, "realtime_config", lambda value: value)
+    monkeypatch.setattr(
+        app_module,
+        "_ensure_llm_provider_allowed_for_derivation",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        app_module,
+        "should_run_realtime_coach",
+        lambda *_args, **_kwargs: False,
+    )
+
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    provider_calls = 0
+
+    async def successful_direct_semantic(**kwargs):
+        nonlocal provider_calls
+        provider_calls += 1
+        kwargs["before_attempt"](1)
+        return {
+            "response": RealtimeIntelligenceResponse((), None, (), None),
+            "idempotency_key": "direct-semantic-success",
+            "transport_mode": "streaming",
+            "fallback_reason": None,
+            "ttft_ms": 50,
+            "repair_ttft_ms": None,
+            "provider_attempt_count": 1,
+            "repair_attempted": False,
+            "timings": {},
+            "usage": None,
+            "response_id": "direct-semantic-response",
+            "model": config.model,
+            "finish_reason": "stop",
+        }
+
+    monkeypatch.setattr(app_module, "run_realtime_intelligence", successful_direct_semantic)
+    committed = app.state.v2_persistence.commit_final_and_enqueue(
+        meeting_id="shared-circuit-direct-success",
+        final_id="shared-circuit-direct-success-final",
+        segment_id="shared-circuit-direct-success-segment",
+        text="我知道了。",
+        normalized_text="我知道了。",
+        started_at_ms=0,
+        ended_at_ms=1_000,
+        evidence_hash="shared-circuit-direct-success-hash",
+        source_track="microphone",
+        now_ms=time.time_ns() // 1_000_000,
+    )
+    job = app.state.v2_persistence.get_job(committed["job_ids"]["intelligence"])
+
+    output = asyncio.run(app.state.v2_intelligence_job_handler_impl(job))
+
+    assert provider_calls == 1
+    assert output["provider_availability"]["scope"] == "direct_semantic"
+    assert output["provider_availability"]["admitted"] is True
+    assert output["provider_availability"]["provider_attempted"] is True
+    assert output["provider_availability"]["provider_attempt_count"] == 1
+    assert output["provider_availability"]["terminal_status"] == "completed"
+    assert output["provider_availability"]["terminal_reason"] == "provider_completed"
+    assert output["coach"]["llm_called"] is True
+    assert output["coach"]["llm_call_status"] == "called"
+    snapshot = app.state.realtime_provider_circuit.snapshot(
+        app_module._realtime_provider_identity(config)
+    )
+    assert snapshot.state == "closed"
+    assert snapshot.failure_count == 0
+
+
+def test_v2_pi_timeout_keeps_failure_and_projects_owner_gap_local_reflex(
+    tmp_path,
+    monkeypatch,
+):
+    """A timed-out Pi attempt may yield a separately labeled local safety hint."""
+
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
+    config = app_module.llm_service.LlmConfig(
+        base_url="https://provider.example.test/v1",
+        api_key="test-only-key",
+        model="test-model",
+        realtime_model="test-realtime-model",
+        timeout_seconds=20,
+        is_mock=True,
+    )
+    monkeypatch.setattr(
+        app_module.llm_service.LlmConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(app_module.llm_service, "realtime_config", lambda value: value)
+    monkeypatch.setattr(
+        app_module,
+        "_ensure_llm_provider_allowed_for_derivation",
+        lambda *_args, **_kwargs: None,
+    )
+
+    async def slow_coach(**kwargs):
+        kwargs["before_attempt"](0)
+        await asyncio.sleep(3.0)
+
+    monkeypatch.setattr(app_module, "run_realtime_coach_routed", slow_coach)
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    app.state.pi_coach_runtime = object()
+    now_ms = time.time_ns() // 1_000_000
+    meeting_id = "provider-timeout-owner-gap-meeting"
+    committed = app.state.v2_persistence.commit_final_and_enqueue(
+        meeting_id=meeting_id,
+        final_id="provider-timeout-owner-gap-final",
+        segment_id="provider-timeout-owner-gap-segment",
+        text="下周三上线，但是负责人目前还没有明确，监控指标和回滚方案也没有最终确定。",
+        normalized_text="下周三上线，但是负责人目前还没有明确，监控指标和回滚方案也没有最终确定。",
+        started_at_ms=0,
+        ended_at_ms=1_000,
+        evidence_hash="provider-timeout-owner-gap-hash",
+        source_track="microphone",
+        now_ms=now_ms,
+    )
+    job = app.state.v2_persistence.get_job(committed["job_ids"]["intelligence"])
+
+    output = asyncio.run(app.state.v2_intelligence_job_handler_impl(job))
+    coach = output["coach"]
+    assert coach["status"] == "intervention"
+    assert coach["runtime_requested"] == "pi"
+    assert coach["runtime_used"] == "local_reflex"
+    assert coach["fallback_reason"] == "provider_timeout"
+    assert coach["pi_provider_attempted"] is True
+    assert coach["intervention"]["origin"] == "local_reflex"
+    assert coach["intervention"]["local_reflex_kind"] == "missing_next_step"
+    assert coach["intervention"]["evidence_quote"]
+    assert output["execution_status"] == "runtime_fallback"
+    assert output["decision"] == "recommendation"
+    assert output["applied"]["coach_decision"]["runtime_used"] == "local_reflex"
+
+
+def test_v2_pi_response_validation_keeps_failure_and_projects_owner_gap_local_reflex(
+    tmp_path,
+    monkeypatch,
+):
+    """A rejected Pi response gets a visible local hint without being mislabeled as Pi."""
+
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
+    config = app_module.llm_service.LlmConfig(
+        base_url="https://provider.example.test/v1",
+        api_key="test-only-key",
+        model="test-model",
+        realtime_model="test-realtime-model",
+        timeout_seconds=20,
+        is_mock=True,
+    )
+    monkeypatch.setattr(
+        app_module.llm_service.LlmConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(app_module.llm_service, "realtime_config", lambda value: value)
+    monkeypatch.setattr(
+        app_module,
+        "_ensure_llm_provider_allowed_for_derivation",
+        lambda *_args, **_kwargs: None,
+    )
+
+    async def rejected_coach(**kwargs):
+        kwargs["before_attempt"](0)
+        return {
+            "intervention": None,
+            "status": "failed",
+            "status_reason": "IntelligenceResponseValidationError",
+            "fallback_error_code": "IntelligenceResponseValidationError",
+            "fallback_reason": "IntelligenceResponseValidationError",
+            "runtime_requested": "pi",
+            "runtime_used": "pi",
+            "pi_provider_attempted": True,
+            "agent_metrics": {
+                "response_validation_category": "semantic_safety",
+                "response_validation_error": "deadline_scope",
+                "fallback_suppressed": True,
+            },
+        }
+
+    monkeypatch.setattr(app_module, "run_realtime_coach_routed", rejected_coach)
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    app.state.pi_coach_runtime = object()
+    meeting_id = "provider-validation-owner-gap-meeting"
+    committed = app.state.v2_persistence.commit_final_and_enqueue(
+        meeting_id=meeting_id,
+        final_id="provider-validation-owner-gap-final",
+        segment_id="provider-validation-owner-gap-segment",
+        text="下周三上线，但是负责人目前还没有明确，监控指标和回滚方案也没有最终确定。",
+        normalized_text="下周三上线，但是负责人目前还没有明确，监控指标和回滚方案也没有最终确定。",
+        started_at_ms=0,
+        ended_at_ms=1_000,
+        evidence_hash="provider-validation-owner-gap-hash",
+        source_track="microphone",
+        now_ms=time.time_ns() // 1_000_000,
+    )
+    job = app.state.v2_persistence.get_job(committed["job_ids"]["intelligence"])
+
+    output = asyncio.run(app.state.v2_intelligence_job_handler_impl(job))
+    coach = output["coach"]
+    assert coach["status"] == "intervention"
+    assert coach["runtime_requested"] == "pi"
+    assert coach["runtime_used"] == "local_reflex"
+    assert coach["fallback_reason"] == "response_validation"
+    assert coach["fallback_error_code"] == "IntelligenceResponseValidationError"
+    assert coach["status_reason"] == "response_validation_local_reflex"
+    assert coach["pi_provider_attempted"] is True
+    assert coach["agent_metrics"]["fallback_after_response_validation"] is True
+    assert coach["agent_metrics"]["response_validation_category"] == "semantic_safety"
+    assert coach["intervention"]["origin"] == "local_reflex"
+    assert coach["intervention"]["local_reflex_kind"] == "missing_next_step"
+    assert output["execution_status"] == "runtime_fallback"
+    assert output["applied"]["coach_decision"]["runtime_used"] == "local_reflex"
+
+
+def test_timeout_local_reflex_can_be_resolved_by_a_later_pi_lifecycle_refresh(
+    tmp_path,
+    monkeypatch,
+):
+    """A fallback card remains an auditable episode without becoming Pi success."""
+
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
+    config = app_module.llm_service.LlmConfig(
+        base_url="https://provider.example.test/v1",
+        api_key="test-only-key",
+        model="test-model",
+        realtime_model="test-realtime-model",
+        timeout_seconds=20,
+        is_mock=True,
+    )
+    monkeypatch.setattr(
+        app_module.llm_service.LlmConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(app_module.llm_service, "realtime_config", lambda value: value)
+    monkeypatch.setattr(
+        app_module,
+        "_ensure_llm_provider_allowed_for_derivation",
+        lambda *_args, **_kwargs: None,
+    )
+
+    calls = 0
+
+    async def fake_coach(**kwargs):
+        nonlocal calls
+        calls += 1
+        kwargs["before_attempt"](0)
+        if calls == 1:
+            await asyncio.sleep(3.0)
+        request = kwargs["request"]
+        paragraph = request.new_paragraphs[0]
+        intervention = CoachIntervention(
+            event_type="commitment_risk",
+            title="补齐发布条件",
+            recommendation="先确认回滚负责人和验收条件。",
+            reason="当前发布承诺缺少可验证条件。",
+            evidence_segment_ids=(paragraph.id,),
+            evidence_quote=paragraph.text,
+            urgency="high",
+            confidence=0.99,
+        )
+        result = build_realtime_coach_provenance_decision(
+            request=request,
+            origin="pi",
+            status="intervention",
+            status_reason="intervention_submitted",
+            decision_reason="当前证据已补齐此前事项。",
+            intervention=intervention,
+        )
+        result.update(
+            {
+                "transport_mode": "pi_agent_jsonl",
+                "model": "test-realtime-model",
+                "runtime_requested": "pi",
+                "runtime_used": "pi",
+                "fallback_error_code": None,
+                "fallback_reason": None,
+                "ttft_ms": 20.0,
+                "decision_latency_ms": 40.0,
+                "timings": {
+                    "clock": "unix_epoch_ms",
+                    "started_at_ms": 1_000,
+                    "first_token_at_ms": 1_020,
+                    "completed_at_ms": 1_040,
+                },
+                "agent_metrics": {"turns": 1, "tool_calls": 1},
+            }
+        )
+        return result
+
+    monkeypatch.setattr(app_module, "run_realtime_coach_routed", fake_coach)
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    app.state.pi_coach_runtime = object()
+    # The real card remains under the normal local-reflex cooldown.  Advance
+    # that clock for this two-phase lifecycle test so the fresh answer reaches
+    # the lifecycle matcher instead of being a duplicate hint suppression.
+    monkeypatch.setattr(
+        app.state.v2_persistence,
+        "active_local_reflex_kind",
+        lambda *_args, **_kwargs: None,
+    )
+    meeting_id = "timeout-local-reflex-lifecycle"
+    base_ms = time.time_ns() // 1_000_000
+
+    first = app.state.v2_persistence.commit_final_and_enqueue(
+        meeting_id=meeting_id,
+        final_id="timeout-local-reflex-final-1",
+        segment_id="timeout-local-reflex-segment-1",
+        text="下周三上线，但是负责人还没有明确，监控指标和回滚方案也没有最终确定。",
+        normalized_text="下周三上线，但是负责人还没有明确，监控指标和回滚方案也没有最终确定。",
+        started_at_ms=0,
+        ended_at_ms=1_000,
+        evidence_hash="timeout-local-reflex-hash-1",
+        source_track="microphone",
+        now_ms=base_ms,
+    )
+    first_job = app.state.v2_persistence.get_job(first["job_ids"]["intelligence"])
+    first_output = asyncio.run(app.state.v2_intelligence_job_handler_impl(first_job))
+    first_decision = first_output["applied"]["coach_decision"]
+    assert first_decision["origin"] == "local_reflex"
+    assert first_decision["runtime_used"] == "local_reflex"
+    assert first_decision["pi_provider_attempted"] is True
+
+    # The first handler intentionally consumes the whole realtime window. A
+    # later final must be committed at its real arrival time so it receives a
+    # fresh bounded window of its own; carrying the synthetic ``base_ms``
+    # forward would make the second job already expired before admission.
+    second_now_ms = time.time_ns() // 1_000_000
+    second = app.state.v2_persistence.commit_final_and_enqueue(
+        meeting_id=meeting_id,
+        final_id="timeout-local-reflex-final-2",
+        segment_id="timeout-local-reflex-segment-2",
+        text="回滚负责人是王工，今天下午六点前确认监控阈值，安全测试和压测已经通过，问题已经解决。",
+        normalized_text="回滚负责人是王工，今天下午六点前确认监控阈值，安全测试和压测已经通过，问题已经解决。",
+        started_at_ms=1_100,
+        ended_at_ms=2_000,
+        evidence_hash="timeout-local-reflex-hash-2",
+        source_track="system_audio",
+        now_ms=second_now_ms,
+    )
+    second_job = app.state.v2_persistence.get_job(second["job_ids"]["intelligence"])
+    second_output = asyncio.run(app.state.v2_intelligence_job_handler_impl(second_job))
+    second_decision = second_output["applied"]["coach_decision"]
+
+    assert calls == 2
+    assert second_decision["origin"] == "pi"
+    assert second_decision["runtime_used"] == "pi"
+    assert second_decision["status"] == "protected_silent"
+    assert second_decision["status_reason"] == "lifecycle_resolved"
+    assert second_decision["lifecycle_refresh"] is True
+    assert second_decision["lifecycle_action"] == "deprioritize"
+    assert second_decision["supersedes_decision_id"] == first_decision["decision_id"]
+
+
+def test_v2_pi_realtime_circuit_suppression_persists_through_real_worker(
+    tmp_path,
+    monkeypatch,
+):
+    """Verify circuit-protected silence survives the complete worker path."""
+
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
+    config = app_module.llm_service.LlmConfig(
+        base_url="https://provider.example.test/v1",
+        api_key="test-only-key",
+        model="test-model",
+        realtime_model="test-realtime-model",
+        timeout_seconds=20,
+        is_mock=True,
+    )
+    monkeypatch.setattr(
+        app_module.llm_service.LlmConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(app_module.llm_service, "realtime_config", lambda value: value)
+    monkeypatch.setattr(
+        app_module,
+        "_ensure_llm_provider_allowed_for_derivation",
+        lambda *_args, **_kwargs: None,
+    )
+
+    semantic_calls = 0
+
+    async def forbidden_intelligence(**_kwargs):
+        nonlocal semantic_calls
+        semantic_calls += 1
+        raise AssertionError("an open realtime circuit must suppress semantic Provider work")
+
+    monkeypatch.setattr(app_module, "run_realtime_intelligence", forbidden_intelligence)
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+
+    class PiRuntime:
+        calls = 0
+
+        async def evaluate(self, _payload):
+            self.calls += 1
+            raise AssertionError("an open realtime circuit must suppress Pi work")
+
+    pi_runtime = PiRuntime()
+    app.state.pi_coach_runtime = pi_runtime
+    correction_calls: list[str] = []
+
+    async def correction_handler(job):
+        correction_calls.append(str(job["id"]))
+        return {"lane": "correction", "job_id": str(job["id"])}
+
+    app.state.v2_correction_job_handler_impl = correction_handler
+    circuit = app.state.realtime_provider_circuit
+    identity = app_module._realtime_provider_identity(
+        app_module.llm_service.realtime_config(config)
+    )
+    for failure_class in ("timeout", "provider_server"):
+        admission = circuit.acquire(identity)
+        assert admission.permit is not None
+        admission.permit.record_failure(failure_class)
+    assert circuit.snapshot(identity).state == "open"
+
+    meeting_id = "worker-circuit-suppressed-meeting"
+    now_ms = time.time_ns() // 1_000_000
+    # Make the two-second debounce boundary immediately claimable while
+    # retaining a healthy absolute deadline; this isolates circuit suppression
+    # from the deadline-budget branch without sleeping in the test.
+    committed = app.state.v2_persistence.commit_final_and_enqueue(
+        meeting_id=meeting_id,
+        final_id="worker-circuit-final",
+        segment_id="worker-circuit-segment",
+        text="我们一定周五上线。",
+        normalized_text="我们一定周五上线。",
+        started_at_ms=0,
+        ended_at_ms=1_000,
+        evidence_hash="worker-circuit-hash",
+        source_track="microphone",
+        now_ms=now_ms - 2_000,
+    )
+    intelligence_job_id = committed["job_ids"]["intelligence"]
+    correction_job_id = committed["job_ids"]["correction"]
+    executor = app.state.v2_executor
+    assert executor is not None
+
+    async def wait_for_terminal_jobs() -> None:
+        deadline = time.perf_counter() + 2.0
+        while True:
+            intelligence = app.state.v2_persistence.get_job(intelligence_job_id)
+            correction = app.state.v2_persistence.get_job(correction_job_id)
+            if intelligence["status"] == "succeeded" and correction["status"] == "succeeded":
+                return
+            if time.perf_counter() >= deadline:
+                raise AssertionError(
+                    f"worker did not finish jobs: intelligence={intelligence['status']!r}, "
+                    f"correction={correction['status']!r}"
+                )
+            await asyncio.sleep(0.005)
+
+    async def run_worker() -> float:
+        started = time.perf_counter()
+        try:
+            await executor.start()
+            await wait_for_terminal_jobs()
+            return time.perf_counter() - started
+        finally:
+            await executor.stop()
+
+    elapsed_s = asyncio.run(run_worker())
+    intelligence_job = app.state.v2_persistence.get_job(intelligence_job_id)
+    correction_job = app.state.v2_persistence.get_job(correction_job_id)
+    coach = intelligence_job["output"]["coach"]
+    assert intelligence_job["status"] == "succeeded"
+    assert correction_job["status"] == "succeeded"
+    assert correction_calls == [correction_job_id]
+    assert semantic_calls == 0
+    assert pi_runtime.calls == 0
+    assert intelligence_job["output"]["semantic"] == {
+        "status": "suppressed_by_realtime_provider_circuit",
+        "error_class": None,
+    }
+    assert coach["status"] == "protected_silent"
+    assert coach["status_reason"] == "realtime_provider_circuit_open"
+    assert coach["fallback_error_code"] == "realtime_provider_circuit_open"
+    assert coach["runtime_requested"] == "pi"
+    assert coach["runtime_used"] is None
+    assert coach["intervention"] is None
+    assert coach["agent_metrics"]["semantic_branch_status"] == "suppressed_by_realtime_provider_circuit"
+    assert coach["agent_metrics"]["realtime_circuit_state"] == "open"
+    assert coach["agent_metrics"]["realtime_circuit_admitted"] is False
+    assert coach["completed_at_ms"] >= coach["created_at_ms"]
+    assert coach["completed_at_ms"] - coach["created_at_ms"] < 1_000
+    timing = intelligence_job["timing"]
+    assert timing["valid"] is True
+    assert timing["excluded"] is False
+    assert timing["final_committed_at_ms"] == now_ms - 2_000
+    assert timing["job_created_at_ms"] == now_ms - 2_000
+    assert timing["job_started_at_ms"] >= timing["job_created_at_ms"]
+    assert timing["decision_completed_at_ms"] >= timing["job_started_at_ms"]
+    assert timing["projected_at_ms"] >= timing["decision_completed_at_ms"]
+    assert timing["final_to_projection_ms"] == (
+        timing["projected_at_ms"] - timing["final_committed_at_ms"]
+    )
+    assert elapsed_s < 2.0
+
+    response = TestClient(app).get(f"/v2/meetings/{meeting_id}/snapshot")
+    assert response.status_code == 200
+    projected_snapshot = response.json()
+    assert projected_snapshot["coach_decision"]["status_reason"] == "realtime_provider_circuit_open"
+    assert projected_snapshot["coach_decision"]["fallback_error_code"] == "realtime_provider_circuit_open"
+    events = app.state.v2_persistence.list_events(meeting_id)
+    applied_events = [event for event in events if event["type"] == "meeting.intelligence.applied"]
+    assert applied_events
+    applied_decision = applied_events[-1]["payload"]["coach_decision"]
+    assert applied_events[-1]["payload"]["timing"] == timing
+    assert applied_decision["status_reason"] == "realtime_provider_circuit_open"
+    assert applied_decision["fallback_error_code"] == "realtime_provider_circuit_open"
+
+
+def test_manual_provider_probe_success_closes_app_realtime_circuit(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gateway.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-probe-secret")
+    monkeypatch.setenv("LLM_GATEWAY_MODEL", "probe-model")
+    monkeypatch.setenv("LLM_GATEWAY_REALTIME_MODEL", "probe-fast-model")
+    monkeypatch.delenv("LLM_GATEWAY_IS_MOCK", raising=False)
+    app_module.llm_service.clear_runtime_config()
+    app = create_app(data_dir=tmp_path)
+    config = app_module.llm_service.LlmConfig.from_env()
+    assert config is not None
+    identity = app_module._realtime_provider_identity(
+        app_module.llm_service.realtime_config(config)
+    )
+    for failure_class in ("timeout", "transport"):
+        admission = app.state.realtime_provider_circuit.acquire(identity)
+        assert admission.permit is not None
+        admission.permit.record_failure(failure_class)
+    assert app.state.realtime_provider_circuit.snapshot(identity).state == "open"
+
+    monkeypatch.setattr(
+        app_module.llm_service,
+        "probe_gateway",
+        lambda probe_config: {
+            "operational": True,
+            "provider": probe_config.provider_label,
+            "model": probe_config.model,
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        },
+    )
+    response = TestClient(app).post(
+        "/providers/llm/probe",
+        headers={"X-Meeting-Copilot-Verification": "1"},
+    )
+
+    assert response.status_code == 200
+    assert app.state.realtime_provider_circuit.snapshot(identity).state == "closed"
+
+
+def test_provider_probe_cache_is_bypassed_after_realtime_circuit_failures(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gateway.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-probe-secret")
+    monkeypatch.setenv("LLM_GATEWAY_MODEL", "probe-model")
+    monkeypatch.setenv("LLM_GATEWAY_REALTIME_MODEL", "probe-fast-model")
+    monkeypatch.delenv("LLM_GATEWAY_IS_MOCK", raising=False)
+    app_module.llm_service.clear_runtime_config()
+    app = create_app(data_dir=tmp_path)
+    config = app_module.llm_service.LlmConfig.from_env()
+    assert config is not None
+    identity = app_module._realtime_provider_identity(
+        app_module.llm_service.realtime_config(config)
+    )
+    calls = 0
+
+    def probe(probe_config):
+        nonlocal calls
+        calls += 1
+        return {
+            "operational": True,
+            "provider": probe_config.provider_label,
+            "model": probe_config.model,
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+
+    monkeypatch.setattr(app_module.llm_service, "probe_gateway", probe)
+    client = TestClient(app)
+    headers = {"X-Meeting-Copilot-Verification": "1"}
+
+    first = client.post("/providers/llm/probe", headers=headers)
+    cached = client.post("/providers/llm/probe", headers=headers)
+    assert first.status_code == 200
+    assert cached.status_code == 200
+    assert cached.json()["cached"] is True
+    assert calls == 1
+
+    # A failure after the cached success makes that result stale. The next
+    # explicit probe must perform a paid request and reset the failure streak.
+    admission = app.state.realtime_provider_circuit.acquire(identity)
+    assert admission.permit is not None
+    admission.permit.record_failure("timeout")
+    degraded = app.state.realtime_provider_circuit.snapshot(identity)
+    assert degraded.state == "closed"
+    assert degraded.failure_count == 1
+
+    after_failure = client.post("/providers/llm/probe", headers=headers)
+    assert after_failure.status_code == 200
+    assert after_failure.json().get("cached") is not True
+    assert calls == 2
+    reset = app.state.realtime_provider_circuit.snapshot(identity)
+    assert reset.state == "closed"
+    assert reset.failure_count == 0
+    assert reset.identity_generation > degraded.identity_generation
+
+    for failure_class in ("timeout", "transport"):
+        admission = app.state.realtime_provider_circuit.acquire(identity)
+        assert admission.permit is not None
+        admission.permit.record_failure(failure_class)
+    assert app.state.realtime_provider_circuit.snapshot(identity).state == "open"
+
+    after_open = client.post("/providers/llm/probe", headers=headers)
+    assert after_open.status_code == 200
+    assert after_open.json().get("cached") is not True
+    assert calls == 3
+    reopened = app.state.realtime_provider_circuit.snapshot(identity)
+    assert reopened.state == "closed"
+    assert reopened.failure_count == 0
+
+
+def test_v2_pi_priority_does_not_lose_coach_to_slow_semantic_lane(
+    tmp_path,
+    monkeypatch,
+):
+    """A valid Pi card is projected even when semantic extraction is deferred."""
+
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
+    config = app_module.llm_service.LlmConfig(
+        base_url="https://provider.example.test/v1",
+        api_key="test-only-key",
+        model="test-model",
+        realtime_model="test-realtime-model",
+        timeout_seconds=20,
+        is_mock=True,
+    )
+    monkeypatch.setattr(
+        app_module.llm_service.LlmConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(app_module.llm_service, "realtime_config", lambda value: value)
+    monkeypatch.setattr(
+        app_module,
+        "_ensure_llm_provider_allowed_for_derivation",
+        lambda *_args, **_kwargs: None,
+    )
+    semantic_calls = 0
+
+    async def semantic_must_not_run(**_kwargs):
+        nonlocal semantic_calls
+        semantic_calls += 1
+        raise AssertionError("Pi priority must not start the competing semantic request")
+
+    async def fake_pi_coach(**kwargs):
+        kwargs["before_attempt"](1)
+        request = kwargs["request"]
+        paragraph = request.new_paragraphs[0]
+        intervention = CoachIntervention(
+            event_type="commitment_risk",
+            title="补齐发布条件",
+            recommendation="先确认负责人和回滚条件。",
+            reason="当前承诺还缺少执行边界。",
+            evidence_segment_ids=(paragraph.id,),
+            evidence_quote=paragraph.text,
+            urgency="high",
+            confidence=0.99,
+        )
+        result = build_realtime_coach_provenance_decision(
+            request=request,
+            origin="pi",
+            status="intervention",
+            status_reason="intervention_submitted",
+            decision_reason="证据足够且现在介入仍有价值。",
+            intervention=intervention,
+        )
+        now_ms = int(time.time() * 1_000)
+        result.update(
+            {
+                "transport_mode": "pi_agent_jsonl",
+                "model": "test-realtime-model",
+                "runtime_requested": "pi",
+                "runtime_used": "pi",
+                "fallback_error_code": None,
+                "fallback_reason": None,
+                "ttft_ms": 25.0,
+                "decision_latency_ms": 50.0,
+                "timings": {
+                    "clock": "unix_epoch_ms",
+                    "started_at_ms": now_ms,
+                    "first_token_at_ms": now_ms + 25,
+                    "completed_at_ms": now_ms + 50,
+                },
+                "agent_metrics": {"turns": 1, "tool_calls": 1},
+            }
+        )
+        return result
+
+    monkeypatch.setattr(app_module, "run_realtime_intelligence", semantic_must_not_run)
+    monkeypatch.setattr(app_module, "run_realtime_coach_routed", fake_pi_coach)
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    app.state.streaming_llm_client = object()
+
+    finalized_at_ms = time.time_ns() // 1_000_000
+    committed = app.state.v2_persistence.commit_final_and_enqueue(
+        meeting_id="pi-priority-meeting",
+        final_id="pi-priority-final",
+        segment_id="pi-priority-segment",
+        text="我们一定周五上线，但回滚负责人还没定。",
+        normalized_text="我们一定周五上线，但回滚负责人还没定。",
+        started_at_ms=0,
+        ended_at_ms=1_000,
+        evidence_hash="pi-priority-hash",
+        source_track="microphone",
+        now_ms=finalized_at_ms,
+    )
+    job = app.state.v2_persistence.get_job(committed["job_ids"]["intelligence"])
+
+    output = asyncio.run(app.state.v2_intelligence_job_handler_impl(job))
+
+    assert semantic_calls == 0
+    assert output["semantic"]["status"] == app_module.REALTIME_COACH_PI_PRIORITY_SEMANTIC_STATUS
+    assert output["coach"]["status"] == "intervention"
+    assert output["coach"]["runtime_used"] == "pi"
+    assert output["ttft_ms"] == 25.0
+    assert output["applied"]["coach_intervention"]["recommendation"] == "先确认负责人和回滚条件。"
+    assert output["applied"]["coach_intervention"]["say_this"] == "先确认负责人和回滚条件。"
+    assert output["applied"]["coach_intervention"]["why_now"] == "当前承诺还缺少执行边界。"
+    assert output["applied"]["follow_up"]["say_this"] == "先确认负责人和回滚条件。"
+    assert output["applied"]["follow_up"]["why_now"] == "当前承诺还缺少执行边界。"
+
+
+def test_v2_user_request_enters_pi_lane_without_fresh_candidate(
+    tmp_path,
+    monkeypatch,
+):
+    """An explicit Ask-AI request must not silently downgrade to direct LLM."""
+
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
+    config = app_module.llm_service.LlmConfig(
+        base_url="https://provider.example.test/v1",
+        api_key="test-only-key",
+        model="test-model",
+        realtime_model="test-realtime-model",
+        timeout_seconds=20,
+        is_mock=True,
+    )
+    monkeypatch.setattr(
+        app_module.llm_service.LlmConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(app_module.llm_service, "realtime_config", lambda value: value)
+    monkeypatch.setattr(
+        app_module,
+        "_ensure_llm_provider_allowed_for_derivation",
+        lambda *_args, **_kwargs: None,
+    )
+    semantic_calls = 0
+    coach_calls = 0
+
+    async def semantic_must_not_run(**_kwargs):
+        nonlocal semantic_calls
+        semantic_calls += 1
+        raise AssertionError("explicit user requests must use the requested Pi lane")
+
+    async def fake_pi_coach(**kwargs):
+        nonlocal coach_calls
+        coach_calls += 1
+        assert kwargs["priority_mode"] == "deep"
+        kwargs["before_attempt"](1)
+        request = kwargs["request"]
+        paragraph = request.context_paragraphs[-1]
+        intervention = CoachIntervention(
+            event_type="question_to_user",
+            title="补齐发布条件",
+            recommendation="我先确认负责人和回滚条件，再给出发布日期。",
+            reason="用户明确要求检查发布风险，当前原话仍缺少执行边界。",
+            evidence_segment_ids=(paragraph.id,),
+            evidence_quote=paragraph.text,
+            urgency="high",
+            confidence=0.95,
+        )
+        result = build_realtime_coach_provenance_decision(
+            request=request,
+            origin="pi",
+            status="intervention",
+            status_reason="intervention_submitted",
+            decision_reason="用户主动请求且证据支持立即澄清。",
+            intervention=intervention,
+        )
+        now_ms = int(time.time() * 1_000)
+        result.update(
+            {
+                "transport_mode": "pi_agent_jsonl",
+                "provider_lane": "pi_deep",
+                "model": "test-realtime-model",
+                "runtime_requested": "pi",
+                "runtime_used": "pi",
+                "fallback_error_code": None,
+                "fallback_reason": None,
+                "ttft_ms": 20.0,
+                "decision_latency_ms": 35.0,
+                "timings": {
+                    "clock": "unix_epoch_ms",
+                    "started_at_ms": now_ms,
+                    "first_token_at_ms": now_ms + 20,
+                    "completed_at_ms": now_ms + 35,
+                },
+                "agent_metrics": {"turns": 1, "tool_calls": 1},
+            }
+        )
+        return result
+
+    monkeypatch.setattr(app_module, "run_realtime_intelligence", semantic_must_not_run)
+    monkeypatch.setattr(app_module, "run_realtime_coach_routed", fake_pi_coach)
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    app.state.streaming_llm_client = object()
+
+    finalized_at_ms = time.time_ns() // 1_000_000
+    app.state.v2_persistence.commit_final_and_enqueue(
+        meeting_id="user-request-pi-meeting",
+        final_id="user-request-pi-final",
+        segment_id="user-request-pi-segment",
+        text="发布前还需要确认负责人和回滚时间。",
+        normalized_text="发布前还需要确认负责人和回滚时间。",
+        started_at_ms=0,
+        ended_at_ms=1_000,
+        evidence_hash="user-request-pi-hash",
+        source_track="microphone",
+        now_ms=finalized_at_ms,
+    )
+    client = TestClient(app)
+    response = client.post(
+        "/v2/meetings/user-request-pi-meeting/coach/request",
+        headers={"Idempotency-Key": "user-request-pi-1"},
+        json={"request": "请基于当前会议检查最重要的发布风险。"},
+    )
+    assert response.status_code == 202
+    job = app.state.v2_persistence.get_job(response.json()["job"]["id"])
+
+    output = asyncio.run(app.state.v2_intelligence_job_handler_impl(job))
+
+    assert semantic_calls == 0
+    assert coach_calls == 1
+    assert output["semantic"]["status"] == app_module.REALTIME_COACH_PI_PRIORITY_SEMANTIC_STATUS
+    assert output["coach"]["runtime_used"] == "pi"
+    assert output["coach"]["status"] == "intervention"
+    assert output["applied"]["coach_intervention"]["recommendation"] == (
+        "我先确认负责人和回滚条件，再给出发布日期。"
+    )
+    decision = output["applied"]["coach_decision"]
+    assert decision["pi_provider_attempted"] is True
+    assert decision["provider_lane"] == "pi_deep"
+    assert decision["eligible_candidate_events"][0]["episode_source_track"] == "microphone"
+    assert app.state.v2_persistence.recent_coach_episode_priorities(
+        "user-request-pi-meeting", since_ms=0
+    ) == {
+        decision["eligible_candidate_events"][0]["episode_id"]: decision[
+            "eligible_candidate_events"
+        ][0]["candidate_priority"]
+    }
+    reservation_events = [
+        event
+            for event in app.state.v2_persistence.list_events("user-request-pi-meeting")
+        if event["type"].startswith("meeting.realtime_provider.reservation")
+    ]
+    assert [event["payload"]["status"] for event in reservation_events] == [
+        "reserved",
+        "committed",
+    ]
+    assert reservation_events[-1]["payload"]["reason"] == "meeting.intelligence.applied"
+    assert app.state.provider_priority_arbiter.active_realtime_count == 0
+
+
+def test_v2_pi_intervention_is_deprioritized_by_resolving_evidence_and_kept_in_history(
+    tmp_path,
+    monkeypatch,
+):
+    """Exercise the production handler twice instead of projecting fixture events."""
+
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
+    config = app_module.llm_service.LlmConfig(
+        base_url="https://provider.example.test/v1",
+        api_key="test-only-key",
+        model="test-model",
+        realtime_model="test-realtime-model",
+        timeout_seconds=20,
+        is_mock=True,
+    )
+    monkeypatch.setattr(
+        app_module.llm_service.LlmConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(app_module.llm_service, "realtime_config", lambda value: value)
+    monkeypatch.setattr(
+        app_module,
+        "_ensure_llm_provider_allowed_for_derivation",
+        lambda *_args, **_kwargs: None,
+    )
+
+    async def fake_intelligence(**_kwargs):
+        now = time.perf_counter()
+        return {
+            "response": RealtimeIntelligenceResponse((), None, (), None),
+            "transport_mode": "test",
+            "ttft_ms": 1.0,
+            "timings": {
+                "started_at": now,
+                "connected_at": now,
+                "first_token_at": now,
+                "completed_at": now,
+            },
+            "usage": None,
+            "model": "test-realtime-model",
+        }
+
+    pi_calls = 0
+
+    async def fake_pi_coach(**kwargs):
+        nonlocal pi_calls
+        pi_calls += 1
+        request = kwargs["request"]
+        paragraph = request.new_paragraphs[0]
+        intervention = CoachIntervention(
+            event_type="commitment_risk",
+            title="补齐发布条件",
+            recommendation="先确认回滚负责人、压测和安全测试条件。",
+            reason="当前发布承诺缺少负责人和可验证条件。",
+            evidence_segment_ids=(paragraph.id,),
+            evidence_quote=paragraph.text,
+            urgency="high",
+            confidence=0.99,
+        )
+        result = build_realtime_coach_provenance_decision(
+            request=request,
+            origin="pi",
+            status="intervention",
+            status_reason="intervention_submitted",
+            decision_reason="负责人和发布条件仍未闭环。",
+            intervention=intervention,
+        )
+        now_ms = int(time.time() * 1_000)
+        result.update(
+            {
+                "transport_mode": "pi_agent_jsonl",
+                "model": "test-realtime-model",
+                "runtime_requested": "pi",
+                "runtime_used": "pi",
+                "fallback_error_code": None,
+                "fallback_reason": None,
+                "ttft_ms": 20.0,
+                "decision_latency_ms": 40.0,
+                "timings": {
+                    "clock": "unix_epoch_ms",
+                    "started_at_ms": now_ms,
+                    "first_token_at_ms": now_ms + 20,
+                    "completed_at_ms": now_ms + 40,
+                },
+                "agent_metrics": {"turns": 1, "tool_calls": 1},
+            }
+        )
+        return result
+
+    monkeypatch.setattr(app_module, "run_realtime_intelligence", fake_intelligence)
+    monkeypatch.setattr(app_module, "run_realtime_coach_routed", fake_pi_coach)
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    app.state.streaming_llm_client = object()
+    persistence = app.state.v2_persistence
+    meeting_id = "pi-lifecycle-production-entry"
+    base_ms = time.time_ns() // 1_000_000
+
+    first_commit = persistence.commit_final_and_enqueue(
+        meeting_id=meeting_id,
+        final_id="pi-lifecycle-final-1",
+        segment_id="pi-lifecycle-segment-1",
+        text="我们一定周五上线，但回滚负责人还没定。",
+        normalized_text="我们一定周五上线，但回滚负责人还没定。",
+        started_at_ms=0,
+        ended_at_ms=1_000,
+        evidence_hash="pi-lifecycle-hash-1",
+        source_track="microphone",
+        now_ms=base_ms,
+    )
+    first_job = persistence.claim_next_job(
+        worker_id="pi-lifecycle-worker-1",
+        lane="intelligence",
+        now_ms=base_ms + 2_500,
+        lease_ms=30_000,
+    )
+    assert first_job is not None
+    assert first_job["id"] == first_commit["job_ids"]["intelligence"]
+    first_output = asyncio.run(app.state.v2_intelligence_job_handler_impl(first_job))
+    assert persistence.complete_job(
+        job_id=first_job["id"],
+        worker_id="pi-lifecycle-worker-1",
+        now_ms=base_ms + 2_600,
+        output=first_output,
+    ) is not None
+    first_decision = first_output["applied"]["coach_decision"]
+    assert first_decision["origin"] == "pi"
+    assert first_decision["status"] == "intervention"
+    assert first_decision["lifecycle_action"] == "retain"
+    assert first_decision["runtime_requested"] == "pi"
+    assert first_decision["runtime_used"] == "pi"
+    assert first_decision["fallback_error_code"] is None
+    assert first_decision["fallback_reason"] is None
+
+    second_commit = persistence.commit_final_and_enqueue(
+        meeting_id=meeting_id,
+        final_id="pi-lifecycle-final-2",
+        segment_id="pi-lifecycle-segment-2",
+        text="回滚负责人是王工，安全测试和压测已经通过。",
+        normalized_text="回滚负责人是王工，安全测试和压测已经通过。",
+        started_at_ms=1_100,
+        ended_at_ms=2_000,
+        evidence_hash="pi-lifecycle-hash-2",
+        source_track="microphone",
+        now_ms=base_ms + 3_000,
+    )
+    second_job = persistence.claim_next_job(
+        worker_id="pi-lifecycle-worker-2",
+        lane="intelligence",
+        now_ms=base_ms + 5_500,
+        lease_ms=30_000,
+    )
+    assert second_job is not None
+    assert second_job["id"] == second_commit["job_ids"]["intelligence"]
+    second_output = asyncio.run(app.state.v2_intelligence_job_handler_impl(second_job))
+    assert persistence.complete_job(
+        job_id=second_job["id"],
+        worker_id="pi-lifecycle-worker-2",
+        now_ms=base_ms + 5_600,
+        output=second_output,
+    ) is not None
+
+    assert pi_calls == 1
+    second_decision = second_output["applied"]["coach_decision"]
+    assert second_decision["status"] == "not_triggered"
+    assert second_decision["lifecycle_action"] == "deprioritize"
+    assert second_decision["runtime_requested"] == "pi"
+    assert second_decision["runtime_used"] is None
+    assert second_decision["supersedes_decision_id"] == first_decision["decision_id"]
+
+    formal_events = persistence.list_events(meeting_id)
+    assert app_module._latest_formal_coach_follow_up(formal_events) is None
+    history = app_module._bounded_formal_coach_history(formal_events)
+    assert len(history) == 1
+    assert history[0]["decision_id"] == first_decision["decision_id"]
+    assert history[0]["lifecycle_action"] == "deprioritize"
+    assert history[0]["superseded_by"] == second_decision["decision_id"]
+    applied_events = [
+        event
+        for event in formal_events
+        if event["type"] == "meeting.intelligence.applied"
+    ]
+    assert len(applied_events) == 2
+    assert applied_events[0]["payload"]["coach_intervention"]["decision_id"] == first_decision["decision_id"]
+    assert applied_events[1]["payload"]["coach_intervention"] is None
+
+
+def _configure_pi_handler_for_reservation_test(monkeypatch):
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
+    config = app_module.llm_service.LlmConfig(
+        base_url="https://provider.example.test/v1",
+        api_key="test-only-key",
+        model="test-model",
+        realtime_model="test-realtime-model",
+        timeout_seconds=20,
+        is_mock=True,
+    )
+    monkeypatch.setattr(
+        app_module.llm_service.LlmConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(app_module.llm_service, "realtime_config", lambda value: value)
+    monkeypatch.setattr(
+        app_module,
+        "_ensure_llm_provider_allowed_for_derivation",
+        lambda *_args, **_kwargs: None,
+    )
+    return config
+
+
+def _reservation_test_coach_result(request, *, runtime_used="pi"):
+    paragraph = request.new_paragraphs[0]
+    intervention = CoachIntervention(
+        event_type="commitment_risk",
+        title="补齐发布条件",
+        recommendation="先确认负责人和回滚条件。",
+        reason="当前发布承诺缺少负责人和可验证条件。",
+        evidence_segment_ids=(paragraph.id,),
+        evidence_quote=paragraph.text,
+        urgency="high",
+        confidence=0.99,
+    )
+    origin = "pi" if runtime_used == "pi" else "direct_fallback"
+    result = build_realtime_coach_provenance_decision(
+        request=request,
+        origin=origin,
+        status="intervention",
+        status_reason="intervention_submitted",
+        decision_reason="证据足够且现在介入仍有价值。",
+        intervention=intervention,
+    )
+    now_ms = int(time.time() * 1_000)
+    result.update(
+        {
+            "transport_mode": "test",
+            "model": "test-realtime-model",
+            "runtime_requested": "pi",
+            "runtime_used": runtime_used,
+            "fallback_error_code": "pi_unavailable" if runtime_used == "direct" else None,
+            "fallback_reason": "runtime_unavailable" if runtime_used == "direct" else None,
+            "ttft_ms": 25.0,
+            "decision_latency_ms": 50.0,
+            "timings": {
+                "clock": "unix_epoch_ms",
+                "started_at_ms": now_ms,
+                "first_token_at_ms": now_ms + 25,
+                "completed_at_ms": now_ms + 50,
+            },
+            "agent_metrics": {
+                "turns": 0 if runtime_used == "direct" else 1,
+                "tool_calls": 0,
+            },
+        }
+    )
+    return result
+
+
+def _reservation_test_job(app, meeting_id: str):
+    now_ms = time.time_ns() // 1_000_000
+    committed = app.state.v2_persistence.commit_final_and_enqueue(
+        meeting_id=meeting_id,
+        final_id=f"{meeting_id}-final",
+        segment_id=f"{meeting_id}-segment",
+        text="我们一定周五上线，但回滚负责人还没定。",
+        normalized_text="我们一定周五上线，但回滚负责人还没定。",
+        started_at_ms=0,
+        ended_at_ms=1_000,
+        evidence_hash=f"{meeting_id}-hash",
+        source_track="microphone",
+        now_ms=now_ms,
+    )
+    return app.state.v2_persistence.get_job(committed["job_ids"]["intelligence"])
+
+
+def test_pi_reservation_released_for_direct_fallback_before_provider_attempt(
+    tmp_path,
+    monkeypatch,
+):
+    _configure_pi_handler_for_reservation_test(monkeypatch)
+
+    async def forbidden_semantic(**_kwargs):
+        raise AssertionError("semantic lane must remain deferred for a coach candidate")
+
+    async def direct_fallback(**kwargs):
+        return _reservation_test_coach_result(kwargs["request"], runtime_used="direct")
+
+    monkeypatch.setattr(app_module, "run_realtime_intelligence", forbidden_semantic)
+    monkeypatch.setattr(app_module, "run_realtime_coach_routed", direct_fallback)
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    meeting_id = "pi-reservation-direct-fallback"
+    job = _reservation_test_job(app, meeting_id)
+
+    output = asyncio.run(app.state.v2_intelligence_job_handler_impl(job))
+
+    assert output["coach"]["runtime_used"] == "direct"
+    assert output["coach"]["pi_provider_attempted"] is False
+    events = app.state.v2_persistence.list_events(meeting_id)
+    reservation_events = [
+        event
+        for event in events
+        if event["type"].startswith("meeting.realtime_provider.reservation")
+    ]
+    assert [event["payload"]["status"] for event in reservation_events] == [
+        "reserved",
+        "released",
+    ]
+    assert reservation_events[-1]["payload"]["reason"] == "direct_fallback"
+    assert app.state.v2_persistence.recent_coach_episode_priorities(
+        meeting_id, since_ms=0
+    ) == {}
+
+
+def test_pi_reservation_is_retained_when_projection_fails_after_provider_attempt(
+    tmp_path,
+    monkeypatch,
+):
+    _configure_pi_handler_for_reservation_test(monkeypatch)
+
+    async def forbidden_semantic(**_kwargs):
+        raise AssertionError("semantic lane must remain deferred for a coach candidate")
+
+    async def fake_pi(**kwargs):
+        kwargs["before_attempt"](1)
+        return _reservation_test_coach_result(kwargs["request"])
+
+    monkeypatch.setattr(app_module, "run_realtime_intelligence", forbidden_semantic)
+    monkeypatch.setattr(app_module, "run_realtime_coach_routed", fake_pi)
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    persistence = app.state.v2_persistence
+    meeting_id = "pi-reservation-projection-failure"
+    job = _reservation_test_job(app, meeting_id)
+
+    def fail_projection(**_kwargs):
+        raise RuntimeError("projection write failed")
+
+    monkeypatch.setattr(persistence, "apply_intelligence_response", fail_projection)
+    with pytest.raises(RuntimeError, match="projection write failed"):
+        asyncio.run(app.state.v2_intelligence_job_handler_impl(job))
+
+    events = persistence.list_events(meeting_id)
+    reservation_events = [
+        event
+        for event in events
+        if event["type"].startswith("meeting.realtime_provider.reservation")
+    ]
+    assert [event["payload"]["status"] for event in reservation_events] == ["reserved"]
+    now_ms = time.time_ns() // 1_000_000
+    priorities = persistence.recent_coach_episode_priorities(
+        meeting_id,
+        since_ms=max(0, now_ms - app_module.REALTIME_COACH_RESERVATION_TTL_MS),
+        now_ms=now_ms,
+    )
+    assert len(priorities) == 1
+
+    # A failed projection intentionally leaves the bounded crash-protection
+    # lease open; clean it after asserting that invariant in this temp DB.
+    reservation_id = reservation_events[0]["payload"]["reservation_id"]
+    persistence.finish_realtime_provider_attempt(
+        meeting_id=meeting_id,
+        reservation_id=reservation_id,
+        status="released",
+        reason="test_cleanup",
+        finished_at_ms=now_ms,
+    )
+    assert persistence.recent_coach_episode_priorities(
+        meeting_id, since_ms=0, now_ms=now_ms
+    ) == {}
 
 
 def _formal_projection_event(
@@ -97,10 +3128,712 @@ def test_coach_history_retains_advice_across_silent_rounds_and_deduplicates():
     assert history[0]["reason"] == repeated["reason"]
     assert history[0]["history_id"] == "event-3"
     assert history[-1]["formal_evidence"]["segment_ids"] == ["segment-4"]
-    latest = app_module._latest_formal_coach_follow_up(events)
-    assert latest is not None
-    assert latest["question"] == second["question"]
-    assert latest["formal_evidence"]["segment_ids"] == ["segment-4"]
+    # The newest silent decision clears the current card; history remains
+    # available for review without reviving the stale recommendation.
+    assert app_module._latest_formal_coach_follow_up(events) is None
+
+
+def test_coach_runtime_history_preserves_pi_failures_without_reviving_cards():
+    timeout = _formal_projection_event(
+        seq=1,
+        event_type="meeting.intelligence.applied",
+        projection=None,
+    )
+    timeout["payload"]["coach_decision"] = {
+        "decision_id": "coach-timeout-1",
+        "status": "timed_out",
+        "status_reason": "provider_timeout",
+        "origin": "pi",
+        "runtime_requested": "pi",
+        "runtime_used": "pi",
+        "pi_provider_attempted": True,
+        "llm_called": True,
+        "llm_call_status": "called",
+        "job_id": "job-timeout-1",
+        "created_at_ms": 1_000,
+        "completed_at_ms": 3_000,
+    }
+    fallback = _formal_projection_event(
+        seq=2,
+        event_type="meeting.intelligence.applied",
+        projection=None,
+    )
+    fallback["payload"]["coach_decision"] = {
+        "decision_id": "coach-local-1",
+        "status": "intervention",
+        "status_reason": "intervention_submitted",
+        "origin": "local_reflex",
+        "runtime_requested": "pi",
+        "runtime_used": "local_reflex",
+        "pi_provider_attempted": False,
+        "llm_called": False,
+        "llm_call_status": "not_called",
+        "created_at_ms": 4_000,
+    }
+
+    history = app_module._bounded_coach_runtime_history([timeout, fallback])
+
+    assert history[0]["outcome"] == "failure"
+    assert history[0]["status_reason"] == "provider_timeout"
+    assert history[0]["origin"] == "pi"
+    assert history[1]["outcome"] == "local_reflex_fallback"
+    assert history[1]["pi_provider_attempted"] is False
+    assert app_module._bounded_formal_coach_history([timeout, fallback]) == []
+
+
+@pytest.mark.parametrize(
+    ("replacement_status", "replacement_action", "expected_history_action"),
+    [
+        ("intervention", "retain", "deprioritize"),
+        ("stale", "retract", "retract"),
+    ],
+)
+def test_coach_history_projects_append_only_supersession_links(
+    replacement_status,
+    replacement_action,
+    expected_history_action,
+):
+    first = _formal_projection_event(
+        seq=1,
+        event_type="meeting.intelligence.applied",
+        projection=None,
+    )
+    first["payload"].update(
+        {
+            "coach_intervention": {
+                "recommendation": "先确认回滚负责人。",
+                "reason": "当前承诺缺少负责人。",
+                "evidence_segment_ids": ["segment-1"],
+                "evidence_quote": "周五上线",
+                "urgency": "high",
+                "event_type": "commitment_risk",
+                "decision_id": "coach-decision-1",
+                "status": "intervention",
+                "lifecycle_action": "retain",
+            },
+            "coach_decision": {
+                "decision_id": "coach-decision-1",
+                "status": "intervention",
+                "lifecycle_action": "retain",
+            },
+        }
+    )
+    replacement = _formal_projection_event(
+        seq=2,
+        event_type="meeting.intelligence.applied",
+        projection=None,
+    )
+    replacement["payload"]["coach_decision"] = {
+        "decision_id": "coach-decision-2",
+        "status": replacement_status,
+        "lifecycle_action": replacement_action,
+        "supersedes_decision_id": "coach-decision-1",
+    }
+
+    history = app_module._bounded_formal_coach_history([first, replacement])
+
+    assert history[0]["decision_id"] == "coach-decision-1"
+    assert history[0]["superseded_by"] == "coach-decision-2"
+    assert history[0]["lifecycle_action"] == expected_history_action
+
+
+def test_coach_history_marks_lifecycle_resolution_separately_from_supersession():
+    first = _formal_projection_event(seq=1, event_type="meeting.intelligence.applied", projection=None)
+    first["payload"].update({
+        "coach_intervention": {
+            "recommendation": "先确认回滚负责人。", "reason": "当前承诺缺少负责人。",
+            "evidence_segment_ids": ["segment-1"], "evidence_quote": "周五上线",
+            "urgency": "high", "event_type": "commitment_risk", "decision_id": "coach-1",
+        },
+        "coach_decision": {"decision_id": "coach-1", "status": "intervention", "lifecycle_action": "retain"},
+    })
+    resolved = _formal_projection_event(seq=2, event_type="meeting.intelligence.applied", projection=None)
+    resolved["payload"]["coach_decision"] = {
+        "decision_id": "coach-2", "status": "protected_silent", "lifecycle_action": "deprioritize",
+        "status_reason": "lifecycle_resolved", "supersedes_decision_id": "coach-1",
+    }
+    history = app_module._bounded_formal_coach_history([first, resolved])
+    assert history[0]["lifecycle_action"] == "deprioritize"
+    assert history[0]["lifecycle_status"] == "resolved"
+
+
+def test_coach_due_work_items_are_rebuilt_from_retained_persistent_history():
+    event = _formal_projection_event(seq=1, event_type="meeting.intelligence.applied", projection=None)
+    event["payload"].update({
+        "coach_intervention": {
+            "recommendation": "先确认回滚负责人。", "reason": "当前承诺缺少负责人。",
+            "evidence_segment_ids": ["segment-1"], "evidence_quote": "周五上线",
+            "urgency": "high", "event_type": "commitment_risk", "decision_id": "coach-due",
+            "valid_until_ms": 1_000,
+        },
+        "coach_decision": {
+            "decision_id": "coach-due", "status": "intervention", "lifecycle_action": "retain",
+        },
+    })
+    assert app_module._coach_due_work_items([event], now_ms=1_001) == [{
+        "item_id": "coach-due", "status": "due", "next_check_at_ms": 1_000,
+        "coach_event_type": "commitment_risk", "title": None,
+        "evidence_segment_ids": ["segment-1"], "evidence_quote": "周五上线",
+        "created_at_ms": 1_000,
+    }]
+    assert app_module._coach_due_work_items([event], now_ms=999) == []
+
+
+def test_coach_history_keeps_same_wording_when_decision_ids_differ_for_supersession():
+    first = _formal_projection_event(
+        seq=1,
+        event_type="meeting.intelligence.applied",
+        projection=None,
+    )
+    first["payload"].update(
+        {
+            "coach_intervention": {
+                "recommendation": "先确认回滚负责人。",
+                "reason": "当前承诺缺少负责人。",
+                "evidence_segment_ids": ["segment-1"],
+                "evidence_quote": "周五上线",
+                "urgency": "high",
+                "event_type": "commitment_risk",
+                "decision_id": "coach-decision-1",
+                "status": "intervention",
+            },
+            "coach_decision": {
+                "decision_id": "coach-decision-1",
+                "status": "intervention",
+                "lifecycle_action": "retain",
+            },
+        }
+    )
+    replacement = _formal_projection_event(
+        seq=2,
+        event_type="meeting.intelligence.applied",
+        projection=None,
+    )
+    replacement["payload"].update(
+        {
+            "coach_intervention": {
+                "recommendation": "先确认回滚负责人。",
+                "reason": "负责人仍需要再次确认。",
+                "evidence_segment_ids": ["segment-2"],
+                "evidence_quote": "回滚负责人",
+                "urgency": "high",
+                "event_type": "commitment_risk",
+                "decision_id": "coach-decision-2",
+                "status": "intervention",
+            },
+            "coach_decision": {
+                "decision_id": "coach-decision-2",
+                "status": "intervention",
+                "lifecycle_action": "retain",
+                "supersedes_decision_id": "coach-decision-1",
+            },
+        }
+    )
+
+    history = app_module._bounded_formal_coach_history([first, replacement])
+
+    assert [item["decision_id"] for item in history] == [
+        "coach-decision-1",
+        "coach-decision-2",
+    ]
+    assert history[0]["superseded_by"] == "coach-decision-2"
+    assert history[0]["lifecycle_action"] == "deprioritize"
+
+
+def test_ended_coach_projection_clears_current_state_and_retains_history():
+    history = [{"decision_id": "coach-decision-1", "question": "确认负责人"}]
+    projected = app_module._clear_ended_coach_projection(
+        {
+            "follow_up": {"question": "确认负责人"},
+            "coach_intervention": {"question": "确认负责人"},
+            "semantic_follow_up": {"question": "负责人是谁？"},
+            "coach_decision": {"decision_id": "coach-decision-1", "status": "intervention"},
+            "coach_history": history,
+            "runtime": {
+                "phase": "ended",
+                "ai": {
+                    "state": "active",
+                    "capabilities": {
+                        "proactive_suggestions": {
+                            "state": "active",
+                            "label": "Pi 教练已分析正文",
+                        }
+                    },
+                },
+            },
+        }
+    )
+
+    assert projected["follow_up"] is None
+    assert projected["coach_intervention"] is None
+    assert projected["semantic_follow_up"] is None
+    assert projected["coach_decision"] is None
+    assert projected["coach_history"] == history
+    assert projected["runtime"]["ai"]["capabilities"]["proactive_suggestions"] == {
+        "state": "idle",
+        "label": "Pi 教练已结束",
+        "detail": "会中建议已停止，历史建议保留在会议记录中",
+        "decision": None,
+    }
+
+
+def test_live_coach_projection_is_not_cleared():
+    source = {
+        "follow_up": {"question": "确认负责人"},
+        "coach_decision": {"status": "intervention"},
+        "runtime": {"phase": "live"},
+    }
+
+    assert app_module._clear_ended_coach_projection(source) == source
+
+
+def test_partition_coach_candidates_preserves_full_cooldown_audit():
+    request = app_module.RealtimeIntelligenceRequest.from_payload(
+        meeting_id="meeting-episode",
+        state_revision=1,
+        context_paragraphs=[
+            {
+                "id": "segment-anchor",
+                "text": "我们先把背景说完整。",
+                "revision": 1,
+                "start_ms": 0,
+                "end_ms": 1_000,
+                "speaker": "Alice",
+                "source_track": "microphone",
+            }
+        ],
+        new_paragraphs=[
+            {
+                "id": "segment-1",
+                "text": "不过周五一定上线吗？",
+                "revision": 1,
+                "start_ms": 1_100,
+                "end_ms": 2_000,
+                "speaker": "Alice",
+                "source_track": "microphone",
+            },
+            {
+                "id": "system-segment",
+                "text": "另一个轨道的问题。",
+                "revision": 1,
+                "start_ms": 1_200,
+                "end_ms": 1_900,
+                "speaker": "Bob",
+                "source_track": "system_audio",
+            },
+            {
+                "id": "other-speaker-segment",
+                "text": "同一轨道换人后的问题。",
+                "revision": 1,
+                "start_ms": 2_100,
+                "end_ms": 2_900,
+                "speaker": "Bob",
+                "source_track": "microphone",
+            },
+        ],
+        rolling_state={},
+    )
+    detected = (
+        app_module.CoachCandidateEvent(
+            event_type="question_pending",
+            evidence_segment_ids=("segment-1",),
+            reason="question",
+            candidate_key="candidate-question",
+        ),
+        app_module.CoachCandidateEvent(
+            event_type="commitment_without_condition",
+            evidence_segment_ids=("segment-1",),
+            reason="commitment",
+            candidate_key="candidate-commitment",
+        ),
+        app_module.CoachCandidateEvent(
+            event_type="question_pending",
+            evidence_segment_ids=("system-segment",),
+            reason="other track question",
+            candidate_key="candidate-other-track",
+        ),
+        app_module.CoachCandidateEvent(
+            event_type="question_pending",
+            evidence_segment_ids=("other-speaker-segment",),
+            reason="other speaker question",
+            candidate_key="candidate-other-speaker",
+        ),
+    )
+    payloads = app_module._coach_candidate_payloads(detected, request=request)
+    microphone_episode = payloads["candidate-question"]["episode_id"]
+    other_track_episode = payloads["candidate-other-track"]["episode_id"]
+    other_speaker_episode = payloads["candidate-other-speaker"]["episode_id"]
+
+    assert payloads["candidate-question"]["episode_anchor_id"] == "segment-anchor"
+    assert payloads["candidate-question"]["episode_source_track"] == "microphone"
+    assert payloads["candidate-question"]["episode_speaker"] == "Alice"
+    assert payloads["candidate-question"]["candidate_priority"] == 100
+    assert payloads["candidate-commitment"]["episode_id"] == microphone_episode
+    assert other_track_episode != microphone_episode
+    assert other_speaker_episode not in {microphone_episode, other_track_episode}
+
+    eligible, suppressed = app_module._partition_coach_candidates(
+        detected,
+        candidate_payloads=payloads,
+        cooled_episode_priorities={microphone_episode: 95},
+    )
+
+    assert [item.candidate_key for item in detected] == [
+        "candidate-question",
+        "candidate-commitment",
+        "candidate-other-track",
+        "candidate-other-speaker",
+    ]
+    assert [item.candidate_key for item in eligible] == [
+        "candidate-question",
+        "candidate-other-track",
+        "candidate-other-speaker",
+    ]
+    assert suppressed == ("candidate-commitment",)
+
+    upgraded_eligible, upgraded_suppressed = app_module._partition_coach_candidates(
+        detected,
+        candidate_payloads=payloads,
+        cooled_episode_priorities={microphone_episode: 100},
+    )
+
+    assert [item.candidate_key for item in upgraded_eligible] == [
+        "candidate-other-track",
+        "candidate-other-speaker",
+    ]
+    assert upgraded_suppressed == (
+        "candidate-question",
+        "candidate-commitment",
+    )
+
+
+def test_coach_episode_anchor_resets_after_a_real_pause():
+    request = app_module.RealtimeIntelligenceRequest.from_payload(
+        meeting_id="meeting-paused-episode",
+        state_revision=1,
+        context_paragraphs=[
+            {
+                "id": "earlier-segment",
+                "text": "前一个话题已经说完。",
+                "revision": 1,
+                "start_ms": 0,
+                "end_ms": 1_000,
+                "speaker": "Alice",
+                "source_track": "microphone",
+            }
+        ],
+        new_paragraphs=[
+            {
+                "id": "later-segment",
+                "text": "十秒后开始另一个问题吗？",
+                "revision": 1,
+                "start_ms": 10_000,
+                "end_ms": 11_000,
+                "speaker": "Alice",
+                "source_track": "microphone",
+            }
+        ],
+        rolling_state={},
+    )
+    candidate = app_module.CoachCandidateEvent(
+        event_type="question_pending",
+        evidence_segment_ids=("later-segment",),
+        reason="new question",
+        candidate_key="candidate-after-pause",
+    )
+
+    payload = app_module._coach_candidate_payloads((candidate,), request=request)[
+        candidate.candidate_key
+    ]
+
+    assert payload["episode_anchor_id"] == "later-segment"
+
+
+def test_coach_episode_identity_stays_stable_with_cross_batch_retrieval_evidence():
+    prior = {
+        "id": "retrieval-anchor",
+        "text": "我继续补充背景，结论稍后再说。",
+        "revision": 1,
+        "start_ms": 0,
+        "end_ms": 20_000,
+        "speaker": "Alice",
+        "source_track": "microphone",
+    }
+    middle = {
+        "id": "retrieval-middle",
+        "text": "现在仍然没有收束。",
+        "revision": 1,
+        "start_ms": 20_100,
+        "end_ms": 40_000,
+        "speaker": "Alice",
+        "source_track": "microphone",
+    }
+    latest = {
+        "id": "fresh-latest",
+        "text": "我还要补充一些背景，暂时不下结论。",
+        "revision": 1,
+        "start_ms": 40_100,
+        "end_ms": 60_000,
+        "speaker": "Alice",
+        "source_track": "microphone",
+    }
+    first_request = app_module.RealtimeIntelligenceRequest.from_payload(
+        meeting_id="meeting-retrieval-episode",
+        state_revision=2,
+        retrieval_paragraphs=[prior],
+        context_paragraphs=[],
+        new_paragraphs=[middle],
+        rolling_state={},
+    )
+    second_request = app_module.RealtimeIntelligenceRequest.from_payload(
+        meeting_id="meeting-retrieval-episode",
+        state_revision=3,
+        retrieval_paragraphs=[prior, middle],
+        context_paragraphs=[],
+        new_paragraphs=[latest],
+        rolling_state={},
+    )
+    first_candidate = app_module.CoachCandidateEvent(
+        event_type="objection_detected",
+        evidence_segment_ids=("retrieval-anchor", "retrieval-middle"),
+        reason="first clarity check",
+        candidate_key="candidate-first-clarity",
+    )
+    second_candidate = app_module.CoachCandidateEvent(
+        event_type="monologue_duration",
+        evidence_segment_ids=("retrieval-anchor", "fresh-latest"),
+        reason="next clarity check",
+        candidate_key="candidate-next-clarity",
+    )
+
+    first_payload = app_module._coach_candidate_payloads(
+        (first_candidate,),
+        request=first_request,
+    )[first_candidate.candidate_key]
+    second_payload = app_module._coach_candidate_payloads(
+        (second_candidate,),
+        request=second_request,
+    )[second_candidate.candidate_key]
+
+    assert first_payload["episode_anchor_id"] == "retrieval-anchor"
+    assert second_payload["episode_anchor_id"] == "retrieval-anchor"
+    assert second_payload["episode_id"] == first_payload["episode_id"]
+
+
+def test_coach_episode_identity_inherits_after_context_window_rolls_out():
+    first_request = app_module.RealtimeIntelligenceRequest.from_payload(
+        meeting_id="meeting-rolled-episode",
+        state_revision=1,
+        context_paragraphs=[],
+        new_paragraphs=[
+            {
+                "id": "rolled-anchor",
+                "text": "我先补充背景。",
+                "revision": 1,
+                "start_ms": 0,
+                "end_ms": 4_000,
+                "speaker": "Alice",
+                "source_track": "microphone",
+            }
+        ],
+        rolling_state={},
+    )
+    second_request = app_module.RealtimeIntelligenceRequest.from_payload(
+        meeting_id="meeting-rolled-episode",
+        state_revision=2,
+        context_paragraphs=[],
+        retrieval_paragraphs=[],
+        new_paragraphs=[
+            {
+                "id": "rolled-fresh",
+                "text": "我继续补充，但暂时还没有结论。",
+                "revision": 1,
+                "start_ms": 4_100,
+                "end_ms": 8_000,
+                "speaker": "Alice",
+                "source_track": "microphone",
+            }
+        ],
+        rolling_state={},
+    )
+    first_candidate = app_module.CoachCandidateEvent(
+        event_type="monologue_duration",
+        evidence_segment_ids=("rolled-anchor",),
+        reason="first",
+        candidate_key="rolled-first",
+    )
+    second_candidate = app_module.CoachCandidateEvent(
+        event_type="monologue_duration",
+        evidence_segment_ids=("rolled-fresh",),
+        reason="second",
+        candidate_key="rolled-second",
+    )
+    first_payload = app_module._coach_candidate_payloads(
+        (first_candidate,),
+        request=first_request,
+    )[first_candidate.candidate_key]
+    second_payload = app_module._coach_candidate_payloads(
+        (second_candidate,),
+        request=second_request,
+        recent_episode_descriptors=[first_payload],
+    )[second_candidate.candidate_key]
+
+    assert second_payload["episode_id"] == first_payload["episode_id"]
+    assert second_payload["episode_anchor_id"] == "rolled-anchor"
+    eligible, suppressed = app_module._partition_coach_candidates(
+        (second_candidate,),
+        candidate_payloads={second_candidate.candidate_key: second_payload},
+        cooled_episode_priorities={
+            first_payload["episode_id"]: first_payload["candidate_priority"]
+        },
+    )
+    assert eligible == ()
+    assert suppressed == (second_candidate.candidate_key,)
+
+
+def test_coach_episode_inheritance_requires_known_same_speaker_track_and_gap():
+    recent = {
+        "episode_id": "coach-episode:prior",
+        "episode_anchor_id": "prior-anchor",
+        "episode_source_track": "microphone",
+        "episode_speaker": "Alice",
+        "episode_speaker_key": app_module.hashlib.sha256(b"alice").hexdigest()[:24],
+        "episode_anchor_start_ms": 0,
+        "episode_anchor_end_ms": 1_000,
+        "episode_latest_start_ms": 0,
+        "episode_latest_end_ms": 1_000,
+    }
+
+    def payload(*, speaker, track="microphone", start_ms=1_100):
+        request = app_module.RealtimeIntelligenceRequest.from_payload(
+            meeting_id="meeting-boundary",
+            state_revision=2,
+            context_paragraphs=[],
+            new_paragraphs=[
+                {
+                    "id": f"fresh-{speaker}-{track}-{start_ms}",
+                    "text": "新的候选。",
+                    "revision": 1,
+                    "start_ms": start_ms,
+                    "end_ms": start_ms + 500,
+                    "speaker": speaker,
+                    "source_track": track,
+                }
+            ],
+            rolling_state={},
+        )
+        candidate = app_module.CoachCandidateEvent(
+            event_type="objection_detected",
+            evidence_segment_ids=(request.new_paragraphs[0].id,),
+            reason="boundary",
+            candidate_key=f"candidate-{speaker}-{track}-{start_ms}",
+        )
+        return app_module._coach_candidate_payloads(
+            (candidate,),
+            request=request,
+            recent_episode_descriptors=[recent],
+        )[candidate.candidate_key]
+
+    assert payload(speaker="Alice")["episode_id"] == recent["episode_id"]
+    assert payload(speaker="Bob")["episode_id"] != recent["episode_id"]
+    assert payload(speaker="Alice", track="system_audio")["episode_id"] != recent["episode_id"]
+    assert payload(speaker="Alice", start_ms=9_001)["episode_id"] != recent["episode_id"]
+    assert payload(speaker=None)["episode_id"] != recent["episode_id"]
+
+
+def test_coach_episode_priority_upgrade_still_crosses_candidate_types():
+    candidate = app_module.CoachCandidateEvent(
+        event_type="question_pending",
+        evidence_segment_ids=("fresh",),
+        reason="higher priority",
+        candidate_key="higher-priority",
+    )
+    payload = {
+        "episode_id": "coach-episode:shared",
+        "candidate_priority": 100,
+    }
+    eligible, suppressed = app_module._partition_coach_candidates(
+        (candidate,),
+        candidate_payloads={candidate.candidate_key: payload},
+        cooled_episode_priorities={"coach-episode:shared": 90},
+    )
+
+    assert eligible == (candidate,)
+    assert suppressed == ()
+
+
+def test_coach_episode_descriptor_does_not_bridge_a_pause_in_one_request():
+    request = app_module.RealtimeIntelligenceRequest.from_payload(
+        meeting_id="meeting-descriptor-pause",
+        state_revision=1,
+        context_paragraphs=[],
+        new_paragraphs=[
+            {
+                "id": "before-pause",
+                "text": "第一个表达。",
+                "revision": 1,
+                "start_ms": 0,
+                "end_ms": 1_000,
+                "speaker": "Alice",
+                "source_track": "microphone",
+            },
+            {
+                "id": "after-pause",
+                "text": "停顿后另一个表达。",
+                "revision": 1,
+                "start_ms": 10_000,
+                "end_ms": 11_000,
+                "speaker": "Alice",
+                "source_track": "microphone",
+            },
+        ],
+        rolling_state={},
+    )
+    candidate = app_module.CoachCandidateEvent(
+        event_type="objection_detected",
+        evidence_segment_ids=("before-pause",),
+        reason="before pause",
+        candidate_key="candidate-before-pause",
+    )
+
+    payload = app_module._coach_candidate_payloads(
+        (candidate,),
+        request=request,
+    )[candidate.candidate_key]
+
+    assert payload["episode_anchor_id"] == "before-pause"
+    assert payload["episode_latest_end_ms"] == 1_000
+
+
+def test_missing_episode_timestamps_disable_lineage_not_provider_reservation():
+    request = app_module.RealtimeIntelligenceRequest.from_payload(
+        meeting_id="meeting-no-timestamps",
+        state_revision=1,
+        context_paragraphs=[],
+        new_paragraphs=[
+            {
+                "id": "no-time-segment",
+                "text": "我们需要确认负责人吗？",
+                "revision": 1,
+                "speaker": "Alice",
+                "source_track": "microphone",
+            }
+        ],
+        rolling_state={},
+    )
+    candidate = app_module.CoachCandidateEvent(
+        event_type="question_pending",
+        evidence_segment_ids=("no-time-segment",),
+        reason="question",
+        candidate_key="candidate-no-time",
+    )
+    payload = app_module._coach_candidate_payloads(
+        (candidate,),
+        request=request,
+    )[candidate.candidate_key]
+
+    assert payload["episode_id"].startswith("coach-episode:")
+    assert app_module._coach_episode_descriptors_for_reservation([payload]) == []
 
 
 def test_recent_context_history_is_mixed_deduplicated_and_bounded():
@@ -244,6 +3977,58 @@ def test_coach_runtime_capability_makes_pi_fallback_visible():
     assert capability["error_class"] == "pi_unavailable"
 
 
+def test_coach_decision_timing_envelope_preserves_observed_pi_wall_clock():
+    timing = app_module._coach_decision_timing_envelope(
+        {
+            "ttft_ms": 125.5,
+            "decision_latency_ms": 840.25,
+            "timings": {
+                "clock": "unix_epoch_ms",
+                "started_at_ms": 1_000,
+                "first_token_at_ms": 1_125,
+                "completed_at_ms": 1_840,
+            }
+        },
+        fallback_started_at_ms=900,
+        fallback_completed_at_ms=2_000,
+    )
+
+    assert timing == {
+        "created_at_ms": 1_000,
+        "first_token_at_ms": 1_125,
+        "completed_at_ms": 1_840,
+        "projected_at_ms": None,
+        "dropped_at_ms": None,
+        "ttft_ms": 125.5,
+        "decision_latency_ms": 840.25,
+    }
+
+
+def test_coach_decision_timing_envelope_never_fabricates_first_token():
+    timing = app_module._coach_decision_timing_envelope(
+        {
+            "timings": {
+                "clock": "monotonic_ms",
+                "started_at_ms": 100,
+                "first_token_at_ms": 120,
+                "completed_at_ms": 180,
+            }
+        },
+        fallback_started_at_ms=1_000,
+        fallback_completed_at_ms=1_840,
+    )
+
+    assert timing == {
+        "created_at_ms": 1_000,
+        "first_token_at_ms": None,
+        "completed_at_ms": 1_840,
+        "projected_at_ms": None,
+        "dropped_at_ms": None,
+        "ttft_ms": None,
+        "decision_latency_ms": None,
+    }
+
+
 def test_v2_intelligence_batch_reads_only_the_next_bounded_increment(tmp_path):
     persistence = V2Persistence(
         tmp_path / "intelligence-batch.db",
@@ -352,6 +4137,40 @@ def test_runtime_app_prewarms_resident_funasr_during_startup(monkeypatch, tmp_pa
     assert lifecycle_calls == ["prewarm", "shutdown"]
 
 
+def test_pi_bridge_prewarm_is_best_effort_and_provider_free(monkeypatch):
+    lifecycle_calls = []
+
+    class FakePiSidecar:
+        def prewarm(self):
+            lifecycle_calls.append("prewarm")
+            return {
+                "ready": True,
+                "bridge_process_reused": False,
+                "bridge_startup_ms": 12.5,
+            }
+
+        def close(self):
+            lifecycle_calls.append("shutdown")
+
+    monkeypatch.setattr(app_module, "PiCoachSidecar", FakePiSidecar)
+    monkeypatch.setenv("MEETING_COPILOT_PI_BRIDGE_PREWARM", "1")
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gateway.example.test")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "provider-test-key")
+    monkeypatch.setenv("LLM_GATEWAY_MODEL", "coach-model")
+
+    with TestClient(app_module.create_app()) as client:
+        assert client.get("/health").status_code == 200
+        assert client.app.state.pi_coach_prewarm == {
+            "attempted": True,
+            "enabled": True,
+            "ready": True,
+            "bridge_process_reused": False,
+            "bridge_startup_ms": 12.5,
+        }
+
+    assert lifecycle_calls == ["prewarm", "shutdown"]
+
+
 def test_base_runtime_starts_without_prewarming_optional_funasr(monkeypatch, tmp_path):
     manifest_path = tmp_path / "runtime-bundle-manifest.json"
     manifest_path.write_text(
@@ -373,6 +4192,101 @@ def test_base_runtime_starts_without_prewarming_optional_funasr(monkeypatch, tmp
         assert client.app.state.distribution_profile == "base"
 
     assert lifecycle_calls == []
+
+
+def test_base_runtime_does_not_prewarm_available_offline_refiner_by_default(
+    monkeypatch,
+    tmp_path,
+):
+    manifest_path = tmp_path / "runtime-bundle-manifest.json"
+    manifest_path.write_text(
+        json.dumps({"distribution_profile": "base"}),
+        encoding="utf-8",
+    )
+    lifecycle_calls = []
+    monkeypatch.setenv("MEETING_COPILOT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MEETING_COPILOT_RUNTIME_MANIFEST", str(manifest_path))
+    monkeypatch.delenv("MEETING_COPILOT_REALTIME_REFINER_POLICY", raising=False)
+    monkeypatch.setattr(
+        app_module.asr_refiner,
+        "refinement_capability",
+        lambda: {"status": "ready"},
+    )
+    monkeypatch.setattr(
+        app_module.asr_refiner,
+        "prewarm_refiner_worker",
+        lambda: (_ for _ in ()).throw(AssertionError("default policy must not prewarm")),
+    )
+    monkeypatch.setattr(
+        app_module.asr_refiner,
+        "shutdown_refiner_worker",
+        lambda: lifecycle_calls.append("refiner_shutdown"),
+    )
+    monkeypatch.setattr(
+        app_module.asr_stream,
+        "prewarm_funasr_resident_manager",
+        lambda: lifecycle_calls.append("realtime_prewarm") or True,
+    )
+
+    with TestClient(app_module.create_runtime_app()) as client:
+        assert client.get("/health").status_code == 200
+        assert client.app.state.funasr_resident_prewarm_ready is False
+        assert client.app.state.funasr_refiner_prewarm_ready is False
+        assert client.app.state.funasr_refiner_policy["mode"] == "online_only"
+        assert (
+            client.app.state.funasr_refiner_policy["degradation_reason"]
+            == "offline_refinement_bypassed_by_resource_policy"
+        )
+
+    assert "refiner_prewarm" not in lifecycle_calls
+    assert "realtime_prewarm" not in lifecycle_calls
+    assert "refiner_shutdown" in lifecycle_calls
+
+
+def test_base_runtime_explicit_prewarm_policy_preserves_offline_refiner_compatibility(
+    monkeypatch,
+    tmp_path,
+):
+    manifest_path = tmp_path / "runtime-bundle-manifest.json"
+    manifest_path.write_text(
+        json.dumps({"distribution_profile": "base"}),
+        encoding="utf-8",
+    )
+    lifecycle_calls = []
+    monkeypatch.setenv("MEETING_COPILOT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MEETING_COPILOT_RUNTIME_MANIFEST", str(manifest_path))
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_REFINER_POLICY", "prewarm")
+    monkeypatch.setattr(
+        app_module.asr_refiner,
+        "refinement_capability",
+        lambda: {"status": "ready"},
+    )
+    monkeypatch.setattr(
+        app_module.asr_refiner,
+        "prewarm_refiner_worker",
+        lambda: lifecycle_calls.append("refiner_prewarm") or True,
+    )
+    monkeypatch.setattr(
+        app_module.asr_refiner,
+        "shutdown_refiner_worker",
+        lambda: lifecycle_calls.append("refiner_shutdown"),
+    )
+    monkeypatch.setattr(
+        app_module.asr_stream,
+        "prewarm_funasr_resident_manager",
+        lambda: lifecycle_calls.append("realtime_prewarm") or True,
+    )
+
+    with TestClient(app_module.create_runtime_app()) as client:
+        assert client.get("/health").status_code == 200
+        assert client.app.state.funasr_resident_prewarm_ready is False
+        assert client.app.state.funasr_refiner_prewarm_ready is True
+        assert client.app.state.funasr_refiner_policy["mode"] == "prewarm"
+        assert client.app.state.funasr_refiner_policy["source"] == "environment"
+
+    assert "refiner_prewarm" in lifecycle_calls
+    assert "realtime_prewarm" not in lifecycle_calls
+    assert "refiner_shutdown" in lifecycle_calls
 
 
 def test_packaged_runtime_fails_startup_when_resident_funasr_is_not_ready(monkeypatch, tmp_path):
@@ -411,6 +4325,47 @@ def test_asr_runtime_status_reports_real_resident_readiness(monkeypatch):
     assert response.status_code == 200
     assert response.json()["resident"]["process_ready"] is True
     assert response.json()["resident"]["pid"] == 123
+
+
+def test_asr_refiner_prewarm_is_local_verification_gated(monkeypatch):
+    policy = {
+        "schema_version": "realtime_refiner_policy.v1",
+        "mode": "prewarm",
+        "source": "environment",
+        "prewarm_enabled": True,
+    }
+    monkeypatch.setattr(app_module.asr_refiner, "realtime_refiner_policy", lambda: policy)
+    monkeypatch.setattr(
+        app_module.asr_refiner,
+        "refinement_capability",
+        lambda: {"status": "ready", "process_resident": True},
+    )
+    monkeypatch.setattr(app_module.asr_refiner, "prewarm_refiner_worker", lambda: True)
+    monkeypatch.setattr(
+        app_module.asr_refiner,
+        "refiner_worker_status",
+        lambda: {
+            "spawned": True,
+            "process_running": True,
+            "process_ready": True,
+            "pid": 456,
+        },
+    )
+    client = TestClient(create_app())
+
+    forbidden = client.post("/providers/asr/prewarm")
+    assert forbidden.status_code == 403
+
+    response = client.post(
+        "/providers/asr/prewarm",
+        headers={
+            "origin": "http://127.0.0.1:8981",
+            "x-meeting-copilot-verification": "1",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert response.json()["worker"]["process_ready"] is True
 
 
 def test_execution_preview_uses_locally_normalized_final_as_llm_evidence():
@@ -1322,9 +5277,25 @@ def test_provider_health_endpoint_masks_llm_secret_and_disables_remote_asr_by_de
         "provider": "openai_compatible_gateway",
         "model": "gpt-provider-health",
         "realtime_model": "gpt-provider-health",
+        "realtime_model_source": "general_model_fallback",
+        "realtime_model_explicit": False,
+        "realtime_model_warning": "realtime_model_inherits_general_model",
+        "correction_model": "gpt-provider-health",
+        "correction_model_source": "general_model_fallback",
+        "correction_model_explicit": False,
+        "correction_model_warning": "correction_model_inherits_general_model",
         "is_mock": False,
         "api_style": "chat_completions",
         "credential_configured": True,
+        "runtime_synced": True,
+        "probe_status": "not_run",
+        "operational": None,
+        "realtime_ready": None,
+        "realtime_probe_ready": None,
+        "realtime_readiness_reason": "probe_not_ready",
+        "probe_latency_ms": None,
+        "probe_usage": None,
+        "realtime_cutoff_ms": 2_500,
     }
     assert body["asr"]["file_provider"] == "local_funasr_batch"
     assert body["asr"]["file_asr_available"] is True
@@ -1353,6 +5324,55 @@ def test_provider_health_reports_resident_file_asr_fallback(monkeypatch, tmp_pat
     assert response.status_code == 200
     assert response.json()["asr"]["file_provider"] == "local_funasr_resident_file"
     assert response.json()["asr"]["file_asr_available"] is True
+
+
+def test_provider_status_and_health_surface_open_realtime_circuit(monkeypatch, tmp_path):
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-provider-health-secret")
+    monkeypatch.setenv("LLM_GATEWAY_MODEL", "gpt-provider-health")
+    monkeypatch.delenv("LLM_GATEWAY_IS_MOCK", raising=False)
+    app_module.llm_service.clear_runtime_config()
+    app = create_app(data_dir=tmp_path)
+    config = app_module.llm_service.LlmConfig.from_env()
+    identity = app_module._realtime_provider_identity(config)
+    app_module.provider_config_runtime.mark_probe_succeeded(
+        config,
+        latency_ms=1_700,
+        usage={"prompt_tokens": 9, "completion_tokens": 5, "total_tokens": 14},
+        realtime_ready=True,
+    )
+    app.state.realtime_provider_circuit.record_probe_failure(identity, "timeout")
+
+    with TestClient(app) as client:
+        status = client.get("/providers/status")
+        health = client.get("/providers/health")
+
+    assert status.status_code == 200
+    circuit = status.json()["realtime_circuit"]
+    assert circuit["state"] == "open"
+    assert circuit["reason"] == "realtime_provider_circuit_open"
+    assert circuit["failure_count"] >= 1
+    assert circuit["last_failure_class"] == "timeout"
+    assert health.status_code == 200
+    assert health.json()["realtime_circuit"]["state"] == "open"
+    assert health.json()["llm"]["realtime_ready"] is False
+    assert health.json()["llm"]["realtime_readiness_reason"] == "realtime_provider_circuit_open"
+    assert health.json()["degradation"]["can_generate_suggestions"] is False
+    assert health.json()["degradation"]["can_call_llm"] is False
+
+
+def test_realtime_provider_identity_is_stable_before_and_after_realtime_normalization():
+    config = app_module.llm_service.LlmConfig(
+        base_url="https://gateway.example/v1",
+        api_key="test-provider-key",
+        model="general-model",
+        realtime_model="realtime-model",
+        api_style="responses",
+    )
+
+    assert app_module._realtime_provider_identity(config) == app_module._realtime_provider_identity(
+        app_module.llm_service.realtime_config(config)
+    )
 
 
 def test_asr_live_sessions_list_endpoint_hides_mock_sessions_by_default(tmp_path):
@@ -2956,6 +6976,13 @@ def test_asr_live_llm_execution_runs_disabled_endpoint_returns_empty_runs_for_tr
         "provider": "not_configured",
         "model": "not_called",
         "realtime_model": "not_called",
+        "realtime_model_source": "not_configured",
+        "realtime_model_explicit": False,
+        "realtime_model_warning": None,
+        "correction_model": "not_called",
+        "correction_model_source": "not_configured",
+        "correction_model_explicit": False,
+        "correction_model_warning": None,
         "configured_from_env": False,
         "is_mock": False,
         "api_style": "not_configured",
@@ -3137,6 +7164,37 @@ def test_enabled_llm_allows_persisted_finals_with_recoverable_refinement_interru
             {
                 "event_type": "transcript_final",
                 "payload": {"segment_id": "segment-1", "text": "已有可用的会议正文。"},
+            }
+        ],
+    }
+
+    app_module._ensure_enabled_llm_allowed(record, allow_non_acceptance_execution=False)
+    assert app_module._realtime_correction_blockers(record) == []
+
+
+def test_enabled_llm_allows_online_only_policy_with_recoverable_boundary_tail(monkeypatch):
+    """A real final stays usable when resource policy and boundary tail coexist."""
+
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-test")
+    record = {
+        "session_id": "online-only-boundary-tail",
+        "source": "live_asr_stream",
+        "provider": "funasr_realtime",
+        "provider_mode": "real",
+        "is_mock": False,
+        "input_source": "browser_live_mic",
+        "degradation_reasons": [
+            "offline_refinement_bypassed_by_resource_policy",
+            "funasr_boundary_ack_timeout",
+        ],
+        "events": [
+            {
+                "event_type": "transcript_final",
+                "payload": {
+                    "segment_id": "segment-1",
+                    "text": "发布由李四负责，周五完成，错误率超过百分之二就回滚。",
+                },
             }
         ],
     }
@@ -5156,8 +9214,8 @@ def test_application_schema_diagnostic_is_safe_and_startup_bootstrap_is_idempote
         "status": "ready",
         "storage": "sqlite",
         "source_version": 0,
-        "final_version": 6,
-        "applied_versions": [1, 2, 3, 4, 5, 6],
+        "final_version": APPLICATION_SCHEMA_VERSION,
+        "applied_versions": list(range(1, APPLICATION_SCHEMA_VERSION + 1)),
         "migrated": True,
         "backup_created": False,
     }
@@ -5166,8 +9224,8 @@ def test_application_schema_diagnostic_is_safe_and_startup_bootstrap_is_idempote
         "schema_version": "application-schema-migration-report.v1",
         "status": "ready",
         "storage": "sqlite",
-        "source_version": 6,
-        "final_version": 6,
+        "source_version": APPLICATION_SCHEMA_VERSION,
+        "final_version": APPLICATION_SCHEMA_VERSION,
         "applied_versions": [],
         "migrated": False,
         "backup_created": False,

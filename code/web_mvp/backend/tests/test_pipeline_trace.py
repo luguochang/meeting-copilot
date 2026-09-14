@@ -7,6 +7,8 @@ import pytest
 from meeting_copilot_web_mvp.pipeline_trace import (
     PIPELINE_STAGES,
     PipelineTraceCollector,
+    classify_pipeline_failure,
+    normalize_provider_timing_stages,
 )
 
 
@@ -275,7 +277,7 @@ def test_bounded_collector_remains_thread_safe_under_concurrent_trace_creation()
     assert {snapshot["meeting_id"] for snapshot in retained} == {"meeting-1"}
 
 
-def test_retry_and_cancellation_are_counted_without_changing_raw_trace_export():
+def test_retry_and_cancellation_are_exposed_in_raw_and_slo_exports():
     collector = PipelineTraceCollector()
     collector.record(
         "trace-1",
@@ -284,12 +286,13 @@ def test_retry_and_cancellation_are_counted_without_changing_raw_trace_export():
         attributes={"lane": "correction"},
         monotonic_ns=1,
     )
-    raw_export = collector.export("trace-1")
-
     collector.record_retry("trace-1", count=2)
     collector.record_cancelled("trace-1")
 
-    assert collector.export("trace-1") == raw_export
+    raw_export = collector.export("trace-1")
+    assert raw_export["retry_count"] == 2
+    assert raw_export["cancelled"] is True
+    assert raw_export["execution"]["terminal"] is None
     snapshot = collector.slo_snapshots()[0]
     assert snapshot["retry_count"] == 2
     assert snapshot["cancelled"] is True
@@ -335,3 +338,261 @@ def test_eviction_is_published_even_when_new_trace_mark_is_rejected():
         collector.record("trace-2", "invalid", meeting_id="meeting-1")
 
     assert [snapshot["trace_id"] for snapshot in evicted] == ["trace-1"]
+
+
+def test_content_free_route_attempt_cancel_and_terminal_contract_is_idempotent():
+    collector = PipelineTraceCollector(clock_ns=lambda: 5_000)
+    collector.record(
+        "trace-1",
+        "job_queued",
+        meeting_id="meeting-1",
+        attributes={"lane": "intelligence"},
+        monotonic_ns=1_000,
+    )
+
+    collector.record_route(
+        "trace-1",
+        "pi_coach",
+        candidate_outcome="eligible",
+        circuit_outcome="admitted",
+        monotonic_ns=2_000,
+    )
+    collector.record_provider_attempt(
+        "trace-1",
+        1,
+        branch="coach",
+        runtime="pi",
+        monotonic_ns=3_000,
+    )
+    collector.record_provider_attempt_outcome(
+        "trace-1",
+        1,
+        "rate_limit",
+        branch="coach",
+        runtime="pi",
+        http_status=429,
+        error_class="StreamingProviderError",
+        monotonic_ns=4_000,
+    )
+    collector.record_provider_attempt_outcome(
+        "trace-1",
+        1,
+        "rate_limit",
+        branch="coach",
+        runtime="pi",
+        http_status=429,
+        error_class="StreamingProviderError",
+        monotonic_ns=4_500,
+    )
+    collector.record_cancelled(
+        "trace-1",
+        result_outcome="rate_limit",
+        error_class="StreamingProviderError",
+        monotonic_ns=5_000,
+    )
+    collector.record_abort_ack(
+        "trace-1",
+        local=True,
+        remote_unavailable=True,
+    )
+
+    execution = collector.export("trace-1")["execution"]
+    assert execution["route"] == {
+        "name": "pi_coach",
+        "candidate_outcome": "eligible",
+        "circuit_outcome": "admitted",
+        "decided_at_monotonic_ns": 2_000,
+    }
+    assert execution["provider_attempts"] == [
+        {
+            "attempt_index": 1,
+            "branch": "coach",
+            "runtime": "pi",
+            "started_at_monotonic_ns": 3_000,
+            "completed_at_monotonic_ns": 4_000,
+            "outcome": "rate_limit",
+            "http_status": 429,
+            "error_class": "StreamingProviderError",
+        }
+    ]
+    assert execution["terminal"]["outcome"] == "cancelled"
+    assert execution["terminal"]["result_outcome"] == "rate_limit"
+    assert execution["cancellation"]["local_abort_ack"] is True
+    assert execution["cancellation"]["remote_ack_unavailable"] is True
+
+
+def test_remote_abort_ack_and_unavailable_are_mutually_exclusive():
+    collector = PipelineTraceCollector()
+    collector.record(
+        "trace-ack-conflict",
+        "job_queued",
+        meeting_id="meeting-1",
+        attributes={"lane": "intelligence"},
+        monotonic_ns=1_000,
+    )
+    collector.record_cancelled(
+        "trace-ack-conflict",
+        monotonic_ns=2_000,
+    )
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        collector.record_abort_ack(
+            "trace-ack-conflict",
+            remote=True,
+            remote_unavailable=True,
+        )
+
+    collector.record_abort_ack("trace-ack-conflict", remote=True)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        collector.record_abort_ack("trace-ack-conflict", remote_unavailable=True)
+
+
+def test_provider_attempt_validation_revision_is_one_way_and_preserves_timing():
+    collector = PipelineTraceCollector(clock_ns=lambda: 5_000)
+    collector.record(
+        "trace-validation-revision",
+        "job_queued",
+        meeting_id="meeting-1",
+        attributes={"lane": "intelligence"},
+        monotonic_ns=1_000,
+    )
+    collector.record_provider_attempt(
+        "trace-validation-revision",
+        1,
+        branch="semantic",
+        runtime="direct",
+        monotonic_ns=2_000,
+    )
+    collector.record_provider_attempt_outcome(
+        "trace-validation-revision",
+        1,
+        "success",
+        branch="semantic",
+        runtime="direct",
+        monotonic_ns=3_000,
+    )
+
+    revised = collector.revise_provider_attempt_validation(
+        "trace-validation-revision",
+        1,
+        branch="semantic",
+        runtime="direct",
+        error_class="IntelligenceResponseValidationError",
+    )
+    assert revised["outcome"] == "validation_error"
+    assert revised["started_at_monotonic_ns"] == 2_000
+    assert revised["completed_at_monotonic_ns"] == 3_000
+    with pytest.raises(ValueError, match="only a successful"):
+        collector.revise_provider_attempt_validation(
+            "trace-validation-revision",
+            1,
+            branch="semantic",
+            runtime="direct",
+        )
+
+
+def test_direct_timing_normalization_keeps_attempt_start_and_provider_stages():
+    normalized = normalize_provider_timing_stages(
+        {
+            "started_at": 10.0,
+            "connected_at": 10.1,
+            "first_token_at": 10.2,
+            "completed_at": 10.4,
+        }
+    )
+
+    assert normalized.status == "complete"
+    assert normalized.source_clock == "monotonic_seconds"
+    assert normalized.attempt_started_monotonic_ns == 10_000_000_000
+    assert normalized.stages == {
+        "provider_connected": 10_100_000_000,
+        "first_token": 10_200_000_000,
+        "provider_completed": 10_400_000_000,
+    }
+    assert normalized.invalid_reasons == ()
+
+
+def test_pi_epoch_timing_is_evaluation_timing_and_never_fabricates_provider_stages():
+    normalized = normalize_provider_timing_stages(
+        {
+            "clock": "unix_epoch_ms",
+            "started_at_ms": 1_000,
+            "first_token_at_ms": 1_025,
+            "completed_at_ms": 1_050,
+        },
+        wall_time_ns=1_100_000_000,
+        monotonic_ns=10_000_000_000,
+    )
+
+    assert normalized.status == "partial"
+    assert normalized.source_clock == "unix_epoch_ms"
+    assert normalized.stages == {"first_token": 9_925_000_000}
+    assert normalized.evaluation == {
+        "evaluation_started": 9_900_000_000,
+        "first_token": 9_925_000_000,
+        "evaluation_completed": 9_950_000_000,
+    }
+    assert normalized.attempt_started_monotonic_ns is None
+    assert normalized.invalid_reasons == (
+        "pi_provider_connected_unobserved",
+        "pi_provider_completed_unobserved",
+    )
+
+
+@pytest.mark.parametrize(
+    ("timings", "reason"),
+    [
+        (
+            {
+                "clock": "unix_epoch_ms",
+                "started_at_ms": 1_000,
+                "connected_at": 1.0,
+            },
+            "mixed_clock_fields",
+        ),
+        (
+            {
+                "clock": "unix_epoch_ms",
+                "started_at_ms": 1_100,
+                "completed_at_ms": 1_000,
+            },
+            "provider_timing_order_invalid",
+        ),
+        ({"clock": "wall_clock_seconds", "connected_at": 1.0}, "unsupported_timing_clock"),
+    ],
+)
+def test_invalid_timing_contracts_are_explicit(timings, reason):
+    normalized = normalize_provider_timing_stages(timings)
+
+    assert normalized.status == "invalid"
+    assert normalized.stages == {}
+    assert reason in normalized.invalid_reasons
+
+
+def test_multiple_direct_attempts_do_not_publish_cross_attempt_total_latency():
+    normalized = normalize_provider_timing_stages(
+        {
+            "started_at": 10.0,
+            "connected_at": 10.1,
+            "first_token_at": 10.2,
+            "completed_at": 12.0,
+        },
+        provider_attempt_count=2,
+    )
+
+    assert "provider_completed" not in normalized.stages
+    assert "multiple_provider_attempts_require_attempt_timings" in normalized.invalid_reasons
+
+
+def test_failure_classifier_covers_acceptance_outcomes_without_error_details():
+    class ProviderFailure(RuntimeError):
+        def __init__(self, *, category=None, status_code=None):
+            super().__init__("private provider detail")
+            self.category = category
+            self.status_code = status_code
+
+    assert classify_pipeline_failure(TimeoutError()) == "timeout"
+    assert classify_pipeline_failure(ProviderFailure(status_code=429)) == "rate_limit"
+    assert classify_pipeline_failure(ProviderFailure(status_code=503)) == "provider_5xx"
+    assert classify_pipeline_failure(ProviderFailure(category="transport")) == "transport_error"
+    assert classify_pipeline_failure(RuntimeError("ignored")) == "failed"

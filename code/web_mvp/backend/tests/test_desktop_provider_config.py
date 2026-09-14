@@ -15,6 +15,7 @@ def _clear_provider_env(monkeypatch) -> None:
         "LLM_GATEWAY_API_KEY",
         "LLM_GATEWAY_MODEL",
         "LLM_GATEWAY_REALTIME_MODEL",
+        "LLM_GATEWAY_CORRECTION_MODEL",
         "LLM_GATEWAY_PROVIDER_LABEL",
         "LLM_GATEWAY_API_STYLE",
     ):
@@ -41,6 +42,13 @@ def test_runtime_provider_config_precedes_environment_and_can_be_cleared(monkeyp
         "provider": "openai_compatible_gateway",
         "model": "runtime-model",
         "realtime_model": "runtime-fast-model",
+        "realtime_model_source": "runtime_realtime_model",
+        "realtime_model_explicit": True,
+        "realtime_model_warning": None,
+        "correction_model": "runtime-model",
+        "correction_model_source": "general_model_fallback",
+        "correction_model_explicit": False,
+        "correction_model_warning": "correction_model_inherits_general_model",
         "is_mock": False,
         "configured_from_env": True,
         "api_style": "chat_completions",
@@ -117,8 +125,18 @@ def test_desktop_provider_config_updates_running_backend_without_echoing_secret(
     llm_service.clear_runtime_config()
     monkeypatch.setenv("MEETING_COPILOT_LOCAL_API_TOKEN", TOKEN)
     monkeypatch.setenv("MEETING_COPILOT_DESKTOP_RUNTIME", "1")
-    client = TestClient(create_app())
+    app = create_app()
+    client = TestClient(app)
     headers = {"x-meeting-copilot-token": TOKEN}
+
+    class ResumeSpy:
+        calls = 0
+
+        def resume(self) -> None:
+            self.calls += 1
+
+    resume_spy = ResumeSpy()
+    app.state.v2_executor = resume_spy
 
     response = client.put(
         "/desktop/provider/config",
@@ -128,6 +146,7 @@ def test_desktop_provider_config_updates_running_backend_without_echoing_secret(
             "api_key": "sk-never-echo-this",
             "model": "gpt-test",
             "realtime_model": "gpt-test-fast",
+            "realtime_model_source": "runtime_realtime_model",
             "api_style": "responses",
         },
     )
@@ -138,8 +157,12 @@ def test_desktop_provider_config_updates_running_backend_without_echoing_secret(
     assert body["runtime_override"] is True
     assert body["model"] == "gpt-test"
     assert body["realtime_model"] == "gpt-test-fast"
+    assert body["realtime_model_source"] == "runtime_realtime_model"
+    assert body["realtime_model_explicit"] is True
+    assert body["realtime_model_warning"] is None
     assert body["api_style"] == "responses"
     assert "never-echo" not in response.text
+    assert resume_spy.calls == 1
     status = client.get("/desktop/provider/config", headers=headers)
     assert status.status_code == 200
     assert status.json()["runtime_override"] is True
@@ -150,6 +173,35 @@ def test_desktop_provider_config_updates_running_backend_without_echoing_secret(
     assert not llm_service.runtime_configured()
 
 
+def test_desktop_provider_config_preserves_general_model_fallback_source(monkeypatch):
+    _clear_provider_env(monkeypatch)
+    llm_service.clear_runtime_config()
+    monkeypatch.setenv("MEETING_COPILOT_LOCAL_API_TOKEN", TOKEN)
+    monkeypatch.setenv("MEETING_COPILOT_DESKTOP_RUNTIME", "1")
+    headers = {"x-meeting-copilot-token": TOKEN}
+
+    with TestClient(create_app()) as client:
+        response = client.put(
+            "/desktop/provider/config",
+            headers=headers,
+            json={
+                "base_url": "https://relay.example",
+                "api_key": "sk-test-secret",
+                "model": "general-model",
+                "realtime_model": "general-model",
+                "realtime_model_source": "general_model_fallback",
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["realtime_model"] == "general-model"
+    assert body["realtime_model_source"] == "general_model_fallback"
+    assert body["realtime_model_explicit"] is False
+    assert body["realtime_model_warning"] == "realtime_model_inherits_general_model"
+    llm_service.clear_runtime_config()
+
+
 def test_provider_status_is_stable_across_refresh_probe_and_model_switch(monkeypatch):
     _clear_provider_env(monkeypatch)
     llm_service.clear_runtime_config()
@@ -158,12 +210,44 @@ def test_provider_status_is_stable_across_refresh_probe_and_model_switch(monkeyp
     headers = {"x-meeting-copilot-token": TOKEN}
     client = TestClient(create_app())
 
+    def circuit(
+        state="closed",
+        reason="realtime_provider_circuit_closed",
+        failure_count=0,
+        last_failure_class=None,
+        identity_generation=1,
+    ):
+        return {
+            "state": state,
+            "reason": reason,
+            "failure_count": failure_count,
+            "retry_after_ms": 0,
+            "half_open": state == "half_open",
+            "identity_generation": identity_generation,
+            "last_failure_class": last_failure_class,
+        }
+
     assert client.get("/providers/status", headers=headers).json() == {
         "configured": False,
         "runtime_synced": False,
         "probe_status": "not_run",
         "model": None,
         "realtime_model": None,
+        "realtime_model_source": "not_configured",
+        "realtime_model_explicit": False,
+        "realtime_model_warning": None,
+        "correction_model": None,
+        "correction_model_source": "not_configured",
+        "correction_model_explicit": False,
+        "correction_model_warning": None,
+        "operational": None,
+        "realtime_ready": None,
+        "realtime_probe_ready": None,
+        "realtime_readiness_reason": "probe_not_ready",
+        "probe_latency_ms": None,
+        "probe_usage": None,
+        "realtime_cutoff_ms": 2500,
+        "realtime_circuit": circuit(identity_generation=1),
     }
 
     configured = client.put(
@@ -183,6 +267,21 @@ def test_provider_status_is_stable_across_refresh_probe_and_model_switch(monkeyp
         "probe_status": "not_run",
         "model": "gpt-first",
         "realtime_model": "gpt-first-fast",
+        "realtime_model_source": "runtime_realtime_model",
+        "realtime_model_explicit": True,
+        "realtime_model_warning": None,
+        "correction_model": "gpt-first",
+        "correction_model_source": "general_model_fallback",
+        "correction_model_explicit": False,
+        "correction_model_warning": "correction_model_inherits_general_model",
+        "operational": None,
+        "realtime_ready": None,
+        "realtime_probe_ready": None,
+        "realtime_readiness_reason": "probe_not_ready",
+        "probe_latency_ms": None,
+        "probe_usage": None,
+        "realtime_cutoff_ms": 2500,
+        "realtime_circuit": circuit(identity_generation=2),
     }
 
     probed_models: list[str] = []
@@ -221,9 +320,34 @@ def test_provider_status_is_stable_across_refresh_probe_and_model_switch(monkeyp
         "probe_status": "succeeded",
         "model": "gpt-first",
         "realtime_model": "gpt-first-fast",
+        "realtime_model_source": "runtime_realtime_model",
+        "realtime_model_explicit": True,
+        "realtime_model_warning": None,
+        "correction_model": "gpt-first",
+        "correction_model_source": "general_model_fallback",
+        "correction_model_explicit": False,
+        "correction_model_warning": "correction_model_inherits_general_model",
+        "operational": True,
+        "realtime_ready": True,
+        "realtime_probe_ready": True,
+        "realtime_readiness_reason": "probe_ready",
+        "probe_latency_ms": 1,
+        "probe_usage": {
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+            "total_tokens": 2,
+        },
+        "realtime_cutoff_ms": 2500,
+        "realtime_circuit": circuit(identity_generation=3),
     }
     assert client.get("/providers/status", headers=headers).json() == expected_connected
-    assert TestClient(create_app()).get("/providers/status", headers=headers).json() == expected_connected
+    second_app_status = TestClient(create_app()).get("/providers/status", headers=headers).json()
+    # The circuit generation is process-local in the in-memory test app; all
+    # provider-facing fields remain stable across app refresh.
+    assert second_app_status == {
+        **expected_connected,
+        "realtime_circuit": circuit(identity_generation=1),
+    }
 
     switched = client.put(
         "/desktop/provider/config",
@@ -242,6 +366,21 @@ def test_provider_status_is_stable_across_refresh_probe_and_model_switch(monkeyp
         "probe_status": "not_run",
         "model": "gpt-second",
         "realtime_model": "gpt-second-fast",
+        "realtime_model_source": "runtime_realtime_model",
+        "realtime_model_explicit": True,
+        "realtime_model_warning": None,
+        "correction_model": "gpt-second",
+        "correction_model_source": "general_model_fallback",
+        "correction_model_explicit": False,
+        "correction_model_warning": "correction_model_inherits_general_model",
+        "operational": None,
+        "realtime_ready": None,
+        "realtime_probe_ready": None,
+        "realtime_readiness_reason": "probe_not_ready",
+        "probe_latency_ms": None,
+        "probe_usage": None,
+        "realtime_cutoff_ms": 2500,
+        "realtime_circuit": circuit(identity_generation=4),
     }
 
     def fail_probe(config):
@@ -262,6 +401,23 @@ def test_provider_status_is_stable_across_refresh_probe_and_model_switch(monkeyp
         "probe_status": "failed",
         "model": "gpt-second",
         "realtime_model": "gpt-second-fast",
+        "realtime_model_source": "runtime_realtime_model",
+        "realtime_model_explicit": True,
+        "realtime_model_warning": None,
+        "correction_model": "gpt-second",
+        "correction_model_source": "general_model_fallback",
+        "correction_model_explicit": False,
+        "correction_model_warning": "correction_model_inherits_general_model",
+        "operational": False,
+        "realtime_ready": False,
+        "realtime_probe_ready": False,
+        "realtime_readiness_reason": "probe_not_ready",
+        "probe_latency_ms": None,
+        "probe_usage": None,
+        "realtime_cutoff_ms": 2500,
+        # A generic ValueError is classified as non-retryable and must
+        # not poison the transport circuit.
+        "realtime_circuit": circuit(identity_generation=4),
     }
 
     llm_service.clear_runtime_config()

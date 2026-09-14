@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import struct
 import sys
+import time
 import wave
 from pathlib import Path
+
+import pytest
 
 from meeting_copilot_web_mvp import asr_refiner
 
@@ -89,6 +93,98 @@ def _float32_payload(samples: list[float]) -> bytes:
     return b"".join(struct.pack("<f", sample) for sample in samples)
 
 
+def test_realtime_refiner_defaults_to_online_only_without_spawning_worker(monkeypatch):
+    monkeypatch.delenv(asr_refiner.REALTIME_REFINER_POLICY_ENV, raising=False)
+    monkeypatch.setattr(
+        asr_refiner,
+        "_get_resident_refiner",
+        lambda: (_ for _ in ()).throw(AssertionError("worker must not be resolved")),
+    )
+
+    policy = asr_refiner.realtime_refiner_policy()
+    result = asr_refiner.refine_pcm_f32(_float32_payload([0.0]))
+
+    assert policy == {
+        "schema_version": "realtime_refiner_policy.v1",
+        "mode": "online_only",
+        "source": "default_resource_guard",
+        "environment_variable": "MEETING_COPILOT_REALTIME_REFINER_POLICY",
+        "configured_value": None,
+        "realtime_refinement_enabled": False,
+        "prewarm_enabled": False,
+        "cold_start_deferred": False,
+        "degradation_reason": asr_refiner.ONLINE_ONLY_REFINEMENT_REASON,
+        "warning": None,
+    }
+    assert result.status == "bypassed"
+    assert result.reason == asr_refiner.ONLINE_ONLY_REFINEMENT_REASON
+    assert result.authoritative is False
+
+
+def test_invalid_realtime_refiner_policy_fails_closed_with_auditable_source(monkeypatch):
+    monkeypatch.setenv(asr_refiner.REALTIME_REFINER_POLICY_ENV, "load-everything")
+
+    policy = asr_refiner.realtime_refiner_policy()
+
+    assert policy["mode"] == "online_only"
+    assert policy["source"] == "invalid_environment_fallback"
+    assert policy["configured_value"] == "load-everything"
+    assert policy["prewarm_enabled"] is False
+    assert policy["warning"] == "invalid_realtime_refiner_policy_fell_back_to_online_only"
+
+
+@pytest.mark.parametrize(
+    ("configured", "prewarm_enabled", "cold_start_deferred", "warning"),
+    [
+        ("on-demand", False, True, "offline_refiner_cold_start_deferred_to_first_final"),
+        ("prewarm", True, False, None),
+    ],
+)
+def test_explicit_realtime_refiner_policy_preserves_compatibility_modes(
+    configured,
+    prewarm_enabled,
+    cold_start_deferred,
+    warning,
+):
+    policy = asr_refiner.realtime_refiner_policy(
+        {asr_refiner.REALTIME_REFINER_POLICY_ENV: configured}
+    )
+
+    assert policy["mode"] == configured.replace("-", "_")
+    assert policy["source"] == "environment"
+    assert policy["realtime_refinement_enabled"] is True
+    assert policy["prewarm_enabled"] is prewarm_enabled
+    assert policy["cold_start_deferred"] is cold_start_deferred
+    assert policy["warning"] == warning
+
+
+def test_prewarm_is_blocked_unless_policy_explicitly_requests_it(monkeypatch):
+    monkeypatch.delenv(asr_refiner.REALTIME_REFINER_POLICY_ENV, raising=False)
+    monkeypatch.setattr(
+        asr_refiner,
+        "refinement_capability",
+        lambda: (_ for _ in ()).throw(AssertionError("capability must not trigger prewarm")),
+    )
+
+    assert asr_refiner.prewarm_refiner_worker() is False
+
+
+def test_prewarm_degrades_when_capability_is_stale_but_components_are_missing(monkeypatch):
+    monkeypatch.setenv(asr_refiner.REALTIME_REFINER_POLICY_ENV, "prewarm")
+    monkeypatch.setattr(
+        asr_refiner,
+        "refinement_capability",
+        lambda: {"status": "ready", "model_id": "stale-capability"},
+    )
+    monkeypatch.setattr(
+        asr_refiner,
+        "_configured_components",
+        lambda *_args, **_kwargs: (None, None, None, None, None),
+    )
+
+    assert asr_refiner.prewarm_refiner_worker() is False
+
+
 def test_packaged_refiner_resolves_components_and_python_environment(monkeypatch, tmp_path):
     manifest_path = _write_packaged_refiner_runtime(tmp_path)
     monkeypatch.setenv("MEETING_COPILOT_RUNTIME_MANIFEST", str(manifest_path))
@@ -123,7 +219,29 @@ def test_packaged_refiner_resolves_components_and_python_environment(monkeypatch
     assert "backend-site-packages" not in environment["PYTHONPATH"]
 
 
+def test_explicit_refiner_python_preserves_venv_symlink_for_execution(tmp_path):
+    base_python = tmp_path / "base" / "python3.11"
+    venv_python = tmp_path / "venv" / "bin" / "python"
+    base_python.parent.mkdir(parents=True)
+    venv_python.parent.mkdir(parents=True)
+    base_python.write_text("fixture", encoding="utf-8")
+    try:
+        venv_python.symlink_to(base_python)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symlink privilege is unavailable")
+        raise
+
+    python, *_ = asr_refiner._configured_components(
+        {"MEETING_COPILOT_REALTIME_REFINER_PYTHON": str(venv_python)}
+    )
+
+    assert python == venv_python
+    assert python.resolve() == base_python.resolve()
+
+
 def test_refiner_fails_closed_without_local_components(monkeypatch):
+    monkeypatch.setenv(asr_refiner.REALTIME_REFINER_POLICY_ENV, "on_demand")
     monkeypatch.setattr(
         asr_refiner,
         "_configured_components",
@@ -157,6 +275,7 @@ def test_refiner_rejects_unaligned_and_non_finite_pcm_before_capability_probe(mo
 
 
 def test_refiner_converts_float32_to_pcm16_for_resident_worker(monkeypatch):
+    monkeypatch.setenv(asr_refiner.REALTIME_REFINER_POLICY_ENV, "on_demand")
     observed = {}
 
     class FakeResidentRefiner:
@@ -220,6 +339,7 @@ def test_refiner_uses_its_packaged_python_home_and_path_instead_of_backend_value
 
 
 def test_refiner_rejects_non_ok_worker_result(monkeypatch):
+    monkeypatch.setenv(asr_refiner.REALTIME_REFINER_POLICY_ENV, "on_demand")
     class FailedResidentRefiner:
         def refine(self, _pcm16, *, timeout_s):
             assert timeout_s == 30.0
@@ -237,6 +357,36 @@ def test_refiner_rejects_non_ok_worker_result(monkeypatch):
     assert result.status == "failed"
     assert result.reason == "offline_worker_failed"
     assert result.authoritative is False
+
+
+def test_resident_refiner_startup_obeys_request_deadline(monkeypatch, tmp_path):
+    monkeypatch.setenv(asr_refiner.REALTIME_REFINER_POLICY_ENV, "on_demand")
+    worker = tmp_path / "deadline_refiner_worker.py"
+    worker.write_text(
+        "import time\n"
+        "time.sleep(5)\n",
+        encoding="utf-8",
+    )
+    model_paths = []
+    for name in ("model", "vad", "punc"):
+        path = tmp_path / name
+        path.mkdir()
+        (path / "model.pt").write_bytes(b"model")
+        (path / "config.yaml").write_text("model: fake\n", encoding="utf-8")
+        model_paths.append(path)
+    resident = asr_refiner._ResidentOfflineRefiner(
+        (Path(sys.executable), worker, *model_paths)
+    )
+
+    started = time.monotonic()
+    try:
+        result = resident.refine(b"\x00\x00", timeout_s=0.05)
+    finally:
+        resident.shutdown()
+
+    assert result.status == "failed"
+    assert result.reason == "offline_worker_not_ready"
+    assert time.monotonic() - started < 1.0
 
 
 def test_refine_wav_file_splits_long_audio_and_reuses_resident_worker(monkeypatch, tmp_path):
@@ -269,6 +419,44 @@ def test_refine_wav_file_splits_long_audio_and_reuses_resident_worker(monkeypatc
     assert len(observed_chunk_samples) == 3
     assert sum(observed_chunk_samples) == 61 * 16_000
     assert max(observed_chunk_samples) <= 30 * 16_000
+
+
+def test_refine_wav_file_skips_empty_final_all_zero_silence_chunk(monkeypatch, tmp_path):
+    audio_path = tmp_path / "trailing-silence.wav"
+    with wave.open(str(audio_path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(16_000)
+        wav_file.writeframes(b"\x01\x00" * 16_000)
+
+    class FakeResidentRefiner:
+        def refine(self, pcm16, *, timeout_s):
+            assert timeout_s > 0
+            if asr_refiner._pcm16_is_exact_silence(pcm16):
+                return asr_refiner.RefinementResult(
+                    text="",
+                    status="empty",
+                    model_id="offline-model",
+                    reason="offline_text_empty",
+                )
+            return asr_refiner.RefinementResult(
+                text="spoken part",
+                status="refined",
+                model_id="offline-model",
+            )
+
+    monkeypatch.setattr(asr_refiner, "refinement_capability", lambda: {"status": "ready"})
+    monkeypatch.setattr(asr_refiner, "_get_resident_refiner", lambda: FakeResidentRefiner())
+    monkeypatch.setattr(
+        asr_refiner,
+        "_split_pcm16_for_file_refinement",
+        lambda _pcm16: [b"\x01\x00", b"\x00\x00"],
+    )
+
+    result = asr_refiner.refine_wav_file(audio_path, timeout_s=5.0)
+
+    assert result.authoritative is True
+    assert result.text == "spoken part"
 
 
 def test_resident_refiner_reuses_one_process_and_forces_offline_environment(tmp_path):
@@ -318,3 +506,117 @@ for line in sys.stdin:
     finally:
         resident.shutdown()
     assert resident.status()["process_running"] is False
+
+
+def test_resident_refiner_unloads_after_idle_and_restarts_on_next_request(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_REFINER_IDLE_UNLOAD_SECONDS", "0.05")
+    worker = tmp_path / "idle_refiner_worker.py"
+    worker.write_text(
+        """
+import base64
+import json
+import sys
+
+print(json.dumps({"event_type": "ready", "model_id": "idle-test-model"}), flush=True)
+for line in sys.stdin:
+    request = json.loads(line)
+    if request.get("command") == "shutdown":
+        break
+    pcm16 = base64.b64decode(request["pcm16_base64"])
+    print(json.dumps({"event_type": "result", "request_id": request["request_id"], "status": "ok", "text": f"bytes-{len(pcm16)}"}), flush=True)
+""".lstrip(),
+        encoding="utf-8",
+    )
+    model_paths = []
+    for name in ("model", "vad", "punc"):
+        path = tmp_path / name
+        path.mkdir()
+        (path / "model.pt").write_bytes(b"model")
+        (path / "config.yaml").write_text("model: fake\n", encoding="utf-8")
+        model_paths.append(path)
+    resident = asr_refiner._ResidentOfflineRefiner(
+        (Path(sys.executable), worker, *model_paths)
+    )
+
+    try:
+        assert resident.start(timeout_s=5.0) is True
+        initial_pid = resident.status()["pid"]
+        deadline = time.monotonic() + 2.0
+        while resident.status()["process_running"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        idle_status = resident.status()
+        assert idle_status["process_running"] is False
+        assert idle_status["idle_unload_count"] == 1
+        assert idle_status["last_stop_reason"] == "idle_timeout"
+
+        result = resident.refine(b"\x00\x00", timeout_s=5.0)
+        restarted_status = resident.status()
+        assert result.text == "bytes-2"
+        assert result.authoritative is True
+        assert restarted_status["pid"] != initial_pid
+        assert restarted_status["process_start_count"] == 2
+        assert restarted_status["idle_unload_scheduled"] is True
+    finally:
+        resident.shutdown()
+
+
+def test_resident_refiner_stays_loaded_for_active_meeting_then_unloads(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_REFINER_IDLE_UNLOAD_SECONDS", "0.05")
+    worker = tmp_path / "meeting_resident_refiner_worker.py"
+    worker.write_text(
+        """
+import json
+import sys
+
+print(json.dumps({"event_type": "ready", "model_id": "meeting-residency-model"}), flush=True)
+for line in sys.stdin:
+    request = json.loads(line)
+    if request.get("command") == "shutdown":
+        break
+""".lstrip(),
+        encoding="utf-8",
+    )
+    model_paths = []
+    for name in ("model", "vad", "punc"):
+        path = tmp_path / name
+        path.mkdir()
+        (path / "model.pt").write_bytes(b"model")
+        (path / "config.yaml").write_text("model: fake\n", encoding="utf-8")
+        model_paths.append(path)
+    resident = asr_refiner._ResidentOfflineRefiner(
+        (Path(sys.executable), worker, *model_paths)
+    )
+
+    try:
+        resident.retain_for_meeting("meeting-active")
+        assert resident.start(timeout_s=5.0) is True
+        time.sleep(0.12)
+
+        active_status = resident.status()
+        assert active_status["process_running"] is True
+        assert active_status["process_start_count"] == 1
+        assert active_status["idle_unload_count"] == 0
+        assert active_status["active_meeting_lease_count"] == 1
+        assert active_status["idle_unload_blocked_by_active_meeting"] is True
+        assert active_status["idle_unload_scheduled"] is False
+
+        resident.release_for_meeting("meeting-active")
+        deadline = time.monotonic() + 2.0
+        while resident.status()["process_running"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        released_status = resident.status()
+        assert released_status["process_running"] is False
+        assert released_status["idle_unload_count"] == 1
+        assert released_status["active_meeting_lease_count"] == 0
+        assert released_status["idle_unload_blocked_by_active_meeting"] is False
+        assert released_status["last_stop_reason"] == "idle_timeout"
+    finally:
+        resident.shutdown()

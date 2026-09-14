@@ -342,7 +342,7 @@ set \"MEETING_COPILOT_FILE_ASR_MODEL_DIR=%ROOT%\\models\\funasr-file\\offline-pa
 set \"MEETING_COPILOT_FILE_ASR_VAD_MODEL_DIR=%ROOT%\\models\\funasr-file\\vad\"\r
 set \"MEETING_COPILOT_FILE_ASR_PUNC_MODEL_DIR=%ROOT%\\models\\funasr-file\\punc\"\r
 set \"MEETING_COPILOT_RUNTIME_MANIFEST=%ROOT%\\runtime-bundle-manifest.json\"\r
-\"%ROOT%\\runtime\\backend-python\\python.exe\" -m uvicorn meeting_copilot_web_mvp.app:app --host 127.0.0.1 --port %MEETING_COPILOT_PORT% --log-level warning --timeout-graceful-shutdown 8\r
+\"%ROOT%\\runtime\\backend-python\\python.exe\" -m uvicorn meeting_copilot_web_mvp.app:app --host 127.0.0.1 --port %MEETING_COPILOT_PORT% --log-level warning --ws websockets-sansio --timeout-graceful-shutdown 8\r
 """,
         encoding="ascii",
         newline="",

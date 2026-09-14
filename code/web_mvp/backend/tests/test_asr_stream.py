@@ -14,6 +14,7 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 from meeting_copilot_web_mvp import asr_stream
+from meeting_copilot_web_mvp import app as app_module
 from meeting_copilot_web_mvp.app import create_app
 from meeting_copilot_web_mvp.asr_live_repository import InMemoryAsrLiveSessionRepository
 from meeting_copilot_web_mvp.canonical_transcript import project_canonical_transcript
@@ -38,6 +39,28 @@ def _force_fake_recognizer(monkeypatch):
     )
 
 
+@pytest.mark.parametrize(
+    "invalid_confidence",
+    [
+        pytest.param(math.nan, id="nan"),
+        pytest.param(math.inf, id="positive-infinity"),
+        pytest.param(-math.inf, id="negative-infinity"),
+        pytest.param(True, id="boolean-true"),
+        pytest.param(False, id="boolean-false"),
+        pytest.param(-0.01, id="below-zero"),
+        pytest.param(1.01, id="above-one"),
+        pytest.param("not-a-number", id="nonnumeric-string"),
+    ],
+)
+def test_asr_confidence_metadata_fails_closed_for_invalid_scores(invalid_confidence):
+    metadata = asr_stream._asr_confidence_metadata({"confidence": invalid_confidence})
+
+    assert metadata == {
+        "confidence": None,
+        "confidence_source": asr_stream.ASR_CONFIDENCE_SOURCE_REALTIME_INVALID,
+    }
+
+
 def test_asr_stream_ws_emits_partial_per_chunk_and_final_on_end():
     client = TestClient(create_app(allow_fake_asr_fallback=True))
     with client.websocket_connect("/live/asr/stream/ws/sess_stream_1") as ws:
@@ -55,6 +78,40 @@ def test_asr_stream_ws_emits_partial_per_chunk_and_final_on_end():
     assert final["event_type"] == "final"
     assert final["segment_id"] == "stream_seg_sess_stream_1"
     assert final["confidence"] == 0.9
+
+
+def test_asr_stream_can_emit_transport_handshake_before_recognizer_ready():
+    class CapturingWebSocket:
+        def __init__(self):
+            self.messages = [{"text": "END"}]
+            self.sent = []
+
+        async def accept(self):
+            return None
+
+        async def receive(self):
+            return self.messages.pop(0)
+
+        async def send_text(self, payload):
+            self.sent.append(json.loads(payload))
+
+        async def close(self):
+            return None
+
+    websocket = CapturingWebSocket()
+    asyncio.run(
+        asr_stream.handle_stream(
+            websocket,
+            "transport_handshake_session",
+            emit_transport_ready=True,
+        )
+    )
+
+    assert websocket.sent[0] == {
+        "event_type": "asr_transport_ready",
+        "provider": "transport",
+        "ready": True,
+    }
 
 
 def test_asr_stream_ws_sessions_are_independent():
@@ -514,6 +571,7 @@ def test_asr_stream_end_finalizes_via_worker_thread_without_abort(monkeypatch):
     class EndingWebSocket:
         def __init__(self):
             self._messages = [{"text": "END"}]
+            self.sent = []
 
         async def accept(self):
             return None
@@ -522,20 +580,22 @@ def test_asr_stream_end_finalizes_via_worker_thread_without_abort(monkeypatch):
             return self._messages.pop(0)
 
         async def send_text(self, payload):
-            return None
+            self.sent.append(json.loads(payload))
 
         async def close(self):
             return None
 
     recognizer = ResourceRecognizer()
+    websocket = EndingWebSocket()
     monkeypatch.setattr(asr_stream, "get_recognizer", lambda sid: recognizer)
 
-    asyncio.run(asr_stream.handle_stream(EndingWebSocket(), "sess_finalize_thread"))
+    asyncio.run(asr_stream.handle_stream(websocket, "sess_finalize_thread"))
 
     assert recognizer.finalize_calls == 1
     assert recognizer.abort_calls == 0
     assert recognizer.finalize_thread is not None
     assert recognizer.finalize_thread.startswith("meeting-stream-sess_finalize_thread")
+    assert websocket.sent[-1]["event_type"] == "end_of_stream"
 
 
 def test_asr_stream_slow_audio_and_final_callbacks_do_not_block_event_loop(monkeypatch):
@@ -814,11 +874,17 @@ def test_funasr_disconnect_backfills_uncommitted_audio_tail(monkeypatch, tmp_pat
     assert transcript_finals[0]["segment_id"] == "microphone:e1:vad_endpoint_001"
     assert transcript_finals[0]["final_source"] == "local_offline_disconnect_backfill"
     assert transcript_finals[0]["refinement_status"] == "backfilled"
+    assert transcript_finals[0]["confidence"] is None
+    assert (
+        transcript_finals[0]["confidence_source"]
+        == asr_stream.ASR_CONFIDENCE_SOURCE_OFFLINE_UNAVAILABLE
+    )
     assert transcript_finals[0]["start_ms"] == 0
     assert transcript_finals[0]["end_ms"] == 300
     assert len(committed) == 1
     assert committed[0]["text"] == "张三下周三完成断线恢复测试。"
     assert committed[0]["authoritative"] is True
+    assert committed[0]["confidence"] is None
     assert "stream_interrupted" in record["degradation_reasons"]
     assert record["transcript_backfill"] == {
         "schema_version": "transcript_backfill.v1",
@@ -910,6 +976,170 @@ def test_funasr_disconnect_records_failed_backfill_without_inventing_a_final(mon
     assert record["transcript_backfill"]["error_class"] == "offline_refinement_unavailable"
     assert "offline_refinement_unavailable" in record["degradation_reasons"]
     assert record["audio"]["saved"] is True
+
+
+def test_funasr_disconnect_does_not_backfill_unvoiced_live_protocol_tail(monkeypatch, tmp_path):
+    """A live text span cannot turn a quiet 100 ms tail into a final."""
+
+    class UnvoicedTailRecognizer:
+        provider = "funasr_realtime"
+        provider_mode = "real"
+        is_mock = False
+        fallback_used = False
+        degradation_reasons = []
+
+        def __init__(self, _session_id):
+            self._seq = 0
+
+        def recognize_chunk(self, _pcm):
+            self._seq += 1
+            return [{
+                "event_type": "partial",
+                "segment_id": "live-unvoiced-tail",
+                "text": "这段文本没有对应的有声证据",
+                "start_ms": 0,
+                "end_ms": 300,
+                "confidence": 0.8,
+            }]
+
+        def finalize(self):
+            return []
+
+        def abort(self):
+            return None
+
+    class DisconnectingWebSocket:
+        def __init__(self):
+            # 100 ms room noise is below the VAD threshold but the online
+            # worker still reports a misleading 300 ms text span.
+            self.messages = [{"bytes": struct.pack("<f", 0.004) * 1_600}]
+
+        async def accept(self):
+            return None
+
+        async def receive(self):
+            if self.messages:
+                return self.messages.pop(0)
+            raise RuntimeError("simulated websocket disconnect")
+
+        async def send_text(self, _payload):
+            return None
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(asr_stream, "get_recognizer", lambda sid: UnvoicedTailRecognizer(sid))
+    monkeypatch.setattr(
+        asr_stream,
+        "refine_pcm_f32",
+        lambda _payload: SimpleNamespace(
+            text="不应被提交的噪声文本。",
+            status="refined",
+            model_id="test-offline-refiner",
+            reason=None,
+            authoritative=True,
+        ),
+    )
+    repo = InMemoryAsrLiveSessionRepository()
+    sid = "sess_disconnect_unvoiced_live_tail"
+
+    asyncio.run(
+        asr_stream.handle_stream(
+            DisconnectingWebSocket(),
+            sid,
+            asr_live_repo=repo,
+            audio_source="browser_live_mic",
+            audio_asset_data_dir=tmp_path,
+        )
+    )
+
+    record = repo.get(sid)
+    assert not any(event["event_type"] == "transcript_final" for event in record["events"])
+    assert "stream_interrupted" in record["degradation_reasons"]
+
+
+def test_funasr_disconnect_records_policy_bypass_without_claiming_worker_unavailable(
+    monkeypatch,
+    tmp_path,
+):
+    class PolicyBypassedRecognizer:
+        provider = "funasr_realtime"
+        provider_mode = "real"
+        is_mock = False
+        fallback_used = False
+        degradation_reasons = []
+        _seq = 0
+
+        def recognize_chunk(self, _pcm):
+            self._seq += 1
+            return [{
+                "event_type": "partial",
+                "segment_id": "online-tail",
+                "text": "下周完成复盘",
+                "start_ms": 0,
+                "end_ms": 300,
+                "confidence": 0.8,
+            }]
+
+        def finalize(self):
+            return []
+
+        def abort(self):
+            return None
+
+    class InterruptedWebSocket:
+        def __init__(self):
+            self.messages = [{"bytes": struct.pack("<f", 0.05) * 4_800}]
+
+        async def accept(self):
+            return None
+
+        async def receive(self):
+            if self.messages:
+                return self.messages.pop(0)
+            raise RuntimeError("simulated websocket disconnect")
+
+        async def send_text(self, _payload):
+            return None
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(asr_stream, "get_recognizer", lambda _sid: PolicyBypassedRecognizer())
+    monkeypatch.setattr(
+        asr_stream,
+        "refine_pcm_f32",
+        lambda _payload: SimpleNamespace(
+            text="",
+            status="bypassed",
+            model_id=None,
+            reason=asr_stream.ONLINE_ONLY_REFINEMENT_REASON,
+            authoritative=False,
+        ),
+    )
+    repo = InMemoryAsrLiveSessionRepository()
+    sid = "sess_disconnect_tail_policy_bypass"
+
+    asyncio.run(
+        asr_stream.handle_stream(
+            InterruptedWebSocket(),
+            sid,
+            asr_live_repo=repo,
+            audio_source="browser_live_mic",
+            audio_asset_data_dir=tmp_path,
+            native_track_id="microphone",
+            native_capture_epoch=1,
+        )
+    )
+
+    record = repo.get(sid)
+    assert record["transcript_backfill"]["status"] == "failed"
+    assert record["transcript_backfill"]["error_class"] == (
+        asr_stream.ONLINE_ONLY_REFINEMENT_REASON
+    )
+    assert asr_stream.ONLINE_ONLY_REFINEMENT_REASON in record["degradation_reasons"]
+    assert "offline_refinement_unavailable" not in record["degradation_reasons"]
+    assert not any(event["event_type"] == "transcript_final" for event in record["events"])
 
 
 def test_asr_stream_recording_setup_failure_aborts_recognizer(monkeypatch, tmp_path):
@@ -1011,6 +1241,264 @@ def test_app_recording_setup_failure_releases_capture_lease(monkeypatch, tmp_pat
     assert recording["error_class"] == "recording_setup_failed"
     assert resumed["status"] == "active"
     assert resumed["capture_generation"] == recording["capture_generation"] + 1
+
+
+def test_capture_heartbeat_end_seal_race_keeps_terminal_recording_and_ws_open(
+    monkeypatch,
+    tmp_path,
+):
+    """A renewal that finishes after END must not report a terminal lease loss."""
+
+    app = create_app(data_dir=tmp_path, allow_fake_asr_fallback=True)
+    persistence = app.state.v2_persistence
+    session_id = "capture-heartbeat-end-race"
+    output_path = f"audio_assets/{session_id}/audio.wav"
+    transcript = "需要确认发布负责人。"
+
+    original_sleep = asyncio.sleep
+    heartbeat_sleep_entered = asyncio.Event()
+    heartbeat_sleep_release = asyncio.Event()
+    heartbeat_started = threading.Event()
+    heartbeat_release = threading.Event()
+    heartbeat_finished = threading.Event()
+
+    async def controlled_sleep(delay):
+        # The app heartbeat sleeps for lease_ms / 3 = 10s. Holding only that
+        # sleep gives the test a deterministic handoff into to_thread without
+        # perturbing any short cooperative sleeps in the stream implementation.
+        if delay >= 5:
+            heartbeat_sleep_entered.set()
+            await heartbeat_sleep_release.wait()
+            return
+        await original_sleep(delay)
+
+    monkeypatch.setattr(app_module.asyncio, "sleep", controlled_sleep)
+
+    def heartbeat_after_end(**_kwargs):
+        heartbeat_started.set()
+        try:
+            if not heartbeat_release.wait(timeout=2):
+                raise AssertionError("heartbeat was not released after END seal")
+            return False
+        finally:
+            heartbeat_finished.set()
+
+    monkeypatch.setattr(
+        persistence,
+        "heartbeat_recording",
+        heartbeat_after_end,
+    )
+    logged_events: list[str] = []
+    original_log = app_module._log
+
+    class LogRecorder:
+        def __getattr__(self, name):
+            return getattr(original_log, name)
+
+        def error(self, event, *args, **kwargs):
+            logged_events.append(str(event))
+
+    monkeypatch.setattr(app_module, "_log", LogRecorder())
+
+    class RaceWebSocket:
+        query_params = {"audio_source": "browser_live_mic"}
+
+        def __init__(self):
+            self.accepted = False
+            self.sent: list[str] = []
+            self.close_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+        async def accept(self):
+            self.accepted = True
+
+        async def send_text(self, payload):
+            self.sent.append(payload)
+
+        async def close(self, *args, **kwargs):
+            self.close_calls.append((args, kwargs))
+
+    websocket = RaceWebSocket()
+
+    async def fake_handle_stream(_websocket, _session_id, **callbacks):
+        await _websocket.accept()
+        started = callbacks["on_audio_recording_started"](
+            {
+                "source_type": "browser_live_mic",
+                "track_id": "microphone",
+                "epoch": 0,
+                "sample_rate_hz": 16_000,
+            }
+        )
+        if asyncio.iscoroutine(started):
+            await started
+        callbacks["on_audio_chunk_committed"](
+            {
+                "source_type": "browser_live_mic",
+                "track_id": "microphone",
+                "epoch": 0,
+                "sequence": 0,
+                "chunk_index": 0,
+                "relative_path": output_path,
+                "sha256": "a" * 64,
+                "sample_rate_hz": 16_000,
+                "sample_count": 1_600,
+                "duration_ms": 100,
+                "file_size_bytes": 6_400,
+            }
+        )
+        await heartbeat_sleep_entered.wait()
+        heartbeat_sleep_release.set()
+        while not heartbeat_started.is_set():
+            await original_sleep(0)
+
+        # The END path marks capture_started false before the seal reaches the
+        # database. The in-flight heartbeat then returns false, but must be
+        # ignored as a terminal-row race.
+        callbacks["on_audio_recording_sealed"](
+            {
+                "source_type": "browser_live_mic",
+                "track_id": "microphone",
+                "epoch": 0,
+                "relative_path": output_path,
+                "interrupted": False,
+            }
+        )
+        callbacks["on_final_committed"](
+            {
+                "event_type": "final",
+                "segment_id": "race-final",
+                "text": transcript,
+                "normalized_text": transcript,
+                "start_ms": 0,
+                "end_ms": 100,
+                "confidence": 0.9,
+            }
+        )
+        heartbeat_release.set()
+        while not heartbeat_finished.is_set():
+            await original_sleep(0)
+        # Let the heartbeat task consume the false renewal and execute its
+        # post-transport ``capture_started`` guard before the route finally
+        # cancels the task.
+        await original_sleep(0)
+
+    monkeypatch.setattr(app_module.asr_stream, "handle_stream", fake_handle_stream)
+    route = next(
+        route
+        for route in app.routes
+        if getattr(route, "path", None) == "/live/asr/stream/ws/{session_id}"
+    )
+
+    asyncio.run(route.endpoint(websocket, session_id))
+
+    recording = persistence.get_recording_session(
+        session_id,
+        track="microphone",
+        epoch=0,
+    )
+    snapshot = persistence.get_snapshot(session_id)
+    persistence.close()
+
+    assert websocket.accepted is True
+    assert websocket.close_calls == []
+    assert "meeting.recording.capture_lease_lost" not in logged_events
+    assert recording["status"] == "sealed"
+    assert recording["chunk_count"] == 1
+    assert recording["duration_ms"] == 100
+    assert recording["output_relative_path"] == output_path
+    assert recording["lease_owner"] is None
+    assert any(
+        segment.get("normalized_text") == transcript
+        for segment in snapshot["segments"]
+    )
+
+
+def test_capture_heartbeat_live_lease_loss_still_closes_ws(
+    monkeypatch,
+    tmp_path,
+):
+    """A failed renewal during active capture remains a real terminal error."""
+
+    app = create_app(data_dir=tmp_path, allow_fake_asr_fallback=True)
+    persistence = app.state.v2_persistence
+    session_id = "capture-heartbeat-live-lease-loss"
+    original_sleep = asyncio.sleep
+    heartbeat_sleep_entered = asyncio.Event()
+    heartbeat_sleep_release = asyncio.Event()
+    websocket_closed = asyncio.Event()
+
+    async def controlled_sleep(delay):
+        if delay >= 5:
+            heartbeat_sleep_entered.set()
+            await heartbeat_sleep_release.wait()
+            return
+        await original_sleep(delay)
+
+    monkeypatch.setattr(app_module.asyncio, "sleep", controlled_sleep)
+    monkeypatch.setattr(
+        persistence,
+        "heartbeat_recording",
+        lambda **_kwargs: False,
+    )
+    logged_events: list[str] = []
+    original_log = app_module._log
+
+    class LogRecorder:
+        def __getattr__(self, name):
+            return getattr(original_log, name)
+
+        def error(self, event, *args, **kwargs):
+            logged_events.append(str(event))
+
+    monkeypatch.setattr(app_module, "_log", LogRecorder())
+
+    class LeaseLossWebSocket:
+        query_params = {"audio_source": "browser_live_mic"}
+
+        def __init__(self):
+            self.close_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+        async def accept(self):
+            return None
+
+        async def send_text(self, _payload):
+            return None
+
+        async def close(self, *args, **kwargs):
+            self.close_calls.append((args, kwargs))
+            websocket_closed.set()
+
+    websocket = LeaseLossWebSocket()
+
+    async def fake_handle_stream(_websocket, _session_id, **callbacks):
+        await _websocket.accept()
+        callbacks["on_audio_recording_started"](
+            {
+                "source_type": "browser_live_mic",
+                "track_id": "microphone",
+                "epoch": 0,
+                "sample_rate_hz": 16_000,
+            }
+        )
+        await heartbeat_sleep_entered.wait()
+        heartbeat_sleep_release.set()
+        await websocket_closed.wait()
+
+    monkeypatch.setattr(app_module.asr_stream, "handle_stream", fake_handle_stream)
+    route = next(
+        route
+        for route in app.routes
+        if getattr(route, "path", None) == "/live/asr/stream/ws/{session_id}"
+    )
+
+    asyncio.run(route.endpoint(websocket, session_id))
+    persistence.close()
+
+    assert "meeting.recording.capture_lease_lost" in logged_events
+    assert len(websocket.close_calls) == 1
+    _args, close_kwargs = websocket.close_calls[0]
+    assert close_kwargs["code"] == 1011
+    assert close_kwargs["reason"] == "recording capture lease lost"
 
 
 def test_browser_reconnect_writes_a_new_recording_epoch_without_overwriting_prior_audio(
@@ -2219,6 +2707,69 @@ def test_asr_stream_persists_finalize_final_before_sending_to_browser(monkeypatc
     assert ws.final_send_saw_persisted_session is True
 
 
+def test_asr_stream_rejects_zero_duration_authoritative_finalize(monkeypatch):
+    class InvalidSpanRecognizer:
+        provider = "test_realtime_asr"
+        provider_mode = "real"
+        is_mock = False
+        fallback_used = False
+        degradation_reasons = []
+
+        def __init__(self, _session_id):
+            self._seq = 0
+
+        def recognize_chunk(self, _pcm):
+            self._seq += 1
+            return []
+
+        def finalize(self):
+            return [
+                {
+                    "event_type": "final",
+                    "segment_id": "invalid_zero_duration",
+                    "text": "这条结果没有真实音频跨度。",
+                    "start_ms": 900,
+                    "end_ms": 900,
+                    "authoritative": True,
+                    "confidence": 0.91,
+                }
+            ]
+
+    class EndWebSocket:
+        def __init__(self):
+            self.messages = [{"bytes": b"\x00" * 3200}, {"text": "END"}]
+            self.sent = []
+
+        async def accept(self):
+            return None
+
+        async def receive(self):
+            return self.messages.pop(0)
+
+        async def send_text(self, payload):
+            self.sent.append(json.loads(payload))
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(asr_stream, "get_recognizer", lambda sid: InvalidSpanRecognizer(sid))
+    repo = InMemoryAsrLiveSessionRepository()
+    websocket = EndWebSocket()
+
+    asyncio.run(
+        asr_stream.handle_stream(
+            websocket,
+            "invalid_zero_duration_session",
+            asr_live_repo=repo,
+            audio_source="browser_live_mic",
+        )
+    )
+
+    record = repo.get("invalid_zero_duration_session")
+    assert not any(event["event_type"] == "transcript_final" for event in record["events"])
+    assert not any(event.get("event_type") == "final" for event in websocket.sent)
+
+
 def test_asr_stream_persists_eos_after_browser_disconnect_during_finalize_send(monkeypatch):
     class FinalizeOnlyRecognizer:
         provider = "test_realtime_asr"
@@ -2900,6 +3451,119 @@ def test_asr_stream_promotes_long_continuous_partial_to_realtime_final_before_st
         ws.send_text("END")
 
 
+@pytest.mark.parametrize("leading_silence_ms", [0, 5_000, 12_000, 20_000])
+def test_funasr_vad_max_segment_starts_at_first_voiced_frame_after_long_preroll(
+    monkeypatch,
+    tmp_path,
+    leading_silence_ms,
+):
+    """Leading silence must not consume the 15-second voiced segment budget."""
+
+    class PrerollRecognizer:
+        provider = "funasr_realtime"
+        provider_mode = "real"
+        is_mock = False
+        fallback_used = False
+        degradation_reasons = []
+
+        def __init__(self, _session_id):
+            self.speech_chunks = 0
+
+        def recognize_chunk(self, pcm):
+            value = struct.unpack("<f", pcm[:4])[0]
+            if abs(value) <= asr_stream.VAD_SILENCE_RMS_THRESHOLD:
+                return []
+            self.speech_chunks += 1
+            return [
+                {
+                    "event_type": "partial",
+                    "segment_id": f"speech_segment_{1 if self.speech_chunks <= 50 else 2}",
+                    "text": (
+                        "这是一段连续语音，应该在十五秒后完整结束。"
+                        if self.speech_chunks <= 50
+                        else "第二段继续确认负责人和截止时间。"
+                    ),
+                    "start_ms": 0,
+                    "end_ms": self.speech_chunks * 300,
+                    "confidence": 0.92,
+                }
+            ]
+
+        def finalize(self):
+            return []
+
+    monkeypatch.setattr(asr_stream, "get_recognizer", lambda sid: PrerollRecognizer(sid))
+    monkeypatch.setattr(
+        asr_stream,
+        "refine_pcm_f32",
+        lambda _payload: SimpleNamespace(
+            text="这是一段连续语音，应该在十五秒后完整结束。",
+            status="refined",
+            model_id="test-offline-refiner",
+            reason=None,
+            authoritative=True,
+        ),
+    )
+    repo = InMemoryAsrLiveSessionRepository()
+
+    class FakeWebSocket:
+        def __init__(self):
+            speech = struct.pack("<f", 0.05) * 4_800
+            leading_silence = struct.pack("<f", 0.0) * 1_600
+            endpoint_silence = struct.pack("<f", 0.0) * 4_800
+            self.messages = [
+                *(
+                    {"bytes": leading_silence}
+                    for _ in range(leading_silence_ms // 100)
+                ),
+                *({"bytes": speech} for _ in range(50)),
+                *({"bytes": speech} for _ in range(10)),
+                {"bytes": endpoint_silence},
+                {"bytes": endpoint_silence},
+                {"bytes": endpoint_silence},
+                {"text": "END"},
+            ]
+            self.sent = []
+
+        async def accept(self):
+            return None
+
+        async def receive(self):
+            return self.messages.pop(0)
+
+        async def send_text(self, payload):
+            self.sent.append(json.loads(payload))
+
+        async def close(self):
+            return None
+
+    websocket = FakeWebSocket()
+    sid = f"sess_vad_preroll_budget_{leading_silence_ms}"
+    asyncio.run(
+        asr_stream.handle_stream(
+            websocket,
+            sid,
+            asr_live_repo=repo,
+            audio_source="browser_live_mic",
+        )
+    )
+
+    finals = [event for event in websocket.sent if event.get("event_type") == "final"]
+    assert finals, "continuous voiced audio should hit the bounded endpoint"
+    assert finals[0]["start_ms"] == leading_silence_ms
+    assert finals[0]["end_ms"] >= leading_silence_ms + 15_000
+    assert finals[0]["end_ms"] - finals[0]["start_ms"] >= 15_000
+
+    record = repo.get(sid)
+    persisted_finals = [
+        event["payload"]
+        for event in record["events"]
+        if event["event_type"] == "transcript_final"
+    ]
+    assert persisted_finals
+    assert all(final["end_ms"] > final["start_ms"] for final in persisted_finals)
+
+
 def test_asr_stream_splits_cumulative_funasr_partials_into_non_repeating_endpoint_finals(monkeypatch, tmp_path):
     first = "第一段主要介绍嘉宾背景"
     second = "第二段继续讨论拍摄计划"
@@ -2975,6 +3639,128 @@ def test_asr_stream_splits_cumulative_funasr_partials_into_non_repeating_endpoin
         assert [event["payload"]["text"] for event in transcript_finals] == [first, second]
 
         ws.send_text("END")
+
+
+def test_incremental_chunk_merger_handles_overlap_and_ascii_boundaries():
+    assert asr_stream._merge_incremental_chunk_text("监控阈", "阈值负责人") == "监控阈值负责人"
+    assert asr_stream._merge_incremental_chunk_text("error rate", "rate and p99") == "error rate and p99"
+    assert asr_stream._merge_incremental_chunk_text("先看", "先看") == "先看"
+
+
+def test_incremental_chunk_merger_is_bounded():
+    merged = asr_stream._merge_incremental_chunk_text("前" * 32, "后" * 32, max_chars=40)
+    assert len(merged) <= 40
+    assert merged.endswith("后" * 32)
+
+
+def test_refinement_degradation_reason_preserves_explicit_resource_bypass():
+    bypassed = SimpleNamespace(
+        status="bypassed",
+        reason=asr_stream.ONLINE_ONLY_REFINEMENT_REASON,
+        authoritative=False,
+    )
+    unavailable = SimpleNamespace(
+        status="unavailable",
+        reason="offline_refinement_components_missing",
+        authoritative=False,
+    )
+
+    assert (
+        asr_stream._refinement_degradation_reason(bypassed)
+        == asr_stream.ONLINE_ONLY_REFINEMENT_REASON
+    )
+    assert (
+        asr_stream._refinement_degradation_reason(unavailable)
+        == "offline_refinement_unavailable"
+    )
+    assert (
+        asr_stream._refinement_degradation_reason(
+            bypassed,
+            rejected_short_text=True,
+        )
+        == "offline_refinement_text_too_short"
+    )
+
+
+def test_incremental_chunk_endpoint_accumulates_explicit_chunks_without_affecting_snapshots(
+    monkeypatch,
+    tmp_path,
+):
+    chunks = ["周五灰度", "发布", "监控阈值负责人未定"]
+
+    class IncrementalChunkRecognizer:
+        provider = "funasr_realtime"
+        provider_mode = "real"
+        is_mock = False
+        fallback_used = False
+        degradation_reasons = []
+
+        def __init__(self, session_id):
+            self.session_id = session_id
+            self._seq = 0
+
+        def recognize_chunk(self, _pcm):
+            self._seq += 1
+            text = chunks[self._seq - 1] if self._seq <= len(chunks) else ""
+            return [
+                {
+                    "event_type": "partial",
+                    "partial_semantics": "incremental_chunk",
+                    "segment_id": f"{self.session_id}_funasr_sc_001",
+                    "source_segment_id": "worker_seg_1",
+                    "text": text,
+                    "start_ms": 0,
+                    "end_ms": self._seq * 300,
+                    "confidence": 0.88,
+                }
+            ]
+
+        def finalize(self):
+            return [
+                {
+                    "event_type": "final",
+                    "partial_semantics": "terminal_snapshot",
+                    "segment_id": f"{self.session_id}_funasr_sc_001",
+                    "source_segment_id": "worker_seg_1",
+                    "text": chunks[-1],
+                    "confidence": 0.9,
+                }
+            ]
+
+    monkeypatch.setattr(asr_stream, "get_recognizer", lambda sid: IncrementalChunkRecognizer(sid))
+    monkeypatch.setattr(
+        asr_stream,
+        "refine_pcm_f32",
+        lambda _payload: SimpleNamespace(
+            text="",
+            status="bypassed",
+            model_id=None,
+            reason=asr_stream.ONLINE_ONLY_REFINEMENT_REASON,
+            authoritative=False,
+        ),
+    )
+    client = TestClient(create_app(data_dir=tmp_path))
+    sid = "sess_incremental_chunk_endpoint"
+    speech = struct.pack("<f", 0.05) * 4_800
+    silence = struct.pack("<f", 0.0) * 4_800
+
+    with client.websocket_connect(f"/live/asr/stream/ws/{sid}?audio_source=browser_live_mic") as ws:
+        for payload in [speech, speech, speech, silence, silence, silence]:
+            ws.send_bytes(payload)
+        observed = []
+        for _ in range(12):
+            event = json.loads(ws.receive_text())
+            observed.append(event)
+            if event.get("event_type") == "final":
+                break
+        ws.send_text("END")
+
+    final = next(event for event in observed if event.get("event_type") == "final")
+    assert final["text"] == "周五灰度发布监控阈值负责人未定"
+    assert final["final_source"] == "local_realtime_online_final"
+    record = client.get(f"/live/asr/sessions/{sid}/events").json()
+    transcript_finals = [event for event in record["events"] if event["event_type"] == "transcript_final"]
+    assert [event["payload"]["text"] for event in transcript_finals] == ["周五灰度发布监控阈值负责人未定"]
 
 
 @pytest.mark.parametrize(
@@ -3097,7 +3883,7 @@ def test_funasr_partial_final_and_canonical_share_l3_normalization_snapshot(
     expected_source_segment_id = f"{sid}_worker_seg_42"
 
     with client.websocket_connect(f"/live/asr/stream/ws/{sid}") as websocket:
-        websocket.send_bytes(b"\x00" * 3200)
+        websocket.send_bytes(struct.pack("<f", 0.05) * 4_800)
         partial = json.loads(websocket.receive_text())
         websocket.send_text("END")
         while True:
@@ -3567,12 +4353,374 @@ def test_vad_endpoint_refines_pcm_before_end_without_online_partial(monkeypatch,
     assert final["event_type"] == "final"
     assert final["authoritative"] is True
     assert final["final_source"] == "local_offline_refinement"
+    assert final["confidence"] is None
+    assert (
+        final["confidence_source"]
+        == asr_stream.ASR_CONFIDENCE_SOURCE_OFFLINE_UNAVAILABLE
+    )
     assert final["text"] == "上线先灰度百分之十，异常时立即回滚。"
     assert final["start_ms"] == 0
     assert final["end_ms"] == 600
     record = client.get(f"/live/asr/sessions/{sid}/events").json()
     transcript_finals = [event for event in record["events"] if event["event_type"] == "transcript_final"]
     assert len(transcript_finals) == 1
+    assert transcript_finals[0]["payload"]["confidence"] is None
+    assert (
+        transcript_finals[0]["payload"]["confidence_source"]
+        == asr_stream.ASR_CONFIDENCE_SOURCE_OFFLINE_UNAVAILABLE
+    )
+
+
+@pytest.mark.parametrize(
+    ("refinement", "expected_final_source", "expected_endpoint_source"),
+    [
+        (
+            SimpleNamespace(
+                text="先到这里",
+                status="refined",
+                model_id="test-offline-refiner",
+                reason=None,
+                authoritative=True,
+            ),
+            "local_offline_refinement",
+            "server_vad_offline_refined",
+        ),
+        (
+            SimpleNamespace(
+                text="",
+                status="bypassed",
+                model_id=None,
+                reason=asr_stream.ONLINE_ONLY_REFINEMENT_REASON,
+                authoritative=False,
+            ),
+            "local_realtime_online_final",
+            "server_vad_online_final_resource_policy",
+        ),
+    ],
+)
+def test_short_funasr_tail_finalizes_after_vad_silence_without_promoting_partial(
+    monkeypatch,
+    refinement,
+    expected_final_source,
+    expected_endpoint_source,
+):
+    class ShortTailRecognizer:
+        provider = "funasr_realtime"
+        provider_mode = "real"
+        is_mock = False
+        fallback_used = False
+        degradation_reasons = []
+
+        def __init__(self):
+            self._seq = 0
+
+        def recognize_chunk(self, pcm):
+            self._seq += 1
+            if struct.unpack("<f", pcm[:4])[0] <= asr_stream.VAD_SILENCE_RMS_THRESHOLD:
+                return []
+            return [
+                {
+                    "event_type": "partial",
+                    "partial_semantics": "incremental_chunk",
+                    "segment_id": "worker_tail_001",
+                    "text": "先到这里",
+                    "start_ms": 0,
+                    "end_ms": 300,
+                    "confidence": 0.9,
+                    "authoritative": False,
+                }
+            ]
+
+        def finalize(self):
+            return []
+
+    class FakeWebSocket:
+        def __init__(self):
+            speech = struct.pack("<f", 0.05) * 4_800
+            silence = struct.pack("<f", 0.0) * 4_800
+            self.messages = [
+                {"bytes": speech},
+                {"bytes": silence},
+                {"bytes": silence},
+                {"bytes": silence},
+                {"text": "END"},
+            ]
+            self.sent = []
+
+        async def accept(self):
+            return None
+
+        async def receive(self):
+            return self.messages.pop(0)
+
+        async def send_text(self, payload):
+            self.sent.append(json.loads(payload))
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(asr_stream, "get_recognizer", lambda _sid: ShortTailRecognizer())
+    monkeypatch.setattr(
+        asr_stream,
+        "refine_pcm_f32",
+        lambda _payload: refinement,
+    )
+    repo = InMemoryAsrLiveSessionRepository()
+    committed = []
+    websocket = FakeWebSocket()
+
+    asyncio.run(
+        asr_stream.handle_stream(
+            websocket,
+            "short_tail_vad_silence",
+            asr_live_repo=repo,
+            on_final_committed=committed.append,
+        )
+    )
+
+    transcript_events = [
+        event for event in websocket.sent if event.get("event_type") in {"partial", "final"}
+    ]
+    assert [event["event_type"] for event in transcript_events] == ["partial", "final"]
+    assert transcript_events[-1]["text"] == "先到这里"
+    assert transcript_events[-1]["authoritative"] is True
+    assert transcript_events[-1]["final_source"] == expected_final_source
+    assert transcript_events[-1]["endpoint_source"] == expected_endpoint_source
+    assert [event["text"] for event in committed] == ["先到这里"]
+    record = repo.get("short_tail_vad_silence")
+    persisted_finals = [
+        event for event in record["events"] if event["event_type"] == "transcript_final"
+    ]
+    assert len(persisted_finals) == 1
+    assert not [
+        event
+        for event in record["events"]
+        if event["event_type"] in {"suggestion_candidate_event", "llm_request_draft_event"}
+    ]
+
+
+def test_client_flush_commits_tail_once_and_end_does_not_duplicate_final(
+    monkeypatch,
+    tmp_path,
+):
+    first_text = "我们已经把方案讨论完了今天"
+    tail_text = "先到这里"
+
+    class SplitTailRecognizer:
+        provider = "funasr_realtime"
+        provider_mode = "real"
+        is_mock = False
+        fallback_used = False
+        degradation_reasons = []
+
+        def __init__(self):
+            self._seq = 0
+
+        def recognize_chunk(self, pcm):
+            self._seq += 1
+            level = struct.unpack("<f", pcm[:4])[0]
+            if level <= asr_stream.VAD_SILENCE_RMS_THRESHOLD:
+                return []
+            text = first_text if level < 0.07 else tail_text
+            return [
+                {
+                    "event_type": "partial",
+                    "partial_semantics": "incremental_chunk",
+                    "segment_id": f"worker_split_{1 if level < 0.07 else 2}",
+                    "text": text,
+                    "start_ms": 0,
+                    "end_ms": self._seq * 300,
+                    "confidence": 0.91,
+                    "authoritative": False,
+                }
+            ]
+
+        def finalize(self):
+            return []
+
+    class FakeWebSocket:
+        def __init__(self):
+            first_speech = struct.pack("<f", 0.05) * 4_800
+            tail_speech = struct.pack("<f", 0.08) * 4_800
+            silence = struct.pack("<f", 0.0) * 4_800
+            self.messages = [
+                {"bytes": first_speech},
+                {"bytes": silence},
+                {"bytes": silence},
+                {"bytes": silence},
+                {"bytes": tail_speech},
+                {"text": asr_stream.STREAM_FLUSH_COMMAND},
+                {"text": asr_stream.STREAM_FLUSH_COMMAND},
+                {"text": "END"},
+            ]
+            self.sent = []
+
+        async def accept(self):
+            return None
+
+        async def receive(self):
+            return self.messages.pop(0)
+
+        async def send_text(self, payload):
+            self.sent.append(json.loads(payload))
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(asr_stream, "get_recognizer", lambda _sid: SplitTailRecognizer())
+
+    def refine(payload):
+        first_sample = struct.unpack("<f", payload[:4])[0]
+        text = first_text if first_sample < 0.07 else tail_text
+        return SimpleNamespace(
+            text=text,
+            status="refined",
+            model_id="test-offline-refiner",
+            reason=None,
+            authoritative=True,
+        )
+
+    monkeypatch.setattr(asr_stream, "refine_pcm_f32", refine)
+    app = create_app(data_dir=tmp_path)
+    persistence = app.state.v2_persistence
+    committed = []
+    websocket = FakeWebSocket()
+
+    def commit_final(event):
+        committed.append(event)
+        return app.state.commit_v2_final("split_tail_client_flush", event)
+
+    asyncio.run(
+        asr_stream.handle_stream(
+            websocket,
+            "split_tail_client_flush",
+            asr_live_repo=app.state.asr_live_repository,
+            on_final_committed=commit_final,
+        )
+    )
+
+    finals = [event for event in websocket.sent if event.get("event_type") == "final"]
+    assert [event["text"] for event in finals] == [first_text, tail_text]
+    assert finals[-1]["endpoint_trigger"] == "client_flush"
+    flush_results = [
+        event for event in websocket.sent if event.get("event_type") == "flush_complete"
+    ]
+    assert [event["final_committed"] for event in flush_results] == [True, False]
+    assert [event["text"] for event in committed] == [first_text, tail_text]
+    assert len({event["segment_id"] for event in committed}) == 2
+
+    record = app.state.asr_live_repository.get("split_tail_client_flush")
+    persisted_finals = [
+        event["payload"]
+        for event in record["events"]
+        if event["event_type"] == "transcript_final"
+    ]
+    assert [event["text"] for event in persisted_finals] == [first_text, tail_text]
+    assert len({event["segment_id"] for event in persisted_finals}) == 2
+    snapshot = persistence.get_snapshot("split_tail_client_flush")
+    assert [segment["text"] for segment in snapshot["segments"]] == [first_text, tail_text]
+    jobs = persistence.list_jobs(meeting_id="split_tail_client_flush")
+    correction_jobs = [job for job in jobs if job["kind"] == "correction"]
+    assert len(correction_jobs) == 2
+    assert len({job["input_transcript_seq"] for job in correction_jobs}) == 2
+    intelligence_jobs = [job for job in jobs if job["kind"] == "intelligence"]
+    suggestion_jobs = [job for job in jobs if job["kind"] == "suggestion"]
+    if intelligence_jobs:
+        assert len(intelligence_jobs) == 1
+        assert not suggestion_jobs
+    else:
+        assert len(suggestion_jobs) == 2
+    persistence.close()
+
+
+def test_disconnect_while_sending_committed_vad_final_does_not_backfill_same_pcm(monkeypatch):
+    class DelayedOnlineRecognizer:
+        provider = "funasr_realtime"
+        provider_mode = "real"
+        is_mock = False
+        fallback_used = False
+        degradation_reasons = []
+
+        def __init__(self):
+            self._seq = 0
+            self.abort_calls = 0
+
+        def recognize_chunk(self, _pcm):
+            self._seq += 1
+            return []
+
+        def finalize(self):
+            return []
+
+        def abort(self):
+            self.abort_calls += 1
+
+    class DisconnectingWebSocket:
+        def __init__(self):
+            speech = struct.pack("<f", 0.05) * 4_800
+            silence = struct.pack("<f", 0.0) * 4_800
+            self.messages = [
+                {"bytes": speech},
+                {"bytes": silence},
+                {"bytes": silence},
+                {"bytes": silence},
+            ]
+            self.sent = []
+
+        async def accept(self):
+            return None
+
+        async def receive(self):
+            return self.messages.pop(0)
+
+        async def send_text(self, payload):
+            event = json.loads(payload)
+            self.sent.append(event)
+            if event.get("event_type") == "final":
+                raise RuntimeError("simulated peer disconnect during final send")
+
+        async def close(self):
+            return None
+
+    recognizer = DelayedOnlineRecognizer()
+    refinement_calls = 0
+
+    def refine(_payload):
+        nonlocal refinement_calls
+        refinement_calls += 1
+        return SimpleNamespace(
+            text="上线先灰度百分之十，异常时立即回滚。",
+            status="refined",
+            model_id="test-offline-refiner",
+            reason=None,
+            authoritative=True,
+        )
+
+    monkeypatch.setattr(asr_stream, "get_recognizer", lambda _sid: recognizer)
+    monkeypatch.setattr(asr_stream, "refine_pcm_f32", refine)
+    repo = InMemoryAsrLiveSessionRepository()
+
+    asyncio.run(
+        asr_stream.handle_stream(
+            DisconnectingWebSocket(),
+            "vad_final_send_disconnect",
+            asr_live_repo=repo,
+        )
+    )
+
+    record = repo.get("vad_final_send_disconnect")
+    transcript_finals = [
+        event["payload"]
+        for event in record["events"]
+        if event["event_type"] == "transcript_final"
+    ]
+    assert refinement_calls == 1
+    assert recognizer.abort_calls == 1
+    assert len(transcript_finals) == 1
+    assert transcript_finals[0]["segment_id"] == "vad_endpoint_001"
+    assert transcript_finals[0]["final_source"] == "local_offline_refinement"
+    assert "stream_interrupted" in record["degradation_reasons"]
+    assert "transcript_backfill" not in record
 
 
 def test_funasr_without_offline_refiner_keeps_terminal_snapshot_non_authoritative(
@@ -3651,3 +4799,808 @@ def test_funasr_without_offline_refiner_keeps_terminal_snapshot_non_authoritativ
     canonical = project_canonical_transcript(session_id=sid, events=record["events"])
     assert canonical["committed_text"] == ""
     assert canonical["active_tail"] is not None
+
+
+def test_online_only_resource_policy_commits_realtime_terminal_as_audited_final(
+    monkeypatch,
+    tmp_path,
+):
+    class OnlineSnapshotRecognizer:
+        provider = "funasr_realtime"
+        provider_mode = "real"
+        is_mock = False
+        fallback_used = False
+        degradation_reasons = []
+
+        def __init__(self, session_id):
+            self.session_id = session_id
+            self._seq = 0
+
+        def recognize_chunk(self, _pcm):
+            self._seq += 1
+            return [
+                {
+                    "event_type": "partial",
+                    "segment_id": f"{self.session_id}_online_001",
+                    "text": "接口先灰度百分之五，谁负责回滚？",
+                    "start_ms": 0,
+                    "end_ms": 300,
+                    "confidence": 0.93,
+                    "authoritative": False,
+                }
+            ]
+
+        def finalize(self):
+            return []
+
+    monkeypatch.setattr(asr_stream, "get_recognizer", lambda sid: OnlineSnapshotRecognizer(sid))
+    monkeypatch.setattr(
+        asr_stream,
+        "refine_pcm_f32",
+        lambda _payload: SimpleNamespace(
+            text="",
+            status="bypassed",
+            model_id=None,
+            reason=asr_stream.ONLINE_ONLY_REFINEMENT_REASON,
+            authoritative=False,
+        ),
+    )
+    client = TestClient(create_app(data_dir=tmp_path))
+    sid = "sess_online_only_resource_policy"
+
+    with client.websocket_connect(f"/live/asr/stream/ws/{sid}") as ws:
+        ws.send_bytes(struct.pack("<f", 0.05) * 4_800)
+        online_partial = json.loads(ws.receive_text())
+        ws.send_text("END")
+        audited_final = None
+        for _ in range(6):
+            candidate = json.loads(ws.receive_text())
+            if (
+                candidate.get("event_type") == "final"
+                and candidate.get("refinement_status") == "bypassed"
+            ):
+                audited_final = candidate
+                break
+
+    assert online_partial["event_type"] == "partial"
+    assert audited_final is not None
+    assert audited_final["authoritative"] is True
+    assert audited_final["final_source"] == "local_realtime_online_final"
+    assert audited_final["refinement_reason"] == asr_stream.ONLINE_ONLY_REFINEMENT_REASON
+    assert audited_final["endpoint_source"] == "end_of_stream_online_final_resource_policy"
+    assert audited_final["confidence"] == 0.93
+    assert (
+        audited_final["confidence_source"]
+        == asr_stream.ASR_CONFIDENCE_SOURCE_REALTIME_REPORTED
+    )
+
+    record = client.get(f"/live/asr/sessions/{sid}/events").json()
+    transcript_finals = [
+        event for event in record["events"] if event["event_type"] == "transcript_final"
+    ]
+    assert len(transcript_finals) == 1
+    assert transcript_finals[0]["payload"]["final_source"] == "local_realtime_online_final"
+    assert (
+        transcript_finals[0]["payload"]["confidence_source"]
+        == asr_stream.ASR_CONFIDENCE_SOURCE_REALTIME_REPORTED
+    )
+    assert asr_stream.ONLINE_ONLY_REFINEMENT_REASON in record["degradation_reasons"]
+    canonical = project_canonical_transcript(session_id=sid, events=record["events"])
+    assert canonical["committed_text"] == "接口先灰度百分之五，谁负责回滚？"
+    assert canonical["active_tail"] is None
+
+
+def test_online_only_resource_policy_commits_vad_final_before_meeting_end(
+    monkeypatch,
+    tmp_path,
+):
+    class OnlineVadRecognizer:
+        provider = "funasr_realtime"
+        provider_mode = "real"
+        is_mock = False
+        fallback_used = False
+        degradation_reasons = []
+
+        def __init__(self):
+            self._seq = 0
+
+        def recognize_chunk(self, _pcm):
+            self._seq += 1
+            if self._seq != 1:
+                return []
+            return [
+                {
+                    "event_type": "partial",
+                    "segment_id": "online_vad_001",
+                    "text": "监控阈值谁来改，还没有确定负责人。",
+                    "start_ms": 0,
+                    "end_ms": 300,
+                    "confidence": 0.91,
+                    "authoritative": False,
+                }
+            ]
+
+        def finalize(self):
+            return []
+
+    monkeypatch.setattr(asr_stream, "get_recognizer", lambda _sid: OnlineVadRecognizer())
+    monkeypatch.setattr(
+        asr_stream,
+        "refine_pcm_f32",
+        lambda _payload: SimpleNamespace(
+            text="",
+            status="bypassed",
+            model_id=None,
+            reason=asr_stream.ONLINE_ONLY_REFINEMENT_REASON,
+            authoritative=False,
+        ),
+    )
+    client = TestClient(create_app(data_dir=tmp_path))
+    sid = "sess_online_only_vad_final"
+    speech = struct.pack("<f", 0.05) * 4_800
+    silence = struct.pack("<f", 0.0) * 4_800
+
+    with client.websocket_connect(f"/live/asr/stream/ws/{sid}") as ws:
+        for payload in [speech, silence, silence, silence]:
+            ws.send_bytes(payload)
+        observed = []
+        vad_final = None
+        for _ in range(6):
+            event = json.loads(ws.receive_text())
+            observed.append(event)
+            if event.get("event_type") == "final":
+                vad_final = event
+                break
+        ws.send_text("END")
+
+    online_partial = next(
+        event for event in observed if event.get("event_type") == "partial"
+    )
+    assert online_partial["event_type"] == "partial"
+    assert vad_final is not None
+    assert vad_final["event_type"] == "final"
+    assert vad_final["authoritative"] is True
+    assert vad_final["final_source"] == "local_realtime_online_final"
+    assert vad_final["endpoint_source"] == "server_vad_online_final_resource_policy"
+    assert vad_final["refinement_status"] == "bypassed"
+    assert vad_final["refinement_reason"] == asr_stream.ONLINE_ONLY_REFINEMENT_REASON
+    assert vad_final["confidence"] == 0.91
+    assert (
+        vad_final["confidence_source"]
+        == asr_stream.ASR_CONFIDENCE_SOURCE_REALTIME_REPORTED
+    )
+
+    record = client.get(f"/live/asr/sessions/{sid}/events").json()
+    transcript_finals = [
+        event for event in record["events"] if event["event_type"] == "transcript_final"
+    ]
+    assert len(transcript_finals) == 1
+    assert asr_stream.ONLINE_ONLY_REFINEMENT_REASON in record["degradation_reasons"]
+
+
+class _BoundaryBarrierRecognizer:
+    provider = "funasr_realtime"
+    provider_mode = "real"
+    is_mock = False
+    fallback_used = False
+    degradation_reasons = []
+
+    def __init__(self, *, timeout_count=0):
+        self._seq = 0
+        self._initial_partial_emitted = False
+        self._timeout_count = timeout_count
+        self.flush_calls = []
+        self.finalize_calls = 0
+        self.abort_calls = 0
+
+    def recognize_chunk(self, pcm):
+        self._seq += 1
+        if (
+            not self._initial_partial_emitted
+            and struct.unpack("<f", pcm[:4])[0]
+            > asr_stream.VAD_SILENCE_RMS_THRESHOLD
+        ):
+            self._initial_partial_emitted = True
+            return [self._partial("我们已经把方案讨论完了今天先", end_ms=4_700)]
+        return []
+
+    def flush_utterance(self, boundary_id, timeout=1.25):
+        self.flush_calls.append((boundary_id, timeout))
+        if len(self.flush_calls) <= self._timeout_count:
+            raise asr_stream.FunasrResidentBoundaryTimeoutError(
+                f"simulated boundary timeout: {boundary_id}"
+            )
+        return [self._partial("到这里", start_ms=4_700, end_ms=6_000)]
+
+    def finalize(self):
+        self.finalize_calls += 1
+        return []
+
+    def abort(self):
+        self.abort_calls += 1
+        return None
+
+    @staticmethod
+    def _partial(text, *, start_ms=0, end_ms):
+        return {
+            "event_type": "partial",
+            "partial_semantics": "incremental_chunk",
+            "segment_id": "worker_run3_segment",
+            "source_segment_id": "worker_run3_segment",
+            "text": text,
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "confidence": 0.91,
+            "authoritative": False,
+        }
+
+
+class _BoundaryBarrierWebSocket:
+    def __init__(self, messages):
+        self.messages = list(messages)
+        self.sent = []
+
+    async def accept(self):
+        return None
+
+    async def receive(self):
+        return self.messages.pop(0)
+
+    async def send_text(self, payload):
+        self.sent.append(json.loads(payload))
+
+    async def close(self):
+        return None
+
+
+def _run3_boundary_refinement(_payload):
+    return SimpleNamespace(
+        text="我们已经把方案讨论完了今天先到这里",
+        status="refined",
+        model_id="test-offline-refiner",
+        reason=None,
+        authoritative=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "boundary_trigger",
+    ["natural_vad", "client_flush"],
+)
+def test_funasr_boundary_barrier_merges_run3_late_tail_before_final(
+    monkeypatch,
+    boundary_trigger,
+):
+    speech = struct.pack("<f", 0.05) * 4_800
+    silence = struct.pack("<f", 0.0) * 4_800
+    boundary_messages = (
+        [{"bytes": speech}, {"bytes": silence}, {"bytes": silence}, {"bytes": silence}]
+        if boundary_trigger == "natural_vad"
+        else [{"bytes": speech}, {"text": asr_stream.STREAM_FLUSH_COMMAND}]
+    )
+    recognizer = _BoundaryBarrierRecognizer()
+    websocket = _BoundaryBarrierWebSocket([*boundary_messages, {"text": "END"}])
+    repository = InMemoryAsrLiveSessionRepository()
+    committed = []
+    session_id = f"run3_barrier_{boundary_trigger}"
+    monkeypatch.setattr(asr_stream, "get_recognizer", lambda _sid: recognizer)
+    monkeypatch.setattr(asr_stream, "refine_pcm_f32", _run3_boundary_refinement)
+
+    asyncio.run(
+        asr_stream.handle_stream(
+            websocket,
+            session_id,
+            asr_live_repo=repository,
+            on_final_committed=committed.append,
+        )
+    )
+
+    transcript_events = [
+        event
+        for event in websocket.sent
+        if event.get("event_type") in {"partial", "final"}
+    ]
+    assert [event["event_type"] for event in transcript_events] == [
+        "partial",
+        "partial",
+        "final",
+    ]
+    assert [event["text"] for event in transcript_events] == [
+        "我们已经把方案讨论完了今天先",
+        "我们已经把方案讨论完了今天先到这里",
+        "我们已经把方案讨论完了今天先到这里",
+    ]
+    assert transcript_events[1]["source_segment_id"] == transcript_events[2][
+        "source_segment_id"
+    ]
+    assert transcript_events[2]["source_snapshot_text"] == (
+        "我们已经把方案讨论完了今天先到这里"
+    )
+    assert len(recognizer.flush_calls) == 1
+    assert recognizer.finalize_calls == 1
+    assert [event["text"] for event in committed] == [
+        "我们已经把方案讨论完了今天先到这里"
+    ]
+    flush_results = [
+        event for event in websocket.sent if event.get("event_type") == "flush_complete"
+    ]
+    if boundary_trigger == "client_flush":
+        assert len(flush_results) == 1
+        assert flush_results[0]["boundary_acknowledged"] is True
+        assert flush_results[0]["final_committed"] is True
+    else:
+        assert flush_results == []
+    record = repository.get(session_id)
+    assert len(
+        [event for event in record["events"] if event["event_type"] == "transcript_final"]
+    ) == 1
+    assert not [
+        event
+        for event in record["events"]
+        if event["event_type"]
+        in {"suggestion_candidate_event", "llm_request_draft_event"}
+    ]
+
+
+def test_funasr_empty_refinement_ack_closes_host_vad_segment_without_flush_storm(
+    monkeypatch,
+):
+    class EmptyBoundaryRecognizer:
+        provider = "funasr_realtime"
+        provider_mode = "real"
+        is_mock = False
+        fallback_used = False
+        degradation_reasons = []
+
+        def __init__(self):
+            self._seq = 0
+            self.flush_calls = []
+            self.finalize_calls = 0
+
+        def recognize_chunk(self, _pcm):
+            self._seq += 1
+            return []
+
+        def flush_utterance(self, boundary_id, timeout=1.25):
+            self.flush_calls.append((boundary_id, timeout))
+            return []
+
+        def finalize(self):
+            self.finalize_calls += 1
+            return []
+
+    speech = struct.pack("<f", 0.05) * 4_800
+    silence = struct.pack("<f", 0.0) * 4_800
+    recognizer = EmptyBoundaryRecognizer()
+    websocket = _BoundaryBarrierWebSocket(
+        [
+            {"bytes": speech},
+            *({"bytes": silence} for _ in range(12)),
+            {"text": "END"},
+        ]
+    )
+    repository = InMemoryAsrLiveSessionRepository()
+    refinement_calls = 0
+
+    def empty_refinement(_payload):
+        nonlocal refinement_calls
+        refinement_calls += 1
+        return SimpleNamespace(
+            text="",
+            status="empty",
+            model_id="test-offline-refiner",
+            reason="offline_text_empty",
+            authoritative=False,
+        )
+
+    monkeypatch.setattr(asr_stream, "get_recognizer", lambda _sid: recognizer)
+    monkeypatch.setattr(asr_stream, "refine_pcm_f32", empty_refinement)
+
+    asyncio.run(
+        asr_stream.handle_stream(
+            websocket,
+            "empty_refinement_boundary_ack",
+            asr_live_repo=repository,
+        )
+    )
+
+    assert recognizer.flush_calls == [("utterance-boundary-00000001", 1.25)]
+    assert refinement_calls == 1
+    assert recognizer.finalize_calls == 1
+    assert not [
+        event
+        for event in websocket.sent
+        if event.get("event_type") in {"partial", "final"}
+    ]
+    record = repository.get("empty_refinement_boundary_ack")
+    assert "offline_refinement_unavailable" in record["degradation_reasons"]
+
+
+def test_funasr_boundary_timeout_fails_closed_then_end_retries_same_token(
+    monkeypatch,
+):
+    speech = struct.pack("<f", 0.05) * 4_800
+    recognizer = _BoundaryBarrierRecognizer(timeout_count=1)
+    websocket = _BoundaryBarrierWebSocket(
+        [
+            {"bytes": speech},
+            {"text": asr_stream.STREAM_FLUSH_COMMAND},
+            {"text": "END"},
+        ]
+    )
+    repository = InMemoryAsrLiveSessionRepository()
+    committed = []
+    monkeypatch.setattr(asr_stream, "get_recognizer", lambda _sid: recognizer)
+    monkeypatch.setattr(asr_stream, "refine_pcm_f32", _run3_boundary_refinement)
+
+    asyncio.run(
+        asr_stream.handle_stream(
+            websocket,
+            "run3_barrier_timeout_recovery",
+            asr_live_repo=repository,
+            on_final_committed=committed.append,
+        )
+    )
+
+    flush_result = next(
+        event for event in websocket.sent if event.get("event_type") == "flush_complete"
+    )
+    assert flush_result["boundary_acknowledged"] is False
+    assert flush_result["boundary_processed"] is False
+    assert flush_result["final_committed"] is False
+    assert flush_result["error_code"] == "funasr_boundary_ack_timeout"
+    assert len(recognizer.flush_calls) == 2
+    assert recognizer.flush_calls[0][0] == recognizer.flush_calls[1][0]
+    transcript_events = [
+        event
+        for event in websocket.sent
+        if event.get("event_type") in {"partial", "final"}
+    ]
+    assert [event["event_type"] for event in transcript_events] == [
+        "partial",
+        "partial",
+        "final",
+    ]
+    assert transcript_events[-1]["text"] == "我们已经把方案讨论完了今天先到这里"
+    assert len(committed) == 1
+    record = repository.get("run3_barrier_timeout_recovery")
+    assert "funasr_boundary_ack_timeout" in record["degradation_reasons"]
+
+
+def test_funasr_boundary_timeout_on_flush_and_end_never_promotes_partial(
+    monkeypatch,
+):
+    speech = struct.pack("<f", 0.05) * 4_800
+    recognizer = _BoundaryBarrierRecognizer(timeout_count=2)
+    websocket = _BoundaryBarrierWebSocket(
+        [
+            {"bytes": speech},
+            {"text": asr_stream.STREAM_FLUSH_COMMAND},
+            {"text": "END"},
+        ]
+    )
+    repository = InMemoryAsrLiveSessionRepository()
+    committed = []
+    refinement_calls = 0
+
+    def forbidden_refinement(_payload):
+        nonlocal refinement_calls
+        refinement_calls += 1
+        return _run3_boundary_refinement(_payload)
+
+    monkeypatch.setattr(asr_stream, "get_recognizer", lambda _sid: recognizer)
+    monkeypatch.setattr(asr_stream, "refine_pcm_f32", forbidden_refinement)
+
+    asyncio.run(
+        asr_stream.handle_stream(
+            websocket,
+            "run3_barrier_terminal_timeout",
+            asr_live_repo=repository,
+            on_final_committed=committed.append,
+        )
+    )
+
+    assert len(recognizer.flush_calls) == 2
+    assert recognizer.flush_calls[0][0] == recognizer.flush_calls[1][0]
+    assert recognizer.finalize_calls == 0
+    assert recognizer.abort_calls == 1
+    assert refinement_calls == 0
+    assert committed == []
+    assert not [
+        event for event in websocket.sent if event.get("event_type") == "final"
+    ]
+    record = repository.get("run3_barrier_terminal_timeout")
+    assert "funasr_boundary_ack_timeout" in record["degradation_reasons"]
+    assert not [
+        event
+        for event in record["events"]
+        if event["event_type"]
+        in {
+            "transcript_final",
+            "suggestion_candidate_event",
+            "llm_request_draft_event",
+        }
+    ]
+
+
+def test_funasr_burst_backlog_never_promotes_terminal_snapshot_without_ack(
+    monkeypatch,
+):
+    class BackloggedRecognizer(_BoundaryBarrierRecognizer):
+        def finalize(self):
+            self.finalize_calls += 1
+            stale_snapshot = self._partial(
+                "这是积压完成后才到达的在线终止快照",
+                end_ms=6_000,
+            )
+            stale_snapshot.update(
+                {
+                    "event_type": "final",
+                    "final_source": "online_terminal_snapshot",
+                    "partial_semantics": "terminal_snapshot",
+                }
+            )
+            return [stale_snapshot]
+
+    speech = struct.pack("<f", 0.05) * 4_800
+    recognizer = BackloggedRecognizer(timeout_count=2)
+    websocket = _BoundaryBarrierWebSocket(
+        [
+            {"bytes": speech},
+            {"text": asr_stream.STREAM_FLUSH_COMMAND},
+            {"text": "END"},
+        ]
+    )
+    repository = InMemoryAsrLiveSessionRepository()
+    committed = []
+    refinement_calls = 0
+
+    def forbidden_refinement(_payload):
+        nonlocal refinement_calls
+        refinement_calls += 1
+        return _run3_boundary_refinement(_payload)
+
+    monkeypatch.setattr(asr_stream, "get_recognizer", lambda _sid: recognizer)
+    monkeypatch.setattr(asr_stream, "refine_pcm_f32", forbidden_refinement)
+
+    asyncio.run(
+        asr_stream.handle_stream(
+            websocket,
+            "run3_barrier_burst_backlog",
+            asr_live_repo=repository,
+            on_final_committed=committed.append,
+        )
+    )
+
+    assert len(recognizer.flush_calls) == 2
+    assert recognizer.finalize_calls == 0
+    assert recognizer.abort_calls == 1
+    assert refinement_calls == 0
+    assert committed == []
+    assert not [
+        event for event in websocket.sent if event.get("event_type") == "final"
+    ]
+    record = repository.get("run3_barrier_burst_backlog")
+    assert "funasr_boundary_ack_timeout" in record["degradation_reasons"]
+    assert not [
+        event
+        for event in record["events"]
+        if event["event_type"]
+        in {
+            "transcript_final",
+            "suggestion_candidate_event",
+            "llm_request_draft_event",
+        }
+    ]
+
+
+def test_funasr_boundary_retry_uses_one_absolute_wait_budget(
+    monkeypatch,
+):
+    """Repeated client boundaries cannot extend one token past two wait slices."""
+
+    speech = struct.pack("<f", 0.05) * 4_800
+    recognizer = _BoundaryBarrierRecognizer(timeout_count=4)
+    websocket = _BoundaryBarrierWebSocket(
+        [
+            {"bytes": speech},
+            {"text": asr_stream.STREAM_FLUSH_COMMAND},
+            {"text": asr_stream.STREAM_FLUSH_COMMAND},
+            {"text": asr_stream.STREAM_FLUSH_COMMAND},
+            {"text": "END"},
+        ]
+    )
+    repository = InMemoryAsrLiveSessionRepository()
+    monkeypatch.setattr(asr_stream, "get_recognizer", lambda _sid: recognizer)
+
+    asyncio.run(
+        asr_stream.handle_stream(
+            websocket,
+            "run3_barrier_wait_budget",
+            asr_live_repo=repository,
+        )
+    )
+
+    # The resident attempt remains addressable, but the endpoint adapter makes
+    # only one bounded retry. Subsequent FLUSH/END messages return the same
+    # safe timeout result without enqueueing another command.
+    assert len(recognizer.flush_calls) == asr_stream.FUNASR_BOUNDARY_MAX_WAIT_ATTEMPTS
+    assert len({boundary_id for boundary_id, _ in recognizer.flush_calls}) == 1
+    assert all(
+        asr_stream.FUNASR_BOUNDARY_MIN_WAIT_S
+        <= timeout
+        <= asr_stream.FUNASR_BOUNDARY_ACK_TIMEOUT_S
+        for _, timeout in recognizer.flush_calls
+    )
+    flush_results = [
+        event for event in websocket.sent if event.get("event_type") == "flush_complete"
+    ]
+    assert len(flush_results) == 3
+    assert all(result["boundary_acknowledged"] is False for result in flush_results)
+    assert all(isinstance(result["boundary_diagnostics"], list) for result in flush_results)
+    assert flush_results[-1]["boundary_status"] == "timeout"
+    assert flush_results[-1]["error_code"] == "funasr_boundary_ack_timeout"
+    assert not [
+        event for event in websocket.sent if event.get("event_type") == "final"
+    ]
+    record = repository.get("run3_barrier_wait_budget")
+    assert "funasr_boundary_ack_timeout" in record["degradation_reasons"]
+
+
+def test_funasr_boundary_budget_exhaustion_stops_automatic_vad_reentry(
+    monkeypatch,
+):
+    """A timed-out token must not call the barrier once per later PCM frame."""
+
+    speech = struct.pack("<f", 0.05) * 4_800
+    silence = struct.pack("<f", 0.0) * 4_800
+    recognizer = _BoundaryBarrierRecognizer(timeout_count=4)
+    # Three silence frames reach the first natural VAD boundary; the next
+    # reaches the one permitted retry. More frames keep endpoint silence above
+    # the threshold and would previously re-enter the exhausted wait branch.
+    websocket = _BoundaryBarrierWebSocket(
+        [
+            {"bytes": speech},
+            {"bytes": silence},
+            {"bytes": silence},
+            {"bytes": silence},
+            {"bytes": silence},
+            *({"bytes": silence} for _ in range(8)),
+            {"text": "END"},
+        ]
+    )
+    repository = InMemoryAsrLiveSessionRepository()
+    monkeypatch.setattr(asr_stream, "get_recognizer", lambda _sid: recognizer)
+
+    asyncio.run(
+        asr_stream.handle_stream(
+            websocket,
+            "run3_barrier_budget_reentry",
+            asr_live_repo=repository,
+        )
+    )
+
+    assert len(recognizer.flush_calls) == asr_stream.FUNASR_BOUNDARY_MAX_WAIT_ATTEMPTS
+    assert len(
+        [event for event in websocket.sent if event.get("event_type") == "flush_complete"]
+    ) == 0
+    assert not [
+        event for event in websocket.sent if event.get("event_type") == "final"
+    ]
+    record = repository.get("run3_barrier_budget_reentry")
+    assert "funasr_boundary_ack_timeout" in record["degradation_reasons"]
+
+
+def test_duplicate_client_flush_and_end_do_not_repeat_funasr_boundary_or_final(
+    monkeypatch,
+):
+    speech = struct.pack("<f", 0.05) * 4_800
+    recognizer = _BoundaryBarrierRecognizer()
+    websocket = _BoundaryBarrierWebSocket(
+        [
+            {"bytes": speech},
+            {"text": asr_stream.STREAM_FLUSH_COMMAND},
+            {"text": asr_stream.STREAM_FLUSH_COMMAND},
+            {"text": "END"},
+        ]
+    )
+    repository = InMemoryAsrLiveSessionRepository()
+    committed = []
+    monkeypatch.setattr(asr_stream, "get_recognizer", lambda _sid: recognizer)
+    monkeypatch.setattr(asr_stream, "refine_pcm_f32", _run3_boundary_refinement)
+
+    asyncio.run(
+        asr_stream.handle_stream(
+            websocket,
+            "run3_barrier_duplicate_flush",
+            asr_live_repo=repository,
+            on_final_committed=committed.append,
+        )
+    )
+
+    flush_results = [
+        event for event in websocket.sent if event.get("event_type") == "flush_complete"
+    ]
+    assert len(recognizer.flush_calls) == 1
+    assert recognizer.finalize_calls == 1
+    assert [event["boundary_status"] for event in flush_results] == [
+        "acknowledged",
+        "not_required",
+    ]
+    assert [event["final_committed"] for event in flush_results] == [True, False]
+    assert len(committed) == 1
+    assert len(
+        [event for event in websocket.sent if event.get("event_type") == "final"]
+    ) == 1
+
+
+@pytest.mark.parametrize(
+    "terminal_failure",
+    ["finalize_error", "disconnect_after_flush"],
+)
+def test_pending_funasr_boundary_blocks_interrupted_backfill(
+    monkeypatch,
+    terminal_failure,
+):
+    class FailingTerminalRecognizer(_BoundaryBarrierRecognizer):
+        def finalize(self):
+            self.finalize_calls += 1
+            raise asr_stream.FunasrResidentUnavailableError(
+                "simulated resident finalize failure"
+            )
+
+    class DisconnectingBoundaryWebSocket(_BoundaryBarrierWebSocket):
+        async def receive(self):
+            if not self.messages:
+                raise WebSocketDisconnect(code=1000)
+            return self.messages.pop(0)
+
+    speech = struct.pack("<f", 0.05) * 4_800
+    recognizer = FailingTerminalRecognizer(timeout_count=2)
+    messages = [
+        {"bytes": speech},
+        {"text": asr_stream.STREAM_FLUSH_COMMAND},
+    ]
+    websocket = DisconnectingBoundaryWebSocket(
+        [*messages, {"text": "END"}]
+        if terminal_failure == "finalize_error"
+        else messages
+    )
+    repository = InMemoryAsrLiveSessionRepository()
+    committed = []
+    refinement_calls = 0
+
+    def forbidden_refinement(_payload):
+        nonlocal refinement_calls
+        refinement_calls += 1
+        return _run3_boundary_refinement(_payload)
+
+    monkeypatch.setattr(asr_stream, "get_recognizer", lambda _sid: recognizer)
+    monkeypatch.setattr(asr_stream, "refine_pcm_f32", forbidden_refinement)
+
+    asyncio.run(
+        asr_stream.handle_stream(
+            websocket,
+            f"run3_barrier_{terminal_failure}",
+            asr_live_repo=repository,
+            on_final_committed=committed.append,
+        )
+    )
+
+    assert refinement_calls == 0
+    assert committed == []
+    assert not [
+        event for event in websocket.sent if event.get("event_type") == "final"
+    ]
+    record = repository.get(f"run3_barrier_{terminal_failure}")
+    assert "funasr_boundary_ack_timeout" in record["degradation_reasons"]
+    assert not [
+        event
+        for event in record["events"]
+        if event["event_type"]
+        in {
+            "transcript_final",
+            "suggestion_candidate_event",
+            "llm_request_draft_event",
+        }
+    ]

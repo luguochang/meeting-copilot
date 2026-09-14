@@ -251,7 +251,7 @@ def test_sherpa_sidecar_feeds_chunks_and_reads_final(monkeypatch):
     fake = _FakeProc()
     monkeypatch.setattr(asr_stream.subprocess, "Popen", lambda *a, **k: fake)
     rec = asr_stream.SherpaSidecarRecognizer("sess", asr_stream.Path("/tmp/model"))
-    rec.recognize_chunk(b"\x00" * 6400)
+    first_events = rec.recognize_chunk(b"\x00" * 6400)
     rec.recognize_chunk(b"\x00" * 6400)
     time.sleep(0.15)  # let the reader thread drain the partial into the queue
     finals = rec.finalize()
@@ -259,6 +259,11 @@ def test_sherpa_sidecar_feeds_chunks_and_reads_final(monkeypatch):
     assert final["event_type"] == "final"
     assert final["segment_id"] == "sess_x"
     assert final["text"] == "hi there"
+    assert final["confidence"] is None
+    assert final["confidence_source"] == asr_stream.ASR_CONFIDENCE_SOURCE_REALTIME_UNAVAILABLE
+    partial = next(event for event in [*first_events, *finals] if event["event_type"] == "partial")
+    assert partial["confidence"] is None
+    assert partial["confidence_source"] == asr_stream.ASR_CONFIDENCE_SOURCE_REALTIME_UNAVAILABLE
     # chunks were fed to the sidecar stdin
     assert len(fake.stdin.written) == 2
     assert fake.stdin.written[0] == b"\x00" * 6400
@@ -499,6 +504,15 @@ def test_sherpa_restart_retires_old_writer_and_routes_future_pcm_to_new_generati
     first_proc.exit(7)
     assert second_spawned.wait(1), "non-zero exit did not trigger the single restart"
 
+    # The mocked Popen publishes its event before the replacement generation
+    # finishes activation under the recognizer lock. Wait for the observable
+    # generation swap instead of racing the restart thread.
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        with rec._state_lock:
+            if rec._generation.number == 2:
+                break
+        time.sleep(0.01)
     assert rec._write_q is not old_write_q
     first_proc.stdin.release_write()
     old_writer.join(timeout=1)

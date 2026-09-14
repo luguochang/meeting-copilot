@@ -2,11 +2,40 @@
 
 Uses a fake LLM client — no network, no real gateway calls.
 """
+import asyncio
 from pathlib import Path
 
 import pytest
 
 from meeting_copilot_web_mvp import llm_service
+
+
+class FakeAsyncClient:
+    def __init__(self, response=None):
+        self.response = response or {
+            "choices": [{"message": {"content": "修正后的文本"}}],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
+        }
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.is_closed = False
+        self.calls = []
+
+    async def post(self, url, *, headers, json, timeout):
+        self.calls.append({"url": url, "headers": dict(headers), "json": json, "timeout": timeout})
+        self.started.set()
+        await self.release.wait()
+
+        class Response:
+            status_code = 200
+
+            def json(self_inner):
+                return self.response
+
+        return Response()
+
+    async def aclose(self):
+        self.is_closed = True
 
 
 class FakeClient:
@@ -41,6 +70,57 @@ def _preview():
     }
 
 
+def test_async_provider_success_uses_shared_transport_and_returns_payload():
+    async def run():
+        transport = FakeAsyncClient()
+        transport.release.set()
+        client = llm_service.AsyncHttpxLlmClient(client=transport)
+        handle = llm_service.ProviderAbortHandle()
+
+        payload = await client.post_json(
+            "https://gw.example/v1/chat/completions",
+            {"Authorization": "Bearer redacted"},
+            {"model": "m1", "messages": []},
+            4.0,
+            abort=handle,
+        )
+
+        assert payload["choices"][0]["message"]["content"] == "修正后的文本"
+        assert handle.abort_requested is False
+        assert handle.abort_acknowledged is False
+        assert transport.calls[0]["timeout"] == 4.0
+
+    asyncio.run(run())
+
+
+def test_async_provider_abort_acknowledges_only_after_request_task_unwinds():
+    async def run():
+        transport = FakeAsyncClient()
+        client = llm_service.AsyncHttpxLlmClient(client=transport)
+        handle = llm_service.ProviderAbortHandle()
+        task = asyncio.create_task(
+            client.post_json(
+                "https://gw.example/v1/chat/completions",
+                {"Authorization": "Bearer redacted"},
+                {"model": "m1", "messages": []},
+                4.0,
+                abort=handle,
+            )
+        )
+        await transport.started.wait()
+        assert handle.abort_acknowledged is False
+
+        handle.request_abort("deadline")
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert handle.abort_requested is True
+        assert handle.abort_acknowledged is True
+        assert handle.reason == "deadline"
+
+    asyncio.run(run())
+
+
 def test_execute_candidate_creates_real_card_with_usage():
     config = llm_service.LlmConfig(base_url="https://gw.example", api_key="sk-x", model="m1")
     fake = FakeClient()
@@ -62,7 +142,97 @@ def test_execute_candidate_creates_real_card_with_usage():
     assert fake.calls[0]["body"]["temperature"] == 0
     assert fake.calls[0]["body"]["reasoning_effort"] == "low"
     assert fake.calls[0]["body"]["max_completion_tokens"] == 512
+    assert "thinking" not in fake.calls[0]["body"]
     assert "transcript_correction" not in run
+
+
+def test_execute_candidate_uses_deepseek_max_tokens_for_deepseek_hostname():
+    config = llm_service.LlmConfig(
+        base_url="https://api.deepseek.com",
+        api_key="sk-test-deepseek",
+        model="deepseek-v4-flash",
+    )
+    fake = FakeClient()
+
+    run = llm_service.execute_candidate(_preview(), config, client=fake)
+
+    assert run["run_status"] == "completed"
+    assert fake.calls[0]["url"] == "https://api.deepseek.com/v1/chat/completions"
+    assert fake.calls[0]["body"]["max_tokens"] == 512
+    assert "max_completion_tokens" not in fake.calls[0]["body"]
+    assert fake.calls[0]["body"]["thinking"] == {"type": "disabled"}
+
+
+def test_probe_gateway_uses_max_tokens_for_deepseek_labelled_relay():
+    calls = []
+
+    class ProbeClient:
+        def post_json(self, url, headers, body, timeout):
+            calls.append({"url": url, "headers": headers, "body": body, "timeout": timeout})
+            return {
+                "choices": [{"message": {"content": "OK"}}],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 2, "total_tokens": 9},
+            }
+
+    config = llm_service.LlmConfig(
+        base_url="https://relay.example/deepseek",
+        api_key="sk-test-deepseek",
+        model="deepseek-v4-flash",
+        provider_label="deepseek",
+    )
+
+    result = llm_service.probe_gateway(config, client=ProbeClient())
+
+    assert result["operational"] is True
+    assert calls[0]["url"] == "https://relay.example/deepseek/v1/chat/completions"
+    assert calls[0]["body"]["max_tokens"] == 16
+    assert "max_completion_tokens" not in calls[0]["body"]
+    assert calls[0]["body"]["thinking"] == {"type": "disabled"}
+    assert calls[0]["timeout"] == 2.5
+
+
+def test_reasoning_compatibility_parameters_only_target_deepseek():
+    deepseek = llm_service.LlmConfig(
+        base_url="https://relay.example/api",
+        api_key="sk-test-deepseek",
+        model="deepseek-v4-flash",
+        provider_label="deepseek",
+    )
+    other = llm_service.LlmConfig(
+        base_url="https://gw.example",
+        api_key="sk-test",
+        model="m1",
+    )
+
+    assert llm_service._reasoning_compatibility_parameters(deepseek) == {
+        "thinking": {"type": "disabled"}
+    }
+    assert llm_service._reasoning_compatibility_parameters(other) == {}
+
+
+def test_execute_candidate_accepts_versioned_base_url_without_duplicate_v1():
+    config = llm_service.LlmConfig(
+        base_url="https://gw.example/v1/",
+        api_key="sk-x",
+        model="m1",
+    )
+    fake = FakeClient()
+
+    run = llm_service.execute_candidate(_preview(), config, client=fake)
+
+    assert config.base_url == "https://gw.example"
+    assert run["run_status"] == "completed"
+    assert fake.calls[0]["url"] == "https://gw.example/v1/chat/completions"
+
+
+def test_llm_config_preserves_non_version_path_prefix():
+    config = llm_service.LlmConfig(
+        base_url="https://gw.example/v1-root/",
+        api_key="sk-x",
+        model="m1",
+    )
+
+    assert config.base_url == "https://gw.example/v1-root"
 
 
 def test_execute_candidate_reuses_redacted_idempotency_header_across_retry(monkeypatch):
@@ -233,6 +403,207 @@ def test_llm_config_from_env_reads_values(monkeypatch):
     assert cfg.api_key == "sk-x"
     assert cfg.model == "m1"
     assert cfg.timeout_seconds == 30.0
+
+
+def test_explicit_realtime_model_env_is_prioritized_with_provenance(monkeypatch):
+    llm_service.clear_runtime_config()
+    monkeypatch.delenv("MEETING_COPILOT_DESKTOP_RUNTIME", raising=False)
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-x")
+    monkeypatch.setenv("LLM_GATEWAY_MODEL", "general-model")
+    monkeypatch.setenv("LLM_GATEWAY_REALTIME_MODEL", "realtime-model")
+
+    config = llm_service.LlmConfig.from_env()
+
+    assert config is not None
+    assert config.model == "general-model"
+    assert config.realtime_model == "realtime-model"
+    assert config.realtime_model_source == llm_service.REALTIME_MODEL_SOURCE_ENV
+    assert llm_service.realtime_config(config).model == "realtime-model"
+    assert llm_service.provider_metadata(config) == {
+        "provider": "openai_compatible_gateway",
+        "model": "general-model",
+        "realtime_model": "realtime-model",
+        "realtime_model_source": "llm_gateway_realtime_model",
+        "realtime_model_explicit": True,
+        "realtime_model_warning": None,
+        "correction_model": "general-model",
+        "correction_model_source": "general_model_fallback",
+        "correction_model_explicit": False,
+        "correction_model_warning": "correction_model_inherits_general_model",
+        "is_mock": False,
+        "configured_from_env": True,
+        "api_style": "chat_completions",
+    }
+
+
+def test_correction_model_does_not_inherit_explicit_realtime_model(monkeypatch):
+    llm_service.clear_runtime_config()
+    monkeypatch.delenv("MEETING_COPILOT_DESKTOP_RUNTIME", raising=False)
+    monkeypatch.delenv("LLM_GATEWAY_CORRECTION_MODEL", raising=False)
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-x")
+    monkeypatch.setenv("LLM_GATEWAY_MODEL", "general-model")
+    monkeypatch.setenv("LLM_GATEWAY_REALTIME_MODEL", "realtime-mini")
+
+    config = llm_service.LlmConfig.from_env()
+
+    assert config is not None
+    assert llm_service.realtime_config(config).model == "realtime-mini"
+    assert llm_service.correction_config(config).model == "general-model"
+    assert config.correction_model_source == llm_service.CORRECTION_MODEL_SOURCE_FALLBACK
+    assert llm_service.correction_model_provenance(config) == {
+        "correction_model_source": "general_model_fallback",
+        "correction_model_explicit": False,
+        "correction_model_warning": "correction_model_inherits_general_model",
+    }
+
+
+def test_explicit_correction_model_env_has_lane_provenance(monkeypatch):
+    llm_service.clear_runtime_config()
+    monkeypatch.delenv("MEETING_COPILOT_DESKTOP_RUNTIME", raising=False)
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-x")
+    monkeypatch.setenv("LLM_GATEWAY_MODEL", "general-model")
+    monkeypatch.setenv("LLM_GATEWAY_REALTIME_MODEL", "realtime-mini")
+    monkeypatch.setenv("LLM_GATEWAY_CORRECTION_MODEL", "correction-model")
+
+    config = llm_service.LlmConfig.from_env()
+    assert config is not None
+    correction = llm_service.correction_config(config)
+    audit = llm_service.provider_audit_metadata(
+        correction,
+        purpose="realtime_transcript_correction",
+        provider_lane="correction",
+        model_source=str(correction.correction_model_source),
+    )
+
+    assert correction.model == "correction-model"
+    assert correction.correction_model_source == llm_service.CORRECTION_MODEL_SOURCE_ENV
+    assert audit == {
+        "provider": "openai_compatible_gateway",
+        "model": "correction-model",
+        "purpose": "realtime_transcript_correction",
+        "provider_lane": "correction",
+        "model_source": "llm_gateway_correction_model",
+    }
+
+
+def test_runtime_correction_model_is_selected_without_inheriting_realtime(monkeypatch):
+    llm_service.clear_runtime_config()
+    monkeypatch.delenv("MEETING_COPILOT_DESKTOP_RUNTIME", raising=False)
+    config_metadata = llm_service.configure_runtime(
+        base_url="https://gw.example",
+        api_key="sk-runtime-correction-test",
+        model="general-model",
+        realtime_model="realtime-model",
+        correction_model="correction-model",
+    )
+    config = llm_service.LlmConfig.from_env()
+    assert config is not None
+    assert config.realtime_model == "realtime-model"
+    assert config.correction_model == "correction-model"
+    assert config.correction_model_source == llm_service.CORRECTION_MODEL_SOURCE_RUNTIME
+    assert llm_service.correction_config(config).model == "correction-model"
+    assert config_metadata["correction_model"] == "correction-model"
+    assert config_metadata["correction_model_source"] == "runtime_correction_model"
+    assert config_metadata["correction_model_explicit"] is True
+    assert config_metadata["correction_model_warning"] is None
+    llm_service.clear_runtime_config()
+
+
+def test_inherited_realtime_model_is_observable_and_warned_once(monkeypatch):
+    events = []
+
+    class CapturingLogger:
+        def warning(self, event, **values):
+            events.append((event, values))
+
+    config = llm_service.LlmConfig(
+        base_url="https://private-gateway.example",
+        api_key="sk-must-not-appear",
+        model="general-model",
+    )
+    monkeypatch.setattr(llm_service, "_log", CapturingLogger())
+    with llm_service._REALTIME_MODEL_WARNING_LOCK:
+        llm_service._REALTIME_MODEL_WARNING_FINGERPRINTS.clear()
+
+    first = llm_service.realtime_config(config)
+    second = llm_service.realtime_config(config)
+    metadata = llm_service.provider_metadata(config)
+
+    assert first.model == "general-model"
+    assert second.model == "general-model"
+    assert config.realtime_model_source == llm_service.REALTIME_MODEL_SOURCE_FALLBACK
+    assert metadata["realtime_model_explicit"] is False
+    assert metadata["realtime_model_warning"] == "realtime_model_inherits_general_model"
+    assert events == [
+        (
+            "llm.realtime_model.inherits_general_model",
+            {
+                "diagnostic_code": "realtime_model_inherits_general_model",
+                "provider": "openai_compatible_gateway",
+                "selected_model": "general-model",
+                "realtime_model_source": "general_model_fallback",
+            },
+        )
+    ]
+    assert "sk-must-not-appear" not in str(events)
+    assert "private-gateway.example" not in str(events)
+
+
+def test_runtime_realtime_model_entry_keeps_explicit_source():
+    llm_service.clear_runtime_config()
+    try:
+        metadata = llm_service.configure_runtime(
+            base_url="https://gw.example",
+            api_key="sk-runtime",
+            model="general-model",
+            realtime_model="runtime-realtime-model",
+        )
+        config = llm_service.LlmConfig.from_env()
+
+        assert config is not None
+        assert config.realtime_model_source == llm_service.REALTIME_MODEL_SOURCE_RUNTIME
+        assert llm_service.realtime_config(config).model == "runtime-realtime-model"
+        assert metadata["realtime_model_source"] == "runtime_realtime_model"
+        assert metadata["realtime_model_explicit"] is True
+        assert metadata["realtime_model_warning"] is None
+    finally:
+        llm_service.clear_runtime_config()
+
+
+def test_realtime_model_source_and_selection_cannot_disagree():
+    fallback = llm_service.LlmConfig(
+        base_url="https://gw.example",
+        api_key="sk-runtime",
+        model="general-model",
+        realtime_model="different-model",
+        realtime_model_source=llm_service.REALTIME_MODEL_SOURCE_FALLBACK,
+    )
+
+    assert fallback.realtime_model == "general-model"
+    with pytest.raises(ValueError, match="explicit LLM realtime model is missing"):
+        llm_service.LlmConfig(
+            base_url="https://gw.example",
+            api_key="sk-runtime",
+            model="general-model",
+            realtime_model_source=llm_service.REALTIME_MODEL_SOURCE_RUNTIME,
+        )
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    ["https://gw.example/v1", "https://gw.example/v1/"],
+)
+def test_llm_config_from_env_normalizes_terminal_v1(monkeypatch, base_url):
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", base_url)
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-x")
+
+    cfg = llm_service.LlmConfig.from_env()
+
+    assert cfg is not None
+    assert cfg.base_url == "https://gw.example"
 
 
 def test_llm_config_from_env_does_not_read_dotenv_when_process_env_is_complete(monkeypatch):

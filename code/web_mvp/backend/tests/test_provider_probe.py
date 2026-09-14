@@ -50,6 +50,9 @@ def test_llm_provider_probe_uses_running_service_configuration(monkeypatch):
         "operational": True,
         "provider": "openai_compatible_gateway",
         "model": "probe-fast-model",
+        "realtime_ready": True,
+        "probe_latency_ms": 1,
+        "realtime_cutoff_ms": 2500,
         "usage": {"prompt_tokens": 7, "completion_tokens": 2, "total_tokens": 9},
     }
     assert calls[0][0] == "https://gateway.example/v1/chat/completions"
@@ -57,6 +60,7 @@ def test_llm_provider_probe_uses_running_service_configuration(monkeypatch):
     assert calls[0][2]["reasoning_effort"] == "low"
     assert calls[0][2]["max_completion_tokens"] == 16
     assert "max_tokens" not in calls[0][2]
+    assert "thinking" not in calls[0][2]
     assert b"sk-probe-secret" not in response.content
     stats = client.get("/settings/cost-stats").json()
     assert any(item["purpose"] == "provider_probe" for item in stats["breakdown"])
@@ -122,6 +126,27 @@ def test_llm_provider_probe_fails_closed_when_usage_metadata_is_missing(monkeypa
     assert response.status_code == 502
     assert response.json()["detail"]["error"] == "llm_probe_failed"
     assert client.get("/settings/cost-stats").json()["breakdown"] == []
+
+
+def test_retryable_probe_failure_opens_shared_realtime_circuit(monkeypatch):
+    class FailingClient:
+        def post_json(self, *_args, **_kwargs):
+            raise llm_service.LlmProviderTransportError("timeout")
+
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gateway.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-probe-secret")
+    monkeypatch.setenv("LLM_GATEWAY_MODEL", "probe-model")
+    monkeypatch.delenv("LLM_GATEWAY_IS_MOCK", raising=False)
+    monkeypatch.setattr(llm_service, "HttpxLlmClient", lambda: FailingClient())
+    client = TestClient(create_app())
+
+    response = client.post("/providers/llm/probe", headers=PROBE_HEADERS)
+    circuit = client.get("/providers/health").json()["realtime_circuit"]
+
+    assert response.status_code == 502
+    assert circuit["state"] == "open"
+    assert circuit["failure_count"] == 2
+    assert circuit["last_failure_class"] == "timeout"
 
 
 def test_llm_provider_probe_rejects_inconsistent_usage_metadata(monkeypatch):

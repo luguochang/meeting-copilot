@@ -15,7 +15,7 @@ import sys
 import time
 from http.client import HTTPConnection, HTTPException
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, Mapping, TextIO
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -46,10 +46,31 @@ SECRET_PROVIDER_ENV_KEYS = {
     "LLM_GATEWAY_BASE_URL",
     "LLM_GATEWAY_API_KEY",
     "LLM_GATEWAY_MODEL",
+    "LLM_GATEWAY_REALTIME_MODEL",
+    "LLM_GATEWAY_CORRECTION_MODEL",
+    "LLM_GATEWAY_API_STYLE",
+    "LLM_GATEWAY_TIMEOUT_SECONDS",
+    "LLM_GATEWAY_PROVIDER_LABEL",
+    "LLM_GATEWAY_IS_MOCK",
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "OPENAI_MODEL",
 }
+
+# ModelScope keeps downloaded models below ``<cache>/hub/models/iic`` by
+# default.  The managed development launcher used to look only under an
+# untracked ``artifacts/tmp/asr_chinese_repair`` directory, so a valid local
+# cache was silently omitted from the child environment.  Keep this fallback
+# deterministic: only these exact model IDs and their protocol-required files
+# are accepted, and a configured runtime manifest remains authoritative.
+MODELSCOPE_CACHE_ENV_KEYS = ("MODELSCOPE_CACHE", "MODELSCOPE_HOME")
+LOCAL_FILE_ASR_MODEL_CACHE_ENV = "MEETING_COPILOT_FILE_ASR_MODEL_CACHE_ROOT"
+FILE_ASR_MODEL_CACHE_LAYOUT = {
+    "offline": "speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
+    "vad": "speech_fsmn_vad_zh-cn-16k-common-pytorch",
+    "punc": "punc_ct-transformer_cn-en-common-vocab471067-large",
+}
+FILE_ASR_REQUIRED_MODEL_FILES = ("model.pt", "config.yaml")
 
 
 def build_uvicorn_command(*, port: int) -> list[str]:
@@ -62,18 +83,151 @@ def build_uvicorn_command(*, port: int) -> list[str]:
         str(port),
         "--log-level",
         "warning",
+        "--ws",
+        "websockets-sansio",
         "--timeout-graceful-shutdown",
         str(GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS),
     ]
 
 
-def build_child_env(*, data_dir: Path, provider_mode: str = "safe") -> dict[str, str]:
+def _complete_file_asr_model(path: Path) -> bool:
+    """Return whether one cached FunASR model has the required entry files."""
+
+    return path.is_dir() and all(
+        (path / filename).is_file() for filename in FILE_ASR_REQUIRED_MODEL_FILES
+    )
+
+
+def _modelscope_file_asr_cache_candidates(
+    environ: Mapping[str, str] | None = None,
+) -> list[Path]:
+    """Build deterministic ModelScope cache roots without scanning the home dir."""
+
+    effective_env = os.environ if environ is None else environ
+    candidates: list[Path] = []
+    explicit_cache_configured = bool(
+        str(effective_env.get(LOCAL_FILE_ASR_MODEL_CACHE_ENV) or "").strip()
+        or any(str(effective_env.get(name) or "").strip() for name in MODELSCOPE_CACHE_ENV_KEYS)
+    )
+
+    def add(value: str | Path | None) -> None:
+        if value is None:
+            return
+        raw = str(value).strip()
+        if not raw:
+            return
+        path = Path(raw).expanduser().resolve(strict=False)
+        if path not in candidates:
+            candidates.append(path)
+
+    configured_root = effective_env.get(LOCAL_FILE_ASR_MODEL_CACHE_ENV)
+    add(configured_root)
+    for name in MODELSCOPE_CACHE_ENV_KEYS:
+        raw = effective_env.get(name)
+        if not str(raw or "").strip():
+            continue
+        root = Path(str(raw)).expanduser()
+        add(root / "hub" / "models" / "iic")
+        add(root / "models" / "iic")
+        # This also supports callers that set MODELSCOPE_CACHE directly to the
+        # final ``.../models/iic`` directory.
+        add(root)
+
+    if not explicit_cache_configured:
+        add(Path.home() / ".cache" / "modelscope" / "hub" / "models" / "iic")
+    return candidates
+
+
+def discover_cached_file_asr_models(
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Path] | None:
+    """Find a complete local file-ASR model set for managed development runs.
+
+    This deliberately does not consult a host cache when a runtime manifest is
+    configured. Packaged/sealed runtimes must use the paths and inventory in
+    that manifest; falling back to arbitrary user-cache bytes would undermine
+    relocation and provenance checks.
+    """
+
+    effective_env = os.environ if environ is None else environ
+    if str(effective_env.get("MEETING_COPILOT_RUNTIME_MANIFEST") or "").strip():
+        return None
+    for cache_root in _modelscope_file_asr_cache_candidates(effective_env):
+        models = {
+            name: cache_root / directory
+            for name, directory in FILE_ASR_MODEL_CACHE_LAYOUT.items()
+        }
+        if all(_complete_file_asr_model(path) for path in models.values()):
+            return models
+    return None
+
+
+REALTIME_REFINER_POLICY_CHOICES = frozenset({"online_only", "on_demand", "prewarm"})
+CORRECTION_PRICING_MODE_CHOICES = frozenset({"metered", "unmetered"})
+REALTIME_COACH_CUTOFF_MIN_MS = 1_000
+REALTIME_COACH_CUTOFF_MAX_MS = 10_000
+
+
+def build_child_env(
+    *,
+    data_dir: Path,
+    provider_mode: str = "safe",
+    realtime_refiner_policy: str | None = None,
+    correction_pricing_mode: str | None = None,
+    realtime_coach_cutoff_ms: int | None = None,
+) -> dict[str, str]:
     env = dict(os.environ)
     if provider_mode == "safe":
         for key in SECRET_PROVIDER_ENV_KEYS:
             env.pop(key, None)
     elif provider_mode != "inherit":
         raise ValueError("provider_mode must be safe or inherit")
+
+    configured_pricing_mode = str(
+        correction_pricing_mode or env.get("LLM_CORRECTION_PRICING_MODE") or ""
+    ).strip().lower()
+    if configured_pricing_mode and configured_pricing_mode not in CORRECTION_PRICING_MODE_CHOICES:
+        raise ValueError("correction_pricing_mode must be metered or unmetered")
+    if configured_pricing_mode:
+        env["LLM_CORRECTION_PRICING_MODE"] = configured_pricing_mode
+
+    configured_cutoff = realtime_coach_cutoff_ms
+    if configured_cutoff is None:
+        raw_cutoff = str(env.get("MEETING_COPILOT_REALTIME_READY_CUTOFF_MS") or "").strip()
+        if raw_cutoff:
+            try:
+                configured_cutoff = int(raw_cutoff)
+            except ValueError as exc:
+                raise ValueError("realtime_coach_cutoff_ms must be an integer") from exc
+    if configured_cutoff is not None:
+        configured_cutoff = int(configured_cutoff)
+        if not REALTIME_COACH_CUTOFF_MIN_MS <= configured_cutoff <= REALTIME_COACH_CUTOFF_MAX_MS:
+            raise ValueError("realtime_coach_cutoff_ms must be between 1000 and 10000")
+        env["MEETING_COPILOT_REALTIME_READY_CUTOFF_MS"] = str(configured_cutoff)
+
+    configured_refiner_policy = str(
+        realtime_refiner_policy or env.get("MEETING_COPILOT_REALTIME_REFINER_POLICY") or ""
+    ).strip().lower().replace("-", "_")
+    if configured_refiner_policy and configured_refiner_policy not in REALTIME_REFINER_POLICY_CHOICES:
+        raise ValueError(
+            "realtime_refiner_policy must be online_only, on_demand, or prewarm"
+        )
+    # A real-provider managed launch is an acceptance run, not the low-memory
+    # demo profile. Keep the application default resource guard intact for
+    # direct/test callers, while making the managed real-provider path use the
+    # local refiner that protects the transcript when the gateway is slow.
+    if configured_refiner_policy:
+        env["MEETING_COPILOT_REALTIME_REFINER_POLICY"] = configured_refiner_policy
+    elif provider_mode == "inherit":
+        env["MEETING_COPILOT_REALTIME_REFINER_POLICY"] = "prewarm"
+
+    # A managed inherited-provider run is the explicit real-provider
+    # acceptance path. Keep Pi on the critical path and warm its local bridge;
+    # direct/demo launches retain their existing environment-driven defaults.
+    if provider_mode == "inherit":
+        env.setdefault("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
+        env.setdefault("MEETING_COPILOT_PI_LOCAL_REFLEX_FIRST", "0")
+        env.setdefault("MEETING_COPILOT_PI_BRIDGE_PREWARM", "1")
 
     existing_pythonpath = env.get("PYTHONPATH", "")
     pythonpath_parts = [str(WEB_BACKEND_ROOT), str(CORE_ROOT)]
@@ -89,9 +243,10 @@ def build_child_env(*, data_dir: Path, provider_mode: str = "safe") -> dict[str,
     ).resolve()
     env["MEETING_COPILOT_DATA_DIR"] = str(resolved_data_dir)
     # Keep the local two-pass ASR lane self-contained for the managed
-    # Workbench process. Explicit deployment paths still win, while this
-    # development bundle uses the verified, hash-checked models downloaded
-    # under artifacts/tmp/asr_chinese_repair.
+    # Workbench process. Explicit deployment paths still win. In development,
+    # use the complete, deterministic ModelScope cache set when the historical
+    # artifacts/tmp staging directory is absent; incomplete caches stay
+    # fail-closed and leave the backend's honest online-only degradation.
     model_root = REPO_ROOT / "artifacts" / "tmp" / "asr_chinese_repair" / "models"
     onnx_preview_root = REPO_ROOT / "artifacts" / "tmp" / "asr_preview_bakeoff"
     onnx_preview_model = onnx_preview_root / "onnx-online"
@@ -116,6 +271,26 @@ def build_child_env(*, data_dir: Path, provider_mode: str = "safe") -> dict[str,
         if hotword_manifest.is_file():
             env.setdefault("MEETING_COPILOT_REALTIME_REFINER_HOTWORDS", str(hotword_manifest))
         env.setdefault("MEETING_COPILOT_REALTIME_REFINER_PREWARM_TIMEOUT_SECONDS", "60")
+    else:
+        cached_models = discover_cached_file_asr_models(env)
+        if refiner_python.is_file() and refiner_worker.is_file() and cached_models is not None:
+            env.setdefault("MEETING_COPILOT_REALTIME_REFINER_PYTHON", str(refiner_python))
+            env.setdefault("MEETING_COPILOT_REALTIME_REFINER_WORKER", str(refiner_worker))
+            env.setdefault(
+                "MEETING_COPILOT_REALTIME_REFINER_MODEL",
+                str(cached_models["offline"]),
+            )
+            env.setdefault(
+                "MEETING_COPILOT_REALTIME_REFINER_VAD_MODEL",
+                str(cached_models["vad"]),
+            )
+            env.setdefault(
+                "MEETING_COPILOT_REALTIME_REFINER_PUNC_MODEL",
+                str(cached_models["punc"]),
+            )
+            if hotword_manifest.is_file():
+                env.setdefault("MEETING_COPILOT_REALTIME_REFINER_HOTWORDS", str(hotword_manifest))
+            env.setdefault("MEETING_COPILOT_REALTIME_REFINER_PREWARM_TIMEOUT_SECONDS", "60")
     onnx_preview_ready = (
         (onnx_preview_model / "model.onnx").is_file()
         and (onnx_preview_model / "decoder.onnx").is_file()
@@ -674,6 +849,9 @@ def start_server(
     log_file: Path,
     data_dir: Path,
     provider_mode: str = "safe",
+    realtime_refiner_policy: str | None = None,
+    correction_pricing_mode: str | None = None,
+    realtime_coach_cutoff_ms: int | None = None,
 ) -> dict[str, Any]:
     data_dir = (data_dir if data_dir.is_absolute() else REPO_ROOT / data_dir).resolve()
     current = status_report(port=port, pid_file=pid_file)
@@ -695,7 +873,13 @@ def start_server(
     log_file.parent.mkdir(parents=True, exist_ok=True)
     data_dir.mkdir(parents=True, exist_ok=True)
     command = build_uvicorn_command(port=port)
-    env = build_child_env(data_dir=data_dir, provider_mode=provider_mode)
+    env = build_child_env(
+        data_dir=data_dir,
+        provider_mode=provider_mode,
+        realtime_refiner_policy=realtime_refiner_policy,
+        correction_pricing_mode=correction_pricing_mode,
+        realtime_coach_cutoff_ms=realtime_coach_cutoff_ms,
+    )
     log_handle = log_file.open("ab")
     try:
         process = subprocess.Popen(
@@ -768,6 +952,7 @@ def start_server(
         "log_file": str(log_file),
         "pid_file": str(pid_file),
         "provider_mode": provider_mode,
+        "realtime_refiner_policy": env.get("MEETING_COPILOT_REALTIME_REFINER_POLICY"),
     }
 
 
@@ -821,6 +1006,24 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--log-file", type=Path, default=DEFAULT_LOG_FILE)
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     parser.add_argument("--provider-mode", choices=["safe", "inherit"], default="safe")
+    parser.add_argument(
+        "--realtime-refiner-policy",
+        choices=sorted(REALTIME_REFINER_POLICY_CHOICES),
+        default=None,
+        help="实时本地 ASR 精修策略；真实 Provider 启动默认使用 prewarm",
+    )
+    parser.add_argument(
+        "--correction-pricing-mode",
+        choices=sorted(CORRECTION_PRICING_MODE_CHOICES),
+        default=None,
+        help="转写精修计费策略；测试网关可显式使用 unmetered",
+    )
+    parser.add_argument(
+        "--realtime-coach-cutoff-ms",
+        type=int,
+        default=None,
+        help="实时 Pi 建议展示截止时间（1000-10000ms）",
+    )
     return parser.parse_args(argv)
 
 
@@ -835,6 +1038,9 @@ def main(argv: list[str] | None = None, *, out: TextIO = sys.stdout) -> int:
             log_file=args.log_file,
             data_dir=args.data_dir,
             provider_mode=args.provider_mode,
+            realtime_refiner_policy=args.realtime_refiner_policy,
+            correction_pricing_mode=args.correction_pricing_mode,
+            realtime_coach_cutoff_ms=args.realtime_coach_cutoff_ms,
         )
     else:
         report = stop_server(pid_file=args.pid_file)

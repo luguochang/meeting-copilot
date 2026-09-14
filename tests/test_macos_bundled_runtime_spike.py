@@ -253,6 +253,7 @@ def test_launchers_are_relocatable_and_do_not_embed_repository_path(tmp_path):
     assert "MEETING_COPILOT_FUNASR_MODEL_DIR" in backend
     assert "MEETING_COPILOT_RUNTIME_MANIFEST" in backend
     assert "--timeout-graceful-shutdown 8" in backend
+    assert "--ws websockets-sansio" in backend
     assert 'exec "$ROOT/runtime/backend-python/bin/python3.13"' in backend
     assert 'exec "$ROOT/runtime/funasr-python/bin/python3.11"' in worker
     assert 'export PYTHONHOME="$ROOT/runtime/funasr-python"' in worker

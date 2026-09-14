@@ -205,7 +205,7 @@ set \"PYTHONIOENCODING=utf-8\"\r
 set \"PYTHONHOME=%ROOT%\\runtime\\backend-python\"\r
 set \"PYTHONPATH=%ROOT%\\runtime\\backend-venv\\Lib\\site-packages;%ROOT%\\app\\code\\web_mvp\\backend;%ROOT%\\app\\code\\core\"\r
 set \"MEETING_COPILOT_RUNTIME_MANIFEST=%ROOT%\\runtime-bundle-manifest.json\"\r
-\"%ROOT%\\runtime\\backend-python\\python.exe\" -m uvicorn meeting_copilot_web_mvp.app:app --host 127.0.0.1 --port %MEETING_COPILOT_PORT% --log-level warning --timeout-graceful-shutdown 8\r
+\"%ROOT%\\runtime\\backend-python\\python.exe\" -m uvicorn meeting_copilot_web_mvp.app:app --host 127.0.0.1 --port %MEETING_COPILOT_PORT% --log-level warning --ws websockets-sansio --timeout-graceful-shutdown 8\r
 """,
         encoding="ascii",
         newline="",

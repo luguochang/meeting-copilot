@@ -71,7 +71,7 @@ def test_report_groups_by_meeting_and_lane_with_all_realtime_latency_metrics():
     )
     correction = report["lanes"]["correction"]
 
-    assert report["schema_version"] == "meeting_copilot.realtime_ai_slo.v1"
+    assert report["schema_version"] == "meeting_copilot.realtime_ai_slo.v2"
     assert report["meeting_id"] == "meeting-1"
     assert report["trace_count"] == 3
     assert correction["count"] == 2
@@ -155,7 +155,7 @@ def test_empty_report_has_no_data_instead_of_zero_latency():
     report = build_realtime_slo_report([], meeting_id="meeting-without-traces")
 
     assert report == {
-        "schema_version": "meeting_copilot.realtime_ai_slo.v1",
+        "schema_version": "meeting_copilot.realtime_ai_slo.v2",
         "meeting_id": "meeting-without-traces",
         "trace_count": 0,
         "lanes": {},
@@ -282,3 +282,223 @@ def test_non_finite_slo_thresholds_are_rejected():
             meeting_id="meeting-1",
             thresholds_ms={"correction": {"provider_ttft_ms": float("nan")}},
         )
+
+
+@pytest.mark.parametrize(
+    ("outcome", "http_status"),
+    [
+        ("timeout", None),
+        ("rate_limit", 429),
+        ("provider_5xx", 503),
+        ("transport_error", None),
+        ("cancelled", None),
+    ],
+)
+def test_known_provider_failures_enter_attempt_and_result_denominators(outcome, http_status):
+    collector = PipelineTraceCollector()
+    collector.record(
+        "trace-failed",
+        "job_queued",
+        meeting_id="meeting-1",
+        attributes={"lane": "intelligence"},
+        monotonic_ns=1_000,
+    )
+    collector.record_provider_attempt(
+        "trace-failed",
+        1,
+        branch="semantic",
+        runtime="direct",
+        monotonic_ns=2_000,
+    )
+    collector.record_provider_attempt_outcome(
+        "trace-failed",
+        1,
+        outcome,
+        branch="semantic",
+        runtime="direct",
+        http_status=http_status,
+        error_class="ProviderFailure",
+        monotonic_ns=3_000,
+    )
+    collector.record_terminal(
+        "trace-failed",
+        "cancelled" if outcome in {"timeout", "cancelled"} else "failed",
+        result_outcome=outcome,
+        error_class="ProviderFailure",
+        http_status=http_status,
+        monotonic_ns=4_000,
+    )
+
+    report = build_realtime_slo_report(
+        collector.slo_snapshots(),
+        meeting_id="meeting-1",
+    )
+    lane = report["lanes"]["intelligence"]
+
+    assert lane["job_outcomes"]["count"] == 1
+    assert lane["job_outcomes"]["result_counts"][outcome] == 1
+    assert lane["provider_attempts"]["count"] == 1
+    assert lane["provider_attempts"]["counts"][outcome] == 1
+    assert lane["metrics"]["provider_ttft_ms"]["count"] == 0
+    assert lane["slo_verdict"]["availability_status"] == "fail"
+    assert lane["slo_verdict"]["status"] == "fail"
+
+
+def test_retry_then_success_counts_one_job_and_two_provider_attempts():
+    collector = PipelineTraceCollector()
+    collector.record(
+        "trace-retried",
+        "job_queued",
+        meeting_id="meeting-1",
+        attributes={"lane": "intelligence"},
+        monotonic_ns=1_000,
+    )
+    for attempt_index, outcome, status in (
+        (1, "rate_limit", 429),
+        (2, "success", 200),
+    ):
+        collector.record_provider_attempt(
+            "trace-retried",
+            attempt_index,
+            branch="semantic",
+            runtime="direct",
+            monotonic_ns=attempt_index * 10_000,
+        )
+        collector.record_provider_attempt_outcome(
+            "trace-retried",
+            attempt_index,
+            outcome,
+            branch="semantic",
+            runtime="direct",
+            http_status=status,
+            monotonic_ns=attempt_index * 10_000 + 1_000,
+        )
+    collector.record_terminal(
+        "trace-retried",
+        "success",
+        result_outcome="success",
+        monotonic_ns=30_000,
+    )
+
+    lane = build_realtime_slo_report(
+        collector.slo_snapshots(),
+        meeting_id="meeting-1",
+    )["lanes"]["intelligence"]
+
+    assert lane["job_outcomes"]["count"] == 1
+    assert lane["job_outcomes"]["counts"]["success"] == 1
+    assert lane["provider_attempts"]["count"] == 2
+    assert lane["provider_attempts"]["counts"]["rate_limit"] == 1
+    assert lane["provider_attempts"]["counts"]["success"] == 1
+    assert lane["result_outcomes"]["success_rate"] == 1.0
+    assert lane["result_outcomes"]["failure_rate"] == 0.0
+    assert lane["provider_attempts"]["rates"]["rate_limit"] == 0.5
+    assert lane["provider_attempts"]["rate_limit_rate"] == 0.5
+    assert lane["provider_attempts"]["success_rate"] == 0.5
+    assert lane["provider_attempts"]["failure_rate"] == 0.5
+    assert lane["slo_verdict"]["status"] == "fail"
+
+
+def test_outcome_rates_keep_empty_denominators_explicitly_missing():
+    collector = PipelineTraceCollector()
+    collector.record(
+        "trace-partial-rates",
+        "job_queued",
+        meeting_id="meeting-1",
+        attributes={"lane": "intelligence"},
+        monotonic_ns=1_000,
+    )
+
+    lane = build_realtime_slo_report(
+        collector.slo_snapshots(),
+        meeting_id="meeting-1",
+    )["lanes"]["intelligence"]
+
+    assert lane["result_outcomes"]["count"] == 0
+    assert lane["result_outcomes"]["success_rate"] is None
+    assert lane["provider_attempts"]["count"] == 0
+    assert lane["provider_attempts"]["failure_rate"] is None
+
+
+def test_circuit_denial_is_a_job_result_but_not_a_provider_attempt():
+    collector = PipelineTraceCollector()
+    collector.record(
+        "trace-denied",
+        "job_queued",
+        meeting_id="meeting-1",
+        attributes={"lane": "intelligence"},
+        monotonic_ns=1_000,
+    )
+    collector.record_route(
+        "trace-denied",
+        "pi_coach",
+        candidate_outcome="eligible",
+        circuit_outcome="denied",
+        monotonic_ns=2_000,
+    )
+    collector.record_terminal(
+        "trace-denied",
+        "failed",
+        result_outcome="circuit_denied",
+        monotonic_ns=3_000,
+    )
+
+    lane = build_realtime_slo_report(
+        collector.slo_snapshots(),
+        meeting_id="meeting-1",
+    )["lanes"]["intelligence"]
+
+    assert lane["job_outcomes"]["result_counts"]["circuit_denied"] == 1
+    assert lane["provider_attempts"]["count"] == 0
+    assert lane["slo_verdict"]["status"] == "fail"
+
+
+def test_invalid_timing_contract_fails_closed_instead_of_becoming_no_data():
+    collector = PipelineTraceCollector()
+    collector.record(
+        "trace-invalid-clock",
+        "job_queued",
+        meeting_id="meeting-1",
+        attributes={"lane": "intelligence"},
+        monotonic_ns=1_000,
+    )
+    from meeting_copilot_web_mvp.pipeline_trace import normalize_provider_timing_stages
+
+    collector.record_timing_contract(
+        "trace-invalid-clock",
+        normalize_provider_timing_stages(
+            {
+                "clock": "unix_epoch_ms",
+                "started_at_ms": 1_000,
+                "connected_at": 1.0,
+            }
+        ),
+    )
+
+    lane = build_realtime_slo_report(
+        collector.slo_snapshots(),
+        meeting_id="meeting-1",
+    )["lanes"]["intelligence"]
+
+    assert lane["timing_contracts"]["counts"]["invalid"] == 1
+    assert lane["slo_verdict"]["status"] == "fail"
+
+
+def test_store_reads_v1_state_and_persists_v2_without_deleting_runtime_state(tmp_path):
+    state_path = tmp_path / "realtime-slo.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "meeting_copilot.realtime_ai_slo_store.v1",
+                "archived": {"meetings": []},
+                "active_traces": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    store = RealtimeSLOStore(state_path=state_path)
+    store.checkpoint(active_traces=[])
+
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert persisted["schema_version"] == "meeting_copilot.realtime_ai_slo_store.v2"

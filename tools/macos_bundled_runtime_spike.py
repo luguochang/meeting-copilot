@@ -595,7 +595,7 @@ export MEETING_COPILOT_RUNTIME_MANIFEST="$ROOT/runtime-bundle-manifest.json"
 : "${MEETING_COPILOT_DATA_DIR:=$HOME/Library/Application Support/Meeting Copilot}"
 export MEETING_COPILOT_DATA_DIR
 : "${MEETING_COPILOT_PORT:=8765}"
-exec "$ROOT/runtime/backend-python/bin/python{backend_version}" -m uvicorn meeting_copilot_web_mvp.app:app --host 127.0.0.1 --port "$MEETING_COPILOT_PORT" --timeout-graceful-shutdown {graceful_shutdown_timeout}
+exec "$ROOT/runtime/backend-python/bin/python{backend_version}" -m uvicorn meeting_copilot_web_mvp.app:app --host 127.0.0.1 --port "$MEETING_COPILOT_PORT" --ws websockets-sansio --timeout-graceful-shutdown {graceful_shutdown_timeout}
 """.replace("{backend_version}", backend_version).replace("{funasr_version}", funasr_version).replace("{graceful_shutdown_timeout}", str(GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS)),
         encoding="utf-8",
     )
