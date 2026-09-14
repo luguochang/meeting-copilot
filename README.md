@@ -10,6 +10,8 @@
 
 > 当前 `feat/pi-realtime-coach-agent-loop` 分支集成 Pi SDK 作为实时教练 Agent runtime，尚未合并到 `main`。Pi 不替代 ASR 或底层 LLM，而是在稳定转写之上增加持续会话、工具调用、历史检索、介入判断和可审计的 Agent Loop。场景技能包的产品与技术方案见 [`docs/pi-coach-skill-packs.md`](docs/pi-coach-skill-packs.md)。
 
+> 2026-09-12 的最新验收差距、整改方案、产品头脑风暴、逐项 checklist 和最终完成审计见 [`Pi 实时会议教练：验收差距、整改方案与产品优化路线图`](docs/pi-agent-acceptance-gap-and-optimization-roadmap-20260904.md)、[`PI 评审执行 checklist`](docs/plan/meeting-copilot_PI_review_execution_checklist_20260908.md)、[`PI 实现状态报告`](docs/pi-agent-implementation-status-20260911.md) 和 [`PI 核心交付完成审计`](docs/pi-agent-completion-audit-20260912.md)。本分支仍未合并到 `main`，Overall 仍 **No-Go**：Pi SDK、session、bounded tool loop、shared Provider admission、meeting-scoped evidence、deep lane、迟到结果屏障、refiner prewarm recovery 和麦克风权限超时保护已接通；当前 backend 正式 `uv` 全量 `1732 passed, 1 skipped, 1 warning`，PI/Stage-0 子集 `119 passed`，frontend `319 passed`，Pi bridge `47 passed`。但真实 Provider 的稳定 terminal action、真实物理外放/ASR 实体安全、真实生命周期闭环、local/direct/Pi 盲评和长时设备稳定性尚未通过；自动化回归绿不等于产品 Go。
+
 ## 产品工作方式
 
 ```mermaid
@@ -330,6 +332,8 @@ npm run check
 | [实时智能质量提升方案](docs/realtime-intelligence-quality-and-agent-decision-plan.md) | 分片诊断、语义窗口、任务拆分、质量评测与 Pi Go / No-Go |
 | [实时对话 Agent 产品与技术方案](docs/pi-agent-product-and-technical-design.md) | 双音轨实时教练、Pi 边界、腾讯会议采集、介入策略与实施路线 |
 | [Pi 持续教练实现说明](docs/pi-continuous-coach-loop.md) | SDK 集成、Agent Loop、checklist、历史信息流、回退与真实 Provider 验收 |
+| [Pi Agent 分支交付说明](docs/pi-agent-delivery.md) | 代码边界、运行链路、关键不变量、验证入口、已知缺口与评审顺序 |
+| [Pi Agent 评测工具](tools/realtime_coach_eval/README.md) | 同输入回放、失败分类、盲评合同与 Go / No-Go 门禁 |
 | [Pi SDK 技术调研](docs/realtime-coach-pi-spike-report.md) | SDK 能力、PoC、部署成本、风险和 Go / No-Go 结论 |
 | [开发指南](docs/development.md) | 开发环境、命令、测试和贡献约定 |
 | [隐私说明](docs/privacy.md) | 本地数据、远程调用和删除边界 |
