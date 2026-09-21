@@ -358,11 +358,11 @@ export function ProviderSettingsControl() {
       if (synced.command_status !== "ok" || !synced.runtime_synced) {
         throw responseError(synced, "AI 配置连接失败");
       }
-      const probeResult = await verifyProviderConnection();
-      const connectedStatus = statusAfterProbe({
+      const savedStatus: ProviderStatus = {
         ...providerStatus,
         configured: true,
         runtime_synced: true,
+        probe_status: "not_run",
         model: synced.model,
         realtime_model: synced.realtime_model ?? synced.model,
         operational: null,
@@ -370,12 +370,15 @@ export function ProviderSettingsControl() {
         probe_latency_ms: null,
         probe_usage: null,
         realtime_cutoff_ms: providerStatus.realtime_cutoff_ms || 2_500,
-      }, probeResult);
+        // A new runtime identity invalidates stale circuit state. The next
+        // explicit probe fetches the authoritative circuit snapshot.
+        realtime_circuit: null,
+      };
       setConfig(synced);
-      setProviderStatus(connectedStatus);
+      setProviderStatus(savedStatus);
       setPhase("configured");
       setApiKey("");
-      setMessage(probeSuccessMessage(probeResult, "，配置已保存"));
+      setMessage("AI 配置已保存，请点击“测试连接”验证 Provider");
       setConfirmingClear(false);
       setDirty(false);
       await loadUsage();
@@ -511,7 +514,6 @@ export function ProviderSettingsControl() {
         : realtimeSlow
           ? "slow"
           : providerStatus.probe_status === "succeeded"
-            || (config.configured && providerStatus.runtime_synced)
             ? "unknown"
             : config.configured
               ? "untested"
@@ -550,7 +552,7 @@ export function ProviderSettingsControl() {
               ? "实时通道暂不可用"
               : "连接失败"
             : connectionState === "untested"
-              ? "待测试"
+              ? "已保存，待测试"
               : "尚未配置";
 
   const realtimeReadinessLabel = connectionState === "slow"
@@ -561,6 +563,8 @@ export function ProviderSettingsControl() {
       ? `Provider 探测通过 · 实时稳定性待验收 · 探测 ${providerStatus.probe_latency_ms ?? 0}ms`
       : connectionState === "unknown"
         ? "实时性待确认 · 请完成一次完整连接测试"
+        : connectionState === "untested"
+          ? "配置已保存 · 尚未发起连接测试"
         : realtimeCircuitUnavailable
           ? "连续实时请求失败 · 请完成连接测试后恢复"
         : null;
@@ -648,6 +652,7 @@ export function ProviderSettingsControl() {
                     type="button"
                     onClick={() => void probe()}
                     disabled={Boolean(busy) || dirty}
+                    aria-label="在状态区测试连接"
                   >
                     {connectionState === "connected" ? <Check size={15} /> : null}
                     {busy === "probe" ? "测试中" : dirty ? "先保存修改" : "测试连接"}
@@ -855,10 +860,21 @@ export function ProviderSettingsControl() {
                       <Trash2 size={15} />移除配置
                     </button>
                   ) : <span />}
-                  <button className="primary-button" type="submit" form="provider-config-panel" disabled={Boolean(busy)}>
-                    {busy === "save" ? <LoaderCircle className="spin" size={15} /> : null}
-                    {busy === "save" ? "正在测试" : "保存并测试"}
-                  </button>
+                  <div className="provider-settings-primary-actions">
+                    <button
+                      className={`secondary-button provider-test-button provider-test-button--${connectionState}`}
+                      type="button"
+                      onClick={() => void probe()}
+                      disabled={Boolean(busy) || dirty || !config.configured}
+                    >
+                      {busy === "probe" ? <LoaderCircle className="spin" size={15} /> : null}
+                      {busy === "probe" ? "测试中" : dirty ? "先保存修改" : "测试连接"}
+                    </button>
+                    <button className="primary-button" type="submit" form="provider-config-panel" disabled={Boolean(busy)}>
+                      {busy === "save" ? <LoaderCircle className="spin" size={15} /> : null}
+                      {busy === "save" ? "正在保存" : "保存配置"}
+                    </button>
+                  </div>
                 </div>
               </footer>
             ) : null}

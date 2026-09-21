@@ -188,7 +188,7 @@ def test_probe_gateway_uses_max_tokens_for_deepseek_labelled_relay():
     assert calls[0]["body"]["max_tokens"] == 16
     assert "max_completion_tokens" not in calls[0]["body"]
     assert calls[0]["body"]["thinking"] == {"type": "disabled"}
-    assert calls[0]["timeout"] == 2.5
+    assert calls[0]["timeout"] == 10.0
 
 
 def test_reasoning_compatibility_parameters_only_target_deepseek():

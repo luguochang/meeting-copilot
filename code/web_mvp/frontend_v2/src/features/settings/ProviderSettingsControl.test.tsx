@@ -235,7 +235,7 @@ describe("ProviderSettingsControl", () => {
     expect(dialog).not.toHaveTextContent("本地 ASR");
   });
 
-  it("saves and tests a Web configuration while keeping the green result visible", async () => {
+  it("saves a Web configuration without probing, then tests it explicitly", async () => {
     const user = userEvent.setup();
     const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const path = String(input);
@@ -256,11 +256,17 @@ describe("ProviderSettingsControl", () => {
     await user.clear(within(dialog).getByLabelText("模型"));
     await user.type(within(dialog).getByLabelText("模型"), "gpt-test");
     await user.type(within(dialog).getByLabelText("API Key"), "sk-web-test");
-    await user.click(within(dialog).getByRole("button", { name: "保存并测试" }));
+    await user.click(within(dialog).getByRole("button", { name: "保存配置" }));
+
+    await waitFor(() => expect(within(dialog).getByText("AI 配置已保存，请点击“测试连接”验证 Provider")).toBeVisible());
+    expect(fetchMock.mock.calls.some(([input]) => String(input) === "/providers/llm/probe")).toBe(false);
+    expect(within(dialog).getByRole("region", { name: "AI 连接状态" })).toHaveClass("provider-connection--untested");
+
+    await user.click(within(dialog).getByRole("button", { name: "测试连接" }));
 
     const connectionRegion = within(dialog).getByRole("region", { name: "AI 连接状态" });
     await waitFor(() => expect(within(connectionRegion).getByText("Provider 探测通过")).toBeVisible());
-    expect(within(dialog).getByText("Provider 探测通过，实时稳定性待验收，配置已保存")).toBeVisible();
+    expect(within(dialog).getByText("Provider 探测通过，实时稳定性待验收")).toBeVisible();
     expect(screen.getByRole("dialog", { name: "AI 设置" })).toBeVisible();
     expect(within(dialog).getByRole("button", { name: "测试连接" })).toHaveClass("provider-test-button--connected");
     const saveCall = fetchMock.mock.calls.find(([input, init]) =>
@@ -312,7 +318,7 @@ describe("ProviderSettingsControl", () => {
 
     await user.clear(within(dialog).getByLabelText("模型"));
     await user.type(within(dialog).getByLabelText("模型"), "gpt-test-updated");
-    await user.click(within(dialog).getByRole("button", { name: "保存并测试" }));
+    await user.click(within(dialog).getByRole("button", { name: "保存配置" }));
 
     await waitFor(() => {
       const saveCall = fetchMock.mock.calls.find(([input, init]) =>
@@ -354,7 +360,7 @@ describe("ProviderSettingsControl", () => {
     await user.clear(within(dialog).getByLabelText("模型"));
     await user.type(within(dialog).getByLabelText("模型"), "gpt-test");
     await user.type(within(dialog).getByLabelText("API Key"), "sk-test-only-secret");
-    await user.click(within(dialog).getByRole("button", { name: "保存并测试" }));
+    await user.click(within(dialog).getByRole("button", { name: "保存配置" }));
 
     await waitFor(() => expect(invoke).toHaveBeenCalledWith("provider_config_save", expect.objectContaining({
       apiKey: "sk-test-only-secret",
@@ -362,9 +368,9 @@ describe("ProviderSettingsControl", () => {
     expect(within(dialog).getByLabelText("API Key")).toHaveValue("");
     expect(within(dialog).getByLabelText("API Key")).toHaveAttribute("placeholder", "留空以继续使用已保存密钥");
     const connectionRegion = within(dialog).getByRole("region", { name: "AI 连接状态" });
-    await waitFor(() => expect(connectionRegion).toHaveClass("provider-connection--unknown"));
+    await waitFor(() => expect(connectionRegion).toHaveClass("provider-connection--untested"));
     expect(connectionRegion).not.toHaveClass("provider-connection--connected");
-    expect(within(connectionRegion).getByText("已连接，实时性待确认")).toBeVisible();
+    expect(within(connectionRegion).getByText("已保存，待测试")).toBeVisible();
   });
 
   it("syncs a saved desktop configuration only when the user tests it", async () => {
@@ -444,10 +450,10 @@ describe("ProviderSettingsControl", () => {
     const region = within(dialog).getByRole("region", { name: "AI 连接状态" });
     await user.click(within(dialog).getByRole("button", { name: "测试连接" }));
 
-    await waitFor(() => expect(region).toHaveClass("provider-connection--unknown"));
+    await waitFor(() => expect(region).toHaveClass("provider-connection--untested"));
     expect(region).not.toHaveClass("provider-connection--connected");
-    expect(within(region).getByText("已连接，实时性待确认")).toBeVisible();
-    expect(within(region).getByText("实时性待确认 · 请完成一次完整连接测试")).toBeVisible();
+    expect(within(region).getByText("已保存，待测试")).toBeVisible();
+    expect(within(region).getByText("配置已保存 · 尚未发起连接测试")).toBeVisible();
   });
 
   it("uses an in-app confirmation before removing a configuration", async () => {

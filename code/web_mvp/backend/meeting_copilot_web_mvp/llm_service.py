@@ -786,13 +786,12 @@ def probe_gateway(
     config: LlmConfig,
     client: LlmClient | None = None,
 ) -> dict[str, Any]:
-    """Make one realtime-budgeted request to verify gateway operability.
+    """Make one bounded request to verify gateway operability.
 
-    This probe feeds the realtime coach readiness gate, so waiting for the
-    general LLM timeout would make the preflight UI block long after the
-    product has already decided that the provider is too slow. A slow provider
-    is still recorded as a transport failure; it is never converted into a
-    successful readiness result.
+    A connection test and the realtime readiness gate answer different
+    questions. The test must be allowed to finish after the realtime window so
+    the UI can distinguish "reachable but slow" from "unreachable". Readiness
+    is calculated from the measured latency by the route layer.
     """
     if config.is_mock:
         raise ValueError("mock LLM provider cannot pass production verification")
@@ -812,7 +811,7 @@ def probe_gateway(
             **_reasoning_compatibility_parameters(config),
             **_completion_token_parameter(config, 16),
         },
-        min(float(config.timeout_seconds), 2.5),
+        min(float(config.timeout_seconds), _provider_probe_timeout_seconds()),
     )
     choices = data.get("choices") if isinstance(data, dict) else None
     content = (
@@ -852,6 +851,22 @@ def probe_gateway(
             "total_tokens": total_tokens,
         },
     }
+
+
+def _provider_probe_timeout_seconds() -> float:
+    """Return the maximum wait for an explicit provider connection test.
+
+    Keep this separate from the realtime readiness cutoff. A relay that takes
+    four seconds should produce a visible "connected but slow" result rather
+    than an opaque timeout, while a broken relay must still fail promptly.
+    """
+
+    raw = str(os.environ.get("LLM_GATEWAY_PROBE_TIMEOUT_SECONDS") or "").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return 10.0
+    return value if 1.0 <= value <= 30.0 else 10.0
 
 
 def _safe_audit_value(value: Any, *, fallback: str) -> str:

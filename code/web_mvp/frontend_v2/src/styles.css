@@ -7716,6 +7716,12 @@ button.product-nav-item:focus-visible {
   justify-content: space-between;
 }
 
+.provider-settings-primary-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .diagnostics-list {
   margin: 16px 20px;
   overflow: hidden;
