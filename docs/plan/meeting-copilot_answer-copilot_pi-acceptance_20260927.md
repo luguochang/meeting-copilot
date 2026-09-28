@@ -3,7 +3,7 @@
 > 日期：2026-09-28
 > 分支：`feat/pi-realtime-coach-agent-loop`
 > 基线：`0b69f1a`
-> 结论：Fast Answer、Pi Deep Coach、后台转写精修三条独立通道已通过真实 FunASR + 真实 Provider 的静音端到端验收，Pi 已能给出绑定当前回答的边界、风险和追问。桌面 system audio 双轨、移动端视觉和同音频 main 基线对比仍是发布前阻塞项；Provider 延迟也仍有偶发越过严格性能线的样本。
+> 结论：Fast Answer、Pi Deep Coach、后台转写精修三条独立通道已通过真实 FunASR + 真实 Provider 的静音端到端验收，Pi 已能给出绑定当前回答的边界、风险和追问。相同固定音频的 `main` 基线对比、原生 microphone/system audio 双轨协议和并发链路也已通过静音 PCM 注入验证。真实物理麦克风 + system audio 五分钟采集、会中移动端视觉仍是发布前阻塞项；Provider 延迟也仍有偶发越过严格性能线的样本。
 
 ## 1. 这次解决的产品问题
 
@@ -146,7 +146,7 @@ Correction 的计价边界已固定：Provider 完全没有配置价格变量时
 
 ## 5. 自动化回归
 
-- 后端全量：`1778 passed / 1 skipped`。跳过项为环境条件测试；只有 Starlette `TestClient` 的已知弃用警告。
+- 后端全量：`1780 passed / 1 skipped`。跳过项为环境条件测试；只有 Starlette `TestClient` 的已知弃用警告。
 - 前端全量：`328 passed / 328`，包含 Answer 流式状态、Pi 失败保留旧卡和新 Answer 换题。
 - Pi SDK bridge：`50 passed / 50`，包含 `deep_answer`、自动 Deep 工具收缩和结构标签去重。
 - Provider/correction 边界聚焦回归：`73 passed / 73`。
@@ -156,8 +156,9 @@ Correction 的计价边界已固定：Provider 完全没有配置价格变量时
 ## 6. 尚未完成的发布阻塞项
 
 - [x] 真实 Chrome 麦克风单轨问题、离题门禁和 Fast Answer 已验收；后续静音注入再次覆盖真实 FunASR WebSocket。
+- [x] 使用相同固定音频对比 `main` 与当前分支；启用相同本地 refiner 后 canonical transcript 逐字一致，Pi 集成未改变本地精修结果。
+- [x] 通过 `native_pcm_v2` 分别注入 `native_microphone_streaming` 与 `macos_system_audio`，验证双轨身份、capture epoch、帧序、并发 ASR、Fast Answer 和 Pi Deep 主链。
 - [ ] 在桌面原生客户端完成麦克风 + system audio 双轨 5 分钟对话，记录问题检测 recall/precision、TTFT 和双方 speaker/track。
-- [ ] 使用同一固定音频对比 `main` 与当前分支 canonical transcript，确认切段和文本不回归。
 - [ ] 验证本地 refiner、远端 correction 和导出在浏览器真实流程中均可见，不只依赖 API/数据库验收。
 - [ ] 桌面和移动宽度截图验收：无溢出、标题跳动、旧 Pi 卡串题或嵌套卡片。
 - [ ] 增加最近 Answer 历史视图，明确区分当前回答、过去回答和过去 Pi 建议。
@@ -168,7 +169,7 @@ Correction 的计价边界已固定：Provider 完全没有配置价格变量时
 
 ## 7. 2026-09-28 静音真实端到端验收
 
-用户要求后续禁止外放声音，因此本轮没有播放音频，也没有打开麦克风。测试将已有语音的 16kHz 单声道 float32 PCM 按 `1600 samples / 6400 bytes / 100ms` 注入 `/live/asr/stream/ws/{meeting_id}`。服务仍经过真实 FunASR、VAD、canonical final、durable executor 和真实 Provider，不是 fake ASR 或 mock Provider。
+用户要求后续禁止外放声音，因此本轮没有播放音频，没有打开麦克风，也没有触发录音权限。网页单轨测试将已有语音的 16kHz 单声道 float32 PCM 按 `1600 samples / 6400 bytes / 100ms` 注入 `/live/asr/stream/ws/{meeting_id}`；原生双轨测试则按 `native_pcm_v2` 的 `4800 samples / 300ms` 帧封装，分别声明 track、capture epoch、sequence 和 timestamp。两种测试均经过真实 FunASR、VAD、canonical final、durable executor 和真实 Provider，不是 fake ASR 或 mock Provider。
 
 ### 调度缺陷复现与修复
 
@@ -216,6 +217,39 @@ Fast Answer 给出了 Redis Stream/Kafka 的选择依据、失败路径和演进
 
 修正版将乱码恢复为“Redis Stream / Kafka / 架构取舍 / 失败路径 / 演进边界”。校对延迟明显下降，但最新 Fast Answer 样本受网关波动影响超过 `2.5s / 5s` 的严格线；因此功能验收通过，性能 SLO 仍需更多样本、专用 realtime model 或网关优化，不能以单次成功宣称完全达标。
 
-网页麦克风输入仍是单轨混合语义，无法可靠区分双方；静音注入也只验证该单轨主链。真正的双方归属、系统音频触发准确率和 speaker/track 指标必须在桌面双轨验收中完成。
+### 同音频 `main` 基线
+
+使用 SHA-256 为 `d06ebabb8f9a41b404fc2b0ba9e4aba369860228a1128bb660d04271bfc2ca16` 的同一段 16kHz/mono/PCM16 WAV，对 `origin/main@5cd0ed5` 的只读临时快照和当前 Pi 分支进行对比。两边启用相同本地离线 refiner 和相同模型后，canonical transcript 逐字一致。Pi 分支没有改变该固定输入的切段或本地精修结果。
+
+该结果同时暴露出本地模型的能力边界：它只能改善断句，不能可靠把误识别恢复为 `Redis Stream / Kafka`；未做远端 correction 时，两边都会保留相同的专有词乱码。当前分支的远端 correction 能把该问题修正为：
+
+```text
+Redis Stream为什么选择Redis Stream，而不是Kafka？请说明架构取舍、失败路径和未来演进边界。
+```
+
+### 原生协议双轨静音验收
+
+会议 `accept_silent_dual_native_20260928_03` 同时建立两个真实 ASR WebSocket：system audio 使用 `macos_system_audio` / epoch `202`，microphone 使用 `native_microphone_streaming` / epoch `101`。两轨均收到 `asr_transport_ready`、`asr_ready`、`final` 和 `end_of_stream`，完整帧、partial tail、track/epoch 归属均按原生协议处理。
+
+| 链路 | 结果 |
+|---|---:|
+| Provider probe | `operational=true`，`realtime_ready=true`，`2269ms` |
+| Fast Answer TTFT / 完成 | 约 `1775ms / 3955ms` |
+| Pi Deep TTFT / decision / projection | 约 `3444ms / 5387ms / 5751ms` |
+| Pi Agent turns / tool calls | `1 / 1`，工具为 `submit_intervention` |
+| Prompt / Answer 绑定 | `deep_answer` / 精确匹配当前 Answer ID |
+| Deep terminal | `completed`，无 validation error |
+
+真实 Deep 输出为：
+
+```text
+边界：限定在单服务/小规模事件驱动；
+风险：若没有量化阈值，演进边界会显得主观且不可验证。
+追问：追问候选人给出切换阈值：QPS、积压时长、保留期、消费者数量。
+```
+
+该轮还复现了右侧 Pi 卡“一眨眼消失”的直接根因：后到的 microphone final 含有“监控阈值”“已解决”等通用词，普通 realtime lifecycle matcher 仅凭词语重叠，误把绑定 Redis/Kafka Answer 的 Deep 卡标记为 `lifecycle_resolved`。现已将 Deep Answer 卡从普通 transcript resolution matcher 中排除；它只随绑定的当前 Answer 变化而退出。普通 realtime 卡仍保留基于新证据关闭旧建议的能力。修复由自动化回归覆盖；因为真实 Provider 已证明生成与 Answer 绑定成功，修复后没有再次消耗余额有限的测试 Key。
+
+边界必须明确：上述结果证明的是桌面原生 PCM 协议、双 track/epoch 归属、后端并发和 AI 主链，不证明 macOS 物理麦克风和系统音频采集设备本身已经验收。真正的采集稳定性、双方问题检测 recall/precision 和五分钟连续运行仍需用户明确允许后再做；在用户禁止外放和真实麦克风期间不会执行。
 
 会后工作台已额外在默认桌面视口和 `390x844` 移动视口检查：未观察到内容重叠或横向溢出，移动端长标题按省略号收敛。该结果只覆盖会后复盘页；会中 Answer/Pi 右栏的移动端真实流式视觉仍保留为发布前检查项。

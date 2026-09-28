@@ -3566,9 +3566,22 @@ def test_deep_answer_card_survives_validity_window_for_its_current_answer():
             "answer_id": "answer:job-1",
         },
     })
+    later_silent = _formal_projection_event(
+        seq=2,
+        event_type="meeting.intelligence.applied",
+        projection=None,
+    )
+    later_silent["payload"]["coach_decision"] = {
+        "decision_id": "coach-realtime-silent-2",
+        "status": "protected_silent",
+        "status_reason": "no_actionable_intervention",
+        "lifecycle_action": "deprioritize",
+        "lifecycle_refresh": False,
+        "prompt_profile": "candidate_fast",
+    }
 
     retained = app_module._latest_formal_coach_follow_up(
-        [event],
+        [event, later_silent],
         now_ms=91_000,
         current_answer_id="answer:job-1",
     )
@@ -3576,11 +3589,72 @@ def test_deep_answer_card_survives_validity_window_for_its_current_answer():
     assert retained is not None
     assert retained["decision_id"] == "coach-deep-1"
     assert app_module._coach_due_work_items([event], now_ms=91_000) == []
+    assert app_module._latest_formal_coach_decision(
+        [event, later_silent]
+    )["decision_id"] == "coach-deep-1"
     assert app_module._latest_formal_coach_follow_up(
         [event],
         now_ms=91_000,
         current_answer_id="answer:job-2",
     ) is None
+
+
+def test_deep_answer_card_is_not_a_realtime_lifecycle_resolution_target():
+    decision = {
+        "decision_id": "coach-deep-1",
+        "status": "intervention",
+        "origin": "pi",
+        "runtime_used": "pi",
+        "pi_provider_attempted": True,
+        "lifecycle_action": "retain",
+        "superseded_by": None,
+        "prompt_profile": "deep_answer",
+        "answer_id": "answer:job-1",
+    }
+    intervention = {
+        **decision,
+        "title": "补上量化边界",
+        "recommendation": "边界：补充退出条件。\n风险：说明异常恢复。\n追问：如何处理积压？",
+        "reason": "当前回答缺少异常路径。",
+        "evidence_segment_ids": ["system-segment"],
+        "evidence_quote": "为什么选择 Redis Stream 而不是 Kafka？",
+    }
+
+    class Persistence:
+        @staticmethod
+        def list_events(_meeting_id, *, limit):
+            assert limit == app_module.DEFAULT_EVENT_PAGE_LIMIT
+            return [
+                {
+                    "type": "meeting.intelligence.applied",
+                    "payload": {
+                        "coach_decision": decision,
+                        "coach_intervention": intervention,
+                    },
+                }
+            ]
+
+    request = app_module.RealtimeIntelligenceRequest.from_payload(
+        meeting_id="deep-lifecycle-meeting",
+        state_revision=2,
+        new_paragraphs=[
+            {
+                "id": "microphone-segment",
+                "text": "监控阈值已经明确，负责人今天完成，我负责复核，问题已经解决。",
+                "revision": 1,
+                "source_track": "microphone",
+            }
+        ],
+        context_paragraphs=[],
+        rolling_state={},
+    )
+
+    assert app_module._latest_active_pi_coach_intervention(
+        Persistence(),
+        "deep-lifecycle-meeting",
+        now_ms=2_000,
+    ) is None
+    assert app_module._pi_lifecycle_resolution_signal(request, intervention) is False
 
 
 def test_coach_history_keeps_same_wording_when_decision_ids_differ_for_supersession():

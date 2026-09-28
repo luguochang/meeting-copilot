@@ -14172,14 +14172,14 @@ def create_app(
             marker in reason for marker in ("timeout", "soft_deadline", "deadline_budget")
         ):
             execution_status, decision = "timeout", "watching"
+        elif status in {"invalid", "invalid_output"} or "validation" in reason:
+            execution_status, decision = "invalid_output", "no_change"
         elif (
             str(availability.get("terminal_status") or "").strip().lower() == "failed"
             or status in {"failed", "provider_error"}
             or any(marker in reason for marker in ("provider", "transport", "rate_limit", "circuit"))
         ):
             execution_status, decision = "provider_error", "no_change"
-        elif status in {"invalid", "invalid_output"} or "validation" in reason:
-            execution_status, decision = "invalid_output", "no_change"
         elif status in {"stale", "evidence_stale"} or "stale" in reason or "superseded" in reason:
             execution_status, decision = "evidence_stale", "no_change"
         elif status in {"suppressed", "protected_silent", "silent", "no_change", "not_triggered", ""}:
@@ -16715,6 +16715,13 @@ def _latest_active_pi_coach_intervention(
             or decision.get("superseded_by") is not None
         ):
             return None
+        # Deep coaching belongs to one committed Fast Answer. A later
+        # transcript turn may share generic words such as "threshold" or
+        # "monitoring" without answering that card, especially on the other
+        # audio track. Keep it visible until the current Answer changes instead
+        # of exposing it to the realtime-card lifecycle matcher.
+        if is_deep_answer_coach_decision(decision):
+            return None
         intervention = payload.get("coach_intervention")
         if not isinstance(intervention, Mapping):
             return None
@@ -16759,6 +16766,8 @@ def _pi_lifecycle_resolution_signal(
     """
 
     if not request.new_paragraphs or not isinstance(previous_intervention, Mapping):
+        return False
+    if is_deep_answer_coach_decision(previous_intervention):
         return False
     fresh_text = " ".join(
         str(paragraph.text or "").strip()

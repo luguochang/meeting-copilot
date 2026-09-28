@@ -2491,10 +2491,17 @@ async def run_realtime_coach_via_pi(
     metrics = dict(result.get("metrics")) if isinstance(result.get("metrics"), Mapping) else {}
     usage = metrics.get("usage") if isinstance(metrics.get("usage"), Mapping) else None
     await _notify_callback(on_usage, dict(usage) if usage is not None else None, 1)
-    intervention = parse_realtime_coach_response(
-        json.dumps({"intervention": result.get("intervention")}, ensure_ascii=False),
-        request=request,
-    )
+    try:
+        intervention = parse_realtime_coach_response(
+            json.dumps({"intervention": result.get("intervention")}, ensure_ascii=False),
+            request=request,
+        )
+    except IntelligenceResponseValidationError as exc:
+        # The bridge completed successfully, so retain its bounded diagnostics
+        # when the host rejects the card. This keeps deep-answer failures bound
+        # to their prompt profile and Answer without persisting model output.
+        exc.metrics = metrics
+        raise
     if intervention is not None and intervention.confidence < 0.78:
         intervention = None
     decision_reason = str(result.get("decision_reason") or "")[:160] or None
@@ -3345,11 +3352,12 @@ def _validate_coach_claim_grounding(
         if isinstance(request.rolling_state, Mapping)
         else None
     )
-    if (
+    is_deep_answer_card = (
         request.trigger_type in {"answer_ready", "user_request", "task_due"}
         and isinstance(current_answer, Mapping)
         and str(current_answer.get("answer") or "").strip()
-    ):
+    )
+    if is_deep_answer_card:
         # A deep card supplements the committed Fast Answer, so its technical
         # terms may be grounded in that visible answer as well as raw ASR. The
         # verbatim quote and segment IDs remain bound to meeting evidence.
@@ -3376,7 +3384,13 @@ def _validate_coach_claim_grounding(
             violations.add("owner")
         if _state_polarities(value) - evidence_polarities:
             violations.add("state")
-        if _material_fact_terms(value) - evidence_terms:
+        # Deep coaching is explicitly allowed to turn the committed Fast
+        # Answer into bounded professional checks such as monitoring,
+        # rollback, latency, or load testing. Those generic risk categories
+        # are not meeting facts. Realtime cards remain strictly quote-bound,
+        # while owners, deadlines, numbers, states, and product names stay
+        # evidence-bound for every profile.
+        if not is_deep_answer_card and _material_fact_terms(value) - evidence_terms:
             violations.add("material_term")
         if _glossary_claim_terms(value, request=request) - evidence_products:
             violations.add("product_name")

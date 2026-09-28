@@ -1858,6 +1858,48 @@ def test_answer_ready_deep_card_can_ground_technical_terms_in_committed_answer()
     assert "Kafka" in intervention.recommendation
 
 
+def test_answer_ready_deep_card_can_add_generic_professional_checks() -> None:
+    deep_request = replace(
+        _coach_request(),
+        trigger_type="answer_ready",
+        work_item_id="answer:job-1",
+        rolling_state={
+            "current_answer": {
+                "answer_id": "answer:job-1",
+                "question": "为什么选择 Redis Stream 而不是 Kafka？",
+                "answer": "Redis Stream 适合当前规模，达到吞吐边界时重新评估 Kafka。",
+                "status": "committed",
+            }
+        },
+    )
+    payload = {
+        "intervention": {
+            "event_type": "question_to_user",
+            "title": "补充选型检查项",
+            "recommendation": (
+                "边界：用压测确认吞吐边界。\n"
+                "风险：监控消费延迟并准备回滚。\n"
+                "追问：什么条件下演进到 Kafka？"
+            ),
+            "reason": "当前回答还缺少压测、监控和回滚检查项。",
+            "evidence_segment_ids": ["remote-4"],
+            "evidence_quote": "你能承诺周五一定上线吗？",
+            "urgency": "medium",
+            "confidence": 0.9,
+        }
+    }
+
+    intervention = parse_realtime_coach_response(
+        json.dumps(payload, ensure_ascii=False),
+        request=deep_request,
+    )
+
+    assert intervention is not None
+    assert "压测" in intervention.recommendation
+    assert "监控" in intervention.recommendation
+    assert "回滚" in intervention.recommendation
+
+
 def test_coach_parser_rejects_a_quote_not_present_in_evidence() -> None:
     content = json.dumps(
         {
@@ -2879,7 +2921,7 @@ def test_pi_response_validation_failure_keeps_bounded_diagnostic() -> None:
                 {
                     "action": "intervention",
                     "intervention": invalid_intervention,
-                    "metrics": {"turns": 1},
+                    "metrics": {"turns": 1, "prompt_profile": "deep_answer"},
                 }
             ),
             pi_provider_config=_pi_provider_config(),
@@ -2892,6 +2934,7 @@ def test_pi_response_validation_failure_keeps_bounded_diagnostic() -> None:
         assert result["agent_metrics"]["response_validation_error"] == (
             "intervention.recommendation is too short"
         )
+        assert result["agent_metrics"]["prompt_profile"] == "deep_answer"
         assert result["agent_metrics"]["fallback_suppressed"] is True
 
     asyncio.run(scenario())

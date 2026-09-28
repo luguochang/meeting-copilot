@@ -3,7 +3,7 @@
 > 版本：v1.0
 > 日期：2026-09-28
 > 目标分支：`feat/pi-realtime-coach-agent-loop`
-> 状态：Fast Answer、Pi Deep、Correction 的真实静音端到端验收已完成；桌面双音轨、同音频 main 基线对比和移动端视觉验收待完成。后续代码、测试和验收必须能回到本文件中的用户效果与指标。
+> 状态：Fast Answer、Pi Deep、Correction 的真实静音端到端验收已完成；同音频 `main` 基线和原生双轨协议已通过静音注入验证。真实物理麦克风 + system audio 五分钟采集和会中移动端视觉验收待完成。后续代码、测试和验收必须能回到本文件中的用户效果与指标。
 
 ## 0. 决策摘要
 
@@ -260,8 +260,9 @@ created_at_ms / updated_at_ms
 - [x] 使用真实 OpenAI-compatible Provider 运行固定中文会议问题集。
 - [x] 记录 Fast Answer TTFT、完成时间和有效回答结果；问题检测 recall/precision 的离线固定集已由自动化测试覆盖，真实双音轨统计待补。
 - [x] 使用真实浏览器麦克风完成单轨问题、离题门禁和 Fast Answer 测试；用户后续要求禁止外放，新增静音 PCM 注入复验。
+- [x] 使用同一固定音频对比 `origin/main@5cd0ed5` 与当前分支；相同本地 refiner 配置下 canonical transcript 逐字一致。
+- [x] 使用 `native_pcm_v2` 静音注入 microphone/system audio 两条独立 WebSocket，验证 track/epoch/sequence、并发 ASR、Fast Answer 和 Pi Deep。
 - [ ] 使用桌面原生麦克风 + system audio 完成真正双轨双方对话测试。
-- [ ] 对比改造前后同一音频的 canonical transcript，确认 ASR 不回归。
 - [x] 保存脱敏快照指标并形成验收报告；真实页面截图待浏览器视觉验收补充。
 
 详细证据、真实输出和剩余风险见 [meeting-copilot_answer-copilot_pi-acceptance_20260927.md](./meeting-copilot_answer-copilot_pi-acceptance_20260927.md)。
@@ -275,7 +276,9 @@ created_at_ms / updated_at_ms
 3. Correction 最多为活动 Answer/Pi 让路 12 秒；达到上限后绕过普通批处理间隔，避免连续语音导致修正版永久饥饿。
 4. Deep 技术补充使用“原始会议证据 + 已提交 Fast Answer”联合事实边界。会议 quote 和 segment id 仍由宿主绑定；这避免原始 ASR 将产品名识别为乱码时，正确 Deep 补充被误判为凭空引入术语。
 
-静音验收使用预生成的 16kHz 单声道 float32 PCM，以每 100ms 一帧直接写入真实 ASR WebSocket。该方法经过真实 FunASR、durable jobs、真实 Provider、数据库和页面投影，但不会打开麦克风或播放声音。它验证了网页单轨主链，不等价于桌面原生双音轨验收。
+静音验收使用预生成的 16kHz 单声道 float32 PCM 直接写入真实 ASR WebSocket。网页单轨按每 100ms 一帧发送；原生双轨按 `native_pcm_v2` 的 300ms 帧分别携带 microphone/system audio track、capture epoch、sequence 和 timestamp。该方法经过真实 FunASR、durable jobs、真实 Provider、数据库和页面投影，但不会打开麦克风、播放声音或触发录音权限。它验证了网页单轨主链和桌面原生双轨协议/后端主链，不等价于 macOS 物理设备采集验收。
+
+原生双轨真实 Provider 样本 `accept_silent_dual_native_20260928_03` 中，Fast Answer 约 `1775ms / 3955ms` 首字/完成，Pi Deep 约 `3444ms / 5387ms / 5751ms` 首字/决策/投影，Agent turn/tool call 为 `1 / 1`，`deep_answer` 精确绑定当前 Answer。Deep 卡曾被后到 microphone 文本的通用词错误判定为 lifecycle resolved；现已将绑定 Answer 的 Deep 卡排除在普通实时卡 matcher 之外，只随当前 Answer 变化而退出。
 
 ## 10. 本轮非目标
 
