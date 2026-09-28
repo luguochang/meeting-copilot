@@ -202,6 +202,118 @@ test("Pi can deliberately keep silent after the host checklist", async () => {
   assert.equal(faux.state.callCount, 1);
 });
 
+test("deep answer coaching sees the Fast Answer and submits an incremental card in one turn", async () => {
+  const { faux, runtime } = harness();
+  const deep = fullRequest("deep-answer");
+  deep.context.trigger_type = "answer_ready";
+  deep.context.work_item_id = "answer:job-1";
+  deep.context.priority_mode = "deep";
+  deep.context.rolling_state.current_answer = {
+    answer_id: "answer:job-1",
+    evidence_segment_id: "remote-1",
+    question: "为什么选择 Redis Stream 而不是 Kafka？",
+    answer: "因为已有 Redis 集群且当前吞吐规模可控，先用 Stream 降低接入和运维成本。",
+    status: "committed",
+  };
+  faux.setResponses([
+    (context) => {
+      const userMessage = context.messages.findLast((message) => message.role === "user");
+      const text = typeof userMessage.content === "string"
+        ? userMessage.content
+        : userMessage.content.find((block) => block.type === "text").text;
+      const payload = JSON.parse(text);
+      assert.equal(payload.task, "deepen_current_answer");
+      assert.deepEqual(payload.current_answer, {
+        question: deep.context.rolling_state.current_answer.question,
+        answer: deep.context.rolling_state.current_answer.answer,
+        status: "committed",
+      });
+      assert.equal(payload.user_request, null);
+      assert.match(context.systemPrompt, /not to rewrite or summarize current_answer/);
+      assert.deepEqual(
+        context.tools.map((tool) => tool.name),
+        ["submit_intervention", "keep_silent"],
+      );
+      assert.ok(!context.tools.some((tool) => tool.name === "read_realtime_context"));
+      const terminalSchema = context.tools.find((tool) => tool.name === "submit_intervention").parameters;
+      assert.ok(terminalSchema.properties.boundary);
+      assert.ok(terminalSchema.properties.risk);
+      assert.ok(terminalSchema.properties.follow_up);
+      assert.equal(terminalSchema.properties.recommendation, undefined);
+      assert.equal(terminalSchema.properties.say_this, undefined);
+      assert.equal(terminalSchema.properties.evidence_segment_ids, undefined);
+      assert.equal(terminalSchema.properties.evidence_quote, undefined);
+      return fauxAssistantMessage(
+        fauxToolCall("submit_intervention", {
+          title: "补充异常恢复边界",
+          boundary: "高吞吐或长周期留存时需要重新评估选型",
+          risk: "需要确认消费异常后的恢复和重复消费处理",
+          follow_up: "如何保证消息不丢并处理消费者积压",
+          why_now: "当前回答已有选型依据，但还可以补充异常路径和可能追问。",
+          urgency: "medium",
+          confidence: 0.88,
+        }),
+        { stopReason: "toolUse" },
+      );
+    },
+  ]);
+
+  const result = await runtime.evaluate(deep);
+
+  assert.equal(result.action, "intervention");
+  assert.equal(result.metrics.prompt_profile, "deep_answer");
+  assert.deepEqual(
+    result.metrics.available_tool_names,
+    ["submit_intervention", "keep_silent"],
+  );
+  assert.equal(result.metrics.turns, 1);
+  assert.equal(result.metrics.tool_calls, 1);
+  assert.deepEqual(result.metrics.tool_names, ["submit_intervention"]);
+  assert.equal(result.intervention.title, "补充异常恢复边界");
+  assert.equal(result.intervention.recommendation, [
+    "边界：高吞吐或长周期留存时需要重新评估选型",
+    "风险：需要确认消费异常后的恢复和重复消费处理",
+    "追问：如何保证消息不丢并处理消费者积压",
+  ].join("\n"));
+  assert.deepEqual(result.intervention.evidence_segment_ids, ["remote-1"]);
+  assert.equal(result.intervention.evidence_quote, "周五一定上线吗");
+});
+
+test("deep answer coaching removes provider-written field labels before composing the card", async () => {
+  const { faux, runtime } = harness();
+  const deep = fullRequest("deep-answer-labels");
+  deep.context.trigger_type = "user_request";
+  deep.context.priority_mode = "deep";
+  deep.context.user_request = "补充当前回答。";
+  deep.context.rolling_state.current_answer = {
+    evidence_segment_id: "local-1",
+    question: "为什么选择 Redis Stream？",
+    answer: "因为当前规模可控。",
+    status: "committed",
+  };
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("submit_intervention", {
+        title: "补充可靠性边界",
+        boundary: "架构边界：只适用于当前规模",
+        risk: "关键风险：异常路径还需说明",
+        follow_up: "面试官最可能追问：如何处理失败消费",
+        why_now: "当前回答缺少异常路径。",
+        urgency: "medium",
+        confidence: 0.8,
+      }),
+      { stopReason: "toolUse" },
+    ),
+  ]);
+
+  const result = await runtime.evaluate(deep);
+
+  assert.equal(
+    result.intervention.recommendation,
+    "边界：只适用于当前规模\n风险：异常路径还需说明\n追问：如何处理失败消费",
+  );
+});
+
 test("the host checklist lets Pi reach a terminal decision in one provider turn", async () => {
   const { faux, runtime } = harness();
   faux.setResponses([
@@ -1017,6 +1129,20 @@ test("trigger contract permits due and user requests without fabricated paragrap
   assert.equal(validatedRequest.context.trigger_type, "user_request");
   assert.equal(validatedRequest.context.user_request, "发布前还缺哪些条件？");
 
+  const answerReady = request("answer-ready-no-delta");
+  answerReady.context.trigger_type = "answer_ready";
+  answerReady.context.work_item_id = "answer:job-1";
+  answerReady.context.new_paragraphs = [];
+  answerReady.context.candidate_events = [];
+  answerReady.context.rolling_state.current_answer = {
+    question: "为什么选择 Redis Stream？",
+    answer: "因为当前规模可控。",
+    status: "committed",
+  };
+  const validatedAnswerReady = validateEvaluationRequest(answerReady);
+  assert.equal(validatedAnswerReady.context.trigger_type, "answer_ready");
+  assert.equal(validatedAnswerReady.context.work_item_id, "answer:job-1");
+
   const transcriptDelta = request("transcript-delta-canonical");
   transcriptDelta.context.trigger_type = "transcript_delta";
   assert.equal(validateEvaluationRequest(transcriptDelta).context.trigger_type, "transcript_delta");
@@ -1046,6 +1172,14 @@ test("trigger contract rejects incomplete due, user, and delta requests", () => 
     () => validateEvaluationRequest(requested),
     (error) => error instanceof PiCoachProtocolError
       && error.message === "user_request requires context.user_request",
+  );
+
+  const answerReady = request("answer-ready-without-item");
+  answerReady.context.trigger_type = "answer_ready";
+  assert.throws(
+    () => validateEvaluationRequest(answerReady),
+    (error) => error instanceof PiCoachProtocolError
+      && error.message === "answer_ready requires context.work_item_id",
   );
 });
 

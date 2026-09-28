@@ -271,6 +271,7 @@ function dependencies() {
     getDocumentRevisions: vi.fn().mockResolvedValue([]),
     regenerateDocument: vi.fn().mockResolvedValue(undefined),
     retryReviewJob: vi.fn().mockResolvedValue(undefined),
+    retryTranscriptCorrection: vi.fn().mockResolvedValue(undefined),
     endMeeting: vi.fn().mockResolvedValue(undefined),
     saveSuggestionFeedback: vi.fn().mockResolvedValue(undefined),
     saveFactStatus: vi.fn().mockResolvedValue(undefined),
@@ -1586,7 +1587,7 @@ describe("LiveMeetingWorkbench", () => {
     expect(api.saveFactStatus).toHaveBeenCalledWith("meeting-1", "risk", "risk-1", "dismissed");
     await waitFor(() => expect(within(facts).queryByText("P99 延迟可能超标")).not.toBeInTheDocument());
 
-    expect(screen.getByRole("heading", { name: "AI 实时教练" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "AI 实时副驾" })).toBeVisible();
     expect(screen.getByRole("heading", { name: "未闭环问题" })).toBeVisible();
   });
 });

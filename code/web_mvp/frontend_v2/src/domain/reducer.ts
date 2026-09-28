@@ -400,6 +400,8 @@ function eventSuggestion(event: MeetingEvent): Suggestion | null {
     meetingId: stringValue(value, "meeting_id", "meetingId") ?? event.meetingId,
     jobId: stringValue(value, "job_id", "jobId") ?? event.causationId,
     generationId,
+    kind: value.kind === "answer" ? "answer" : "follow_up",
+    questionText: stringValue(value, "question_text", "questionText"),
     evidenceSegmentId,
     evidenceTranscriptSeq,
     evidenceHash: stringValue(value, "evidence_hash", "evidenceHash") ?? "",
@@ -409,6 +411,12 @@ function eventSuggestion(event: MeetingEvent): Suggestion | null {
     draftSeq,
     text,
     finalDraftSeq: numberValue(value, "final_draft_seq", "finalDraftSeq"),
+    runtime: stringValue(value, "runtime"),
+    provider: stringValue(value, "provider"),
+    model: stringValue(value, "model"),
+    ttftMs: numberValue(value, "ttft_ms", "ttftMs"),
+    completedMs: numberValue(value, "completed_ms", "completedMs"),
+    errorClass: stringValue(value, "error_class", "errorClass"),
     feedback: feedback === "kept" || feedback === "ignored" || feedback === "false_positive" || feedback === "too_late"
       ? feedback
       : null,
@@ -513,6 +521,8 @@ function eventFollowUp(event: MeetingEvent, lane: "coach" | "semantic" = "coach"
   const decisionReason = stringValue(metadata, "decision_reason", "decisionReason");
   const runId = stringValue(metadata, "run_id", "runId");
   const decisionId = stringValue(metadata, "decision_id", "decisionId");
+  const promptProfile = stringValue(metadata, "prompt_profile", "promptProfile");
+  const answerId = stringValue(metadata, "answer_id", "answerId");
   const validUntil = numberValue(
     metadata,
     "valid_until_ms",
@@ -551,6 +561,8 @@ function eventFollowUp(event: MeetingEvent, lane: "coach" | "semantic" = "coach"
     ...(decisionReason ? { decisionReason } : {}),
     ...(runId ? { runId } : {}),
     ...(decisionId ? { decisionId } : {}),
+    ...(promptProfile ? { promptProfile } : {}),
+    ...(answerId ? { answerId } : {}),
     ...(evidenceRevision !== null ? { evidenceRevision } : {}),
     ...(validUntil !== null ? { validUntil } : {}),
     ...(lifecycleAction ? { lifecycleAction } : {}),
@@ -613,7 +625,18 @@ function eventCoachDecision(event: MeetingEvent): CoachDecisionProjection | null
     ...(numberValue(value, "completed_at_ms", "completedAtMs") !== null ? { completedAtMs: numberValue(value, "completed_at_ms", "completedAtMs")! } : {}),
     ...(numberValue(value, "deadline_at_ms", "deadlineAtMs") !== null ? { deadlineAtMs: numberValue(value, "deadline_at_ms", "deadlineAtMs")! } : {}),
     ...(validUntil !== null ? { validUntil } : {}),
+    ...(stringValue(value, "prompt_profile", "promptProfile")
+      ? { promptProfile: stringValue(value, "prompt_profile", "promptProfile")! }
+      : {}),
+    ...(stringValue(value, "answer_id", "answerId")
+      ? { answerId: stringValue(value, "answer_id", "answerId")! }
+      : {}),
     ...(lifecycleAction ? { lifecycleAction } : {}),
+    ...(typeof value.lifecycle_refresh === "boolean"
+      ? { lifecycleRefresh: value.lifecycle_refresh }
+      : typeof value.lifecycleRefresh === "boolean"
+        ? { lifecycleRefresh: value.lifecycleRefresh }
+        : {}),
     ...(lifecycleStatus ? { lifecycleStatus } : {}),
     ...(typeof supersedesDecisionIdValue === "string" || supersedesDecisionIdValue === null
       ? { supersedesDecisionId: supersedesDecisionIdValue }
@@ -662,10 +685,11 @@ function mergeCoachHistory(current: CoachHistoryEntry[], incoming: CoachHistoryE
 function applyCoachSupersession(
   history: CoachHistoryEntry[],
   decision: CoachDecisionProjection | null,
+  replacesPrior: boolean,
 ): CoachHistoryEntry[] {
   const supersedesDecisionId = decision?.supersedesDecisionId;
   const replacementDecisionId = decision?.decisionId;
-  if (!supersedesDecisionId || !replacementDecisionId || supersedesDecisionId === replacementDecisionId) {
+  if (!replacesPrior || !supersedesDecisionId || !replacementDecisionId || supersedesDecisionId === replacementDecisionId) {
     return history;
   }
   const lifecycleAction = decision.lifecycleAction === "retract" ? "retract" : "deprioritize";
@@ -676,6 +700,15 @@ function applyCoachSupersession(
       supersededBy: replacementDecisionId,
     }
     : item);
+}
+
+function coachDecisionReplacesPrior(
+  decision: CoachDecisionProjection | null,
+  hasIntervention: boolean,
+): boolean {
+  return hasIntervention || decision?.lifecycleAction === "retract" || Boolean(
+    decision?.lifecycleRefresh && decision.lifecycleAction === "deprioritize",
+  );
 }
 
 function mergeRecentContextHistory(current: RecentContextEntry[], incoming: RecentContextEntry[]): RecentContextEntry[] {
@@ -935,11 +968,13 @@ function applyEvent(state: MeetingViewState, event: MeetingEvent): MeetingViewSt
     event.type === "meeting.intelligence.applied" || event.type === "meeting.decision.updated" ||
     event.type === "meeting.action_item.updated" || event.type === "meeting.risk.updated" ||
     event.type === "suggestion.draft.started" || event.type === "suggestion.draft.delta" ||
-    event.type === "suggestion.committed" || event.type === "suggestion.superseded" ||
+    event.type === "suggestion.committed" || event.type === "suggestion.rejected" || event.type === "suggestion.superseded" ||
     event.type === "suggestion.evidence.remapped";
+  const suggestionPayload = asRecord(event.payload.suggestion) ?? event.payload;
+  const answerSuggestionEvent = formalAiEvent && suggestionPayload.kind === "answer";
   const localReflexEvent = event.type === "meeting.intelligence.applied" &&
     isLocalReflexCoachPayload(event.payload);
-  if (formalAiEvent && !isFormalLlmFirstPayload(event.payload) && !localReflexEvent) return next;
+  if (formalAiEvent && !isFormalLlmFirstPayload(event.payload) && !localReflexEvent && !answerSuggestionEvent) return next;
 
   if (event.type === "transcript.segment.finalized" || event.type === "transcript.segment.corrected" ||
       event.type === "transcript.segment.revised") {
@@ -966,15 +1001,24 @@ function applyEvent(state: MeetingViewState, event: MeetingEvent): MeetingViewSt
       };
     }
   } else if (event.type === "suggestion.draft.started" || event.type === "suggestion.draft.delta" ||
-      event.type === "suggestion.committed" || event.type === "suggestion.superseded" ||
+      event.type === "suggestion.committed" || event.type === "suggestion.rejected" || event.type === "suggestion.superseded" ||
       event.type === "suggestion.evidence.remapped") {
     const suggestion = eventSuggestion(event);
     if (suggestion) {
       const authoritative = event.type === "suggestion.superseded" ||
         event.type === "suggestion.evidence.remapped";
+      const linkedAnswerId = next.followUp?.answerId;
+      const invalidatesLinkedCoach = suggestion.kind === "answer" && Boolean(
+        linkedAnswerId && (
+          (suggestion.status === "superseded" && suggestion.suggestionId === linkedAnswerId) ||
+          (suggestion.status !== "superseded" && suggestion.suggestionId !== linkedAnswerId)
+        ),
+      );
       next = {
         ...next,
         suggestions: mergeSuggestions(next.suggestions, [suggestion], authoritative),
+        followUp: invalidatesLinkedCoach ? null : next.followUp,
+        coachDecision: invalidatesLinkedCoach ? null : next.coachDecision,
       };
     }
   } else if (event.type === "transcript.segment.partial") {
@@ -1008,7 +1052,12 @@ function applyEvent(state: MeetingViewState, event: MeetingEvent): MeetingViewSt
       const followUp = eventFollowUp(event);
       const semanticFollowUp = eventFollowUp(event, "semantic");
       const coachDecision = eventCoachDecision(event);
-      const supersededCoachHistory = applyCoachSupersession(next.coachHistory, coachDecision);
+      const replacesPrior = coachDecisionReplacesPrior(coachDecision, Boolean(followUp));
+      const supersededCoachHistory = applyCoachSupersession(
+        next.coachHistory,
+        coachDecision,
+        replacesPrior,
+      );
       if (followUp) {
         next = {
           ...next,
@@ -1020,12 +1069,18 @@ function applyEvent(state: MeetingViewState, event: MeetingEvent): MeetingViewSt
             [coachHistoryEntryFromEvent(event, followUp)],
           ),
         };
-      } else {
+      } else if (replacesPrior || !next.followUp) {
         next = {
           ...next,
           followUp: null,
           semanticFollowUp,
           coachDecision,
+          coachHistory: supersededCoachHistory,
+        };
+      } else {
+        next = {
+          ...next,
+          semanticFollowUp,
           coachHistory: supersededCoachHistory,
         };
       }
@@ -1159,7 +1214,11 @@ function applySnapshot(state: MeetingViewState, snapshot: MeetingSnapshot, recei
     followUp: meetingEnded ? null : snapshotFollowUp,
     semanticFollowUp: meetingEnded ? null : snapshot.semanticFollowUp ?? null,
     coachDecision: meetingEnded ? null : snapshotCoachDecision,
-    coachHistory: applyCoachSupersession(mergedCoachHistory, snapshotCoachDecision),
+    coachHistory: applyCoachSupersession(
+      mergedCoachHistory,
+      snapshotCoachDecision,
+      coachDecisionReplacesPrior(snapshotCoachDecision, Boolean(snapshotFollowUp)),
+    ),
     recentContextHistory: mergeRecentContextHistory([], snapshotRecentContextHistory),
     audio: meetingEnded && snapshot.audio.status === "recording"
       ? { ...snapshot.audio, status: "assembling" }

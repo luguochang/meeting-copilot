@@ -105,6 +105,7 @@ export interface MeetingApi {
   ): Promise<ReviewDocumentRevision[]>;
   regenerateDocument(meetingId: string, kind: ReviewDocumentKind, signal?: AbortSignal): Promise<void>;
   retryReviewJob(meetingId: string, kind: ReviewJobKind, signal?: AbortSignal): Promise<void>;
+  retryTranscriptCorrection(meetingId: string, signal?: AbortSignal): Promise<void>;
   endMeeting(meetingId: string, signal?: AbortSignal): Promise<void>;
   saveSuggestionFeedback(
     meetingId: string,
@@ -856,6 +857,13 @@ export class HttpMeetingApi implements MeetingApi {
     await this.request(
       `/v2/meetings/${encodeURIComponent(meetingId)}/jobs/${encodeURIComponent(kind)}/retry`,
       { method: "POST", body: JSON.stringify({ use_current_transcript_revision: true }), signal },
+    );
+  }
+
+  async retryTranscriptCorrection(meetingId: string, signal?: AbortSignal): Promise<void> {
+    await this.request(
+      `/v2/meetings/${encodeURIComponent(meetingId)}/transcript/correction/retry`,
+      { method: "POST", body: JSON.stringify({}), signal },
     );
   }
 

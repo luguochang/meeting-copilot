@@ -1090,6 +1090,8 @@ function parseSuggestion(value: unknown, index: number): Suggestion {
     meetingId: requiredString(first(item, "meeting_id", "meetingId"), `suggestions[${index}].meeting_id`),
     jobId: optionalString(first(item, "job_id", "jobId")),
     generationId: requiredString(first(item, "generation_id", "generationId"), `suggestions[${index}].generation_id`),
+    kind: first(item, "kind") === "answer" ? "answer" : "follow_up",
+    questionText: optionalString(first(item, "question_text", "questionText")),
     evidenceSegmentId: requiredString(first(item, "evidence_segment_id", "evidenceSegmentId"), `suggestions[${index}].evidence_segment_id`),
     evidenceTranscriptSeq: requiredNumber(first(item, "evidence_transcript_seq", "evidenceTranscriptSeq"), `suggestions[${index}].evidence_transcript_seq`),
     evidenceHash: optionalString(first(item, "evidence_hash", "evidenceHash")) ?? "",
@@ -1099,6 +1101,12 @@ function parseSuggestion(value: unknown, index: number): Suggestion {
     draftSeq: optionalNumber(first(item, "draft_seq", "draftSeq")) ?? 0,
     text: optionalString(item.text),
     finalDraftSeq: optionalNumber(first(item, "final_draft_seq", "finalDraftSeq")),
+    runtime: optionalString(item.runtime),
+    provider: optionalString(item.provider),
+    model: optionalString(item.model),
+    ttftMs: optionalNumber(first(item, "ttft_ms", "ttftMs")),
+    completedMs: optionalNumber(first(item, "completed_ms", "completedMs")),
+    errorClass: optionalString(first(item, "error_class", "errorClass")),
     feedback: parseFeedback(item.feedback),
     createdAtMs: optionalNumber(first(item, "created_at_ms", "createdAtMs")) ?? 0,
     updatedAtMs: optionalNumber(first(item, "updated_at_ms", "updatedAtMs")) ?? 0,
@@ -1209,6 +1217,8 @@ function parseFollowUp(value: unknown, metadataValue?: unknown): FollowUpProject
   const decisionReason = optionalString(first(item, "decision_reason", "decisionReason"));
   const runId = optionalString(first(item, "run_id", "runId"));
   const decisionId = optionalString(first(item, "decision_id", "decisionId"));
+  const promptProfile = optionalString(first(item, "prompt_profile", "promptProfile"));
+  const answerId = optionalString(first(item, "answer_id", "answerId"));
   const validUntil = optionalNumber(first(
     item,
     "valid_until_ms",
@@ -1260,6 +1270,8 @@ function parseFollowUp(value: unknown, metadataValue?: unknown): FollowUpProject
     ...(decisionReason ? { decisionReason } : {}),
     ...(runId ? { runId } : {}),
     ...(decisionId ? { decisionId } : {}),
+    ...(promptProfile ? { promptProfile } : {}),
+    ...(answerId ? { answerId } : {}),
     ...(evidenceRevision !== null ? { evidenceRevision } : {}),
     ...(validUntil !== null ? { validUntil } : {}),
     ...(softDeadlineAtMs !== null ? { softDeadlineAtMs } : {}),
@@ -1348,7 +1360,14 @@ function parseCoachDecision(value: unknown): CoachDecisionProjection | null {
         ? item.lateResultDiscarded
         : undefined,
     validUntil: numberField("valid_until_ms", "validUntilMs"),
+    promptProfile: stringField("prompt_profile", "promptProfile"),
+    answerId: stringField("answer_id", "answerId"),
     lifecycleAction,
+    lifecycleRefresh: typeof item.lifecycle_refresh === "boolean"
+      ? item.lifecycle_refresh
+      : typeof item.lifecycleRefresh === "boolean"
+        ? item.lifecycleRefresh
+        : undefined,
     lifecycleStatus,
     ...(typeof supersedesDecisionIdValue === "string" || supersedesDecisionIdValue === null
       ? { supersedesDecisionId: supersedesDecisionIdValue }

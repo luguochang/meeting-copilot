@@ -15,7 +15,12 @@ POLICY_VERSION = "realtime-transcript-correction.v1"
 # than the character threshold; stop/finalize still uses force=True.
 MIN_BATCH_CHARS = 80
 MIN_INTERVAL_MS = 15_000
-MAX_BATCH_CHARS = 2_000
+# Keep forced backfills small enough for slower OpenAI-compatible gateways.
+# Marker overhead and generated output can make a 2,000-character transcript
+# request exceed 3,000 characters and time out even with a 30-second budget.
+# Live finals still batch normally from MIN_BATCH_CHARS; backfills are split
+# into several auditable revisions instead of failing the whole transcript.
+MAX_BATCH_CHARS = 800
 MIN_LENGTH_RATIO = 0.65
 MAX_LENGTH_RATIO = 1.40
 MIN_SIMILARITY = 0.65

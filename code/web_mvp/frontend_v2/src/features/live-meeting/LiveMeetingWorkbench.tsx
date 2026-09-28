@@ -706,6 +706,7 @@ export function LiveMeetingWorkbench({
           onLoadDocumentRevisions={(kind) => api.getDocumentRevisions(meetingId, kind)}
           onRegenerateDocument={(kind) => api.regenerateDocument(meetingId, kind)}
           onRetryReviewJob={(kind) => api.retryReviewJob(meetingId, kind)}
+          onRetryTranscriptCorrection={() => api.retryTranscriptCorrection(meetingId)}
           onRenameSpeaker={actions.renameSpeaker}
           onRefresh={actions.refresh}
         />

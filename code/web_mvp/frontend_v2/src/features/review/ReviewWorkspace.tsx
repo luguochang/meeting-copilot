@@ -55,6 +55,7 @@ interface ReviewWorkspaceProps {
   onLoadDocumentRevisions?(kind: ReviewDocumentKind): Promise<ReviewDocumentRevision[]>;
   onRegenerateDocument?(kind: ReviewDocumentKind): Promise<void>;
   onRetryReviewJob?(kind: ReviewJobKind): Promise<void>;
+  onRetryTranscriptCorrection?(): Promise<void>;
   onRenameSpeaker?(speakerId: string, speakerLabel: string): Promise<void>;
   onCreateMixedAudio?(signal?: AbortSignal): Promise<MeetingAudioDerivedAsset>;
   onRefresh?(): Promise<void> | void;
@@ -276,6 +277,61 @@ function reviewJobError(job: ReviewJob): string {
 
 function displayText(segment: TranscriptSegment): string {
   return segment.normalizedText.trim() || segment.text.trim();
+}
+
+interface TranscriptCorrectionSummary {
+  total: number;
+  changed: number;
+  verified: number;
+  failed: number;
+  pending: number;
+  failureReason: string | null;
+  state: "corrected" | "processing" | "failed" | "raw";
+}
+
+function transcriptCorrectionFailureReason(segments: TranscriptSegment[]): string | null {
+  const classes = new Set(
+    segments
+      .filter((segment) => segment.correctionStatus === "failed_preserved_original")
+      .map((segment) => segment.correctionErrorClass)
+      .filter((value): value is string => Boolean(value)),
+  );
+  if (classes.has("correction_provider_rates_not_configured")) {
+    return "远程语义校对未执行：Provider 未配置价格费率。";
+  }
+  if (classes.has("correction_provider_budget_exhausted")) {
+    return "远程语义校对未执行：本轮校对预算已用尽。";
+  }
+  if (["provider_timeout", "TimeoutError", "deadline_exceeded"].some((value) => classes.has(value))) {
+    return "远程语义校对响应超时，原始识别文字已保留。";
+  }
+  if (classes.size > 0) {
+    return "远程语义校对失败，原始识别文字已保留。";
+  }
+  return null;
+}
+
+function summarizeTranscriptCorrection(segments: TranscriptSegment[]): TranscriptCorrectionSummary {
+  const total = segments.length;
+  const changed = segments.filter((segment) => segment.correctionStatus === "changed").length;
+  const verified = segments.filter((segment) => ["changed", "no_change"].includes(segment.correctionStatus ?? "")).length;
+  const failed = segments.filter((segment) => segment.correctionStatus === "failed_preserved_original").length;
+  const pending = segments.filter((segment) => ["pending", "processing"].includes(segment.correctionStatus ?? "")).length;
+  return {
+    total,
+    changed,
+    verified,
+    failed,
+    pending,
+    failureReason: transcriptCorrectionFailureReason(segments),
+    state: total > 0 && verified === total
+      ? "corrected"
+      : pending > 0
+        ? "processing"
+        : failed > 0
+          ? "failed"
+          : "raw",
+  };
 }
 
 interface MinutesActionItem {
@@ -643,6 +699,7 @@ export function ReviewWorkspace({
   onLoadDocumentRevisions,
   onRegenerateDocument,
   onRetryReviewJob,
+  onRetryTranscriptCorrection,
   onRenameSpeaker,
   onCreateMixedAudio,
   onRefresh,
@@ -660,6 +717,9 @@ export function ReviewWorkspace({
   const retryReviewJobRequest = onRetryReviewJob ?? (async () => {
     throw new Error("当前页面未连接会后任务重试接口");
   });
+  const retryTranscriptCorrectionRequest = onRetryTranscriptCorrection ?? (async () => {
+    throw new Error("当前页面未连接转写校对重试接口");
+  });
   const refreshAction = onRefresh ?? (() => undefined);
   const [activeTab, setActiveTab] = useState<ReviewTab>("review");
   const [pendingEvidence, setPendingEvidence] = useState<string | null>(null);
@@ -670,6 +730,8 @@ export function ReviewWorkspace({
   const [factsEditing, setFactsEditing] = useState(false);
   const [transcriptEditing, setTranscriptEditing] = useState(false);
   const [retryingJobs, setRetryingJobs] = useState<Partial<Record<ReviewJobKind, boolean>>>({});
+  const [retryingTranscriptCorrection, setRetryingTranscriptCorrection] = useState(false);
+  const [transcriptCorrectionError, setTranscriptCorrectionError] = useState<string | null>(null);
   const [jobErrors, setJobErrors] = useState<Partial<Record<ReviewJobKind, string>>>({});
   const [revisionHistoryKind, setRevisionHistoryKind] = useState<ReviewDocumentKind | null>(null);
   const [documentRevisions, setDocumentRevisions] = useState<ReviewDocumentRevision[]>([]);
@@ -689,6 +751,10 @@ export function ReviewWorkspace({
   );
   const audioDetail = state.audioDetail as MeetingAudioWithTracks | null;
   const transcript = state.fullTranscript.length ? state.fullTranscript : state.segments;
+  const transcriptCorrection = useMemo(
+    () => summarizeTranscriptCorrection(transcript),
+    [transcript],
+  );
   const keptSuggestions = state.suggestions.filter(
     (suggestion) => suggestion.status === "committed" && suggestion.feedback === "kept",
   );
@@ -1016,6 +1082,23 @@ export function ReviewWorkspace({
     }
   };
 
+  const retryTranscriptCorrection = async () => {
+    if (retryingTranscriptCorrection || transcriptCorrection.state === "processing") return;
+    setRetryingTranscriptCorrection(true);
+    setTranscriptCorrectionError(null);
+    try {
+      await retryTranscriptCorrectionRequest();
+      await refreshAction();
+      onReloadTranscript();
+    } catch (error) {
+      setTranscriptCorrectionError(
+        error instanceof Error ? error.message : "转写校对重试失败",
+      );
+    } finally {
+      setRetryingTranscriptCorrection(false);
+    }
+  };
+
   const createMixedReplay = async () => {
     if (!bothTracksReady || creatingMixed) return;
     setCreatingMixed(true);
@@ -1178,6 +1261,43 @@ export function ReviewWorkspace({
           <span>
             {failedReviewJobNames.join("、")}未能生成。会议文字和录音已保存，可使用上方对应的重试按钮重新生成。
           </span>
+        </p>
+      ) : null}
+      {transcriptCorrection.total > 0 && transcriptCorrection.state !== "corrected" ? (
+        <div
+          className={transcriptCorrection.state === "failed" ? "inline-error" : "inline-warning"}
+          role={transcriptCorrection.state === "failed" ? "alert" : "status"}
+        >
+          <strong>
+            {transcriptCorrection.state === "failed"
+              ? "当前文字是原始 ASR"
+              : transcriptCorrection.state === "processing"
+                ? "AI 正在校对会议文字"
+                : "会议文字尚未完成校对"}
+          </strong>
+          <span>
+            {transcriptCorrection.state === "failed"
+              ? `有 ${transcriptCorrection.failed} 段校对失败。${transcriptCorrection.failureReason ?? "原始文字已保留。"}`
+              : transcriptCorrection.state === "processing"
+                ? `已校对 ${transcriptCorrection.verified}/${transcriptCorrection.total} 段，剩余 ${transcriptCorrection.pending} 段处理中。`
+                : "当前没有可用的 AI 校对结果，页面仍展示原始识别文字。"}
+          </span>
+          {onRetryTranscriptCorrection ? (
+            <button
+              className="secondary-button compact-button"
+              type="button"
+              onClick={() => void retryTranscriptCorrection()}
+              disabled={retryingTranscriptCorrection || transcriptCorrection.state === "processing"}
+            >
+              {retryingTranscriptCorrection ? <LoaderCircle className="spin" size={14} /> : <RotateCcw size={14} />}
+              重试 AI 校对
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+      {transcriptCorrectionError ? (
+        <p className="inline-error" role="alert">
+          转写校对重试失败：{transcriptCorrectionError}
         </p>
       ) : null}
       {Object.entries(jobErrors).map(([kind, error]) => error ? (
@@ -1524,8 +1644,16 @@ export function ReviewWorkspace({
                 <h2>完整会议文字</h2>
               </div>
               <div className="document-heading-actions">
-                <span className={`document-source document-source--${transcriptEditor.isUserFinal ? "user_final" : state.documents?.transcript?.source ?? "ai_generated"}`}>
-                  {transcriptEditor.isUserFinal ? "用户最终稿" : "AI 修正版"}
+                <span className={`document-source document-source--${transcriptEditor.isUserFinal ? "user_final" : transcriptCorrection.state === "corrected" ? "ai_generated" : "raw"}`}>
+                  {transcriptEditor.isUserFinal
+                    ? "用户最终稿"
+                    : transcriptCorrection.state === "corrected"
+                      ? "AI 修正版"
+                      : transcriptCorrection.state === "processing"
+                        ? "AI 校对中"
+                        : transcriptCorrection.state === "failed"
+                          ? "原始 ASR（校对失败）"
+                          : "原始 ASR"}
                 </span>
                 <button className="icon-button" type="button" onClick={() => void showDocumentRevisions("transcript")} title="完整文字版本历史" aria-label="查看完整文字版本历史">
                   <History size={17} />

@@ -64,8 +64,30 @@ function currentSuggestion(suggestions: Suggestion[]): Suggestion | null {
   return visible.sort((a, b) => b.evidenceTranscriptSeq - a.evidenceTranscriptSeq || b.updatedAtMs - a.updatedAtMs)[0] ?? null;
 }
 
+function currentAnswer(suggestions: Suggestion[]): Suggestion | null {
+  const visible = suggestions.filter(
+    (item) =>
+      item.kind === "answer" &&
+      item.status !== "superseded" &&
+      item.feedback !== "ignored" &&
+      item.feedback !== "false_positive" &&
+      item.feedback !== "too_late",
+  );
+  return visible.sort((a, b) => b.evidenceTranscriptSeq - a.evidenceTranscriptSeq || b.updatedAtMs - a.updatedAtMs)[0] ?? null;
+}
+
 function suggestionText(suggestion: Suggestion): string {
   return suggestion.status === "committed" ? suggestion.text ?? suggestion.draftText : suggestion.draftText;
+}
+
+function answerErrorMessage(suggestion: Suggestion): string {
+  if (suggestion.errorClass === "provider_not_configured") {
+    return "回答模型尚未连接，连接后会自动继续。";
+  }
+  if (suggestion.status === "rejected") {
+    return "回答服务本轮不可用，左侧转写和录音不受影响。";
+  }
+  return "回答服务暂时异常，正在重试；已生成的内容会保留。";
 }
 
 function questionIsOpen(question: OpenQuestionProjection): boolean {
@@ -502,10 +524,12 @@ export function NowRail({
     );
     return () => window.clearTimeout(timer);
   }, [coachDecisionValidUntil, followUpValidUntil]);
+  const answer = useMemo(() => currentAnswer(suggestions), [suggestions]);
   const suggestion = useMemo(
-    () => currentSuggestion(suggestions.filter((item) => isFormalAi(item))),
-    [suggestions],
+    () => answer ?? currentSuggestion(suggestions.filter((item) => isFormalAi(item))),
+    [answer, suggestions],
   );
+  const isAnswer = suggestion?.kind === "answer";
   const questions = openQuestions.filter((question) => isFormalAi(question) && questionIsOpen(question)).slice(0, 3);
   const formalTopic = currentTopic && isFormalAi(currentTopic) ? currentTopic : null;
   const formalFollowUpCandidate = followUp && isTrustedCoachProjection(followUp) ? followUp : null;
@@ -533,6 +557,15 @@ export function NowRail({
   const formalCoachHistory = coachHistory
     .filter((item) => isTrustedCoachProjection(item) && isCoachInterventionProjection(item))
     .sort((left, right) => left.createdAtMs - right.createdAtMs);
+  const deepAnswerFollowUp = isAnswer && suggestion
+    ? (
+      formalFollowUp?.promptProfile === "deep_answer"
+        && formalFollowUp.answerId === suggestion.suggestionId
+        ? formalFollowUp
+        : [...formalCoachHistory].reverse().find((item) =>
+          item.promptProfile === "deep_answer" && item.answerId === suggestion.suggestionId) ?? null
+    )
+    : null;
   const currentCoachHistoryId = formalFollowUp
     ? [...formalCoachHistory].reverse().find((item) =>
       formalFollowUp.decisionId && item.decisionId
@@ -602,7 +635,7 @@ export function NowRail({
     if (!text) return;
     try {
       await navigator.clipboard.writeText(text);
-      onMessage("追问已复制");
+      onMessage(isAnswer ? "回答已复制" : "追问已复制");
     } catch {
       onMessage("复制失败，请检查剪贴板权限");
     }
@@ -632,7 +665,7 @@ export function NowRail({
       <section className="rail-section suggestion-section" aria-labelledby="suggestion-title">
         <header className="rail-heading">
           <MessageCircleQuestion size={16} />
-          <h2 id="suggestion-title">AI 实时教练</h2>
+          <h2 id="suggestion-title">AI 实时副驾</h2>
           {activeCoachSkillId ? (
             <span className="coach-skill-badge" title="本轮实时教练使用的场景技能包">
               {COACH_SKILL_LABELS[activeCoachSkillId]}
@@ -655,7 +688,68 @@ export function NowRail({
           <p className="coach-runtime-decision" role="status">{coachRuntime.decision}</p>
         ) : null}
 
-        {formalFollowUp ? (
+        {isAnswer && suggestion ? (
+          <div
+            className={`suggestion-card answer-copilot-card suggestion-card--${suggestion.status}`}
+            data-testid="answer-copilot-card"
+            data-ui-render-card="answer"
+            data-ui-render-job-id={suggestion.jobId ?? undefined}
+          >
+            <div className="answer-copilot-field">
+              <span className="follow-up-field-label">当前问题</span>
+              <p className="answer-copilot-question">{suggestion.questionText ?? "正在确认对方的问题..."}</p>
+            </div>
+            <div className="answer-copilot-field answer-copilot-field--response">
+              <span className="follow-up-field-label">建议回答</span>
+              {suggestion.status === "rejected" ? (
+                <p className="answer-copilot-error" role="alert" title={suggestion.errorClass ?? undefined}>
+                  {answerErrorMessage(suggestion)}
+                </p>
+              ) : text ? (
+                <>
+                  <blockquote aria-live="polite">{text}</blockquote>
+                  {suggestion.errorClass ? (
+                    <p className="answer-copilot-error" role="status" title={suggestion.errorClass}>
+                      {answerErrorMessage(suggestion)}
+                    </p>
+                  ) : null}
+                </>
+              ) : suggestion.errorClass ? (
+                <p className="answer-copilot-error" role="status" title={suggestion.errorClass}>
+                  {answerErrorMessage(suggestion)}
+                </p>
+              ) : (
+                <p className="answer-copilot-loading" role="status">正在生成可直接说出口的回答...</p>
+              )}
+            </div>
+            {deepAnswerFollowUp ? (
+              <div className="answer-copilot-field answer-copilot-supplement">
+                <span className="follow-up-field-label">Pi 深度补充</span>
+                <p>{deepAnswerFollowUp.sayThis ?? deepAnswerFollowUp.question}</p>
+              </div>
+            ) : null}
+            <div className="suggestion-footer">
+              <button
+                className="evidence-link"
+                type="button"
+                onClick={() => onEvidence(suggestion.evidenceSegmentId)}
+              >
+                <Quote size={13} />查看问题原话
+              </button>
+              {text ? (
+                <button
+                  className="icon-button icon-button--small"
+                  type="button"
+                  onClick={copySuggestion}
+                  title="复制回答"
+                  aria-label="复制回答"
+                >
+                  <Copy size={15} />
+                </button>
+              ) : null}
+            </div>
+          </div>
+        ) : formalFollowUp ? (
           <div
             className="follow-up-card"
             data-testid="follow-up-card"

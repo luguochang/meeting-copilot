@@ -189,7 +189,19 @@ const SPARK_CANDIDATE_FAST_SYSTEM_PROMPT = [
   "Use the first preferred event type. Do not invent facts or repeat a question. Provisional evidence allows clarification only. Match the dialogue language; Chinese dialogue needs Chinese title, recommendation, and reason.",
 ].join(" ");
 
+const DEEP_ANSWER_SYSTEM_PROMPT = [
+  "You are Talktrace's second-pass answer coach, running after a Fast Answer is already visible to the user.",
+  "Your job is not to rewrite or summarize current_answer. Add only the highest-value missing boundary, risk, evidence-backed nuance, or likely follow-up preparation. Honor user_request when present; answer_ready is an automatic second pass over the visible answer.",
+  "Submit one structured deep-coaching card with boundary, risk, and follow_up. Keep each point to one concise phrase; do not repeat current_answer in any field.",
+  "A point may contain a bounded professional inference, but uncertain project details must be phrased as a check or possible risk rather than a claim that they happened.",
+  "The host binds the card to the exact transcript paragraph behind current_answer. Never invent a person, project result, number, deadline, or user experience.",
+  "Use only an allowed_event_type. Match the dialogue language; Chinese context requires Chinese title, recommendation, and reason.",
+  "If the supplied evidence and current_answer are sufficient, call submit_intervention in the first response. Search or read history only when a missing earlier fact is necessary. Use keep_silent only when no incremental value remains.",
+  "Finish with exactly one terminal tool and never return ordinary assistant text.",
+].join(" ");
+
 function systemPromptFor(model, promptProfile, compactTerminal) {
+  if (promptProfile === "deep_answer") return DEEP_ANSWER_SYSTEM_PROMPT;
   if (promptProfile !== "candidate_fast") return SYSTEM_PROMPT;
   if (compactTerminal && /codex-spark/i.test(String(model?.id || ""))) {
     return SPARK_CANDIDATE_FAST_SYSTEM_PROMPT;
@@ -292,6 +304,27 @@ const compactInterventionParameters = Type.Object(
   { additionalProperties: false },
 );
 
+// Deep coaching is a second-pass product surface, not a realtime interruption.
+// Give it one unambiguous contract instead of asking the provider to choose
+// between legacy aliases (recommendation/say_this and reason/why_now). The
+// host composes the three bounded points into the existing audited card shape.
+const deepInterventionParameters = Type.Object(
+  {
+    title: Type.String({ minLength: 1, maxLength: 80 }),
+    boundary: Type.String({ minLength: 1, maxLength: 160 }),
+    risk: Type.String({ minLength: 1, maxLength: 160 }),
+    follow_up: Type.String({ minLength: 1, maxLength: 160 }),
+    why_now: Type.String({ minLength: 1, maxLength: 300 }),
+    urgency: Type.Union([
+      Type.Literal("low"),
+      Type.Literal("medium"),
+      Type.Literal("high"),
+    ]),
+    confidence: Type.Number({ minimum: 0, maximum: 1 }),
+  },
+  { additionalProperties: false },
+);
+
 const silentParameters = Type.Object(
   {
     reason: Type.Optional(Type.String({ minLength: 1, maxLength: 160 })),
@@ -329,17 +362,20 @@ function optionalText(value, maximum) {
   return normalized;
 }
 
-function normalizeInterventionCardFields(intervention, { allowAliasMismatch = false } = {}) {
+function normalizeInterventionCardFields(
+  intervention,
+  { allowAliasMismatch = false, maximumRecommendation = 120 } = {},
+) {
   if (!intervention || typeof intervention !== "object" || Array.isArray(intervention)) {
     throw new PiCoachProtocolError(
       "intervention must be an object",
       "invalid_agent_action",
     );
   }
-  const legacySayThis = optionalText(intervention.recommendation, 120);
+  const legacySayThis = optionalText(intervention.recommendation, maximumRecommendation);
   const canonicalSayThis = optionalText(
     intervention.say_this ?? intervention.sayThis,
-    120,
+    maximumRecommendation,
   );
   if (legacySayThis && canonicalSayThis && legacySayThis !== canonicalSayThis && !allowAliasMismatch) {
     throw new PiCoachProtocolError(
@@ -383,6 +419,63 @@ function normalizeInterventionCardFields(intervention, { allowAliasMismatch = fa
     say_this: recommendation,
     reason,
     why_now: reason,
+  };
+}
+
+function boundedDeepPoint(value, field) {
+  const normalized = requiredText(value, field, 500)
+    .replace(
+      /^(?:(?:补充)?(?:架构|回答|适用)?边界|(?:关键|主要|核心)?风险|(?:面试官)?(?:最)?可能追问|追问)\s*[：:]\s*/u,
+      "",
+    )
+    .split(/(?<=[。！？!?；;])\s*/u)[0]
+    .trim();
+  if (!normalized) {
+    throw new PiCoachProtocolError(`${field} must contain a useful point`, "invalid_agent_action");
+  }
+  return normalized.slice(0, 120).replace(/[，,：:]$/u, "");
+}
+
+function deepAnswerEvidence(context) {
+  const currentAnswer = context?.rolling_state?.current_answer;
+  const answerEvidenceId = typeof currentAnswer?.evidence_segment_id === "string"
+    ? currentAnswer.evidence_segment_id.trim()
+    : "";
+  const paragraphs = [
+    ...context.new_paragraphs,
+    ...context.context_paragraphs,
+    ...context.candidate_evidence_paragraphs,
+    ...context.retrieval_paragraphs,
+  ];
+  const paragraph = paragraphs.find((item) => item.id === answerEvidenceId);
+  if (!answerEvidenceId || !paragraph?.text?.trim()) {
+    throw new PiCoachProtocolError(
+      "deep answer is missing its host-bound evidence paragraph",
+      "invalid_request",
+    );
+  }
+  return {
+    evidence_segment_ids: [answerEvidenceId],
+    evidence_quote: paragraph.text.trim().slice(0, 1000),
+  };
+}
+
+function deepInterventionToCard(params, context) {
+  const boundary = boundedDeepPoint(params?.boundary, "intervention.boundary");
+  const risk = boundedDeepPoint(params?.risk, "intervention.risk");
+  const followUp = boundedDeepPoint(params?.follow_up, "intervention.follow_up");
+  const recommendation = `边界：${boundary}\n风险：${risk}\n追问：${followUp}`;
+  const evidence = deepAnswerEvidence(context);
+  return {
+    event_type: "question_to_user",
+    title: params?.title,
+    recommendation,
+    say_this: recommendation,
+    reason: params?.why_now,
+    why_now: params?.why_now,
+    ...evidence,
+    urgency: params?.urgency,
+    confidence: params?.confidence,
   };
 }
 
@@ -554,7 +647,7 @@ function validateContext(value) {
   const triggerType = value.trigger_type === undefined || value.trigger_type === null
     ? "delta"
     : requiredText(value.trigger_type, "context.trigger_type", 40).toLowerCase();
-  if (!["delta", "transcript_delta", "task_due", "user_request"].includes(triggerType)) {
+  if (!["delta", "transcript_delta", "task_due", "user_request", "answer_ready"].includes(triggerType)) {
     throw new PiCoachProtocolError("context.trigger_type is unsupported", "invalid_request");
   }
   const workItemId = optionalText(value.work_item_id, 240);
@@ -565,6 +658,9 @@ function validateContext(value) {
   }
   if (triggerType === "task_due" && workItemId === null) {
     throw new PiCoachProtocolError("task_due requires context.work_item_id", "invalid_request");
+  }
+  if (triggerType === "answer_ready" && workItemId === null) {
+    throw new PiCoachProtocolError("answer_ready requires context.work_item_id", "invalid_request");
   }
   if (triggerType === "user_request" && userRequest === null) {
     throw new PiCoachProtocolError("user_request requires context.user_request", "invalid_request");
@@ -912,8 +1008,12 @@ function readTranscriptSpan(segmentId, paragraphs, before = 1, after = 1) {
   return ordered.slice(Math.max(0, index - before), index + after + 1);
 }
 
-function validateInterventionEvidence(intervention, context) {
-  intervention = normalizeInterventionCardFields(intervention);
+function validateInterventionEvidence(
+  intervention,
+  context,
+  { maximumRecommendation = 120 } = {},
+) {
+  intervention = normalizeInterventionCardFields(intervention, { maximumRecommendation });
   if (!EVENT_TYPES.has(intervention.event_type)
     || !allowedEventTypes(context).has(intervention.event_type)
     || !URGENCIES.has(intervention.urgency)) {
@@ -1350,6 +1450,13 @@ function contextSignals(context) {
     if (state[key] !== undefined) compactState[key] = state[key];
   }
   if (openItems.length > 0) compactState.open_items = openItems;
+  if (state.current_answer && typeof state.current_answer === "object") {
+    compactState.current_answer = {
+      question: String(state.current_answer.question || "").slice(0, 1000),
+      answer: String(state.current_answer.answer || "").slice(0, 2000),
+      status: String(state.current_answer.status || "").slice(0, 40),
+    };
+  }
   return {
     trigger_type: context.trigger_type,
     work_item_id: context.work_item_id,
@@ -1461,7 +1568,12 @@ function toolErrorCode(result) {
 
 function createRestrictedTools(
   entry,
-  { includeContextRead = true, includeHistorySearch = true, compactTerminal = false } = {},
+  {
+    includeContextRead = true,
+    includeHistorySearch = true,
+    compactTerminal = false,
+    deepTerminal = false,
+  } = {},
 ) {
   const tools = [
     {
@@ -1572,10 +1684,16 @@ function createRestrictedTools(
     {
       name: "submit_intervention",
       label: "Submit intervention",
-      description: compactTerminal
-        ? "Submit one grounded intervention and stop."
-        : "Submit one evidence-grounded intervention that is still useful right now, then stop.",
-      parameters: compactTerminal ? compactInterventionParameters : interventionParameters,
+      description: deepTerminal
+        ? "Submit one structured, evidence-grounded deep coaching supplement and stop."
+        : compactTerminal
+          ? "Submit one grounded intervention and stop."
+          : "Submit one evidence-grounded intervention that is still useful right now, then stop.",
+      parameters: deepTerminal
+        ? deepInterventionParameters
+        : compactTerminal
+          ? compactInterventionParameters
+          : interventionParameters,
       executionMode: "sequential",
       execute: async (_toolCallId, params) => {
         const run = activeRunOrThrow(entry);
@@ -1583,10 +1701,14 @@ function createRestrictedTools(
         if (!run.checklistReviewed) {
           throw new PiCoachProtocolError("host coaching checklist must be complete", "checklist_not_reviewed");
         }
-        const candidateParams = compactTerminal
-          ? compactInterventionFromCandidate(params, context)
-          : params;
-        const intervention = validateInterventionEvidence(candidateParams, context);
+        const candidateParams = deepTerminal
+          ? deepInterventionToCard(params, context)
+          : compactTerminal
+            ? compactInterventionFromCandidate(params, context)
+            : params;
+        const intervention = validateInterventionEvidence(candidateParams, context, {
+          maximumRecommendation: deepTerminal ? 480 : 120,
+        });
         setTerminalAction(entry, { action: "intervention", intervention });
         return {
           content: [{ type: "text", text: "Intervention accepted." }],
@@ -1723,7 +1845,37 @@ function buildSparkCandidatePrompt(context) {
   });
 }
 
+function buildDeepAnswerPrompt(context) {
+  const signals = contextSignals(context);
+  const paragraphsById = new Map();
+  for (const paragraph of [
+    ...context.retrieval_paragraphs,
+    ...context.context_paragraphs,
+    ...context.candidate_evidence_paragraphs,
+    ...context.new_paragraphs,
+  ]) {
+    paragraphsById.set(paragraph.id, compactPromptParagraph(paragraph));
+  }
+  return JSON.stringify({
+    task: "deepen_current_answer",
+    output_language: outputLanguage(context),
+    host_checklist_reviewed: true,
+    user_request: context.user_request,
+    current_answer: signals.rolling_state.current_answer ?? null,
+    recent_evidence_paragraphs: [...paragraphsById.values()].slice(-8),
+    meeting_goal: context.meeting_goal,
+    open_items: signals.rolling_state.open_items ?? [],
+    skill: {
+      id: context.coach_skill.id,
+      objective: context.coach_skill.objective,
+      allowed_event_types: [...allowedEventTypes(context)].filter(Boolean).sort(),
+    },
+    instruction: "Do not repeat current_answer. Submit one incremental boundary, risk, missing point, or likely follow-up preparation. The host owns evidence binding; search older evidence only when necessary.",
+  });
+}
+
 function buildPrompt(context, promptProfile = "full", model = null) {
+  if (promptProfile === "deep_answer") return buildDeepAnswerPrompt(context);
   if (promptProfile === "candidate_fast") {
     return /codex-spark/i.test(String(model?.id || ""))
       ? buildSparkCandidatePrompt(context)
@@ -1779,6 +1931,7 @@ function createSessionEntry(
   wallClock,
   { promptProfile = "full", includeHistorySearch = true, compactTerminal = false } = {},
 ) {
+  const deepTerminal = promptProfile === "deep_answer";
   const entry = {
     sessionId,
     backendIdentity: backend.identity,
@@ -1793,6 +1946,7 @@ function createSessionEntry(
     includeContextRead: promptProfile === "full",
     includeHistorySearch: promptProfile === "full" || includeHistorySearch,
     compactTerminal,
+    deepTerminal,
   });
   entry.agent = new Agent({
     initialState: {
@@ -1951,7 +2105,16 @@ export class PiCoachRuntime {
     const request = validateEvaluationRequest(rawRequest);
     const backend = this.backendFactory(request.provider);
     let entry = this.sessions.get(request.session_id);
-    const promptProfile = usesCandidateFastPath(request.context) ? "candidate_fast" : "full";
+    const hasCurrentAnswer = Boolean(
+      request.context.rolling_state?.current_answer
+      && typeof request.context.rolling_state.current_answer === "object"
+      && String(request.context.rolling_state.current_answer.answer || "").trim(),
+    );
+    const promptProfile = request.context.priority_mode === "deep" && hasCurrentAnswer
+      ? "deep_answer"
+      : usesCandidateFastPath(request.context)
+        ? "candidate_fast"
+        : "full";
     // A host evidence channel being available does not mean every realtime
     // candidate needs the full retrieval tool schema. Candidate events already
     // carry bounded, validated evidence in the compact fast path; exposing
@@ -1961,8 +2124,10 @@ export class PiCoachRuntime {
     // need prior-history lookup.
     const hostEvidenceAvailable = typeof searchEvidence === "function"
       || typeof readEvidenceSpan === "function";
-    const needsHistorySearch = promptProfile !== "candidate_fast"
-      || candidateFastPathNeedsHistorySearch(request.context, hostEvidenceAvailable);
+    const needsHistorySearch = promptProfile === "full"
+      || (promptProfile === "deep_answer" && request.context.trigger_type === "user_request")
+      || (promptProfile === "candidate_fast"
+        && candidateFastPathNeedsHistorySearch(request.context, hostEvidenceAvailable));
     // A history-search candidate may need model-selected prior evidence, so it
     // retains the full terminal schema. The compact contract is only safe when
     // the host can reconstruct all evidence from the bounded candidate.
@@ -2015,6 +2180,7 @@ export class PiCoachRuntime {
       includeContextRead: promptProfile === "full",
       includeHistorySearch: promptProfile === "full" || entry.historySearchEnabled,
       compactTerminal,
+      deepTerminal: promptProfile === "deep_answer",
     });
     entry.activeContext = request.context;
     entry.run = {

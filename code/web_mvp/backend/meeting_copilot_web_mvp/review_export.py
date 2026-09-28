@@ -20,7 +20,15 @@ def user_final_content(payload: Mapping[str, Any], kind: str) -> tuple[bool, Any
     if not isinstance(document, Mapping):
         return False, None
     final = document.get("user_final")
-    if not isinstance(final, Mapping) or final.get("content") is None:
+    # The persistence layer creates an unmodified user-final snapshot when an
+    # AI document is first generated.  That snapshot is not an intentional
+    # user edit and must not freeze exports at an older transcript/minutes
+    # revision after a later correction or regeneration succeeds.
+    if (
+        not isinstance(final, Mapping)
+        or final.get("content") is None
+        or not bool(final.get("modified"))
+    ):
         return False, None
     return True, final.get("content")
 

@@ -204,6 +204,26 @@ def test_trigger_contract_allows_due_or_user_request_without_fake_delta() -> Non
     assert prompt["trigger_type"] == "user_request"
     assert prompt["user_request"] == "发布前还缺哪些条件？"
 
+    answer_ready = RealtimeIntelligenceRequest.from_payload(
+        meeting_id="meeting-answer-ready",
+        state_revision=11,
+        trigger_type="answer_ready",
+        work_item_id="answer:job-1",
+        new_paragraphs=[],
+        context_paragraphs=[_paragraph("question-1", "为什么选择 Redis Stream？")],
+        rolling_state={
+            "current_answer": {
+                "answer_id": "answer:job-1",
+                "question": "为什么选择 Redis Stream？",
+                "answer": "因为当前规模可控。",
+                "status": "committed",
+            }
+        },
+    )
+    assert answer_ready.trigger_type == "answer_ready"
+    assert answer_ready.work_item_id == "answer:job-1"
+    assert answer_ready.new_paragraphs == ()
+
     transcript_delta = RealtimeIntelligenceRequest.from_payload(
         meeting_id="meeting-transcript-delta",
         state_revision=11,
@@ -220,6 +240,7 @@ def test_trigger_contract_allows_due_or_user_request_without_fake_delta() -> Non
     [
         ({}, "delta new_paragraphs"),
         ({"trigger_type": "task_due"}, "task_due requires work_item_id"),
+        ({"trigger_type": "answer_ready"}, "answer_ready requires work_item_id"),
         (
             {"trigger_type": "task_due", "work_item_id": "decision-1"},
             "requires persisted evidence context",
@@ -1646,6 +1667,28 @@ def test_coach_prompt_is_focused_on_timely_action_instead_of_summary() -> None:
     assert "不要为了显得有帮助" in messages[0]["content"]
 
 
+def test_coach_prompt_receives_fast_answer_as_non_destructive_context() -> None:
+    request = replace(
+        _coach_request(),
+        rolling_state={
+            "current_answer": {
+                "question": "为什么选择 Redis Stream？",
+                "answer": "我们优先复用了现有 Redis 基础设施。",
+                "status": "committed",
+                "error_class": None,
+            },
+            "version": 4,
+        },
+    )
+
+    messages = build_realtime_coach_messages(request)
+    payload = json.loads(messages[1]["content"])
+
+    assert payload["rolling_state"]["current_answer"]["answer"].startswith("我们优先复用")
+    assert "不要重复或清空" in messages[0]["content"]
+    assert "遗漏、边界、风险或可能追问" in messages[0]["content"]
+
+
 def test_coach_prompt_loads_the_selected_scene_skill() -> None:
     request = replace(_coach_request(), coach_skill_id="interview")
 
@@ -1721,6 +1764,98 @@ def test_coach_parser_builds_an_evidence_bound_private_intervention() -> None:
     assert response.follow_up is not None
     assert response.follow_up.coach_event_type == "commitment_risk"
     assert response.follow_up.question == intervention.recommendation
+
+
+def test_coach_parser_allows_a_structured_deep_answer_card_over_120_characters() -> None:
+    recommendation = "\n".join(
+        (
+            "边界：可以进一步说明适用范围、退出条件和演进判断。",
+            "风险：可以补充异常路径、恢复策略和需要提前核实的假设。",
+            "追问：还可以准备对方案取舍、验证方法和后续演进的回答。" * 3,
+        )
+    )
+    assert 120 < len(recommendation) < 480
+    deep_request = replace(
+        _coach_request(),
+        trigger_type="user_request",
+        user_request="补充当前回答遗漏的边界、风险和可能追问。",
+        rolling_state={
+            "current_answer": {
+                "question": "你能承诺周五一定上线吗？",
+                "answer": "需要先完成压测，再确认上线日期。",
+                "status": "committed",
+            }
+        },
+    )
+    payload = {
+        "intervention": {
+            "event_type": "question_to_user",
+            "title": "补充回答边界",
+            "recommendation": recommendation,
+            "reason": "当前回答还可以补充适用范围和需要核实的条件。",
+            "evidence_segment_ids": ["local-3", "remote-4"],
+            "evidence_quote": "压测还没有完成。\n你能承诺周五一定上线吗？",
+            "urgency": "medium",
+            "confidence": 0.88,
+        }
+    }
+
+    intervention = parse_realtime_coach_response(
+        json.dumps(payload, ensure_ascii=False),
+        request=deep_request,
+    )
+
+    assert intervention is not None
+    assert intervention.recommendation == recommendation
+    with pytest.raises(IntelligenceResponseValidationError, match="exceeds 120"):
+        parse_realtime_coach_response(
+            json.dumps(payload, ensure_ascii=False),
+            request=_coach_request(),
+        )
+
+
+def test_answer_ready_deep_card_can_ground_technical_terms_in_committed_answer() -> None:
+    deep_request = replace(
+        _coach_request(),
+        trigger_type="answer_ready",
+        work_item_id="answer:job-1",
+        rolling_state={
+            "current_answer": {
+                "answer_id": "answer:job-1",
+                "question": "为什么选择 Redis Stream 而不是 Kafka？",
+                "answer": (
+                    "Redis Stream 适合当前规模；高吞吐、长期留存和消费堆积需要监控，"
+                    "达到边界时重新评估 Kafka，并说明何时演进。"
+                ),
+                "status": "committed",
+            }
+        },
+    )
+    payload = {
+        "intervention": {
+            "event_type": "question_to_user",
+            "title": "补充 Redis Stream 选型边界",
+            "recommendation": (
+                "边界：高吞吐和长期留存场景应重新评估 Kafka。\n"
+                "风险：Redis Stream 消费堆积需要监控。\n"
+                "追问：何时从 Redis Stream 演进到 Kafka？"
+            ),
+            "reason": "当前回答需要补充消费堆积和演进边界。",
+            "evidence_segment_ids": ["local-3", "remote-4"],
+            "evidence_quote": "压测还没有完成。\n你能承诺周五一定上线吗？",
+            "urgency": "medium",
+            "confidence": 0.9,
+        }
+    }
+
+    intervention = parse_realtime_coach_response(
+        json.dumps(payload, ensure_ascii=False),
+        request=deep_request,
+    )
+
+    assert intervention is not None
+    assert "Redis Stream" in intervention.recommendation
+    assert "Kafka" in intervention.recommendation
 
 
 def test_coach_parser_rejects_a_quote_not_present_in_evidence() -> None:

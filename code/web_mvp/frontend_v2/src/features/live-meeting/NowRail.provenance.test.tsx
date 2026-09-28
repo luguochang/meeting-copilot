@@ -2,7 +2,7 @@ import { act, render, screen } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { parseMeetingSnapshot } from "../../api/schema";
 import { createInitialMeetingState, meetingReducer } from "../../domain/reducer";
-import type { FollowUpProjection } from "../../domain/events";
+import type { FollowUpProjection, Suggestion } from "../../domain/events";
 import { NowRail } from "./NowRail";
 
 function formalAi(segmentId = "segment-1") {
@@ -59,6 +59,111 @@ function renderRail(nextFollowUp: FollowUpProjection | null) {
   };
   return render(<NowRail {...props} />);
 }
+
+it("keeps the current streamed answer primary while Pi remains a supplement", () => {
+  const answer: Suggestion = {
+    suggestionId: "answer-1",
+    meetingId: "meeting-1",
+    jobId: "answer-job-1",
+    generationId: "answer-generation-1",
+    kind: "answer",
+    questionText: "为什么选择 Redis Stream，而不是 Kafka？",
+    evidenceSegmentId: "segment-1",
+    evidenceTranscriptSeq: 3,
+    evidenceHash: "hash-1",
+    stateRevision: 1,
+    status: "draft",
+    draftText: "我们当时更看重现有 Redis 的复用和较低的运维成本。",
+    draftSeq: 1,
+    text: null,
+    finalDraftSeq: null,
+    feedback: null,
+    createdAtMs: 100,
+    updatedAtMs: 110,
+    committedAtMs: null,
+  };
+
+  render(
+    <NowRail
+      currentTopic={null}
+      followUp={followUp({
+        origin: "pi",
+        status: "intervention",
+        promptProfile: "deep_answer",
+        answerId: "answer-1",
+        sayThis: "准备说明消息不丢失的保障，以及迁移 Kafka 的触发条件。",
+      })}
+      coachHistory={[]}
+      openQuestions={[]}
+      suggestions={[answer]}
+      decisionCandidates={[]}
+      actionItems={[]}
+      risks={[]}
+      onEvidence={vi.fn()}
+      onFeedback={vi.fn(async () => undefined)}
+      onFactStatus={vi.fn(async () => undefined)}
+      onMessage={vi.fn()}
+    />,
+  );
+
+  const card = screen.getByTestId("answer-copilot-card");
+  expect(card).toHaveTextContent("为什么选择 Redis Stream，而不是 Kafka？");
+  expect(card).toHaveTextContent("我们当时更看重现有 Redis 的复用");
+  expect(card).toHaveTextContent("Pi 深度补充");
+  expect(card).toHaveTextContent("迁移 Kafka 的触发条件");
+  expect(screen.queryByTestId("follow-up-card")).toBeNull();
+  expect(screen.getByRole("button", { name: "复制回答" })).toBeVisible();
+});
+
+it("never labels an unrelated realtime Pi intervention as a deep answer supplement", () => {
+  const answer: Suggestion = {
+    suggestionId: "answer-1",
+    meetingId: "meeting-1",
+    jobId: "answer-job-1",
+    generationId: "answer-generation-1",
+    kind: "answer",
+    questionText: "为什么选择 Redis Stream？",
+    evidenceSegmentId: "segment-1",
+    evidenceTranscriptSeq: 3,
+    evidenceHash: "hash-1",
+    stateRevision: 1,
+    status: "committed",
+    draftText: "",
+    draftSeq: 1,
+    text: "因为当前规模可控且可以复用现有 Redis 运维体系。",
+    finalDraftSeq: 1,
+    feedback: null,
+    createdAtMs: 100,
+    updatedAtMs: 110,
+    committedAtMs: 110,
+  };
+
+  render(
+    <NowRail
+      currentTopic={null}
+      followUp={followUp({
+        origin: "pi",
+        status: "intervention",
+        promptProfile: "candidate_fast",
+        sayThis: "你说的是观澜湖新城吗？",
+      })}
+      coachHistory={[]}
+      openQuestions={[]}
+      suggestions={[answer]}
+      decisionCandidates={[]}
+      actionItems={[]}
+      risks={[]}
+      onEvidence={vi.fn()}
+      onFeedback={vi.fn(async () => undefined)}
+      onFactStatus={vi.fn(async () => undefined)}
+      onMessage={vi.fn()}
+    />,
+  );
+
+  const card = screen.getByTestId("answer-copilot-card");
+  expect(card).not.toHaveTextContent("Pi 深度补充");
+  expect(card).not.toHaveTextContent("观澜湖");
+});
 
 it("shows the provenance badge on a current Pi intervention", () => {
   renderRail(followUp({

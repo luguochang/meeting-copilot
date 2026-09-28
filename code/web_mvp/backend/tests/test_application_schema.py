@@ -98,6 +98,7 @@ def test_fresh_database_bootstraps_legacy_and_v2_schema(tmp_path: Path) -> None:
         (9, "add_intelligence_trigger_contract"),
             (10, "add_intelligence_input_coverage"),
             (11, "add_durable_pi_work_items"),
+            (12, "add_realtime_answer_copilot_fields"),
     ]
 
 
@@ -146,9 +147,10 @@ def test_existing_legacy_v1_database_is_backed_up_and_upgraded_without_data_loss
                     (7, "add_realtime_intelligence_timing_chain"),
                     (8, "add_realtime_provider_circuit_state"),
                     (9, "add_intelligence_trigger_contract"),
-                        (10, "add_intelligence_input_coverage"),
-                        (11, "add_durable_pi_work_items"),
-            ]
+                            (10, "add_intelligence_input_coverage"),
+                            (11, "add_durable_pi_work_items"),
+                            (12, "add_realtime_answer_copilot_fields"),
+                ]
 
 
 def test_failed_v2_migration_rolls_back_v1_database_and_retains_verified_backup(

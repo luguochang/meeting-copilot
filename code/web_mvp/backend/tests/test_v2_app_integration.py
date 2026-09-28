@@ -283,6 +283,33 @@ def test_pending_realtime_work_defers_correction_before_provider_call(
     app.state.v2_persistence.close()
 
 
+def test_pending_fast_answer_and_pi_both_defer_live_correction(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_GATEWAY_MODEL", "gpt-5.5")
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    meeting_id = "provider-priority-fast-answer"
+    event = _final_event(text="Redis Stream 和 Kafka 应该怎么选？")
+    event["source_track"] = "system_audio"
+    committed = app.state.commit_v2_final(meeting_id, event)
+    correction_job = dict(
+        app.state.v2_persistence.get_job(committed["job_ids"]["correction"])
+    )
+
+    with pytest.raises(app_module.CorrectionProviderPriorityDeferred) as deferred:
+        app.state.v2_correction_job_handler_impl(correction_job)
+
+    assert set(deferred.value.blocking_job_ids) == {
+        committed["job_ids"]["answer"],
+        committed["job_ids"]["intelligence"],
+    }
+    assert deferred.value.preserve_attempt is True
+    app.state.v2_persistence.close()
+
+
 def test_meeting_end_correction_bypasses_realtime_priority_gate(
     tmp_path,
     monkeypatch,
@@ -367,6 +394,67 @@ def test_running_realtime_work_defers_correction_before_provider_call(
 
     assert deferred.value.blocking_job_ids == (intelligence_id,)
     assert deferred.value.preserve_attempt is True
+    app.state.v2_persistence.close()
+
+
+def test_aged_live_correction_is_not_starved_by_continuous_realtime_work(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
+    monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_GATEWAY_MODEL", "gpt-5.5")
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    meeting_id = "provider-priority-fairness"
+    event = _final_event(text="Redis Stream 和 Kafka 应该怎么选？")
+    event["source_track"] = "system_audio"
+    committed = app.state.commit_v2_final(meeting_id, event)
+    correction_job = dict(app.state.v2_persistence.get_job(committed["job_ids"]["correction"]))
+    correction_job["created_at_ms"] = (
+        int(time.time() * 1_000)
+        - app_module.REALTIME_CORRECTION_MAX_PRIORITY_WAIT_MS
+        - 1
+    )
+    app.state.asr_live_repository.create(
+        {
+            "session_id": meeting_id,
+            "source": "live_asr_stream",
+            "trace_kind": "live_event",
+            "provider": "funasr_realtime",
+            "provider_mode": "real",
+            "is_mock": False,
+            "input_source": "browser_live_mic",
+            "ingest_mode": "live_asr_stream",
+            "asr_fallback_used": False,
+            "degradation_reasons": [],
+            "events": [
+                {
+                    "event_type": "transcript_final",
+                    "payload": {
+                        "segment_id": "segment-1",
+                        "text": "Redis Stream 和 Kafka 应该怎么选？",
+                        "normalized_text": "Redis Stream 和 Kafka 应该怎么选？",
+                    },
+                }
+            ],
+        }
+    )
+    provider_calls: list[str] = []
+
+    def correction_provider_call(raw, config, *, raise_on_failure=False):
+        provider_calls.append(config.model)
+        return raw, {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}, False
+
+    monkeypatch.setattr(
+        app_module.asr_correct,
+        "correct_transcript",
+        correction_provider_call,
+    )
+
+    result = app.state.v2_correction_job_handler_impl(correction_job)
+
+    assert result["called"] is True
+    assert provider_calls == ["gpt-5.5"]
     app.state.v2_persistence.close()
 
 
@@ -1831,7 +1919,7 @@ def test_app_lifecycle_runs_durable_jobs_without_browser_trigger(tmp_path):
             assert trace["execution"]["required_stage_completeness"]["missing_stages"] == []
 
 
-def test_correction_budget_rates_missing_is_terminal_and_not_retryable(
+def test_correction_rates_missing_keeps_user_enabled_provider_path_available(
     tmp_path,
     monkeypatch,
 ):
@@ -1842,35 +1930,61 @@ def test_correction_budget_rates_missing_is_terminal_and_not_retryable(
     monkeypatch.delenv("LLM_PROMPT_CNY_PER_1M_TOKENS", raising=False)
     monkeypatch.delenv("LLM_COMPLETION_CNY_PER_1M_TOKENS", raising=False)
     app = create_app(data_dir=tmp_path)
-    committed = app.state.commit_v2_final("meeting-rates-missing", _final_event())
+    meeting_id = "meeting-rates-missing"
+    committed = app.state.commit_v2_final(meeting_id, _final_event())
+    app.state.asr_live_repository.create(
+        {
+            "session_id": meeting_id,
+            "source": "live_asr_stream",
+            "trace_kind": "live_event",
+            "provider": "funasr_realtime",
+            "provider_mode": "real",
+            "is_mock": False,
+            "input_source": "browser_live_mic",
+            "ingest_mode": "live_asr_stream",
+            "asr_fallback_used": False,
+            "degradation_reasons": [],
+            "events": [],
+        }
+    )
     persistence = app.state.v2_persistence
     provider_calls: list[object] = []
-    app.state.run_asr_live_session_realtime_corrections_once = (
-        lambda *_args, **_kwargs: provider_calls.append(object())
-    )
+
+    async def provider_path(*_args, **_kwargs):
+        provider_calls.append(object())
+        return {
+            "called": False,
+            "gate": {"eligible": False, "reason": "no_unrevised_final"},
+            "status": {},
+            "revision_count": 0,
+            "transcript_revisions": [],
+            "no_revision_segment_ids": [],
+        }
+
+    app.state.run_asr_live_session_realtime_corrections_once_async = provider_path
     app.state.v2_suggestion_job_handler_impl = lambda _job: {"generated_card_count": 0}
 
     with TestClient(app):
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
             terminal = persistence.get_job(committed["job_ids"]["correction"])
-            if terminal["status"] == "failed":
+            if terminal["status"] == "succeeded":
                 break
             time.sleep(0.01)
         else:
             raise AssertionError(f"correction job did not become terminal: {terminal}")
-        assert terminal["status"] == "failed"
+        assert terminal["status"] == "succeeded"
         assert terminal["attempts"] == 1
-        assert terminal["error_class"] == "correction_provider_rates_not_configured"
+        assert terminal["error_class"] is None
         assert terminal["max_attempts"] == 3
         assert committed["job_ids"]["correction"] == terminal["id"]
-        assert provider_calls == []
+        assert len(provider_calls) == 1
         quality = app.state.wait_for_v2_correction_jobs("meeting-rates-missing", timeout_seconds=0.1)
-        assert quality["correction_degraded"] is True
-        assert quality["reason"] == "correction_provider_rates_not_configured"
+        assert quality["correction_degraded"] is False
+        assert quality["reason"] is None
 
 
-def test_durable_correction_zero_rate_matches_run_once_fail_closed_policy(
+def test_durable_correction_explicit_zero_rate_fails_before_provider(
     tmp_path,
     monkeypatch,
 ):
@@ -1881,17 +1995,43 @@ def test_durable_correction_zero_rate_matches_run_once_fail_closed_policy(
     monkeypatch.setenv("LLM_PROMPT_CNY_PER_1M_TOKENS", "0")
     monkeypatch.setenv("LLM_COMPLETION_CNY_PER_1M_TOKENS", "1")
     app = create_app(data_dir=tmp_path)
-    committed = app.state.commit_v2_final("meeting-rates-zero", _final_event())
-    provider_calls: list[object] = []
-    app.state.run_asr_live_session_realtime_corrections_once = (
-        lambda *_args, **_kwargs: provider_calls.append(object())
+    meeting_id = "meeting-rates-zero"
+    committed = app.state.commit_v2_final(meeting_id, _final_event())
+    app.state.asr_live_repository.create(
+        {
+            "session_id": meeting_id,
+            "source": "live_asr_stream",
+            "trace_kind": "live_event",
+            "provider": "funasr_realtime",
+            "provider_mode": "real",
+            "is_mock": False,
+            "input_source": "browser_live_mic",
+            "ingest_mode": "live_asr_stream",
+            "asr_fallback_used": False,
+            "degradation_reasons": [],
+            "events": [],
+        }
     )
+    provider_calls: list[object] = []
+
+    def provider_path(*_args, **_kwargs):
+        provider_calls.append(object())
+        return {
+            "called": False,
+            "gate": {"eligible": False, "reason": "no_unrevised_final"},
+            "status": {},
+            "revision_count": 0,
+            "transcript_revisions": [],
+            "no_revision_segment_ids": [],
+        }
+
+    app.state.run_asr_live_session_realtime_corrections_once = provider_path
     job = app.state.v2_persistence.get_job(committed["job_ids"]["correction"])
 
-    with pytest.raises(app_module.CorrectionProviderTerminalDegraded) as degraded:
+    with pytest.raises(app_module.CorrectionProviderTerminalDegraded) as blocked:
         app.state.v2_correction_job_handler_impl(job)
 
-    assert degraded.value.durable_error_class == "correction_provider_rates_not_configured"
+    assert str(blocked.value) == "correction_provider_rates_not_configured"
     assert provider_calls == []
     app.state.v2_persistence.close()
 

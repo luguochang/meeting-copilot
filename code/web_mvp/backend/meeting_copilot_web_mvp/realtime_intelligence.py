@@ -46,7 +46,9 @@ _STATE_KINDS = frozenset({"decision", "action_item", "risk", "open_question"})
 _STATE_OPERATIONS = frozenset({"add", "update", "resolve", "noop"})
 _TOPIC_OPERATIONS = frozenset({"add", "update", "noop"})
 _URGENCY_VALUES = frozenset({"low", "medium", "high"})
-_ROLLING_STATE_KEYS = frozenset({"topic", "open_items", "summary", "version"})
+_ROLLING_STATE_KEYS = frozenset(
+    {"topic", "open_items", "summary", "version", "current_answer"}
+)
 _SOURCE_TRACKS = frozenset({"microphone", "system_audio", "unknown"})
 _ROLE_HINTS = frozenset({"self_or_room", "remote_mix", "unknown"})
 _SEMANTIC_WINDOW_STATUSES = frozenset({"active", "stable"})
@@ -54,7 +56,9 @@ _ASR_CORRECTION_STATUSES = frozenset(
     {"unknown", "pending", "processing", "no_change", "changed", "failed_preserved_original"}
 )
 _COACH_EVENT_TYPES = BASE_COACH_EVENT_TYPES | SCENE_COACH_EVENT_TYPES
-_TRIGGER_TYPES = frozenset({"delta", "transcript_delta", "task_due", "user_request"})
+_TRIGGER_TYPES = frozenset(
+    {"delta", "transcript_delta", "task_due", "user_request", "answer_ready"}
+)
 
 _COACH_MATERIAL_FACT_TERMS = frozenset(
     {
@@ -434,7 +438,7 @@ class RealtimeIntelligenceRequest:
         ).casefold()
         if normalized_trigger_type not in _TRIGGER_TYPES:
             raise ValueError(
-                "trigger_type must be delta, transcript_delta, task_due, or user_request"
+                "trigger_type must be delta, transcript_delta, task_due, user_request, or answer_ready"
             )
         normalized_work_item_id = _optional_text(work_item_id, maximum=240)
         normalized_user_request = _optional_text(user_request, maximum=2_000)
@@ -446,6 +450,8 @@ class RealtimeIntelligenceRequest:
             raise ValueError(f"delta new_paragraphs must contain 1 to {MAX_NEW_PARAGRAPHS} items")
         if normalized_trigger_type == "task_due" and normalized_work_item_id is None:
             raise ValueError("task_due requires work_item_id")
+        if normalized_trigger_type == "answer_ready" and normalized_work_item_id is None:
+            raise ValueError("answer_ready requires work_item_id")
         if normalized_trigger_type == "user_request" and normalized_user_request is None:
             raise ValueError("user_request trigger requires user_request")
         if not isinstance(context_paragraphs, Sequence) or isinstance(context_paragraphs, (str, bytes)):
@@ -699,7 +705,7 @@ def build_realtime_intelligence_messages(
             "不得用关键词匹配、常识补全或猜测生成决定、待办、风险、问题或追问；没有充分证据时返回空数组或 null。",
             "source_track 是采集来源；system_audio/remote_mix 通常是电脑中对方的混音，microphone/self_or_room 可能是用户本人也可能是同处一室的人，归因必须保守。",
             "semantic_windows 是从原始段落派生的理解窗口，只用于理解上下文；所有证据 ID 仍必须从 new_paragraphs 或 context_paragraphs 的 id 中复制。",
-            "trigger_type=delta 表示新转写增量；task_due 表示持久事项到期复核；user_request 表示用户主动请求。",
+            "trigger_type=delta 表示新转写增量；task_due 表示持久事项到期复核；user_request 表示用户主动请求；answer_ready 表示快速回答已经可见，只需做第二阶段补强。",
             "task_due 没有新段落时只能基于持久事项和旧证据复核状态，不得假造进展或默认生成新的强提醒。",
             "user_request 必须直接回应 user_request 的授权范围；需要更多证据时只能引用输入或受控检索返回的原文。",
             revision_rule,
@@ -2071,7 +2077,7 @@ def should_run_realtime_coach(
     # A user-request trigger is an explicit coaching command and may contain
     # no fresh transcript. It must not be forced through the lexical delta
     # gate, otherwise the production route silently drops valid requests.
-    if request.trigger_type in {"user_request", "task_due"}:
+    if request.trigger_type in {"user_request", "task_due", "answer_ready"}:
         return True
     source_tracks = {item.source_track for item in request.new_paragraphs}
     if str(requested_runtime or "direct").strip().lower() == "pi":
@@ -2100,6 +2106,7 @@ def build_realtime_coach_messages(
             "correction_status 为 pending、processing 或 failed_preserved_original 时，原话仍是待核实证据；只能建议澄清，不得据此断言负责人、期限、数字、完成状态或技术名词。",
             "但 communication_clarity 可以直接使用持续的 microphone/self_or_room 原话判断当前可听见的表达模式；建议只针对表达本身，不推断说话者身份，也不能仅因身份未确认而保持静默。",
             "candidate_evidence_paragraphs 只包含当前候选引用的极少量较早原话；引用时仍必须复制其 id 和逐字原文。",
+            "rolling_state.current_answer 是快速回答通道已经展示给用户的内容；不要重复或清空它，只在有证据时补充遗漏、边界、风险或可能追问。",
             "对 communication_clarity 而言，听众抓不住核心观点或错过及时收束结论属于具体损失，只要此刻能用一句下一步表达修正，就具有介入价值。",
             "没有高价值、可执行且仍来得及的介入时 intervention 必须是 null。不要为了显得有帮助而生成提示。",
             "不得猜测说话人身份、公司信息、数字、期限、关键技术名词或用户立场；title、reason 和 recommendation 中的实质事实都必须逐字来自 evidence_quote，不能借用同一引用段落里未逐字引用的其他内容。",
@@ -2183,13 +2190,23 @@ def parse_realtime_coach_response(
     urgency = _required_response_text(item.get("urgency"), "intervention.urgency", maximum=20)
     if urgency not in _URGENCY_VALUES:
         raise IntelligenceResponseValidationError("intervention.urgency is unsupported")
+    current_answer = (
+        request.rolling_state.get("current_answer")
+        if isinstance(request.rolling_state, Mapping)
+        else None
+    )
+    is_deep_answer_card = (
+        request.trigger_type in {"user_request", "task_due", "answer_ready"}
+        and isinstance(current_answer, Mapping)
+        and bool(str(current_answer.get("answer") or "").strip())
+    )
     recommendation = _response_alias_text(
         item,
         primary_key="recommendation",
         alias_keys=("say_this", "sayThis"),
         field="intervention.recommendation",
         alias_field="intervention.say_this",
-        maximum=120,
+        maximum=480 if is_deep_answer_card else 120,
     )
     if len(recommendation) < 8:
         raise IntelligenceResponseValidationError("intervention.recommendation is too short")
@@ -2483,7 +2500,7 @@ async def run_realtime_coach_via_pi(
     decision_reason = str(result.get("decision_reason") or "")[:160] or None
     allowed_evidence_ids = (
         request.writable_paragraph_ids
-        if request.trigger_type not in {"user_request", "task_due"}
+        if request.trigger_type not in {"user_request", "task_due", "answer_ready"}
         else frozenset(request.paragraphs_by_id)
     )
     if intervention is not None and set(intervention.evidence_segment_ids).isdisjoint(allowed_evidence_ids):
@@ -3322,12 +3339,30 @@ def _validate_coach_claim_grounding(
     # which facts the card may repeat.  Otherwise a model can cite an innocuous
     # fragment and silently borrow an owner, deadline, number, polarity, or term
     # from somewhere else in the same (potentially noisy) ASR paragraph.
-    evidence_numbers = _number_claim_tokens(evidence_quote)
-    evidence_times = _claim_tokens(_COACH_TIME_RE, evidence_quote)
-    evidence_owners = _owner_assignment_values(evidence_quote)
-    evidence_polarities = _state_polarities(evidence_quote)
-    evidence_terms = _material_fact_terms(evidence_quote)
-    evidence_products = _glossary_claim_terms(evidence_quote, request=request)
+    grounding_text = evidence_quote
+    current_answer = (
+        request.rolling_state.get("current_answer")
+        if isinstance(request.rolling_state, Mapping)
+        else None
+    )
+    if (
+        request.trigger_type in {"answer_ready", "user_request", "task_due"}
+        and isinstance(current_answer, Mapping)
+        and str(current_answer.get("answer") or "").strip()
+    ):
+        # A deep card supplements the committed Fast Answer, so its technical
+        # terms may be grounded in that visible answer as well as raw ASR. The
+        # verbatim quote and segment IDs remain bound to meeting evidence.
+        grounding_text = "\n".join(
+            (evidence_quote, str(current_answer["answer"]).strip())
+        )
+
+    evidence_numbers = _number_claim_tokens(grounding_text)
+    evidence_times = _claim_tokens(_COACH_TIME_RE, grounding_text)
+    evidence_owners = _owner_assignment_values(grounding_text)
+    evidence_polarities = _state_polarities(grounding_text)
+    evidence_terms = _material_fact_terms(grounding_text)
+    evidence_products = _glossary_claim_terms(grounding_text, request=request)
 
     violations: set[str] = set()
     for value in (title, recommendation, reason):

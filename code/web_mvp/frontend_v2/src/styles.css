@@ -1948,6 +1948,58 @@ button:focus-visible,
   border-left-color: #d28a25;
 }
 
+.answer-copilot-card {
+  display: grid;
+  gap: 12px;
+  border-left-color: #2563a6;
+}
+
+.answer-copilot-field {
+  min-width: 0;
+}
+
+.answer-copilot-field--response {
+  padding-top: 11px;
+  border-top: 1px solid var(--border);
+}
+
+.answer-copilot-question {
+  margin: 5px 0 0;
+  overflow-wrap: anywhere;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.55;
+}
+
+.answer-copilot-loading,
+.answer-copilot-error,
+.answer-copilot-supplement p {
+  margin: 6px 0 0;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.answer-copilot-loading {
+  color: var(--text-tertiary);
+}
+
+.answer-copilot-error {
+  color: var(--danger);
+}
+
+.answer-copilot-supplement {
+  padding: 9px 10px;
+  background: #f4f8f6;
+  border: 1px solid #d6e5dc;
+  border-radius: 5px;
+}
+
+.answer-copilot-supplement p {
+  color: var(--text-secondary);
+}
+
 .follow-up-card {
   margin-top: 12px;
   padding: 15px;

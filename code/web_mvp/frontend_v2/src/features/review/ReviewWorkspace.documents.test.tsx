@@ -335,6 +335,36 @@ describe("ReviewWorkspace document editing", () => {
 });
 
 describe("ReviewWorkspace independent retries", () => {
+  it("labels failed transcript correction as raw ASR and retries it explicitly", async () => {
+    const user = userEvent.setup();
+    const state = endedState();
+    state.segments = [{
+      ...transcriptSegment(),
+      correctionStatus: "failed_preserved_original",
+      correctionErrorClass: "correction_provider_rates_not_configured",
+    }];
+    const onRetryTranscriptCorrection = vi.fn().mockResolvedValue(undefined);
+    const onReloadTranscript = vi.fn();
+    const onRefresh = vi.fn().mockResolvedValue(undefined);
+
+    render(<ReviewWorkspace {...workspaceProps(state, {
+      onRetryTranscriptCorrection,
+      onReloadTranscript,
+      onRefresh,
+    })} />);
+
+    expect(screen.getByRole("alert")).toHaveTextContent("当前文字是原始 ASR");
+    expect(screen.getByRole("alert")).toHaveTextContent("Provider 未配置价格费率");
+    expect(screen.getByRole("button", { name: "重试 AI 校对" })).toBeEnabled();
+    await user.click(screen.getByRole("tab", { name: "会议文字" }));
+    expect(screen.getByText("原始 ASR（校对失败）")).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: "重试 AI 校对" }));
+    expect(onRetryTranscriptCorrection).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(onRefresh).toHaveBeenCalledTimes(1));
+    expect(onReloadTranscript).toHaveBeenCalledTimes(1);
+  });
+
   it.each([
     ["minutes", "会议纪要"],
     ["approach", "分析建议"],

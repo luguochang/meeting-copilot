@@ -57,12 +57,14 @@ class _ScriptedProvider:
         failure: BaseException | None = None,
         before_return: Callable[[], None] | None = None,
         content: str | None = None,
+        expected_max_tokens: int = 128,
     ) -> None:
         self.clock = clock
         self.deltas = list(deltas)
         self.failure = failure
         self.before_return = before_return
         self.content = content
+        self.expected_max_tokens = expected_max_tokens
         self.calls: list[dict[str, Any]] = []
 
     async def complete(
@@ -74,7 +76,7 @@ class _ScriptedProvider:
     ) -> ChatCompletionResult:
         assert messages
         self.calls.append(dict(parameters))
-        assert parameters["max_completion_tokens"] == 128
+        assert parameters["max_completion_tokens"] == self.expected_max_tokens
         emitted: list[str] = []
         for delay, text in self.deltas:
             self.clock.advance(delay)
@@ -138,6 +140,68 @@ def _claimed_suggestion_job(persistence: V2Persistence) -> dict[str, Any]:
 
 def _messages() -> list[dict[str, str]]:
     return [{"role": "user", "content": "给出一条现在最值得追问的建议"}]
+
+
+def test_answer_job_streams_and_commits_answer_metadata(tmp_path) -> None:
+    async def scenario() -> None:
+        persistence = V2Persistence(
+            tmp_path / "answer.db",
+            semantic_projection_mode="llm_first",
+        )
+        committed = persistence.commit_final_and_enqueue(
+            meeting_id="meeting-answer",
+            final_id="final-answer",
+            segment_id="segment-answer",
+            text="为什么选择 Redis Stream，而不是 Kafka？",
+            normalized_text="为什么选择 Redis Stream，而不是 Kafka？",
+            started_at_ms=100,
+            ended_at_ms=900,
+            evidence_hash="hash-answer",
+            now_ms=1_000,
+            source_track="system_audio",
+        )
+        job = persistence.claim_next_job(
+            worker_id="answer-worker",
+            lane="answer",
+            now_ms=1_100,
+            lease_ms=60_000,
+        )
+        assert job is not None
+        assert job["id"] == committed["job_ids"]["answer"]
+        clock = _Clock()
+        provider = _ScriptedProvider(
+            clock=clock,
+            deltas=[(0.0, "我们优先考虑现有 Redis 复用，"), (0.05, "并保留迁移 Kafka 的边界。")],
+            expected_max_tokens=420,
+        )
+        try:
+            output = await generate_streaming_suggestion(
+                job=job,
+                messages=_messages(),
+                provider=provider,
+                persistence=persistence,
+                question_text="为什么选择 Redis Stream，而不是 Kafka？",
+                runtime="openai_compatible_streaming",
+                provider_name="gateway",
+                model="fast-model",
+                max_characters=1_200,
+                completion_parameters={"max_completion_tokens": 420},
+                monotonic=clock,
+                now_ms=_NowMs(),
+            )
+            answer = output["suggestion"]
+            assert answer["kind"] == "answer"
+            assert answer["question_text"] == "为什么选择 Redis Stream，而不是 Kafka？"
+            assert answer["status"] == "committed"
+            assert answer["provider"] == "gateway"
+            assert answer["model"] == "fast-model"
+            assert answer["ttft_ms"] == 80
+            assert answer["completed_ms"] == 200
+            assert answer["text"].startswith("我们优先考虑")
+        finally:
+            persistence.close()
+
+    asyncio.run(scenario())
 
 
 def test_realtime_suggestion_prompt_is_single_sourced_and_evidence_bound() -> None:

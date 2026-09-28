@@ -188,6 +188,77 @@ describe("meetingReducer", () => {
     });
   });
 
+  it("accepts answer lane events without Pi formal provenance and keeps availability errors", () => {
+    const initial = createInitialMeetingState("meeting-1");
+    const started = meetingReducer(initial, {
+      type: "events.received",
+      receivedAtMs: 100,
+      events: [event({
+        seq: 2,
+        type: "suggestion.draft.started",
+        aggregateType: "suggestion",
+        aggregateId: "answer-1",
+        correlationId: "answer-generation-1",
+        causationId: "answer-job-1",
+        payload: {
+          suggestion_id: "answer-1",
+          meeting_id: "meeting-1",
+          job_id: "answer-job-1",
+          generation_id: "answer-generation-1",
+          kind: "answer",
+          question_text: "为什么选择 Redis Stream？",
+          evidence_segment_id: "segment-1",
+          evidence_transcript_seq: 1,
+          evidence_hash: "hash-1",
+          state_revision: 1,
+          status: "draft",
+          draft_text: "",
+          draft_seq: 0,
+          created_at_ms: 90,
+          updated_at_ms: 90,
+        },
+      })],
+    });
+    const unavailable = meetingReducer(started, {
+      type: "events.received",
+      receivedAtMs: 110,
+      events: [event({
+        seq: 3,
+        type: "suggestion.draft.delta",
+        aggregateType: "suggestion",
+        aggregateId: "answer-1",
+        correlationId: "answer-generation-1",
+        causationId: "answer-job-1",
+        payload: {
+          suggestion_id: "answer-1",
+          meeting_id: "meeting-1",
+          job_id: "answer-job-1",
+          generation_id: "answer-generation-1",
+          kind: "answer",
+          question_text: "为什么选择 Redis Stream？",
+          evidence_segment_id: "segment-1",
+          evidence_transcript_seq: 1,
+          evidence_hash: "hash-1",
+          state_revision: 1,
+          status: "draft",
+          draft_text: "",
+          draft_seq: 1,
+          error_class: "provider_not_configured",
+          created_at_ms: 90,
+          updated_at_ms: 105,
+        },
+      })],
+    });
+
+    expect(unavailable.suggestions).toHaveLength(1);
+    expect(unavailable.suggestions[0]).toMatchObject({
+      kind: "answer",
+      questionText: "为什么选择 Redis Stream？",
+      errorClass: "provider_not_configured",
+      draftSeq: 1,
+    });
+  });
+
   it("keeps terminal content sealed while accepting persisted feedback", () => {
     const committed = suggestion({
       status: "committed",
@@ -528,7 +599,7 @@ describe("meetingReducer", () => {
     expect(current.coachHistory).toHaveLength(0);
   });
 
-  it("moves prior coach advice into history when a later Pi loop stays silent", () => {
+  it("keeps prior coach advice visible when a later Pi loop stays silent", () => {
     const advised = meetingReducer(createInitialMeetingState("meeting-1"), {
       type: "events.received",
       events: [event({
@@ -579,23 +650,79 @@ describe("meetingReducer", () => {
       receivedAtMs: 3_000,
     });
 
-    expect(silent.followUp).toBeNull();
+    expect(silent.followUp).toMatchObject({
+      decisionId: "coach-decision-2",
+      question: "先确认回滚负责人。",
+    });
     expect(silent.coachHistory).toHaveLength(1);
     expect(silent.coachHistory[0]).toMatchObject({
       decisionId: "coach-decision-2",
       question: "先确认回滚负责人。",
     });
-    expect(silent.coachDecision).toMatchObject({
-      decisionId: "coach-decision-3",
-      status: "protected_silent",
-      lifecycleAction: "deprioritize",
-      agentMetrics: {
-        decisionLatencyMs: 1_250,
-        bridgeProcessReused: true,
-        toolErrors: [{ tool: "submit_intervention", code: "evidence_quote_not_verbatim" }],
-      },
+    expect(silent.coachDecision).toBeNull();
+  });
+
+  it("clears an answer-scoped Pi supplement when a newer answer starts", () => {
+    const advised = meetingReducer(createInitialMeetingState("meeting-1"), {
+      type: "events.received",
+      events: [event({
+        seq: 2,
+        type: "meeting.intelligence.applied",
+        payload: {
+          ...formalAiPayload("segment-2"),
+          coach_intervention: {
+            question: "边界：补充退出条件。",
+            reason: "当前回答缺少边界。",
+            evidence_segment_ids: ["segment-2"],
+            evidence_quote: "退出条件",
+            urgency: "medium",
+            coach_event_type: "question_to_user",
+          },
+          coach_decision: {
+            origin: "pi",
+            status: "intervention",
+            decision_id: "coach-deep-2",
+            lifecycle_action: "retain",
+            prompt_profile: "deep_answer",
+            answer_id: "answer:job-2",
+          },
+        },
+      })],
+      receivedAtMs: 2_000,
     });
-    expect(silent.coachDecision?.agentMetrics).not.toHaveProperty("providerResponse");
+    const nextAnswer = meetingReducer(advised, {
+      type: "events.received",
+      events: [event({
+        seq: 3,
+        type: "suggestion.draft.started",
+        aggregateId: "answer:job-3",
+        payload: {
+          suggestion: {
+            suggestion_id: "answer:job-3",
+            meeting_id: "meeting-1",
+            job_id: "job-3",
+            generation_id: "generation-3",
+            kind: "answer",
+            question_text: "下一个问题是什么？",
+            evidence_segment_id: "segment-3",
+            evidence_transcript_seq: 3,
+            evidence_hash: "hash-3",
+            state_revision: 3,
+            status: "draft",
+            draft_text: "",
+            draft_seq: 0,
+            created_at_ms: 3_000,
+            updated_at_ms: 3_000,
+          },
+        },
+      })],
+      receivedAtMs: 3_000,
+    });
+
+    expect(advised.followUp?.answerId).toBe("answer:job-2");
+    expect(nextAnswer.followUp).toBeNull();
+    expect(nextAnswer.coachDecision).toBeNull();
+    expect(nextAnswer.coachHistory).toHaveLength(1);
   });
 
   it("retracts the current coach card without deleting the prior intervention history", () => {

@@ -242,6 +242,126 @@ def test_deep_executor_claims_explicit_jobs_without_claiming_realtime_delta(llm_
     assert realtime_claim["trigger_type"] in {"delta", "transcript_delta"}
 
 
+def test_microphone_final_only_enqueues_answer_when_explicitly_enabled(llm_persistence):
+    ordinary = llm_persistence.commit_final_and_enqueue(
+        meeting_id="meeting-microphone-default",
+        final_id="final-default",
+        segment_id="segment-default",
+        text="你们为什么选择 Redis Stream？",
+        normalized_text="你们为什么选择 Redis Stream？",
+        started_at_ms=100,
+        ended_at_ms=900,
+        evidence_hash="hash-default",
+        now_ms=1_000,
+        source_track="microphone",
+    )
+    browser_single_track = llm_persistence.commit_final_and_enqueue(
+        meeting_id="meeting-microphone-mixed",
+        final_id="final-mixed",
+        segment_id="segment-mixed",
+        text="你们为什么选择 Redis Stream？",
+        normalized_text="你们为什么选择 Redis Stream？",
+        started_at_ms=100,
+        ended_at_ms=900,
+        evidence_hash="hash-mixed",
+        now_ms=1_100,
+        source_track="microphone",
+        enqueue_answer=True,
+    )
+
+    assert "answer" not in ordinary["job_ids"]
+    assert browser_single_track["job_ids"]["answer"]
+    assert llm_persistence.get_job(browser_single_track["job_ids"]["answer"])[
+        "kind"
+    ] == "answer"
+
+
+def test_answer_ready_job_is_idempotent_and_owned_by_deep_lane(llm_persistence):
+    committed = llm_persistence.commit_final_and_enqueue(
+        meeting_id="meeting-answer-ready",
+        final_id="final-answer-ready",
+        segment_id="segment-answer-ready",
+        text="你们为什么选择 Redis Stream？",
+        normalized_text="你们为什么选择 Redis Stream？",
+        started_at_ms=100,
+        ended_at_ms=900,
+        evidence_hash="hash-answer-ready",
+        now_ms=1_000,
+        source_track="system_audio",
+    )
+    realtime = llm_persistence.claim_next_job(
+        worker_id="realtime-before-answer-ready",
+        lane="intelligence",
+        now_ms=3_001,
+        lease_ms=10_000,
+    )
+    assert realtime is not None
+    llm_persistence.complete_job(
+        job_id=realtime["id"],
+        worker_id="realtime-before-answer-ready",
+        now_ms=3_002,
+        output={"coach": {"status": "not_triggered"}},
+    )
+
+    answer_id = "answer:ready-1"
+    generation_id = str(
+        llm_persistence.get_job(committed["job_ids"]["answer"])["generation_id"]
+    )
+    llm_persistence.upsert_suggestion_draft(
+        suggestion_id=answer_id,
+        meeting_id="meeting-answer-ready",
+        job_id=committed["job_ids"]["answer"],
+        generation_id=generation_id,
+        evidence_segment_id="segment-answer-ready",
+        evidence_transcript_seq=1,
+        evidence_hash="hash-answer-ready",
+        state_revision=1,
+        draft_text="因为当前规模可控，且可以复用现有 Redis 基础设施。",
+        draft_seq=1,
+        now_ms=3_100,
+        kind="answer",
+        question_text="你们为什么选择 Redis Stream？",
+    )
+    assert llm_persistence.commit_suggestion(
+        suggestion_id=answer_id,
+        generation_id=generation_id,
+        expected_evidence_hash="hash-answer-ready",
+        final_draft_seq=1,
+        text="因为当前规模可控，且可以复用现有 Redis 基础设施。",
+        now_ms=3_200,
+    ) is not None
+
+    first = llm_persistence.enqueue_answer_coach_request(
+        meeting_id="meeting-answer-ready",
+        answer_id=answer_id,
+        now_ms=3_300,
+    )
+    replay = llm_persistence.enqueue_answer_coach_request(
+        meeting_id="meeting-answer-ready",
+        answer_id=answer_id,
+        now_ms=3_400,
+    )
+
+    assert replay["id"] == first["id"]
+    assert first["trigger_type"] == "answer_ready"
+    assert first["work_item_id"] == answer_id
+    assert llm_persistence.claim_next_job(
+        worker_id="ordinary-intelligence-worker",
+        lane="intelligence",
+        now_ms=3_500,
+        lease_ms=10_000,
+    ) is None
+    deep = llm_persistence.claim_next_job(
+        worker_id="answer-ready-deep-worker",
+        lane="pi_deep",
+        now_ms=3_500,
+        lease_ms=10_000,
+    )
+    assert deep is not None
+    assert deep["id"] == first["id"]
+    assert deep["trigger_type"] == "answer_ready"
+
+
 def test_input_coverage_records_pending_and_source_duplicate_excluded(llm_persistence):
     llm_persistence.commit_final_and_enqueue(
         meeting_id="meeting-1",
@@ -271,6 +391,76 @@ def test_input_coverage_records_pending_and_source_duplicate_excluded(llm_persis
     coverage = llm_persistence.list_intelligence_input_coverage("meeting-1")
     assert [item["status"] for item in coverage] == ["pending", "excluded"]
     assert coverage[1]["failure_reason"] == "source_duplicate"
+
+
+def test_new_answer_question_supersedes_older_retrying_answer(llm_persistence):
+    first = llm_persistence.commit_final_and_enqueue(
+        meeting_id="meeting-answer-supersede",
+        final_id="final-1",
+        segment_id="segment-1",
+        text="为什么选择 Redis Stream？",
+        normalized_text="为什么选择 Redis Stream？",
+        started_at_ms=100,
+        ended_at_ms=900,
+        evidence_hash="hash-1",
+        now_ms=1_000,
+        source_track="system_audio",
+    )
+    claimed = llm_persistence.claim_next_job(
+        worker_id="answer-worker",
+        lane="answer",
+        now_ms=1_100,
+        lease_ms=60_000,
+    )
+    assert claimed is not None
+    llm_persistence.upsert_suggestion_draft(
+        suggestion_id="answer-draft-1",
+        meeting_id="meeting-answer-supersede",
+        job_id=claimed["id"],
+        generation_id=claimed["generation_id"],
+        evidence_segment_id=claimed["evidence_segment_id"],
+        evidence_transcript_seq=claimed["input_transcript_seq"],
+        evidence_hash=claimed["evidence_hash"],
+        state_revision=claimed["input_version"],
+        draft_text="旧问题的部分回答",
+        draft_seq=1,
+        now_ms=1_200,
+        kind="answer",
+        question_text="为什么选择 Redis Stream？",
+        lease_owner="answer-worker",
+    )
+    llm_persistence.defer_job(
+        job_id=claimed["id"],
+        worker_id="answer-worker",
+        now_ms=1_300,
+        next_attempt_at_ms=5_000,
+        error_class="timeout",
+    )
+    second = llm_persistence.commit_final_and_enqueue(
+        meeting_id="meeting-answer-supersede",
+        final_id="final-2",
+        segment_id="segment-2",
+        text="那怎么保证消息不会丢失？",
+        normalized_text="那怎么保证消息不会丢失？",
+        started_at_ms=1_000,
+        ended_at_ms=1_800,
+        evidence_hash="hash-2",
+        now_ms=2_000,
+        source_track="system_audio",
+    )
+
+    superseded = llm_persistence.supersede_queued_answer_jobs(
+        meeting_id="meeting-answer-supersede",
+        replacement_job_id=second["job_ids"]["answer"],
+        now_ms=2_100,
+    )
+
+    assert superseded == 1
+    assert llm_persistence.get_job(first["job_ids"]["answer"])["status"] == "cancelled"
+    assert llm_persistence.get_job(second["job_ids"]["answer"])["status"] == "pending"
+    answer = llm_persistence.get_suggestion("answer-draft-1")
+    assert answer is not None
+    assert answer["status"] == "superseded"
 
 
 def test_input_coverage_lifecycle_is_explicit(llm_persistence):
@@ -1178,6 +1368,37 @@ def test_coach_decisions_form_an_append_only_supersession_chain(tmp_path):
         )
         assert first["coach_decision"]["supersedes_decision_id"] is None
 
+        failed_commit = persistence.commit_final_and_enqueue(
+            meeting_id="meeting-1",
+            final_id="coach-failed-final",
+            segment_id="coach-failed-segment",
+            text="模型本轮没有返回可用建议。",
+            normalized_text="模型本轮没有返回可用建议。",
+            started_at_ms=2_000,
+            ended_at_ms=2_900,
+            evidence_hash="coach-failed-hash",
+            now_ms=3_000,
+        )
+        failed = persistence.apply_intelligence_response(
+            meeting_id="meeting-1",
+            job_id=failed_commit["job_ids"]["intelligence"],
+            response={
+                "paragraph_revisions": [],
+                "topic_update": None,
+                "state_changes": [],
+                "follow_up": None,
+                "coach_intervention": None,
+                "coach_decision": {
+                    "decision_id": "coach-decision-failed",
+                    "status": "failed",
+                    "decision_reason": "Provider response validation failed.",
+                    "lifecycle_action": "deprioritize",
+                },
+            },
+            now_ms=3_500,
+        )
+        assert failed["coach_decision"]["supersedes_decision_id"] is None
+
         second_commit = persistence.commit_final_and_enqueue(
             meeting_id="meeting-1",
             final_id="coach-second-final",
@@ -1216,7 +1437,8 @@ def test_coach_decisions_form_an_append_only_supersession_chain(tmp_path):
             if event["type"] == "meeting.intelligence.applied"
         ]
         assert applied_events[0]["payload"]["coach_decision"]["superseded_by"] is None
-        assert applied_events[1]["payload"]["coach_decision"]["supersedes_decision_id"] == (
+        assert applied_events[1]["payload"]["coach_decision"]["supersedes_decision_id"] is None
+        assert applied_events[2]["payload"]["coach_decision"]["supersedes_decision_id"] == (
             "coach-decision-1"
         )
     finally:
@@ -4575,6 +4797,49 @@ def test_meeting_end_enqueues_one_replacement_after_terminal_correction_failure(
     assert persistence.get_job(committed["job_ids"]["correction"])["status"] == "failed"
     assert len(active) == 1
     assert active[0]["idempotency_key"].endswith("meeting.ended")
+
+
+def test_manual_transcript_correction_retry_preserves_raw_text_and_history(persistence):
+    committed = _commit_final(
+        persistence,
+        text="原始识别文字保留用于审计。",
+        now_ms=1_000,
+    )
+    claimed = persistence.claim_next_job(
+        worker_id="correction-worker",
+        lane="correction",
+        now_ms=1_100,
+        lease_ms=5_000,
+    )
+    assert claimed is not None
+    failed = persistence.fail_job(
+        job_id=claimed["id"],
+        worker_id="correction-worker",
+        now_ms=1_200,
+        error_class="ProviderTimeout",
+    )
+    assert failed is not None
+
+    retry = persistence.enqueue_transcript_correction_retry(
+        meeting_id="meeting-1",
+        now_ms=2_000,
+    )
+
+    assert retry["created"] is True
+    assert retry["reason"] == "queued"
+    assert retry["segment_count"] == 1
+    assert retry["jobs"][0]["id"] != committed["job_ids"]["correction"]
+    assert persistence.get_snapshot("meeting-1")["segments"][0]["normalized_text"] == "原始识别文字保留用于审计。"
+    assert persistence.get_snapshot("meeting-1")["segments"][0]["correction_status"] == "pending"
+    assert len(persistence.list_jobs(meeting_id="meeting-1", lane="correction")) == 2
+    assert persistence.list_events("meeting-1")[-1]["type"] == "meeting.transcript_correction.retry_requested"
+
+    in_flight = persistence.enqueue_transcript_correction_retry(
+        meeting_id="meeting-1",
+        now_ms=2_100,
+    )
+    assert in_flight["created"] is False
+    assert in_flight["reason"] == "in_flight"
 
 
 def test_meeting_end_cancels_pending_realtime_intelligence_without_consuming_attempts(tmp_path):

@@ -11,10 +11,11 @@ import re
 import sqlite3
 from threading import RLock
 import time
-from typing import Any, Callable, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping, Sequence
 import unicodedata
 
 from .application_schema import bootstrap_application_schema, fallback_meeting_title
+from .coach_lifecycle import coach_decision_replaces_prior_intervention
 from .meeting_state_extractor import extract_meeting_state
 from .audio_assets import audio_chunk_journal_sha256
 from .storage_governance import (
@@ -3585,6 +3586,7 @@ class V2Persistence:
         max_attempts: int = 3,
         enqueue_jobs: bool = True,
         source_track: str | None = None,
+        enqueue_answer: bool | None = None,
     ) -> dict[str, Any]:
         """Commit one final and its derived jobs as a single durable unit."""
 
@@ -3600,6 +3602,11 @@ class V2Persistence:
             speaker_id=normalized_speaker_id,
         )
         normalized_source_track = _validated_transcript_source_track(source_track)
+        should_enqueue_answer = (
+            normalized_source_track == "system_audio"
+            if enqueue_answer is None
+            else bool(enqueue_answer)
+        )
         now_ms = max(0, int(now_ms))
         max_attempts = int(max_attempts)
         if max_attempts <= 0:
@@ -3608,7 +3615,9 @@ class V2Persistence:
         event_id = _stable_id("evt", meeting_id, f"transcript.final:{final_id}")
         correction_job_id = _stable_id("job", meeting_id, final_id, "correction")
         suggestion_job_id = _stable_id("job", meeting_id, final_id, "suggestion")
+        answer_job_id = _stable_id("job", meeting_id, final_id, "answer")
         generation_id = f"suggestion:{meeting_id}:{final_id}"
+        answer_generation_id = f"answer:{meeting_id}:{final_id}"
         intelligence_job_id: str | None = None
 
         with self._write_transaction():
@@ -3892,6 +3901,16 @@ class V2Persistence:
                             paragraph_revision,
                         )
                     )
+                    if should_enqueue_answer:
+                        job_specs.append(
+                            (
+                                "answer",
+                                answer_job_id,
+                                140,
+                                answer_generation_id,
+                                transcript_seq,
+                            )
+                        )
                     # Keep realtime intelligence ahead of live correction in
                     # the durable metadata as well as at handler admission.
                     # The executor currently claims lanes independently, so
@@ -4001,7 +4020,15 @@ class V2Persistence:
             "source_duplicate_similarity": source_duplicate_similarity,
             "job_ids": (
                 (
-                    {"correction": correction_job_id, "intelligence": intelligence_job_id}
+                    {
+                        "correction": correction_job_id,
+                        "intelligence": intelligence_job_id,
+                        **(
+                            {"answer": answer_job_id}
+                            if should_enqueue_answer
+                            else {}
+                        ),
+                    }
                     if self.semantic_projection_mode == "llm_first" and intelligence_job_id is not None
                     else {"correction": correction_job_id, "suggestion": suggestion_job_id}
                 )
@@ -4086,6 +4113,90 @@ class V2Persistence:
                     job_id,
                     int(latest["transcript_seq"]),
                     user_request,
+                    idempotency_key,
+                    now_ms,
+                    deadline_at_ms,
+                    now_ms,
+                    now_ms,
+                    now_ms,
+                ),
+            )
+            row = self._conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            return self._job_dict(row)
+
+    def enqueue_answer_coach_request(
+        self,
+        *,
+        meeting_id: str,
+        answer_id: str,
+        now_ms: int,
+    ) -> dict[str, Any]:
+        """Queue Pi's automatic second pass after a Fast Answer is committed."""
+
+        meeting_id = _required(meeting_id, "meeting_id")
+        answer_id = _required(answer_id, "answer_id")
+        now_ms = max(0, int(now_ms))
+        if self.semantic_projection_mode != "llm_first":
+            raise ValueError("answer coaching requires llm_first semantic projection")
+        with self._write_transaction():
+            meeting = self._conn.execute(
+                "SELECT state FROM meetings WHERE id = ?", (meeting_id,)
+            ).fetchone()
+            if meeting is None:
+                raise KeyError(f"meeting not found: {meeting_id}")
+            if str(meeting["state"]) != "live":
+                raise ValueError("meeting is not live")
+            answer = self._conn.execute(
+                "SELECT * FROM suggestions WHERE meeting_id = ? AND suggestion_id = ? "
+                "AND kind = 'answer' AND status = 'committed'",
+                (meeting_id, answer_id),
+            ).fetchone()
+            if answer is None:
+                raise ValueError("committed answer not found")
+            segment = self._conn.execute(
+                "SELECT * FROM transcript_segments WHERE meeting_id = ? AND segment_id = ? "
+                "AND duplicate_of_segment_id IS NULL",
+                (meeting_id, answer["evidence_segment_id"]),
+            ).fetchone()
+            if segment is None:
+                raise ValueError("answer evidence segment not found")
+            paragraph = self._conn.execute(
+                "SELECT paragraph.revision FROM semantic_paragraph_checkpoints mapping "
+                "JOIN semantic_paragraphs paragraph ON paragraph.meeting_id = mapping.meeting_id "
+                "AND paragraph.paragraph_id = mapping.paragraph_id "
+                "WHERE mapping.meeting_id = ? AND mapping.checkpoint_id = ?",
+                (meeting_id, segment["segment_id"]),
+            ).fetchone()
+            if paragraph is None:
+                raise ValueError("answer evidence has no semantic paragraph")
+            idempotency_key = f"intelligence:answer_ready:{answer_id}"
+            existing = self._conn.execute(
+                "SELECT * FROM jobs WHERE meeting_id = ? AND kind = 'intelligence' "
+                "AND idempotency_key = ? LIMIT 1",
+                (meeting_id, idempotency_key),
+            ).fetchone()
+            if existing is not None:
+                return self._job_dict(existing)
+            job_id = _stable_id("job", meeting_id, "answer_ready", answer_id)
+            deadline_at_ms = intelligence_deadline_at_ms(now_ms)
+            self._conn.execute(
+                "INSERT INTO jobs ("
+                "id, meeting_id, kind, status, priority, input_transcript_seq, input_version, "
+                "evidence_segment_id, evidence_hash, generation_id, trigger_type, work_item_id, "
+                "trigger_reference_seq, idempotency_key, attempts, max_attempts, "
+                "next_attempt_at_ms, deadline_at_ms, final_committed_at_ms, created_at_ms, updated_at_ms"
+                ") VALUES (?, ?, 'intelligence', 'pending', 125, ?, ?, ?, ?, ?, 'answer_ready', "
+                "?, ?, ?, 0, 3, ?, ?, ?, ?, ?)",
+                (
+                    job_id,
+                    meeting_id,
+                    int(segment["transcript_seq"]),
+                    int(paragraph["revision"]),
+                    str(segment["segment_id"]),
+                    str(segment["evidence_hash"]),
+                    f"answer-ready:{answer_id}",
+                    answer_id,
+                    int(segment["transcript_seq"]),
                     idempotency_key,
                     now_ms,
                     deadline_at_ms,
@@ -4286,10 +4397,15 @@ class V2Persistence:
             )
             if lane == "pi_deep":
                 kind = "intelligence"
-                trigger_filter = "AND trigger_type IN ('task_due', 'user_request')"
+                trigger_filter = (
+                    "AND trigger_type IN ('task_due', 'user_request', 'answer_ready')"
+                )
             elif lane == "intelligence":
                 kind = "intelligence"
-                trigger_filter = "AND (trigger_type IS NULL OR trigger_type NOT IN ('task_due', 'user_request'))"
+                trigger_filter = (
+                    "AND (trigger_type IS NULL OR trigger_type NOT IN "
+                    "('task_due', 'user_request', 'answer_ready'))"
+                )
             else:
                 kind = lane
                 trigger_filter = ""
@@ -4651,6 +4767,12 @@ class V2Persistence:
                 now_ms=now_ms,
                 error_class=error_class,
             )
+            if str(row["kind"]) == "answer" and error_class == "evidence_superseded":
+                self._supersede_answer_drafts_locked(
+                    job_ids=(str(row["id"]),),
+                    replacement_job_id=None,
+                    now_ms=now_ms,
+                )
         return self._job_dict(row)
 
     def retry_job(
@@ -4832,7 +4954,11 @@ class V2Persistence:
         job_row: sqlite3.Row | None,
         now_ms: int,
     ) -> None:
-        if job_row is None or job_row["kind"] != "suggestion" or job_row["status"] != "failed":
+        if (
+            job_row is None
+            or job_row["kind"] not in {"suggestion", "answer"}
+            or job_row["status"] != "failed"
+        ):
             return
         draft_rows = self._conn.execute(
             "SELECT * FROM suggestions WHERE job_id = ? AND status = 'draft' ORDER BY created_at_ms, suggestion_id",
@@ -4840,10 +4966,11 @@ class V2Persistence:
         ).fetchall()
         for draft_row in draft_rows:
             suggestion_id = str(draft_row["suggestion_id"])
+            error_class = _public_job_error_class(job_row["error_class"])
             updated = self._conn.execute(
-                "UPDATE suggestions SET status = 'rejected', updated_at_ms = ? "
+                "UPDATE suggestions SET status = 'rejected', error_class = ?, updated_at_ms = ? "
                 "WHERE suggestion_id = ? AND job_id = ? AND status = 'draft'",
-                (now_ms, suggestion_id, job_row["id"]),
+                (error_class, now_ms, suggestion_id, job_row["id"]),
             )
             if updated.rowcount != 1:
                 continue
@@ -4861,11 +4988,93 @@ class V2Persistence:
                 idempotency_key=f"suggestion.rejected:{suggestion_id}:{job_row['id']}",
                 payload={
                     **rejected,
-                    "error_class": _public_job_error_class(job_row["error_class"]),
+                    "error_class": error_class,
                 },
                 correlation_id=str(rejected_row["generation_id"]),
                 causation_id=str(job_row["id"]),
             )
+
+    def _supersede_answer_drafts_locked(
+        self,
+        *,
+        job_ids: Sequence[str],
+        replacement_job_id: str | None,
+        now_ms: int,
+    ) -> None:
+        for job_id in job_ids:
+            draft_rows = self._conn.execute(
+                "SELECT * FROM suggestions WHERE job_id = ? AND kind = 'answer' "
+                "AND status = 'draft' ORDER BY created_at_ms, suggestion_id",
+                (job_id,),
+            ).fetchall()
+            for draft_row in draft_rows:
+                suggestion_id = str(draft_row["suggestion_id"])
+                changed = self._conn.execute(
+                    "UPDATE suggestions SET status = 'superseded', updated_at_ms = ? "
+                    "WHERE suggestion_id = ? AND status = 'draft'",
+                    (now_ms, suggestion_id),
+                )
+                if changed.rowcount != 1:
+                    continue
+                updated_row = self._conn.execute(
+                    "SELECT * FROM suggestions WHERE suggestion_id = ?",
+                    (suggestion_id,),
+                ).fetchone()
+                updated = self._suggestion_dict(updated_row)
+                self._append_event_locked(
+                    meeting_id=str(updated_row["meeting_id"]),
+                    event_type="suggestion.superseded",
+                    aggregate_type="suggestion",
+                    aggregate_id=suggestion_id,
+                    occurred_at_ms=now_ms,
+                    idempotency_key=(
+                        f"suggestion.superseded:{suggestion_id}:"
+                        f"{replacement_job_id or 'newer_answer'}"
+                    ),
+                    payload={
+                        **updated,
+                        "replacement_job_id": replacement_job_id,
+                    },
+                    correlation_id=str(updated_row["generation_id"]),
+                    causation_id=replacement_job_id or job_id,
+                )
+
+    def supersede_queued_answer_jobs(
+        self,
+        *,
+        meeting_id: str,
+        replacement_job_id: str,
+        now_ms: int,
+    ) -> int:
+        """Cancel older queued answers once a newer remote question is confirmed."""
+
+        meeting_id = _required(meeting_id, "meeting_id")
+        replacement_job_id = _required(replacement_job_id, "replacement_job_id")
+        now_ms = max(0, int(now_ms))
+        with self._write_transaction():
+            rows = self._conn.execute(
+                "SELECT id FROM jobs WHERE meeting_id = ? AND kind = 'answer' "
+                "AND id != ? AND status IN ('pending', 'retry_wait') "
+                "ORDER BY created_at_ms, id",
+                (meeting_id, replacement_job_id),
+            ).fetchall()
+            job_ids = tuple(str(row["id"]) for row in rows)
+            if not job_ids:
+                return 0
+            placeholders = ",".join("?" for _ in job_ids)
+            self._conn.execute(
+                "UPDATE jobs SET status = 'cancelled', error_class = 'evidence_superseded', "
+                "completed_at_ms = ?, updated_at_ms = ? WHERE id IN ("
+                + placeholders
+                + ") AND status IN ('pending', 'retry_wait')",
+                (now_ms, now_ms, *job_ids),
+            )
+            self._supersede_answer_drafts_locked(
+                job_ids=job_ids,
+                replacement_job_id=replacement_job_id,
+                now_ms=now_ms,
+            )
+        return len(job_ids)
 
     def commit_transcript_revision(
         self,
@@ -5089,7 +5298,7 @@ class V2Persistence:
             )
         return updated
 
-    def _latest_coach_decision_locked(
+    def _latest_active_coach_intervention_decision_locked(
         self,
         meeting_id: str,
         *,
@@ -5100,13 +5309,28 @@ class V2Persistence:
             "AND type = 'meeting.intelligence.applied' ORDER BY seq DESC LIMIT 64",
             (meeting_id,),
         ).fetchall()
+        superseded_decision_ids: set[str] = set()
         for row in rows:
             payload = json.loads(row["payload_json"] or "{}")
             decision = payload.get("coach_decision") if isinstance(payload, Mapping) else None
             if not isinstance(decision, Mapping):
                 continue
+            if coach_decision_replaces_prior_intervention(payload, decision):
+                superseded_id = str(
+                    decision.get("supersedes_decision_id") or ""
+                ).strip()
+                if superseded_id:
+                    superseded_decision_ids.add(superseded_id)
             decision_id = str(decision.get("decision_id") or "").strip()
-            if decision_id and decision_id != excluding_decision_id:
+            intervention = payload.get("coach_intervention")
+            if (
+                decision_id
+                and decision_id != excluding_decision_id
+                and decision_id not in superseded_decision_ids
+                and isinstance(intervention, Mapping)
+                and str(decision.get("status") or "") == "intervention"
+                and str(decision.get("lifecycle_action") or "") == "retain"
+            ):
                 return dict(decision)
         return None
 
@@ -5740,17 +5964,39 @@ class V2Persistence:
             if coach_decision_payload is not None:
                 decision_id = str(coach_decision_payload.get("decision_id") or "").strip()
                 if decision_id:
-                    previous_decision = self._latest_coach_decision_locked(
-                        meeting_id,
-                        excluding_decision_id=decision_id,
+                    replaces_prior = coach_decision_replaces_prior_intervention(
+                        {
+                            "coach_decision": coach_decision_payload,
+                            "coach_intervention": coach_intervention_payload,
+                        },
+                        coach_decision_payload,
+                    )
+                    lifecycle_previous_id = str(
+                        coach_decision_payload.get(
+                            "lifecycle_refresh_previous_decision_id"
+                        )
+                        or ""
+                    ).strip()
+                    previous_decision = (
+                        self._latest_active_coach_intervention_decision_locked(
+                            meeting_id,
+                            excluding_decision_id=decision_id,
+                        )
+                        if replaces_prior and not lifecycle_previous_id
+                        else None
                     )
                     previous_decision_id = (
-                        str(previous_decision.get("decision_id") or "").strip()
-                        if previous_decision is not None
-                        else ""
+                        lifecycle_previous_id
+                        or (
+                            str(previous_decision.get("decision_id") or "").strip()
+                            if previous_decision is not None
+                            else ""
+                        )
                     )
                     coach_decision_payload["supersedes_decision_id"] = (
                         previous_decision_id or None
+                        if replaces_prior
+                        else None
                     )
                     coach_decision_payload.setdefault("superseded_by", None)
                     if coach_intervention_payload is not None:
@@ -5935,6 +6181,11 @@ class V2Persistence:
         draft_text: str,
         draft_seq: int,
         now_ms: int,
+        kind: str = "follow_up",
+        question_text: str | None = None,
+        runtime: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
         lease_owner: str | None = None,
     ) -> dict[str, Any]:
         suggestion_id = _required(suggestion_id, "suggestion_id")
@@ -5946,6 +6197,15 @@ class V2Persistence:
         state_revision = int(state_revision)
         draft_seq = int(draft_seq)
         now_ms = max(0, int(now_ms))
+        normalized_kind = str(kind or "follow_up").strip().lower()
+        if normalized_kind not in {"follow_up", "answer"}:
+            raise ValueError("suggestion kind must be follow_up or answer")
+        normalized_question = " ".join(str(question_text or "").split()) or None
+        if normalized_kind == "answer" and normalized_question is None:
+            raise ValueError("answer suggestion requires question_text")
+        normalized_runtime = " ".join(str(runtime or "").split()) or None
+        normalized_provider = " ".join(str(provider or "").split()) or None
+        normalized_model = " ".join(str(model or "").split()) or None
         if evidence_transcript_seq <= 0 or state_revision <= 0 or draft_seq < 0:
             raise ValueError("suggestion versions must be positive and draft_seq non-negative")
         normalized_lease_owner = str(lease_owner or "").strip() or None
@@ -5977,15 +6237,21 @@ class V2Persistence:
             if existing is None:
                 self._conn.execute(
                     "INSERT INTO suggestions ("
-                    "suggestion_id, meeting_id, job_id, generation_id, evidence_segment_id, "
+                    "suggestion_id, meeting_id, job_id, generation_id, kind, question_text, "
+                    "runtime, provider, model, evidence_segment_id, "
                     "evidence_transcript_seq, evidence_hash, state_revision, status, "
                     "draft_text, draft_seq, created_at_ms, updated_at_ms"
-                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?)",
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?)",
                     (
                         suggestion_id,
                         meeting_id,
                         job_id,
                         generation_id,
+                        normalized_kind,
+                        normalized_question,
+                        normalized_runtime,
+                        normalized_provider,
+                        normalized_model,
                         evidence_segment_id,
                         evidence_transcript_seq,
                         evidence_hash,
@@ -6002,6 +6268,8 @@ class V2Persistence:
                     "meeting_id": meeting_id,
                     "job_id": job_id,
                     "generation_id": generation_id,
+                    "kind": normalized_kind,
+                    "question_text": normalized_question,
                     "evidence_segment_id": evidence_segment_id,
                     "evidence_transcript_seq": evidence_transcript_seq,
                     "evidence_hash": evidence_hash,
@@ -6012,9 +6280,20 @@ class V2Persistence:
                     raise ValueError(f"suggestion_id {suggestion_id!r} has conflicting identity: {conflicts}")
                 if existing["status"] == "draft" and draft_seq > int(existing["draft_seq"]):
                     result = self._conn.execute(
-                        "UPDATE suggestions SET draft_text = ?, draft_seq = ?, updated_at_ms = ? "
+                        "UPDATE suggestions SET draft_text = ?, draft_seq = ?, "
+                        "runtime = COALESCE(?, runtime), provider = COALESCE(?, provider), "
+                        "model = COALESCE(?, model), updated_at_ms = ? "
                         "WHERE suggestion_id = ? AND status = 'draft' AND draft_seq < ?",
-                        (str(draft_text), draft_seq, now_ms, suggestion_id, draft_seq),
+                        (
+                            str(draft_text),
+                            draft_seq,
+                            normalized_runtime,
+                            normalized_provider,
+                            normalized_model,
+                            now_ms,
+                            suggestion_id,
+                            draft_seq,
+                        ),
                     )
                     changed = result.rowcount == 1
                     event_type = "suggestion.draft.delta"
@@ -6042,6 +6321,66 @@ class V2Persistence:
                 (suggestion_id,),
             ).fetchone()
         return self._suggestion_dict(row) if row is not None else None
+
+    def update_suggestion_error(
+        self,
+        *,
+        suggestion_id: str,
+        error_class: str | None,
+        now_ms: int,
+        expected_job_id: str,
+        expected_lease_owner: str,
+    ) -> dict[str, Any]:
+        """Expose transient Answer availability without terminating its draft."""
+
+        suggestion_id = _required(suggestion_id, "suggestion_id")
+        expected_job_id = _required(expected_job_id, "expected_job_id")
+        expected_lease_owner = _required(expected_lease_owner, "expected_lease_owner")
+        normalized_error = " ".join(str(error_class or "").split()) or None
+        now_ms = max(0, int(now_ms))
+        with self._write_transaction():
+            self._assert_job_lease_locked(
+                job_id=expected_job_id,
+                lease_owner=expected_lease_owner,
+                now_ms=now_ms,
+            )
+            row = self._conn.execute(
+                "SELECT * FROM suggestions WHERE suggestion_id = ? AND job_id = ?",
+                (suggestion_id, expected_job_id),
+            ).fetchone()
+            if row is None or str(row["status"]) != "draft":
+                raise KeyError(f"active suggestion draft not found: {suggestion_id}")
+            if row["error_class"] == normalized_error:
+                return self._suggestion_dict(row)
+            draft_seq = int(row["draft_seq"]) + 1
+            self._conn.execute(
+                "UPDATE suggestions SET error_class = ?, draft_seq = ?, updated_at_ms = ? "
+                "WHERE suggestion_id = ? AND job_id = ? AND status = 'draft'",
+                (
+                    normalized_error,
+                    draft_seq,
+                    now_ms,
+                    suggestion_id,
+                    expected_job_id,
+                ),
+            )
+            updated_row = self._conn.execute(
+                "SELECT * FROM suggestions WHERE suggestion_id = ?",
+                (suggestion_id,),
+            ).fetchone()
+            updated = self._suggestion_dict(updated_row)
+            self._append_event_locked(
+                meeting_id=str(updated_row["meeting_id"]),
+                event_type="suggestion.draft.delta",
+                aggregate_type="suggestion",
+                aggregate_id=suggestion_id,
+                occurred_at_ms=now_ms,
+                idempotency_key=f"suggestion.availability:{suggestion_id}:{draft_seq}",
+                payload=updated,
+                correlation_id=str(updated_row["generation_id"]),
+                causation_id=expected_job_id,
+            )
+        return updated
 
     def end_meeting(
         self,
@@ -8875,6 +9214,128 @@ class V2Persistence:
             row = self._conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
         return {"created": True, "job": self._job_dict(row)}
 
+    def enqueue_transcript_correction_retry(
+        self,
+        *,
+        meeting_id: str,
+        now_ms: int,
+        max_attempts: int = 3,
+    ) -> dict[str, Any]:
+        """Queue a bounded retry for every transcript segment without a usable correction.
+
+        Realtime correction jobs are created per final segment, but the normal
+        live path can exhaust its Provider/billing gates before any request is
+        made.  A post-meeting retry must therefore reset only failed/pending
+        segments and create fresh durable rows; historical failed rows remain
+        intact for audit and are never mutated into a false success.
+        """
+
+        meeting_id = _required(meeting_id, "meeting_id")
+        now_ms = max(0, int(now_ms))
+        max_attempts = int(max_attempts)
+        if max_attempts <= 0:
+            raise ValueError("max_attempts must be positive")
+        with self._write_transaction():
+            self._raise_if_tombstoned_locked(meeting_id)
+            meeting = self._conn.execute(
+                "SELECT state FROM meetings WHERE id = ?", (meeting_id,)
+            ).fetchone()
+            if meeting is None:
+                raise KeyError(f"meeting not found: {meeting_id}")
+
+            active = self._conn.execute(
+                "SELECT * FROM jobs WHERE meeting_id = ? AND kind = 'correction' "
+                "AND status IN ('pending', 'running', 'retry_wait') "
+                "ORDER BY created_at_ms DESC, id DESC LIMIT 1",
+                (meeting_id,),
+            ).fetchone()
+            if active is not None:
+                return {
+                    "created": False,
+                    "reason": "in_flight",
+                    "jobs": [self._job_dict(active)],
+                    "segment_count": 0,
+                }
+
+            rows = self._conn.execute(
+                "SELECT * FROM transcript_segments WHERE meeting_id = ? "
+                "AND duplicate_of_segment_id IS NULL "
+                "AND correction_status IN ('failed_preserved_original', 'pending', 'processing') "
+                "ORDER BY transcript_seq",
+                (meeting_id,),
+            ).fetchall()
+            if not rows:
+                return {
+                    "created": False,
+                    "reason": "no_retryable_segments",
+                    "jobs": [],
+                    "segment_count": 0,
+                }
+
+            generation = int(
+                self._conn.execute(
+                    "SELECT COUNT(*) FROM jobs WHERE meeting_id = ? AND kind = 'correction'",
+                    (meeting_id,),
+                ).fetchone()[0]
+            ) + 1
+            jobs: list[dict[str, Any]] = []
+            for offset, row in enumerate(rows):
+                segment_id = str(row["segment_id"])
+                self._conn.execute(
+                    "UPDATE transcript_segments SET correction_status = 'pending', "
+                    "correction_error_class = NULL, correction_updated_at_ms = ?, updated_at_ms = ? "
+                    "WHERE meeting_id = ? AND segment_id = ? AND revision = 1",
+                    (now_ms, now_ms, meeting_id, segment_id),
+                )
+                job_id = _stable_id(
+                    "job", meeting_id, "correction", "manual_retry", str(generation), str(offset)
+                )
+                idempotency_key = f"correction.retry:{meeting_id}:{generation}:{offset}"
+                self._conn.execute(
+                    "INSERT INTO jobs ("
+                    "id, meeting_id, kind, status, priority, input_transcript_seq, input_version, "
+                    "evidence_segment_id, evidence_hash, generation_id, idempotency_key, attempts, "
+                    "max_attempts, next_attempt_at_ms, deadline_at_ms, created_at_ms, updated_at_ms"
+                    ") VALUES (?, ?, 'correction', 'pending', 120, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, ?, ?)",
+                    (
+                        job_id,
+                        meeting_id,
+                        int(row["transcript_seq"]),
+                        int(row["revision"]),
+                        segment_id,
+                        str(row["evidence_hash"]),
+                        f"correction:{meeting_id}:manual_retry:{generation}:{offset}",
+                        idempotency_key,
+                        max_attempts,
+                        now_ms,
+                        now_ms,
+                        now_ms,
+                    ),
+                )
+                job = self._conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+                jobs.append(self._job_dict(job))
+
+            self._append_event_locked(
+                meeting_id=meeting_id,
+                event_type="meeting.transcript_correction.retry_requested",
+                aggregate_type="transcript_correction",
+                aggregate_id=meeting_id,
+                occurred_at_ms=now_ms,
+                idempotency_key=f"meeting.transcript_correction.retry_requested:{meeting_id}:{generation}",
+                payload={
+                    "meeting_id": meeting_id,
+                    "generation": generation,
+                    "segment_count": len(jobs),
+                },
+                correlation_id=meeting_id,
+            )
+        return {
+            "created": True,
+            "reason": "queued",
+            "jobs": jobs,
+            "segment_count": len(jobs),
+        }
+
     def save_minutes(
         self,
         *,
@@ -9138,6 +9599,11 @@ class V2Persistence:
         final_draft_seq: int,
         text: str,
         now_ms: int,
+        runtime: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        ttft_ms: int | None = None,
+        completed_ms: int | None = None,
         expected_job_id: str | None = None,
         expected_lease_owner: str | None = None,
     ) -> dict[str, Any] | None:
@@ -9149,6 +9615,11 @@ class V2Persistence:
         now_ms = max(0, int(now_ms))
         normalized_job_id = str(expected_job_id or "").strip() or None
         normalized_lease_owner = str(expected_lease_owner or "").strip() or None
+        normalized_runtime = " ".join(str(runtime or "").split()) or None
+        normalized_provider = " ".join(str(provider or "").split()) or None
+        normalized_model = " ".join(str(model or "").split()) or None
+        normalized_ttft_ms = max(0, int(ttft_ms)) if ttft_ms is not None else None
+        normalized_completed_ms = max(0, int(completed_ms)) if completed_ms is not None else None
         if (normalized_job_id is None) != (normalized_lease_owner is None):
             raise ValueError("expected_job_id and expected_lease_owner must be provided together")
         with self._write_transaction():
@@ -9160,6 +9631,9 @@ class V2Persistence:
                 )
             result = self._conn.execute(
                 "UPDATE suggestions SET status = 'committed', text = ?, final_draft_seq = ?, "
+                "runtime = COALESCE(?, runtime), provider = COALESCE(?, provider), "
+                "model = COALESCE(?, model), ttft_ms = COALESCE(?, ttft_ms), "
+                "completed_ms = COALESCE(?, completed_ms), error_class = NULL, "
                 "committed_at_ms = ?, updated_at_ms = ? "
                 "WHERE suggestion_id = ? AND generation_id = ? AND status = 'draft' "
                 "AND evidence_hash = ? AND draft_seq = ? "
@@ -9173,6 +9647,11 @@ class V2Persistence:
                 (
                     text,
                     final_draft_seq,
+                    normalized_runtime,
+                    normalized_provider,
+                    normalized_model,
+                    normalized_ttft_ms,
+                    normalized_completed_ms,
                     now_ms,
                     now_ms,
                     suggestion_id,
@@ -12265,6 +12744,8 @@ class V2Persistence:
             "meeting_id": row["meeting_id"],
             "job_id": row["job_id"],
             "generation_id": row["generation_id"],
+            "kind": row["kind"],
+            "question_text": row["question_text"],
             "evidence_segment_id": row["evidence_segment_id"],
             "evidence_transcript_seq": int(row["evidence_transcript_seq"]),
             "evidence_hash": row["evidence_hash"],
@@ -12274,6 +12755,12 @@ class V2Persistence:
             "draft_seq": int(row["draft_seq"]),
             "text": row["text"],
             "final_draft_seq": row["final_draft_seq"],
+            "runtime": row["runtime"],
+            "provider": row["provider"],
+            "model": row["model"],
+            "ttft_ms": row["ttft_ms"],
+            "completed_ms": row["completed_ms"],
+            "error_class": row["error_class"],
             "feedback": row["feedback"],
             "feedback_at_ms": row["feedback_at_ms"],
             "created_at_ms": int(row["created_at_ms"]),

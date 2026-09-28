@@ -26,7 +26,7 @@ from .sqlite_schema import (
 )
 
 
-APPLICATION_SCHEMA_VERSION = 11
+APPLICATION_SCHEMA_VERSION = 12
 APPLICATION_MAX_SUPPORTED_SCHEMA_VERSION = APPLICATION_SCHEMA_VERSION
 
 _SHANGHAI_TIMEZONE = timezone(timedelta(hours=8))
@@ -665,7 +665,13 @@ _V2_ADDITIVE_COLUMNS = (
             ("label_locked", "INTEGER NOT NULL DEFAULT 0"),
         ),
     ),
-    ("suggestions", (("feedback", "TEXT"), ("feedback_at_ms", "INTEGER"))),
+    (
+        "suggestions",
+        (
+            ("feedback", "TEXT"),
+            ("feedback_at_ms", "INTEGER"),
+        ),
+    ),
     ("jobs", (("deadline_at_ms", "INTEGER"),)),
     (
         "transcript_segments",
@@ -1156,6 +1162,20 @@ APPLICATION_SCHEMA_MIGRATIONS = (
             ,
             "CREATE INDEX idx_agent_work_item_evidence_meeting "
             "ON agent_work_item_evidence(meeting_id, segment_id, revision)",
+        ),
+    ),
+    sql_migration(
+        12,
+        "add_realtime_answer_copilot_fields",
+        (
+            "ALTER TABLE suggestions ADD COLUMN kind TEXT NOT NULL DEFAULT 'follow_up'",
+            "ALTER TABLE suggestions ADD COLUMN question_text TEXT",
+            "ALTER TABLE suggestions ADD COLUMN runtime TEXT",
+            "ALTER TABLE suggestions ADD COLUMN provider TEXT",
+            "ALTER TABLE suggestions ADD COLUMN model TEXT",
+            "ALTER TABLE suggestions ADD COLUMN ttft_ms INTEGER",
+            "ALTER TABLE suggestions ADD COLUMN completed_ms INTEGER",
+            "ALTER TABLE suggestions ADD COLUMN error_class TEXT",
         ),
     ),
 )

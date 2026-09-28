@@ -66,6 +66,10 @@ async def generate_streaming_suggestion(
     provider: OpenAICompatibleStreamingProvider,
     persistence: V2Persistence,
     suggestion_id: str | None = None,
+    question_text: str | None = None,
+    runtime: str | None = None,
+    provider_name: str | None = None,
+    model: str | None = None,
     checkpoint_interval_seconds: float = 0.250,
     checkpoint_characters: int = 64,
     max_characters: int = 240,
@@ -80,7 +84,11 @@ async def generate_streaming_suggestion(
     Provider failures and task cancellation therefore leave, at most, a draft.
     """
 
-    identity = _SuggestionIdentity.from_claimed_job(job, suggestion_id=suggestion_id)
+    identity = _SuggestionIdentity.from_claimed_job(
+        job,
+        suggestion_id=suggestion_id,
+        question_text=question_text,
+    )
     _validate_options(
         messages=messages,
         checkpoint_interval_seconds=checkpoint_interval_seconds,
@@ -112,6 +120,11 @@ async def generate_streaming_suggestion(
             draft_text=text,
             draft_seq=draft_seq,
             now_ms=now_ms(),
+            kind=identity.artifact_kind,
+            question_text=identity.question_text,
+            runtime=runtime,
+            provider=provider_name,
+            model=model,
             lease_owner=identity.lease_owner,
         )
         _validate_persisted_identity(row, identity, expected_draft_seq=draft_seq)
@@ -181,6 +194,13 @@ async def generate_streaming_suggestion(
         final_draft_seq=draft_seq,
         text=final_text,
         now_ms=now_ms(),
+        runtime=runtime or result.transport_mode.value,
+        provider=provider_name,
+        model=model,
+        ttft_ms=round(result.timings.time_to_first_token_seconds * 1_000),
+        completed_ms=round(
+            max(0.0, result.timings.completed_at - result.timings.started_at) * 1_000
+        ),
         expected_job_id=identity.job_id if identity.lease_owner is not None else None,
         expected_lease_owner=identity.lease_owner,
     )
@@ -219,6 +239,8 @@ class _SuggestionIdentity:
         evidence_transcript_seq: int,
         evidence_hash: str,
         state_revision: int,
+        artifact_kind: str,
+        question_text: str | None,
         lease_owner: str | None,
     ) -> None:
         self.suggestion_id = suggestion_id
@@ -229,6 +251,8 @@ class _SuggestionIdentity:
         self.evidence_transcript_seq = evidence_transcript_seq
         self.evidence_hash = evidence_hash
         self.state_revision = state_revision
+        self.artifact_kind = artifact_kind
+        self.question_text = question_text
         self.lease_owner = lease_owner
 
     @classmethod
@@ -237,18 +261,25 @@ class _SuggestionIdentity:
         job: Mapping[str, Any],
         *,
         suggestion_id: str | None,
+        question_text: str | None,
     ) -> _SuggestionIdentity:
         if not isinstance(job, Mapping):
             raise SuggestionValidationError("suggestion job must be a mapping")
-        if str(job.get("kind") or "") != "suggestion":
-            raise SuggestionValidationError("durable job is not in the suggestion lane")
+        job_kind = str(job.get("kind") or "")
+        if job_kind not in {"suggestion", "answer"}:
+            raise SuggestionValidationError("durable job is not in a streaming suggestion lane")
         if str(job.get("status") or "") != "running":
             raise SuggestionValidationError("suggestion job must already be claimed")
 
         job_id = _required_job_text(job, "id")
         evidence_transcript_seq = _positive_job_integer(job, "input_transcript_seq")
         state_revision = _positive_job_integer(job, "input_version")
-        resolved_suggestion_id = str(suggestion_id or f"suggestion:{job_id}").strip()
+        artifact_kind = "answer" if job_kind == "answer" else "follow_up"
+        normalized_question = " ".join(str(question_text or "").split()) or None
+        if artifact_kind == "answer" and normalized_question is None:
+            raise SuggestionValidationError("answer job requires question_text")
+        default_prefix = "answer" if artifact_kind == "answer" else "suggestion"
+        resolved_suggestion_id = str(suggestion_id or f"{default_prefix}:{job_id}").strip()
         if not resolved_suggestion_id:
             raise SuggestionValidationError("suggestion_id must not be empty")
         return cls(
@@ -260,6 +291,8 @@ class _SuggestionIdentity:
             evidence_transcript_seq=evidence_transcript_seq,
             evidence_hash=_required_job_text(job, "evidence_hash"),
             state_revision=state_revision,
+            artifact_kind=artifact_kind,
+            question_text=normalized_question,
             lease_owner=(str(job.get("lease_owner") or "").strip() or None),
         )
 
@@ -329,6 +362,8 @@ def _validate_persisted_identity(
         "evidence_transcript_seq": identity.evidence_transcript_seq,
         "evidence_hash": identity.evidence_hash,
         "state_revision": identity.state_revision,
+        "kind": identity.artifact_kind,
+        "question_text": identity.question_text,
         "draft_seq": expected_draft_seq,
     }
     conflicts = {

@@ -734,6 +734,76 @@ def test_v2_local_reflex_same_kind_active_card_is_silently_suppressed(
     assert provider_lanes.pending_realtime_count == 0
 
 
+def test_v2_delta_pi_is_suppressed_when_fast_answer_owns_same_evidence(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    persistence = app.state.v2_persistence
+    provider_lanes = app.state.provider_lane_registry
+
+    def forbidden_provider_config(_cls):
+        raise AssertionError("Answer-owned Pi work must not read Provider configuration")
+
+    async def forbidden_provider_call(**_kwargs):
+        raise AssertionError("Answer-owned Pi work must not call a Provider")
+
+    class ForbiddenPiRuntime:
+        async def evaluate(self, _payload):
+            raise AssertionError("Answer-owned Pi work must not start Pi")
+
+    monkeypatch.setattr(
+        app_module.llm_service.LlmConfig,
+        "from_env",
+        classmethod(forbidden_provider_config),
+    )
+    monkeypatch.setattr(app_module, "run_realtime_intelligence", forbidden_provider_call)
+    app.state.pi_coach_runtime = ForbiddenPiRuntime()
+
+    now_ms = time.time_ns() // 1_000_000
+    committed = persistence.commit_final_and_enqueue(
+        meeting_id="fast-answer-owns-evidence",
+        final_id="fast-answer-final-1",
+        segment_id="fast-answer-segment-1",
+        text="Redis Stream 和 Kafka 应该怎么选？",
+        normalized_text="Redis Stream 和 Kafka 应该怎么选？",
+        started_at_ms=0,
+        ended_at_ms=1_000,
+        evidence_hash="fast-answer-hash-1",
+        source_track="system_audio",
+        now_ms=now_ms,
+    )
+    assert "answer" in committed["job_ids"]
+    intelligence_job = persistence.claim_next_job(
+        worker_id="fast-answer-intelligence-worker",
+        lane="intelligence",
+        now_ms=now_ms,
+        lease_ms=30_000,
+    )
+    assert intelligence_job is not None
+
+    output = asyncio.run(
+        app.state.v2_intelligence_job_handler_impl(intelligence_job)
+    )
+
+    assert output["applied"] is False
+    assert output["transport_mode"] == "fast_answer_lane_owned"
+    assert output["provider_attempt_count"] == 0
+    assert output["coach"]["triggered"] is False
+    assert output["coach"]["pi_provider_attempted"] is False
+    assert (
+        output["coach"]["suppression_reason"]
+        == "fast_answer_owns_question"
+    )
+    assert output["semantic"]["status"] == "suppressed_by_answer_lane"
+    assert output["execution_status"] == "succeeded"
+    assert output["decision"] == "no_change"
+    assert provider_lanes.active_realtime_count == 0
+    assert provider_lanes.pending_realtime_count == 0
+
+
 def test_v2_nonlocal_provider_path_waits_for_lane_and_revalidates_evidence(
     tmp_path,
     monkeypatch,
@@ -1516,8 +1586,8 @@ def test_v2_pi_realtime_circuit_fast_fails_with_durable_explainable_silence(
     assert coach["agent_metrics"]["realtime_circuit_last_failure_class"] == "rate_limit"
     assert coach["agent_metrics"]["realtime_circuit_admitted"] is False
     assert output["provider_availability"] == {
-        "policy_version": "shared_realtime_provider.v1",
-        "scope": "pi_coach",
+            "policy_version": "scoped_realtime_provider.v2",
+            "scope": "pi_realtime",
         "admitted": False,
         "provider_attempted": False,
         "provider_attempt_count": 0,
@@ -1532,7 +1602,7 @@ def test_v2_pi_realtime_circuit_fast_fails_with_durable_explainable_silence(
     }
     assert coach["llm_called"] is False
     assert coach["llm_call_status"] == "not_called"
-    assert coach["provider_access_scope"] == "pi_coach"
+    assert coach["provider_access_scope"] == "pi_realtime"
     assert coach["circuit_scope_bypassed"] is None
     assert coach["durable_terminal_status"] == "denied"
     assert coach["durable_terminal_reason"] == "realtime_provider_rate_limit_backoff"
@@ -1629,11 +1699,11 @@ def test_v2_pi_realtime_circuit_keeps_high_signal_local_reflex_available(
     assert pi_runtime.calls == 0
 
 
-def test_direct_semantic_uses_pi_shared_circuit_and_cannot_take_expired_half_open_trial(
+def test_direct_semantic_cannot_take_its_expired_half_open_trial(
     tmp_path,
     monkeypatch,
 ):
-    """A non-candidate final must not bypass known Pi gateway failure state."""
+    """A non-candidate final must not bypass its own known failure state."""
 
     monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
     monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
@@ -1707,7 +1777,9 @@ def test_direct_semantic_uses_pi_shared_circuit_and_cannot_take_expired_half_ope
         asyncio.run(app.state.v2_intelligence_job_handler_impl(first_job))
 
     assert provider_calls == 1
-    assert circuit.snapshot(app_module._realtime_provider_identity(config)).state == "open"
+    assert circuit.snapshot(
+        app_module._realtime_provider_identity(config, scope="direct_semantic")
+    ).state == "open"
 
     # The normal cooldown elapsed, but no explicit/short-budget recovery probe
     # has succeeded. Direct semantic must fail fast instead of taking a new
@@ -1746,7 +1818,7 @@ def test_direct_semantic_uses_pi_shared_circuit_and_cannot_take_expired_half_ope
     }
     availability = output["provider_availability"]
     assert availability == {
-        "policy_version": "shared_realtime_provider.v1",
+        "policy_version": "scoped_realtime_provider.v2",
         "scope": "direct_semantic",
         "admitted": False,
         "provider_attempted": False,
@@ -1789,7 +1861,7 @@ def test_direct_semantic_uses_pi_shared_circuit_and_cannot_take_expired_half_ope
     )
 
 
-def test_successful_direct_semantic_closes_shared_circuit_permit(
+def test_successful_direct_semantic_closes_its_scoped_circuit_permit(
     tmp_path,
     monkeypatch,
 ):
@@ -1870,7 +1942,7 @@ def test_successful_direct_semantic_closes_shared_circuit_permit(
     assert output["coach"]["llm_called"] is True
     assert output["coach"]["llm_call_status"] == "called"
     snapshot = app.state.realtime_provider_circuit.snapshot(
-        app_module._realtime_provider_identity(config)
+        app_module._realtime_provider_identity(config, scope="direct_semantic")
     )
     assert snapshot.state == "closed"
     assert snapshot.failure_count == 0
@@ -2337,14 +2409,19 @@ def test_manual_provider_probe_success_closes_app_realtime_circuit(
     app = create_app(data_dir=tmp_path)
     config = app_module.llm_service.LlmConfig.from_env()
     assert config is not None
-    identity = app_module._realtime_provider_identity(
-        app_module.llm_service.realtime_config(config)
-    )
-    for failure_class in ("timeout", "transport"):
-        admission = app.state.realtime_provider_circuit.acquire(identity)
-        assert admission.permit is not None
-        admission.permit.record_failure(failure_class)
-    assert app.state.realtime_provider_circuit.snapshot(identity).state == "open"
+    identities = {
+        scope: app_module._realtime_provider_identity(
+            app_module.llm_service.realtime_config(config),
+            scope=scope,
+        )
+        for scope in app_module.REALTIME_PROVIDER_CIRCUIT_SCOPES
+    }
+    for identity in identities.values():
+        for failure_class in ("timeout", "transport"):
+            admission = app.state.realtime_provider_circuit.acquire(identity)
+            assert admission.permit is not None
+            admission.permit.record_failure(failure_class)
+        assert app.state.realtime_provider_circuit.snapshot(identity).state == "open"
 
     monkeypatch.setattr(
         app_module.llm_service,
@@ -2362,7 +2439,10 @@ def test_manual_provider_probe_success_closes_app_realtime_circuit(
     )
 
     assert response.status_code == 200
-    assert app.state.realtime_provider_circuit.snapshot(identity).state == "closed"
+    assert all(
+        app.state.realtime_provider_circuit.snapshot(identity).state == "closed"
+        for identity in identities.values()
+    )
 
 
 def test_provider_probe_cache_is_bypassed_after_realtime_circuit_failures(
@@ -2636,6 +2716,18 @@ def test_v2_user_request_enters_pi_lane_without_fresh_candidate(
     monkeypatch.setattr(app_module, "run_realtime_coach_routed", fake_pi_coach)
     app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
     app.state.streaming_llm_client = object()
+    realtime_identity = app_module._realtime_provider_identity(
+        config,
+        scope="pi_realtime",
+    )
+    for failure_class in ("timeout", "provider_server"):
+        admission = app.state.realtime_provider_circuit.acquire(realtime_identity)
+        assert admission.permit is not None
+        admission.permit.record_failure(failure_class)
+    assert app.state.realtime_provider_circuit.snapshot(realtime_identity).state == "open"
+    assert app.state.realtime_provider_circuit.snapshot(
+        app_module._realtime_provider_identity(config, scope="pi_deep")
+    ).state == "closed"
 
     finalized_at_ms = time.time_ns() // 1_000_000
     app.state.v2_persistence.commit_final_and_enqueue(
@@ -2691,6 +2783,157 @@ def test_v2_user_request_enters_pi_lane_without_fresh_candidate(
     ]
     assert reservation_events[-1]["payload"]["reason"] == "meeting.intelligence.applied"
     assert app.state.provider_priority_arbiter.active_realtime_count == 0
+
+
+def test_v2_answer_ready_enters_pi_deep_with_committed_fast_answer(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
+    config = app_module.llm_service.LlmConfig(
+        base_url="https://provider.example.test/v1",
+        api_key="test-only-key",
+        model="test-model",
+        realtime_model="test-realtime-model",
+        timeout_seconds=20,
+        is_mock=True,
+    )
+    monkeypatch.setattr(
+        app_module.llm_service.LlmConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(app_module.llm_service, "realtime_config", lambda value: value)
+    monkeypatch.setattr(
+        app_module,
+        "_ensure_llm_provider_allowed_for_derivation",
+        lambda *_args, **_kwargs: None,
+    )
+
+    async def semantic_must_not_run(**_kwargs):
+        raise AssertionError("answer_ready must use Pi deep instead of direct semantic")
+
+    async def fake_pi_coach(**kwargs):
+        assert kwargs["priority_mode"] == "deep"
+        request = kwargs["request"]
+        assert request.trigger_type == "answer_ready"
+        assert request.work_item_id == "answer:automatic-deep"
+        assert request.user_request is None
+        assert request.new_paragraphs == ()
+        assert request.rolling_state["current_answer"] == {
+            "answer_id": "answer:automatic-deep",
+            "evidence_segment_id": "answer-ready-segment",
+            "question": "你们为什么选择 Redis Stream？",
+            "answer": "因为当前规模可控，且可以复用现有 Redis 基础设施。",
+            "status": "committed",
+            "error_class": None,
+        }
+        kwargs["before_attempt"](1)
+        paragraph = request.context_paragraphs[-1]
+        intervention = CoachIntervention(
+            event_type="question_to_user",
+            title="补充选型边界",
+            recommendation=(
+                "边界：高吞吐或长周期留存时重新评估。\n"
+                "风险：需要说清消费失败和重复消费。\n"
+                "追问：如何保证消息不丢失？"
+            ),
+            reason="当前回答已给出选型依据，但还缺少失败路径和演进边界。",
+            evidence_segment_ids=(paragraph.id,),
+            evidence_quote=paragraph.text,
+            urgency="medium",
+            confidence=0.9,
+        )
+        result = build_realtime_coach_provenance_decision(
+            request=request,
+            origin="pi",
+            status="intervention",
+            status_reason="intervention_submitted",
+            decision_reason="Fast Answer 已可见，Pi 补充高价值边界。",
+            intervention=intervention,
+        )
+        now_ms = int(time.time() * 1_000)
+        result.update(
+            {
+                "transport_mode": "pi_agent_jsonl",
+                "provider_lane": "pi_deep",
+                "model": "test-realtime-model",
+                "runtime_requested": "pi",
+                "runtime_used": "pi",
+                "ttft_ms": 20.0,
+                "decision_latency_ms": 35.0,
+                "timings": {
+                    "clock": "unix_epoch_ms",
+                    "started_at_ms": now_ms,
+                    "first_token_at_ms": now_ms + 20,
+                    "completed_at_ms": now_ms + 35,
+                },
+                "agent_metrics": {
+                    "turns": 1,
+                    "tool_calls": 1,
+                    "prompt_profile": "deep_answer",
+                },
+            }
+        )
+        return result
+
+    monkeypatch.setattr(app_module, "run_realtime_intelligence", semantic_must_not_run)
+    monkeypatch.setattr(app_module, "run_realtime_coach_routed", fake_pi_coach)
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    app.state.streaming_llm_client = object()
+    persistence = app.state.v2_persistence
+    finalized_at_ms = time.time_ns() // 1_000_000
+    committed = persistence.commit_final_and_enqueue(
+        meeting_id="answer-ready-pi-meeting",
+        final_id="answer-ready-final",
+        segment_id="answer-ready-segment",
+        text="你们为什么选择 Redis Stream？",
+        normalized_text="你们为什么选择 Redis Stream？",
+        started_at_ms=0,
+        ended_at_ms=1_000,
+        evidence_hash="answer-ready-hash",
+        source_track="system_audio",
+        now_ms=finalized_at_ms,
+    )
+    answer_job = persistence.get_job(committed["job_ids"]["answer"])
+    persistence.upsert_suggestion_draft(
+        suggestion_id="answer:automatic-deep",
+        meeting_id="answer-ready-pi-meeting",
+        job_id=answer_job["id"],
+        generation_id=answer_job["generation_id"],
+        evidence_segment_id="answer-ready-segment",
+        evidence_transcript_seq=1,
+        evidence_hash="answer-ready-hash",
+        state_revision=1,
+        draft_text="因为当前规模可控，且可以复用现有 Redis 基础设施。",
+        draft_seq=1,
+        now_ms=finalized_at_ms + 10,
+        kind="answer",
+        question_text="你们为什么选择 Redis Stream？",
+    )
+    assert persistence.commit_suggestion(
+        suggestion_id="answer:automatic-deep",
+        generation_id=answer_job["generation_id"],
+        expected_evidence_hash="answer-ready-hash",
+        final_draft_seq=1,
+        text="因为当前规模可控，且可以复用现有 Redis 基础设施。",
+        now_ms=finalized_at_ms + 20,
+    ) is not None
+    deep_job = persistence.enqueue_answer_coach_request(
+        meeting_id="answer-ready-pi-meeting",
+        answer_id="answer:automatic-deep",
+        now_ms=finalized_at_ms + 30,
+    )
+
+    output = asyncio.run(app.state.v2_intelligence_job_handler_impl(deep_job))
+
+    assert output["semantic"]["status"] == app_module.REALTIME_COACH_PI_PRIORITY_SEMANTIC_STATUS
+    assert output["coach"]["status"] == "intervention"
+    assert output["coach"]["provider_lane"] == "pi_deep"
+    assert output["applied"]["coach_intervention"]["answer_id"] == "answer:automatic-deep"
+    assert output["applied"]["coach_intervention"]["prompt_profile"] == "deep_answer"
+    persistence.close()
 
 
 def test_v2_pi_intervention_is_deprioritized_by_resolving_evidence_and_kept_in_history(
@@ -2862,15 +3105,17 @@ def test_v2_pi_intervention_is_deprioritized_by_resolving_evidence_and_kept_in_h
     assert second_decision["lifecycle_action"] == "deprioritize"
     assert second_decision["runtime_requested"] == "pi"
     assert second_decision["runtime_used"] is None
-    assert second_decision["supersedes_decision_id"] == first_decision["decision_id"]
+    assert second_decision["supersedes_decision_id"] is None
 
     formal_events = persistence.list_events(meeting_id)
-    assert app_module._latest_formal_coach_follow_up(formal_events) is None
+    assert app_module._latest_formal_coach_follow_up(formal_events)["decision_id"] == (
+        first_decision["decision_id"]
+    )
     history = app_module._bounded_formal_coach_history(formal_events)
     assert len(history) == 1
     assert history[0]["decision_id"] == first_decision["decision_id"]
-    assert history[0]["lifecycle_action"] == "deprioritize"
-    assert history[0]["superseded_by"] == second_decision["decision_id"]
+    assert history[0]["lifecycle_action"] == "retain"
+    assert history[0].get("superseded_by") is None
     applied_events = [
         event
         for event in formal_events
@@ -3128,9 +3373,8 @@ def test_coach_history_retains_advice_across_silent_rounds_and_deduplicates():
     assert history[0]["reason"] == repeated["reason"]
     assert history[0]["history_id"] == "event-3"
     assert history[-1]["formal_evidence"]["segment_ids"] == ["segment-4"]
-    # The newest silent decision clears the current card; history remains
-    # available for review without reviving the stale recommendation.
-    assert app_module._latest_formal_coach_follow_up(events) is None
+    # A silent round is diagnostic only and cannot erase the last useful card.
+    assert app_module._latest_formal_coach_follow_up(events)["question"] == second["question"]
 
 
 def test_coach_runtime_history_preserves_pi_failures_without_reviving_cards():
@@ -3229,6 +3473,18 @@ def test_coach_history_projects_append_only_supersession_links(
         "lifecycle_action": replacement_action,
         "supersedes_decision_id": "coach-decision-1",
     }
+    if replacement_status == "intervention":
+        replacement["payload"]["coach_intervention"] = {
+            "recommendation": "再确认上线窗口。",
+            "reason": "出现了新的交付约束。",
+            "evidence_segment_ids": ["segment-2"],
+            "evidence_quote": "新的交付约束",
+            "urgency": "medium",
+            "event_type": "commitment_risk",
+            "decision_id": "coach-decision-2",
+            "status": "intervention",
+            "lifecycle_action": "retain",
+        }
 
     history = app_module._bounded_formal_coach_history([first, replacement])
 
@@ -3251,6 +3507,7 @@ def test_coach_history_marks_lifecycle_resolution_separately_from_supersession()
     resolved["payload"]["coach_decision"] = {
         "decision_id": "coach-2", "status": "protected_silent", "lifecycle_action": "deprioritize",
         "status_reason": "lifecycle_resolved", "supersedes_decision_id": "coach-1",
+        "lifecycle_refresh": True,
     }
     history = app_module._bounded_formal_coach_history([first, resolved])
     assert history[0]["lifecycle_action"] == "deprioritize"
@@ -3277,6 +3534,53 @@ def test_coach_due_work_items_are_rebuilt_from_retained_persistent_history():
         "created_at_ms": 1_000,
     }]
     assert app_module._coach_due_work_items([event], now_ms=999) == []
+
+
+def test_deep_answer_card_survives_validity_window_for_its_current_answer():
+    event = _formal_projection_event(
+        seq=1,
+        event_type="meeting.intelligence.applied",
+        projection=None,
+    )
+    event["payload"].update({
+        "coach_intervention": {
+            "recommendation": "边界：补充退出条件。\n风险：说明异常恢复。\n追问：如何处理积压？",
+            "reason": "当前回答缺少异常路径。",
+            "evidence_segment_ids": ["segment-1"],
+            "evidence_quote": "当前回答",
+            "urgency": "medium",
+            "event_type": "question_to_user",
+            "decision_id": "coach-deep-1",
+            "status": "intervention",
+            "lifecycle_action": "retain",
+            "valid_until_ms": 1_000,
+            "prompt_profile": "deep_answer",
+            "answer_id": "answer:job-1",
+        },
+        "coach_decision": {
+            "decision_id": "coach-deep-1",
+            "status": "intervention",
+            "lifecycle_action": "retain",
+            "valid_until_ms": 1_000,
+            "prompt_profile": "deep_answer",
+            "answer_id": "answer:job-1",
+        },
+    })
+
+    retained = app_module._latest_formal_coach_follow_up(
+        [event],
+        now_ms=91_000,
+        current_answer_id="answer:job-1",
+    )
+
+    assert retained is not None
+    assert retained["decision_id"] == "coach-deep-1"
+    assert app_module._coach_due_work_items([event], now_ms=91_000) == []
+    assert app_module._latest_formal_coach_follow_up(
+        [event],
+        now_ms=91_000,
+        current_answer_id="answer:job-2",
+    ) is None
 
 
 def test_coach_history_keeps_same_wording_when_decision_ids_differ_for_supersession():

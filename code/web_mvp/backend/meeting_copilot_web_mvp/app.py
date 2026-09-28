@@ -126,6 +126,14 @@ from meeting_copilot_web_mvp.v2_streaming_suggestions import (
     build_realtime_suggestion_messages,
     generate_streaming_suggestion,
 )
+from meeting_copilot_web_mvp.realtime_answer_copilot import (
+    build_realtime_answer_messages,
+    detect_answer_trigger,
+)
+from meeting_copilot_web_mvp.coach_lifecycle import (
+    coach_decision_replaces_prior_intervention,
+    is_deep_answer_coach_decision,
+)
 from meeting_copilot_web_mvp.realtime_intelligence import (
     CoachCandidateEvent,
     CoachIntervention,
@@ -269,17 +277,33 @@ def _configured_intelligence_debounce_for_app(
     return _realtime_intelligence_debounce_ms()
 
 
-def _realtime_provider_identity(config: llm_service.LlmConfig | None) -> tuple[str, ...]:
-    """Return the effective realtime Provider identity used by every lane.
+REALTIME_PROVIDER_CIRCUIT_SCOPES = (
+    "pi_realtime",
+    "pi_deep",
+    "direct_semantic",
+)
+
+
+def _realtime_provider_identity(
+    config: llm_service.LlmConfig | None,
+    *,
+    scope: str = "pi_realtime",
+) -> tuple[str, ...]:
+    """Return one lane-scoped effective realtime Provider identity.
 
     Callers often hold the general configuration (for example the status and
     health endpoints), while the coach normalizes to ``realtime_config``
     before admission. Normalize here as well so diagnostics, probes and jobs
     cannot observe different circuit rows for the same configured Provider.
+    The scope suffix prevents one workload's latency profile from opening the
+    circuit for another independent workload.
     """
 
+    normalized_scope = str(scope or "").strip().lower()
+    if normalized_scope not in REALTIME_PROVIDER_CIRCUIT_SCOPES:
+        raise ValueError(f"unsupported realtime Provider circuit scope: {scope}")
     if config is None:
-        return ("not_configured",)
+        return ("not_configured", f"scope:{normalized_scope}")
     config = llm_service.realtime_config(config)
     return (
         str(config.base_url),
@@ -288,6 +312,7 @@ def _realtime_provider_identity(config: llm_service.LlmConfig | None) -> tuple[s
         str(config.realtime_model or config.model),
         str(config.api_style),
         str(llm_service.provider_idempotency_header_value(config.api_key) or ""),
+        f"scope:{normalized_scope}",
     )
 
 
@@ -337,20 +362,27 @@ REALTIME_COACH_SOFT_DELIVERY_CUTOFF_MS = REALTIME_COACH_SOFT_CUTOFF_MS
 # several seconds, so a four-second cap preserved raw ASR text even when the
 # same Provider was healthy. Keep this bounded, but allow a complete short
 # correction turn to finish.
-REALTIME_CORRECTION_PROVIDER_TIMEOUT_SECONDS = 12.0
+# Transcript correction is an independent background lane. Large forced
+# backfills can contain close to 2,000 transcript characters plus stable
+# segment markers, so they need a wider Provider budget than Fast Answer or
+# Pi. This does not delay partial/final ASR projection or occupy their locks.
+REALTIME_CORRECTION_PROVIDER_TIMEOUT_SECONDS = 30.0
 # Avoid tight durable-queue polling when the correction lane itself is full.
 REALTIME_CORRECTION_LANE_RETRY_MS = 750
 # A live Pi job owns the short realtime window. Correction must yield before
 # starting a Provider request, then retry without consuming its attempt budget.
 REALTIME_CORRECTION_PRIORITY_RETRY_MS = 250
+# Continuous speech can otherwise create an unbroken chain of Answer/Pi jobs
+# and starve canonical-transcript correction forever. Protect the complete
+# Fast Answer delivery window, then let the independent correction lane run.
+REALTIME_CORRECTION_MAX_PRIORITY_WAIT_MS = 12_000
 # A candidate Pi intervention is the user-visible realtime contract. Keep
 # semantic extraction off that critical path; it can be retried or produced by
 # the post-meeting lane without making a valid coach card miss its deadline.
 REALTIME_COACH_PI_PRIORITY_SEMANTIC_STATUS = "deferred_for_pi_priority"
-# Pi and direct semantic extraction use one Provider availability state.  The
-# scope remains explicit in durable provenance so a future product-approved
-# bypass cannot become an invisible second path to the same failing gateway.
-REALTIME_PROVIDER_AVAILABILITY_POLICY_VERSION = "shared_realtime_provider.v1"
+# Each workload owns its Provider availability state. A short realtime Pi turn
+# must not suppress a user-requested deep analysis before that lane has tried.
+REALTIME_PROVIDER_AVAILABILITY_POLICY_VERSION = "scoped_realtime_provider.v2"
 
 
 def _acquire_direct_semantic_provider_admission(
@@ -883,7 +915,7 @@ def _v2_intelligence_batch_segments(
             if int(segment.get("transcript_seq") or 0) <= reference_seq
         ][-3:]
         return new_segments, context
-    if trigger_type == "user_request":
+    if trigger_type in {"user_request", "answer_ready"}:
         # An explicit coach request is evaluated against the current meeting
         # snapshot rather than a fresh transcript delta. Keep these as
         # context evidence so provenance does not claim the user request
@@ -2147,7 +2179,21 @@ def create_app(
             return snapshot
         formal_events = _all_v2_formal_events(meeting_id)
         coach_history = _bounded_formal_coach_history(formal_events)
-        current_coach_follow_up = _latest_formal_coach_follow_up(formal_events)
+        current_answer_id = next(
+            (
+                str(item.get("suggestion_id") or "").strip()
+                for item in reversed(snapshot.get("suggestions") or [])
+                if isinstance(item, Mapping)
+                and item.get("kind") == "answer"
+                and item.get("status") != "superseded"
+                and str(item.get("suggestion_id") or "").strip()
+            ),
+            None,
+        )
+        current_coach_follow_up = _latest_formal_coach_follow_up(
+            formal_events,
+            current_answer_id=current_answer_id,
+        )
         current_coach_decision = _latest_formal_coach_decision(formal_events)
         current_semantic_follow_up = _latest_formal_semantic_follow_up(formal_events)
         recent_context_history = _bounded_recent_context_history(formal_events)
@@ -2214,7 +2260,16 @@ def create_app(
             }
         projected = {
             **snapshot,
-            "suggestions": [],
+            # Legacy follow-up suggestions are intentionally hidden in
+            # llm_first mode because the formal Pi projection below is their
+            # source of truth. Fast Answer is a separate durable lane: it has
+            # no Pi event equivalent and must survive snapshot hydration so a
+            # refresh or SSE reconnect cannot make a valid answer disappear.
+            "suggestions": [
+                item
+                for item in snapshot.get("suggestions") or []
+                if isinstance(item, Mapping) and item.get("kind") == "answer"
+            ],
             "current_topic": current_topic,
             "open_questions": [
                 item for item in (
@@ -2307,11 +2362,33 @@ def create_app(
             projected["coach_intervention"] = None
             projected["coach_decision"] = None
             projected["coach_history"] = []
+        provider_circuit = (
+            realtime_provider_circuit.snapshot(_realtime_provider_identity(provider_config))
+            if provider_config is not None
+            else None
+        )
+        realtime_provider_available = (
+            provider_config is not None
+            and (provider_circuit is None or provider_circuit.state == "closed")
+        )
         runtime["ai"]["capabilities"] = {
             "provider": {
-                "state": "active" if provider_config is not None else "offline",
-                "label": "模型已连接" if provider_config is not None else "模型未连接",
-                "detail": provider_config.model if provider_config is not None else None,
+                "state": "active" if realtime_provider_available else "paused" if provider_config is not None else "offline",
+                "label": (
+                    "模型已连接"
+                    if realtime_provider_available
+                    else "实时 Provider 暂不可用"
+                    if provider_config is not None
+                    else "模型未连接"
+                ),
+                "detail": (
+                    provider_config.model
+                    if realtime_provider_available
+                    else f"已连续失败 {provider_circuit.failure_count} 次，最近原因：{provider_circuit.last_failure_class or '未知'}"
+                    if provider_circuit is not None
+                    else None
+                ),
+                "error_class": provider_circuit.reason if provider_circuit is not None and not realtime_provider_available else None,
             },
             "transcript": {
                 "state": (
@@ -2470,6 +2547,8 @@ def create_app(
     }
     app.state.streaming_llm_client = None
     app.state.realtime_llm_client = None
+    app.state.answer_llm_client = None
+    app.state.deep_llm_client = None
     app.state.correction_llm_client = None
     # Older integrations replace ``streaming_llm_client`` before lifespan
     # startup (usually with a MockTransport). Keep that injection usable for
@@ -2658,6 +2737,27 @@ def create_app(
             else raw_segment_id
         )
         normalized_text = str(event.get("normalized_text") or text).strip()
+        preparation = (
+            meeting_preparation_store.get(session_id)
+            if meeting_preparation_store is not None
+            else None
+        )
+        single_track_mixed = bool(
+            source_track == "microphone"
+            and preparation is not None
+            and preparation.input_source == "microphone"
+        )
+        answer_trigger = detect_answer_trigger(
+            text=normalized_text,
+            source_track=source_track,
+            preset_id=preparation.preset_id if preparation is not None else "general",
+            allow_single_track_microphone=single_track_mixed,
+            single_track_focus_terms=(
+                (*preparation.focus_points, *preparation.hotwords)
+                if preparation is not None
+                else ()
+            ),
+        )
         evidence_hash = transcript_evidence_hash(segment_id, normalized_text)
         timeline_offset_ms = max(0, int(event.get("timeline_offset_ms") or 0))
         realtime_reservation_id = (
@@ -2688,6 +2788,7 @@ def create_app(
                 speaker_confidence=event.get("speaker_confidence"),
                 correlation_id=session_id,
                 source_track=source_track,
+                enqueue_answer=answer_trigger.should_answer,
             )
         except BaseException:
             if realtime_reservation_id is not None:
@@ -2759,6 +2860,18 @@ def create_app(
                 )
             executor = getattr(app.state, "v2_executor", None)
             if executor is not None:
+                answer_job_id = committed["job_ids"].get("answer")
+                if answer_job_id is not None and answer_trigger.should_answer:
+                    v2_persistence.supersede_queued_answer_jobs(
+                        meeting_id=session_id,
+                        replacement_job_id=str(answer_job_id),
+                        now_ms=time.time_ns() // 1_000_000,
+                    )
+                    executor.supersede_running(
+                        "answer",
+                        meeting_id=session_id,
+                        replacement_job_id=str(answer_job_id),
+                    )
                 intelligence_job_id = committed["job_ids"].get("intelligence")
                 if intelligence_job_id is not None:
                     executor.supersede_running(
@@ -3388,18 +3501,24 @@ def create_app(
         "result": None,
         "circuit_identity_generation": None,
     }
-    # This breaker is shared by Pi coach and direct semantic work that target
-    # the same realtime Provider identity. Correction, general LLM calls, and
-    # post-meeting lanes retain their independent availability contracts.
-    realtime_provider_circuit = RealtimeProviderCircuit(
-        failure_threshold=2,
-        cooldown_seconds=15.0,
-        # Use the application database when the production SQLite path is
-        # active. Repository-only tests intentionally retain the process-local
-        # circuit because they have no durable application store.
-        persistence=v2_persistence,
-    )
+    # The breaker persists separate rows per lane-scoped Provider identity.
+    # Correction, Fast Answer and post-meeting work retain independent
+    # availability contracts as well.
+    realtime_provider_circuits = {
+        scope: RealtimeProviderCircuit(
+            failure_threshold=2,
+            cooldown_seconds=15.0,
+            # Use the application database when the production SQLite path is
+            # active. Each scope still needs its own in-process instance for
+            # memory-only deployments because that circuit implementation
+            # intentionally owns only one active identity at a time.
+            persistence=v2_persistence,
+        )
+        for scope in REALTIME_PROVIDER_CIRCUIT_SCOPES
+    }
+    realtime_provider_circuit = realtime_provider_circuits["pi_realtime"]
     app.state.realtime_provider_circuit = realtime_provider_circuit
+    app.state.realtime_provider_circuits = realtime_provider_circuits
     llm_lane_locks = LaneLockRegistry()
     provider_lane_registry = ProviderLaneRegistry(
         realtime_max_active=_positive_provider_lane_setting(
@@ -3430,6 +3549,10 @@ def create_app(
             "MEETING_COPILOT_PROVIDER_REALTIME_MAX_CONNECTIONS",
             2,
         ),
+        "answer": _positive_provider_lane_setting(
+            "MEETING_COPILOT_PROVIDER_ANSWER_MAX_CONNECTIONS",
+            2,
+        ),
         "deep": _positive_provider_lane_setting(
             "MEETING_COPILOT_PROVIDER_DEEP_MAX_CONNECTIONS",
             2,
@@ -3447,7 +3570,9 @@ def create_app(
         for lane, max_connections in provider_lane_client_limits.items()
     }
 
-    def _provider_client_for_lane(lane: Literal["general", "realtime", "deep", "correction"]) -> Any:
+    def _provider_client_for_lane(
+        lane: Literal["general", "realtime", "answer", "deep", "correction"],
+    ) -> Any:
         if (
             lane != "general"
             and getattr(app.state, "provider_lane_legacy_client_injection", False)
@@ -3458,6 +3583,7 @@ def create_app(
         attribute = {
             "general": "streaming_llm_client",
             "realtime": "realtime_llm_client",
+            "answer": "answer_llm_client",
             "deep": "deep_llm_client",
             "correction": "correction_llm_client",
         }[lane]
@@ -3482,7 +3608,8 @@ def create_app(
             for job in v2_persistence.list_jobs(lane="intelligence")
             if str(job.get("id") or "")
             and str(job.get("status") or "") in {"pending", "running", "retry_wait"}
-            and str(job.get("trigger_type") or "delta") not in {"task_due", "user_request"}
+            and str(job.get("trigger_type") or "delta")
+            not in {"task_due", "user_request", "answer_ready"}
             and (
                 str(job.get("status") or "") == "running"
                 or job.get("deadline_at_ms") is None
@@ -3508,7 +3635,8 @@ def create_app(
             for job in v2_persistence.list_jobs(lane="intelligence")
             if str(job.get("id") or "")
             and str(job.get("status") or "") in {"pending", "running", "retry_wait"}
-            and str(job.get("trigger_type") or "") in {"task_due", "user_request"}
+            and str(job.get("trigger_type") or "")
+            in {"task_due", "user_request", "answer_ready"}
             # Keep a running job reserved even after its realtime deadline.
             # Its in-process Provider call cannot be forcefully interrupted;
             # pruning the reservation here would let correction overlap that
@@ -5168,6 +5296,74 @@ def create_app(
             executor.wake()
         return {"job": result["job"], "created": result["created"]}
 
+    @app.post("/v2/meetings/{meeting_id}/transcript/correction/retry", status_code=202)
+    def retry_v2_transcript_correction(meeting_id: str) -> dict[str, Any]:
+        """Retry failed transcript correction without touching raw ASR facts."""
+
+        persistence = _require_v2_persistence()
+        try:
+            result = persistence.enqueue_transcript_correction_retry(
+                meeting_id=meeting_id,
+                now_ms=time.time_ns() // 1_000_000,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        segment_ids = {
+            str(job.get("evidence_segment_id") or "")
+            for job in result.get("jobs") or []
+            if str(job.get("evidence_segment_id") or "").strip()
+        }
+        if segment_ids:
+            try:
+                def reset_live_correction_state(latest: dict[str, Any]) -> dict[str, Any]:
+                    status = dict(latest.get("realtime_transcript_correction") or {})
+                    for field in (
+                        "failed_segment_ids",
+                        "terminal_failed_segment_ids",
+                        "in_flight_segment_ids",
+                        "skipped_segment_ids",
+                    ):
+                        status[field] = sorted(
+                            set(status.get(field) or []).difference(segment_ids)
+                        )
+                    failure_counts = {
+                        str(key): int(value or 0)
+                        for key, value in dict(status.get("failure_counts") or {}).items()
+                        if str(key) not in segment_ids
+                    }
+                    status["failure_counts"] = failure_counts
+                    status["status"] = "waiting"
+                    status["retry_requested_at_ms"] = time.time_ns() // 1_000_000
+                    status.pop("reservation", None)
+                    return {**latest, "realtime_transcript_correction": status}
+
+                asr_live_repo.update(meeting_id, reset_live_correction_state)
+            except KeyError:
+                # V2 transcript facts remain exportable when an old live
+                # projection has already been pruned.
+                pass
+
+        executor = getattr(app.state, "v2_executor", None)
+        if executor is not None:
+            executor.wake()
+        return {
+            "created": bool(result.get("created")),
+            "reason": result.get("reason"),
+            "segment_count": int(result.get("segment_count") or 0),
+            "jobs": [
+                {
+                    "id": job.get("id"),
+                    "kind": job.get("kind"),
+                    "status": job.get("status"),
+                    "evidence_segment_id": job.get("evidence_segment_id"),
+                }
+                for job in result.get("jobs") or []
+            ],
+        }
+
     @app.get("/v2/meetings/{meeting_id}/export")
     def export_v2_meeting(
         meeting_id: str,
@@ -6557,7 +6753,11 @@ def create_app(
         # identity open after a successful probe, so the next Pi job was
         # incorrectly protected-silent despite the probe passing.
         probe_config = llm_service.realtime_config(config)
-        realtime_provider_identity = _realtime_provider_identity(probe_config)
+        realtime_provider_identities = {
+            scope: _realtime_provider_identity(probe_config, scope=scope)
+            for scope in REALTIME_PROVIDER_CIRCUIT_SCOPES
+        }
+        realtime_provider_identity = realtime_provider_identities["pi_realtime"]
         cache_key = (
             *realtime_provider_identity,
             str(llm_service.runtime_config_generation()),
@@ -6576,15 +6776,19 @@ def create_app(
         try:
             now = time.monotonic()
             _enforce_llm_budget("provider_probe", purpose="provider_probe", config=config)
-            circuit_before_probe = realtime_provider_circuit.snapshot(
-                realtime_provider_identity
-            )
+            circuits_before_probe = {
+                scope: realtime_provider_circuits[scope].snapshot(identity)
+                for scope, identity in realtime_provider_identities.items()
+            }
+            circuit_before_probe = circuits_before_probe["pi_realtime"]
             if (
                 provider_probe_cache.get("key") == cache_key
                 and float(provider_probe_cache.get("expires_at_monotonic") or 0.0) > now
                 and isinstance(provider_probe_cache.get("result"), dict)
-                and circuit_before_probe.state == "closed"
-                and circuit_before_probe.failure_count == 0
+                and all(
+                    snapshot.state == "closed" and snapshot.failure_count == 0
+                    for snapshot in circuits_before_probe.values()
+                )
                 and provider_probe_cache.get("circuit_identity_generation")
                 == circuit_before_probe.identity_generation
             ):
@@ -6604,9 +6808,11 @@ def create_app(
                 config=probe_config,
                 usage=dict(result.get("usage") or {}),
             )
-            circuit_after_probe = realtime_provider_circuit.record_probe_success(
-                realtime_provider_identity
-            )
+            circuits_after_probe = {
+                scope: realtime_provider_circuits[scope].record_probe_success(identity)
+                for scope, identity in realtime_provider_identities.items()
+            }
+            circuit_after_probe = circuits_after_probe["pi_realtime"]
             provider_probe_cache.update(
                 {
                     "key": cache_key,
@@ -6626,11 +6832,12 @@ def create_app(
                 raise
             failure_class = classify_realtime_provider_failure(exc)
             if failure_class is not None:
-                realtime_provider_circuit.record_probe_failure(
-                    realtime_provider_identity,
-                    failure_class,
-                    retry_after_ms=_realtime_retry_after_ms(exc),
-                )
+                for scope, identity in realtime_provider_identities.items():
+                    realtime_provider_circuits[scope].record_probe_failure(
+                        identity,
+                        failure_class,
+                        retry_after_ms=_realtime_retry_after_ms(exc),
+                    )
             status_code = getattr(exc, "status_code", None)
             provider_code = getattr(exc, "provider_code", None)
             _log.warning(
@@ -10435,6 +10642,7 @@ def create_app(
             "transcript_delta",
             "task_due",
             "user_request",
+            "answer_ready",
         }:
             raise RuntimeError("intelligence job trigger type is unsupported")
         new_segments, context = _v2_intelligence_batch_segments(v2_persistence, job)
@@ -10488,6 +10696,30 @@ def create_app(
             )
         snapshot = v2_persistence.get_snapshot(meeting_id, segment_limit=100)
         topic = snapshot.get("current_topic") or {}
+        answer_id = (
+            str(job.get("work_item_id") or "").strip()
+            if trigger_type == "answer_ready"
+            else ""
+        )
+        current_answer = next(
+            (
+                item
+                for item in reversed(snapshot.get("suggestions") or [])
+                if str(item.get("kind") or "") == "answer"
+                and str(item.get("status") or "") != "superseded"
+                and (
+                    str(item.get("suggestion_id") or "") == answer_id
+                    if answer_id
+                    else int(item.get("evidence_transcript_seq") or 0)
+                    <= int(job.get("input_transcript_seq") or 0)
+                )
+            ),
+            None,
+        )
+        if trigger_type == "answer_ready" and current_answer is None:
+            raise IntelligenceEvidenceSuperseded(
+                "answer_ready job no longer resolves to its bound Fast Answer"
+            )
         rolling_state = {
             "topic": {
                 "title": str(topic.get("text") or ""),
@@ -10510,6 +10742,25 @@ def create_app(
                 )
                 for item in items[-24:]
             ],
+            "current_answer": (
+                {
+                    "answer_id": str(current_answer.get("suggestion_id") or "") or None,
+                    "evidence_segment_id": str(
+                        current_answer.get("evidence_segment_id") or ""
+                    )
+                    or None,
+                    "question": str(current_answer.get("question_text") or "")[:1_000],
+                    "answer": str(
+                        current_answer.get("text")
+                        or current_answer.get("draft_text")
+                        or ""
+                    )[:2_000],
+                    "status": str(current_answer.get("status") or "draft"),
+                    "error_class": str(current_answer.get("error_class") or "") or None,
+                }
+                if current_answer is not None
+                else None
+            ),
             "version": int(job.get("input_transcript_seq") or job.get("input_version") or 1),
         }
         preparation = meeting_preparation_store.get(meeting_id) if meeting_preparation_store is not None else None
@@ -10601,12 +10852,80 @@ def create_app(
             allow_paragraph_revisions=False,
         )
         coach_priority_mode = (
-            "deep" if trigger_type in {"user_request", "task_due"} else "realtime"
+            "deep"
+            if trigger_type in {"user_request", "task_due", "answer_ready"}
+            else "realtime"
         )
         coach_enabled = str(
             os.environ.get("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
         ).strip().lower() not in {"0", "false", "off", "no"}
         coach_runtime_requested = configured_coach_runtime()
+        if trigger_type in {"delta", "transcript_delta"}:
+            answer_job = next(
+                (
+                    candidate
+                    for candidate in v2_persistence.list_jobs(
+                        meeting_id=meeting_id,
+                        lane="answer",
+                    )
+                    if str(candidate.get("evidence_segment_id") or "") == target_id
+                ),
+                None,
+            )
+            answer_trigger = detect_answer_trigger(
+                text=target.get("normalized_text") or target.get("text"),
+                source_track=target.get("source_track"),
+                preset_id=(
+                    preparation.preset_id if preparation is not None else "general"
+                ),
+                allow_single_track_microphone=bool(
+                    preparation is not None
+                    and preparation.input_source == "microphone"
+                    and target.get("source_track") == "microphone"
+                ),
+                single_track_focus_terms=(
+                    (*preparation.focus_points, *preparation.hotwords)
+                    if preparation is not None
+                    else ()
+                ),
+            )
+            if answer_job is not None and answer_trigger.should_answer:
+                _mark_v2_job_stage(
+                    job,
+                    "validated",
+                    attributes={
+                        "revision_count": 0,
+                        "state_change_count": 0,
+                        "suppression_reason": "fast_answer_owns_question",
+                        "answer_job_id": str(answer_job.get("id") or ""),
+                    },
+                )
+                return {
+                    "schema_version": "v2_realtime_intelligence_job_output.v1",
+                    "applied": False,
+                    "formal_event_context": None,
+                    "transport_mode": "fast_answer_lane_owned",
+                    "ttft_ms": None,
+                    "repair_ttft_ms": None,
+                    "provider_attempt_count": 0,
+                    "repair_attempted": False,
+                    "usage": None,
+                    "model": None,
+                    "coach": {
+                        "enabled": coach_enabled,
+                        "triggered": False,
+                        "status": "suppressed",
+                        "suppression_reason": "fast_answer_owns_question",
+                        "runtime_requested": coach_runtime_requested,
+                        "runtime_used": None,
+                        "pi_provider_attempted": False,
+                        "intervention": None,
+                    },
+                    "semantic": {
+                        "status": "suppressed_by_answer_lane",
+                        "error_class": None,
+                    },
+                }
         local_reflex_started_at_ms = time.time_ns() // 1_000_000
         # A coalesced job keeps the first final's hard deadline, but a local
         # reflex must be timed from the target evidence that made the pattern
@@ -11478,7 +11797,7 @@ def create_app(
         coach_would_trigger = coach_gate_open and (
             coach_runtime_requested != "pi"
             or bool(coach_candidates)
-            or request.trigger_type in {"user_request", "task_due"}
+            or request.trigger_type in {"user_request", "task_due", "answer_ready"}
         )
         coach_evaluation_started_at_ms = time.time_ns() // 1_000_000
         (
@@ -11520,7 +11839,6 @@ def create_app(
             meeting_id,
             "correction",
         )
-        realtime_circuit_identity = _realtime_provider_identity(config)
         provider_access_scope = (
             "pi_deep"
             if (
@@ -11528,10 +11846,15 @@ def create_app(
                 and coach_runtime_requested == "pi"
                 and coach_priority_mode == "deep"
             )
-            else "pi_coach"
+            else "pi_realtime"
             if coach_would_trigger and coach_runtime_requested == "pi"
             else "direct_semantic"
         )
+        realtime_circuit_identity = _realtime_provider_identity(
+            config,
+            scope=provider_access_scope,
+        )
+        provider_circuit = realtime_provider_circuits[provider_access_scope]
         coach_circuit_admission = None
         coach_circuit_permit = None
         coach_circuit_suppressed = False
@@ -11543,14 +11866,14 @@ def create_app(
         coach_reservation_conflict: dict[str, Any] | None = None
         if provider_access_scope == "direct_semantic":
             coach_circuit_admission = _acquire_direct_semantic_provider_admission(
-                realtime_provider_circuit,
+                provider_circuit,
                 realtime_circuit_identity,
             )
         elif hard_coach_provider_timeout_ms >= REALTIME_COACH_MIN_PROVIDER_BUDGET_MS:
             # Admit a bounded Pi recovery trial using the hard budget even when
             # the soft window has already closed. This preserves the specific
             # circuit reason without starting Provider work after the cutoff.
-            coach_circuit_admission = realtime_provider_circuit.acquire(realtime_circuit_identity)
+            coach_circuit_admission = provider_circuit.acquire(realtime_circuit_identity)
         if coach_circuit_admission is not None:
             if coach_circuit_admission.admitted:
                 coach_circuit_permit = coach_circuit_admission.permit
@@ -11565,7 +11888,7 @@ def create_app(
         )
         if (
             coach_circuit_permit is not None
-            and provider_access_scope in {"pi_coach", "pi_deep"}
+            and provider_access_scope in {"pi_realtime", "pi_deep"}
             and not coach_triggered
         ):
             # Admission happens before the soft-window decision so an open
@@ -11634,11 +11957,16 @@ def create_app(
             # needs the same cross-worker Provider reservation fence. Keep the
             # synthetic key scoped to this job and label it as a request so it
             # cannot be mistaken for host-detected evidence later.
-            if request.trigger_type in {"user_request", "task_due"} and not reservation_candidate_keys:
+            if (
+                request.trigger_type in {"user_request", "task_due", "answer_ready"}
+                and not reservation_candidate_keys
+            ):
                 reservation_candidate_keys = [
                     (
                         f"user-request:{meeting_id}:{job['id']}"
                         if request.trigger_type == "user_request"
+                        else f"answer-ready:{meeting_id}:{request.work_item_id or job['id']}"
+                        if request.trigger_type == "answer_ready"
                         else f"task-due:{meeting_id}:{request.work_item_id or job['id']}"
                     )
                 ]
@@ -12352,7 +12680,7 @@ def create_app(
                     if coach_budget_exhausted
                     or (
                         coach_circuit_suppressed
-                        and provider_access_scope in {"pi_coach", "pi_deep"}
+                        and provider_access_scope in {"pi_realtime", "pi_deep"}
                     )
                     or coach_reservation_suppressed
                     else "direct_intelligence"
@@ -12612,7 +12940,7 @@ def create_app(
                 }
             )
         if coach_circuit_admission is not None:
-            circuit_snapshot = realtime_provider_circuit.snapshot(
+            circuit_snapshot = provider_circuit.snapshot(
                 realtime_circuit_identity
             )
             agent_metrics.update(
@@ -12663,7 +12991,7 @@ def create_app(
                 or coach_result.get("status_reason")
                 or "provider_not_required"
             )[:128]
-        provider_circuit_snapshot = realtime_provider_circuit.snapshot(
+        provider_circuit_snapshot = provider_circuit.snapshot(
             realtime_circuit_identity
         )
         provider_availability = {
@@ -12741,6 +13069,13 @@ def create_app(
             for key in provenance_keys
             if coach_result.get(key) is not None
         }
+        public_agent_metrics = _public_coach_agent_metrics(agent_metrics)
+        prompt_profile = str(public_agent_metrics.get("prompt_profile") or "").strip()
+        deep_answer_id = (
+            str(current_answer.get("suggestion_id") or "").strip()
+            if prompt_profile == "deep_answer" and current_answer is not None
+            else ""
+        )
         coach_decision.update(
             {
                 "meeting_id": meeting_id,
@@ -12801,11 +13136,17 @@ def create_app(
                 # Keep the safe phase metrics in the formal decision so the
                 # public snapshot/event/replay path can explain latency and
                 # budget outcomes without opening private job output.
-                "agent_metrics": _public_coach_agent_metrics(agent_metrics),
+                "agent_metrics": public_agent_metrics,
+                "prompt_profile": prompt_profile or None,
+                "answer_id": deep_answer_id or None,
                 # Validity belongs to the decision envelope, including an
                 # explicit silent decision. This makes audit/replay consumers
                 # able to distinguish an active silence from an old one.
-                "valid_until_ms": coach_timing["completed_at_ms"] + COACH_INTERVENTION_VALIDITY_MS,
+                "valid_until_ms": (
+                    None
+                    if prompt_profile == "deep_answer"
+                    else coach_timing["completed_at_ms"] + COACH_INTERVENTION_VALIDITY_MS
+                ),
                 "lifecycle_action": {
                     "intervention": "retain",
                     "stale": "retract",
@@ -13061,12 +13402,12 @@ def create_app(
             },
         }
 
-    def _open_realtime_intelligence_jobs_for_correction(
+    def _open_realtime_jobs_for_correction(
         meeting_id: str,
         *,
         now_ms: int,
     ) -> list[dict[str, Any]]:
-        """Return live Pi jobs that still own a viable realtime window.
+        """Return Answer/Pi jobs that still own the initial realtime window.
 
         Correction and intelligence have independent durable consumers. The
         correction worker therefore needs an explicit admission barrier before
@@ -13083,25 +13424,29 @@ def create_app(
             return []
         normalized_now_ms = max(0, int(now_ms))
         blockers: list[dict[str, Any]] = []
-        for candidate in v2_persistence.list_jobs(
-            meeting_id=str(meeting_id),
-            lane="intelligence",
-        ):
-            status = str(candidate.get("status") or "")
-            if status == "running":
-                blockers.append(candidate)
-                continue
-            if status not in {"pending", "retry_wait"}:
-                continue
-            deadline_at_ms = candidate.get("deadline_at_ms")
-            if deadline_at_ms is None:
-                # Rows from before the deadline column was introduced are
-                # backfilled by ``claim_next_job``. Use the same derivation
-                # here so an old, never-claimed row cannot block correction
-                # forever when the intelligence worker is not running.
-                deadline_at_ms = int(candidate.get("created_at_ms") or 0) + INTELLIGENCE_REALTIME_BUDGET_MS
-            if int(deadline_at_ms) > normalized_now_ms:
-                blockers.append(candidate)
+        for lane in ("answer", "intelligence"):
+            for candidate in v2_persistence.list_jobs(
+                meeting_id=str(meeting_id),
+                lane=lane,
+            ):
+                status = str(candidate.get("status") or "")
+                if status == "running":
+                    blockers.append(candidate)
+                    continue
+                if status not in {"pending", "retry_wait"}:
+                    continue
+                if lane == "answer":
+                    blockers.append(candidate)
+                    continue
+                deadline_at_ms = candidate.get("deadline_at_ms")
+                if deadline_at_ms is None:
+                    # Rows from before the deadline column was introduced are
+                    # backfilled by ``claim_next_job``. Use the same derivation
+                    # here so an old, never-claimed row cannot block correction
+                    # forever when the intelligence worker is not running.
+                    deadline_at_ms = int(candidate.get("created_at_ms") or 0) + INTELLIGENCE_REALTIME_BUDGET_MS
+                if int(deadline_at_ms) > normalized_now_ms:
+                    blockers.append(candidate)
         return blockers
 
     def _defer_correction_for_realtime_priority(job: Mapping[str, Any]) -> None:
@@ -13109,6 +13454,10 @@ def create_app(
 
         meeting_id = str(job.get("meeting_id") or "").strip()
         if not meeting_id:
+            return
+        now_ms = time.time_ns() // 1_000_000
+        created_at_ms = max(0, int(job.get("created_at_ms") or now_ms))
+        if now_ms - created_at_ms >= REALTIME_CORRECTION_MAX_PRIORITY_WAIT_MS:
             return
         if str(job.get("idempotency_key") or "").endswith("meeting.ended"):
             return
@@ -13119,9 +13468,9 @@ def create_app(
             except KeyError:
                 # Let the normal correction path report a missing meeting.
                 pass
-        blockers = _open_realtime_intelligence_jobs_for_correction(
+        blockers = _open_realtime_jobs_for_correction(
             meeting_id,
-            now_ms=time.time_ns() // 1_000_000,
+            now_ms=now_ms,
         )
         if blockers:
             raise CorrectionProviderPriorityDeferred(
@@ -13215,7 +13564,15 @@ def create_app(
                 )
             except KeyError:
                 meeting_ended = False
-        force = meeting_ended or int(job.get("attempts") or 0) > 1
+        correction_age_ms = max(
+            0,
+            time.time_ns() // 1_000_000 - int(job.get("created_at_ms") or 0),
+        )
+        force = (
+            meeting_ended
+            or int(job.get("attempts") or 0) > 1
+            or correction_age_ms >= REALTIME_CORRECTION_MAX_PRIORITY_WAIT_MS
+        )
         try:
             result = run_once(
                 str(job["meeting_id"]),
@@ -13597,6 +13954,194 @@ def create_app(
         finally:
             lane_lease.release()
 
+    async def _default_v2_answer_job_handler(job: dict[str, Any]) -> dict[str, Any]:
+        """Generate the immediate speakable answer independently from Pi."""
+
+        if v2_persistence is None:
+            raise RuntimeError("V2 persistence is unavailable")
+        if str(job.get("kind") or "") != "answer":
+            raise ValueError("answer handler requires an answer job")
+        session_id = str(job["meeting_id"])
+        segment = v2_persistence.get_transcript_segment(
+            session_id,
+            str(job["evidence_segment_id"]),
+        )
+        preparation = (
+            meeting_preparation_store.get(session_id)
+            if meeting_preparation_store is not None
+            else None
+        )
+        trigger = detect_answer_trigger(
+            text=segment.get("normalized_text") or segment.get("text"),
+            source_track=segment.get("source_track"),
+            preset_id=preparation.preset_id if preparation is not None else "general",
+            allow_single_track_microphone=bool(
+                preparation is not None
+                and preparation.input_source == "microphone"
+                and segment.get("source_track") == "microphone"
+            ),
+            single_track_focus_terms=(
+                (*preparation.focus_points, *preparation.hotwords)
+                if preparation is not None
+                else ()
+            ),
+        )
+        if not trigger.should_answer or not trigger.question_text:
+            return {
+                "generated_answer_count": 0,
+                "reason": trigger.reason,
+                "confidence": trigger.confidence,
+            }
+
+        answer_id = f"answer:{job['id']}"
+        lease_owner = str(job.get("lease_owner") or "")
+        v2_persistence.upsert_suggestion_draft(
+            suggestion_id=answer_id,
+            meeting_id=session_id,
+            job_id=str(job["id"]),
+            generation_id=str(job["generation_id"]),
+            evidence_segment_id=str(job["evidence_segment_id"]),
+            evidence_transcript_seq=int(job["input_transcript_seq"]),
+            evidence_hash=str(job["evidence_hash"]),
+            state_revision=int(job["input_version"]),
+            draft_text="",
+            draft_seq=0,
+            now_ms=time.time_ns() // 1_000_000,
+            kind="answer",
+            question_text=trigger.question_text,
+            runtime="openai_compatible_streaming",
+            lease_owner=lease_owner or None,
+        )
+
+        config = llm_service.LlmConfig.from_env()
+        if config is None:
+            v2_persistence.update_suggestion_error(
+                suggestion_id=answer_id,
+                error_class="provider_not_configured",
+                now_ms=time.time_ns() // 1_000_000,
+                expected_job_id=str(job["id"]),
+                expected_lease_owner=lease_owner,
+            )
+            raise ProviderRuntimeNotConfiguredDeferred()
+        config = llm_service.realtime_config(config)
+        _ensure_llm_provider_allowed_for_derivation(
+            config,
+            allow_non_acceptance_execution=False,
+        )
+        _enforce_llm_budget(session_id, purpose="realtime_answer", config=config)
+        lane_lease = llm_lane_locks.try_acquire(session_id, "answer")
+        if lane_lease is None:
+            raise RuntimeError("answer lane is already in flight")
+        try:
+            v2_persistence.update_suggestion_error(
+                suggestion_id=answer_id,
+                error_class=None,
+                now_ms=time.time_ns() // 1_000_000,
+                expected_job_id=str(job["id"]),
+                expected_lease_owner=lease_owner,
+            )
+            snapshot = v2_persistence.get_snapshot(session_id, segment_limit=16)
+            context_segments = [
+                item
+                for item in snapshot.get("segments") or []
+                if int(item.get("transcript_seq") or 0) <= int(job["input_transcript_seq"])
+            ][-12:]
+            messages = build_realtime_answer_messages(
+                question_text=trigger.question_text,
+                context_segments=context_segments,
+                preset_id=preparation.preset_id if preparation is not None else "general",
+                meeting_goal=preparation.meeting_goal if preparation is not None else None,
+                participant_role=preparation.participant_role if preparation is not None else None,
+                focus_points=preparation.focus_points if preparation is not None else (),
+                single_track_mixed=bool(
+                    preparation is not None
+                    and preparation.input_source == "microphone"
+                    and segment.get("source_track") == "microphone"
+                ),
+            )
+            streaming_client = _provider_client_for_lane("answer")
+            if streaming_client is None:
+                raise RuntimeError("answer streaming LLM client is not started")
+            audit = llm_service.provider_audit_metadata(config, purpose="realtime_answer")
+            provider = OpenAICompatibleStreamingProvider(
+                base_url=config.base_url,
+                api_key=config.api_key,
+                model=config.model,
+                client=streaming_client,
+                timeout_seconds=min(config.timeout_seconds, 12.0),
+                api_style=config.api_style,
+            )
+            try:
+                result = await generate_streaming_suggestion(
+                    job=job,
+                    messages=messages,
+                    provider=provider,
+                    persistence=v2_persistence,
+                    suggestion_id=answer_id,
+                    question_text=trigger.question_text,
+                    runtime="openai_compatible_streaming",
+                    provider_name=str(audit.get("provider") or "openai_compatible"),
+                    model=str(audit.get("model") or config.model),
+                    max_characters=420,
+                    completion_parameters={
+                        "reasoning_effort": "low",
+                        "temperature": 0.25,
+                        "max_completion_tokens": 140,
+                    },
+                )
+            except Exception as exc:
+                category = getattr(exc, "category", None)
+                error_class = str(getattr(category, "value", "") or type(exc).__name__)
+                try:
+                    v2_persistence.update_suggestion_error(
+                        suggestion_id=answer_id,
+                        error_class=error_class,
+                        now_ms=time.time_ns() // 1_000_000,
+                        expected_job_id=str(job["id"]),
+                        expected_lease_owner=lease_owner,
+                    )
+                except (KeyError, ValueError, sqlite3.Error):
+                    pass
+                raise
+            observe_provider_timing(
+                pipeline_traces,
+                trace_id=str(job["id"]),
+                meeting_id=session_id,
+                job_id=str(job["id"]),
+                generation_id=str(job.get("generation_id") or "") or None,
+                timings=result.get("timings"),
+                provider_attempt_count=1,
+            )
+            _record_llm_usage(
+                session_id,
+                purpose="realtime_answer",
+                config=config,
+                usage=dict(result.get("usage") or {}),
+            )
+            _mark_v2_job_stage(job, "validated", attributes={"answer_count": 1})
+            _mark_v2_job_stage(
+                job,
+                "event_emitted",
+                attributes={"suggestion_id": answer_id},
+            )
+            deep_job = v2_persistence.enqueue_answer_coach_request(
+                meeting_id=session_id,
+                answer_id=answer_id,
+                now_ms=time.time_ns() // 1_000_000,
+            )
+            executor = getattr(app.state, "v2_executor", None)
+            if executor is not None:
+                executor.wake()
+            return {
+                **result,
+                "generated_answer_count": 1,
+                "trigger_reason": trigger.reason,
+                "trigger_confidence": trigger.confidence,
+                "deep_coach_job_id": str(deep_job["id"]),
+            }
+        finally:
+            lane_lease.release()
+
     def _with_v2_intelligence_result_contract(result: Mapping[str, Any]) -> dict[str, Any]:
         """Separate execution outcome from the coach's product decision."""
 
@@ -13656,6 +14201,7 @@ def create_app(
         deep_job = str(job.get("trigger_type") or "").strip() in {
             "task_due",
             "user_request",
+            "answer_ready",
         }
         release_lane_reservation = (
             provider_lane_registry.release_deep
@@ -13731,6 +14277,7 @@ def create_app(
     app.state.v2_correction_job_handler_async_impl = _default_v2_correction_job_handler_realtime
     app.state._v2_default_correction_job_handler = _default_v2_correction_job_handler
     app.state.v2_suggestion_job_handler_impl = _default_v2_suggestion_job_handler
+    app.state.v2_answer_job_handler_impl = _default_v2_answer_job_handler
 
     def _completed_realtime_correction_covers_jobs(
         meeting_id: str,
@@ -14044,7 +14591,7 @@ def create_app(
                 "lane": (
                     "pi_deep"
                     if str(job.get("trigger_type") or "").strip()
-                    in {"task_due", "user_request"}
+                    in {"task_due", "user_request", "answer_ready"}
                     else "intelligence"
                 ),
                 "job_queue_latency_ms": max(
@@ -14058,6 +14605,10 @@ def create_app(
     def _run_v2_suggestion_job(job: dict[str, Any]) -> Any:
         _mark_v2_job_stage(job, "job_claimed", attributes={"lane": "suggestion"})
         return app.state.v2_suggestion_job_handler_impl(job)
+
+    def _run_v2_answer_job(job: dict[str, Any]) -> Any:
+        _mark_v2_job_stage(job, "job_claimed", attributes={"lane": "answer"})
+        return app.state.v2_answer_job_handler_impl(job)
 
     def _record_v2_job_lifecycle(event: Mapping[str, Any]) -> None:
         """Project content-free durable lifecycle facts into the trace/SLO sink."""
@@ -14166,7 +14717,7 @@ def create_app(
             provenance_snapshot = trace.execution_snapshot().get("provenance") or {}
             if "speech_endpoint" not in provenance_snapshot:
                 trigger_type = str(job.get("trigger_type") or "").strip()
-                if trigger_type in {"task_due", "user_request"}:
+                if trigger_type in {"task_due", "user_request", "answer_ready"}:
                     _safe(
                         trace.record_provenance_stage,
                         "speech_endpoint",
@@ -14667,6 +15218,7 @@ def create_app(
             correction_handler=_run_v2_correction_job,
             suggestion_handler=_run_v2_suggestion_job,
             additional_handlers={
+                "answer": _run_v2_answer_job,
                 "intelligence": _run_v2_intelligence_job,
                 "pi_deep": _run_v2_intelligence_job,
                 "minutes": lambda job: _dispatch_v2_post_job("minutes", job),
@@ -14790,6 +15342,7 @@ def create_app(
         for lane, attribute in (
             ("general", "streaming_llm_client"),
             ("realtime", "realtime_llm_client"),
+            ("answer", "answer_llm_client"),
             ("deep", "deep_llm_client"),
             ("correction", "correction_llm_client"),
         ):
@@ -15032,6 +15585,7 @@ def create_app(
         for attribute in (
             "streaming_llm_client",
             "realtime_llm_client",
+            "answer_llm_client",
             "deep_llm_client",
             "correction_llm_client",
         ):
@@ -16107,9 +16661,9 @@ def _latest_active_pi_coach_intervention(
 ) -> tuple[dict[str, Any], dict[str, Any]] | None:
     """Return the latest still-active Pi episode for lifecycle reconciliation.
 
-    Coach events are append-only.  The first decision-bearing applied event
-    therefore represents the current lifecycle state: an explicit silent,
-    stale, or failed decision closes any earlier card.  Keeping this lookup in
+    Coach events are append-only. Only a new intervention or an explicit
+    lifecycle transition changes the current card; ordinary silence or a
+    failed Provider turn leaves the last useful card active. Keeping this lookup in
     the host avoids teaching the generic candidate detector to spend a costly
     Provider turn for every ordinary resolution sentence.  A deterministic
     local fallback is included only when it was produced *after* a real Pi
@@ -16134,6 +16688,8 @@ def _latest_active_pi_coach_intervention(
         if not isinstance(decision, Mapping):
             # Semantic-only historical events do not establish coach
             # lifecycle state; continue until a provenance decision is found.
+            continue
+        if not coach_decision_replaces_prior_intervention(payload, decision):
             continue
         decision_origin = str(decision.get("origin") or "").strip()
         decision_runtime = str(decision.get("runtime_used") or "").strip()
@@ -16178,7 +16734,11 @@ def _latest_active_pi_coach_intervention(
             valid_until_ms = int(valid_until_raw) if valid_until_raw is not None else None
         except (TypeError, ValueError, OverflowError):
             valid_until_ms = None
-        if valid_until_ms is not None and valid_until_ms <= normalized_now_ms:
+        if (
+            valid_until_ms is not None
+            and valid_until_ms <= normalized_now_ms
+            and not is_deep_answer_coach_decision(decision)
+        ):
             return None
         return dict(decision), dict(intervention)
     return None
@@ -16518,6 +17078,8 @@ def _coach_follow_up_from_event_payload(payload: Mapping[str, Any]) -> dict[str,
                     "delivery_status",
                     "late_result_discarded",
                     "valid_until_ms",
+                    "prompt_profile",
+                    "answer_id",
                     "lifecycle_action",
                     "supersedes_decision_id",
                     "superseded_by",
@@ -16547,6 +17109,8 @@ def _coach_supersession_index(
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
         decision = payload.get("coach_decision")
         if not isinstance(decision, Mapping):
+            continue
+        if not coach_decision_replaces_prior_intervention(payload, decision):
             continue
         supersedes = str(decision.get("supersedes_decision_id") or "").strip()
         replacement = str(decision.get("decision_id") or "").strip()
@@ -16752,6 +17316,8 @@ def _coach_due_work_items(
         if item.get("lifecycle_action") != "retain":
             continue
         valid_until = item.get("valid_until_ms")
+        if str(item.get("prompt_profile") or "") == "deep_answer":
+            continue
         if not isinstance(valid_until, int) or valid_until > now_ms:
             continue
         decision_id = str(item.get("decision_id") or "").strip()
@@ -16776,17 +17342,39 @@ def _latest_formal_coach_follow_up(
     formal_events: list[dict[str, Any]],
     *,
     now_ms: int | None = None,
+    current_answer_id: str | None = None,
 ) -> dict[str, Any] | None:
     effective_now_ms = time.time_ns() // 1_000_000 if now_ms is None else max(0, int(now_ms))
     for event in reversed(formal_events):
         if event.get("type") != "meeting.intelligence.applied":
             continue
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        decision = payload.get("coach_decision")
+        if isinstance(decision, Mapping) and not coach_decision_replaces_prior_intervention(
+            payload,
+            decision,
+        ):
+            continue
         follow_up = _coach_follow_up_from_event_payload(payload)
         if follow_up is None:
+            if isinstance(decision, Mapping):
+                return None
+            continue
+        if (
+            current_answer_id
+            and str(follow_up.get("answer_id") or "").strip()
+            and str(follow_up.get("answer_id") or "").strip() != current_answer_id
+        ):
             return None
         valid_until_ms = follow_up.get("valid_until_ms")
-        if valid_until_ms is not None and effective_now_ms >= int(valid_until_ms):
+        if (
+            valid_until_ms is not None
+            and effective_now_ms >= int(valid_until_ms)
+            and not (
+                isinstance(decision, Mapping)
+                and is_deep_answer_coach_decision(decision)
+            )
+        ):
             return None
         question = str(follow_up.get("question") or "").strip()
         reason = str(follow_up.get("reason") or "").strip()
@@ -16797,13 +17385,19 @@ def _latest_formal_coach_follow_up(
 
 
 def _latest_formal_coach_decision(formal_events: list[dict[str, Any]]) -> dict[str, Any] | None:
+    latest_non_replacing: dict[str, Any] | None = None
     for event in reversed(formal_events):
         if event.get("type") != "meeting.intelligence.applied":
             continue
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
         decision = payload.get("coach_decision")
         if isinstance(decision, Mapping):
-            return {**dict(decision), **_formal_projection_metadata(event)}
+            projected = {**dict(decision), **_formal_projection_metadata(event)}
+            if latest_non_replacing is None:
+                latest_non_replacing = projected
+            if coach_decision_replaces_prior_intervention(payload, decision):
+                return projected
+            continue
         follow_up = _coach_follow_up_from_event_payload(payload)
         if follow_up is not None:
             return {
@@ -16812,8 +17406,7 @@ def _latest_formal_coach_decision(formal_events: list[dict[str, Any]]) -> dict[s
                 "decision_reason": None,
                 **_formal_projection_metadata(event),
             }
-        return None
-    return None
+    return latest_non_replacing
 
 
 def _latest_formal_semantic_follow_up(formal_events: list[dict[str, Any]]) -> dict[str, Any] | None:

@@ -131,6 +131,8 @@ export interface Suggestion {
   meetingId: string;
   jobId: string | null;
   generationId: string;
+  kind?: "follow_up" | "answer";
+  questionText?: string | null;
   evidenceSegmentId: string;
   evidenceTranscriptSeq: number;
   evidenceHash: string;
@@ -140,6 +142,12 @@ export interface Suggestion {
   draftSeq: number;
   text: string | null;
   finalDraftSeq: number | null;
+  runtime?: string | null;
+  provider?: string | null;
+  model?: string | null;
+  ttftMs?: number | null;
+  completedMs?: number | null;
+  errorClass?: string | null;
   feedback: SuggestionFeedback | null;
   createdAtMs: number;
   updatedAtMs: number;
@@ -294,7 +302,10 @@ export interface CoachDecisionProjection {
   softCutoffTriggered?: boolean;
   lateResultDiscarded?: boolean;
   validUntil?: number;
+  promptProfile?: string;
+  answerId?: string;
   lifecycleAction?: CoachLifecycleAction;
+  lifecycleRefresh?: boolean;
   lifecycleStatus?: CoachLifecycleStatus;
   supersedesDecisionId?: string | null;
   supersededBy?: string | null;
@@ -332,6 +343,8 @@ export interface FollowUpProjection {
   decisionId?: string;
   evidenceRevision?: string | number;
   validUntil?: number;
+  promptProfile?: string;
+  answerId?: string;
   lifecycleAction?: CoachLifecycleAction;
   lifecycleStatus?: CoachLifecycleStatus;
   supersedesDecisionId?: string | null;
