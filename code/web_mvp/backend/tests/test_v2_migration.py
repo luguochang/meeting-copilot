@@ -190,6 +190,15 @@ def test_normal_migration_uses_pre_v2_backup_and_reconciles_canonical_finals(
             "接口先灰度 5%。",
             "谁负责回滚？",
         ]
+        assert [segment["text"] for segment in snapshot["segments"]] == [
+            "接口 先灰度 5%。",
+            "谁负责回滚？",
+        ]
+        assert [segment["correction_status"] for segment in snapshot["segments"]] == [
+            "changed",
+            "no_change",
+        ]
+        assert [segment["revision"] for segment in snapshot["segments"]] == [2, 1]
         assert persistence.list_jobs(meeting_id="meeting-1") == []
         assert snapshot["suggestions"] == []
     finally:
@@ -234,6 +243,44 @@ def test_repeated_migration_is_idempotent_and_reuses_source_marker(tmp_path: Pat
             "SELECT attempts FROM v2_migration_markers WHERE migration_name = ?",
             (MIGRATION_NAME,),
         ).fetchone()[0] == 2
+
+
+def test_repeated_migration_repairs_legacy_pending_correction_projection(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "meeting_copilot.db"
+    _create_legacy_database(
+        database_path,
+        {
+            "meeting-1": _record(
+                "meeting-1",
+                _final("seg-1", "结构化翻新框。", at_ms=1_000),
+                _revision("seg-1", "结构化 function call。", at_ms=2_000),
+            )
+        },
+    )
+    V1ToV2ShadowMigrator(database_path).run()
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "UPDATE transcript_segments SET text = normalized_text, revision = 1, "
+            "correction_status = 'pending', correction_before_text = NULL, "
+            "correction_after_text = NULL, correction_updated_at_ms = NULL"
+        )
+
+    report = V1ToV2ShadowMigrator(database_path).run()
+
+    assert report["status"] == "completed"
+    persistence = V2Persistence(database_path)
+    try:
+        segment = persistence.get_snapshot("meeting-1")["segments"][0]
+    finally:
+        persistence.close()
+    assert segment["text"] == "结构化翻新框。"
+    assert segment["normalized_text"] == "结构化 function call。"
+    assert segment["revision"] == 2
+    assert segment["correction_status"] == "changed"
+    assert segment["correction_before_text"] == "结构化翻新框。"
+    assert segment["correction_after_text"] == "结构化 function call。"
 
 
 def test_interrupted_migration_keeps_legacy_data_and_resumes_idempotently(

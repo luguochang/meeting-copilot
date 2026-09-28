@@ -80,6 +80,14 @@ function suggestionText(suggestion: Suggestion): string {
   return suggestion.status === "committed" ? suggestion.text ?? suggestion.draftText : suggestion.draftText;
 }
 
+function answerHistoryText(suggestion: Suggestion): string {
+  return suggestion.text ?? suggestion.draftText;
+}
+
+function answerHistoryState(suggestion: Suggestion): string {
+  return suggestion.status === "superseded" ? "已替换" : "已完成";
+}
+
 function answerErrorMessage(suggestion: Suggestion): string {
   if (suggestion.errorClass === "provider_not_configured") {
     return "回答模型尚未连接，连接后会自动继续。";
@@ -529,6 +537,13 @@ export function NowRail({
     () => answer ?? currentSuggestion(suggestions.filter((item) => isFormalAi(item))),
     [answer, suggestions],
   );
+  const pastAnswers = useMemo(() => suggestions
+    .filter((item) => item.kind === "answer" && item.suggestionId !== answer?.suggestionId)
+    .filter((item) => item.status === "committed" || item.status === "superseded")
+    .filter((item) => item.feedback !== "ignored" && item.feedback !== "false_positive" && item.feedback !== "too_late")
+    .filter((item) => Boolean(answerHistoryText(item).trim()))
+    .sort((left, right) => right.evidenceTranscriptSeq - left.evidenceTranscriptSeq || right.updatedAtMs - left.updatedAtMs)
+    .slice(0, 5), [answer?.suggestionId, suggestions]);
   const isAnswer = suggestion?.kind === "answer";
   const questions = openQuestions.filter((question) => isFormalAi(question) && questionIsOpen(question)).slice(0, 3);
   const formalTopic = currentTopic && isFormalAi(currentTopic) ? currentTopic : null;
@@ -574,6 +589,12 @@ export function NowRail({
     : null;
   const pastCoachHistory = formalCoachHistory
     .filter((item) => item.historyId !== currentCoachHistoryId)
+    .filter((item) => !(
+      deepAnswerFollowUp
+      && suggestion?.kind === "answer"
+      && item.promptProfile === "deep_answer"
+      && item.answerId === suggestion.suggestionId
+    ))
     .reverse();
   const [menuOpen, setMenuOpen] = useState(false);
   const [coachHistoryExpanded, setCoachHistoryExpanded] = useState(false);
@@ -915,6 +936,36 @@ export function NowRail({
             </ul>
           </div>
         )}
+
+        {pastAnswers.length ? (
+          <div className="answer-history">
+            <div className="answer-history-heading">
+              <span><History size={13} />最近回答 <small>{pastAnswers.length}</small></span>
+            </div>
+            <ol className="answer-history-list" aria-label="最近回答">
+              {pastAnswers.map((item) => (
+                <li key={item.suggestionId}>
+                  <details>
+                    <summary>
+                      <span className="answer-history-summary">
+                        <span className="answer-history-meta">
+                          <time dateTime={new Date(item.updatedAtMs).toISOString()}>{coachHistoryTime(item.updatedAtMs)}</time>
+                          <span className="answer-history-state" data-status={item.status}>{answerHistoryState(item)}</span>
+                        </span>
+                        <span className="answer-history-question">{item.questionText ?? "历史问题"}</span>
+                      </span>
+                      <ChevronDown className="answer-history-chevron" size={14} aria-hidden="true" />
+                    </summary>
+                    <p>{answerHistoryText(item)}</p>
+                    <button className="evidence-link" type="button" onClick={() => onEvidence(item.evidenceSegmentId)}>
+                      <Quote size={12} />查看问题原话
+                    </button>
+                  </details>
+                </li>
+              ))}
+            </ol>
+          </div>
+        ) : null}
 
         {pastCoachHistory.length ? (
           <div className="coach-history">

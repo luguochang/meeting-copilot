@@ -1,9 +1,9 @@
 # Meeting Copilot Answer Copilot + Pi 双通道重构方案
 
 > 版本：v1.0
-> 日期：2026-09-28
+> 日期：2026-09-29（最新复验）
 > 目标分支：`feat/pi-realtime-coach-agent-loop`
-> 状态：Fast Answer、Pi Deep、Correction 的真实静音端到端验收已完成；同音频 `main` 基线和原生双轨协议已通过静音注入验证。真实物理麦克风 + system audio 五分钟采集和会中移动端视觉验收待完成。后续代码、测试和验收必须能回到本文件中的用户效果与指标。
+> 状态：Fast Answer、Pi Deep、Correction 的真实静音端到端验收已完成；同音频 `main` 基线和原生双轨协议已通过静音注入验证；会中 Answer/Pi 桌面和移动布局已完成无声视觉验收。真实物理麦克风 + system audio 五分钟采集待完成。后续代码、测试和验收必须能回到本文件中的用户效果与指标。
 
 ## 0. 决策摘要
 
@@ -243,8 +243,8 @@ created_at_ms / updated_at_ms
 - [x] 右侧改为稳定的“当前问题 / 建议回答 / Pi 深度补充”布局。
 - [x] 显示 streaming 生成状态，禁止标题闪烁替换正文。
 - [x] `answer` 的复制按钮文案为“复制回答”，不再叫“复制追问”。
-- [ ] 最近回答和过去教练建议分开保存与展示。
-- [ ] 桌面和移动宽度无文字溢出、跳动或卡片嵌套。
+- [x] 最近回答和过去教练建议分开保存与展示；当前 Answer 绑定的 Deep 补充不会在历史区重复出现。
+- [x] 桌面和移动宽度无文字溢出、跳动或卡片嵌套；已覆盖 `1440x1000` 与 `390x844`。
 
 ### E. 自动化验证
 
@@ -263,7 +263,7 @@ created_at_ms / updated_at_ms
 - [x] 使用同一固定音频对比 `origin/main@5cd0ed5` 与当前分支；相同本地 refiner 配置下 canonical transcript 逐字一致。
 - [x] 使用 `native_pcm_v2` 静音注入 microphone/system audio 两条独立 WebSocket，验证 track/epoch/sequence、并发 ASR、Fast Answer 和 Pi Deep。
 - [ ] 使用桌面原生麦克风 + system audio 完成真正双轨双方对话测试。
-- [x] 保存脱敏快照指标并形成验收报告；真实页面截图待浏览器视觉验收补充。
+- [x] 保存脱敏快照指标并形成验收报告；真实页面已使用禁用音频输出和 MediaDevices 的 Chromium 完成视觉验收。
 
 详细证据、真实输出和剩余风险见 [meeting-copilot_answer-copilot_pi-acceptance_20260927.md](./meeting-copilot_answer-copilot_pi-acceptance_20260927.md)。
 
@@ -279,6 +279,10 @@ created_at_ms / updated_at_ms
 静音验收使用预生成的 16kHz 单声道 float32 PCM 直接写入真实 ASR WebSocket。网页单轨按每 100ms 一帧发送；原生双轨按 `native_pcm_v2` 的 300ms 帧分别携带 microphone/system audio track、capture epoch、sequence 和 timestamp。该方法经过真实 FunASR、durable jobs、真实 Provider、数据库和页面投影，但不会打开麦克风、播放声音或触发录音权限。它验证了网页单轨主链和桌面原生双轨协议/后端主链，不等价于 macOS 物理设备采集验收。
 
 原生双轨真实 Provider 样本 `accept_silent_dual_native_20260928_03` 中，Fast Answer 约 `1775ms / 3955ms` 首字/完成，Pi Deep 约 `3444ms / 5387ms / 5751ms` 首字/决策/投影，Agent turn/tool call 为 `1 / 1`，`deep_answer` 精确绑定当前 Answer。Deep 卡曾被后到 microphone 文本的通用词错误判定为 lifecycle resolved；现已将绑定 Answer 的 Deep 卡排除在普通实时卡 matcher 之外，只随当前 Answer 变化而退出。
+
+2026-09-29 的补充验收将当前回答与最近 5 条 Answer 历史分区，过去 Pi 建议继续独立展示。桌面右栏和移动正文的 `clientWidth` 与 `scrollWidth` 完全一致，未出现横向溢出；当前 Deep 卡不重复进入历史，也没有卡片嵌套。浏览器以 `--disable-audio-output --disable-features=MediaDevices` 运行，不使用麦克风或扬声器。
+
+同轮修复了 V1 -> V2 shadow migration 的校对状态假 pending：迁移后的 raw `text` 与 canonical `normalized_text` 分离保存，已有 revision 投影为 `changed/no_change`，且不会为已完成的历史 revision 创建虚假 correction job。修复受 migration causation、source checksum、canonical 一致性和“无真实 correction job”四层条件保护，避免误改实时会议。
 
 ## 10. 本轮非目标
 

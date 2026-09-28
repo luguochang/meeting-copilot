@@ -65,6 +65,7 @@ class _CanonicalFinal:
     segment_id: str
     text: str
     normalized_text: str
+    correction_status: str
     started_at_ms: int | None
     ended_at_ms: int | None
     evidence_hash: str
@@ -296,7 +297,23 @@ class V1ToV2ShadowMigrator:
             report["meetings"].append(meeting_report)
             commit_errors: dict[str, str] = {}
             for final in finals:
+                reconcile_correction = getattr(
+                    persistence,
+                    "reconcile_migrated_transcript_correction",
+                    None,
+                )
                 try:
+                    if callable(reconcile_correction):
+                        reconcile_correction(
+                            meeting_id=meeting_id,
+                            final_id=final.final_id,
+                            segment_id=final.segment_id,
+                            source_checksum=source.source_checksum,
+                            original_text=final.text,
+                            normalized_text=final.normalized_text,
+                            correction_status=final.correction_status,
+                            now_ms=final.now_ms,
+                        )
                     result = persistence.commit_final_and_enqueue(
                         meeting_id=meeting_id,
                         final_id=final.final_id,
@@ -329,6 +346,17 @@ class V1ToV2ShadowMigrator:
                     meeting_report["created_final_count"] += 1
                 else:
                     meeting_report["idempotent_final_count"] += 1
+                if callable(reconcile_correction):
+                    reconcile_correction(
+                        meeting_id=meeting_id,
+                        final_id=final.final_id,
+                        segment_id=final.segment_id,
+                        source_checksum=source.source_checksum,
+                        original_text=final.text,
+                        normalized_text=final.normalized_text,
+                        correction_status=final.correction_status,
+                        now_ms=final.now_ms,
+                    )
             _reconcile_meeting(
                 self.database_path,
                 meeting_report,
@@ -651,13 +679,21 @@ def _parse_source_meeting(
         seen_segment_ids.add(segment_id)
         started_at_ms = _optional_nonnegative_int(segment.get("start_ms"))
         ended_at_ms = _optional_nonnegative_int(segment.get("end_ms"))
+        original_text = _normalize_text(segment.get("original_text")) or normalized_text
+        correction_status = (
+            "changed"
+            if str(segment.get("status") or "").strip().lower() == "corrected"
+            and original_text != normalized_text
+            else "no_change"
+        )
         evidence_hash = transcript_evidence_hash(segment_id, normalized_text)
         finals.append(
             _CanonicalFinal(
                 final_id=f"final:{meeting_id}:{segment_id}",
                 segment_id=segment_id,
-                text=normalized_text,
+                text=original_text,
                 normalized_text=normalized_text,
+                correction_status=correction_status,
                 started_at_ms=started_at_ms,
                 ended_at_ms=ended_at_ms,
                 evidence_hash=evidence_hash,

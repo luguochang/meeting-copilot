@@ -2669,6 +2669,87 @@ class V2Persistence:
                 )
         return True
 
+    def reconcile_migrated_transcript_correction(
+        self,
+        *,
+        meeting_id: str,
+        final_id: str,
+        segment_id: str,
+        source_checksum: str,
+        original_text: str,
+        normalized_text: str,
+        correction_status: str,
+        now_ms: int,
+    ) -> bool:
+        """Restore canonical revision state for one migration-owned segment.
+
+        Shadow migration intentionally creates no correction jobs because the
+        legacy canonical projection has already applied its revisions. Older
+        migrations left those rows permanently ``pending`` and discarded the
+        pre-revision text. Reconcile only rows proven to belong to this exact
+        migration and never overwrite a segment that has a real correction
+        job or has drifted from the source canonical text.
+        """
+
+        meeting_id = _required(meeting_id, "meeting_id")
+        final_id = _required(final_id, "final_id")
+        segment_id = _required(segment_id, "segment_id")
+        source_checksum = _required(source_checksum, "source_checksum")
+        original_text = _required(original_text, "original_text")
+        normalized_text = _required(normalized_text, "normalized_text")
+        normalized_status = str(correction_status or "").strip().lower()
+        if normalized_status not in {"changed", "no_change"}:
+            raise ValueError("migration correction status must be changed or no_change")
+        updated_at_ms = max(0, int(now_ms))
+        expected_causation_id = f"migration:{source_checksum}"
+        with self._write_transaction():
+            event = self._conn.execute(
+                "SELECT causation_id FROM meeting_events WHERE meeting_id = ? "
+                "AND type = 'transcript.segment.finalized' AND idempotency_key = ?",
+                (meeting_id, f"transcript.final:{final_id}"),
+            ).fetchone()
+            segment = self._conn.execute(
+                "SELECT normalized_text FROM transcript_segments WHERE meeting_id = ? "
+                "AND segment_id = ? AND final_id = ?",
+                (meeting_id, segment_id, final_id),
+            ).fetchone()
+            if (
+                event is None
+                or str(event["causation_id"] or "") != expected_causation_id
+                or segment is None
+                or str(segment["normalized_text"] or "") != normalized_text
+            ):
+                return False
+            has_real_correction_job = self._conn.execute(
+                "SELECT 1 FROM jobs WHERE meeting_id = ? AND kind = 'correction' "
+                "AND evidence_segment_id = ? LIMIT 1",
+                (meeting_id, segment_id),
+            ).fetchone()
+            if has_real_correction_job is not None:
+                return False
+            result = self._conn.execute(
+                "UPDATE transcript_segments SET text = ?, normalized_text = ?, "
+                "revision = CASE WHEN ? = 'changed' THEN MAX(revision, 2) ELSE revision END, "
+                "correction_status = ?, correction_before_text = ?, correction_after_text = ?, "
+                "correction_error_class = NULL, correction_updated_at_ms = ?, "
+                "updated_at_ms = MAX(updated_at_ms, ?) "
+                "WHERE meeting_id = ? AND segment_id = ? AND final_id = ?",
+                (
+                    original_text,
+                    normalized_text,
+                    normalized_status,
+                    normalized_status,
+                    original_text,
+                    normalized_text,
+                    updated_at_ms,
+                    updated_at_ms,
+                    meeting_id,
+                    segment_id,
+                    final_id,
+                ),
+            )
+        return result.rowcount == 1
+
     def _ensure_meeting_speaker_locked(
         self,
         *,

@@ -1,9 +1,9 @@
 # Meeting Copilot Answer Copilot + Pi 验收报告
 
-> 日期：2026-09-28
+> 日期：2026-09-29（最新复验）
 > 分支：`feat/pi-realtime-coach-agent-loop`
 > 基线：`0b69f1a`
-> 结论：Fast Answer、Pi Deep Coach、后台转写精修三条独立通道已通过真实 FunASR + 真实 Provider 的静音端到端验收，Pi 已能给出绑定当前回答的边界、风险和追问。相同固定音频的 `main` 基线对比、原生 microphone/system audio 双轨协议和并发链路也已通过静音 PCM 注入验证。真实物理麦克风 + system audio 五分钟采集、会中移动端视觉仍是发布前阻塞项；Provider 延迟也仍有偶发越过严格性能线的样本。
+> 结论：Fast Answer、Pi Deep Coach、后台转写精修三条独立通道已通过真实 FunASR + 真实 Provider 的静音端到端验收，Pi 已能给出绑定当前回答的边界、风险和追问。相同固定音频的 `main` 基线对比、原生 microphone/system audio 双轨协议和并发链路也已通过静音 PCM 注入验证；当前 Answer、最近回答与过去 Pi 建议的桌面/移动布局也已完成静音视觉验收。真实物理麦克风 + system audio 五分钟采集仍是发布前阻塞项；Provider 延迟也仍有偶发越过严格性能线的样本。
 
 ## 1. 这次解决的产品问题
 
@@ -146,12 +146,12 @@ Correction 的计价边界已固定：Provider 完全没有配置价格变量时
 
 ## 5. 自动化回归
 
-- 后端全量：`1780 passed / 1 skipped`。跳过项为环境条件测试；只有 Starlette `TestClient` 的已知弃用警告。
-- 前端全量：`328 passed / 328`，包含 Answer 流式状态、Pi 失败保留旧卡和新 Answer 换题。
+- 后端全量：`1781 passed / 1 skipped`。跳过项为环境条件测试；只有 Starlette `TestClient` 的已知弃用警告。
+- 前端全量：`329 passed / 329`，包含 Answer 流式状态、Pi 失败保留旧卡、新 Answer 换题以及回答/Pi 历史去重。
 - Pi SDK bridge：`50 passed / 50`，包含 `deep_answer`、自动 Deep 工具收缩和结构标签去重。
 - Provider/correction 边界聚焦回归：`73 passed / 73`。
 - Ruff、ESLint、TypeScript、Vite production build 和 `git diff --check` 通过。
-- Vite 仍提示主 JS chunk `656.30KB`（gzip `188.51KB`），属于后续首屏性能优化项，不影响本轮功能验收。
+- Vite 仍提示主 JS chunk `658.03KB`（gzip `188.73KB`），属于后续首屏性能优化项，不影响本轮功能验收。
 
 ## 6. 尚未完成的发布阻塞项
 
@@ -160,8 +160,8 @@ Correction 的计价边界已固定：Provider 完全没有配置价格变量时
 - [x] 通过 `native_pcm_v2` 分别注入 `native_microphone_streaming` 与 `macos_system_audio`，验证双轨身份、capture epoch、帧序、并发 ASR、Fast Answer 和 Pi Deep 主链。
 - [ ] 在桌面原生客户端完成麦克风 + system audio 双轨 5 分钟对话，记录问题检测 recall/precision、TTFT 和双方 speaker/track。
 - [ ] 验证本地 refiner、远端 correction 和导出在浏览器真实流程中均可见，不只依赖 API/数据库验收。
-- [ ] 桌面和移动宽度截图验收：无溢出、标题跳动、旧 Pi 卡串题或嵌套卡片。
-- [ ] 增加最近 Answer 历史视图，明确区分当前回答、过去回答和过去 Pi 建议。
+- [x] 桌面和移动宽度截图验收：无溢出、标题跳动、旧 Pi 卡串题或嵌套卡片。
+- [x] 增加最近 Answer 历史视图，明确区分当前回答、过去回答和过去 Pi 建议。
 
 在以上真实设备/视觉验收完成前，不把分支标记为“桌面端可发布”；但 Pi 的产品定位、Harness/Loop 调用、双 lane 主链、Answer 绑定和失败不清卡问题已经有真实 Provider 与自动化证据，不再属于“只接了 SDK 但没用起来”的状态。
 
@@ -252,4 +252,12 @@ Redis Stream为什么选择Redis Stream，而不是Kafka？请说明架构取舍
 
 边界必须明确：上述结果证明的是桌面原生 PCM 协议、双 track/epoch 归属、后端并发和 AI 主链，不证明 macOS 物理麦克风和系统音频采集设备本身已经验收。真正的采集稳定性、双方问题检测 recall/precision 和五分钟连续运行仍需用户明确允许后再做；在用户禁止外放和真实麦克风期间不会执行。
 
-会后工作台已额外在默认桌面视口和 `390x844` 移动视口检查：未观察到内容重叠或横向溢出，移动端长标题按省略号收敛。该结果只覆盖会后复盘页；会中 Answer/Pi 右栏的移动端真实流式视觉仍保留为发布前检查项。
+会中 Answer/Pi 右栏已使用禁用音频输出、禁用媒体设备的 Chromium headless shell 完成桌面和移动视觉验收。桌面 `1440x1000` 下 document 宽度为 `1440/1440`，右栏 `client/scroll width=556/556`，当前 Answer 与最近回答均为 `520px`；移动 `390x844` 下 document 和正文均为 `390/390`，当前 Answer 与最近回答均为 `354px`。页面展示 1 张当前 Answer、4 条最近回答和 1 条绑定当前 Answer 的 Pi Deep 补充；Pi Deep 未重复进入过去建议，嵌套卡片计数为 0。测试参数包含 `--disable-audio-output` 与 `--disable-features=MediaDevices`，没有打开真实麦克风、触发录音权限或播放声音。
+
+## 8. 2026-09-29 迁移会议的校对状态修复
+
+旧 V1 -> V2 shadow migration 已经把 `transcript_revision` 的 canonical 文本写入 V2，但历史实现同时把 raw `text` 覆盖成 canonical，并沿用默认 `correction_status=pending`；迁移又明确不创建 correction job。结果是内容实际已修正，页面却永久显示“AI 正在校对 / 已校对 0/N”，也无法保留修正前原文。
+
+本轮修复将 migration-owned 段落恢复为双层事实：`text` 保留旧 `original_text`，`normalized_text` 保留 canonical 修正版，有变化时状态为 `changed` 且 revision 至少为 2，无变化时为 `no_change`。修复只允许修改由相同 `migration:<source_checksum>` finalized event 创建、canonical 内容仍一致、且没有真实 correction job 的段落；实时会议和已有 correction job 不会被迁移逻辑改写。重复迁移会先修复旧错误投影，再执行不可变内容校验，真实 canonical drift 仍会被报告为冲突。
+
+专项迁移测试 `8 passed`，后端全量 `1781 passed, 1 skipped`。真实本地迁移会议的数据库、页面和 Markdown 导出复验将在修复版受管服务重启后完成；完成前，上述浏览器真实流程项保持未勾选。

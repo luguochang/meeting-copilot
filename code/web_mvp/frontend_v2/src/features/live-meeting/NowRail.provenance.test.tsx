@@ -1,4 +1,4 @@
-import { act, render, screen } from "@testing-library/react";
+import { act, render, screen, within } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { parseMeetingSnapshot } from "../../api/schema";
 import { createInitialMeetingState, meetingReducer } from "../../domain/reducer";
@@ -113,6 +113,100 @@ it("keeps the current streamed answer primary while Pi remains a supplement", ()
   expect(card).toHaveTextContent("迁移 Kafka 的触发条件");
   expect(screen.queryByTestId("follow-up-card")).toBeNull();
   expect(screen.getByRole("button", { name: "复制回答" })).toBeVisible();
+});
+
+it("separates prior answers and prior coach cards without duplicating the current deep supplement", () => {
+  const current: Suggestion = {
+    suggestionId: "answer-current",
+    meetingId: "meeting-1",
+    jobId: "answer-job-current",
+    generationId: "answer-generation-current",
+    kind: "answer",
+    questionText: "为什么选择 Redis Stream，而不是 Kafka？",
+    evidenceSegmentId: "segment-current",
+    evidenceTranscriptSeq: 8,
+    evidenceHash: "hash-current",
+    stateRevision: 3,
+    status: "committed",
+    draftText: "",
+    draftSeq: 2,
+    text: "当前规模优先复用 Redis，并给出迁移 Kafka 的量化边界。",
+    finalDraftSeq: 2,
+    feedback: null,
+    createdAtMs: 300,
+    updatedAtMs: 320,
+    committedAtMs: 320,
+  };
+  const prior: Suggestion = {
+    ...current,
+    suggestionId: "answer-prior",
+    jobId: "answer-job-prior",
+    generationId: "answer-generation-prior",
+    questionText: "如何保证消息不会丢失？",
+    evidenceSegmentId: "segment-prior",
+    evidenceTranscriptSeq: 4,
+    evidenceHash: "hash-prior",
+    stateRevision: 2,
+    status: "superseded",
+    draftText: "通过消费确认、幂等键和失败重试共同保护处理结果。",
+    text: "通过消费确认、幂等键和失败重试共同保护处理结果。",
+    createdAtMs: 100,
+    updatedAtMs: 150,
+    committedAtMs: 150,
+  };
+  const currentDeep = {
+    ...followUp({
+      origin: "pi" as const,
+      status: "intervention" as const,
+      promptProfile: "deep_answer",
+      answerId: "answer-current",
+      decisionId: "coach-deep-current",
+      sayThis: "补充压测阈值、监控指标和回滚条件。",
+    }),
+    historyId: "coach-history-deep-current",
+    createdAtMs: 330,
+  };
+  const priorCoach = {
+    ...followUp({
+      origin: "pi" as const,
+      status: "intervention" as const,
+      promptProfile: "candidate_fast",
+      decisionId: "coach-prior",
+      question: "先确认失败恢复的验收条件。",
+    }),
+    historyId: "coach-history-prior",
+    createdAtMs: 200,
+  };
+
+  render(
+    <NowRail
+      currentTopic={null}
+      followUp={null}
+      coachHistory={[priorCoach, currentDeep]}
+      openQuestions={[]}
+      suggestions={[prior, current]}
+      decisionCandidates={[]}
+      actionItems={[]}
+      risks={[]}
+      onEvidence={vi.fn()}
+      onFeedback={vi.fn(async () => undefined)}
+      onFactStatus={vi.fn(async () => undefined)}
+      onMessage={vi.fn()}
+    />,
+  );
+
+  const currentCard = screen.getByTestId("answer-copilot-card");
+  expect(currentCard).toHaveTextContent("当前规模优先复用 Redis");
+  expect(currentCard).toHaveTextContent("补充压测阈值、监控指标和回滚条件");
+
+  const answerHistory = screen.getByRole("list", { name: "最近回答" });
+  expect(answerHistory).toHaveTextContent("如何保证消息不会丢失？");
+  expect(answerHistory).toHaveTextContent("已替换");
+  expect(answerHistory).not.toHaveTextContent("为什么选择 Redis Stream，而不是 Kafka？");
+
+  const coachHistory = screen.getByRole("list", { name: "过去的教练建议" });
+  expect(coachHistory).toHaveTextContent("先确认失败恢复的验收条件。");
+  expect(within(coachHistory).queryByText("补充压测阈值、监控指标和回滚条件。")).toBeNull();
 });
 
 it("never labels an unrelated realtime Pi intervention as a deep answer supplement", () => {

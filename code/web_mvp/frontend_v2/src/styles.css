@@ -2328,6 +2328,110 @@ button:focus-visible,
   color: var(--accent-strong);
 }
 
+.answer-history {
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.answer-history-heading,
+.answer-history-heading > span,
+.answer-history-meta {
+  display: flex;
+  align-items: center;
+}
+
+.answer-history-heading {
+  min-height: 26px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.answer-history-heading > span {
+  gap: 5px;
+}
+
+.answer-history-heading small {
+  min-width: 17px;
+  color: var(--text-tertiary);
+  font-size: 10px;
+  text-align: center;
+}
+
+.answer-history-list {
+  display: grid;
+  margin: 2px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.answer-history-list li {
+  min-width: 0;
+  border-top: 1px solid var(--border);
+}
+
+.answer-history-list summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 16px;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 0;
+  list-style: none;
+  cursor: pointer;
+}
+
+.answer-history-list summary::-webkit-details-marker {
+  display: none;
+}
+
+.answer-history-summary {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.answer-history-meta {
+  gap: 7px;
+  color: var(--text-tertiary);
+  font-size: 9px;
+}
+
+.answer-history-state {
+  white-space: nowrap;
+}
+
+.answer-history-question {
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.5;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.answer-history-chevron {
+  color: var(--text-tertiary);
+  transition: transform 120ms ease;
+}
+
+.answer-history-list details[open] .answer-history-chevron {
+  transform: rotate(180deg);
+}
+
+.answer-history-list details > p {
+  margin: 0 0 7px;
+  overflow-wrap: anywhere;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.answer-history-list details > .evidence-link {
+  margin-bottom: 9px;
+}
+
 .fact-view-tabs {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
