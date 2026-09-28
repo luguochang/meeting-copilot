@@ -2675,6 +2675,7 @@ class V2Persistence:
         meeting_id: str,
         final_id: str,
         segment_id: str,
+        migration_name: str,
         source_checksum: str,
         original_text: str,
         normalized_text: str,
@@ -2694,6 +2695,7 @@ class V2Persistence:
         meeting_id = _required(meeting_id, "meeting_id")
         final_id = _required(final_id, "final_id")
         segment_id = _required(segment_id, "segment_id")
+        migration_name = _required(migration_name, "migration_name")
         source_checksum = _required(source_checksum, "source_checksum")
         original_text = _required(original_text, "original_text")
         normalized_text = _required(normalized_text, "normalized_text")
@@ -2701,7 +2703,6 @@ class V2Persistence:
         if normalized_status not in {"changed", "no_change"}:
             raise ValueError("migration correction status must be changed or no_change")
         updated_at_ms = max(0, int(now_ms))
-        expected_causation_id = f"migration:{source_checksum}"
         with self._write_transaction():
             event = self._conn.execute(
                 "SELECT causation_id FROM meeting_events WHERE meeting_id = ? "
@@ -2713,9 +2714,31 @@ class V2Persistence:
                 "AND segment_id = ? AND final_id = ?",
                 (meeting_id, segment_id, final_id),
             ).fetchone()
+            causation_id = str(event["causation_id"] or "") if event is not None else ""
+            event_checksum = causation_id.removeprefix("migration:")
+            current_marker = self._conn.execute(
+                "SELECT 1 FROM v2_migration_markers WHERE migration_name = ? "
+                "AND source_checksum = ? LIMIT 1",
+                (migration_name, source_checksum),
+            ).fetchone()
+            event_marker = self._conn.execute(
+                "SELECT 1 FROM v2_migration_markers WHERE migration_name = ? "
+                "AND source_checksum = ? LIMIT 1",
+                (migration_name, event_checksum),
+            ).fetchone()
+            has_non_migration_final = self._conn.execute(
+                "SELECT 1 FROM meeting_events WHERE meeting_id = ? "
+                "AND type = 'transcript.segment.finalized' "
+                "AND (causation_id IS NULL OR causation_id NOT LIKE 'migration:%') "
+                "LIMIT 1",
+                (meeting_id,),
+            ).fetchone()
             if (
                 event is None
-                or str(event["causation_id"] or "") != expected_causation_id
+                or not causation_id.startswith("migration:")
+                or current_marker is None
+                or event_marker is None
+                or has_non_migration_final is not None
                 or segment is None
                 or str(segment["normalized_text"] or "") != normalized_text
             ):

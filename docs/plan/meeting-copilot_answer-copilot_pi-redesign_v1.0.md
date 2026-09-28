@@ -282,7 +282,7 @@ created_at_ms / updated_at_ms
 
 2026-09-29 的补充验收将当前回答与最近 5 条 Answer 历史分区，过去 Pi 建议继续独立展示。桌面右栏和移动正文的 `clientWidth` 与 `scrollWidth` 完全一致，未出现横向溢出；当前 Deep 卡不重复进入历史，也没有卡片嵌套。浏览器以 `--disable-audio-output --disable-features=MediaDevices` 运行，不使用麦克风或扬声器。
 
-同轮修复了 V1 -> V2 shadow migration 的校对状态假 pending：迁移后的 raw `text` 与 canonical `normalized_text` 分离保存，已有 revision 投影为 `changed/no_change`，且不会为已完成的历史 revision 创建虚假 correction job。修复受 migration causation、source checksum、canonical 一致性和“无真实 correction job”四层条件保护，避免误改实时会议。
+同轮修复了 V1 -> V2 shadow migration 的校对状态假 pending：迁移后的 raw `text` 与 canonical `normalized_text` 分离保存，已有 revision 投影为 `changed/no_change`，且不会为已完成的历史 revision 创建虚假 correction job。修复受“整场 migration-only”、migration causation、已登记历史/当前 checksum marker、canonical 一致性和“无真实 correction job”多层条件保护；新增无关会议造成整表 checksum 变化时仍可修复旧 migration-only 段落，含任意真实 final 的混合/实时会议则整体跳过。
 
 ## 10. 本轮非目标
 

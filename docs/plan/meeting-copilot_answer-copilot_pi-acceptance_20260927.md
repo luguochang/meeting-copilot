@@ -146,7 +146,7 @@ Correction 的计价边界已固定：Provider 完全没有配置价格变量时
 
 ## 5. 自动化回归
 
-- 后端全量：`1781 passed / 1 skipped`。跳过项为环境条件测试；只有 Starlette `TestClient` 的已知弃用警告。
+- 后端全量：`1782 passed / 1 skipped`。跳过项为环境条件测试；只有 Starlette `TestClient` 的已知弃用警告。
 - 前端全量：`329 passed / 329`，包含 Answer 流式状态、Pi 失败保留旧卡、新 Answer 换题以及回答/Pi 历史去重。
 - Pi SDK bridge：`50 passed / 50`，包含 `deep_answer`、自动 Deep 工具收缩和结构标签去重。
 - Provider/correction 边界聚焦回归：`73 passed / 73`。
@@ -159,7 +159,7 @@ Correction 的计价边界已固定：Provider 完全没有配置价格变量时
 - [x] 使用相同固定音频对比 `main` 与当前分支；启用相同本地 refiner 后 canonical transcript 逐字一致，Pi 集成未改变本地精修结果。
 - [x] 通过 `native_pcm_v2` 分别注入 `native_microphone_streaming` 与 `macos_system_audio`，验证双轨身份、capture epoch、帧序、并发 ASR、Fast Answer 和 Pi Deep 主链。
 - [ ] 在桌面原生客户端完成麦克风 + system audio 双轨 5 分钟对话，记录问题检测 recall/precision、TTFT 和双方 speaker/track。
-- [ ] 验证本地 refiner、远端 correction 和导出在浏览器真实流程中均可见，不只依赖 API/数据库验收。
+- [x] 验证本地 refiner、远端 correction 和导出在浏览器真实流程中均可见，不只依赖 API/数据库验收。
 - [x] 桌面和移动宽度截图验收：无溢出、标题跳动、旧 Pi 卡串题或嵌套卡片。
 - [x] 增加最近 Answer 历史视图，明确区分当前回答、过去回答和过去 Pi 建议。
 
@@ -258,6 +258,8 @@ Redis Stream为什么选择Redis Stream，而不是Kafka？请说明架构取舍
 
 旧 V1 -> V2 shadow migration 已经把 `transcript_revision` 的 canonical 文本写入 V2，但历史实现同时把 raw `text` 覆盖成 canonical，并沿用默认 `correction_status=pending`；迁移又明确不创建 correction job。结果是内容实际已修正，页面却永久显示“AI 正在校对 / 已校对 0/N”，也无法保留修正前原文。
 
-本轮修复将 migration-owned 段落恢复为双层事实：`text` 保留旧 `original_text`，`normalized_text` 保留 canonical 修正版，有变化时状态为 `changed` 且 revision 至少为 2，无变化时为 `no_change`。修复只允许修改由相同 `migration:<source_checksum>` finalized event 创建、canonical 内容仍一致、且没有真实 correction job 的段落；实时会议和已有 correction job 不会被迁移逻辑改写。重复迁移会先修复旧错误投影，再执行不可变内容校验，真实 canonical drift 仍会被报告为冲突。
+本轮修复将 migration-owned 段落恢复为双层事实：`text` 保留旧 `original_text`，`normalized_text` 保留 canonical 修正版，有变化时状态为 `changed` 且 revision 至少为 2，无变化时为 `no_change`。修复只允许修改整场会议均由 migration finalized event 构成、目标 event 指向同一 migration 的已登记 checksum、当前运行也有 migration marker、canonical 内容仍一致、且没有真实 correction job 的段落；只要会议含有任意真实 finalized event，就按混合/实时会议整体跳过。即使后来新增无关旧会议导致整表 checksum 变化，旧 checksum 仍可由历史 marker 验证。重复迁移会先修复旧错误投影，再执行不可变内容校验，真实 canonical drift 仍会被报告为冲突。
 
-专项迁移测试 `8 passed`，后端全量 `1781 passed, 1 skipped`。真实本地迁移会议的数据库、页面和 Markdown 导出复验将在修复版受管服务重启后完成；完成前，上述浏览器真实流程项保持未勾选。
+专项迁移测试 `9 passed`，后端全量 `1782 passed, 1 skipped`。最终安全版受管服务启动后，真实本地会议 `accept_correction_small_20260927` 的 5 段投影为 `3 changed + 2 no_change`，revision 为 `2/1`，correction job 数仍为 0；raw 误识别与 canonical 修正版均完整保留。API runtime 显示“精修已稳定”，浏览器顶部显示“文字已确认”，会议文字页显示 `3 个语义段落 · 5 条识别片段`；修正版 `结构化 function call` 和“对啊，对，你没有听错”可见，旧误识别、`AI 正在校对会议文字` 与 `已校对 0/5` 均不存在。Markdown 导出也只包含 canonical 修正版。
+
+混合实时会议 `rec_mula036s_e9efbdcdb403` 同时用于保护边界复验：其中目标段含真实 finalized event 的同会证据，因此重启后继续保持 `pending`，migration reconciliation 没有改写它。页面复验使用 `--disable-audio-output --mute-audio --disable-features=MediaDevices`，没有访问麦克风、播放音频或调用 Provider。

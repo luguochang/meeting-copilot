@@ -266,6 +266,20 @@ def test_repeated_migration_repairs_legacy_pending_correction_projection(
             "correction_status = 'pending', correction_before_text = NULL, "
             "correction_after_text = NULL, correction_updated_at_ms = NULL"
         )
+        connection.execute(
+            "INSERT INTO asr_live_sessions (session_id, record_json) VALUES (?, ?)",
+            (
+                "meeting-2",
+                json.dumps(
+                    _record(
+                        "meeting-2",
+                        _final("seg-2", "新增的无关会议。", at_ms=3_000),
+                    ),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+            ),
+        )
 
     report = V1ToV2ShadowMigrator(database_path).run()
 
@@ -281,6 +295,64 @@ def test_repeated_migration_repairs_legacy_pending_correction_projection(
     assert segment["correction_status"] == "changed"
     assert segment["correction_before_text"] == "结构化翻新框。"
     assert segment["correction_after_text"] == "结构化 function call。"
+
+
+def test_repeated_migration_does_not_repair_a_mixed_live_meeting(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "meeting_copilot.db"
+    _create_legacy_database(
+        database_path,
+        {
+            "meeting-1": _record(
+                "meeting-1",
+                _final("seg-1", "结构化翻新框。", at_ms=1_000),
+                _revision("seg-1", "结构化 function call。", at_ms=2_000),
+            )
+        },
+    )
+    V1ToV2ShadowMigrator(database_path).run()
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "UPDATE transcript_segments SET text = normalized_text, revision = 1, "
+            "correction_status = 'pending', correction_before_text = NULL, "
+            "correction_after_text = NULL, correction_updated_at_ms = NULL"
+        )
+        next_seq = int(
+            connection.execute(
+                "SELECT MAX(seq) + 1 FROM meeting_events WHERE meeting_id = 'meeting-1'"
+            ).fetchone()[0]
+        )
+        connection.execute(
+            "INSERT INTO meeting_events (meeting_id, seq, event_id, type, "
+            "aggregate_type, aggregate_id, occurred_at_ms, correlation_id, "
+            "causation_id, idempotency_key, payload_json, published_at_ms) "
+            "VALUES (?, ?, ?, 'transcript.segment.finalized', 'transcript', ?, ?, ?, "
+            "NULL, ?, '{}', NULL)",
+            (
+                "meeting-1",
+                next_seq,
+                "event:real-final",
+                "real-segment",
+                3_000,
+                "meeting-1",
+                "transcript.final:real-final",
+            ),
+        )
+
+    report = V1ToV2ShadowMigrator(database_path).run()
+
+    assert report["status"] == "completed_with_issues"
+    persistence = V2Persistence(database_path)
+    try:
+        segment = persistence.get_snapshot("meeting-1")["segments"][0]
+    finally:
+        persistence.close()
+    assert segment["text"] == "结构化 function call。"
+    assert segment["revision"] == 1
+    assert segment["correction_status"] == "pending"
+    assert segment["correction_before_text"] is None
+    assert segment["correction_after_text"] is None
 
 
 def test_interrupted_migration_keeps_legacy_data_and_resumes_idempotently(
