@@ -3,7 +3,7 @@
 > 版本：v1.0
 > 日期：2026-09-29（最新复验）
 > 目标分支：`feat/pi-realtime-coach-agent-loop`
-> 状态：Fast Answer、Pi Deep、Correction 已完成真实 Provider 验收；同音频 `main` 基线、原生双轨协议、五分钟物理 system audio 连续采集和会中 Answer/Pi 布局均已有证据。MacBook Air 物理麦克风 helper 已获权限并持续运行，但设备处于合盖状态（`AppleClamshellState = Yes`），Apple Silicon 在该状态下硬件断开内建麦克风，因此系统输入电平与 PCM 为零。打开上盖或连接外置麦克风后的真正双人双轨验收仍是发布阻塞项。后续代码、测试和验收必须能回到本文件中的用户效果与指标。
+> 状态：Fast Answer、Pi Deep、Correction 已完成真实 Provider 验收；同音频 `main` 基线、原生双轨协议、会中 Answer/Pi 布局和打开上盖后的五分钟 microphone + system audio 物理双轨均已有证据。物理采集阻塞已关闭，但最新六个成功 Answer 的 final-to-first-token P95 约 `2.95s`，尚未达到 `<= 2.5s` 的严格线；Pi 阶段时钟和两名独立标注者的增量价值盲评也未完成，因此当前结论为功能通过、发布 Conditional No-Go。后续代码、测试和验收必须能回到本文件中的用户效果与指标。
 
 ## 0. 决策摘要
 
@@ -260,12 +260,12 @@ created_at_ms / updated_at_ms
 ### F. 真实验收
 
 - [x] 使用真实 OpenAI-compatible Provider 运行固定中文会议问题集。
-- [x] 记录 Fast Answer TTFT、完成时间和有效回答结果；问题检测 recall/precision 的离线固定集已由自动化测试覆盖，真实双音轨统计待补。
+- [x] 记录 Fast Answer TTFT、完成时间和有效回答结果；离线固定集覆盖 recall/precision，真实物理双轨样本记录两轨 final、Answer/Pi 成功率和时延。
 - [x] 使用真实浏览器麦克风完成单轨问题、离题门禁和 Fast Answer 测试；用户后续要求禁止外放，新增静音 PCM 注入复验。
 - [x] 使用同一固定音频对比 `origin/main@5cd0ed5` 与当前分支；相同本地 refiner 配置下 canonical transcript 逐字一致。
 - [x] 使用 `native_pcm_v2` 静音注入 microphone/system audio 两条独立 WebSocket，验证 track/epoch/sequence、并发 ASR、Fast Answer 和 Pi Deep。
 - [x] 使用桌面原生 helper 连续运行约五分钟，完成物理扬声器 -> system audio -> ASR -> Answer/Pi 主链并保存指标。
-- [ ] 取得 MacBook Air 麦克风非零 PCM，完成真正双方发声的双轨对话和 speaker/track 验收。
+- [x] 打开 MacBook 上盖后取得 MacBook Air 麦克风非零 PCM，完成 microphone/system audio 独立 track/epoch、final 和约五分钟连续稳定性验收。
 - [x] 保存脱敏快照指标并形成验收报告；真实页面已使用禁用音频输出和 MediaDevices 的 Chromium 完成视觉验收。
 
 详细证据、真实输出和剩余风险见 [meeting-copilot_answer-copilot_pi-acceptance_20260927.md](./meeting-copilot_answer-copilot_pi-acceptance_20260927.md)。
@@ -295,11 +295,30 @@ created_at_ms / updated_at_ms
 
 随后增加 Pi Deep 提交前事实落地屏障：仅替换无证据的日期、数字、负责人、产品名或完成状态所在行，结构错误、证据错误和其他安全错误仍 fail closed。最小真实 Provider 复验 `accept_real_grounded_pi_20260929_03` 中，Fast Answer 首字/提交约为 `2.27s / 3.30s`；Pi SDK 使用 `deep_answer` profile、单轮 `submit_intervention`、两段宿主证据，约 `2.74s` 首字、`4.88s` 决策、`4.96s` 投影，最终卡片补充了上线判断边界、无依据承诺风险和验收未通过时的追问。
 
-物理麦克风没有被误报为通过：默认输入已确认是 MacBook Air 麦克风，ChatGPT/Chrome/桌面 helper 权限均已开启；输入音量复核时调至 `60%`，输出为 MacBook Air 扬声器、`18%` 且未静音。macOS“声音 > 输入”和 3 秒 AVAudioEngine probe 均为零，随后系统级复核得到 `AppleClamshellState = Yes`，证明设备当前合盖；Apple Silicon 合盖时会在硬件层断开内建麦克风。当前结论是 system audio 物理链路通过，麦克风 helper、权限和协议正常，零 PCM 的已知物理原因是合盖；下一次验收必须先打开上盖或连接外置麦克风，确认系统输入电平和 `peak_rms` 非零，再运行真正双方发声的双轨样本。
+首次物理麦克风没有被误报为通过：默认输入已确认是 MacBook Air 麦克风，ChatGPT/Chrome/桌面 helper 权限均已开启；当时系统级复核得到 `AppleClamshellState = Yes`，Apple Silicon 合盖时会在硬件层断开内建麦克风，因此 `_01` 的麦克风轨为零 PCM。这一历史失败用于证明验收门禁会 fail closed，而不是浏览器权限、WebSocket、ASR 或 Pi bug。
+
+打开上盖后，系统状态变为 `AppleClamshellState = No`，3 秒 AVAudioEngine probe 返回 `probe_status=audible`；复核样本的 `peak_rms=0.003741`、`rms=0.002689`，高于代码中的 `0.002` 门槛。随后会议 `accept_real_dual_open_lid_pi_20260929_05` 使用独立 epoch `1790678035001`（microphone）与 `1790678035002`（system audio）运行约五分钟，两条 helper 均自然退出且 exit code 为 `0`。
+
+| 指标 | `_05` 结果 |
+|---|---:|
+| final / 轨道 | `21`：microphone `9` + system audio `12` |
+| 录音 | `138` chunks，双轨 `685232ms`，`21927428` bytes，状态 `saved` |
+| Correction canonical 状态 | `5 changed + 16 no_change + 0 error` |
+| Fast Answer | 触发 `7`，成功 `6`，evidence superseded `1`，失败 `0` |
+| Fast Answer TTFT | `P50 1.74s / P95 2.93s / Max 3.32s` |
+| Fast Answer 完成 | `P50 3.08s / P95 4.44s / Max 4.80s` |
+| Pi Deep | `6/6` intervention，`0` silent / failure / fallback |
+| Pi TTFT | `P50 2.54s / P95 2.89s / Max 2.95s` |
+| Pi 投影 | `P50 4.77s / P95 5.29s / Max 5.42s` |
+| Pi 运行合同 | `6/6 runtime_used=pi`、`deep_answer`、1 turn、1 次 `submit_intervention`、0 tool error、0 validation failure |
+| 双轨证据绑定 | 麦克风开始形成 final 后的后 `3/3` 次 Pi 同时绑定 microphone + system audio；此前 `3` 次只绑定当时已有的 system audio |
+| 会后派生 | minutes / approach / index 均成功，`3` 张 approach cards |
+
+物理双轨和 Pi Harness/Loop 因此已经通过。发布判断仍保持 Conditional No-Go：六个 Answer 的 P95 超过严格首字线约 `0.45s`，`/realtime-ai-slo` 尚缺 Pi 的完整 Provider/投影/UI 阶段时钟，且 Pi 相对仅 Fast Answer 的增量价值仍需两名独立标注者盲评。
 
 ## 12. 本轮非目标
 
 - 不开发隐身、反录屏或规避监控能力。
 - 不引入屏幕持续录制。
 - 不在本轮建设完整简历向量库；先使用会议准备信息和现有上下文，资料库作为后续增量。
-- 不宣称 Pi 已可用，直到 Fast Answer 和 Pi Deep Coach 均通过真实端到端验收。
+- 不以单次端到端成功宣称发布 Go；真实 Provider、物理双轨、性能 SLO、阶段时钟和独立价值盲评分别给出结论。

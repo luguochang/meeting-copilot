@@ -3,7 +3,7 @@
 > 日期：2026-09-29（最新复验）
 > 分支：`feat/pi-realtime-coach-agent-loop`
 > 基线：`0b69f1a`
-> 结论：Fast Answer、Pi Deep Coach、后台转写精修三条独立通道已通过真实 FunASR + 真实 Provider 验收，Pi 已能给出绑定当前回答的边界、风险和追问。相同固定音频的 `main` 基线、原生双轨协议、五分钟物理 system audio 连续采集以及桌面/移动布局均已有证据。MacBook Air 麦克风 helper 已获权限并连续运行，但设备处于合盖状态（`AppleClamshellState = Yes`），内建麦克风被硬件断开，系统输入电平和 PCM 因此为零；system audio 主链可用，打开上盖或连接外置麦克风后的真正双方发声双轨仍未达到发布线。
+> 结论：Fast Answer、Pi Deep Coach、后台转写精修三条独立通道已通过真实 FunASR + 真实 Provider 验收，Pi 已能给出绑定当前回答的边界、风险和追问。打开 MacBook 上盖后的五分钟复验取得 microphone 与 system audio 两条物理轨的非零 PCM、独立 final、Answer/Pi 和会后派生结果，物理双轨阻塞已关闭。当前仍为 Conditional No-Go：Fast Answer P95 约 `2.95s`，未达到 `<= 2.5s` 的严格首字线；Pi 阶段时钟不完整；Pi 相对仅 Fast Answer 的增量价值还缺两名独立标注者盲评。
 
 ## 1. 这次解决的产品问题
 
@@ -146,7 +146,7 @@ Correction 的计价边界已固定：Provider 完全没有配置价格变量时
 
 ## 5. 自动化回归
 
-- 后端全量：`1797 passed / 1 skipped`。跳过项为环境条件测试；只有 Starlette `TestClient` 的已知弃用警告。
+- 后端全量：`1799 passed / 1 skipped`。跳过项为环境条件测试；只有 Starlette `TestClient` 的已知弃用警告。
 - 前端全量：`329 passed / 329`，包含 Answer 流式状态、Pi 失败保留旧卡、新 Answer 换题以及回答/Pi 历史去重。
 - Pi SDK bridge：`50 passed / 50`，包含 `deep_answer`、自动 Deep 工具收缩和结构标签去重。
 - Provider/correction 边界聚焦回归：`73 passed / 73`。
@@ -159,12 +159,12 @@ Correction 的计价边界已固定：Provider 完全没有配置价格变量时
 - [x] 使用相同固定音频对比 `main` 与当前分支；启用相同本地 refiner 后 canonical transcript 逐字一致，Pi 集成未改变本地精修结果。
 - [x] 通过 `native_pcm_v2` 分别注入 `native_microphone_streaming` 与 `macos_system_audio`，验证双轨身份、capture epoch、帧序、并发 ASR、Fast Answer 和 Pi Deep 主链。
 - [x] 桌面原生 helper 连续运行约五分钟，记录 system audio 问题 recall、Fast Answer TTFT/完成时延和 Pi 业务成功率。
-- [ ] MacBook Air 麦克风产生非零 PCM 后，补齐真正双方发声的 speaker/track、recall/precision 和连续稳定性验收。
+- [x] 打开 MacBook 上盖后取得麦克风非零 PCM，完成 microphone/system audio 独立 track/epoch、final 和约五分钟连续稳定性验收。
 - [x] 验证本地 refiner、远端 correction 和导出在浏览器真实流程中均可见，不只依赖 API/数据库验收。
 - [x] 桌面和移动宽度截图验收：无溢出、标题跳动、旧 Pi 卡串题或嵌套卡片。
 - [x] 增加最近 Answer 历史视图，明确区分当前回答、过去回答和过去 Pi 建议。
 
-在物理麦克风非零输入和双人双轨验收完成前，不把分支标记为“桌面端可发布”；但 Pi 的产品定位、Harness/Loop 调用、双 lane 主链、Answer 绑定和失败不清卡问题已经有真实 Provider 与自动化证据，不再属于“只接了 SDK 但没用起来”的状态。
+物理麦克风与双轨验收已经完成；分支仍不标记为“桌面端可发布”，原因改为 Fast Answer P95 超线、Pi 阶段时钟不完整以及独立价值盲评未完成。Pi 的产品定位、Harness/Loop 调用、双 lane 主链、Answer 绑定和失败不清卡问题已有真实 Provider、物理双轨与自动化证据，不再属于“只接了 SDK 但没用起来”的状态。
 
 2026-09-27 的真实 Chrome 流程已成功创建会议 `rec_mujth0ku_56e33a3c7862`，页面显示“AI 已连接”；点击“开始录音”时 macOS 进入锁屏，原生自动化无法解锁，因此尚未开始麦克风或 system audio 数据，也尚未产生可用于 ASR 质量结论的录音。该结果只记为设备验收阻塞，不计作双音轨通过。
 
@@ -261,7 +261,7 @@ Redis Stream为什么选择Redis Stream，而不是Kafka？请说明架构取舍
 
 本轮修复将 migration-owned 段落恢复为双层事实：`text` 保留旧 `original_text`，`normalized_text` 保留 canonical 修正版，有变化时状态为 `changed` 且 revision 至少为 2，无变化时为 `no_change`。修复只允许修改整场会议均由 migration finalized event 构成、目标 event 指向同一 migration 的已登记 checksum、当前运行也有 migration marker、canonical 内容仍一致、且没有真实 correction job 的段落；只要会议含有任意真实 finalized event，就按混合/实时会议整体跳过。即使后来新增无关旧会议导致整表 checksum 变化，旧 checksum 仍可由历史 marker 验证。重复迁移会先修复旧错误投影，再执行不可变内容校验，真实 canonical drift 仍会被报告为冲突。
 
-专项迁移测试 `9 passed`；计入本轮其他修复后，后端全量为 `1797 passed, 1 skipped`。最终安全版受管服务启动后，真实本地会议 `accept_correction_small_20260927` 的 5 段投影为 `3 changed + 2 no_change`，revision 为 `2/1`，correction job 数仍为 0；raw 误识别与 canonical 修正版均完整保留。API runtime 显示“精修已稳定”，浏览器顶部显示“文字已确认”，会议文字页显示 `3 个语义段落 · 5 条识别片段`；修正版 `结构化 function call` 和“对啊，对，你没有听错”可见，旧误识别、`AI 正在校对会议文字` 与 `已校对 0/5` 均不存在。Markdown 导出也只包含 canonical 修正版。
+专项迁移测试 `9 passed`；计入本轮其他修复和验收证据一致性回归后，后端全量为 `1799 passed, 1 skipped`。最终安全版受管服务启动后，真实本地会议 `accept_correction_small_20260927` 的 5 段投影为 `3 changed + 2 no_change`，revision 为 `2/1`，correction job 数仍为 0；raw 误识别与 canonical 修正版均完整保留。API runtime 显示“精修已稳定”，浏览器顶部显示“文字已确认”，会议文字页显示 `3 个语义段落 · 5 条识别片段`；修正版 `结构化 function call` 和“对啊，对，你没有听错”可见，旧误识别、`AI 正在校对会议文字` 与 `已校对 0/5` 均不存在。Markdown 导出也只包含 canonical 修正版。
 
 混合实时会议 `rec_mula036s_e9efbdcdb403` 同时用于保护边界复验：其中目标段含真实 finalized event 的同会证据，因此重启后继续保持 `pending`，migration reconciliation 没有改写它。页面复验使用 `--disable-audio-output --mute-audio --disable-features=MediaDevices`，没有访问麦克风、播放音频或调用 Provider。
 
@@ -327,3 +327,56 @@ Pi Deep 增量卡为：
 ```
 
 这次结果达到“先给可直接说的回答，再由 Pi harness/loop 补边界和追问”的目标效果；但单个成功样本不替代后续双人双轨长时间验收和独立价值盲评。
+
+## 11. 2026-09-29 打开上盖后的真实物理双轨验收
+
+MacBook 上盖打开后，`ioreg` 返回 `AppleClamshellState = No`。3 秒 AVAudioEngine probe 返回 `probe_status=audible`、`peak_rms=0.003741`、`rms=0.002689`，超过代码中的 `0.002` 可听门槛。会议 `accept_real_dual_open_lid_pi_20260929_05` 随后同时运行 AVAudioEngine microphone helper 和 ScreenCaptureKit system audio helper，复用时长 `299.628s` 的固定中文会议题集；两条 helper 各运行约 `340s`，自然退出且 exit code 均为 `0`。
+
+### 11.1 采集、ASR 与修正
+
+| 指标 | 结果 |
+|---|---:|
+| capture epoch | microphone `1790678035001` / system audio `1790678035002` |
+| canonical final | `21`：microphone `9` + system audio `12` |
+| 录音 | `138` chunks，双轨总时长 `685232ms`，`21927428` bytes，状态 `saved` |
+| Correction canonical 状态 | `5 changed + 16 no_change + 0 error` |
+| 会后派生 | minutes / approach / index 均 `succeeded`，生成 `3` 张 approach cards |
+
+麦克风轨形成了独立 segment，例如“九十九分位延迟是。”和“也没有写清楚。”，其 segment id、track 与 capture epoch 均不同于 system audio，不是复制系统音轨。Correction 的真实改写包括 `支付接口二点零 -> 支付接口2.0`、`三个核心用力，没有连调财务 -> 三个核心用例没有联调财务`。这证明物理双轨已经可采集、可持久化并进入独立 ASR/Correction 链路；同时也说明麦克风碎片句的可读性仍有继续优化空间，不能把“有 final”写成“双方语义识别已完美”。
+
+### 11.2 Fast Answer 与 Pi Harness/Loop
+
+| 指标 | 结果 |
+|---|---:|
+| Fast Answer 触发 / 成功 / superseded / 失败 | `7 / 6 / 1 / 0` |
+| Fast Answer TTFT | `P50 1.74s / P95 2.93s / Max 3.32s` |
+| Fast Answer 完成 | `P50 3.08s / P95 4.44s / Max 4.80s` |
+| Pi attempted / intervention / silent / failure | `6 / 6 / 0 / 0` |
+| Pi TTFT | `P50 2.54s / P95 2.89s / Max 2.95s` |
+| Pi projection | `P50 4.77s / P95 5.29s / Max 5.42s` |
+| Pi 运行合同 | `6/6 runtime_used=pi`、`origin=pi`、`deep_answer`、`gpt-5.5` |
+| Harness / Loop | 每次 `1` turn、`1` 次 `submit_intervention`、`0` tool error、`0` validation failure、`0` fallback |
+| 证据轨道 | 前 `3` 次只有当时已形成的 system audio；麦克风产生 final 后，后 `3/3` 次同时绑定 microphone + system audio |
+
+代表性 Pi 输出不再是摘要或“未达到门槛”：
+
+```text
+标题：避免发布口径误读
+边界：把“当前决定”表述为有条件发布判断，不要默认本周五可上线。
+风险：若只说会后补齐，业务方可能理解为按原计划发布已被认可。
+追问：马上确认谁对安全验收、三个用例联调、回滚触发条件逐项签字。
+```
+
+另一轮正确区分“首期 100 并发”和“年底 500 并发”的阶段口径。六轮均由 Pi SDK session/harness/loop 执行并以受限终止工具提交，证明不是 direct prompt 冒充 Pi。
+
+### 11.3 验收结论与剩余门槛
+
+- [x] 物理 microphone + system audio 双轨非零输入、独立 epoch/segment/final 和约五分钟连续采集。
+- [x] 真实 Provider 下 Fast Answer `6/6` 成功提交，Pi `6/6` intervention 且无 validation/fallback。
+- [x] Correction、修正稿事实层与 minutes/approach/index 在双轨会议结束后可用。
+- [x] 验收证据导出修复“Correction 后拿 canonical 修正版与 live 原始 final 比较”的假不一致，并有聚焦回归测试。
+- [ ] Fast Answer final-to-first-token P95 从约 `2.95s` 降到 `<= 2.5s`，并扩大到不少于 30 个有效问题复验。
+- [ ] 补齐 Pi Deep 的 Provider connected、projection 和 UI render 阶段时钟，使 `/realtime-ai-slo` 不再为 trace incomplete。
+- [ ] 至少两名独立标注者对 Fast Answer only 与 Fast Answer + Pi 做随机盲评，证明 Pi 在边界、风险或追问上有增量价值。
+
+因此本轮的准确结论是：物理双轨、功能主链和 Pi Harness/Loop 已通过；性能 P95、SLO 可观测性和人工增量价值仍未达到完整发布线。证据原始 JSON、录音和本机诊断保存在忽略 Git 的 `artifacts/tmp/native-hardware-acceptance/accept_real_dual_open_lid_pi_20260929_05/`，不会进入源码提交。

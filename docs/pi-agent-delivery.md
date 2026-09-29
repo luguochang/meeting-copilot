@@ -6,9 +6,9 @@
 
 当前分支已经打通真实 Provider 下的 Pi Agent harness/loop，并把它从“首答生成器”收敛为 Fast Answer 之后的增量教练：宿主先识别完整问题并流式生成可直接说的回答，Pi 再通过受限工具读取当前 Answer 和多段会议证据，以 `submit_intervention` 或 `keep_silent` 结束一轮判断。Provider 调用、工具调用、证据、时延、降级原因和建议生命周期均进入持久化事件，可由快照和诊断接口复核。
 
-此前“标题闪动但正文无价值”的两个 P0 已处理：Fast Answer 与 Pi Deep 使用独立 durable lane，失败/静默不再清除有效回答或上一张卡；Provider 费率未知不再错误禁用 correction，Answer/Pi/correction 的 reservation 和公平调度也已分开。五分钟真实硬件样本和后续回归证明 system audio -> ASR -> Fast Answer -> Pi Deep 主链可用。
+此前“标题闪动但正文无价值”的两个 P0 已处理：Fast Answer 与 Pi Deep 使用独立 durable lane，失败/静默不再清除有效回答或上一张卡；Provider 费率未知不再错误禁用 correction，Answer/Pi/correction 的 reservation 和公平调度也已分开。打开 MacBook 上盖后的五分钟真实硬件复验已经取得 microphone 与 system audio 两条物理轨的非零 PCM、独立 final、Fast Answer、Pi Deep 和会后派生结果，合盖阻塞项已关闭。
 
-当前不宣称桌面端达到 Go 标准，原因已收敛为两项可验证缺口：MacBook Air 处于合盖状态（`AppleClamshellState = Yes`），Apple Silicon 在该状态下硬件断开内建麦克风，因此系统设置和 AVAudioEngine 均只能得到零电平，尚未形成真正双方发声的物理双轨证据；Pi 相对只使用 Fast Answer 的增量价值仍缺至少两名独立标注者的盲评。
+当前仍不宣称桌面端达到完整 Go 标准。最新六个成功 Answer 的 final-to-first-token P95 为约 `2.95s`，高于目标 `2.5s`；Pi SLO 采集还缺完整的 Provider/投影阶段时钟；Pi 相对只使用 Fast Answer 的增量价值仍缺至少两名独立标注者盲评。也就是说，物理双轨与功能主链已经通过，剩余问题是性能、可观测性和产品增量价值证明，不再是麦克风权限或 Pi SDK 未调用。
 
 ## 2. 运行链路
 
@@ -109,11 +109,14 @@ cargo check --locked
 | 范围 | 结果 |
 | --- | --- |
 | Python 静态检查（本次改动文件） | Ruff 和 `py_compile` 通过 |
-| 后端全量测试 | `1797 passed, 1 skipped` |
+| 后端全量测试 | `1799 passed, 1 skipped` |
 | Pi bridge | `50 passed` |
 | 前端 | ESLint 通过，`329 passed`，TypeScript/Vite build 通过 |
 | 真实 Provider | Fast Answer `1/1`；Pi `deep_answer`、单轮工具调用和多段证据绑定成功 |
-| 真实五分钟硬件 | system audio `12` 条 final；物理麦克风 helper 连续运行但因 MacBook 合盖而 PCM 为零 |
+| 真实物理双轨 | `accept_real_dual_open_lid_pi_20260929_05`：microphone `9` 条 final、system audio `12` 条 final；`138` 个录音块、`685232ms` 双轨总时长、录音状态 `saved` |
+| Fast Answer | 触发 `7` 次，成功 `6`、新证据覆盖取消 `1`、失败 `0`；TTFT `P50 1.74s / P95 2.93s / Max 3.32s`，完成 `P50 3.08s / P95 4.44s / Max 4.80s` |
+| Pi Deep | `6/6` 为 `runtime_used=pi` + `deep_answer` + 单轮 `submit_intervention`，工具错误/validation/fallback 均为 `0`；TTFT `P50 2.54s / P95 2.89s`，投影 `P50 4.77s / P95 5.29s` |
+| Correction / 会后任务 | `21` 条 final 中 `5 changed + 16 no_change + 0 error`；minutes、approach、index 均成功，生成 `3` 张 approach cards |
 | Git 差异 | `git diff --check` 与凭据扫描通过，不包含本地录音或 `artifacts/` |
 
 后端唯一跳过项是显式环境集成测试，不在普通源码运行环境伪造通过。Vite 仍提示主包超过 500 kB，这是已记录的性能优化项，不影响本次构建正确性。
@@ -131,7 +134,9 @@ cargo check --locked
 - [x] 有效 Pi 卡片不会被后续 `not_triggered`/`protected_silent` 空状态清除。
 - [x] 显式测试 Provider 下 realtime/deep/correction 使用独立 reservation；未知费率不再错误禁用 correction。
 - [x] 真实 system audio 会议达到 Fast Answer 首字、完成时延和 ASR 可读性门槛。
-- [ ] 打开 MacBook 上盖（或连接外置麦克风），确认系统输入电平与 3 秒 AVAudioEngine probe 为非零后，完成真正双方发声的双轨稳定性验收。
+- [x] 打开 MacBook 上盖后确认 `AppleClamshellState = No`；3 秒 AVAudioEngine probe 为 `audible`，并完成 microphone/system audio 双物理轨约五分钟稳定性验收。
+- [ ] 将 Fast Answer final-to-first-token P95 从本轮约 `2.95s` 降到 `<= 2.5s`，并用不少于 30 个有效问题复验，避免以六个样本下结论。
+- [ ] 补齐 Pi Deep 的 Provider connected、projection 和 UI render 阶段时钟，使 `/realtime-ai-slo` 不再因 trace incomplete 返回 `insufficient_data`。
 - [ ] 至少两名独立标注者证明 Pi 相对 direct/local 具有增量价值。
 
 ## 8. 建议评审顺序
@@ -143,4 +148,4 @@ cargo check --locked
 5. `code/web_mvp/frontend_v2/src/domain/reducer.ts` 与 `NowRail.tsx`：用户可见投影。
 6. 对应测试和 `tools/realtime_coach_eval/README.md`：失败口径与产品价值门禁。
 
-评审时应分别判断三件事：SDK 是否真实运行、工程状态是否可追踪、建议是否对用户有增量价值。前两项已有自动化和真实 Provider 证据，第三项仍需完成上述 P0 整改和盲评，不能用测试数量替代。
+评审时应分别判断三件事：SDK 是否真实运行、工程状态是否可追踪、建议是否对用户有增量价值。SDK 与主链已有真实 Provider 和物理双轨证据；性能与阶段时钟仍需按 checklist 收口；产品增量价值仍需盲评，不能用测试数量替代。
