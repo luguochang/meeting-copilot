@@ -13,12 +13,14 @@ import {
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { LocalCapabilityStatus, MeetingApi } from "../../api/client";
-import { ProductNavigation } from "../../components/ProductNavigation";
+import { ProductNavigation, type ActiveMeetingNavigation } from "../../components/ProductNavigation";
 
 interface LocalCapabilitiesProps {
   api: MeetingApi;
   onOpenMeetings: () => void;
   onOpenNotes: () => void;
+  activeMeeting?: ActiveMeetingNavigation | null;
+  onOpenActiveMeeting?: () => void;
 }
 
 function safeDownloadUrl(value: string | null | undefined): string | null {
@@ -37,7 +39,13 @@ function formatFileSize(bytes: number): string {
   return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
-export function LocalCapabilities({ api, onOpenMeetings, onOpenNotes }: LocalCapabilitiesProps) {
+export function LocalCapabilities({
+  api,
+  onOpenMeetings,
+  onOpenNotes,
+  activeMeeting,
+  onOpenActiveMeeting,
+}: LocalCapabilitiesProps) {
   const [status, setStatus] = useState<LocalCapabilityStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
@@ -102,6 +110,8 @@ export function LocalCapabilities({ api, onOpenMeetings, onOpenNotes }: LocalCap
         active="capabilities"
         onOpenMeetings={onOpenMeetings}
         onOpenNotes={onOpenNotes}
+        activeMeeting={activeMeeting}
+        onOpenActiveMeeting={onOpenActiveMeeting}
       />
       <main className="capabilities-shell">
         <header className="capabilities-header">

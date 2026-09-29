@@ -73,6 +73,10 @@ REVIEW_DOCUMENT_KINDS = frozenset({"minutes", "decisions", "action_items", "risk
 # The absolute deadline and minimum execution reserve remain the hard guards.
 INTELLIGENCE_DEBOUNCE_MS = 750
 INTELLIGENCE_REALTIME_BUDGET_MS = 10_000
+# Fast Answer remains visible while Pi deepens it. The optional second pass
+# must either add value inside the product SLO or fail without replacing the
+# current successful version; a slower gateway must not extend the UI wait.
+INTELLIGENCE_DEEP_BUDGET_MS = 8_000
 # Post-meeting derivations must not keep a durable row running forever when a
 # gateway stalls.  The executor applies this deadline to the handler and the
 # persistence claim path closes expired pending/retry rows after restarts.
@@ -98,6 +102,46 @@ SEMANTIC_PARAGRAPH_PROJECTION_VERSION = 2
 SEMANTIC_PARAGRAPH_GAP_MS = 3_500
 SEMANTIC_PARAGRAPH_MIN_DURATION_MS = 15_000
 SEMANTIC_PARAGRAPH_TARGET_MAX_DURATION_MS = 45_000
+
+
+def _capture_freshness_summary(
+    recordings: Sequence[Mapping[str, Any]],
+    *,
+    meeting_state: str,
+    now_ms: int,
+) -> dict[str, Any]:
+    """Project recording leases into the public meeting-capture contract."""
+
+    rows = [dict(recording) for recording in recordings]
+    active_rows = [recording for recording in rows if str(recording.get("status") or "") == "active"]
+    fresh_rows = [
+        recording
+        for recording in active_rows
+        if int(recording.get("lease_until_ms") or 0) > now_ms
+    ]
+    if meeting_state != "live":
+        state = "inactive"
+    elif fresh_rows:
+        state = "active"
+    elif rows:
+        state = "recoverable"
+    else:
+        state = "inactive"
+    return {
+        "state": state,
+        "active_track_count": len(fresh_rows),
+        "track_count": len({str(recording.get("track") or "") for recording in rows}),
+        "last_heartbeat_at_ms": (
+            max(int(recording.get("updated_at_ms") or 0) for recording in active_rows)
+            if active_rows
+            else None
+        ),
+        "lease_until_ms": (
+            max(int(recording.get("lease_until_ms") or 0) for recording in active_rows)
+            if active_rows
+            else None
+        ),
+    }
 SEMANTIC_PARAGRAPH_HARD_MAX_DURATION_MS = 60_000
 SEMANTIC_PARAGRAPH_TARGET_MAX_CHARACTERS = 220
 SEMANTIC_PARAGRAPH_HARD_MAX_CHARACTERS = 280
@@ -491,6 +535,12 @@ def intelligence_deadline_at_ms(finalized_at_ms: int) -> int:
     """
 
     return max(0, int(finalized_at_ms)) + INTELLIGENCE_REALTIME_BUDGET_MS
+
+
+def deep_intelligence_deadline_at_ms(requested_at_ms: int) -> int:
+    """Return the bounded deadline for non-blocking Pi Answer enrichment."""
+
+    return max(0, int(requested_at_ms)) + INTELLIGENCE_DEEP_BUDGET_MS
 
 
 def intelligence_next_attempt_at_ms(
@@ -4148,6 +4198,7 @@ class V2Persistence:
         user_request: str,
         idempotency_key: str,
         now_ms: int,
+        answer_id: str | None = None,
     ) -> dict[str, Any]:
         """Persist one explicit live-meeting coach request over current evidence."""
 
@@ -4161,6 +4212,7 @@ class V2Persistence:
         if len(idempotency_key) > 240 or any(ord(character) < 32 for character in idempotency_key):
             raise ValueError("idempotency_key is invalid")
         now_ms = max(0, int(now_ms))
+        answer_id = str(answer_id or "").strip() or None
         if self.semantic_projection_mode != "llm_first":
             raise ValueError("realtime coach requires llm_first semantic projection")
         with self._write_transaction():
@@ -4179,10 +4231,24 @@ class V2Persistence:
                 if str(existing["meeting_id"]) != meeting_id or str(existing["kind"]) != "intelligence":
                     raise ValueError("idempotency_key is already used by another job")
                 return self._job_dict(existing)
+            answer = None
+            if answer_id is not None:
+                answer = self._conn.execute(
+                    "SELECT * FROM suggestions WHERE meeting_id = ? AND suggestion_id = ? "
+                    "AND kind = 'answer' AND status = 'committed'",
+                    (meeting_id, answer_id),
+                ).fetchone()
+                if answer is None:
+                    raise ValueError("committed answer not found")
             latest = self._conn.execute(
                 "SELECT * FROM transcript_segments WHERE meeting_id = ? "
+                "AND segment_id = ? AND duplicate_of_segment_id IS NULL"
+                if answer is not None
+                else "SELECT * FROM transcript_segments WHERE meeting_id = ? "
                 "AND duplicate_of_segment_id IS NULL ORDER BY transcript_seq DESC LIMIT 1",
-                (meeting_id,),
+                (meeting_id, str(answer["evidence_segment_id"]))
+                if answer is not None
+                else (meeting_id,),
             ).fetchone()
             if latest is None:
                 raise ValueError("当前会议还没有可供教练分析的文字")
@@ -4195,10 +4261,20 @@ class V2Persistence:
             ).fetchone()
             if paragraph is None:
                 raise ValueError("当前会议文字尚未形成可验证的语义段落")
+            if answer_id is not None:
+                self._conn.execute(
+                    "UPDATE jobs SET status = 'cancelled', lease_owner = NULL, "
+                    "lease_until_ms = NULL, error_class = 'superseded_by_user_request', "
+                    "completed_at_ms = COALESCE(completed_at_ms, ?), updated_at_ms = ? "
+                    "WHERE meeting_id = ? AND kind = 'intelligence' "
+                    "AND trigger_type = 'answer_ready' AND work_item_id = ? "
+                    "AND status IN ('pending', 'retry_wait')",
+                    (now_ms, now_ms, meeting_id, answer_id),
+                )
             request_hash = hashlib.sha256(user_request.encode("utf-8")).hexdigest()[:24]
             job_id = _stable_id("job", meeting_id, "user_request", idempotency_key)
-            generation_id = f"user-request:{meeting_id}:{request_hash}"
-            deadline_at_ms = intelligence_deadline_at_ms(now_ms)
+            generation_id = f"user-request:{meeting_id}:{answer_id or 'meeting'}:{request_hash}"
+            deadline_at_ms = deep_intelligence_deadline_at_ms(now_ms)
             self._conn.execute(
                 "INSERT INTO jobs ("
                 "id, meeting_id, kind, status, priority, input_transcript_seq, input_version, "
@@ -4214,7 +4290,7 @@ class V2Persistence:
                     str(latest["segment_id"]),
                     str(latest["evidence_hash"]),
                     generation_id,
-                    job_id,
+                    answer_id or job_id,
                     int(latest["transcript_seq"]),
                     user_request,
                     idempotency_key,
@@ -4282,7 +4358,7 @@ class V2Persistence:
             if existing is not None:
                 return self._job_dict(existing)
             job_id = _stable_id("job", meeting_id, "answer_ready", answer_id)
-            deadline_at_ms = intelligence_deadline_at_ms(now_ms)
+            deadline_at_ms = deep_intelligence_deadline_at_ms(now_ms)
             self._conn.execute(
                 "INSERT INTO jobs ("
                 "id, meeting_id, kind, status, priority, input_transcript_seq, input_version, "
@@ -9925,11 +10001,19 @@ class V2Persistence:
             for row in paragraph_rows
         ]
         review_documents = {str(row["document_kind"]): self._review_document_dict(row) for row in review_document_rows}
+        recording_dicts = [self._recording_session_dict(row) for row in recording_rows]
+        capture = _capture_freshness_summary(
+            recording_dicts,
+            meeting_state=str(meeting["state"] if meeting is not None else "unknown"),
+            now_ms=snapshot_now_ms,
+        )
         recording_statuses = {str(row["status"]) for row in recording_rows}
         if "failed" in recording_statuses:
             audio_status = "failed"
-        elif "active" in recording_statuses:
+        elif capture["state"] == "active":
             audio_status = "recording"
+        elif "active" in recording_statuses:
+            audio_status = "unknown"
         elif recording_statuses & {"sealed", "exporting", "interrupted"}:
             audio_status = "assembling"
         elif "ready" in recording_statuses or (
@@ -9946,6 +10030,8 @@ class V2Persistence:
         recording_indicator = (
             {"state": "error", "label": "录音整理失败"}
             if audio_status == "failed"
+            else {"state": "paused", "label": "录音待恢复"}
+            if capture["state"] == "recoverable"
             else {"state": "active", "label": "正在录音"}
             if audio_status == "recording"
             else {"state": "busy", "label": "正在整理录音"}
@@ -10036,6 +10122,7 @@ class V2Persistence:
             },
             "runtime": {
                 "phase": meeting["state"] if meeting is not None else "unknown",
+                "capture": capture,
                 "recording": recording_indicator,
                 "input": {"state": "unknown", "label": "等待输入状态"},
                 "ai": {
@@ -10614,12 +10701,14 @@ class V2Persistence:
         status: str = "all",
         before_updated_at_ms: int | None = None,
         before_meeting_id: str | None = None,
+        now_ms: int | None = None,
     ) -> dict[str, Any]:
         limit = int(limit)
         if not 1 <= limit <= 500:
             raise ValueError("limit must be between 1 and 500")
         normalized_query = " ".join(str(query or "").split())
         normalized_status = str(status or "all").strip().lower()
+        history_now_ms = time.time_ns() // 1_000_000 if now_ms is None else max(0, int(now_ms))
         if normalized_status not in {"all", "live", "processing", "ready", "failed"}:
             raise ValueError("status must be all, live, processing, ready, or failed")
         clauses: list[str] = []
@@ -10706,6 +10795,17 @@ class V2Persistence:
                 if meeting_ids
                 else []
             )
+            recording_rows = (
+                self._conn.execute(
+                    "SELECT meeting_id, track, status, lease_until_ms, updated_at_ms "
+                    "FROM recording_sessions "
+                    f"WHERE meeting_id IN ({','.join('?' for _ in meeting_ids)}) "
+                    "ORDER BY meeting_id, track, epoch",
+                    meeting_ids,
+                ).fetchall()
+                if meeting_ids
+                else []
+            )
         review_jobs: dict[str, dict[str, dict[str, Any]]] = {}
         for job_row in job_rows:
             meeting_jobs = review_jobs.setdefault(str(job_row["meeting_id"]), {})
@@ -10716,6 +10816,9 @@ class V2Persistence:
             str(import_job_row["meeting_id"]): self._import_job_dict(import_job_row)
             for import_job_row in import_job_rows
         }
+        recordings_by_meeting: dict[str, list[dict[str, Any]]] = {}
+        for recording_row in recording_rows:
+            recordings_by_meeting.setdefault(str(recording_row["meeting_id"]), []).append(dict(recording_row))
         meetings = [
             {
                 **self._meeting_dict(row),
@@ -10724,6 +10827,11 @@ class V2Persistence:
                 "audio_duration_ms": int(row["audio_duration_ms"]),
                 "has_minutes": bool(row["has_minutes"]),
                 "review_jobs": review_jobs.get(str(row["id"]), {}),
+                "capture": _capture_freshness_summary(
+                    recordings_by_meeting.get(str(row["id"]), []),
+                    meeting_state=str(row["state"]),
+                    now_ms=history_now_ms,
+                ),
                 **({"import_job": import_jobs[str(row["id"])]} if str(row["id"]) in import_jobs else {}),
             }
             for row in visible

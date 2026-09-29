@@ -1900,6 +1900,74 @@ def test_answer_ready_deep_card_can_add_generic_professional_checks() -> None:
     assert "回滚" in intervention.recommendation
 
 
+def test_answer_ready_preserves_the_structured_pi_coaching_package() -> None:
+    deep_request = replace(
+        _coach_request(),
+        trigger_type="answer_ready",
+        work_item_id="answer:job-structured",
+        rolling_state={
+            "current_answer": {
+                "answer_id": "answer:job-structured",
+                "question": "能承诺周五上线吗？",
+                "answer": "需要先完成压测，再确认上线日期。",
+                "status": "committed",
+            }
+        },
+    )
+    say_this = "我先把周五作为目标，等压测完成后再确认是否满足上线条件。"
+    reason = "当前回答需要把目标日期和放行条件明确区分。"
+    payload = {
+        "intervention": {
+            "event_type": "question_to_user",
+            "title": "区分目标与承诺",
+            "recommendation": say_this,
+            "say_this": say_this,
+            "reason": reason,
+            "why_now": reason,
+            "evidence_segment_ids": ["local-3", "remote-4"],
+            "evidence_quote": "压测还没有完成。\n你能承诺周五一定上线吗？",
+            "urgency": "high",
+            "confidence": 0.91,
+            "coaching_package": {
+                "headline": "区分目标与承诺",
+                "question_intent": "判断是否能承诺周五上线",
+                "core_judgement": "压测还没有完成，需要完成后再确认上线日期",
+                "why_it_matters": reason,
+                "say_this_addition": say_this,
+                "missing_points": ["明确压测完成后的确认动作"],
+                "constraints": ["压测完成后再确认上线日期"],
+                "risks": ["把目标日期表达成无条件承诺"],
+                "next_actions": ["压测完成后确认上线条件"],
+                "likely_follow_ups": [
+                    {
+                        "question": "压测完成后如何确认？",
+                        "answer_angle": "说明上线条件和确认动作",
+                    }
+                ],
+                "evidence_refs": [
+                    {"segment_id": "local-3", "quote": "压测还没有完成。"},
+                    {"segment_id": "remote-4", "quote": "你能承诺周五一定上线吗？"},
+                ],
+                "confidence": 0.91,
+            },
+        }
+    }
+
+    intervention = parse_realtime_coach_response(
+        json.dumps(payload, ensure_ascii=False),
+        request=deep_request,
+    )
+
+    assert intervention is not None
+    assert intervention.coaching_package is not None
+    assert intervention.coaching_package["headline"] == "区分目标与承诺"
+    assert intervention.coaching_package["likely_follow_ups"][0]["answer_angle"] == "说明上线条件和确认动作"
+    assert intervention.to_dict()["coaching_package"]["evidence_refs"][1] == {
+        "segment_id": "remote-4",
+        "quote": "你能承诺周五一定上线吗？",
+    }
+
+
 def test_coach_parser_rejects_a_quote_not_present_in_evidence() -> None:
     content = json.dumps(
         {

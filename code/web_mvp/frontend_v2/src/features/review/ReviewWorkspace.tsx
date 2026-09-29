@@ -22,6 +22,8 @@ import {
   Sparkles,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
+import { motionAwareScrollBehavior } from "../../app/motion";
+import { useDismissablePopover } from "../../components/useDismissablePopover";
 import type {
   MeetingViewState,
   OpenQuestionProjection,
@@ -725,6 +727,10 @@ export function ReviewWorkspace({
   const [pendingEvidence, setPendingEvidence] = useState<string | null>(null);
   const [pendingAudioOffsetMs, setPendingAudioOffsetMs] = useState<number | null>(null);
   const [exportMenuOpen, setExportMenuOpen] = useState(false);
+  const exportMenu = useDismissablePopover<HTMLButtonElement, HTMLDivElement>(
+    exportMenuOpen,
+    () => setExportMenuOpen(false),
+  );
   const [exporting, setExporting] = useState<MeetingExportFormat | null>(null);
   const [exportNotice, setExportNotice] = useState<{ text: string; error: boolean } | null>(null);
   const [factsEditing, setFactsEditing] = useState(false);
@@ -915,17 +921,17 @@ export function ReviewWorkspace({
   const hasDecisionContent = decisionsEditor.draft.length > 0 || actionsEditor.draft.length > 0 || keptSuggestions.length > 0;
   const hasRiskContent = risksEditor.draft.length > 0 || reviewQuestions.length > 0;
   const actionUnavailable = !hasDecisionContent && !state.minutes
-    ? qualityPaused
+      ? qualityPaused
       ? { className: "inline-warning", text: "识别语义质量不足，决策与行动项提取已暂停。" }
       : minutesJobFailed
-        ? { className: "inline-error", text: "会议纪要生成失败，未能提取决策与行动项。" }
+        ? { className: "review-empty", text: "决策与行动项暂未生成，请从页面顶部重试会议纪要。" }
         : { className: "review-empty", text: "会议纪要正在生成，完成后显示决策与行动项。" }
     : null;
   const riskUnavailable = !hasRiskContent && !state.minutes
-    ? qualityPaused
+      ? qualityPaused
       ? { className: "inline-warning", text: "识别语义质量不足，风险与待确认问题提取已暂停。" }
       : minutesJobFailed
-        ? { className: "inline-error", text: "会议纪要生成失败，未能提取风险与待确认问题。" }
+        ? { className: "review-empty", text: "风险与待确认问题暂未生成，请从页面顶部重试会议纪要。" }
         : { className: "review-empty", text: "会议纪要正在生成，完成后显示风险与待确认问题。" }
     : null;
 
@@ -1028,7 +1034,7 @@ export function ReviewWorkspace({
     const frame = window.requestAnimationFrame(() => {
       const anchor = document.getElementById(segmentDomId(pendingEvidence));
       const paragraph = anchor?.closest<HTMLElement>(".transcript-segment") ?? anchor;
-      paragraph?.scrollIntoView({ behavior: "smooth", block: "center" });
+      paragraph?.scrollIntoView({ behavior: motionAwareScrollBehavior(), block: "center" });
       paragraph?.focus({ preventScroll: true });
       paragraph?.classList.add("is-evidence-target");
       setPendingEvidence(null);
@@ -1325,6 +1331,7 @@ export function ReviewWorkspace({
         </div>
         <div className="review-export-wrap">
           <button
+            ref={exportMenu.triggerRef}
             className="icon-button"
             type="button"
             aria-label="导出会议"
@@ -1337,7 +1344,7 @@ export function ReviewWorkspace({
             {exporting ? <LoaderCircle className="spin" size={17} /> : <Download size={17} />}
           </button>
           {exportMenuOpen ? (
-            <div className="review-export-menu" role="menu" aria-label="导出格式">
+            <div ref={exportMenu.popoverRef} className="review-export-menu" role="menu" aria-label="导出格式">
               <button type="button" role="menuitem" onClick={() => void exportMeeting("markdown")}>
                 <FileText size={16} />Markdown
               </button>
@@ -1387,7 +1394,7 @@ export function ReviewWorkspace({
               ) : !state.minutes && !state.documents?.minutes && transcript.length === 0 ? (
                 <p className="inline-warning">本次没有形成可确认的会议文字，录音已保存；补充有效音频后可重新整理。</p>
               ) : !state.minutes && !state.documents?.minutes && providerNotConfigured(state.reviewJobs.minutes) ? (
-                <p className="inline-warning">AI 尚未配置，会议文字和录音已保存；配置 AI 后可重新生成会议纪要。</p>
+                <p className="review-empty">会议纪要尚未生成。</p>
               ) : !state.minutes && !state.documents?.minutes && state.reviewJobs.minutes?.status === "failed" ? (
                 <p className="review-empty">会议复盘暂未生成，可从上方状态栏重试。</p>
               ) : !state.minutes && !state.documents?.minutes ? (
@@ -1422,7 +1429,7 @@ export function ReviewWorkspace({
               ) : transcript.length === 0 ? (
                 <p className="inline-warning">本次没有形成可确认的会议文字，暂时没有可生成的分析建议。</p>
               ) : providerNotConfigured(state.reviewJobs.approach) ? (
-                <p className="inline-warning">AI 尚未配置，会议文字和录音已保存；配置 AI 后可重新生成分析建议。</p>
+                <p className="review-empty">分析建议尚未生成。</p>
               ) : state.reviewJobs.approach?.status === "failed" ? (
                 <p className="review-empty">分析建议暂未生成，可从上方状态栏重试。</p>
               ) : (

@@ -24,6 +24,41 @@ afterEach(() => {
 });
 
 describe("ImportRecordingDialog", () => {
+  it("does not allow Escape or close controls to interrupt an active upload", async () => {
+    let resolveImport!: (value: { meetingId: string; job: ImportJob }) => void;
+    const importing = new Promise<{ meetingId: string; job: ImportJob }>((resolve) => {
+      resolveImport = resolve;
+    });
+    const onClose = vi.fn();
+    const user = userEvent.setup();
+    render(
+      <ImportRecordingDialog
+        open
+        onClose={onClose}
+        onImport={vi.fn().mockReturnValue(importing)}
+        onReadImportJob={vi.fn()}
+        onRetryImport={vi.fn()}
+        onOpenMeeting={vi.fn()}
+      />,
+    );
+
+    await user.upload(
+      screen.getByLabelText("选择要导入的录音文件"),
+      new File([new Uint8Array(16)], "会议.wav", { type: "audio/wav" }),
+    );
+    await user.click(screen.getByRole("button", { name: "开始导入" }));
+    for (const closeButton of screen.getAllByRole("button", { name: "关闭录音导入" })) {
+      expect(closeButton).toBeDisabled();
+    }
+    expect(screen.getByRole("button", { name: "取消" })).toBeDisabled();
+
+    await user.keyboard("{Escape}");
+    expect(onClose).not.toHaveBeenCalled();
+
+    resolveImport({ meetingId: "import-meeting-1", job: job() });
+    await waitFor(() => expect(screen.getByRole("button", { name: "返回会议列表" })).toBeEnabled());
+  });
+
   it("keeps reading the durable background job and shows its real stage", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     let resolveCompleted!: (value: ImportJob) => void;

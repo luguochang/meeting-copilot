@@ -1,7 +1,12 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach } from "vitest";
 import type { MeetingApi } from "../../api/client";
 import type { AskAiMessage, AskAiThread } from "../../domain/events";
 import { AiWorkspace } from "./AiWorkspace";
+
+afterEach(() => {
+  window.sessionStorage.clear();
+});
 
 function assistantMessage(): AskAiMessage {
   return {
@@ -36,6 +41,39 @@ function formalAi(segmentId: string) {
     },
   };
 }
+
+it("restores the selected AI workspace tab after leaving and returning to a meeting", async () => {
+  const api = {
+    getAskThreads: vi.fn(async () => []),
+    getChapters: vi.fn(async () => []),
+    listNotes: vi.fn(async () => []),
+  } as unknown as MeetingApi;
+  const props = {
+    meetingId: "meeting-view-state",
+    api,
+    selection: null,
+    askSelectionNonce: 0,
+    currentTopic: null,
+    followUp: null,
+    openQuestions: [],
+    suggestions: [],
+    decisionCandidates: [],
+    actionItems: [],
+    risks: [],
+    onEvidence: vi.fn(),
+    onFeedback: vi.fn(),
+    onFactStatus: vi.fn(),
+    onMessage: vi.fn(),
+  };
+
+  const first = render(<AiWorkspace {...props} />);
+  fireEvent.click(await screen.findByRole("tab", { name: "询问 AI" }));
+  await waitFor(() => expect(window.sessionStorage.getItem("meeting-copilot-ai-view:meeting-view-state")).toContain('"tab":"ask"'));
+  first.unmount();
+
+  render(<AiWorkspace {...props} />);
+  expect(await screen.findByRole("tab", { name: "询问 AI" })).toHaveAttribute("aria-selected", "true");
+});
 
 it("shows the active Pi checklist loop when no intervention is needed", async () => {
   const api = {
@@ -100,13 +138,22 @@ it("shows the active Pi checklist loop when no intervention is needed", async ()
 
   expect(await screen.findByText("Pi 教练监听中")).toBeVisible();
   expect(await screen.findByText("用户访谈")).toBeVisible();
-  expect(screen.getByText("本轮结论：暂不打断，没有发现需要立刻介入的表达问题")).toBeVisible();
+  expect(document.querySelector(".coach-loop-decision")).toHaveTextContent(
+    "本轮状态：本轮结论：暂不打断，没有发现需要立刻介入的表达问题",
+  );
   expect(screen.getByText("本轮完成 6 项检查 · 检索历史 1 次 · 已延续会议上下文")).toBeVisible();
   expect(screen.getByRole("list", { name: "教练检查项" })).toHaveTextContent("问题回应");
   expect(screen.getByRole("list", { name: "教练检查项" })).toHaveTextContent("承诺条件");
   expect(screen.getByRole("list", { name: "教练检查项" })).toHaveTextContent("表达清晰");
   expect(screen.getByRole("list", { name: "教练检查项" })).toHaveTextContent("访谈证据深度");
   expect(screen.getByRole("list", { name: "过去的教练建议" })).toHaveTextContent("先确认负责人，再承诺时间。");
+  const coachTab = screen.getByRole("tab", { name: "实时教练" });
+  const askTab = screen.getByRole("tab", { name: "询问 AI" });
+  expect(coachTab).toHaveAttribute("aria-controls", screen.getByRole("tabpanel").id);
+  coachTab.focus();
+  fireEvent.keyDown(coachTab, { key: "ArrowRight" });
+  await waitFor(() => expect(askTab).toHaveFocus());
+  expect(askTab).toHaveAttribute("aria-selected", "true");
 });
 
 it("keeps the latest coach intervention prominent and exposes prior advice", async () => {
@@ -211,8 +258,8 @@ it("shows recent discussion as a bounded timeline that can reveal earlier items"
     />,
   );
 
-  await screen.findByRole("tab", { name: "会议重点" });
-  fireEvent.click(screen.getByRole("tab", { name: "Ask AI" }));
+  await screen.findByRole("tab", { name: "实时教练" });
+  fireEvent.click(screen.getByRole("tab", { name: "询问 AI" }));
   const timeline = await screen.findByRole("list", { name: "最近讨论时间线" });
   expect(timeline).toHaveTextContent("讨论内容 6");
   expect(timeline).not.toHaveTextContent("讨论内容 1");

@@ -37,6 +37,14 @@ async function finishBrowserProbe() {
   });
 }
 
+async function completeBrowserProbe() {
+  vi.useFakeTimers();
+  fireEvent.click(screen.getByRole("button", { name: "检查麦克风" }));
+  await finishBrowserProbe();
+  vi.useRealTimers();
+  expect(screen.getByText("正常收到声音，麦克风可用")).toBeVisible();
+}
+
 
 function response(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -134,9 +142,11 @@ describe("MeetingPreflightDialog", () => {
     expect(await screen.findByText("本地中文实时识别可用")).toBeVisible();
     expect(screen.getByText("AI 已连接 · gpt-5.5")).toBeVisible();
     expect(screen.getByText("本地可写 4.0 GB · 本场预计 110 MB")).toBeVisible();
+    fireEvent.click(screen.getByText("会议与教练设置"));
     fireEvent.change(screen.getByPlaceholderText(/checkout-service/), {
       target: { value: "P99，checkout-service\np99" },
     });
+    await completeBrowserProbe();
     fireEvent.click(screen.getByLabelText("我已告知参会者并确认可以录音"));
     fireEvent.click(screen.getByRole("button", { name: "开始会议" }));
 
@@ -154,9 +164,11 @@ describe("MeetingPreflightDialog", () => {
     render(<MeetingPreflightDialog open busy={false} onCancel={vi.fn()} onStart={onStart} />);
 
     expect(await screen.findByText("本地中文实时识别可用")).toBeVisible();
+    fireEvent.click(screen.getByText("会议与教练设置"));
     fireEvent.change(screen.getByDisplayValue("通用对话教练"), { target: { value: "interview" } });
 
     expect(screen.getByText(/中立追问补齐具体行为/)).toBeVisible();
+    await completeBrowserProbe();
     fireEvent.click(screen.getByLabelText("我已告知参会者并确认可以录音"));
     fireEvent.click(screen.getByRole("button", { name: "开始会议" }));
 
@@ -356,6 +368,7 @@ describe("MeetingPreflightDialog", () => {
     render(<MeetingPreflightDialog open busy={false} onCancel={vi.fn()} onStart={onStart} />);
     await screen.findByText("本地中文实时识别可用");
 
+    await completeBrowserProbe();
     fireEvent.click(screen.getByLabelText("我已告知参会者并确认可以录音"));
     fireEvent.click(screen.getByRole("button", { name: "开始会议" }));
 
@@ -393,11 +406,11 @@ describe("MeetingPreflightDialog", () => {
 
     vi.useFakeTimers();
     fireEvent.click(screen.getByRole("button", { name: "检查麦克风" }));
-    expect(screen.getByRole("status")).toHaveTextContent("等待麦克风权限");
+    expect(screen.getByText(/等待麦克风权限：/)).toBeVisible();
     await act(async () => {
       await vi.advanceTimersByTimeAsync(150);
     });
-    expect(screen.getByRole("status")).toHaveTextContent("麦克风权限已通过，正在采样输入音量");
+    expect(screen.getByText(/麦克风权限已通过，正在采样输入音量/)).toBeVisible();
     expect(screen.getByLabelText("输入音量 5.0%")).toHaveAttribute("data-probe-status", "checking");
     await finishBrowserProbe();
 
@@ -451,7 +464,7 @@ describe("MeetingPreflightDialog", () => {
 
     vi.useFakeTimers();
     fireEvent.click(screen.getByRole("button", { name: "检查麦克风" }));
-    expect(screen.getByRole("status")).toHaveTextContent("等待麦克风权限");
+    expect(screen.getByText(/等待麦克风权限：/)).toBeVisible();
     expect(screen.getByLabelText("检查后显示输入音量")).toHaveTextContent("等待授权");
     await act(async () => {
       await vi.advanceTimersByTimeAsync(8_100);
@@ -492,12 +505,12 @@ describe("MeetingPreflightDialog", () => {
     await screen.findByText("本地中文实时识别可用");
 
     fireEvent.click(screen.getByRole("button", { name: "检查麦克风" }));
-    expect(screen.getByRole("status")).toHaveTextContent("等待麦克风权限");
+    expect(screen.getByText(/等待麦克风权限：/)).toBeVisible();
     fireEvent.change(screen.getByRole("combobox", { name: "输入设备" }), {
       target: { value: "mic-2" },
     });
 
-    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.queryByText(/等待麦克风权限：/)).not.toBeInTheDocument();
     expect(screen.getByLabelText("检查后显示输入音量")).toHaveAttribute("data-probe-status", "idle");
     expect(screen.getByLabelText("检查后显示输入音量")).toHaveTextContent("尚未检查");
     expect(screen.getByRole("button", { name: "检查麦克风" })).toBeEnabled();
@@ -565,7 +578,7 @@ describe("MeetingPreflightDialog", () => {
     await screen.findByText("本地中文实时识别可用");
 
     fireEvent.click(screen.getByRole("button", { name: "检查麦克风" }));
-    expect(screen.getByRole("status")).toHaveTextContent("等待麦克风权限");
+    expect(screen.getByText(/等待麦克风权限：/)).toBeVisible();
     fireEvent.click(screen.getByRole("button", { name: "取消" }));
     expect(onCancel).toHaveBeenCalledOnce();
     rerender(<MeetingPreflightDialog open={false} busy={false} onCancel={onCancel} onStart={vi.fn()} />);
@@ -916,7 +929,8 @@ describe("MeetingPreflightDialog", () => {
 
     expect(await screen.findByText("AI 未配置，会议仍可录音和转写")).toBeVisible();
     fireEvent.click(screen.getByLabelText("我已告知参会者并确认可以录音"));
-    expect(screen.getByRole("button", { name: "开始会议" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "开始会议" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "定位缺项：检查麦克风" })).toBeVisible();
     expect(invokeMock).toHaveBeenCalledTimes(4);
     expect(invokeMock).toHaveBeenCalledWith("provider_config_status", undefined);
     expect(invokeMock).toHaveBeenCalledWith("dual_track_adapter_status", undefined);
@@ -978,7 +992,8 @@ describe("MeetingPreflightDialog", () => {
 
     expect(await screen.findByRole("alert")).toHaveTextContent("系统凭据未授权");
     expect(screen.getByRole("button", { name: "重试连接 AI" })).toBeEnabled();
-    expect(screen.getByRole("button", { name: "开始会议" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "开始会议" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "定位缺项：检查麦克风" })).toBeVisible();
     expect(invokeMock).toHaveBeenCalledWith("provider_config_sync", undefined);
     expect(fetchMock.mock.calls.filter(([input]) => String(input).endsWith("/providers/health"))).toHaveLength(1);
     expect(fetchMock.mock.calls.some(([input]) => String(input).includes("/providers/llm/probe"))).toBe(false);

@@ -1,7 +1,7 @@
 import { Archive, ArchiveRestore, ArrowUpRight, FileText, Info, Link2, LoaderCircle, Search, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { MeetingApi } from "../../api/client";
-import { ProductNavigation } from "../../components/ProductNavigation";
+import { ProductNavigation, type ActiveMeetingNavigation } from "../../components/ProductNavigation";
 import type { MeetingHistoryItem, MeetingNote, MeetingNoteStatus } from "../../domain/events";
 import { ProviderSettingsControl } from "../settings/ProviderSettingsControl";
 
@@ -11,6 +11,8 @@ interface NotesCenterProps {
   onOpenMeeting: (meetingId: string) => void;
   onOpenEvidence: (meetingId: string, segmentId: string) => void;
   onOpenCapabilities?: () => void;
+  activeMeeting?: ActiveMeetingNavigation | null;
+  onOpenActiveMeeting?: () => void;
 }
 
 function formatUpdatedAt(timestamp: number): string {
@@ -34,6 +36,8 @@ export function NotesCenter({
   onOpenMeeting,
   onOpenEvidence,
   onOpenCapabilities,
+  activeMeeting,
+  onOpenActiveMeeting,
 }: NotesCenterProps) {
   const [notes, setNotes] = useState<MeetingNote[]>([]);
   const [meetings, setMeetings] = useState<MeetingHistoryItem[]>([]);
@@ -154,7 +158,13 @@ export function NotesCenter({
 
   return (
     <div className="product-app product-app--notes">
-      <ProductNavigation active="notes" onOpenMeetings={onOpenMeetings} onOpenCapabilities={onOpenCapabilities} />
+      <ProductNavigation
+        active="notes"
+        onOpenMeetings={onOpenMeetings}
+        onOpenCapabilities={onOpenCapabilities}
+        activeMeeting={activeMeeting}
+        onOpenActiveMeeting={onOpenActiveMeeting}
+      />
       <div className="notes-shell">
         <header className="notes-header">
           <div>

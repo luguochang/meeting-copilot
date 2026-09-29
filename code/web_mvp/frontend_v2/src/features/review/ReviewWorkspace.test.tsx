@@ -45,6 +45,29 @@ async function openActions(state: MeetingViewState) {
 }
 
 describe("ReviewWorkspace", () => {
+  it("closes the export menu with Escape or an outside click and restores trigger focus", async () => {
+    const user = userEvent.setup();
+    render(
+      <ReviewWorkspace
+        state={endedState()}
+        onReloadTranscript={vi.fn()}
+        onReloadAudio={vi.fn()}
+        onExport={vi.fn().mockResolvedValue(undefined)}
+      />,
+    );
+
+    const trigger = screen.getByRole("button", { name: "导出会议" });
+    await user.click(trigger);
+    expect(screen.getByRole("menu", { name: "导出格式" })).toBeVisible();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("menu", { name: "导出格式" })).toBeNull();
+    expect(trigger).toHaveFocus();
+
+    await user.click(trigger);
+    await user.click(document.body);
+    expect(screen.queryByRole("menu", { name: "导出格式" })).toBeNull();
+  });
+
   it("falls back to an authenticated blob when direct audio metadata cannot load", async () => {
     const state = endedState();
     state.audioDetail = {
@@ -346,7 +369,7 @@ describe("ReviewWorkspace", () => {
 
   it.each([
     ["running", false, "会议纪要正在生成，完成后显示决策与行动项。"],
-    ["failed", false, "会议纪要生成失败，未能提取决策与行动项。"],
+    ["failed", false, "决策与行动项暂未生成，请从页面顶部重试会议纪要。"],
     ["failed", true, "识别语义质量不足，决策与行动项提取已暂停。"],
   ] as Array<[ReviewJobStatus, boolean, string]>) (
     "shows the actual %s minutes state in the actions tab",
@@ -415,8 +438,8 @@ describe("ReviewWorkspace", () => {
 
     expect(screen.getByText("会议纪要：等待配置 AI")).toBeVisible();
     expect(screen.getByText("AI 尚未配置，会议文字和录音已保存；配置 AI 后会自动继续生成会后产物。")).toBeVisible();
-    expect(screen.getByText("AI 尚未配置，会议文字和录音已保存；配置 AI 后可重新生成会议纪要。")).toBeVisible();
-    expect(screen.getByText("AI 尚未配置，会议文字和录音已保存；配置 AI 后可重新生成分析建议。")).toBeVisible();
+    expect(screen.getByText("会议纪要尚未生成。")).toBeVisible();
+    expect(screen.getByText("分析建议尚未生成。")).toBeVisible();
     expect(screen.queryByText("会议纪要：正在重试")).not.toBeInTheDocument();
   });
 

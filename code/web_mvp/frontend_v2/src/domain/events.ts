@@ -304,12 +304,40 @@ export interface CoachDecisionProjection {
   validUntil?: number;
   promptProfile?: string;
   answerId?: string;
+  revision?: number;
+  triggerType?: string;
+  userRequest?: string;
   lifecycleAction?: CoachLifecycleAction;
   lifecycleRefresh?: boolean;
   lifecycleStatus?: CoachLifecycleStatus;
   supersedesDecisionId?: string | null;
   supersededBy?: string | null;
   agentMetrics?: CoachAgentMetrics;
+}
+
+export interface PiCoachingEvidenceRef {
+  segmentId: string;
+  quote: string;
+}
+
+export interface PiCoachingFollowUp {
+  question: string;
+  answerAngle: string;
+}
+
+export interface PiCoachingPackage {
+  headline: string;
+  questionIntent: string;
+  coreJudgement: string;
+  whyItMatters: string;
+  sayThisAddition: string;
+  missingPoints: string[];
+  constraints: string[];
+  risks: string[];
+  nextActions: string[];
+  likelyFollowUps: PiCoachingFollowUp[];
+  evidenceRefs: PiCoachingEvidenceRef[];
+  confidence: number;
 }
 
 export interface FollowUpProjection {
@@ -345,6 +373,10 @@ export interface FollowUpProjection {
   validUntil?: number;
   promptProfile?: string;
   answerId?: string;
+  revision?: number;
+  triggerType?: string;
+  userRequest?: string;
+  coachingPackage?: PiCoachingPackage;
   lifecycleAction?: CoachLifecycleAction;
   lifecycleStatus?: CoachLifecycleStatus;
   supersedesDecisionId?: string | null;
@@ -455,8 +487,19 @@ export interface RuntimeIndicator {
   capabilities?: Record<string, RuntimeIndicator>;
 }
 
+export type MeetingCaptureState = "active" | "recoverable" | "inactive";
+
+export interface MeetingCaptureSummary {
+  state: MeetingCaptureState;
+  activeTrackCount: number;
+  trackCount: number;
+  lastHeartbeatAtMs: number | null;
+  leaseUntilMs: number | null;
+}
+
 export interface MeetingRuntime {
   phase: "live" | "ending" | "ended" | "unknown";
+  capture?: MeetingCaptureSummary;
   recording: RuntimeIndicator;
   input: RuntimeIndicator;
   ai: RuntimeIndicator;
@@ -699,6 +742,7 @@ export interface MeetingHistoryItem {
   suggestionCount: number;
   audioDurationMs: number;
   hasMinutes: boolean;
+  capture?: MeetingCaptureSummary;
   reviewJobs?: ReviewJobs;
   importJob?: ImportJob | null;
   audioStatus?: MeetingAudioSummary["status"];

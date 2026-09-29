@@ -234,29 +234,34 @@ test("deep answer coaching sees the Fast Answer and submits an incremental card 
         payload.bound_evidence.map((paragraph) => paragraph.id),
         ["local-1", "remote-1"],
       );
-      assert.match(context.systemPrompt, /not to rewrite or summarize current_answer/);
-      assert.match(context.systemPrompt, /must appear verbatim in bound_evidence or current_answer/);
+      assert.match(context.systemPrompt, /do not rewrite or summarize current_answer/i);
+      assert.match(context.systemPrompt, /facts only from current_answer and bound_evidence/i);
+      assert.match(context.systemPrompt, /speakable addition is the primary result/i);
       assert.deepEqual(
         context.tools.map((tool) => tool.name),
         ["submit_intervention", "keep_silent"],
       );
       assert.ok(!context.tools.some((tool) => tool.name === "read_realtime_context"));
       const terminalSchema = context.tools.find((tool) => tool.name === "submit_intervention").parameters;
-      assert.ok(terminalSchema.properties.boundary);
-      assert.ok(terminalSchema.properties.risk);
-      assert.ok(terminalSchema.properties.follow_up);
+      assert.ok(terminalSchema.properties.headline);
+      assert.ok(terminalSchema.properties.say_this_addition);
+      assert.ok(terminalSchema.properties.key_points);
+      assert.equal(terminalSchema.properties.key_points.minItems, 2);
+      assert.equal(terminalSchema.properties.key_points.maxItems, 2);
+      assert.equal(terminalSchema.properties.core_judgement, undefined);
+      assert.equal(terminalSchema.properties.next_action, undefined);
       assert.equal(terminalSchema.properties.recommendation, undefined);
       assert.equal(terminalSchema.properties.say_this, undefined);
       assert.equal(terminalSchema.properties.evidence_segment_ids, undefined);
       assert.equal(terminalSchema.properties.evidence_quote, undefined);
       return fauxAssistantMessage(
         fauxToolCall("submit_intervention", {
-          title: "补充异常恢复边界",
-          boundary: "高吞吐或长周期留存时需要重新评估选型",
-          risk: "需要确认消费异常后的恢复和重复消费处理",
-          follow_up: "如何保证消息不丢并处理消费者积压",
-          why_now: "当前回答已有选型依据，但还可以补充异常路径和可能追问。",
-          urgency: "medium",
+          headline: "补充异常恢复边界",
+          say_this_addition: "我会再补充异常恢复和重新评估选型的触发条件，避免只回答接入成本。",
+          key_points: [
+            "当前回答没有覆盖异常恢复和重新选型条件",
+            "补充选型切换条件和验证方式",
+          ],
           confidence: 0.88,
         }),
         { stopReason: "toolUse" },
@@ -276,11 +281,10 @@ test("deep answer coaching sees the Fast Answer and submits an incremental card 
   assert.equal(result.metrics.tool_calls, 1);
   assert.deepEqual(result.metrics.tool_names, ["submit_intervention"]);
   assert.equal(result.intervention.title, "补充异常恢复边界");
-  assert.equal(result.intervention.recommendation, [
-    "边界：高吞吐或长周期留存时需要重新评估选型",
-    "风险：需要确认消费异常后的恢复和重复消费处理",
-    "追问：如何保证消息不丢并处理消费者积压",
-  ].join("\n"));
+  assert.equal(result.intervention.recommendation, "我会再补充异常恢复和重新评估选型的触发条件，避免只回答接入成本。");
+  assert.equal(result.intervention.coaching_package.question_intent, "需要回答：为什么选择 Redis Stream 而不是 Kafka？");
+  assert.deepEqual(result.intervention.coaching_package.likely_follow_ups, []);
+  assert.deepEqual(result.intervention.coaching_package.evidence_refs.map((item) => item.segment_id), ["local-1", "remote-1"]);
   assert.deepEqual(result.intervention.evidence_segment_ids, ["local-1", "remote-1"]);
   assert.equal(
     result.intervention.evidence_quote,
@@ -288,7 +292,7 @@ test("deep answer coaching sees the Fast Answer and submits an incremental card 
   );
 });
 
-test("deep answer coaching removes provider-written field labels before composing the card", async () => {
+test("deep answer coaching preserves a structured user-request revision", async () => {
   const { faux, runtime } = harness();
   const deep = fullRequest("deep-answer-labels");
   deep.context.trigger_type = "user_request";
@@ -303,12 +307,9 @@ test("deep answer coaching removes provider-written field labels before composin
   faux.setResponses([
     fauxAssistantMessage(
       fauxToolCall("submit_intervention", {
-        title: "补充可靠性边界",
-        boundary: "架构边界：只适用于当前规模",
-        risk: "关键风险：异常路径还需说明",
-        follow_up: "面试官最可能追问：如何处理失败消费",
-        why_now: "当前回答缺少异常路径。",
-        urgency: "medium",
+        headline: "补充可靠性边界",
+        say_this_addition: "可以补充当前规模之外的重新评估条件，以及失败消费的处理方式。",
+        key_points: ["当前回答只说明了规模条件", "补充失败消费验证方式"],
         confidence: 0.8,
       }),
       { stopReason: "toolUse" },
@@ -317,10 +318,38 @@ test("deep answer coaching removes provider-written field labels before composin
 
   const result = await runtime.evaluate(deep);
 
-  assert.equal(
-    result.intervention.recommendation,
-    "边界：只适用于当前规模\n风险：异常路径还需说明\n追问：如何处理失败消费",
+  assert.equal(result.intervention.coaching_package.missing_points[0], "当前回答只说明了规模条件");
+  assert.equal(result.intervention.coaching_package.next_actions[0], "补充失败消费验证方式");
+  assert.deepEqual(
+    result.metrics.available_tool_names,
+    ["submit_intervention", "keep_silent"],
   );
+  assert.equal(result.metrics.history_searches, 0);
+});
+
+test("bound user-request revisions fail before Provider when Answer evidence is absent", async () => {
+  const { faux, runtime } = harness();
+  const deep = fullRequest("deep-answer-missing-bound-evidence");
+  deep.context.trigger_type = "user_request";
+  deep.context.work_item_id = "answer:older-question";
+  deep.context.priority_mode = "deep";
+  deep.context.user_request = "没说中重点：请围绕原问题补充判断边界。";
+  deep.context.rolling_state.current_answer = {
+    answer_id: "answer:older-question",
+    evidence_segment_id: "older-question-evidence",
+    context_evidence_segment_ids: ["older-question-evidence"],
+    question: "两个指标是否冲突？",
+    answer: "两个指标采用了不同统计口径。",
+    status: "committed",
+  };
+
+  await assert.rejects(
+    runtime.evaluate(deep),
+    (error) => error instanceof PiCoachProtocolError
+      && error.code === "invalid_request"
+      && error.message === "deep answer is missing its host-bound evidence paragraph",
+  );
+  assert.equal(faux.state.callCount, 0);
 });
 
 test("the host checklist lets Pi reach a terminal decision in one provider turn", async () => {
@@ -1550,6 +1579,146 @@ test("GPT-5 compatible gateways explicitly disable hidden default reasoning", ()
 
   assert.equal(backend.model.reasoning, true);
   assert.equal(backend.model.thinkingLevelMap.off, "none");
+});
+
+test("Provider requests cannot exceed the ten-second bridge ceiling", () => {
+  const backend = createOpenAICompatibleBackend({
+    base_url: "https://provider.example.test/v1",
+    api_key: "test-only-key",
+    model: "gpt-5.5",
+    api_style: "responses",
+    timeout_ms: 25_000,
+    decision_timeout_ms: 25_000,
+  });
+
+  assert.equal(backend.providerTimeoutMs, 10_000);
+  assert.equal(backend.decisionTimeoutMs, 10_000);
+});
+
+test("deep Answer uses bounded non-streaming Responses while preserving the Pi tool loop", async () => {
+  const backend = createOpenAICompatibleBackend({
+    base_url: "https://provider.example.test/v1",
+    api_key: "test-only-key",
+    model: "gpt-5.5",
+    api_style: "responses",
+    timeout_ms: 1000,
+    decision_timeout_ms: 1000,
+  });
+  let requestBody;
+  let requestHeaders;
+  let streamingCalls = 0;
+  const fetch = async (input, init) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    requestBody = await request.clone().json();
+    requestHeaders = request.headers;
+    return new Response(JSON.stringify({
+      id: "resp_deep_non_streaming",
+      object: "response",
+      created_at: 1,
+      status: "completed",
+      model: "gpt-5.5",
+      output: [{
+        type: "function_call",
+        id: "fc_deep_non_streaming",
+        call_id: "call_deep_non_streaming",
+        name: "submit_intervention",
+        arguments: JSON.stringify({
+          headline: "补充异常恢复边界",
+          say_this_addition: "我再补充异常消费后的恢复策略和重新评估选型的触发条件。",
+          key_points: ["当前回答没有说明异常恢复条件", "补充异常路径验证方式"],
+          confidence: 0.88,
+        }),
+        status: "completed",
+      }],
+      usage: {
+        input_tokens: 210,
+        output_tokens: 70,
+        total_tokens: 280,
+        input_tokens_details: { cached_tokens: 10 },
+        output_tokens_details: { reasoning_tokens: 5 },
+      },
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  const runtime = new PiCoachRuntime({
+    backendFactory: () => ({
+      identity: backend.identity,
+      model: backend.model,
+      decisionTimeoutMs: backend.decisionTimeoutMs,
+      streamFn: (...args) => {
+        streamingCalls += 1;
+        return backend.streamFn(...args);
+      },
+      deepStreamFn: (model, context, options) => backend.deepStreamFn(model, context, {
+        ...options,
+        fetch,
+      }),
+      get lastProviderStatusCode() {
+        return backend.lastProviderStatusCode;
+      },
+      get lastProviderConnectMs() {
+        return backend.lastProviderConnectMs;
+      },
+    }),
+  });
+  const deep = fullRequest("deep-non-streaming");
+  deep.context.trigger_type = "answer_ready";
+  deep.context.priority_mode = "deep";
+  deep.context.work_item_id = "answer:job-non-streaming";
+  deep.context.rolling_state.current_answer = {
+    answer_id: "answer:job-non-streaming",
+    evidence_segment_id: "remote-1",
+    context_evidence_segment_ids: ["local-1", "remote-1"],
+    question: "为什么选择 Redis Stream 而不是 Kafka？",
+    answer: "当前吞吐规模可控，而且已有 Redis 集群。",
+    status: "committed",
+  };
+
+  const result = await runtime.evaluate(deep);
+
+  assert.equal(requestBody.stream, false);
+  assert.equal(requestBody.tool_choice, "required");
+  assert.equal(requestBody.max_output_tokens, 280);
+  assert.equal(requestHeaders.has("session_id"), false);
+  assert.equal(requestHeaders.has("x-client-request-id"), false);
+  assert.equal(streamingCalls, 0);
+  assert.equal(result.action, "intervention");
+  assert.equal(result.metrics.provider_transport, "responses_non_streaming");
+  assert.equal(result.metrics.tool_calls, 1);
+  assert.equal(result.metrics.provider_status_code, undefined);
+  assert.equal(result.metrics.usage.total_tokens, 280);
+  assert.equal(result.intervention.title, "补充异常恢复边界");
+});
+
+test("realtime candidates keep the Pi SDK streaming transport", async () => {
+  const faux = fauxProvider({ provider: `talktrace-streaming-lane-${Math.random()}` });
+  const models = createModels();
+  models.setProvider(faux.provider);
+  let deepCalls = 0;
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("keep_silent", { reason: "No intervention needed." }), {
+      stopReason: "toolUse",
+    }),
+  ]);
+  const runtime = new PiCoachRuntime({
+    backendFactory: () => ({
+      identity: "streaming-lane-test",
+      model: faux.getModel(),
+      streamFn: models.streamSimple.bind(models),
+      deepStreamFn: () => {
+        deepCalls += 1;
+        return createAssistantMessageEventStream();
+      },
+    }),
+  });
+
+  const result = await runtime.evaluate(request("streaming-lane"));
+
+  assert.equal(result.action, "silent");
+  assert.equal(result.metrics.provider_transport, "sdk_streaming");
+  assert.equal(deepCalls, 0);
 });
 
 test("a provider that ignores abort cannot crash on a late tool callback", async () => {

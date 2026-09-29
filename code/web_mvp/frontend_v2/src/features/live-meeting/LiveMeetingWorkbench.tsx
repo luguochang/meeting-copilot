@@ -6,13 +6,14 @@ import {
   Clock3,
   FileAudio,
   FileText,
-  Gauge,
+  Lightbulb,
   LoaderCircle,
   Mic,
   Pause,
   Play,
   Square,
   Users,
+  Video,
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { MeetingApi } from "../../api/client";
@@ -22,8 +23,7 @@ import { useMeetingProjection } from "../../app/useMeetingProjection";
 import { BrandMark } from "../../components/BrandMark";
 import { DiagnosticsDrawer } from "../../components/DiagnosticsDrawer";
 import { MeetingTitleEditor } from "../../components/MeetingTitleEditor";
-import { ProductNavigation } from "../../components/ProductNavigation";
-import { StatusIndicator } from "../../components/StatusIndicator";
+import { ProductNavigation, type ActiveMeetingNavigation } from "../../components/ProductNavigation";
 import type {
   MeetingFactKind,
   MeetingFactStatus,
@@ -33,6 +33,7 @@ import type {
 import { segmentDomId } from "./domIds";
 import { AiWorkspace } from "./AiWorkspace";
 import { MeetingPreflightDialog } from "./MeetingPreflightDialog";
+import { captureHealthSummary, resolveMeetingSessionState, type MeetingSessionState } from "./meetingSessionState";
 import { TranscriptPane, type TranscriptSelection, type TranscriptSelectionAction } from "./TranscriptPane";
 import { MeetingHistory } from "../history/MeetingHistory";
 import { ImportRecordingDialog } from "../history/ImportRecordingDialog";
@@ -57,6 +58,22 @@ interface LiveMeetingWorkbenchProps {
   initialEvidenceSegmentId?: string | null;
   onEvidenceFocused?: () => void;
   microphoneController?: BrowserMicrophoneController;
+  activeCaptureMeetingId?: string | null;
+  activeMeeting?: ActiveMeetingNavigation | null;
+  onOpenActiveMeeting?: () => void;
+  onMeetingStarted?: (meetingId: string) => void;
+  onMeetingEnded?: (meetingId: string) => void;
+  onMeetingSessionStateChange?: (meetingId: string, state: MeetingSessionState) => void;
+}
+
+type MeetingPanel = "transcript" | "coach";
+
+function panelFromHistory(meetingId: string | null): MeetingPanel {
+  if (!meetingId) return "transcript";
+  const historyState = window.history.state as { meetingPanel?: unknown; meetingPanelMeetingId?: unknown } | null;
+  return historyState?.meetingPanelMeetingId === meetingId && historyState.meetingPanel === "coach"
+    ? "coach"
+    : "transcript";
 }
 
 function formatElapsed(milliseconds: number | null): string {
@@ -102,22 +119,6 @@ function transcriptBackfillDiagnostic(value: unknown): TranscriptBackfillDiagnos
   };
 }
 
-function localRecordingIndicator(state: BrowserMicrophoneState): RuntimeIndicator | null {
-  if (state.phase === "idle") return null;
-  const values: Record<Exclude<BrowserMicrophoneState["phase"], "idle">, RuntimeIndicator> = {
-    requesting: { state: "busy", label: "请求权限", level: null, detail: state.statusMessage },
-    connecting: { state: "busy", label: "连接中", level: null, detail: state.statusMessage },
-    reconnecting: { state: "busy", label: "正在恢复", level: null, detail: state.statusMessage },
-    starting: { state: "busy", label: "准备中", level: null, detail: state.statusMessage },
-    recording: { state: "active", label: "录音中", level: null, detail: state.statusMessage },
-    paused: { state: "paused", label: "已暂停", level: null, detail: state.statusMessage },
-    stopping: { state: "busy", label: "保存中", level: null, detail: state.statusMessage },
-    ended: { state: "idle", label: "已保存", level: null, detail: state.statusMessage },
-    error: { state: "error", label: "录音异常", level: null, detail: state.error },
-  };
-  return values[state.phase];
-}
-
 function localInputIndicator(
   state: BrowserMicrophoneState,
   inputSource: BrowserMicrophoneController["inputSource"],
@@ -160,8 +161,7 @@ function localInputIndicator(
   };
 }
 
-const capturePhases = new Set(["requesting", "connecting", "reconnecting", "starting", "recording", "paused", "stopping"]);
-const endableCapturePhases = new Set([...capturePhases, "error"]);
+const endableCapturePhases = new Set(["requesting", "connecting", "reconnecting", "starting", "recording", "paused", "stopping", "error"]);
 
 export function LiveMeetingWorkbench({
   meetingId,
@@ -176,6 +176,12 @@ export function LiveMeetingWorkbench({
   initialEvidenceSegmentId,
   onEvidenceFocused,
   microphoneController,
+  activeCaptureMeetingId = null,
+  activeMeeting,
+  onOpenActiveMeeting,
+  onMeetingStarted,
+  onMeetingEnded,
+  onMeetingSessionStateChange,
 }: LiveMeetingWorkbenchProps) {
   const { state, actions, transportKind } = useMeetingProjection(meetingId, api, transport);
   const liveMicrophone = useMeetingMicrophone({ asrBaseUrl });
@@ -189,6 +195,8 @@ export function LiveMeetingWorkbench({
   const [askSelectionNonce, setAskSelectionNonce] = useState(0);
   const [askSelectionAction, setAskSelectionAction] = useState<TranscriptSelectionAction>("ask");
   const [preparationRefreshKey, setPreparationRefreshKey] = useState(0);
+  const [mobileMeetingView, setMobileMeetingView] = useState<MeetingPanel>(() => panelFromHistory(meetingId));
+  const [evidenceReturnAvailable, setEvidenceReturnAvailable] = useState(false);
 
   useEffect(() => {
     if (!message) return;
@@ -197,19 +205,54 @@ export function LiveMeetingWorkbench({
   }, [message]);
 
   useEffect(() => {
+    if (activeCaptureMeetingId && activeCaptureMeetingId !== meetingId) return;
     microphone.acknowledgeCommitted(state.segments.map((segment) => segment.segmentId));
-  }, [microphone, state.segments]);
+  }, [activeCaptureMeetingId, meetingId, microphone, state.segments]);
+
+  useEffect(() => {
+    const restoreMeetingPanel = () => {
+      const panel = panelFromHistory(meetingId);
+      setEvidenceReturnAvailable(false);
+      setMobileMeetingView(panel);
+      window.requestAnimationFrame(() => {
+        document.getElementById(`meeting-mobile-panel-${panel}`)?.focus({ preventScroll: true });
+      });
+    };
+    setEvidenceReturnAvailable(false);
+    setMobileMeetingView(panelFromHistory(meetingId));
+    window.addEventListener("popstate", restoreMeetingPanel);
+    return () => window.removeEventListener("popstate", restoreMeetingPanel);
+  }, [meetingId]);
 
   const focusEvidence = (segmentId: string) => {
-    const element = document.getElementById(segmentDomId(segmentId));
-    if (!element) {
-      setMessage("对应文字暂未加载");
-      return;
+    setEvidenceReturnAvailable(true);
+    setMobileMeetingView("transcript");
+    window.requestAnimationFrame(() => {
+      const element = document.getElementById(segmentDomId(segmentId));
+      if (!element) {
+        setMessage("对应文字暂未加载");
+        return;
+      }
+      element.scrollIntoView({ behavior: motionAwareScrollBehavior(), block: "center" });
+      element.focus({ preventScroll: true });
+      element.classList.remove("is-evidence-target");
+      window.requestAnimationFrame(() => element.classList.add("is-evidence-target"));
+    });
+  };
+
+  const focusMeetingPanel = (view: MeetingPanel, pushHistory = false) => {
+    if (view === "coach") setEvidenceReturnAvailable(false);
+    if (pushHistory && meetingId && panelFromHistory(meetingId) !== view) {
+      window.history.pushState({
+        ...(window.history.state ?? {}),
+        meetingPanel: view,
+        meetingPanelMeetingId: meetingId,
+      }, "", window.location.href);
     }
-    element.scrollIntoView({ behavior: motionAwareScrollBehavior(), block: "center" });
-    element.focus({ preventScroll: true });
-    element.classList.remove("is-evidence-target");
-    window.requestAnimationFrame(() => element.classList.add("is-evidence-target"));
+    setMobileMeetingView(view);
+    window.requestAnimationFrame(() => {
+      document.getElementById(`meeting-mobile-panel-${view}`)?.focus({ preventScroll: true });
+    });
   };
 
   useEffect(() => {
@@ -222,6 +265,25 @@ export function LiveMeetingWorkbench({
     });
     return () => window.cancelAnimationFrame(frame);
   }, [initialEvidenceSegmentId, onEvidenceFocused, state.segments.length, state.semanticParagraphs?.length]);
+
+  useEffect(() => {
+    if (!meetingId || state.meetingId !== meetingId.trim() || state.lastSyncedAtMs === null) return;
+    onMeetingSessionStateChange?.(meetingId, resolveMeetingSessionState({
+      meetingPhase: state.runtime.phase,
+      capturePhase: microphone.state.phase,
+      captureBelongsToMeeting: !activeCaptureMeetingId || activeCaptureMeetingId === meetingId,
+      backendCaptureState: state.runtime.capture?.state,
+    }));
+  }, [
+    activeCaptureMeetingId,
+    meetingId,
+    microphone.state.phase,
+    onMeetingSessionStateChange,
+    state.lastSyncedAtMs,
+    state.meetingId,
+    state.runtime.capture?.state,
+    state.runtime.phase,
+  ]);
 
   const startMeeting = async (preparation: MeetingPreparationInput) => {
     const activeMeetingId = meetingId ?? onCreateMeeting?.();
@@ -242,6 +304,7 @@ export function LiveMeetingWorkbench({
         inputDeviceId: preparation.inputDeviceId,
         inputSource: preparation.inputSource,
       });
+      onMeetingStarted?.(activeMeetingId);
       setPreflightOpen(false);
       setMessage("会议已开始");
     } catch (error) {
@@ -267,6 +330,7 @@ export function LiveMeetingWorkbench({
     try {
       if (endableCapturePhases.has(microphone.state.phase)) await microphone.end();
       await actions.endMeeting();
+      if (meetingId) onMeetingEnded?.(meetingId);
       setMessage("会议已结束，正在整理复盘");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "结束会议失败");
@@ -307,9 +371,16 @@ export function LiveMeetingWorkbench({
   };
 
   if (!meetingId) {
+    const activeMeetingAction = activeMeeting?.state === "external"
+      ? "查看录音中的会议"
+      : activeMeeting?.state === "recoverable"
+        ? "恢复未结束会议"
+        : activeMeeting?.state === "paused"
+          ? "返回已暂停会议"
+          : "返回正在会议";
     return (
       <div className="product-app product-app--home">
-        <ProductNavigation active="meetings" onOpenMeetings={onBackToMeetings} onOpenNotes={onOpenNotes} onOpenCapabilities={onOpenCapabilities} />
+        <ProductNavigation active="meetings" onOpenMeetings={onBackToMeetings} onOpenNotes={onOpenNotes} onOpenCapabilities={onOpenCapabilities} activeMeeting={activeMeeting} onOpenActiveMeeting={onOpenActiveMeeting} />
         <main className="start-home">
           <section className="start-command">
             <div className="start-command-copy">
@@ -328,14 +399,26 @@ export function LiveMeetingWorkbench({
                 <FileAudio size={17} />
                 导入录音
               </button>
-              <button
-                className="start-meeting-button"
-                type="button"
-                onClick={() => setPreflightOpen(true)}
-              >
-                {microphone.state.phase === "requesting" ? <LoaderCircle className="spin" size={17} /> : <Mic size={17} />}
-                {microphone.state.phase === "requesting" ? "正在请求权限" : "开始会议"}
-              </button>
+              {activeMeeting ? (
+                <button
+                  className="start-meeting-button"
+                  type="button"
+                  onClick={onOpenActiveMeeting}
+                  disabled={!onOpenActiveMeeting}
+                >
+                  <Video size={17} />
+                  {activeMeetingAction}
+                </button>
+              ) : (
+                <button
+                  className="start-meeting-button"
+                  type="button"
+                  onClick={() => setPreflightOpen(true)}
+                >
+                  {microphone.state.phase === "requesting" ? <LoaderCircle className="spin" size={17} /> : <Mic size={17} />}
+                  {microphone.state.phase === "requesting" ? "正在请求权限" : "开始会议"}
+                </button>
+              )}
             </div>
             {microphone.state.error ? <p className="unbound-error">{microphone.state.error}</p> : null}
             {message ? (
@@ -348,7 +431,7 @@ export function LiveMeetingWorkbench({
               </p>
             ) : null}
           </section>
-          <MeetingHistory api={api} onOpenMeeting={onOpenMeeting ?? (() => undefined)} />
+          <MeetingHistory api={api} onOpenMeeting={onOpenMeeting ?? (() => undefined)} activeMeetingId={activeCaptureMeetingId} />
         </main>
         <ImportRecordingDialog
           open={importDialogOpen}
@@ -378,7 +461,7 @@ export function LiveMeetingWorkbench({
   if (snapshotLoading) {
     return (
       <div className="product-app product-app--live">
-        <ProductNavigation active="live" onOpenMeetings={onBackToMeetings} onOpenNotes={onOpenNotes} onOpenCapabilities={onOpenCapabilities} />
+        <ProductNavigation active="live" onOpenMeetings={onBackToMeetings} onOpenNotes={onOpenNotes} onOpenCapabilities={onOpenCapabilities} activeMeeting={activeMeeting} onOpenActiveMeeting={onOpenActiveMeeting} />
         <div className="workbench-shell">
           <header className="app-header">
             <div className="meeting-identity">
@@ -418,7 +501,6 @@ export function LiveMeetingWorkbench({
     );
   }
 
-  const localRecording = localRecordingIndicator(microphone.state);
   const localInput = localInputIndicator(microphone.state, microphone.inputSource);
   const transcriptBackfill = transcriptBackfillDiagnostic(
     state.diagnostics.transcript_backfill ?? state.diagnostics.transcriptBackfill,
@@ -435,15 +517,25 @@ export function LiveMeetingWorkbench({
       }
     : null;
   const meetingEnded = state.runtime.phase === "ended";
-  const localCaptureActive = !meetingEnded && capturePhases.has(microphone.state.phase);
-  const recordingIndicator = meetingEnded ? state.runtime.recording : localRecording ?? state.runtime.recording;
+  const captureBelongsToMeeting = !activeCaptureMeetingId || activeCaptureMeetingId === meetingId;
+  const otherMeetingCapturing = Boolean(activeCaptureMeetingId && activeCaptureMeetingId !== meetingId);
+  const sessionState = resolveMeetingSessionState({
+    meetingPhase: state.runtime.phase,
+    capturePhase: microphone.state.phase,
+    captureBelongsToMeeting,
+    backendCaptureState: state.runtime.capture?.state,
+  });
+  const remoteCaptureActive = sessionState === "capturing_elsewhere";
+  const localCaptureActive = ["preparing", "capturing", "paused", "reconnecting", "ending"].includes(sessionState);
   const inputIndicator = meetingEnded
     ? state.runtime.input
-    : backfillInputIndicator ?? localInput ?? state.runtime.input;
-  const elapsedMs = meetingEnded ? state.runtime.elapsedMs : microphone.state.elapsedMs ?? state.runtime.elapsedMs;
-  const showEndCommand = !meetingEnded;
-  const canStartCapture = !localCaptureActive && !meetingEnded;
-  const candidatePartial = meetingEnded ? null : microphone.state.activePartial ?? state.activePartial;
+    : backfillInputIndicator ?? (captureBelongsToMeeting ? localInput : null) ?? state.runtime.input;
+  const elapsedMs = meetingEnded || !captureBelongsToMeeting
+    ? state.runtime.elapsedMs
+    : microphone.state.elapsedMs ?? state.runtime.elapsedMs;
+  const showEndCommand = localCaptureActive && sessionState !== "ending";
+  const canStartCapture = ["idle", "recoverable", "error"].includes(sessionState) && !otherMeetingCapturing;
+  const candidatePartial = meetingEnded || !captureBelongsToMeeting ? null : microphone.state.activePartial ?? state.activePartial;
   const committedSegmentIds = new Set([
     ...state.segments.map((segment) => segment.segmentId),
     ...state.fullTranscript.map((segment) => segment.segmentId),
@@ -465,22 +557,6 @@ export function LiveMeetingWorkbench({
         : state.connection === "connecting" || state.connection === "reconnecting"
           ? { state: "busy", label: "连接中", level: null, detail: null }
           : { state: "active", label: "实时识别", level: null, detail: null };
-  const refinementPending = state.segments.some((segment) =>
-    ["pending", "processing"].includes(segment.correctionStatus ?? ""));
-  const refinementIndicator: RuntimeIndicator = aiCapabilities.transcript ?? {
-    state: refinementPending ? "busy" : "idle",
-    label: refinementPending ? "处理中" : "已稳定",
-    level: null,
-    detail: null,
-  };
-  const userNamedSpeakerCount = state.speakers.filter((speaker) =>
-    speaker.labelSource === "user" || speaker.labelLocked).length;
-  const automaticSpeakerCount = state.speakers.length - userNamedSpeakerCount;
-  const speakerIndicator: RuntimeIndicator = userNamedSpeakerCount
-    ? { state: "active", label: `${userNamedSpeakerCount} 个已命名`, level: null, detail: "只默认显示用户确认的说话人名称" }
-    : automaticSpeakerCount
-      ? { state: "paused", label: "实验关闭", level: null, detail: "自动说话人未通过真实嘈杂会议门禁，默认不展示" }
-      : { state: "idle", label: "未启用", level: null, detail: "正文按自然段显示，不强行归属说话人" };
   const llmIndicator: RuntimeIndicator = aiCapabilities.provider ?? {
     state: state.runtime.ai.state,
     label: state.runtime.ai.label,
@@ -506,19 +582,34 @@ export function LiveMeetingWorkbench({
         }
       : { state: "idle" as const, label: "索引待开始", level: null, detail: null },
   };
-  const taskStates = Object.values(taskCapabilities).map((indicator) => indicator.state);
-  const taskIndicator: RuntimeIndicator = {
-    state: taskStates.includes("error") ? "error" : taskStates.includes("busy") ? "busy" : "idle",
-    label: taskStates.includes("error") ? "部分失败" : taskStates.includes("busy") ? "处理中" : "已就绪",
-    level: null,
-    detail: null,
-    capabilities: taskCapabilities,
-  };
+  const captureHealth = captureHealthSummary(sessionState, inputIndicator, asrIndicator, llmIndicator);
 
   return (
     <div className={`product-app ${meetingEnded ? "product-app--review" : "product-app--live"}`}>
-      <ProductNavigation active="live" onOpenMeetings={onBackToMeetings} onOpenNotes={onOpenNotes} onOpenCapabilities={onOpenCapabilities} />
-      <div className={`workbench-shell${nativeSystemAudioHealth || transcriptBackfill || canStartCapture ? " workbench-shell--status-band" : ""}`}>
+      {!meetingEnded ? (
+        <nav className="meeting-skip-links" aria-label="跳过导航">
+          <a
+            href="#meeting-mobile-panel-transcript"
+            onClick={(event) => {
+              event.preventDefault();
+              focusMeetingPanel("transcript", true);
+            }}
+          >
+            跳到会议文字
+          </a>
+          <a
+            href="#meeting-mobile-panel-coach"
+            onClick={(event) => {
+              event.preventDefault();
+              focusMeetingPanel("coach", true);
+            }}
+          >
+            跳到实时教练
+          </a>
+        </nav>
+      ) : null}
+      <ProductNavigation active="live" onOpenMeetings={onBackToMeetings} onOpenNotes={onOpenNotes} onOpenCapabilities={onOpenCapabilities} activeMeeting={activeMeeting} onOpenActiveMeeting={onOpenActiveMeeting} />
+      <div className={`workbench-shell${nativeSystemAudioHealth || transcriptBackfill || canStartCapture || otherMeetingCapturing || remoteCaptureActive ? " workbench-shell--status-band" : ""}`}>
       <header className="app-header">
         <div className="meeting-identity">
           {onBackToMeetings ? (
@@ -554,13 +645,19 @@ export function LiveMeetingWorkbench({
         </div>
 
         <div className="meeting-statuses" aria-label="会议运行状态">
-          <StatusIndicator label="录音" indicator={recordingIndicator} />
-          <StatusIndicator label="声音" indicator={inputIndicator} showLevel />
-          <StatusIndicator label="ASR" indicator={asrIndicator} />
-          <StatusIndicator label="精修" indicator={refinementIndicator} />
-          <StatusIndicator label="说话人" indicator={speakerIndicator} />
-          <StatusIndicator label="LLM" indicator={llmIndicator} />
-          <StatusIndicator label="任务" indicator={taskIndicator} />
+          <button
+            className="capture-health-summary"
+            type="button"
+            onClick={() => setDiagnosticsOpen(true)}
+            aria-label={`采集健康：${captureHealth.label}；${captureHealth.aiLabel}。打开运行诊断`}
+            title="查看录音、声音、识别、精修、说话人、模型和任务详情"
+          >
+            <span className={`status-dot status-dot--${captureHealth.state}`} aria-hidden="true" />
+            <span>
+              <strong>{captureHealth.label}</strong>
+              <small>{captureHealth.aiLabel}</small>
+            </span>
+          </button>
           <time className="elapsed-time" aria-label={`会议时长 ${formatElapsed(elapsedMs)}`}>
             {formatElapsed(elapsedMs)}
           </time>
@@ -568,18 +665,6 @@ export function LiveMeetingWorkbench({
 
         <div className="header-actions">
           <ProviderSettingsControl />
-          {canStartCapture ? (
-            <button
-              className="start-recording-button"
-              type="button"
-              aria-label={microphone.state.phase === "error" ? "继续录音" : "开始录音"}
-              title={microphone.state.phase === "error" ? "继续录音" : "开始录音"}
-              onClick={() => setPreflightOpen(true)}
-            >
-              <Mic size={16} />
-              <span className="meeting-command-label">{microphone.state.phase === "error" ? "继续录音" : "开始录音"}</span>
-            </button>
-          ) : null}
           {localCaptureActive
           && microphone.state.phase !== "stopping"
           && microphone.supportsPause !== false ? (
@@ -593,15 +678,6 @@ export function LiveMeetingWorkbench({
               {microphone.state.phase === "paused" ? <Play size={18} fill="currentColor" /> : <Pause size={18} fill="currentColor" />}
             </button>
           ) : null}
-          <button
-            className="icon-button runtime-diagnostics-button"
-            type="button"
-            onClick={() => setDiagnosticsOpen(true)}
-            title="运行诊断"
-            aria-label="打开运行诊断"
-          >
-            <Gauge size={18} />
-          </button>
           {showEndCommand ? (
             <button
               className="end-meeting-button"
@@ -618,14 +694,20 @@ export function LiveMeetingWorkbench({
         </div>
       </header>
 
-      {nativeSystemAudioHealth || transcriptBackfill || canStartCapture ? (
+      {nativeSystemAudioHealth || transcriptBackfill || canStartCapture || otherMeetingCapturing || remoteCaptureActive ? (
         <div className="meeting-status-bands">
         {canStartCapture ? (
           <div className="capture-inactive-status" role="alert" aria-live="polite">
             <AlertCircle size={17} aria-hidden="true" />
             <div>
-              <strong>{microphone.state.phase === "error" ? "录音已中断" : "当前没有录音输入"}</strong>
-              <span>现在说话不会进入会议文字，Pi 教练也不会收到新内容。</span>
+              <strong>
+                {sessionState === "error" ? "录音已中断" : sessionState === "recoverable" ? "会议录音待恢复" : "当前没有录音输入"}
+              </strong>
+              <span>
+                {sessionState === "recoverable"
+                  ? "浏览器无法自动恢复上次的声音权限；已保存的文字和会议上下文不会丢失。"
+                  : "现在说话不会进入会议文字，Pi 教练也不会收到新内容。"}
+              </span>
             </div>
             <button
               className="start-recording-button capture-inactive-status__action"
@@ -633,8 +715,39 @@ export function LiveMeetingWorkbench({
               onClick={() => setPreflightOpen(true)}
             >
               <Mic size={15} />
-              {microphone.state.phase === "error" ? "立即恢复录音" : "立即开始录音"}
+              {sessionState === "error" ? "立即恢复录音" : sessionState === "recoverable" ? "恢复录音" : "立即开始录音"}
             </button>
+            <button
+              className="secondary-button capture-inactive-status__action"
+              type="button"
+              onClick={() => void endMeeting()}
+              disabled={state.ending}
+            >
+              <Square size={14} fill="currentColor" />
+              {state.ending ? "正在结束" : "直接结束并整理"}
+            </button>
+          </div>
+        ) : null}
+        {otherMeetingCapturing ? (
+          <div className="capture-inactive-status" role="status" aria-live="polite">
+            <AlertCircle size={17} aria-hidden="true" />
+            <div>
+              <strong>另一场会议正在录音</strong>
+              <span>当前页面只读展示；返回正在进行的会议后再暂停或结束录音。</span>
+            </div>
+            <button className="secondary-button capture-inactive-status__action" type="button" onClick={onOpenActiveMeeting}>
+              <Play size={15} />
+              返回正在会议
+            </button>
+          </div>
+        ) : null}
+        {remoteCaptureActive && !otherMeetingCapturing ? (
+          <div className="capture-inactive-status" role="status" aria-live="polite">
+            <CircleCheck size={17} aria-hidden="true" />
+            <div>
+              <strong>另一窗口正在录音</strong>
+              <span>服务端仍收到新鲜采集心跳；当前页面保持只读，避免重复占用麦克风或覆盖录音。</span>
+            </div>
           </div>
         ) : null}
         {transcriptBackfill ? (
@@ -712,65 +825,109 @@ export function LiveMeetingWorkbench({
         />
       ) : (
         <main className="meeting-grid">
-          <TranscriptPane
-            segments={state.segments}
-            semanticParagraphs={state.semanticParagraphs}
-            archivedTranscript={state.archivedTranscript}
-            archivedSegmentCount={state.archivedSegmentCount}
-            activePartial={partial}
-            connection={state.connection}
-            aiIndicator={state.runtime.ai}
-            speakers={state.speakers}
-            onRenameSpeaker={actions.renameSpeaker}
-            onSelectionChange={setTranscriptSelection}
-            onAskSelection={(selection, action) => {
-              setTranscriptSelection(selection);
-              setAskSelectionAction(action);
-              setAskSelectionNonce((current) => current + 1);
-            }}
-            onSaveSelection={async (selection) => {
-              if (!api.createNote) return;
-              const selectedSegments = state.segments.filter((segment) => selection.segmentIds.includes(segment.segmentId));
-              await api.createNote(meetingId, {
-                body: selection.text,
-                sourceKind: "selection",
-                evidence: selectedSegments.map((segment) => ({
-                  segmentId: segment.segmentId,
-                  transcriptSeq: segment.transcriptSeq,
-                  startMs: segment.startedAtMs,
-                  endMs: segment.endedAtMs,
-                  quote: segment.normalizedText.trim() || segment.text.trim(),
-                })),
-              });
-              setMessage("已保存到笔记");
-            }}
-          />
-          <AiWorkspace
-            meetingId={meetingId}
-            api={api}
-            selection={transcriptSelection}
-            askSelectionNonce={askSelectionNonce}
-            selectionAction={askSelectionAction}
-            preparationRefreshKey={preparationRefreshKey}
-            currentTopic={state.currentTopic}
-            followUp={state.followUp}
-            semanticFollowUp={state.semanticFollowUp}
-            coachDecision={state.coachDecision}
-            coachHistory={state.coachHistory}
-            recentContextHistory={state.recentContextHistory}
-            coachRuntime={taskCapabilities.realtime_suggestions}
-            openQuestions={state.openQuestions}
-            suggestions={state.suggestions}
-            decisionCandidates={state.decisionCandidates}
-            actionItems={state.actionItems}
-            risks={state.risks}
-            onEvidence={focusEvidence}
-            onFeedback={actions.saveSuggestionFeedback}
-            onFactStatus={saveFactStatus}
-            onFactEdit={api.updateFact ? updateFact : undefined}
-            onFactMerge={api.mergeFacts ? mergeFacts : undefined}
-            onMessage={setMessage}
-          />
+          <div className="meeting-mobile-view-switch" role="group" aria-label="会中视图">
+            <button
+              type="button"
+              aria-pressed={mobileMeetingView === "transcript"}
+              aria-controls="meeting-mobile-panel-transcript"
+              onClick={() => focusMeetingPanel("transcript", true)}
+            >
+              <FileText size={15} />会议文字
+            </button>
+            <button
+              type="button"
+              aria-pressed={mobileMeetingView === "coach"}
+              aria-controls="meeting-mobile-panel-coach"
+              onClick={() => focusMeetingPanel("coach", true)}
+            >
+              <Lightbulb size={15} />实时教练
+            </button>
+          </div>
+          <section
+            id="meeting-mobile-panel-transcript"
+            className={`meeting-view-panel meeting-view-panel--transcript${mobileMeetingView === "transcript" ? " is-selected" : ""}`}
+            aria-label="会议文字视图"
+            tabIndex={-1}
+          >
+            {evidenceReturnAvailable ? (
+              <button
+                className="evidence-return-control"
+                type="button"
+                onClick={() => focusMeetingPanel("coach")}
+              >
+                <ArrowLeft size={15} />
+                返回实时教练
+              </button>
+            ) : null}
+            <TranscriptPane
+              segments={state.segments}
+              semanticParagraphs={state.semanticParagraphs}
+              archivedTranscript={state.archivedTranscript}
+              archivedSegmentCount={state.archivedSegmentCount}
+              activePartial={partial}
+              connection={state.connection}
+              aiIndicator={state.runtime.ai}
+              speakers={state.speakers}
+              onRenameSpeaker={actions.renameSpeaker}
+              onSelectionChange={setTranscriptSelection}
+              onAskSelection={(selection, action) => {
+                setTranscriptSelection(selection);
+                setAskSelectionAction(action);
+                setAskSelectionNonce((current) => current + 1);
+                setEvidenceReturnAvailable(false);
+                focusMeetingPanel("coach", true);
+              }}
+              onSaveSelection={async (selection) => {
+                if (!api.createNote) return;
+                const selectedSegments = state.segments.filter((segment) => selection.segmentIds.includes(segment.segmentId));
+                await api.createNote(meetingId, {
+                  body: selection.text,
+                  sourceKind: "selection",
+                  evidence: selectedSegments.map((segment) => ({
+                    segmentId: segment.segmentId,
+                    transcriptSeq: segment.transcriptSeq,
+                    startMs: segment.startedAtMs,
+                    endMs: segment.endedAtMs,
+                    quote: segment.normalizedText.trim() || segment.text.trim(),
+                  })),
+                });
+                setMessage("已保存到笔记");
+              }}
+            />
+          </section>
+          <section
+            id="meeting-mobile-panel-coach"
+            className={`meeting-view-panel meeting-view-panel--coach${mobileMeetingView === "coach" ? " is-selected" : ""}`}
+            aria-label="实时教练视图"
+            tabIndex={-1}
+          >
+            <AiWorkspace
+              meetingId={meetingId}
+              api={api}
+              selection={transcriptSelection}
+              askSelectionNonce={askSelectionNonce}
+              selectionAction={askSelectionAction}
+              preparationRefreshKey={preparationRefreshKey}
+              currentTopic={state.currentTopic}
+              followUp={state.followUp}
+              semanticFollowUp={state.semanticFollowUp}
+              coachDecision={state.coachDecision}
+              coachHistory={state.coachHistory}
+              recentContextHistory={state.recentContextHistory}
+              coachRuntime={taskCapabilities.realtime_suggestions}
+              openQuestions={state.openQuestions}
+              suggestions={state.suggestions}
+              decisionCandidates={state.decisionCandidates}
+              actionItems={state.actionItems}
+              risks={state.risks}
+              onEvidence={focusEvidence}
+              onFeedback={actions.saveSuggestionFeedback}
+              onFactStatus={saveFactStatus}
+              onFactEdit={api.updateFact ? updateFact : undefined}
+              onFactMerge={api.mergeFacts ? mergeFacts : undefined}
+              onMessage={setMessage}
+            />
+          </section>
         </main>
       )}
 

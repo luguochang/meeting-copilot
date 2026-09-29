@@ -1,5 +1,5 @@
 import { Check, ChevronDown, ChevronUp, Clock3, FileCheck2, ListTodo, LoaderCircle, MessageSquareText, NotebookPen, Plus, Quote, Save, Send, Target } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState, type ComponentProps } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type ComponentProps, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import ReactMarkdown from "react-markdown";
 import type { MeetingApi } from "../../api/client";
 import type { AskAiMessage, AskAiScope, AskAiThread, MeetingChapter, MeetingPreparationSnapshot } from "../../domain/events";
@@ -29,6 +29,26 @@ const SELECTION_ACTION_PROMPTS: Partial<Record<TranscriptSelectionAction, string
 };
 
 const CATCH_UP_PROMPT = "我刚错过了什么？请用 3 至 6 条简洁要点说明刚才讨论的主题、已确认结论和仍待确认的问题，并给出原文时间依据。";
+type WorkspaceTab = "ask" | "insights" | "context";
+
+interface AiWorkspaceViewState {
+  tab: WorkspaceTab;
+  threadId: string | null;
+}
+
+function readWorkspaceViewState(meetingId: string): AiWorkspaceViewState {
+  try {
+    const raw = window.sessionStorage.getItem(`meeting-copilot-ai-view:${meetingId}`);
+    if (!raw) return { tab: "insights", threadId: null };
+    const parsed = JSON.parse(raw) as Partial<AiWorkspaceViewState>;
+    return {
+      tab: parsed.tab === "ask" || parsed.tab === "context" ? parsed.tab : "insights",
+      threadId: typeof parsed.threadId === "string" ? parsed.threadId : null,
+    };
+  } catch {
+    return { tab: "insights", threadId: null };
+  }
+}
 
 function assistantEvidence(message: AskAiMessage): string | null {
   return message.evidence[0]?.segmentId ?? null;
@@ -61,7 +81,7 @@ export function AiWorkspace({
   ...railProps
 }: AiWorkspaceProps) {
   // Realtime coaching is the primary meeting workflow; Ask AI remains available as a deliberate follow-up tool.
-  const [tab, setTab] = useState<"ask" | "insights" | "context">("insights");
+  const [tab, setTab] = useState<WorkspaceTab>(() => readWorkspaceViewState(meetingId).tab);
   const [scope, setScope] = useState<AskAiScope>("recent");
   const [recentMinutes, setRecentMinutes] = useState<1 | 3 | 5 | 10>(3);
   const [recentContextOpen, setRecentContextOpen] = useState(true);
@@ -71,7 +91,7 @@ export function AiWorkspace({
   const [threads, setThreads] = useState<AskAiThread[]>([]);
   const [savedNoteMessageIds, setSavedNoteMessageIds] = useState<Set<string>>(new Set());
   const [savedEntityKeys, setSavedEntityKeys] = useState<Set<string>>(new Set());
-  const [threadId, setThreadId] = useState<string | null>(null);
+  const [threadId, setThreadId] = useState<string | null>(() => readWorkspaceViewState(meetingId).threadId);
   const [question, setQuestion] = useState("");
   const [pendingQuestion, setPendingQuestion] = useState("");
   const [streamText, setStreamText] = useState("");
@@ -85,6 +105,27 @@ export function AiWorkspace({
   const [contextFocus, setContextFocus] = useState("");
   const [contextSaving, setContextSaving] = useState(false);
   const questionRef = useRef<HTMLTextAreaElement | null>(null);
+  const workspaceId = useId();
+
+  useEffect(() => {
+    const stored = readWorkspaceViewState(meetingId);
+    setTab(stored.tab);
+    setThreadId(stored.threadId);
+  }, [meetingId]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      try {
+        window.sessionStorage.setItem(
+          `meeting-copilot-ai-view:${meetingId}`,
+          JSON.stringify({ tab, threadId } satisfies AiWorkspaceViewState),
+        );
+      } catch {
+        // The workspace still works when browser storage is unavailable.
+      }
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [meetingId, tab, threadId]);
 
   const loadWorkspace = useCallback(async (preferredThreadId?: string | null) => {
     const [nextThreads, nextChapters, nextNotes] = await Promise.all([
@@ -269,6 +310,11 @@ export function AiWorkspace({
     }
   };
 
+  const requestCoachRefinement = async (answerId: string, request: string) => {
+    if (!api.requestRealtimeCoach) throw new Error("当前版本未启用 Pi 回答精修");
+    await api.requestRealtimeCoach(meetingId, request, answerId);
+  };
+
   const historyContext = railProps.recentContextHistory ?? [];
   const fallbackContext = historyContext.length ? [] : [
     railProps.currentTopic ? {
@@ -300,32 +346,94 @@ export function AiWorkspace({
     .sort((left, right) => right.updatedAtMs - left.updatedAtMs)
     .slice(0, 10);
   const visibleRecentContext = recentContextExpanded ? recentContextItems : recentContextItems.slice(0, 5);
+  const availableTabs: WorkspaceTab[] = api.getMeetingPreparation
+    ? ["insights", "ask", "context"]
+    : ["insights", "ask"];
+  const selectAdjacentTab = (event: ReactKeyboardEvent<HTMLButtonElement>, currentTab: WorkspaceTab) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const currentIndex = availableTabs.indexOf(currentTab);
+    const nextIndex = event.key === "Home"
+      ? 0
+      : event.key === "End"
+        ? availableTabs.length - 1
+        : (currentIndex + (event.key === "ArrowRight" ? 1 : -1) + availableTabs.length) % availableTabs.length;
+    const nextTab = availableTabs[nextIndex];
+    setTab(nextTab);
+    window.requestAnimationFrame(() => document.getElementById(`${workspaceId}-tab-${nextTab}`)?.focus());
+  };
 
   return (
     <aside className="ai-workspace" aria-label="会议 AI 工作区">
       <div className="ai-workspace-tabs" role="tablist" aria-label="AI 工作区视图">
-        <button type="button" role="tab" aria-selected={tab === "ask"} className={tab === "ask" ? "is-selected" : ""} onClick={() => setTab("ask")}>
-          <MessageSquareText size={15} />Ask AI
+        <button
+          id={`${workspaceId}-tab-insights`}
+          type="button"
+          role="tab"
+          aria-selected={tab === "insights"}
+          aria-controls={`${workspaceId}-panel-insights`}
+          tabIndex={tab === "insights" ? 0 : -1}
+          className={tab === "insights" ? "is-selected" : ""}
+          onClick={() => setTab("insights")}
+          onKeyDown={(event) => selectAdjacentTab(event, "insights")}
+        >
+          实时教练
         </button>
-        <button type="button" role="tab" aria-selected={tab === "insights"} className={tab === "insights" ? "is-selected" : ""} onClick={() => setTab("insights")}>
-          会议重点
+        <button
+          id={`${workspaceId}-tab-ask`}
+          type="button"
+          role="tab"
+          aria-selected={tab === "ask"}
+          aria-controls={`${workspaceId}-panel-ask`}
+          tabIndex={tab === "ask" ? 0 : -1}
+          className={tab === "ask" ? "is-selected" : ""}
+          onClick={() => setTab("ask")}
+          onKeyDown={(event) => selectAdjacentTab(event, "ask")}
+        >
+          <MessageSquareText size={15} />询问 AI
         </button>
         {api.getMeetingPreparation ? (
-          <button type="button" role="tab" aria-selected={tab === "context"} className={tab === "context" ? "is-selected" : ""} onClick={() => setTab("context")}>
+          <button
+            id={`${workspaceId}-tab-context`}
+            type="button"
+            role="tab"
+            aria-selected={tab === "context"}
+            aria-controls={`${workspaceId}-panel-context`}
+            tabIndex={tab === "context" ? 0 : -1}
+            className={tab === "context" ? "is-selected" : ""}
+            onClick={() => setTab("context")}
+            onKeyDown={(event) => selectAdjacentTab(event, "context")}
+          >
             <Target size={15} />会议目标
           </button>
         ) : null}
       </div>
 
       {tab === "insights" ? (
-        <NowRail
-          {...railProps}
-          activeCoachSkillId={preparation?.presetId ?? "general"}
-          onEvidence={onEvidence}
-          onMessage={onMessage}
-        />
+        <div
+          id={`${workspaceId}-panel-insights`}
+          className="ai-workspace-panel"
+          role="tabpanel"
+          aria-labelledby={`${workspaceId}-tab-insights`}
+          tabIndex={0}
+        >
+          <NowRail
+            {...railProps}
+            viewStateKey={meetingId}
+            activeCoachSkillId={preparation?.presetId ?? "general"}
+            onEvidence={onEvidence}
+            onMessage={onMessage}
+            onCoachRefine={requestCoachRefinement}
+          />
+        </div>
       ) : tab === "context" ? (
-        <section className="meeting-context-panel" aria-label="会议目标和关注点">
+        <section
+          id={`${workspaceId}-panel-context`}
+          className="meeting-context-panel"
+          role="tabpanel"
+          aria-labelledby={`${workspaceId}-tab-context`}
+          tabIndex={0}
+        >
           <header>
             <div><span>会中上下文</span><strong>会议目标</strong></div>
             <small>{preparation ? `版本 ${preparation.version} · 共 ${Math.max(preparationVersionCount, preparation.version)} 个版本` : "正在加载"}</small>
@@ -349,7 +457,13 @@ export function AiWorkspace({
           </button>
         </section>
       ) : (
-        <div className="ask-ai-panel" role="tabpanel">
+        <div
+          id={`${workspaceId}-panel-ask`}
+          className="ask-ai-panel"
+          role="tabpanel"
+          aria-labelledby={`${workspaceId}-tab-ask`}
+          tabIndex={0}
+        >
           <div className="ask-ai-toolbar">
             <select value={threadId ?? ""} onChange={(event) => setThreadId(event.target.value || null)} aria-label="AI 对话">
               <option value="">新对话</option>

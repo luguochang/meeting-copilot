@@ -612,6 +612,7 @@ class CoachIntervention:
     runtime_used: str | None = None
     pi_provider_attempted: bool | None = None
     valid_until_ms: int | None = None
+    coaching_package: Mapping[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize one coach card for independent event persistence."""
@@ -642,6 +643,8 @@ class CoachIntervention:
             payload["pi_provider_attempted"] = self.pi_provider_attempted
         if self.valid_until_ms is not None:
             payload["valid_until_ms"] = self.valid_until_ms
+        if self.coaching_package is not None:
+            payload["coaching_package"] = dict(self.coaching_package)
         return payload
 
     def to_follow_up(self) -> FollowUp:
@@ -2145,6 +2148,224 @@ def build_realtime_coach_messages(
     ]
 
 
+def _structured_coach_text_list(
+    value: Any,
+    *,
+    field: str,
+    maximum_items: int = 3,
+) -> list[str]:
+    if not isinstance(value, list) or len(value) > maximum_items:
+        raise IntelligenceResponseValidationError(
+            f"{field} must be an array with at most {maximum_items} items"
+        )
+    return [
+        _required_response_text(item, f"{field}[{index}]", maximum=160)
+        for index, item in enumerate(value)
+    ]
+
+
+def _parse_structured_coaching_package(
+    value: Any,
+    *,
+    request: RealtimeIntelligenceRequest,
+    title: str,
+    recommendation: str,
+    reason: str,
+    evidence_ids: tuple[str, ...],
+    evidence_quote: str,
+    confidence: float,
+) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    package = _required_object(value, "intervention.coaching_package")
+    expected_fields = {
+        "headline",
+        "question_intent",
+        "core_judgement",
+        "why_it_matters",
+        "say_this_addition",
+        "missing_points",
+        "constraints",
+        "risks",
+        "next_actions",
+        "likely_follow_ups",
+        "evidence_refs",
+        "confidence",
+    }
+    unexpected = set(package) - expected_fields
+    if unexpected:
+        raise IntelligenceResponseValidationError(
+            "intervention.coaching_package contains unsupported fields: "
+            + ", ".join(sorted(unexpected))
+        )
+
+    headline = _required_response_text(
+        package.get("headline"),
+        "intervention.coaching_package.headline",
+        maximum=100,
+    )
+    question_intent = _required_response_text(
+        package.get("question_intent"),
+        "intervention.coaching_package.question_intent",
+        maximum=180,
+    )
+    core_judgement = _required_response_text(
+        package.get("core_judgement"),
+        "intervention.coaching_package.core_judgement",
+        maximum=220,
+    )
+    why_it_matters = _required_response_text(
+        package.get("why_it_matters"),
+        "intervention.coaching_package.why_it_matters",
+        maximum=300,
+    )
+    say_this_addition = _required_response_text(
+        package.get("say_this_addition"),
+        "intervention.coaching_package.say_this_addition",
+        maximum=800,
+    )
+    if len(say_this_addition) < 8:
+        raise IntelligenceResponseValidationError(
+            "intervention.coaching_package.say_this_addition is too short"
+        )
+    if headline != title or why_it_matters != reason or say_this_addition != recommendation:
+        raise IntelligenceResponseValidationError(
+            "structured coaching package aliases do not match the visible card"
+        )
+
+    likely_raw = package.get("likely_follow_ups")
+    if not isinstance(likely_raw, list) or len(likely_raw) > 2:
+        raise IntelligenceResponseValidationError(
+            "intervention.coaching_package.likely_follow_ups must have at most two items"
+        )
+    likely_follow_ups: list[dict[str, str]] = []
+    for index, raw_follow_up in enumerate(likely_raw):
+        follow_up = _required_object(
+            raw_follow_up,
+            f"intervention.coaching_package.likely_follow_ups[{index}]",
+        )
+        if set(follow_up) - {"question", "answer_angle"}:
+            raise IntelligenceResponseValidationError(
+                f"intervention.coaching_package.likely_follow_ups[{index}] contains unsupported fields"
+            )
+        likely_follow_ups.append(
+            {
+                "question": _required_response_text(
+                    follow_up.get("question"),
+                    f"intervention.coaching_package.likely_follow_ups[{index}].question",
+                    maximum=160,
+                ),
+                "answer_angle": _required_response_text(
+                    follow_up.get("answer_angle"),
+                    f"intervention.coaching_package.likely_follow_ups[{index}].answer_angle",
+                    maximum=240,
+                ),
+            }
+        )
+
+    evidence_refs_raw = package.get("evidence_refs")
+    if (
+        not isinstance(evidence_refs_raw, list)
+        or not evidence_refs_raw
+        or len(evidence_refs_raw) > 12
+    ):
+        raise IntelligenceResponseValidationError(
+            "intervention.coaching_package.evidence_refs must be a non-empty bounded array"
+        )
+    paragraphs = request.paragraphs_by_id
+    evidence_refs: list[dict[str, str]] = []
+    seen_ref_ids: set[str] = set()
+    for index, raw_ref in enumerate(evidence_refs_raw):
+        ref = _required_object(
+            raw_ref,
+            f"intervention.coaching_package.evidence_refs[{index}]",
+        )
+        if set(ref) - {"segment_id", "quote"}:
+            raise IntelligenceResponseValidationError(
+                f"intervention.coaching_package.evidence_refs[{index}] contains unsupported fields"
+            )
+        segment_id = _required_response_text(
+            ref.get("segment_id"),
+            f"intervention.coaching_package.evidence_refs[{index}].segment_id",
+            maximum=200,
+        )
+        quote = _required_response_text(
+            ref.get("quote"),
+            f"intervention.coaching_package.evidence_refs[{index}].quote",
+            maximum=1_000,
+        )
+        paragraph = paragraphs.get(segment_id)
+        if (
+            segment_id not in evidence_ids
+            or segment_id in seen_ref_ids
+            or paragraph is None
+            or _normalize_for_evidence(quote) not in _normalize_for_evidence(paragraph.text)
+        ):
+            raise IntelligenceResponseValidationError(
+                "intervention.coaching_package.evidence_refs must quote referenced evidence verbatim",
+                category="evidence",
+            )
+        seen_ref_ids.add(segment_id)
+        evidence_refs.append({"segment_id": segment_id, "quote": quote})
+
+    package_confidence = _response_confidence(
+        package.get("confidence"),
+        "intervention.coaching_package.confidence",
+    )
+    if abs(package_confidence - confidence) > 1e-9:
+        raise IntelligenceResponseValidationError(
+            "intervention.coaching_package.confidence must match intervention.confidence"
+        )
+
+    parsed = {
+        "headline": headline,
+        "question_intent": question_intent,
+        "core_judgement": core_judgement,
+        "why_it_matters": why_it_matters,
+        "say_this_addition": say_this_addition,
+        "missing_points": _structured_coach_text_list(
+            package.get("missing_points"),
+            field="intervention.coaching_package.missing_points",
+        ),
+        "constraints": _structured_coach_text_list(
+            package.get("constraints"),
+            field="intervention.coaching_package.constraints",
+        ),
+        "risks": _structured_coach_text_list(
+            package.get("risks"),
+            field="intervention.coaching_package.risks",
+        ),
+        "next_actions": _structured_coach_text_list(
+            package.get("next_actions"),
+            field="intervention.coaching_package.next_actions",
+        ),
+        "likely_follow_ups": likely_follow_ups,
+        "evidence_refs": evidence_refs,
+        "confidence": package_confidence,
+    }
+    structured_grounding_text = "\n".join(
+        (
+            question_intent,
+            core_judgement,
+            *parsed["missing_points"],
+            *parsed["constraints"],
+            *parsed["risks"],
+            *parsed["next_actions"],
+            *(item["question"] for item in likely_follow_ups),
+            *(item["answer_angle"] for item in likely_follow_ups),
+        )
+    )
+    _validate_coach_claim_grounding(
+        title=headline,
+        recommendation=structured_grounding_text,
+        reason=why_it_matters,
+        evidence_quote=evidence_quote,
+        evidence_ids=evidence_ids,
+        request=request,
+    )
+    return parsed
+
+
 def parse_realtime_coach_response(
     content: Any,
     *,
@@ -2206,7 +2427,7 @@ def parse_realtime_coach_response(
         alias_keys=("say_this", "sayThis"),
         field="intervention.recommendation",
         alias_field="intervention.say_this",
-        maximum=480 if is_deep_answer_card else 120,
+        maximum=800 if is_deep_answer_card else 120,
     )
     if len(recommendation) < 8:
         raise IntelligenceResponseValidationError("intervention.recommendation is too short")
@@ -2227,6 +2448,17 @@ def parse_realtime_coach_response(
         evidence_ids=evidence_ids,
         request=request,
     )
+    confidence = _response_confidence(item.get("confidence"), "intervention.confidence")
+    coaching_package = _parse_structured_coaching_package(
+        item.get("coaching_package"),
+        request=request,
+        title=title,
+        recommendation=recommendation,
+        reason=reason,
+        evidence_ids=evidence_ids,
+        evidence_quote=evidence_quote,
+        confidence=confidence,
+    )
     return CoachIntervention(
         event_type=event_type,
         title=title,
@@ -2235,7 +2467,8 @@ def parse_realtime_coach_response(
         evidence_segment_ids=evidence_ids,
         evidence_quote=evidence_quote,
         urgency=urgency,
-        confidence=_response_confidence(item.get("confidence"), "intervention.confidence"),
+        confidence=confidence,
+        coaching_package=coaching_package,
     )
 
 
@@ -3519,6 +3752,11 @@ def _ground_pi_deep_intervention(
         return value, ()
     grounding_text = "\n".join((evidence_quote.strip(), answer_text))
     grounded = dict(value)
+    package = (
+        dict(value["coaching_package"])
+        if isinstance(value.get("coaching_package"), Mapping)
+        else None
+    )
     changed_fields: list[str] = []
 
     title = value.get("title")
@@ -3528,6 +3766,8 @@ def _ground_pi_deep_intervention(
         request=request,
     ):
         grounded["title"] = "补齐判断边界"
+        if package is not None:
+            package["headline"] = grounded["title"]
         changed_fields.append("title")
 
     recommendation_values = tuple(
@@ -3563,11 +3803,17 @@ def _ground_pi_deep_intervention(
             grounded_lines.append(f"{label}：{_DEEP_COACH_GROUNDED_LINES[label]}")
             recommendation_changed = True
         if recommendation_changed:
-            grounded_recommendation = "\n".join(grounded_lines)
+            grounded_recommendation = (
+                "可以补充：当前结论的适用范围、判断条件和验证方式仍需明确。"
+                if package is not None
+                else "\n".join(grounded_lines)
+            )
             grounded["recommendation"] = grounded_recommendation
             for alias in ("say_this", "sayThis"):
                 if alias in value:
                     grounded[alias] = grounded_recommendation
+            if package is not None:
+                package["say_this_addition"] = grounded_recommendation
             changed_fields.append("recommendation")
 
     reason_values = tuple(
@@ -3587,8 +3833,12 @@ def _ground_pi_deep_intervention(
             for alias in ("why_now", "whyNow"):
                 if alias in value:
                     grounded[alias] = grounded_reason
+            if package is not None:
+                package["why_it_matters"] = grounded_reason
             changed_fields.append("reason")
 
+    if package is not None and changed_fields:
+        grounded["coaching_package"] = package
     return grounded, tuple(changed_fields)
 
 

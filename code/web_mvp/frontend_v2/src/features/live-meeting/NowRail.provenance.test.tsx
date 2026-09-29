@@ -1,9 +1,15 @@
-import { act, render, screen, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import type { ComponentProps } from "react";
+import { afterEach } from "vitest";
 import { parseMeetingSnapshot } from "../../api/schema";
 import { createInitialMeetingState, meetingReducer } from "../../domain/reducer";
-import type { FollowUpProjection, Suggestion } from "../../domain/events";
+import type { CoachHistoryEntry, FollowUpProjection, Suggestion } from "../../domain/events";
 import { NowRail } from "./NowRail";
+
+afterEach(() => {
+  window.sessionStorage.clear();
+});
 
 function formalAi(segmentId = "segment-1") {
   return {
@@ -35,6 +41,23 @@ function followUp(overrides: Partial<FollowUpProjection> = {}): FollowUpProjecti
   };
 }
 
+function coachingPackage(headline: string, sayThisAddition: string) {
+  return {
+    headline,
+    questionIntent: "判断选型是否有清晰的适用边界",
+    coreJudgement: "当前回答解释了成本，但异常恢复仍需补充",
+    whyItMatters: "缺少异常路径会让选型依据显得不完整",
+    sayThisAddition,
+    missingPoints: ["异常消费后的恢复策略"],
+    constraints: ["当前吞吐规模可控"],
+    risks: ["重复消费和积压处理尚未说明"],
+    nextActions: ["补充迁移条件和验证方式"],
+    likelyFollowUps: [{ question: "如何处理失败消费？", answerAngle: "说明重试、幂等和人工介入边界" }],
+    evidenceRefs: [{ segmentId: "segment-1", quote: "为什么选择 Redis Stream？" }],
+    confidence: 0.88,
+  };
+}
+
 function renderRail(nextFollowUp: FollowUpProjection | null) {
   const props: ComponentProps<typeof NowRail> = {
     currentTopic: null,
@@ -59,6 +82,14 @@ function renderRail(nextFollowUp: FollowUpProjection | null) {
   };
   return render(<NowRail {...props} />);
 }
+
+it("keeps the empty coach heading stable while runtime state remains secondary", () => {
+  renderRail(null);
+
+  expect(screen.getByRole("heading", { name: "AI 实时教练" })).toBeVisible();
+  expect(screen.getByText("等待可回答的问题")).toBeVisible();
+  expect(screen.getByText("等待下一段稳定对话")).toBeVisible();
+});
 
 it("keeps the current streamed answer primary while Pi remains a supplement", () => {
   const answer: Suggestion = {
@@ -113,6 +144,97 @@ it("keeps the current streamed answer primary while Pi remains a supplement", ()
   expect(card).toHaveTextContent("迁移 Kafka 的触发条件");
   expect(screen.queryByTestId("follow-up-card")).toBeNull();
   expect(screen.getByRole("button", { name: "复制回答" })).toBeVisible();
+});
+
+it("renders the structured Pi package and lets the user switch retained revisions", async () => {
+  const user = userEvent.setup();
+  const onEvidence = vi.fn();
+  const answer: Suggestion = {
+    suggestionId: "answer-structured",
+    meetingId: "meeting-1",
+    jobId: "answer-job-structured",
+    generationId: "answer-generation-structured",
+    kind: "answer",
+    questionText: "为什么选择 Redis Stream？",
+    evidenceSegmentId: "segment-1",
+    evidenceTranscriptSeq: 3,
+    evidenceHash: "hash-1",
+    stateRevision: 1,
+    status: "committed",
+    draftText: "",
+    draftSeq: 1,
+    text: "因为当前规模可控且可以复用现有 Redis 运维体系。",
+    finalDraftSeq: 1,
+    feedback: null,
+    createdAtMs: 100,
+    updatedAtMs: 110,
+    committedAtMs: 110,
+  };
+  const revisions: CoachHistoryEntry[] = [
+    {
+      ...followUp({
+        origin: "pi",
+        status: "intervention",
+        promptProfile: "deep_answer",
+        answerId: answer.suggestionId,
+        decisionId: "pi-v1",
+        revision: 1,
+        triggerType: "answer_ready",
+        coachingPackage: coachingPackage("先补齐可靠性", "第一版：补充失败消费和积压处理。"),
+      }),
+      historyId: "history-v1",
+      createdAtMs: 120,
+    },
+    {
+      ...followUp({
+        origin: "pi",
+        status: "intervention",
+        promptProfile: "deep_answer",
+        answerId: answer.suggestionId,
+        decisionId: "pi-v2",
+        revision: 2,
+        triggerType: "user_request",
+        userRequest: "请更具体",
+        supersedesDecisionId: "pi-v1",
+        coachingPackage: coachingPackage("给出迁移判断", "第二版：补充吞吐、留存和运维成本的迁移判断。"),
+      }),
+      historyId: "history-v2",
+      createdAtMs: 140,
+    },
+  ];
+
+  const props: ComponentProps<typeof NowRail> = {
+    viewStateKey: "meeting-1",
+    currentTopic: null,
+    followUp: null,
+    coachHistory: revisions,
+    openQuestions: [],
+    suggestions: [answer],
+    decisionCandidates: [],
+    actionItems: [],
+    risks: [],
+    onEvidence,
+    onFeedback: vi.fn(async () => undefined),
+    onFactStatus: vi.fn(async () => undefined),
+    onMessage: vi.fn(),
+  };
+  const first = render(<NowRail {...props} />);
+
+  const card = screen.getByTestId("answer-copilot-card");
+  expect(card).toHaveTextContent("根据你的反馈更新 · v2");
+  expect(card).toHaveTextContent("给出迁移判断");
+  expect(card).toHaveTextContent("第二版：补充吞吐、留存和运维成本的迁移判断。");
+  expect(card).toHaveTextContent("可能追问与回答方向");
+  await user.click(within(card).getByRole("button", { name: "v1" }));
+  expect(card).toHaveTextContent("先补齐可靠性");
+  expect(card).toHaveTextContent("第一版：补充失败消费和积压处理。");
+  await waitFor(() => expect(window.sessionStorage.getItem("meeting-copilot-now-rail:meeting-1")).toContain("pi-v1"));
+  await user.click(within(card).getByRole("button", { name: "原话 1" }));
+  expect(onEvidence).toHaveBeenCalledWith("segment-1");
+
+  first.unmount();
+  render(<NowRail {...props} />);
+  expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("第一版：补充失败消费和积压处理。");
 });
 
 it("separates prior answers and prior coach cards without duplicating the current deep supplement", () => {
@@ -199,7 +321,7 @@ it("separates prior answers and prior coach cards without duplicating the curren
   expect(currentCard).toHaveTextContent("当前规模优先复用 Redis");
   expect(currentCard).toHaveTextContent("补充压测阈值、监控指标和回滚条件");
 
-  const answerHistory = screen.getByRole("list", { name: "最近回答" });
+  const answerHistory = screen.getByRole("list", { name: "回答与 Pi 历史" });
   expect(answerHistory).toHaveTextContent("如何保证消息不会丢失？");
   expect(answerHistory).toHaveTextContent("已替换");
   expect(answerHistory).not.toHaveTextContent("为什么选择 Redis Stream，而不是 Kafka？");
@@ -207,6 +329,65 @@ it("separates prior answers and prior coach cards without duplicating the curren
   const coachHistory = screen.getByRole("list", { name: "过去的教练建议" });
   expect(coachHistory).toHaveTextContent("先确认失败恢复的验收条件。");
   expect(within(coachHistory).queryByText("补充压测阈值、监控指标和回滚条件。")).toBeNull();
+});
+
+it("requests a Pi revision against the selected answer without removing the current content", async () => {
+  const user = userEvent.setup();
+  const onCoachRefine = vi.fn(async () => undefined);
+  const answer: Suggestion = {
+    suggestionId: "answer-feedback",
+    meetingId: "meeting-1",
+    jobId: "answer-job-feedback",
+    generationId: "answer-generation-feedback",
+    kind: "answer",
+    questionText: "上线前最重要的风险是什么？",
+    evidenceSegmentId: "segment-1",
+    evidenceTranscriptSeq: 3,
+    evidenceHash: "hash-1",
+    stateRevision: 1,
+    status: "committed",
+    draftText: "",
+    draftSeq: 1,
+    text: "最重要的是先确认回滚触发条件和负责人。",
+    finalDraftSeq: 1,
+    feedback: null,
+    createdAtMs: 100,
+    updatedAtMs: 110,
+    committedAtMs: 110,
+  };
+
+  render(
+    <NowRail
+      currentTopic={null}
+      followUp={null}
+      coachHistory={[]}
+      openQuestions={[]}
+      suggestions={[answer]}
+      decisionCandidates={[]}
+      actionItems={[]}
+      risks={[]}
+      onEvidence={vi.fn()}
+      onFeedback={vi.fn(async () => undefined)}
+      onFactStatus={vi.fn(async () => undefined)}
+      onMessage={vi.fn()}
+      onCoachRefine={onCoachRefine}
+    />,
+  );
+
+  const missReasonTrigger = screen.getByRole("button", { name: "没说中重点" });
+  await user.click(missReasonTrigger);
+  expect(screen.getByRole("menu", { name: "选择没说中重点的原因" })).toBeVisible();
+  await user.keyboard("{Escape}");
+  expect(screen.queryByRole("menu", { name: "选择没说中重点的原因" })).toBeNull();
+  expect(missReasonTrigger).toHaveFocus();
+
+  await user.click(screen.getByRole("button", { name: "补风险" }));
+
+  expect(onCoachRefine).toHaveBeenCalledWith(
+    "answer-feedback",
+    expect.stringContaining("关键风险"),
+  );
+  expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("最重要的是先确认回滚触发条件和负责人");
 });
 
 it("never labels an unrelated realtime Pi intervention as a deep answer supplement", () => {

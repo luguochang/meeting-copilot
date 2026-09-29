@@ -30,6 +30,7 @@ const FAILURE_METRIC_KEYS = [
   "available_tool_names",
   "session_message_count_before",
   "session_reused",
+  "provider_transport",
   "decision_latency_budget_ms",
   "decision_timeout_ms",
   "provider_status_code",

@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from meeting_copilot_web_mvp.v2_persistence import (
+    INTELLIGENCE_DEEP_BUDGET_MS,
     INTELLIGENCE_DEBOUNCE_MS,
     INTELLIGENCE_MIN_EXECUTION_BUDGET_MS,
     INTELLIGENCE_REALTIME_BUDGET_MS,
@@ -341,10 +342,23 @@ def test_answer_ready_job_is_idempotent_and_owned_by_deep_lane(llm_persistence):
         answer_id=answer_id,
         now_ms=3_400,
     )
+    refinement = llm_persistence.enqueue_user_coach_request(
+        meeting_id="meeting-answer-ready",
+        answer_id=answer_id,
+        user_request="请补充当前回答遗漏的关键风险",
+        idempotency_key="api.coach.request:meeting-answer-ready:refine-1",
+        now_ms=3_450,
+    )
 
     assert replay["id"] == first["id"]
     assert first["trigger_type"] == "answer_ready"
     assert first["work_item_id"] == answer_id
+    assert first["deadline_at_ms"] == 3_300 + INTELLIGENCE_DEEP_BUDGET_MS
+    assert refinement["trigger_type"] == "user_request"
+    assert refinement["work_item_id"] == answer_id
+    assert refinement["deadline_at_ms"] == 3_450 + INTELLIGENCE_DEEP_BUDGET_MS
+    assert refinement["evidence_segment_id"] == "segment-answer-ready"
+    assert refinement["input_transcript_seq"] == 1
     assert llm_persistence.claim_next_job(
         worker_id="ordinary-intelligence-worker",
         lane="intelligence",
@@ -358,8 +372,15 @@ def test_answer_ready_job_is_idempotent_and_owned_by_deep_lane(llm_persistence):
         lease_ms=10_000,
     )
     assert deep is not None
-    assert deep["id"] == first["id"]
-    assert deep["trigger_type"] == "answer_ready"
+    assert deep["id"] == refinement["id"]
+    assert deep["trigger_type"] == "user_request"
+    assert llm_persistence.get_job(first["id"])["status"] == "cancelled"
+    assert llm_persistence.claim_next_job(
+        worker_id="answer-ready-deep-worker",
+        lane="pi_deep",
+        now_ms=3_501,
+        lease_ms=10_000,
+    ) is None
 
 
 def test_input_coverage_records_pending_and_source_duplicate_excluded(llm_persistence):
@@ -5870,6 +5891,13 @@ def test_create_meeting_is_idempotent_and_history_is_normalized(persistence):
             "audio_duration_ms": 0,
             "has_minutes": False,
             "review_jobs": {},
+            "capture": {
+                "state": "inactive",
+                "active_track_count": 0,
+                "track_count": 0,
+                "last_heartbeat_at_ms": None,
+                "lease_until_ms": None,
+            },
         }
     ]
 
@@ -5922,3 +5950,46 @@ def test_history_search_status_and_cursor_are_database_backed(persistence):
     )
     assert [item["id"] for item in live["meetings"]] == ["meeting-a"]
     assert {item["id"] for item in ready["meetings"]} == {"meeting-b", "meeting-c"}
+
+
+def test_history_and_snapshot_project_capture_lease_freshness(persistence, monkeypatch):
+    meeting_id = "meeting-capture-freshness"
+    persistence.create_meeting(meeting_id=meeting_id, title="跨窗口录音", now_ms=1_000)
+    persistence.begin_recording(
+        meeting_id=meeting_id,
+        track="microphone",
+        epoch=0,
+        source_type="browser_live_mic",
+        sample_rate_hz=16_000,
+        lease_owner="capture-window-a",
+        lease_ms=30_000,
+        now_ms=2_000,
+    )
+
+    assert persistence.heartbeat_recording(
+        meeting_id=meeting_id,
+        track="microphone",
+        epoch=0,
+        lease_owner="capture-window-a",
+        lease_ms=30_000,
+        now_ms=20_000,
+    ) is True
+    fresh = persistence.list_meetings_page(now_ms=33_000)["meetings"][0]["capture"]
+    assert fresh == {
+        "state": "active",
+        "active_track_count": 1,
+        "track_count": 1,
+        "last_heartbeat_at_ms": 20_000,
+        "lease_until_ms": 50_000,
+    }
+
+    monkeypatch.setattr(
+        "meeting_copilot_web_mvp.v2_persistence.time.time_ns",
+        lambda: 50_001 * 1_000_000,
+    )
+    stale_history = persistence.list_meetings_page(now_ms=50_001)["meetings"][0]["capture"]
+    stale_snapshot = persistence.get_snapshot(meeting_id)["runtime"]
+    assert stale_history["state"] == "recoverable"
+    assert stale_history["active_track_count"] == 0
+    assert stale_snapshot["capture"]["state"] == "recoverable"
+    assert stale_snapshot["recording"] == {"state": "paused", "label": "录音待恢复"}

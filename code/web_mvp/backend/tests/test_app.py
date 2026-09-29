@@ -2937,6 +2937,190 @@ def test_v2_answer_ready_enters_pi_deep_with_committed_fast_answer(
     persistence.close()
 
 
+def test_v2_bound_user_request_retains_answer_evidence_and_versions_revision(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
+    config = app_module.llm_service.LlmConfig(
+        base_url="https://provider.example.test/v1",
+        api_key="test-only-key",
+        model="test-model",
+        realtime_model="test-realtime-model",
+        timeout_seconds=20,
+        is_mock=True,
+    )
+    monkeypatch.setattr(
+        app_module.llm_service.LlmConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(app_module.llm_service, "realtime_config", lambda value: value)
+    monkeypatch.setattr(
+        app_module,
+        "_ensure_llm_provider_allowed_for_derivation",
+        lambda *_args, **_kwargs: None,
+    )
+
+    async def semantic_must_not_run(**_kwargs):
+        raise AssertionError("bound Answer revisions must stay in the Pi deep lane")
+
+    observed_requests = []
+
+    async def fake_pi_coach(**kwargs):
+        assert kwargs["priority_mode"] == "deep"
+        request = kwargs["request"]
+        observed_requests.append(request)
+        assert request.work_item_id == "answer:bound-revision"
+        assert request.new_paragraphs == ()
+        assert request.rolling_state["current_answer"]["answer_id"] == (
+            "answer:bound-revision"
+        )
+        assert request.rolling_state["current_answer"]["evidence_segment_id"] == (
+            "bound-answer-segment"
+        )
+        assert "bound-answer-segment" in request.paragraphs_by_id
+        assert request.context_paragraphs[-1].id == "bound-answer-segment"
+        kwargs["before_attempt"](1)
+        revision_number = len(observed_requests)
+        paragraph = request.paragraphs_by_id["bound-answer-segment"]
+        intervention = CoachIntervention(
+            event_type="question_to_user",
+            title=f"补充判断边界 v{revision_number}",
+            recommendation=(
+                "先明确判断，再说明指标口径、适用边界和触发重新评估的条件。"
+            ),
+            reason="当前回答还可以补齐指标口径和适用边界。",
+            evidence_segment_ids=(paragraph.id,),
+            evidence_quote=paragraph.text,
+            urgency="medium",
+            confidence=0.9,
+        )
+        result = build_realtime_coach_provenance_decision(
+            request=request,
+            origin="pi",
+            status="intervention",
+            status_reason="intervention_submitted",
+            decision_reason="Pi 基于绑定 Answer 生成可追溯修订。",
+            intervention=intervention,
+        )
+        now_ms = int(time.time() * 1_000)
+        result.update(
+            {
+                "transport_mode": "pi_agent_jsonl",
+                "provider_lane": "pi_deep",
+                "model": "test-realtime-model",
+                "runtime_requested": "pi",
+                "runtime_used": "pi",
+                "ttft_ms": 20.0,
+                "decision_latency_ms": 35.0,
+                "timings": {
+                    "clock": "unix_epoch_ms",
+                    "started_at_ms": now_ms,
+                    "first_token_at_ms": now_ms + 20,
+                    "completed_at_ms": now_ms + 35,
+                },
+                "agent_metrics": {
+                    "turns": 1,
+                    "tool_calls": 1,
+                    "prompt_profile": "deep_answer",
+                },
+            }
+        )
+        return result
+
+    monkeypatch.setattr(app_module, "run_realtime_intelligence", semantic_must_not_run)
+    monkeypatch.setattr(app_module, "run_realtime_coach_routed", fake_pi_coach)
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    app.state.streaming_llm_client = object()
+    persistence = app.state.v2_persistence
+    finalized_at_ms = time.time_ns() // 1_000_000
+    segment_texts = (
+        "先同步背景，两个性能指标采用了不同统计口径。",
+        "当前方案仍需明确适用范围和验收条件。",
+        "这两个指标是否冲突？请给出明确判断。",
+        "后续还讨论了发布窗口。",
+        "另一个问题涉及回滚负责人。",
+        "还需要补充验收时间。",
+        "最后确认会议行动项。",
+    )
+    committed = []
+    for index, text in enumerate(segment_texts, start=1):
+        segment_id = "bound-answer-segment" if index == 3 else f"later-context-{index}"
+        committed.append(
+            persistence.commit_final_and_enqueue(
+                meeting_id="bound-user-revision-meeting",
+                final_id=f"bound-final-{index}",
+                segment_id=segment_id,
+                text=text,
+                normalized_text=text,
+                started_at_ms=(index - 1) * 1_000,
+                ended_at_ms=index * 1_000,
+                evidence_hash=f"bound-hash-{index}",
+                source_track="system_audio",
+                now_ms=finalized_at_ms + index,
+            )
+        )
+
+    answer_job = persistence.get_job(committed[2]["job_ids"]["answer"])
+    persistence.upsert_suggestion_draft(
+        suggestion_id="answer:bound-revision",
+        meeting_id="bound-user-revision-meeting",
+        job_id=answer_job["id"],
+        generation_id=answer_job["generation_id"],
+        evidence_segment_id="bound-answer-segment",
+        evidence_transcript_seq=3,
+        evidence_hash="bound-hash-3",
+        state_revision=3,
+        draft_text="不冲突；两个指标描述的是不同统计口径。",
+        draft_seq=1,
+        now_ms=finalized_at_ms + 20,
+        kind="answer",
+        question_text="这两个指标是否冲突？请给出明确判断。",
+    )
+    assert persistence.commit_suggestion(
+        suggestion_id="answer:bound-revision",
+        generation_id=answer_job["generation_id"],
+        expected_evidence_hash="bound-hash-3",
+        final_draft_seq=1,
+        text="不冲突；两个指标描述的是不同统计口径。",
+        now_ms=finalized_at_ms + 21,
+    ) is not None
+
+    automatic_job = persistence.enqueue_answer_coach_request(
+        meeting_id="bound-user-revision-meeting",
+        answer_id="answer:bound-revision",
+        now_ms=finalized_at_ms + 30,
+    )
+    first_output = asyncio.run(
+        app.state.v2_intelligence_job_handler_impl(automatic_job)
+    )
+    revision_job = persistence.enqueue_user_coach_request(
+        meeting_id="bound-user-revision-meeting",
+        answer_id="answer:bound-revision",
+        user_request="没说中重点：先给明确判断，再补充口径差异和适用边界。",
+        idempotency_key="bound-user-revision-1",
+        now_ms=finalized_at_ms + 40,
+    )
+    second_output = asyncio.run(
+        app.state.v2_intelligence_job_handler_impl(revision_job)
+    )
+
+    first_decision = first_output["applied"]["coach_decision"]
+    second_decision = second_output["applied"]["coach_decision"]
+    assert len(observed_requests) == 2
+    assert observed_requests[0].trigger_type == "answer_ready"
+    assert observed_requests[1].trigger_type == "user_request"
+    assert observed_requests[1].user_request.startswith("没说中重点")
+    assert first_decision["answer_id"] == "answer:bound-revision"
+    assert first_decision["revision"] == 1
+    assert second_decision["answer_id"] == "answer:bound-revision"
+    assert second_decision["revision"] == 2
+    assert second_decision["supersedes_decision_id"] == first_decision["decision_id"]
+    persistence.close()
+
+
 def test_v2_pi_intervention_is_deprioritized_by_resolving_evidence_and_kept_in_history(
     tmp_path,
     monkeypatch,

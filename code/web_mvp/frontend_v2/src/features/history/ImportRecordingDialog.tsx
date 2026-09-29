@@ -1,6 +1,7 @@
 import { Check, FileAudio, HardDrive, LoaderCircle, Upload, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { ImportRecordingResult } from "../../api/client";
+import { useModalDialog } from "../../components/useModalDialog";
 import type { ImportJob, ImportJobStage } from "../../domain/events";
 
 interface ImportRecordingDialogProps {
@@ -69,6 +70,7 @@ export function ImportRecordingDialog({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<ImportRecordingResult | null>(null);
+  const dialogRef = useModalDialog(open, onClose, busy);
 
   const meetingId = result?.meetingId;
   const jobStatus = result?.job?.status;
@@ -150,11 +152,32 @@ export function ImportRecordingDialog({
   };
   return (
     <div className="drawer-layer import-recording-layer" role="presentation">
-      <button className="drawer-scrim" type="button" aria-label="关闭录音导入" onClick={onClose} />
-      <section className="import-recording-dialog" role="dialog" aria-modal="true" aria-labelledby="import-recording-title">
+      <button
+        className="drawer-scrim"
+        type="button"
+        aria-label="关闭录音导入"
+        onClick={onClose}
+        disabled={busy}
+      />
+      <section
+        ref={dialogRef}
+        className="import-recording-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="import-recording-title"
+        aria-busy={busy}
+        tabIndex={-1}
+      >
         <header className="drawer-header">
           <h2 id="import-recording-title">导入录音</h2>
-          <button className="icon-button" type="button" onClick={onClose} aria-label="关闭录音导入" title="关闭">
+          <button
+            className="icon-button"
+            type="button"
+            onClick={onClose}
+            aria-label="关闭录音导入"
+            title="关闭"
+            disabled={busy}
+          >
             <X size={18} />
           </button>
         </header>
@@ -199,6 +222,7 @@ export function ImportRecordingDialog({
             ref={inputRef}
             className="sr-only"
             type="file"
+            tabIndex={-1}
             accept={ACCEPTED_FILES}
             onChange={(event) => chooseFile(event.target.files?.[0])}
             aria-label="选择要导入的录音文件"
@@ -251,7 +275,9 @@ export function ImportRecordingDialog({
         </div>
 
         <footer className="import-recording-actions">
-          <button className="secondary-button" type="button" onClick={onClose}>{result?.job ? "返回会议列表" : "取消"}</button>
+          <button className="secondary-button" type="button" onClick={onClose} disabled={busy}>
+            {result?.job ? "返回会议列表" : "取消"}
+          </button>
           {result?.meetingId ? (
             <>
               {result.job?.retryable && ["failed", "cancelled"].includes(result.job.status) ? (

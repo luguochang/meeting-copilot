@@ -24,6 +24,7 @@ PI_BRIDGE_ENTRY_ENV = "MEETING_COPILOT_PI_BRIDGE_ENTRY"
 PI_NODE_EXECUTABLE_ENV = "MEETING_COPILOT_NODE_EXECUTABLE"
 DEFAULT_TIMEOUT_SECONDS = 12.0
 REALTIME_PROVIDER_TIMEOUT_SECONDS = 10.0
+DEEP_PROVIDER_TIMEOUT_SECONDS = 8.0
 BRIDGE_RESPONSE_GRACE_SECONDS = 0.25
 MAX_REQUEST_BYTES = 200_000
 MAX_RESPONSE_BYTES = 200_000
@@ -100,6 +101,11 @@ def build_pi_coach_request(
     # Give the agent the deterministic routing result so it can spend its
     # bounded turn on choosing and wording, rather than rediscovering triggers.
     candidate_events = [dict(item) for item in (candidate_events or ())][:8]
+    provider_timeout_cap = (
+        DEEP_PROVIDER_TIMEOUT_SECONDS
+        if normalized_priority_mode == "deep"
+        else REALTIME_PROVIDER_TIMEOUT_SECONDS
+    )
     candidate_evidence_ids: list[str] = []
     for candidate in candidate_events:
         raw_ids = candidate.get("evidence_segment_ids")
@@ -128,10 +134,10 @@ def build_pi_coach_request(
             "model": str(model),
             "api_style": str(api_style),
             "timeout_ms": int(
-                max(1.0, min(float(timeout_seconds), REALTIME_PROVIDER_TIMEOUT_SECONDS)) * 1_000
+                max(1.0, min(float(timeout_seconds), provider_timeout_cap)) * 1_000
             ),
             "decision_timeout_ms": int(
-                max(1.0, min(float(timeout_seconds), REALTIME_PROVIDER_TIMEOUT_SECONDS)) * 1_000
+                max(1.0, min(float(timeout_seconds), provider_timeout_cap)) * 1_000
             ),
         },
         "context": {

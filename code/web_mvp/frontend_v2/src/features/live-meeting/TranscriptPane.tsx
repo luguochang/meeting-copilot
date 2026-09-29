@@ -561,6 +561,21 @@ export function TranscriptPane({
     };
   }, [scheduleSelectionCapture]);
 
+  useEffect(() => {
+    if (!selection) return undefined;
+    const dismissSelectionToolbar = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      window.getSelection()?.removeAllRanges();
+      setSelection(null);
+      setSelectionToolbarPosition(null);
+      onSelectionChange?.(null);
+      document.getElementById(segmentDomId(selection.segmentIds[0]))?.focus({ preventScroll: true });
+    };
+    document.addEventListener("keydown", dismissSelectionToolbar);
+    return () => document.removeEventListener("keydown", dismissSelectionToolbar);
+  }, [onSelectionChange, selection]);
+
   const returnToLatest = () => {
     setFollowingLatest(true);
     setNewParagraphCount(0);

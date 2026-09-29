@@ -153,6 +153,8 @@ def test_pi_request_can_select_the_explicit_deep_lane() -> None:
     )
 
     assert payload["context"]["priority_mode"] == "deep"
+    assert payload["provider"]["timeout_ms"] == 8_000
+    assert payload["provider"]["decision_timeout_ms"] == 8_000
 
 
 def test_pi_request_includes_only_exact_cross_batch_candidate_evidence() -> None:

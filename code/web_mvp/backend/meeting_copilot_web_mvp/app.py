@@ -919,10 +919,16 @@ def _v2_intelligence_batch_segments(
         return new_segments, context
     if trigger_type in {"user_request", "answer_ready"}:
         # An explicit coach request is evaluated against the current meeting
-        # snapshot rather than a fresh transcript delta. Keep these as
-        # context evidence so provenance does not claim the user request
-        # created new speech, while still giving Pi a bounded, useful window.
-        return [], all_segments[-3:]
+        # snapshot rather than a fresh transcript delta. A request bound to an
+        # Answer must retain the transcript window that produced that Answer;
+        # later speech must not evict its host-bound evidence before the Pi
+        # bridge validates the request. Generic user requests already point at
+        # the latest transcript sequence, so the same bounded rule applies.
+        return [], [
+            segment
+            for segment in all_segments
+            if int(segment.get("transcript_seq") or 0) <= target_seq
+        ][-3:]
     terminal_statuses = {"succeeded", "failed", "cancelled"}
     previous_batch_end = max(
         (
@@ -4948,6 +4954,9 @@ def create_app(
             raise HTTPException(status_code=422, detail="request must not be empty")
         if len(user_request) > 4_000:
             raise HTTPException(status_code=422, detail="request must not exceed 4000 characters")
+        answer_id = " ".join(str(payload.get("answer_id") or "").split()) or None
+        if answer_id is not None and len(answer_id) > 240:
+            raise HTTPException(status_code=422, detail="answer_id must not exceed 240 characters")
         request_key = str(request.headers.get("idempotency-key") or "").strip()
         if not request_key:
             request_key = f"generated:{uuid.uuid4().hex}"
@@ -4965,6 +4974,7 @@ def create_app(
                 user_request=user_request,
                 idempotency_key=idempotency_key,
                 now_ms=time.time_ns() // 1_000_000,
+                answer_id=answer_id,
             )
         except KeyError:
             raise HTTPException(status_code=404, detail="meeting not found") from None
@@ -10737,9 +10747,9 @@ def create_app(
             )
         snapshot = v2_persistence.get_snapshot(meeting_id, segment_limit=100)
         topic = snapshot.get("current_topic") or {}
-        answer_id = (
+        requested_answer_id = (
             str(job.get("work_item_id") or "").strip()
-            if trigger_type == "answer_ready"
+            if trigger_type in {"answer_ready", "user_request"}
             else ""
         )
         current_answer = next(
@@ -10748,15 +10758,22 @@ def create_app(
                 for item in reversed(snapshot.get("suggestions") or [])
                 if str(item.get("kind") or "") == "answer"
                 and str(item.get("status") or "") != "superseded"
-                and (
-                    str(item.get("suggestion_id") or "") == answer_id
-                    if answer_id
-                    else int(item.get("evidence_transcript_seq") or 0)
-                    <= int(job.get("input_transcript_seq") or 0)
-                )
+                and str(item.get("suggestion_id") or "") == requested_answer_id
             ),
             None,
-        )
+        ) if requested_answer_id else None
+        if current_answer is None and trigger_type != "answer_ready":
+            current_answer = next(
+                (
+                    item
+                    for item in reversed(snapshot.get("suggestions") or [])
+                    if str(item.get("kind") or "") == "answer"
+                    and str(item.get("status") or "") != "superseded"
+                    and int(item.get("evidence_transcript_seq") or 0)
+                    <= int(job.get("input_transcript_seq") or 0)
+                ),
+                None,
+            )
         if trigger_type == "answer_ready" and current_answer is None:
             raise IntelligenceEvidenceSuperseded(
                 "answer_ready job no longer resolves to its bound Fast Answer"
@@ -13129,6 +13146,35 @@ def create_app(
             if prompt_profile == "deep_answer" and current_answer is not None
             else ""
         )
+        previous_deep_revision: Mapping[str, Any] | None = None
+        if deep_answer_id:
+            previous_deep_revision = next(
+                (
+                    item
+                    for item in reversed(
+                        _bounded_formal_coach_history(
+                            _all_v2_formal_events(meeting_id),
+                            limit=COACH_HISTORY_LIMIT,
+                        )
+                    )
+                    if str(item.get("prompt_profile") or "") == "deep_answer"
+                    and str(item.get("answer_id") or "") == deep_answer_id
+                    and str(item.get("status") or "") == "intervention"
+                    and not str(item.get("superseded_by") or "").strip()
+                ),
+                None,
+            )
+        deep_revision = (
+            int(previous_deep_revision.get("revision") or 1) + 1
+            if previous_deep_revision is not None
+            else 1
+        ) if deep_answer_id else None
+        supersedes_deep_decision_id = (
+            str(previous_deep_revision.get("decision_id") or "").strip() or None
+            if previous_deep_revision is not None
+            and str(coach_result.get("status") or "") == "intervention"
+            else None
+        )
         coach_decision.update(
             {
                 "meeting_id": meeting_id,
@@ -13192,6 +13238,11 @@ def create_app(
                 "agent_metrics": public_agent_metrics,
                 "prompt_profile": prompt_profile or None,
                 "answer_id": deep_answer_id or None,
+                "revision": deep_revision,
+                "trigger_type": trigger_type,
+                "user_request": (
+                    str(job.get("user_request") or "")[:2_000] or None
+                ),
                 # Validity belongs to the decision envelope, including an
                 # explicit silent decision. This makes audit/replay consumers
                 # able to distinguish an active silence from an old one.
@@ -13208,7 +13259,7 @@ def create_app(
                     "protected_silent": "deprioritize",
                     "not_triggered": "deprioritize",
                 }.get(str(coach_result.get("status") or "protected_silent"), "deprioritize"),
-                "supersedes_decision_id": None,
+                "supersedes_decision_id": supersedes_deep_decision_id,
                 "superseded_by": None,
                 "lifecycle_refresh": bool(coach_result.get("lifecycle_refresh")),
                 "lifecycle_refresh_previous_decision_id": (
@@ -17138,6 +17189,11 @@ def _coach_follow_up_from_event_payload(payload: Mapping[str, Any]) -> dict[str,
             "coach_event_type": str(intervention.get("event_type") or "").strip() or None,
             "title": str(intervention.get("title") or "").strip() or None,
             "confidence": intervention.get("confidence"),
+            "coaching_package": (
+                dict(intervention["coaching_package"])
+                if isinstance(intervention.get("coaching_package"), Mapping)
+                else None
+            ),
             **{
                 key: value
                 for key in (
@@ -17166,6 +17222,9 @@ def _coach_follow_up_from_event_payload(payload: Mapping[str, Any]) -> dict[str,
                     "valid_until_ms",
                     "prompt_profile",
                     "answer_id",
+                    "revision",
+                    "trigger_type",
+                    "user_request",
                     "lifecycle_action",
                     "supersedes_decision_id",
                     "superseded_by",

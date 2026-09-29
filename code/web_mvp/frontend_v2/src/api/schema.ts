@@ -19,6 +19,7 @@ import type {
   FormalAiProvenance,
   MeetingAudio,
   MeetingAudioSummary,
+  MeetingCaptureSummary,
   MeetingFactStatus,
   MeetingEvent,
   MeetingHistory,
@@ -32,6 +33,7 @@ import type {
   MeetingSnapshot,
   MinutesArtifact,
   OpenQuestionProjection,
+  PiCoachingPackage,
   RecentContextEntry,
   RiskProjection,
   ReviewJob,
@@ -1168,6 +1170,71 @@ function parseQuestion(value: unknown, index: number): OpenQuestionProjection | 
   };
 }
 
+function parsePiCoachingPackage(value: unknown): PiCoachingPackage | null {
+  if (value === undefined || value === null) return null;
+  const item = record(value, "Pi coaching package");
+  const requiredText = (key: string, alias?: string): string => {
+    const parsed = optionalString(first(item, key, ...(alias ? [alias] : [])));
+    if (!parsed) throw new ContractError(`Pi coaching package.${key} must be non-empty text`);
+    return parsed;
+  };
+  const textList = (key: string, alias?: string, maximum = 3): string[] => {
+    const raw = first(item, key, ...(alias ? [alias] : []));
+    if (!Array.isArray(raw) || raw.length > maximum) {
+      throw new ContractError(`Pi coaching package.${key} must be a bounded array`);
+    }
+    return raw.map((entry, index) => {
+      const parsed = optionalString(entry);
+      if (!parsed) throw new ContractError(`Pi coaching package.${key}[${index}] must be non-empty text`);
+      return parsed;
+    });
+  };
+  const followUpsRaw = first(item, "likely_follow_ups", "likelyFollowUps");
+  if (!Array.isArray(followUpsRaw) || followUpsRaw.length > 2) {
+    throw new ContractError("Pi coaching package.likely_follow_ups must be a bounded array");
+  }
+  const likelyFollowUps = followUpsRaw.map((entry, index) => {
+    const followUp = record(entry, `Pi coaching package.likely_follow_ups[${index}]`);
+    const question = optionalString(followUp.question);
+    const answerAngle = optionalString(first(followUp, "answer_angle", "answerAngle"));
+    if (!question || !answerAngle) {
+      throw new ContractError(`Pi coaching package.likely_follow_ups[${index}] is incomplete`);
+    }
+    return { question, answerAngle };
+  });
+  const evidenceRefsRaw = first(item, "evidence_refs", "evidenceRefs");
+  if (!Array.isArray(evidenceRefsRaw) || evidenceRefsRaw.length === 0 || evidenceRefsRaw.length > 12) {
+    throw new ContractError("Pi coaching package.evidence_refs must be a non-empty bounded array");
+  }
+  const evidenceRefs = evidenceRefsRaw.map((entry, index) => {
+    const ref = record(entry, `Pi coaching package.evidence_refs[${index}]`);
+    const segmentId = optionalString(first(ref, "segment_id", "segmentId"));
+    const quote = optionalString(ref.quote);
+    if (!segmentId || !quote) {
+      throw new ContractError(`Pi coaching package.evidence_refs[${index}] is incomplete`);
+    }
+    return { segmentId, quote };
+  });
+  const confidence = optionalNumber(item.confidence);
+  if (confidence === null || confidence < 0 || confidence > 1) {
+    throw new ContractError("Pi coaching package.confidence must be between 0 and 1");
+  }
+  return {
+    headline: requiredText("headline"),
+    questionIntent: requiredText("question_intent", "questionIntent"),
+    coreJudgement: requiredText("core_judgement", "coreJudgement"),
+    whyItMatters: requiredText("why_it_matters", "whyItMatters"),
+    sayThisAddition: requiredText("say_this_addition", "sayThisAddition"),
+    missingPoints: textList("missing_points", "missingPoints"),
+    constraints: textList("constraints"),
+    risks: textList("risks"),
+    nextActions: textList("next_actions", "nextActions"),
+    likelyFollowUps,
+    evidenceRefs,
+    confidence,
+  };
+}
+
 function parseFollowUp(value: unknown, metadataValue?: unknown): FollowUpProjection | null {
   const rawItem = optionalRecord(value);
   if (!rawItem) return null;
@@ -1219,6 +1286,10 @@ function parseFollowUp(value: unknown, metadataValue?: unknown): FollowUpProject
   const decisionId = optionalString(first(item, "decision_id", "decisionId"));
   const promptProfile = optionalString(first(item, "prompt_profile", "promptProfile"));
   const answerId = optionalString(first(item, "answer_id", "answerId"));
+  const revision = optionalNumber(first(item, "revision"));
+  const triggerType = optionalString(first(item, "trigger_type", "triggerType"));
+  const userRequest = optionalString(first(item, "user_request", "userRequest"));
+  const coachingPackage = parsePiCoachingPackage(first(item, "coaching_package", "coachingPackage"));
   const validUntil = optionalNumber(first(
     item,
     "valid_until_ms",
@@ -1272,6 +1343,10 @@ function parseFollowUp(value: unknown, metadataValue?: unknown): FollowUpProject
     ...(decisionId ? { decisionId } : {}),
     ...(promptProfile ? { promptProfile } : {}),
     ...(answerId ? { answerId } : {}),
+    ...(revision !== null ? { revision } : {}),
+    ...(triggerType ? { triggerType } : {}),
+    ...(userRequest ? { userRequest } : {}),
+    ...(coachingPackage ? { coachingPackage } : {}),
     ...(evidenceRevision !== null ? { evidenceRevision } : {}),
     ...(validUntil !== null ? { validUntil } : {}),
     ...(softDeadlineAtMs !== null ? { softDeadlineAtMs } : {}),
@@ -1362,6 +1437,9 @@ function parseCoachDecision(value: unknown): CoachDecisionProjection | null {
     validUntil: numberField("valid_until_ms", "validUntilMs"),
     promptProfile: stringField("prompt_profile", "promptProfile"),
     answerId: stringField("answer_id", "answerId"),
+    revision: numberField("revision", "revision"),
+    triggerType: stringField("trigger_type", "triggerType"),
+    userRequest: stringField("user_request", "userRequest"),
     lifecycleAction,
     lifecycleRefresh: typeof item.lifecycle_refresh === "boolean"
       ? item.lifecycle_refresh
@@ -1465,11 +1543,28 @@ function parseIndicator(value: unknown, fallbackLabel: string): RuntimeIndicator
   };
 }
 
+function parseCaptureSummary(value: unknown): MeetingCaptureSummary | undefined {
+  const item = optionalRecord(value);
+  if (!item) return undefined;
+  const rawState = first(item, "state");
+  const state: MeetingCaptureSummary["state"] = rawState === "active" || rawState === "recoverable" || rawState === "inactive"
+    ? rawState
+    : "inactive";
+  return {
+    state,
+    activeTrackCount: optionalNumber(first(item, "active_track_count", "activeTrackCount")) ?? 0,
+    trackCount: optionalNumber(first(item, "track_count", "trackCount")) ?? 0,
+    lastHeartbeatAtMs: optionalNumber(first(item, "last_heartbeat_at_ms", "lastHeartbeatAtMs")),
+    leaseUntilMs: optionalNumber(first(item, "lease_until_ms", "leaseUntilMs")),
+  };
+}
+
 function parseRuntime(source: JsonRecord): MeetingRuntime {
   const runtime = optionalRecord(first(source, "runtime", "meeting_status", "meetingStatus", "status")) ?? {};
   const phase = first(runtime, "phase", "meeting_phase", "meetingPhase");
   return {
     phase: phase === "live" || phase === "ending" || phase === "ended" ? phase : "unknown",
+    capture: parseCaptureSummary(first(runtime, "capture", "capture_state", "captureState")),
     recording: parseIndicator(first(runtime, "recording", "recording_status", "recordingStatus"), "录音状态待读取"),
     input: parseIndicator(first(runtime, "input", "input_status", "inputStatus"), "输入状态待读取"),
     ai: parseIndicator(first(runtime, "ai", "ai_status", "aiStatus"), "AI 状态待读取"),
@@ -1727,6 +1822,7 @@ function parseHistoryItem(value: unknown, index: number): MeetingHistoryItem {
     suggestionCount: optionalNumber(first(item, "suggestion_count", "suggestionCount")) ?? 0,
     audioDurationMs: optionalNumber(first(item, "audio_duration_ms", "audioDurationMs")) ?? 0,
     hasMinutes: optionalBoolean(first(item, "has_minutes", "hasMinutes")) ?? false,
+    capture: parseCaptureSummary(first(item, "capture", "capture_state", "captureState")),
     reviewJobs: parseReviewJobs(first(item, "review_jobs", "reviewJobs"), requiredString(first(item, "id", "meeting_id", "meetingId"), `meetings[${index}].id`)),
     importJob: parseImportJob(first(item, "import_job", "importJob")),
     audioStatus: parseAudioStatus(first(item, "audio_status", "audioStatus")),

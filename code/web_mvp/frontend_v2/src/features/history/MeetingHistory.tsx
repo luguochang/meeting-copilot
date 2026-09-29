@@ -7,15 +7,17 @@ import {
   Database,
   FileText,
   LoaderCircle,
+  MoreHorizontal,
   Radio,
   RefreshCw,
   Search,
   Trash2,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { MeetingApi } from "../../api/client";
 import { meetingDisplayTitle } from "../../app/meetingTitle";
+import { useModalDialog } from "../../components/useModalDialog";
 import type {
   DataDeletionScope,
   DataRetentionPolicy,
@@ -27,9 +29,49 @@ import type {
 interface MeetingHistoryProps {
   api: MeetingApi;
   onOpenMeeting(meetingId: string): void;
+  activeMeetingId?: string | null;
 }
 
 type HistoryFilter = "all" | "live" | "processing" | "ready" | "failed";
+
+interface MeetingHistoryViewState {
+  query: string;
+  filter: HistoryFilter;
+  sortOrder: "newest" | "oldest";
+  scrollY: number;
+}
+
+const HISTORY_VIEW_STATE_KEY = "talktrace.meeting-history.view.v1";
+const defaultHistoryViewState: MeetingHistoryViewState = {
+  query: "",
+  filter: "all",
+  sortOrder: "newest",
+  scrollY: 0,
+};
+
+function readHistoryViewState(): MeetingHistoryViewState {
+  try {
+    const parsed = JSON.parse(window.sessionStorage.getItem(HISTORY_VIEW_STATE_KEY) ?? "null") as Partial<MeetingHistoryViewState> | null;
+    return {
+      query: typeof parsed?.query === "string" ? parsed.query : "",
+      filter: ["all", "live", "processing", "ready", "failed"].includes(parsed?.filter ?? "")
+        ? parsed!.filter as HistoryFilter
+        : "all",
+      sortOrder: parsed?.sortOrder === "oldest" ? "oldest" : "newest",
+      scrollY: typeof parsed?.scrollY === "number" && Number.isFinite(parsed.scrollY) ? Math.max(0, parsed.scrollY) : 0,
+    };
+  } catch {
+    return defaultHistoryViewState;
+  }
+}
+
+function writeHistoryViewState(value: MeetingHistoryViewState): void {
+  try {
+    window.sessionStorage.setItem(HISTORY_VIEW_STATE_KEY, JSON.stringify(value));
+  } catch {
+    // A disabled session store must not block local meeting access.
+  }
+}
 
 const importStageLabels: Record<ImportJobStage, string> = {
   reading: "读取文件",
@@ -98,7 +140,10 @@ function failedReviewNames(meeting: MeetingHistoryItem): string[] {
   );
 }
 
-function meetingStatus(meeting: MeetingHistoryItem): { text: string; filter: Exclude<HistoryFilter, "all"> } {
+function meetingStatus(
+  meeting: MeetingHistoryItem,
+  activeMeetingId: string | null,
+): { text: string; filter: Exclude<HistoryFilter, "all"> } {
   const importJob = meeting.importJob;
   if (importJob?.status === "failed" || importJob?.status === "cancelled") {
     return { text: `导入失败 · ${importStageLabels[importJob.stage]}`, filter: "failed" };
@@ -107,7 +152,12 @@ function meetingStatus(meeting: MeetingHistoryItem): { text: string; filter: Exc
     const progress = importJob.progress !== null ? ` · ${Math.round(importJob.progress)}%` : "";
     return { text: `${importStageLabels[importJob.stage]}${progress}`, filter: "processing" };
   }
-  if (meeting.phase === "live") return { text: "会议进行中", filter: "live" };
+  if (meeting.phase === "live") {
+    if (meeting.meetingId === activeMeetingId) return { text: "会议进行中", filter: "live" };
+    if (meeting.capture?.state === "active") return { text: "另一窗口录音中", filter: "live" };
+    if (meeting.capture?.state === "inactive") return { text: "会议未结束 · 可开始", filter: "live" };
+    return { text: "会议未结束 · 可恢复", filter: "live" };
+  }
   const failed = failedReviewNames(meeting);
   if (failed.length) return { text: `文字和录音已保留 · ${failed.join("、")}失败`, filter: "failed" };
   const reviewWorking = Object.values(meeting.reviewJobs ?? {}).some((job) =>
@@ -118,15 +168,16 @@ function meetingStatus(meeting: MeetingHistoryItem): { text: string; filter: Exc
   return { text: "文字和录音已保存", filter: "ready" };
 }
 
-export function MeetingHistory({ api, onOpenMeeting }: MeetingHistoryProps) {
+export function MeetingHistory({ api, onOpenMeeting, activeMeetingId = null }: MeetingHistoryProps) {
+  const [initialViewState] = useState(readHistoryViewState);
   const [meetings, setMeetings] = useState<MeetingHistoryItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [retryingImportId, setRetryingImportId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [query, setQuery] = useState("");
-  const [filter, setFilter] = useState<HistoryFilter>("all");
-  const [sortOrder, setSortOrder] = useState<"newest" | "oldest">("newest");
+  const [query, setQuery] = useState(initialViewState.query);
+  const [filter, setFilter] = useState<HistoryFilter>(initialViewState.filter);
+  const [sortOrder, setSortOrder] = useState<"newest" | "oldest">(initialViewState.sortOrder);
   const [hasMore, setHasMore] = useState(false);
   const [nextCursor, setNextCursor] = useState<MeetingHistoryCursor | null>(null);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -139,6 +190,74 @@ export function MeetingHistory({ api, onOpenMeeting }: MeetingHistoryProps) {
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [settingsSaved, setSettingsSaved] = useState(false);
   const [retentionPolicy, setRetentionPolicy] = useState<DataRetentionPolicy>("local_until_user_deletes");
+  const [savedRetentionPolicy, setSavedRetentionPolicy] = useState<DataRetentionPolicy>("local_until_user_deletes");
+  const [discardSettingsOpen, setDiscardSettingsOpen] = useState(false);
+  const [openRowMenuId, setOpenRowMenuId] = useState<string | null>(null);
+  const rowMenuRefs = useRef(new Map<string, HTMLDivElement>());
+  const rowMenuTriggerRefs = useRef(new Map<string, HTMLButtonElement>());
+  const historyViewStateRef = useRef(initialViewState);
+  const restoredScrollRef = useRef(false);
+
+  useEffect(() => {
+    historyViewStateRef.current = { ...historyViewStateRef.current, query, filter, sortOrder };
+  }, [filter, query, sortOrder]);
+
+  useEffect(() => () => {
+    writeHistoryViewState({ ...historyViewStateRef.current, scrollY: window.scrollY });
+  }, []);
+
+  useLayoutEffect(() => {
+    if (loading || restoredScrollRef.current) return;
+    restoredScrollRef.current = true;
+    if (initialViewState.scrollY <= 0) return;
+    window.requestAnimationFrame(() => window.scrollTo({ top: initialViewState.scrollY, behavior: "auto" }));
+  }, [initialViewState.scrollY, loading]);
+
+  const openMeetingFromHistory = (meetingId: string) => {
+    writeHistoryViewState({ query, filter, sortOrder, scrollY: window.scrollY });
+    onOpenMeeting(meetingId);
+  };
+
+  const closeDeleteDialog = useCallback(() => {
+    if (!deletingId) setDeleteTarget(null);
+  }, [deletingId]);
+  const settingsDirty = retentionPolicy !== savedRetentionPolicy;
+  const closeSettingsDialog = useCallback(() => {
+    if (settingsSaving) return;
+    if (settingsDirty) {
+      setDiscardSettingsOpen(true);
+      return;
+    }
+    setSettingsOpen(false);
+  }, [settingsDirty, settingsSaving]);
+  const deleteDialogRef = useModalDialog(Boolean(deleteTarget), closeDeleteDialog, Boolean(deletingId));
+  const settingsDialogRef = useModalDialog(settingsOpen, closeSettingsDialog, settingsSaving);
+
+  const closeRowMenu = useCallback((restoreFocus: boolean) => {
+    const meetingId = openRowMenuId;
+    setOpenRowMenuId(null);
+    if (restoreFocus && meetingId) {
+      window.requestAnimationFrame(() => rowMenuTriggerRefs.current.get(meetingId)?.focus());
+    }
+  }, [openRowMenuId]);
+
+  useEffect(() => {
+    if (!openRowMenuId) return undefined;
+    const onPointerDown = (event: PointerEvent) => {
+      if (!rowMenuRefs.current.get(openRowMenuId)?.contains(event.target as Node)) closeRowMenu(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      closeRowMenu(true);
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [closeRowMenu, openRowMenuId]);
 
   const load = useCallback(async (
     signal?: AbortSignal,
@@ -162,7 +281,7 @@ export function MeetingHistory({ api, onOpenMeeting }: MeetingHistoryProps) {
         const history = await api.listMeetings(signal);
         const normalizedQuery = query.trim().toLocaleLowerCase();
         const filtered = history.meetings.filter((meeting) => {
-          const status = meetingStatus(meeting);
+          const status = meetingStatus(meeting, activeMeetingId);
           if (filter !== "all" && status.filter !== filter) return false;
           return !normalizedQuery || meetingDisplayTitle(
             meeting.title,
@@ -183,7 +302,7 @@ export function MeetingHistory({ api, onOpenMeeting }: MeetingHistoryProps) {
         if (mode === "append") setLoadingMore(false);
       }
     }
-  }, [api, filter, query]);
+  }, [activeMeetingId, api, filter, query]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -192,11 +311,13 @@ export function MeetingHistory({ api, onOpenMeeting }: MeetingHistoryProps) {
   }, [load]);
 
   useEffect(() => {
-    const hasActiveWork = meetings.some((meeting) => meetingStatus(meeting).filter === "processing");
+    const hasActiveWork = meetings.some((meeting) =>
+      meetingStatus(meeting, activeMeetingId).filter === "processing" || meeting.capture?.state === "active",
+    );
     if (!hasActiveWork) return;
     const timer = window.setInterval(() => void load(undefined, "quiet"), 3_000);
     return () => window.clearInterval(timer);
-  }, [load, meetings]);
+  }, [activeMeetingId, load, meetings]);
 
   const openDeleteDialog = (meeting: MeetingHistoryItem) => {
     if (deletingId) return;
@@ -233,6 +354,7 @@ export function MeetingHistory({ api, onOpenMeeting }: MeetingHistoryProps) {
       if (!api.getDataGovernanceSettings) throw new Error("当前运行版本不支持本地数据设置");
       const settings = await api.getDataGovernanceSettings();
       setRetentionPolicy(settings.retentionPolicy);
+      setSavedRetentionPolicy(settings.retentionPolicy);
     } catch (settingsLoadError) {
       setSettingsError(settingsLoadError instanceof Error ? settingsLoadError.message : "保留策略加载失败");
     } finally {
@@ -241,6 +363,7 @@ export function MeetingHistory({ api, onOpenMeeting }: MeetingHistoryProps) {
   };
 
   const openDataGovernanceSettings = () => {
+    setDiscardSettingsOpen(false);
     setSettingsOpen(true);
     void loadDataGovernanceSettings();
   };
@@ -254,6 +377,7 @@ export function MeetingHistory({ api, onOpenMeeting }: MeetingHistoryProps) {
       if (!api.updateDataGovernanceSettings) throw new Error("当前运行版本不支持本地数据设置");
       const settings = await api.updateDataGovernanceSettings(retentionPolicy);
       setRetentionPolicy(settings.retentionPolicy);
+      setSavedRetentionPolicy(settings.retentionPolicy);
       setSettingsSaved(true);
     } catch (settingsSaveError) {
       setSettingsError(settingsSaveError instanceof Error ? settingsSaveError.message : "保留策略保存失败");
@@ -278,7 +402,7 @@ export function MeetingHistory({ api, onOpenMeeting }: MeetingHistoryProps) {
 
   const historyStats = meetings.reduce(
     (summary, meeting) => {
-      summary[meetingStatus(meeting).filter] += 1;
+      summary[meetingStatus(meeting, activeMeetingId).filter] += 1;
       summary.segments += meeting.segmentCount;
       return summary;
     },
@@ -379,7 +503,7 @@ export function MeetingHistory({ api, onOpenMeeting }: MeetingHistoryProps) {
       <div className="history-list">
         {displayedMeetings.map((meeting) => {
           const title = meetingDisplayTitle(meeting.title, meeting.startedAtMs ?? meeting.createdAtMs, meeting.meetingId);
-          const status = meetingStatus(meeting);
+          const status = meetingStatus(meeting, activeMeetingId);
           return (
             <div className="history-row" key={meeting.meetingId}>
               <span className={`history-state history-state--${status.filter}`} aria-hidden="true" />
@@ -387,7 +511,7 @@ export function MeetingHistory({ api, onOpenMeeting }: MeetingHistoryProps) {
                 type="button"
                 className="history-row-open"
                 data-meeting-id={meeting.meetingId}
-                onClick={() => onOpenMeeting(meeting.meetingId)}
+                onClick={() => openMeetingFromHistory(meeting.meetingId)}
                 aria-label={`打开会议：${title}`}
               >
                 <span className="history-row-main">
@@ -403,28 +527,62 @@ export function MeetingHistory({ api, onOpenMeeting }: MeetingHistoryProps) {
                 <span className={`history-row-meta history-row-meta--${status.filter}`}>{status.text}</span>
                 <ChevronRight size={17} aria-hidden="true" />
               </button>
-              <button
-                className="icon-button icon-button--small history-delete"
-                type="button"
-                onClick={() => openDeleteDialog(meeting)}
-                disabled={Boolean(deletingId)}
-                title="管理或删除本地数据"
-                aria-label={`管理本地数据：${title}`}
+              <div
+                className="history-row-menu"
+                ref={(node) => {
+                  if (node) rowMenuRefs.current.set(meeting.meetingId, node);
+                  else rowMenuRefs.current.delete(meeting.meetingId);
+                }}
               >
-                {deletingId === meeting.meetingId ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />}
-              </button>
-              {meeting.importJob?.retryable && ["failed", "cancelled"].includes(meeting.importJob.status) ? (
                 <button
-                  className="icon-button icon-button--small history-retry"
+                  ref={(node) => {
+                    if (node) rowMenuTriggerRefs.current.set(meeting.meetingId, node);
+                    else rowMenuTriggerRefs.current.delete(meeting.meetingId);
+                  }}
+                  className="icon-button icon-button--small"
                   type="button"
-                  onClick={() => void retryImport(meeting)}
-                  disabled={Boolean(retryingImportId)}
-                  title="重试录音导入"
-                  aria-label={`重试录音导入：${title}`}
+                  onClick={() => setOpenRowMenuId((current) => current === meeting.meetingId ? null : meeting.meetingId)}
+                  disabled={Boolean(deletingId)}
+                  aria-label={`会议操作：${title}`}
+                  aria-haspopup="menu"
+                  aria-expanded={openRowMenuId === meeting.meetingId}
+                  title="会议操作"
                 >
-                  {retryingImportId === meeting.meetingId ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}
+                  {deletingId === meeting.meetingId ? <LoaderCircle className="spin" size={15} /> : <MoreHorizontal size={17} />}
                 </button>
-              ) : null}
+                {openRowMenuId === meeting.meetingId ? (
+                  <div className="history-row-menu__popover" role="menu" aria-label={`会议操作：${title}`}>
+                    {meeting.importJob?.retryable && ["failed", "cancelled"].includes(meeting.importJob.status) ? (
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => {
+                          setOpenRowMenuId(null);
+                          void retryImport(meeting);
+                        }}
+                        disabled={Boolean(retryingImportId)}
+                        aria-label={`重试录音导入：${title}`}
+                      >
+                        {retryingImportId === meeting.meetingId ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}
+                        重试录音导入
+                      </button>
+                    ) : null}
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        setOpenRowMenuId(null);
+                        rowMenuTriggerRefs.current.get(meeting.meetingId)?.focus();
+                        openDeleteDialog(meeting);
+                      }}
+                      aria-label={`管理本地数据：${title}`}
+                    >
+                      <Trash2 size={15} />
+                      管理本地数据
+                    </button>
+                  </div>
+                ) : null}
+              </div>
             </div>
           );
         })}
@@ -447,21 +605,24 @@ export function MeetingHistory({ api, onOpenMeeting }: MeetingHistoryProps) {
             className="drawer-scrim"
             type="button"
             aria-label="关闭删除本地数据"
-            onClick={() => setDeleteTarget(null)}
+            onClick={closeDeleteDialog}
             disabled={Boolean(deletingId)}
           />
           <section
+            ref={deleteDialogRef}
             className="data-governance-dialog"
             role="dialog"
             aria-modal="true"
             aria-labelledby="delete-local-data-title"
+            aria-busy={Boolean(deletingId)}
+            tabIndex={-1}
           >
             <header className="drawer-header">
               <h2 id="delete-local-data-title">删除会议数据</h2>
               <button
                 className="icon-button"
                 type="button"
-                onClick={() => setDeleteTarget(null)}
+                onClick={closeDeleteDialog}
                 disabled={Boolean(deletingId)}
                 aria-label="关闭删除本地数据"
                 title="关闭"
@@ -508,8 +669,9 @@ export function MeetingHistory({ api, onOpenMeeting }: MeetingHistoryProps) {
               <button
                 className="secondary-button"
                 type="button"
-                onClick={() => setDeleteTarget(null)}
+                onClick={closeDeleteDialog}
                 disabled={Boolean(deletingId)}
+                data-dialog-initial-focus
               >
                 取消
               </button>
@@ -533,21 +695,24 @@ export function MeetingHistory({ api, onOpenMeeting }: MeetingHistoryProps) {
             className="drawer-scrim"
             type="button"
             aria-label="关闭本地数据设置"
-            onClick={() => setSettingsOpen(false)}
+            onClick={closeSettingsDialog}
             disabled={settingsSaving}
           />
           <section
+            ref={settingsDialogRef}
             className="data-governance-dialog"
             role="dialog"
             aria-modal="true"
             aria-labelledby="data-retention-title"
+            aria-busy={settingsLoading || settingsSaving}
+            tabIndex={-1}
           >
             <header className="drawer-header">
               <h2 id="data-retention-title">数据保留策略</h2>
               <button
                 className="icon-button"
                 type="button"
-                onClick={() => setSettingsOpen(false)}
+                onClick={closeSettingsDialog}
                 disabled={settingsSaving}
                 aria-label="关闭本地数据设置"
                 title="关闭"
@@ -581,6 +746,7 @@ export function MeetingHistory({ api, onOpenMeeting }: MeetingHistoryProps) {
                           onChange={() => {
                             setRetentionPolicy(option.policy);
                             setSettingsSaved(false);
+                            setDiscardSettingsOpen(false);
                           }}
                         />
                         <span>
@@ -611,12 +777,40 @@ export function MeetingHistory({ api, onOpenMeeting }: MeetingHistoryProps) {
                 </div>
               ) : null}
               {settingsSaved ? <p className="inline-success" role="status">保留策略已保存</p> : null}
+              {discardSettingsOpen ? (
+                <div className="settings-discard-confirm" role="alert">
+                  <div>
+                    <strong>放弃未保存的修改？</strong>
+                    <span>关闭后，本次保留策略修改不会生效。</span>
+                  </div>
+                  <div className="settings-discard-confirm__actions">
+                    <button
+                      className="secondary-button"
+                      type="button"
+                      onClick={() => setDiscardSettingsOpen(false)}
+                    >
+                      继续编辑
+                    </button>
+                    <button
+                      className="danger-button"
+                      type="button"
+                      onClick={() => {
+                        setRetentionPolicy(savedRetentionPolicy);
+                        setDiscardSettingsOpen(false);
+                        setSettingsOpen(false);
+                      }}
+                    >
+                      放弃修改
+                    </button>
+                  </div>
+                </div>
+              ) : null}
             </div>
             <footer className="data-governance-actions">
               <button
                 className="secondary-button"
                 type="button"
-                onClick={() => setSettingsOpen(false)}
+                onClick={closeSettingsDialog}
                 disabled={settingsSaving}
               >
                 关闭

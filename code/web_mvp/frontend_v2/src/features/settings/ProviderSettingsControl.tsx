@@ -1,19 +1,14 @@
-import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   AlertTriangle,
-  BookOpenText,
   Check,
   CheckCircle2,
-  ExternalLink,
-  Github,
-  HeartHandshake,
   KeyRound,
   LoaderCircle,
   Settings,
   Trash2,
   X,
 } from "lucide-react";
-import { type FormEvent, type MouseEvent, useCallback, useEffect, useState } from "react";
+import { type FormEvent, useCallback, useEffect, useState } from "react";
 import { fetchProviderStatus } from "../../api/client";
 import {
   parseProviderProbeResult,
@@ -23,6 +18,7 @@ import {
   type ProviderStatus,
 } from "../../api/schema";
 import { resolveTauriInvoke } from "../../desktop/tauri";
+import { useModalDialog } from "../../components/useModalDialog";
 
 type ProviderApiStyle = "chat_completions" | "responses";
 
@@ -72,9 +68,6 @@ type ProviderConnectionState = "testing" | "connected" | "slow" | "unknown" | "f
 const DEFAULT_BASE_URL = "https://codexai.club";
 const BASE_URL_PLACEHOLDER = "https://api.example.com/v1";
 const DEFAULT_MODEL = "gpt-5.5";
-const SPONSOR_URL = "https://codexai.club/";
-const REPOSITORY_URL = "https://github.com/luguochang/meeting-copilot";
-const BLOG_URL = "https://blog.csdn.net/luguochang";
 
 const emptyResponse: ProviderConfigResponse = {
   command_status: "ok",
@@ -277,7 +270,18 @@ export function ProviderSettingsControl() {
   const [error, setError] = useState<string | null>(null);
   const [costStats, setCostStats] = useState<CostStatsResponse | null>(null);
   const [confirmingClear, setConfirmingClear] = useState(false);
+  const [confirmingClose, setConfirmingClose] = useState(false);
   const [dirty, setDirty] = useState(false);
+
+  const requestClose = useCallback(() => {
+    if (busy) return;
+    if (dirty) {
+      setConfirmingClose(true);
+      return;
+    }
+    setOpen(false);
+  }, [busy, dirty]);
+  const dialogRef = useModalDialog(open, requestClose, Boolean(busy));
 
   const refresh = useCallback(async () => {
     const invoke = resolveTauriInvoke();
@@ -380,6 +384,7 @@ export function ProviderSettingsControl() {
       setApiKey("");
       setMessage("AI 配置已保存，请点击“测试连接”验证 Provider");
       setConfirmingClear(false);
+      setConfirmingClose(false);
       setDirty(false);
       await loadUsage();
     } catch (saveError) {
@@ -485,6 +490,7 @@ export function ProviderSettingsControl() {
       setApiKey("");
       setMessage("AI 配置已移除");
       setConfirmingClear(false);
+      setConfirmingClose(false);
       setDirty(false);
     } catch (clearError) {
       setError(clearError instanceof Error ? clearError.message : "AI 配置移除失败");
@@ -571,6 +577,7 @@ export function ProviderSettingsControl() {
 
   const markConfigChanged = () => {
     setDirty(true);
+    setConfirmingClose(false);
     setMessage(null);
     setError(null);
     setProviderStatus((current) => current.probe_status === "succeeded"
@@ -585,14 +592,12 @@ export function ProviderSettingsControl() {
       : current);
   };
 
-  const openExternalLink = async (event: MouseEvent<HTMLAnchorElement>, url: string) => {
-    if (!resolveTauriInvoke()) return;
-    event.preventDefault();
-    try {
-      await openUrl(url);
-    } catch {
-      setError(`无法打开链接，请在浏览器访问 ${url}`);
-    }
+  const discardChangesAndClose = () => {
+    setOpen(false);
+    setDirty(false);
+    setConfirmingClose(false);
+    setConfirmingClear(false);
+    void refresh();
   };
 
   return (
@@ -602,6 +607,7 @@ export function ProviderSettingsControl() {
         type="button"
         onClick={() => {
           setConfirmingClear(false);
+          setConfirmingClose(false);
           setOpen(true);
         }}
         aria-label="打开 AI 设置"
@@ -613,11 +619,11 @@ export function ProviderSettingsControl() {
 
       {open ? (
         <div className="drawer-layer" role="presentation">
-          <button className="drawer-scrim" aria-label="关闭 AI 设置" onClick={() => setOpen(false)} />
-          <section className="provider-settings-dialog" role="dialog" aria-modal="true" aria-labelledby="provider-settings-title">
+          <button className="drawer-scrim" aria-label="关闭 AI 设置" onClick={requestClose} disabled={Boolean(busy)} />
+          <section ref={dialogRef} tabIndex={-1} className="provider-settings-dialog" role="dialog" aria-modal="true" aria-labelledby="provider-settings-title">
             <header className="drawer-header">
               <h2 id="provider-settings-title">AI 设置</h2>
-              <button className="icon-button" type="button" onClick={() => setOpen(false)} aria-label="关闭 AI 设置" title="关闭">
+              <button className="icon-button" type="button" onClick={requestClose} disabled={Boolean(busy)} aria-label="关闭 AI 设置" title="关闭">
                 <X size={18} />
               </button>
             </header>
@@ -638,7 +644,7 @@ export function ProviderSettingsControl() {
                   <span>
                     {config.configured
                       ? `${config.model ?? model}${dirty ? " · 配置有修改" : ""}`
-                      : "未配置，不影响本地转写"}
+                      : dirty ? "配置有修改，尚未保存" : "未配置，不影响本地转写"}
                   </span>
                   {realtimeReadinessLabel ? (
                     <span className={providerStatus.realtime_ready === true ? "provider-realtime-ready" : "provider-realtime-warning"} role="status">
@@ -646,37 +652,6 @@ export function ProviderSettingsControl() {
                     </span>
                   ) : null}
                 </div>
-                {config.configured ? (
-                  <button
-                    className={`provider-test-button provider-test-button--${connectionState}`}
-                    type="button"
-                    onClick={() => void probe()}
-                    disabled={Boolean(busy) || dirty}
-                    aria-label="在状态区测试连接"
-                  >
-                    {connectionState === "connected" ? <Check size={15} /> : null}
-                    {busy === "probe" ? "测试中" : dirty ? "先保存修改" : "测试连接"}
-                  </button>
-                ) : null}
-              </section>
-
-              <section className="provider-sponsor-card" aria-label="AI 赞助商 codexai.club">
-                <span className="provider-sponsor-icon" aria-hidden="true">
-                  <HeartHandshake size={18} />
-                </span>
-                <div>
-                  <span>AI 赞助商</span>
-                  <strong>codexai.club</strong>
-                </div>
-                <a
-                  href={SPONSOR_URL}
-                  target="_blank"
-                  rel="noreferrer"
-                  onClick={(event) => void openExternalLink(event, SPONSOR_URL)}
-                  aria-label="访问 AI 赞助商 codexai.club"
-                >
-                  访问服务 <ExternalLink size={13} />
-                </a>
               </section>
 
               {phase === "unavailable" ? (
@@ -818,32 +793,17 @@ export function ProviderSettingsControl() {
 
                 </form>
               )}
-
-              <nav className="provider-project-links" aria-label="项目链接">
-                <span>项目链接</span>
-                <div>
-                  <a
-                    href={REPOSITORY_URL}
-                    target="_blank"
-                    rel="noreferrer"
-                    onClick={(event) => void openExternalLink(event, REPOSITORY_URL)}
-                  >
-                    <Github size={14} /> GitHub 仓库 <ExternalLink size={12} />
-                  </a>
-                  <a
-                    href={BLOG_URL}
-                    target="_blank"
-                    rel="noreferrer"
-                    onClick={(event) => void openExternalLink(event, BLOG_URL)}
-                  >
-                    <BookOpenText size={14} /> CSDN 博客 <ExternalLink size={12} />
-                  </a>
-                </div>
-              </nav>
             </div>
 
             {phase !== "unavailable" ? (
               <footer className="provider-settings-actions">
+                {confirmingClose ? (
+                  <div className="provider-close-confirm" role="alert">
+                    <span>当前配置尚未保存，确定关闭吗？</span>
+                    <button type="button" onClick={() => setConfirmingClose(false)}>继续编辑</button>
+                    <button className="is-danger" type="button" onClick={discardChangesAndClose}>放弃修改</button>
+                  </div>
+                ) : null}
                 {confirmingClear ? (
                   <div className="provider-clear-confirm" role="alert">
                     <span>确定移除已保存的 AI 配置？</span>
@@ -866,9 +826,10 @@ export function ProviderSettingsControl() {
                       type="button"
                       onClick={() => void probe()}
                       disabled={Boolean(busy) || dirty || !config.configured}
+                      title={dirty ? "请先保存修改，再测试连接" : undefined}
                     >
                       {busy === "probe" ? <LoaderCircle className="spin" size={15} /> : null}
-                      {busy === "probe" ? "测试中" : dirty ? "先保存修改" : "测试连接"}
+                      {busy === "probe" ? "测试中" : "测试连接"}
                     </button>
                     <button className="primary-button" type="submit" form="provider-config-panel" disabled={Boolean(busy)}>
                       {busy === "save" ? <LoaderCircle className="spin" size={15} /> : null}

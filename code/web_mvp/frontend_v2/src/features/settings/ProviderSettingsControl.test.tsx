@@ -196,7 +196,7 @@ describe("ProviderSettingsControl", () => {
     expect(trigger).not.toHaveTextContent("AI 已连接");
   });
 
-  it("keeps remote AI optional and shows the sponsor and project links", async () => {
+  it("keeps remote AI optional and limits the dialog to configuration work", async () => {
     const user = userEvent.setup();
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
       const path = String(input);
@@ -216,23 +216,46 @@ describe("ProviderSettingsControl", () => {
       "placeholder",
       "https://api.example.com/v1",
     );
+    expect(within(dialog).getByText("未配置，不影响本地转写")).toBeVisible();
     await user.clear(baseUrlInput);
     expect(baseUrlInput).toHaveValue("");
-    expect(within(dialog).getByText("未配置，不影响本地转写")).toBeVisible();
-    expect(within(dialog).getByRole("link", { name: "访问 AI 赞助商 codexai.club" })).toHaveAttribute(
-      "href",
-      "https://codexai.club/",
-    );
-    expect(within(dialog).getByRole("link", { name: /GitHub 仓库/ })).toHaveAttribute(
-      "href",
-      "https://github.com/luguochang/meeting-copilot",
-    );
-    expect(within(dialog).getByRole("link", { name: /CSDN 博客/ })).toHaveAttribute(
-      "href",
-      "https://blog.csdn.net/luguochang",
-    );
+    expect(within(dialog).getByText("配置有修改，尚未保存")).toBeVisible();
+    expect(within(dialog).queryByRole("link")).not.toBeInTheDocument();
+    expect(within(dialog).getAllByRole("button", { name: "测试连接" })).toHaveLength(1);
+    expect(within(dialog).queryByText("AI 赞助商")).not.toBeInTheDocument();
+    expect(within(dialog).queryByText("项目链接")).not.toBeInTheDocument();
     expect(dialog).not.toHaveTextContent("Provider 健康与使用边界");
     expect(dialog).not.toHaveTextContent("本地 ASR");
+  });
+
+  it("confirms unsaved changes before closing and restores focus after discard", async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path === "/providers/config") return Promise.resolve(jsonResponse(unconfigured));
+      if (path === "/providers/status") return Promise.resolve(jsonResponse(emptyProviderStatus));
+      if (path === "/settings/cost-stats") return Promise.resolve(jsonResponse({ breakdown: [] }));
+      return Promise.reject(new Error(`unexpected request: ${path}`));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<ProviderSettingsControl />);
+
+    const trigger = await screen.findByRole("button", { name: "打开 AI 设置" });
+    await user.click(trigger);
+    const dialog = screen.getByRole("dialog", { name: "AI 设置" });
+    await user.type(within(dialog).getByLabelText("API Key"), "unsaved-key");
+    await user.keyboard("{Escape}");
+
+    expect(within(dialog).getByText("当前配置尚未保存，确定关闭吗？")).toBeVisible();
+    expect(dialog).toBeVisible();
+    await user.click(within(dialog).getByRole("button", { name: "继续编辑" }));
+    expect(within(dialog).queryByText("当前配置尚未保存，确定关闭吗？")).not.toBeInTheDocument();
+
+    await user.click(within(dialog).getByRole("button", { name: "关闭 AI 设置" }));
+    await user.click(within(dialog).getByRole("button", { name: "放弃修改" }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "AI 设置" })).not.toBeInTheDocument());
+    await waitFor(() => expect(trigger).toHaveFocus());
   });
 
   it("saves a Web configuration without probing, then tests it explicitly", async () => {

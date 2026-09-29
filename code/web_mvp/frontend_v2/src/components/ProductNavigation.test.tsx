@@ -12,9 +12,39 @@ describe("ProductNavigation", () => {
     render(<ProductNavigation active="live" onOpenMeetings={onOpenMeetings} />);
 
     expect(screen.getByRole("button", { name: "会议记录" })).toBeVisible();
-    expect(screen.getByText("当前会议，当前页面")).toBeInTheDocument();
+    expect(screen.getByText("会议详情，当前页面")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "会议记录" }));
     expect(onOpenMeetings).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the active meeting reachable from another product page", async () => {
+    const user = userEvent.setup();
+    const onOpenActiveMeeting = vi.fn();
+
+    render(
+      <ProductNavigation
+        active="notes"
+        activeMeeting={{ meetingId: "meeting-live", state: "capturing", elapsedMs: 402_000 }}
+        onOpenActiveMeeting={onOpenActiveMeeting}
+      />,
+    );
+
+    const activeMeeting = screen.getByRole("button", { name: "正在会议 · 06:42" });
+    expect(activeMeeting).toBeVisible();
+    await user.click(activeMeeting);
+    expect(onOpenActiveMeeting).toHaveBeenCalledOnce();
+  });
+
+  it("labels a fresh capture owned by another window without a local timer", () => {
+    render(
+      <ProductNavigation
+        active="notes"
+        activeMeeting={{ meetingId: "meeting-external", state: "external", elapsedMs: null }}
+        onOpenActiveMeeting={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "另一窗口录音" })).toBeVisible();
   });
 
   it("does not expose planned modules as fake navigation", () => {

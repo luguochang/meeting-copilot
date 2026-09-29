@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { fetchProviderStatus } from "../../api/client";
+import { motionAwareScrollBehavior } from "../../app/motion";
 import {
   parseProviderStatus,
   reconcileProviderStatus,
@@ -23,6 +24,7 @@ import { resolveTauriInvoke } from "../../desktop/tauri";
 import { dualTrackStatus, isDualTrackCapabilityAvailable } from "../../desktop/dualTrackAdapter";
 import type { NativeCaptureHealthFields } from "../../desktop/nativeCaptureHealth";
 import type { MeetingInputSource, MeetingPreparationInput } from "../../domain/events";
+import { useModalDialog } from "../../components/useModalDialog";
 
 interface MeetingPreflightDialogProps {
   open: boolean;
@@ -493,6 +495,11 @@ export function MeetingPreflightDialog({
     inputCheckRuntimeRef.current.controller?.abort();
     inputCheckRuntimeRef.current.controller = null;
   }, []);
+  const closeDialog = useCallback(() => {
+    cancelInputCheck();
+    onCancel();
+  }, [cancelInputCheck, onCancel]);
+  const dialogRef = useModalDialog(open, closeDialog, busy);
 
   const refreshPreflight = useCallback(async (isCancelled: () => boolean = () => false) => {
     const invoke = resolveTauriInvoke();
@@ -855,7 +862,7 @@ export function MeetingPreflightDialog({
   };
 
   const submit = async () => {
-    if (!noticeAcknowledged || storage?.allowed !== true || busy) return;
+    if (!noticeAcknowledged || storage?.allowed !== true || !localAsrReady || !sourceReady || busy) return;
     cancelInputCheck();
     setInputCheck("idle");
     setBrowserInputCheckStage("idle");
@@ -910,14 +917,46 @@ export function MeetingPreflightDialog({
           : providerStatus?.configured
             ? `${providerStatus.model ?? "AI"} 已保存，AI 待连接`
             : "AI 未配置，会议仍可录音和转写";
+  const microphoneReady = inputSource !== "microphone" || inputCheck === "receiving_audio";
+  const sourceReady = microphoneReady
+    && (inputSource !== "system_audio" || systemAudioCheck === "available")
+    && (inputSource !== "dual_track" || dualTrackAvailable);
+  const startBlockers = [
+    ...(loading ? [{ id: "preflight-runtime-status", label: "等待本地服务检查" }] : []),
+    ...(storage?.allowed !== true && !loading ? [{ id: "preflight-runtime-status", label: "确认本地存储可写" }] : []),
+    ...(!localAsrReady && !loading ? [{ id: "preflight-runtime-status", label: "恢复本地实时识别" }] : []),
+    ...(!microphoneReady ? [{
+      id: "preflight-microphone",
+      label: inputCheck === "permission_denied"
+        ? "允许麦克风权限并重新检查"
+        : inputCheck === "silent"
+          ? "让麦克风检测到声音"
+          : inputCheck === "checking"
+            ? "等待麦克风检查完成"
+            : "检查麦克风",
+    }] : []),
+    ...(inputSource === "system_audio" && systemAudioCheck !== "available"
+      ? [{ id: "preflight-audio-source", label: "完成系统音频检查" }]
+      : []),
+    ...(inputSource === "dual_track" && !dualTrackAvailable
+      ? [{ id: "preflight-audio-source", label: "确认双轨采集可用" }]
+      : []),
+    ...(!noticeAcknowledged ? [{ id: "preflight-consent", label: "确认已告知参会者" }] : []),
+  ];
+
+  const focusBlocker = (id: string) => {
+    const target = document.getElementById(id);
+    target?.scrollIntoView({ block: "center", behavior: motionAwareScrollBehavior() });
+    target?.focus({ preventScroll: true });
+  };
 
   return (
     <div className="drawer-layer meeting-preflight-layer" role="presentation">
-      <button className="drawer-scrim" aria-label="关闭会前检查" onClick={() => { cancelInputCheck(); onCancel(); }} disabled={busy} />
-      <section className="meeting-preflight-dialog" role="dialog" aria-modal="true" aria-labelledby="meeting-preflight-title">
+      <button className="drawer-scrim" aria-label="关闭会前检查" onClick={closeDialog} disabled={busy} />
+      <section ref={dialogRef} tabIndex={-1} className="meeting-preflight-dialog" role="dialog" aria-modal="true" aria-labelledby="meeting-preflight-title">
         <header className="drawer-header">
           <h2 id="meeting-preflight-title">准备开始会议</h2>
-          <button className="icon-button" type="button" onClick={() => { cancelInputCheck(); onCancel(); }} disabled={busy} aria-label="关闭会前检查" title="关闭">
+          <button className="icon-button" type="button" onClick={closeDialog} disabled={busy} aria-label="关闭会前检查" title="关闭">
             <X size={18} />
           </button>
         </header>
@@ -926,7 +965,7 @@ export function MeetingPreflightDialog({
           {loading ? (
             <p className="preflight-loading" role="status"><LoaderCircle className="spin" size={17} />正在检查本地服务</p>
           ) : (
-            <div className="preflight-status-list" aria-label="运行条件">
+            <div id="preflight-runtime-status" tabIndex={-1} className="preflight-status-list" aria-label="运行条件">
               <div className={storage?.allowed ? "preflight-status preflight-status--ready" : "preflight-status preflight-status--error"}>
                 <HardDrive size={17} />
                 <span>
@@ -963,7 +1002,7 @@ export function MeetingPreflightDialog({
           ) : null}
 
           {nativeDesktop ? (
-            <div className="preflight-source-field">
+            <div id="preflight-audio-source" tabIndex={-1} className="preflight-source-field">
               <span className="preflight-source-label">会议声音来源</span>
               <div
                 className={`preflight-source-segmented${dualTrackAvailable ? " has-dual-track" : ""}`}
@@ -1012,7 +1051,7 @@ export function MeetingPreflightDialog({
           ) : null}
 
           {inputSource === "microphone" ? (
-            <div className="preflight-field-group">
+            <div id="preflight-microphone" tabIndex={-1} className="preflight-field-group">
               <div className="preflight-field-heading">
                 <div><Mic size={17} /><strong>麦克风</strong></div>
                 <button className="secondary-button" type="button" onClick={() => void checkInput()} disabled={busy || inputCheck === "checking"}>
@@ -1098,102 +1137,6 @@ export function MeetingPreflightDialog({
             </div>
           )}
 
-          <label className="preflight-title-field">
-            <span>会议名称 <small>可选</small></span>
-            <input
-              value={title}
-              onChange={(event) => setTitle(event.target.value)}
-              placeholder="例如：支付服务上线评审"
-              maxLength={200}
-              disabled={busy}
-            />
-          </label>
-
-          <div className="preflight-ai-context">
-            <label>
-              <span>教练技能包</span>
-              <select
-                value={presetId}
-                onChange={(event) => {
-                  const next = event.target.value as MeetingPresetId;
-                  const defaults = PRESET_DEFAULTS[next];
-                  setPresetId(next);
-                  setMeetingGoal(defaults.goal);
-                  setFocusPointsText(defaults.focusPoints);
-                  setOutputFormat(defaults.outputFormat);
-                }}
-                disabled={busy}
-              >
-                <option value="general">通用对话教练</option>
-                <option value="decision">决策准备度教练</option>
-                <option value="project">项目执行教练</option>
-                <option value="interview">用户访谈教练</option>
-                <option value="brainstorm">头脑风暴教练</option>
-              </select>
-              <small>{PRESET_DEFAULTS[presetId].coachSummary}</small>
-            </label>
-            <label>
-              <span>我的角色</span>
-              <input
-                value={participantRole}
-                onChange={(event) => setParticipantRole(event.target.value)}
-                placeholder="例如：主持人、产品负责人"
-                maxLength={200}
-                disabled={busy}
-              />
-            </label>
-            <label className="preflight-ai-context__wide">
-              <span>会议目标</span>
-              <input
-                value={meetingGoal}
-                onChange={(event) => setMeetingGoal(event.target.value)}
-                placeholder="本场会议需要达成什么结果"
-                maxLength={2_000}
-                disabled={busy}
-              />
-            </label>
-            <label className="preflight-ai-context__wide">
-              <span>重点关注</span>
-              <input
-                value={focusPointsText}
-                onChange={(event) => setFocusPointsText(event.target.value)}
-                placeholder="逗号分隔，例如：决策、风险、负责人"
-                maxLength={1_200}
-                disabled={busy}
-              />
-            </label>
-            <label>
-              <span>整理格式</span>
-              <select value={outputFormat} onChange={(event) => setOutputFormat(event.target.value as MeetingOutputFormat)} disabled={busy}>
-                <option value="standard">标准纪要</option>
-                <option value="decision_log">决策记录</option>
-                <option value="action_plan">行动计划</option>
-                <option value="brief">简报</option>
-              </select>
-            </label>
-            <label>
-              <span>主动建议</span>
-              <select value={suggestionPolicy} onChange={(event) => setSuggestionPolicy(event.target.value as SuggestionPolicy)} disabled={busy}>
-                <option value="low_frequency">低频高信号</option>
-                <option value="standard">标准频率</option>
-                <option value="off">关闭</option>
-              </select>
-            </label>
-          </div>
-
-          <label className="preflight-hotwords-field">
-            <span>本次会议技术词</span>
-            <textarea
-              value={hotwordsText}
-              onChange={(event) => setHotwordsText(event.target.value)}
-              placeholder="例如：checkout-service、P99、订单中台"
-              rows={3}
-              maxLength={2_500}
-              disabled={busy}
-            />
-            <small>逗号或换行分隔，仅用于本次会议的本地识别。</small>
-          </label>
-
           <div className="meeting-notice-row">
             <ShieldCheck size={18} />
             <p>{MEETING_NOTICE}</p>
@@ -1201,7 +1144,7 @@ export function MeetingPreflightDialog({
               <Copy size={15} />
             </button>
           </div>
-          <label className="preflight-consent">
+          <label id="preflight-consent" tabIndex={-1} className="preflight-consent">
             <input
               type="checkbox"
               checked={noticeAcknowledged}
@@ -1210,6 +1153,110 @@ export function MeetingPreflightDialog({
             />
             <span>我已告知参会者并确认可以录音</span>
           </label>
+
+          <details className="preflight-optional-settings">
+            <summary>
+              <span>会议与教练设置</span>
+              <small>可选</small>
+            </summary>
+            <div className="preflight-optional-settings__body">
+              <label className="preflight-title-field">
+                <span>会议名称</span>
+                <input
+                  value={title}
+                  onChange={(event) => setTitle(event.target.value)}
+                  placeholder="例如：支付服务上线评审"
+                  maxLength={200}
+                  disabled={busy}
+                />
+              </label>
+
+              <div className="preflight-ai-context">
+                <label>
+                  <span>教练技能包</span>
+                  <select
+                    value={presetId}
+                    onChange={(event) => {
+                      const next = event.target.value as MeetingPresetId;
+                      const defaults = PRESET_DEFAULTS[next];
+                      setPresetId(next);
+                      setMeetingGoal(defaults.goal);
+                      setFocusPointsText(defaults.focusPoints);
+                      setOutputFormat(defaults.outputFormat);
+                    }}
+                    disabled={busy}
+                  >
+                    <option value="general">通用对话教练</option>
+                    <option value="decision">决策准备度教练</option>
+                    <option value="project">项目执行教练</option>
+                    <option value="interview">用户访谈教练</option>
+                    <option value="brainstorm">头脑风暴教练</option>
+                  </select>
+                  <small>{PRESET_DEFAULTS[presetId].coachSummary}</small>
+                </label>
+                <label>
+                  <span>我的角色</span>
+                  <input
+                    value={participantRole}
+                    onChange={(event) => setParticipantRole(event.target.value)}
+                    placeholder="例如：主持人、产品负责人"
+                    maxLength={200}
+                    disabled={busy}
+                  />
+                </label>
+                <label className="preflight-ai-context__wide">
+                  <span>会议目标</span>
+                  <input
+                    value={meetingGoal}
+                    onChange={(event) => setMeetingGoal(event.target.value)}
+                    placeholder="本场会议需要达成什么结果"
+                    maxLength={2_000}
+                    disabled={busy}
+                  />
+                </label>
+                <label className="preflight-ai-context__wide">
+                  <span>重点关注</span>
+                  <input
+                    value={focusPointsText}
+                    onChange={(event) => setFocusPointsText(event.target.value)}
+                    placeholder="逗号分隔，例如：决策、风险、负责人"
+                    maxLength={1_200}
+                    disabled={busy}
+                  />
+                </label>
+                <label>
+                  <span>整理格式</span>
+                  <select value={outputFormat} onChange={(event) => setOutputFormat(event.target.value as MeetingOutputFormat)} disabled={busy}>
+                    <option value="standard">标准纪要</option>
+                    <option value="decision_log">决策记录</option>
+                    <option value="action_plan">行动计划</option>
+                    <option value="brief">简报</option>
+                  </select>
+                </label>
+                <label>
+                  <span>主动建议</span>
+                  <select value={suggestionPolicy} onChange={(event) => setSuggestionPolicy(event.target.value as SuggestionPolicy)} disabled={busy}>
+                    <option value="low_frequency">低频高信号</option>
+                    <option value="standard">标准频率</option>
+                    <option value="off">关闭</option>
+                  </select>
+                </label>
+              </div>
+
+              <label className="preflight-hotwords-field">
+                <span>本次会议技术词</span>
+                <textarea
+                  value={hotwordsText}
+                  onChange={(event) => setHotwordsText(event.target.value)}
+                  placeholder="例如：checkout-service、P99、订单中台"
+                  rows={3}
+                  maxLength={2_500}
+                  disabled={busy}
+                />
+                <small>逗号或换行分隔，仅用于本次会议的本地识别。</small>
+              </label>
+            </div>
+          </details>
 
           {error ? <p className="inline-error" role="alert">{error}</p> : null}
           {inputSource === "microphone"
@@ -1224,26 +1271,37 @@ export function MeetingPreflightDialog({
         </div>
 
         <footer className="meeting-preflight-actions">
-          <button className="secondary-button" type="button" onClick={() => { cancelInputCheck(); onCancel(); }} disabled={busy}>取消</button>
-          <button
-            className="primary-button"
-            type="button"
-            onClick={() => void submit()}
-            disabled={busy
-              || loading
-              || !noticeAcknowledged
-              || storage?.allowed !== true
-              || !localAsrReady
-              || (inputSource === "system_audio" && systemAudioCheck !== "available")
-              || (inputSource === "dual_track" && !dualTrackAvailable)}
-          >
-            {busy
-              ? <LoaderCircle className="spin" size={16} />
-              : inputSource === "dual_track"
-                ? <AudioLines size={16} />
-                : inputSource === "system_audio" ? <MonitorSpeaker size={16} /> : <Mic size={16} />}
-            {busy ? "正在启动" : "开始会议"}
-          </button>
+          {startBlockers.length ? (
+            <div className="preflight-start-blockers" role="status" aria-label="开始会议前还需完成">
+              <strong>还需完成：</strong>
+              {startBlockers.map((blocker) => (
+                <button
+                  key={`${blocker.id}:${blocker.label}`}
+                  type="button"
+                  aria-label={`定位缺项：${blocker.label}`}
+                  onClick={() => focusBlocker(blocker.id)}
+                >
+                  {blocker.label}
+                </button>
+              ))}
+            </div>
+          ) : <p className="preflight-ready-to-start"><CheckCircle2 size={15} />已满足开始条件</p>}
+          <div className="meeting-preflight-action-row">
+            <button className="secondary-button" type="button" onClick={closeDialog} disabled={busy}>取消</button>
+            <button
+              className="primary-button"
+              type="button"
+              onClick={() => void submit()}
+              disabled={busy || startBlockers.length > 0}
+            >
+              {busy
+                ? <LoaderCircle className="spin" size={16} />
+                : inputSource === "dual_track"
+                  ? <AudioLines size={16} />
+                  : inputSource === "system_audio" ? <MonitorSpeaker size={16} /> : <Mic size={16} />}
+              {busy ? "正在启动" : "开始会议"}
+            </button>
+          </div>
         </footer>
       </section>
     </div>

@@ -1,11 +1,17 @@
 import { Agent } from "@earendil-works/pi-agent-core";
 import {
   Type,
+  createAssistantMessageEventStream,
   createModels,
   createProvider,
 } from "@earendil-works/pi-ai";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
+import {
+  convertResponsesMessages,
+  convertResponsesTools,
+} from "@earendil-works/pi-ai/api/openai-responses-shared";
+import OpenAI from "openai";
 
 export const PROTOCOL = "talktrace-pi-coach-jsonl.v1";
 
@@ -66,8 +72,14 @@ const MAX_TOOL_CALLS_PER_EVALUATION = 4;
 const MAX_SESSIONS = 8;
 const MAX_RETRIEVAL_PARAGRAPHS = 48;
 const DECISION_LATENCY_BUDGET_MS = 10_000;
+const MAX_DECISION_TIMEOUT_MS = 10_000;
 const TERMINAL_TOOL_NAMES = new Set(["submit_intervention", "keep_silent"]);
 const MAX_RETRY_AFTER_MS = 300_000;
+const OPENAI_RESPONSES_TOOL_CALL_PROVIDERS = new Set([
+  "openai",
+  "openai-codex",
+  "opencode",
+]);
 
 const COACHING_CHECKLIST = [
   {
@@ -191,14 +203,11 @@ const SPARK_CANDIDATE_FAST_SYSTEM_PROMPT = [
 
 const DEEP_ANSWER_SYSTEM_PROMPT = [
   "You are Talktrace's second-pass answer coach, running after a Fast Answer is already visible to the user.",
-  "Your job is not to rewrite or summarize current_answer. Add only the highest-value missing boundary, risk, evidence-backed nuance, or likely follow-up preparation. Honor user_request when present; answer_ready is an automatic second pass over the visible answer.",
-  "Submit one structured deep-coaching card with boundary, risk, and follow_up. Keep each point to one concise phrase; do not repeat current_answer in any field.",
-  "A point may contain a bounded professional inference, but uncertain project details must be phrased as a check or possible risk rather than a claim that they happened.",
-  "The host binds the card to the exact bounded transcript evidence used by current_answer. Never invent a person, project result, number, deadline, product name, completion state, or user experience.",
-  "Every date, number, threshold, owner, product name, and completion state in boundary, risk, follow_up, title, or why_now must appear verbatim in bound_evidence or current_answer. Otherwise use a fact-free check such as '需要确认适用边界' without adding specifics.",
-  "Use only an allowed_event_type. Match the dialogue language; Chinese context requires Chinese title, recommendation, and reason.",
-  "If the supplied evidence and current_answer are sufficient, call submit_intervention in the first response. Search or read history only when a missing earlier fact is necessary. Use keep_silent only when no incremental value remains.",
-  "Finish with exactly one terminal tool and never return ordinary assistant text.",
+  "Do not rewrite or summarize current_answer. Add only material information that helps answer the same question better.",
+  "Use facts only from current_answer and bound_evidence. Phrase uncertain details as checks; never invent a person, number, deadline, product, or completion state.",
+  "submit_intervention needs a headline, one concrete speakable addition, and exactly two key_points: first the missing judgement, then the next action.",
+  "The speakable addition is the primary result and should normally be 60 to 180 Chinese characters. Do not repeat current_answer in any field.",
+  "Match the dialogue language. If no material addition is possible, call keep_silent. Call exactly one terminal tool in the first response; never return ordinary text.",
 ].join(" ");
 
 function systemPromptFor(model, promptProfile, compactTerminal) {
@@ -306,21 +315,16 @@ const compactInterventionParameters = Type.Object(
 );
 
 // Deep coaching is a second-pass product surface, not a realtime interruption.
-// Give it one unambiguous contract instead of asking the provider to choose
-// between legacy aliases (recommendation/say_this and reason/why_now). The
-// host composes the three bounded points into the existing audited card shape.
+// Keep Provider generation compact; the host expands this into the stable
+// coaching-package and legacy card contracts after validation.
 const deepInterventionParameters = Type.Object(
   {
-    title: Type.String({ minLength: 1, maxLength: 80 }),
-    boundary: Type.String({ minLength: 1, maxLength: 160 }),
-    risk: Type.String({ minLength: 1, maxLength: 160 }),
-    follow_up: Type.String({ minLength: 1, maxLength: 160 }),
-    why_now: Type.String({ minLength: 1, maxLength: 300 }),
-    urgency: Type.Union([
-      Type.Literal("low"),
-      Type.Literal("medium"),
-      Type.Literal("high"),
-    ]),
+    headline: Type.String({ minLength: 1, maxLength: 60 }),
+    say_this_addition: Type.String({ minLength: 8, maxLength: 360 }),
+    key_points: Type.Array(
+      Type.String({ minLength: 1, maxLength: 140 }),
+      { minItems: 2, maxItems: 2 },
+    ),
     confidence: Type.Number({ minimum: 0, maximum: 1 }),
   },
   { additionalProperties: false },
@@ -423,18 +427,11 @@ function normalizeInterventionCardFields(
   };
 }
 
-function boundedDeepPoint(value, field) {
-  const normalized = requiredText(value, field, 500)
-    .replace(
-      /^(?:(?:补充)?(?:架构|回答|适用)?边界|(?:关键|主要|核心)?风险|(?:面试官)?(?:最)?可能追问|追问)\s*[：:]\s*/u,
-      "",
-    )
-    .split(/(?<=[。！？!?；;])\s*/u)[0]
-    .trim();
-  if (!normalized) {
-    throw new PiCoachProtocolError(`${field} must contain a useful point`, "invalid_agent_action");
+function boundedDeepList(value, field, maximumItems = 3) {
+  if (!Array.isArray(value) || value.length > maximumItems) {
+    throw new PiCoachProtocolError(`${field} must be a bounded array`, "invalid_agent_action");
   }
-  return normalized.slice(0, 120).replace(/[，,：:]$/u, "");
+  return value.map((item, index) => requiredText(item, `${field}[${index}]`, 160));
 }
 
 function deepAnswerParagraphs(context) {
@@ -486,25 +483,55 @@ function deepAnswerEvidence(context) {
   return {
     evidence_segment_ids: bounded.map(({ paragraph }) => paragraph.id),
     evidence_quote: bounded.map(({ text }) => text).join("\n"),
+    evidence_refs: bounded.map(({ paragraph, text }) => ({
+      segment_id: paragraph.id,
+      quote: text,
+    })),
   };
 }
 
 function deepInterventionToCard(params, context) {
-  const boundary = boundedDeepPoint(params?.boundary, "intervention.boundary");
-  const risk = boundedDeepPoint(params?.risk, "intervention.risk");
-  const followUp = boundedDeepPoint(params?.follow_up, "intervention.follow_up");
-  const recommendation = `边界：${boundary}\n风险：${risk}\n追问：${followUp}`;
   const evidence = deepAnswerEvidence(context);
+  const currentAnswer = context?.rolling_state?.current_answer ?? {};
+  const answerQuestion = requiredText(
+    currentAnswer.question,
+    "context.rolling_state.current_answer.question",
+    180,
+  );
+  const keyPoints = boundedDeepList(params?.key_points, "intervention.key_points", 2);
+  if (keyPoints.length !== 2) {
+    throw new PiCoachProtocolError(
+      "intervention.key_points must contain a judgement and next action",
+      "invalid_agent_action",
+    );
+  }
+  const coreJudgement = keyPoints[0];
+  const coachingPackage = {
+    headline: requiredText(params?.headline, "intervention.headline", 60),
+    question_intent: `需要回答：${answerQuestion}`.slice(0, 180),
+    core_judgement: coreJudgement,
+    why_it_matters: coreJudgement,
+    say_this_addition: requiredText(params?.say_this_addition, "intervention.say_this_addition", 360),
+    missing_points: [keyPoints[0]],
+    constraints: [],
+    risks: [],
+    next_actions: [keyPoints[1]],
+    likely_follow_ups: [],
+    evidence_refs: evidence.evidence_refs,
+    confidence: params?.confidence,
+  };
   return {
     event_type: "question_to_user",
-    title: params?.title,
-    recommendation,
-    say_this: recommendation,
-    reason: params?.why_now,
-    why_now: params?.why_now,
-    ...evidence,
-    urgency: params?.urgency,
+    title: coachingPackage.headline,
+    recommendation: coachingPackage.say_this_addition,
+    say_this: coachingPackage.say_this_addition,
+    reason: coachingPackage.why_it_matters,
+    why_now: coachingPackage.why_it_matters,
+    evidence_segment_ids: evidence.evidence_segment_ids,
+    evidence_quote: evidence.evidence_quote,
+    urgency: "medium",
     confidence: params?.confidence,
+    coaching_package: coachingPackage,
   };
 }
 
@@ -801,7 +828,159 @@ export function requiresTerminalToolChoice(context) {
 }
 
 export function outputTokenLimitForContext(context) {
+  const deepTerminal = (Array.isArray(context?.tools) ? context.tools : []).some((tool) => (
+    tool?.name === "submit_intervention"
+    && tool?.parameters?.properties?.key_points
+    && tool?.parameters?.properties?.say_this_addition
+  ));
+  if (deepTerminal) return 280;
   return requiresTerminalToolChoice(context) ? 256 : 512;
+}
+
+function emptyProviderUsage() {
+  return {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    reasoning: 0,
+    totalTokens: 0,
+    cost: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      total: 0,
+    },
+  };
+}
+
+function providerUsageFromResponse(response) {
+  const usage = response?.usage;
+  if (!usage || typeof usage !== "object") return emptyProviderUsage();
+  const cachedTokens = Number(usage.input_tokens_details?.cached_tokens || 0);
+  const cacheWriteTokens = Number(usage.input_tokens_details?.cache_write_tokens || 0);
+  const inputTokens = Number(usage.input_tokens || 0);
+  const outputTokens = Number(usage.output_tokens || 0);
+  return {
+    input: Math.max(0, inputTokens - cachedTokens - cacheWriteTokens),
+    output: Math.max(0, outputTokens),
+    cacheRead: Math.max(0, cachedTokens),
+    cacheWrite: Math.max(0, cacheWriteTokens),
+    reasoning: Math.max(0, Number(usage.output_tokens_details?.reasoning_tokens || 0)),
+    totalTokens: Math.max(0, Number(usage.total_tokens || inputTokens + outputTokens)),
+    cost: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      total: 0,
+    },
+  };
+}
+
+function parseCompletedToolArguments(value) {
+  if (value && typeof value === "object" && !Array.isArray(value)) return value;
+  if (typeof value !== "string" || !value.trim()) return {};
+  const parsed = JSON.parse(value);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("Provider returned non-object tool arguments");
+  }
+  return parsed;
+}
+
+function piMessageFromCompletedResponse(response, model) {
+  const content = [];
+  for (const item of Array.isArray(response?.output) ? response.output : []) {
+    if (item?.type === "function_call") {
+      const callId = String(item.call_id || item.id || "").trim();
+      const itemId = String(item.id || item.call_id || "").trim();
+      const name = String(item.name || "").trim();
+      if (!callId || !itemId || !name) {
+        throw new Error("Provider returned an incomplete function call");
+      }
+      content.push({
+        type: "toolCall",
+        id: `${callId}|${itemId}`,
+        name,
+        arguments: parseCompletedToolArguments(item.arguments),
+        ...(item.namespace !== undefined ? { namespace: item.namespace } : {}),
+      });
+      continue;
+    }
+    if (item?.type !== "message") continue;
+    for (const part of Array.isArray(item.content) ? item.content : []) {
+      if (part?.type !== "output_text" || typeof part.text !== "string") continue;
+      content.push({
+        type: "text",
+        text: part.text,
+        ...(item.id ? { textSignature: JSON.stringify({ v: 1, id: item.id }) } : {}),
+      });
+    }
+  }
+  const incompleteReason = typeof response?.incomplete_details?.reason === "string"
+    ? response.incomplete_details.reason
+    : "";
+  let stopReason = content.some((block) => block.type === "toolCall") ? "toolUse" : "stop";
+  if (response?.status === "incomplete") {
+    stopReason = incompleteReason === "max_output_tokens" ? "length" : "error";
+  } else if (response?.status && response.status !== "completed") {
+    stopReason = "error";
+  }
+  return {
+    role: "assistant",
+    content,
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    responseModel: typeof response?.model === "string" ? response.model : undefined,
+    responseId: typeof response?.id === "string" ? response.id : undefined,
+    usage: providerUsageFromResponse(response),
+    stopReason,
+    ...(incompleteReason ? { rawStopReason: `incomplete.${incompleteReason}` } : {}),
+    ...(stopReason === "error" ? { errorMessage: "Provider returned an incomplete response" } : {}),
+    timestamp: Date.now(),
+  };
+}
+
+function emitCompletedMessage(stream, message) {
+  const partial = {
+    ...message,
+    content: [],
+    stopReason: "pending",
+  };
+  stream.push({ type: "start", partial: { ...partial } });
+  for (const block of message.content) {
+    const contentIndex = partial.content.length;
+    if (block.type === "toolCall") {
+      partial.content.push({
+        type: "toolCall",
+        id: block.id,
+        name: block.name,
+        arguments: {},
+        ...(block.namespace !== undefined ? { namespace: block.namespace } : {}),
+      });
+      stream.push({ type: "toolcall_start", contentIndex, partial: { ...partial } });
+      const delta = JSON.stringify(block.arguments);
+      stream.push({ type: "toolcall_delta", contentIndex, delta, partial: { ...partial } });
+      partial.content[contentIndex] = block;
+      stream.push({ type: "toolcall_end", contentIndex, toolCall: block, partial: { ...partial } });
+      continue;
+    }
+    if (block.type === "text") {
+      partial.content.push({ type: "text", text: "" });
+      stream.push({ type: "text_start", contentIndex, partial: { ...partial } });
+      stream.push({ type: "text_delta", contentIndex, delta: block.text, partial: { ...partial } });
+      partial.content[contentIndex] = block;
+      stream.push({ type: "text_end", contentIndex, content: block.text, partial: { ...partial } });
+    }
+  }
+  if (message.stopReason === "error" || message.stopReason === "aborted") {
+    stream.push({ type: "error", reason: message.stopReason, error: message });
+  } else {
+    stream.push({ type: "done", reason: message.stopReason, message });
+  }
+  stream.end(message);
 }
 
 export function createOpenAICompatibleBackend(providerInput) {
@@ -899,11 +1078,145 @@ export function createOpenAICompatibleBackend(providerInput) {
   if (!configuredModel) {
     throw new PiCoachProtocolError("Pi could not register the configured model", "invalid_provider");
   }
-  const timeoutMs = Math.max(1000, Math.min(Number(providerInput.timeout_ms) || 8000, DECISION_LATENCY_BUDGET_MS));
+  const timeoutMs = Math.max(1000, Math.min(Number(providerInput.timeout_ms) || 8000, MAX_DECISION_TIMEOUT_MS));
   const decisionTimeoutMs = Math.max(
     1000,
-    Math.min(Number(providerInput.decision_timeout_ms) || timeoutMs, DECISION_LATENCY_BUDGET_MS),
+    Math.min(Number(providerInput.decision_timeout_ms) || timeoutMs, MAX_DECISION_TIMEOUT_MS),
   );
+  const beginProviderRequest = (options) => {
+    lastProviderStatusCode = null;
+    lastProviderRetryAfterMs = null;
+    lastProviderConnectMs = null;
+    const providerRequestStartedAt = performance.now();
+    const upstreamFetch = typeof options?.fetch === "function"
+      ? options.fetch
+      : globalThis.fetch;
+    const trackedFetch = typeof upstreamFetch === "function"
+      ? async (...args) => {
+        const response = await upstreamFetch(...args);
+        // Record only transport metadata. Provider bodies and credentials are
+        // deliberately excluded from metrics and errors.
+        recordProviderStatus(response);
+        lastProviderConnectMs = Math.max(
+          0,
+          performance.now() - providerRequestStartedAt,
+        );
+        return response;
+      }
+      : undefined;
+    return { providerRequestStartedAt, trackedFetch };
+  };
+  const streamFn = (activeModel, context, options) => {
+    const { providerRequestStartedAt, trackedFetch } = beginProviderRequest(options);
+    const upstreamOnResponse = options?.onResponse;
+    return models.streamSimple(activeModel, context, {
+      ...options,
+      ...(trackedFetch ? { fetch: trackedFetch } : {}),
+      onResponse: async (response, responseModel) => {
+        recordProviderStatus(response);
+        if (lastProviderConnectMs === null) {
+          lastProviderConnectMs = Math.max(
+            0,
+            performance.now() - providerRequestStartedAt,
+          );
+        }
+        if (typeof upstreamOnResponse === "function") {
+          await upstreamOnResponse(response, responseModel);
+        }
+      },
+      temperature: 0.1,
+      // Terminal-only candidate requests have a bounded output; a smaller cap
+      // reduces provider generation tail without weakening host validation.
+      maxTokens: outputTokenLimitForContext(context),
+      toolChoice: requiresTerminalToolChoice(context) ? "required" : options?.toolChoice,
+      timeoutMs,
+      maxRetries: 0,
+      cacheRetention: "short",
+    });
+  };
+  // pi-ai 0.84.2 exposes completeSimple(), but that method still sends
+  // stream:true and only consumes the stream internally. Some OpenAI-
+  // compatible gateways complete Responses tool calls quickly in non-streaming
+  // mode while leaving their SSE tool-call stream unfinished. Keep this
+  // adapter narrow: the Pi Agent loop and terminal tools remain in control,
+  // and only the non-blocking deep-answer lane selects it.
+  const deepStreamFn = apiStyle === "responses"
+    ? (activeModel, context, options) => {
+      const stream = createAssistantMessageEventStream();
+      const { trackedFetch } = beginProviderRequest(options);
+      void (async () => {
+        try {
+          if (options?.signal?.aborted) throw new Error("Request was aborted");
+          const defaultHeaders = {
+            ...(activeModel.headers || {}),
+            ...(options?.headers || {}),
+          };
+          const client = new OpenAI({
+            apiKey,
+            baseURL: activeModel.baseUrl,
+            dangerouslyAllowBrowser: true,
+            maxRetries: 0,
+            ...(trackedFetch ? { fetch: trackedFetch } : {}),
+            defaultHeaders,
+          });
+          const tools = Array.isArray(context.tools) ? context.tools : [];
+          const params = {
+            model: activeModel.id,
+            input: convertResponsesMessages(
+              activeModel,
+              context,
+              OPENAI_RESPONSES_TOOL_CALL_PROVIDERS,
+            ),
+            stream: false,
+            store: false,
+            max_output_tokens: outputTokenLimitForContext(context),
+            temperature: 0.1,
+            ...(tools.length > 0
+              ? {
+                tools: convertResponsesTools(tools, {
+                  strict: false,
+                  supportsStrictMode: false,
+                  supportsOpenAIGrammarTools: false,
+                }),
+              }
+              : {}),
+            ...(requiresTerminalToolChoice(context) ? { tool_choice: "required" } : {}),
+            ...(activeModel.reasoning && activeModel.thinkingLevelMap?.off !== null
+              ? { reasoning: { effort: activeModel.thinkingLevelMap?.off ?? "none" } }
+              : {}),
+          };
+          const request = client.responses.create(params, {
+            ...(options?.signal ? { signal: options.signal } : {}),
+            timeout: timeoutMs,
+            maxRetries: 0,
+          });
+          const { data: response, response: rawResponse } = await request.withResponse();
+          recordProviderStatus(rawResponse);
+          if (typeof options?.onResponse === "function") {
+            await options.onResponse(rawResponse, activeModel);
+          }
+          emitCompletedMessage(stream, piMessageFromCompletedResponse(response, activeModel));
+        } catch (error) {
+          const aborted = options?.signal?.aborted === true;
+          const message = {
+            role: "assistant",
+            content: [],
+            api: activeModel.api,
+            provider: activeModel.provider,
+            model: activeModel.id,
+            usage: emptyProviderUsage(),
+            stopReason: aborted ? "aborted" : "error",
+            errorMessage: aborted
+              ? "Request was aborted"
+              : `OpenAI Responses request failed${lastProviderStatusCode ? ` (HTTP ${lastProviderStatusCode})` : ""}`,
+            timestamp: Date.now(),
+          };
+          emitCompletedMessage(stream, message);
+        }
+      })();
+      return stream;
+    }
+    : null;
   return {
     identity: `${api}:${baseUrl}:${modelId}`,
     model: configuredModel,
@@ -918,59 +1231,8 @@ export function createOpenAICompatibleBackend(providerInput) {
     get lastProviderConnectMs() {
       return lastProviderConnectMs;
     },
-    streamFn: (activeModel, context, options) => {
-      lastProviderStatusCode = null;
-      lastProviderRetryAfterMs = null;
-      lastProviderConnectMs = null;
-      const providerRequestStartedAt = performance.now();
-      const upstreamOnResponse = options?.onResponse;
-      const upstreamFetch = typeof options?.fetch === "function"
-        ? options.fetch
-        : globalThis.fetch;
-      const trackedFetch = typeof upstreamFetch === "function"
-        ? async (...args) => {
-          const response = await upstreamFetch(...args);
-          // OpenAI's client throws on 5xx before Pi's onResponse hook. The
-          // fetch wrapper records only the safe numeric status so those
-          // failures remain classifiable without exposing headers or bodies.
-          recordProviderStatus(response);
-          lastProviderConnectMs = Math.max(
-            0,
-            performance.now() - providerRequestStartedAt,
-          );
-          return response;
-        }
-        : undefined;
-      return models.streamSimple(activeModel, context, {
-        ...options,
-        ...(trackedFetch ? { fetch: trackedFetch } : {}),
-        onResponse: async (response, responseModel) => {
-          recordProviderStatus(response);
-          if (lastProviderConnectMs === null) {
-            lastProviderConnectMs = Math.max(
-              0,
-              performance.now() - providerRequestStartedAt,
-            );
-          }
-          if (typeof upstreamOnResponse === "function") {
-            await upstreamOnResponse(response, responseModel);
-          }
-        },
-        temperature: 0.1,
-        // Terminal-only candidate requests have a bounded five-field output;
-        // a smaller cap reduces provider generation tail without changing the
-        // host-side evidence and terminal-action contract.
-        maxTokens: outputTokenLimitForContext(context),
-        // Candidate fast paths have no read/search tool. Requiring a terminal
-        // tool keeps an otherwise valid provider text response from becoming
-        // a reliability failure, while full/contradiction paths retain tool
-        // choice freedom for context and history lookup.
-        toolChoice: requiresTerminalToolChoice(context) ? "required" : options?.toolChoice,
-        timeoutMs,
-        maxRetries: 0,
-        cacheRetention: "short",
-      });
-    },
+    streamFn,
+    deepStreamFn,
   };
 }
 
@@ -1736,7 +1998,7 @@ function createRestrictedTools(
             ? compactInterventionFromCandidate(params, context)
             : params;
         const intervention = validateInterventionEvidence(candidateParams, context, {
-          maximumRecommendation: deepTerminal ? 480 : 120,
+          maximumRecommendation: deepTerminal ? 800 : 120,
         });
         setTerminalAction(entry, { action: "intervention", intervention });
         return {
@@ -1879,19 +2141,11 @@ function buildDeepAnswerPrompt(context) {
   const boundEvidence = deepAnswerParagraphs(context).map(compactPromptParagraph);
   return JSON.stringify({
     task: "deepen_current_answer",
-    output_language: outputLanguage(context),
-    host_checklist_reviewed: true,
+    language: outputLanguage(context),
     user_request: context.user_request,
     current_answer: signals.rolling_state.current_answer ?? null,
     bound_evidence: boundEvidence,
-    meeting_goal: context.meeting_goal,
-    open_items: signals.rolling_state.open_items ?? [],
-    skill: {
-      id: context.coach_skill.id,
-      objective: context.coach_skill.objective,
-      allowed_event_types: [...allowedEventTypes(context)].filter(Boolean).sort(),
-    },
-    instruction: "Do not repeat current_answer. Submit one incremental boundary, risk, missing point, or likely follow-up preparation. Every concrete date, number, threshold, owner, product name, or completion state must appear verbatim in bound_evidence or current_answer; otherwise use a fact-free check without specifics.",
+    instruction: "Add one evidence-grounded answer move. key_points[0] is the missing judgement; key_points[1] is the next action.",
   });
 }
 
@@ -1950,7 +2204,13 @@ function createSessionEntry(
   backend,
   clock,
   wallClock,
-  { promptProfile = "full", includeHistorySearch = true, compactTerminal = false } = {},
+  {
+    promptProfile = "full",
+    includeHistorySearch = true,
+    compactTerminal = false,
+    streamFn = backend.streamFn,
+    providerTransport = "sdk_streaming",
+  } = {},
 ) {
   const deepTerminal = promptProfile === "deep_answer";
   const entry = {
@@ -1959,6 +2219,7 @@ function createSessionEntry(
     promptProfile,
     historySearchEnabled: includeHistorySearch,
     compactTerminal,
+    providerTransport,
     activeContext: null,
     run: null,
     agent: null,
@@ -1977,7 +2238,7 @@ function createSessionEntry(
       tools,
       messages: [],
     },
-    streamFn: backend.streamFn,
+    streamFn,
     transformContext: async (messages) => pruneContext(messages),
     toolExecution: "sequential",
     sessionId,
@@ -2079,7 +2340,8 @@ function failureMetrics({
     available_tool_names: entry.agent.state.tools.map((tool) => tool.name),
     session_message_count_before: priorMessageCount,
     session_reused: sessionReused,
-    decision_latency_budget_ms: DECISION_LATENCY_BUDGET_MS,
+    provider_transport: entry.providerTransport,
+    decision_latency_budget_ms: decisionTimeoutMs,
     decision_timeout_ms: decisionTimeoutMs,
     usage: usageFromMessages(entry.agent.state.messages.slice(priorMessageCount)),
   };
@@ -2136,6 +2398,14 @@ export class PiCoachRuntime {
       : usesCandidateFastPath(request.context)
         ? "candidate_fast"
         : "full";
+    const usesDeepNonStreamingTransport = promptProfile === "deep_answer"
+      && typeof backend.deepStreamFn === "function";
+    const activeStreamFn = usesDeepNonStreamingTransport
+      ? backend.deepStreamFn
+      : backend.streamFn;
+    const providerTransport = usesDeepNonStreamingTransport
+      ? "responses_non_streaming"
+      : "sdk_streaming";
     // A host evidence channel being available does not mean every realtime
     // candidate needs the full retrieval tool schema. Candidate events already
     // carry bounded, validated evidence in the compact fast path; exposing
@@ -2146,7 +2416,6 @@ export class PiCoachRuntime {
     const hostEvidenceAvailable = typeof searchEvidence === "function"
       || typeof readEvidenceSpan === "function";
     const needsHistorySearch = promptProfile === "full"
-      || (promptProfile === "deep_answer" && request.context.trigger_type === "user_request")
       || (promptProfile === "candidate_fast"
         && candidateFastPathNeedsHistorySearch(request.context, hostEvidenceAvailable));
     // A history-search candidate may need model-selected prior evidence, so it
@@ -2163,6 +2432,7 @@ export class PiCoachRuntime {
       && entry.promptProfile === promptProfile
       && entry.compactTerminal === compactTerminal
       && entry.historySearchEnabled === needsHistorySearch
+      && entry.providerTransport === providerTransport
     );
     if (!sessionReused) {
       const canCarryHistory = Boolean(
@@ -2177,7 +2447,13 @@ export class PiCoachRuntime {
         backend,
         this.clock,
         this.wallClock,
-        { promptProfile, includeHistorySearch: needsHistorySearch, compactTerminal },
+        {
+          promptProfile,
+          includeHistorySearch: needsHistorySearch,
+          compactTerminal,
+          streamFn: activeStreamFn,
+          providerTransport,
+        },
       );
       entry.skillIdentity = skillIdentity;
       if (priorMessages.length > 0) entry.agent.state.messages = priorMessages;
@@ -2192,10 +2468,11 @@ export class PiCoachRuntime {
       this.sessions.delete(request.session_id);
       this.sessions.set(request.session_id, entry);
       entry.agent.state.model = backend.model;
-      entry.agent.streamFunction = backend.streamFn;
+      entry.agent.streamFunction = activeStreamFn;
     }
     entry.historySearchEnabled = needsHistorySearch;
     entry.compactTerminal = compactTerminal;
+    entry.providerTransport = providerTransport;
     entry.agent.state.systemPrompt = systemPromptFor(backend.model, promptProfile, compactTerminal);
     entry.agent.state.tools = createRestrictedTools(entry, {
       includeContextRead: promptProfile === "full",
@@ -2226,7 +2503,7 @@ export class PiCoachRuntime {
     const startedAt = this.clock();
     const decisionTimeoutMs = Math.max(
       1,
-      Math.min(Number(backend.decisionTimeoutMs) || DECISION_LATENCY_BUDGET_MS, DECISION_LATENCY_BUDGET_MS),
+      Math.min(Number(backend.decisionTimeoutMs) || DECISION_LATENCY_BUDGET_MS, MAX_DECISION_TIMEOUT_MS),
     );
     const promptText = buildPrompt(request.context, promptProfile, backend.model);
     let deadlineExceeded = false;
@@ -2297,8 +2574,8 @@ export class PiCoachRuntime {
           checklist_item_ids: checklist.map((item) => item.id),
           coach_skill_id: request.context.coach_skill.id,
           coach_skill_version: request.context.coach_skill.version,
-          decision_latency_budget_ms: DECISION_LATENCY_BUDGET_MS,
-          within_latency_budget: elapsedMs <= DECISION_LATENCY_BUDGET_MS,
+          decision_latency_budget_ms: decisionTimeoutMs,
+          within_latency_budget: elapsedMs <= decisionTimeoutMs,
           decision_timeout_ms: decisionTimeoutMs,
           prompt_profile: promptProfile,
           compact_terminal_tools: compactTerminal,
@@ -2313,6 +2590,7 @@ export class PiCoachRuntime {
           history_searches: entry.run.historySearches,
           history_results: entry.run.historyResults,
           session_reused: sessionReused,
+          provider_transport: entry.providerTransport,
           provider_connect_ms: backend.lastProviderConnectMs,
           usage: runUsage,
         },

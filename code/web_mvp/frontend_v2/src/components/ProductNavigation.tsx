@@ -20,6 +20,14 @@ interface ProductNavigationProps {
   onOpenMeetings?: () => void;
   onOpenNotes?: () => void;
   onOpenCapabilities?: () => void;
+  activeMeeting?: ActiveMeetingNavigation | null;
+  onOpenActiveMeeting?: () => void;
+}
+
+export interface ActiveMeetingNavigation {
+  meetingId: string;
+  state: "capturing" | "paused" | "reconnecting" | "external" | "recoverable";
+  elapsedMs: number | null;
 }
 
 interface NavigationItemProps {
@@ -79,11 +87,38 @@ function NavigationItem({ active, label, icon: Icon, onClick }: NavigationItemPr
   );
 }
 
+function formatElapsed(milliseconds: number | null): string | null {
+  if (milliseconds === null) return null;
+  const seconds = Math.max(0, Math.floor(milliseconds / 1_000));
+  const hours = Math.floor(seconds / 3_600);
+  const minutes = Math.floor((seconds % 3_600) / 60);
+  const remainder = seconds % 60;
+  return hours
+    ? `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`
+    : `${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`;
+}
+
+function activeMeetingLabel(activeMeeting: ActiveMeetingNavigation): string {
+  const elapsed = formatElapsed(activeMeeting.elapsedMs);
+  const prefix = activeMeeting.state === "paused"
+    ? "会议已暂停"
+    : activeMeeting.state === "reconnecting"
+      ? "会议重连中"
+      : activeMeeting.state === "external"
+        ? "另一窗口录音"
+      : activeMeeting.state === "recoverable"
+        ? "会议待恢复"
+        : "正在会议";
+  return elapsed ? `${prefix} · ${elapsed}` : prefix;
+}
+
 export function ProductNavigation({
   active,
   onOpenMeetings,
   onOpenNotes,
   onOpenCapabilities,
+  activeMeeting,
+  onOpenActiveMeeting,
 }: ProductNavigationProps) {
   const [theme, setTheme] = useState<NavigationTheme>(readNavigationTheme);
   const [collapsed, setCollapsed] = useState(readNavigationCollapsed);
@@ -127,6 +162,16 @@ export function ProductNavigation({
           icon={LayoutDashboard}
           onClick={active === "meetings" ? undefined : onOpenMeetings}
         />
+        {activeMeeting ? (
+          <NavigationItem
+            active={active === "live"}
+            label={activeMeetingLabel(activeMeeting)}
+            icon={Video}
+            onClick={active === "live" ? undefined : onOpenActiveMeeting}
+          />
+        ) : active === "live" ? (
+          <NavigationItem active label="会议详情" icon={Video} />
+        ) : null}
         <NavigationItem
           active={active === "notes"}
           label="笔记"
@@ -139,7 +184,6 @@ export function ProductNavigation({
           icon={PackageCheck}
           onClick={active === "capabilities" ? undefined : onOpenCapabilities}
         />
-        {active === "live" ? <NavigationItem active label="当前会议" icon={Video} /> : null}
       </nav>
 
       <div className="product-nav-controls" aria-label="侧栏显示设置">

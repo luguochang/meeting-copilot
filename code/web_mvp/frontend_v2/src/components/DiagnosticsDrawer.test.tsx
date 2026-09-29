@@ -1,9 +1,51 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { createInitialMeetingState } from "../domain/reducer";
 import { DiagnosticsDrawer } from "./DiagnosticsDrawer";
 
 describe("DiagnosticsDrawer", () => {
+  it("supports Escape, traps keyboard focus, and restores focus to its trigger", async () => {
+    const state = {
+      ...createInitialMeetingState("meeting-dialog-contract"),
+      connection: "live" as const,
+    };
+    function Harness() {
+      const [open, setOpen] = useState(false);
+      return (
+        <>
+          <button type="button" onClick={() => setOpen(true)}>打开运行诊断</button>
+          <DiagnosticsDrawer
+            open={open}
+            onClose={() => setOpen(false)}
+            onRefresh={vi.fn()}
+            onExport={vi.fn().mockResolvedValue(undefined)}
+            state={state}
+            transportKind="sse"
+          />
+        </>
+      );
+    }
+    const user = userEvent.setup();
+    render(<Harness />);
+
+    const trigger = screen.getByRole("button", { name: "打开运行诊断" });
+    await user.click(trigger);
+    const close = within(screen.getByRole("dialog", { name: "会议连接详情" }))
+      .getByRole("button", { name: "关闭运行诊断" });
+    await waitFor(() => expect(close).toHaveFocus());
+
+    const refresh = screen.getByRole("button", { name: "重新读取状态" });
+    refresh.focus();
+    await user.tab();
+    expect(close).toHaveFocus();
+
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog", { name: "会议连接详情" })).not.toBeInTheDocument();
+    await waitFor(() => expect(trigger).toHaveFocus());
+  });
+
   it("does not report normal operation when the Pi realtime lane timed out", () => {
     const state = {
       ...createInitialMeetingState("meeting-pi-timeout"),

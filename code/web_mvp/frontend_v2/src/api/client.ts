@@ -113,6 +113,12 @@ export interface MeetingApi {
     feedback: SuggestionFeedback,
     signal?: AbortSignal,
   ): Promise<void>;
+  requestRealtimeCoach?(
+    meetingId: string,
+    request: string,
+    answerId?: string | null,
+    signal?: AbortSignal,
+  ): Promise<void>;
   saveFactStatus(
     meetingId: string,
     factType: MeetingFactKind,
@@ -886,6 +892,26 @@ export class HttpMeetingApi implements MeetingApi {
       {
         method: "PUT",
         body: JSON.stringify({ feedback }),
+        signal,
+      },
+    );
+  }
+
+  async requestRealtimeCoach(
+    meetingId: string,
+    request: string,
+    answerId: string | null = null,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const idempotencyKey = typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    await this.request(
+      `/v2/meetings/${encodeURIComponent(meetingId)}/coach/request`,
+      {
+        method: "POST",
+        headers: { "Idempotency-Key": idempotencyKey },
+        body: JSON.stringify({ request, answer_id: answerId }),
         signal,
       },
     );

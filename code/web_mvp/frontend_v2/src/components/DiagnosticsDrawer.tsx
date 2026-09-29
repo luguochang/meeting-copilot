@@ -1,6 +1,7 @@
 import { Activity, CircleCheckBig, Download, LoaderCircle, RefreshCw, TriangleAlert, X } from "lucide-react";
 import { useState } from "react";
 import type { MeetingViewState } from "../domain/events";
+import { useModalDialog } from "./useModalDialog";
 
 interface DiagnosticsDrawerProps {
   open: boolean;
@@ -78,6 +79,7 @@ function coachRuntimeInfo(state: MeetingViewState): string | null {
 export function DiagnosticsDrawer({ open, onClose, onRefresh, onExport, state, transportKind }: DiagnosticsDrawerProps) {
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState("");
+  const dialogRef = useModalDialog(open, onClose);
   if (!open) return null;
   const coachIssue = coachRuntimeIssue(state);
   const coachInfo = coachRuntimeInfo(state);
@@ -111,8 +113,15 @@ export function DiagnosticsDrawer({ open, onClose, onRefresh, onExport, state, t
 
   return (
     <div className="drawer-layer" role="presentation">
-      <button className="drawer-scrim" aria-label="关闭运行诊断" onClick={onClose} />
-      <aside className="diagnostics-drawer" role="dialog" aria-modal="true" aria-labelledby="diagnostics-title">
+      <button className="drawer-scrim" type="button" aria-label="关闭运行诊断" onClick={onClose} />
+      <aside
+        ref={dialogRef}
+        className="diagnostics-drawer"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="diagnostics-title"
+        tabIndex={-1}
+      >
         <header className="drawer-header">
           <h2 id="diagnostics-title">会议连接详情</h2>
           <button className="icon-button" type="button" onClick={onClose} aria-label="关闭运行诊断" title="关闭">

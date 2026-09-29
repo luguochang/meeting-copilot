@@ -1,6 +1,7 @@
 import { Bookmark, Check, ChevronDown, ChevronUp, CircleAlert, CircleHelp, Copy, EyeOff, Flag, GitMerge, History, ListChecks, MessageCircleQuestion, MoreHorizontal, Pencil, Quote, Save, ShieldAlert, TimerOff, X } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
+import { useDismissablePopover } from "../../components/useDismissablePopover";
 import { isCoachInterventionProjection, isLocalReflexCoachProjection } from "../../domain/events";
 import type {
   ActionItemProjection,
@@ -11,6 +12,7 @@ import type {
   MeetingFactKind,
   MeetingFactStatus,
   OpenQuestionProjection,
+  PiCoachingPackage,
   RecentContextEntry,
   RiskProjection,
   RuntimeIndicator,
@@ -18,8 +20,10 @@ import type {
   SuggestionFeedback,
   TopicProjection,
 } from "../../domain/events";
+import { buildAnswerThreads } from "./answerThreads";
 
 interface NowRailProps {
+  viewStateKey?: string;
   currentTopic: TopicProjection | null;
   followUp: FollowUpProjection | null | undefined;
   semanticFollowUp?: FollowUpProjection | null;
@@ -50,6 +54,122 @@ interface NowRailProps {
     expectedSourceVersion: number,
   ): Promise<void>;
   onMessage(message: string): void;
+  onCoachRefine?(answerId: string, request: string): Promise<void>;
+}
+
+interface NowRailViewState {
+  selectedAnswerId: string | null;
+  selectedPiRevisionByAnswer: Record<string, string>;
+}
+
+function readNowRailViewState(viewStateKey: string | undefined): NowRailViewState {
+  if (!viewStateKey) return { selectedAnswerId: null, selectedPiRevisionByAnswer: {} };
+  try {
+    const raw = window.sessionStorage.getItem(`meeting-copilot-now-rail:${viewStateKey}`);
+    if (!raw) return { selectedAnswerId: null, selectedPiRevisionByAnswer: {} };
+    const parsed = JSON.parse(raw) as Partial<NowRailViewState>;
+    return {
+      selectedAnswerId: typeof parsed.selectedAnswerId === "string" ? parsed.selectedAnswerId : null,
+      selectedPiRevisionByAnswer: parsed.selectedPiRevisionByAnswer && typeof parsed.selectedPiRevisionByAnswer === "object"
+        ? parsed.selectedPiRevisionByAnswer
+        : {},
+    };
+  } catch {
+    return { selectedAnswerId: null, selectedPiRevisionByAnswer: {} };
+  }
+}
+
+const COACH_REFINEMENT_ACTIONS = [
+  { id: "specific", label: "更具体", request: "请基于当前 Answer 和会议证据给出更具体的补充，优先引用已出现的事实、条件和原话，减少抽象判断。" },
+  { id: "risk", label: "补风险", request: "请补充当前 Answer 遗漏的关键风险、适用边界和可执行验证方式。" },
+  { id: "angle", label: "换个角度", request: "请换一个更有增量价值的角度分析当前 Answer，优先考虑对方立场、执行条件和决策影响。" },
+  { id: "short", label: "一句话版", request: "请把对当前问题最直接的回应压缩成 20 到 40 个中文字，并保留关键结论。" },
+] as const;
+
+const COACH_MISS_REASONS = [
+  "偏离了问题",
+  "内容太空泛",
+  "没有结合当前会议",
+  "缺少明确结论",
+  "缺少案例或数据",
+  "事实不准确",
+] as const;
+
+function PiCoachingPackageView({
+  value,
+  onEvidence,
+}: {
+  value: PiCoachingPackage;
+  onEvidence(segmentId: string): void;
+}) {
+  const groups = [
+    { key: "missing", label: "遗漏重点", items: value.missingPoints },
+    { key: "constraints", label: "适用约束", items: value.constraints },
+    { key: "risks", label: "关键风险", items: value.risks },
+    { key: "actions", label: "下一步", items: value.nextActions },
+  ].filter((group) => group.items.length > 0);
+  return (
+    <div className="pi-coaching-package">
+      <header>
+        <strong>{value.headline}</strong>
+        <span>{Math.round(value.confidence * 100)}% 依据置信度</span>
+      </header>
+      <dl className="pi-coaching-summary">
+        <div>
+          <dt>问题意图</dt>
+          <dd>{value.questionIntent}</dd>
+        </div>
+        <div>
+          <dt>核心判断</dt>
+          <dd>{value.coreJudgement}</dd>
+        </div>
+        <div>
+          <dt>为什么重要</dt>
+          <dd>{value.whyItMatters}</dd>
+        </div>
+      </dl>
+      <div className="pi-say-this">
+        <span>可以接着说</span>
+        <blockquote>{value.sayThisAddition}</blockquote>
+      </div>
+      {groups.length ? (
+        <div className="pi-coaching-groups">
+          {groups.map((group) => (
+            <section key={group.key}>
+              <h3>{group.label}</h3>
+              <ul>{group.items.map((item) => <li key={item}>{item}</li>)}</ul>
+            </section>
+          ))}
+        </div>
+      ) : null}
+      {value.likelyFollowUps.length ? (
+        <details className="pi-likely-follow-ups" open>
+          <summary>可能追问与回答方向</summary>
+          <ol>
+            {value.likelyFollowUps.map((item) => (
+              <li key={`${item.question}:${item.answerAngle}`}>
+                <strong>{item.question}</strong>
+                <span>{item.answerAngle}</span>
+              </li>
+            ))}
+          </ol>
+        </details>
+      ) : null}
+      <div className="pi-evidence-links" aria-label="Pi 证据依据">
+        <span>证据依据</span>
+        {value.evidenceRefs.map((ref, index) => (
+          <button key={ref.segmentId} type="button" onClick={() => onEvidence(ref.segmentId)} title={ref.quote}>
+            <Quote size={12} />原话 {index + 1}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function piRevisionIdentity(item: FollowUpProjection, index = 0): string {
+  return item.decisionId
+    ?? `${item.answerId ?? "answer"}:${item.revision ?? index + 1}:${item.question}`;
 }
 
 function currentSuggestion(suggestions: Suggestion[]): Suggestion | null {
@@ -498,6 +618,7 @@ function FactGroup({
 }
 
 export function NowRail({
+  viewStateKey,
   currentTopic,
   followUp,
   semanticFollowUp: semanticFollowUpProp = null,
@@ -516,6 +637,7 @@ export function NowRail({
   onFactEdit,
   onFactMerge,
   onMessage,
+  onCoachRefine,
 }: NowRailProps) {
   const [, refreshCoachExpiration] = useState(0);
   const nowMs = Date.now();
@@ -532,18 +654,49 @@ export function NowRail({
     );
     return () => window.clearTimeout(timer);
   }, [coachDecisionValidUntil, followUpValidUntil]);
-  const answer = useMemo(() => currentAnswer(suggestions), [suggestions]);
+  const answerThreads = useMemo(
+    () => buildAnswerThreads(suggestions, coachHistory),
+    [coachHistory, suggestions],
+  );
+  const [selectedAnswerId, setSelectedAnswerId] = useState<string | null>(
+    () => readNowRailViewState(viewStateKey).selectedAnswerId,
+  );
+  const [selectedPiRevisionByAnswer, setSelectedPiRevisionByAnswer] = useState<Record<string, string>>(
+    () => readNowRailViewState(viewStateKey).selectedPiRevisionByAnswer,
+  );
+  useEffect(() => {
+    const stored = readNowRailViewState(viewStateKey);
+    setSelectedAnswerId(stored.selectedAnswerId);
+    setSelectedPiRevisionByAnswer(stored.selectedPiRevisionByAnswer);
+  }, [viewStateKey]);
+  useEffect(() => {
+    if (!viewStateKey) return undefined;
+    const timer = window.setTimeout(() => {
+      try {
+        window.sessionStorage.setItem(
+          `meeting-copilot-now-rail:${viewStateKey}`,
+          JSON.stringify({ selectedAnswerId, selectedPiRevisionByAnswer } satisfies NowRailViewState),
+        );
+      } catch {
+        // The rail still works when browser storage is unavailable.
+      }
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [selectedAnswerId, selectedPiRevisionByAnswer, viewStateKey]);
+  const selectedAnswerThread = useMemo(
+    () => answerThreads.find((item) => item.answerId === selectedAnswerId) ?? answerThreads[0] ?? null,
+    [answerThreads, selectedAnswerId],
+  );
+  const answer = selectedAnswerThread?.answer ?? currentAnswer(suggestions);
   const suggestion = useMemo(
     () => answer ?? currentSuggestion(suggestions.filter((item) => isFormalAi(item))),
     [answer, suggestions],
   );
-  const pastAnswers = useMemo(() => suggestions
-    .filter((item) => item.kind === "answer" && item.suggestionId !== answer?.suggestionId)
-    .filter((item) => item.status === "committed" || item.status === "superseded")
-    .filter((item) => item.feedback !== "ignored" && item.feedback !== "false_positive" && item.feedback !== "too_late")
-    .filter((item) => Boolean(answerHistoryText(item).trim()))
-    .sort((left, right) => right.evidenceTranscriptSeq - left.evidenceTranscriptSeq || right.updatedAtMs - left.updatedAtMs)
-    .slice(0, 5), [answer?.suggestionId, suggestions]);
+  const pastAnswerThreads = answerThreads
+    .filter((item) => item.answerId !== answer?.suggestionId)
+    .filter((item) => item.answer.status === "committed" || item.answer.status === "superseded")
+    .filter((item) => Boolean(answerHistoryText(item.answer).trim()))
+    .slice(0, 19);
   const isAnswer = suggestion?.kind === "answer";
   const questions = openQuestions.filter((question) => isFormalAi(question) && questionIsOpen(question)).slice(0, 3);
   const formalTopic = currentTopic && isFormalAi(currentTopic) ? currentTopic : null;
@@ -572,15 +725,24 @@ export function NowRail({
   const formalCoachHistory = coachHistory
     .filter((item) => isTrustedCoachProjection(item) && isCoachInterventionProjection(item))
     .sort((left, right) => left.createdAtMs - right.createdAtMs);
-  const deepAnswerFollowUp = isAnswer && suggestion
-    ? (
-      formalFollowUp?.promptProfile === "deep_answer"
-        && formalFollowUp.answerId === suggestion.suggestionId
-        ? formalFollowUp
-        : [...formalCoachHistory].reverse().find((item) =>
-          item.promptProfile === "deep_answer" && item.answerId === suggestion.suggestionId) ?? null
-    )
-    : null;
+  const availablePiRevisions = isAnswer && suggestion
+    ? [
+      ...(formalFollowUp?.promptProfile === "deep_answer"
+        && formalFollowUp.answerId === suggestion.suggestionId ? [formalFollowUp] : []),
+      ...(selectedAnswerThread?.piRevisions.filter((item) =>
+        item.status === undefined || item.status === "intervention") ?? []),
+    ].filter((item, index, items) => items.findIndex((candidate) => (
+      candidate.decisionId && item.decisionId
+        ? candidate.decisionId === item.decisionId
+        : candidate.question === item.question && candidate.revision === item.revision
+    )) === index)
+    : [];
+  const selectedPiRevisionId = suggestion
+    ? selectedPiRevisionByAnswer[suggestion.suggestionId]
+    : undefined;
+  const deepAnswerFollowUp = availablePiRevisions.find((item, index) => (
+    piRevisionIdentity(item, index) === selectedPiRevisionId
+  )) ?? availablePiRevisions[0] ?? null;
   const currentCoachHistoryId = formalFollowUp
     ? [...formalCoachHistory].reverse().find((item) =>
       formalFollowUp.decisionId && item.decisionId
@@ -590,10 +752,7 @@ export function NowRail({
   const pastCoachHistory = formalCoachHistory
     .filter((item) => item.historyId !== currentCoachHistoryId)
     .filter((item) => !(
-      deepAnswerFollowUp
-      && suggestion?.kind === "answer"
-      && item.promptProfile === "deep_answer"
-      && item.answerId === suggestion.suggestionId
+      item.promptProfile === "deep_answer" && Boolean(item.answerId)
     ))
     .reverse();
   const [menuOpen, setMenuOpen] = useState(false);
@@ -603,6 +762,17 @@ export function NowRail({
   const [factStatusOverrides, setFactStatusOverrides] = useState<Record<string, MeetingFactStatus>>({});
   const [savingQuestionId, setSavingQuestionId] = useState<string | null>(null);
   const [factView, setFactView] = useState<FactView>("active");
+  const [refinementPending, setRefinementPending] = useState<string | null>(null);
+  const [refinementError, setRefinementError] = useState<string | null>(null);
+  const [missReasonOpen, setMissReasonOpen] = useState(false);
+  const feedbackMenu = useDismissablePopover<HTMLButtonElement, HTMLDivElement>(
+    menuOpen,
+    () => setMenuOpen(false),
+  );
+  const missReasonMenu = useDismissablePopover<HTMLButtonElement, HTMLDivElement>(
+    missReasonOpen,
+    () => setMissReasonOpen(false),
+  );
   const text = suggestion ? suggestionText(suggestion) : "";
   const sceneCheckLabel = activeCoachSkillId ? COACH_SKILL_CHECK_LABELS[activeCoachSkillId] : null;
   const coachCheckLabels = sceneCheckLabel
@@ -662,31 +832,29 @@ export function NowRail({
     }
   };
 
+  const requestRefinement = async (label: string, request: string) => {
+    if (!suggestion || suggestion.kind !== "answer" || !onCoachRefine || refinementPending) return;
+    setRefinementPending(label);
+    setRefinementError(null);
+    setMissReasonOpen(false);
+    try {
+      await onCoachRefine(suggestion.suggestionId, request);
+      onMessage(`${label}请求已提交，旧版本会保留`);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "Pi 精修请求失败";
+      setRefinementError(detail);
+      onMessage(detail);
+    } finally {
+      setRefinementPending(null);
+    }
+  };
+
   return (
     <aside className="now-rail" aria-label="当前会议重点">
-      <section className="rail-section topic-section" aria-labelledby="topic-title">
-        <header className="rail-heading">
-          <Flag size={15} />
-          <h2 id="topic-title">当前议题</h2>
-        </header>
-        {formalTopic ? (
-          <button
-            className="topic-content evidence-content"
-            type="button"
-            onClick={() => formalTopic.evidenceSegmentIds[0] && onEvidence(formalTopic.evidenceSegmentIds[0])}
-            disabled={!formalTopic.evidenceSegmentIds.length}
-          >
-            {formalTopic.text}
-          </button>
-        ) : (
-          <p className="rail-empty">尚未形成明确议题</p>
-        )}
-      </section>
-
       <section className="rail-section suggestion-section" aria-labelledby="suggestion-title">
         <header className="rail-heading">
           <MessageCircleQuestion size={16} />
-          <h2 id="suggestion-title">AI 实时副驾</h2>
+          <h2 id="suggestion-title">AI 实时教练</h2>
           {activeCoachSkillId ? (
             <span className="coach-skill-badge" title="本轮实时教练使用的场景技能包">
               {COACH_SKILL_LABELS[activeCoachSkillId]}
@@ -745,8 +913,84 @@ export function NowRail({
             </div>
             {deepAnswerFollowUp ? (
               <div className="answer-copilot-field answer-copilot-supplement">
-                <span className="follow-up-field-label">Pi 深度补充</span>
-                <p>{deepAnswerFollowUp.sayThis ?? deepAnswerFollowUp.question}</p>
+                <div className="pi-supplement-heading">
+                  <span className="follow-up-field-label">Pi 深度补充</span>
+                  <span>
+                    {deepAnswerFollowUp.triggerType === "user_request" ? "根据你的反馈更新" : "自动检查回答遗漏"}
+                    {deepAnswerFollowUp.revision ? ` · v${deepAnswerFollowUp.revision}` : ""}
+                  </span>
+                </div>
+                {availablePiRevisions.length > 1 ? (
+                  <div className="pi-revision-switcher" role="group" aria-label="Pi 补充版本">
+                    {availablePiRevisions.map((revision, index) => {
+                      const id = piRevisionIdentity(revision, index);
+                      const revisionNumber = revision.revision ?? availablePiRevisions.length - index;
+                      return (
+                        <button
+                          key={id}
+                          type="button"
+                          aria-pressed={revision === deepAnswerFollowUp}
+                          onClick={() => suggestion && setSelectedPiRevisionByAnswer((current) => ({
+                            ...current,
+                            [suggestion.suggestionId]: id,
+                          }))}
+                        >
+                          v{revisionNumber}
+                        </button>
+                      );
+                    })}
+                  </div>
+                ) : null}
+                {deepAnswerFollowUp.coachingPackage ? (
+                  <PiCoachingPackageView value={deepAnswerFollowUp.coachingPackage} onEvidence={onEvidence} />
+                ) : (
+                  <p>{deepAnswerFollowUp.sayThis ?? deepAnswerFollowUp.question}</p>
+                )}
+              </div>
+            ) : null}
+            {suggestion.status === "committed" && onCoachRefine ? (
+              <div className="coach-refinement" aria-label="调整 Pi 教练回答">
+                <div className="coach-refinement-actions">
+                  {COACH_REFINEMENT_ACTIONS.map((action) => (
+                    <button
+                      key={action.id}
+                      type="button"
+                      disabled={Boolean(refinementPending)}
+                      onClick={() => void requestRefinement(action.label, action.request)}
+                    >
+                      {refinementPending === action.label ? `${action.label}处理中` : action.label}
+                    </button>
+                  ))}
+                  <button
+                    ref={missReasonMenu.triggerRef}
+                    type="button"
+                    aria-haspopup="menu"
+                    aria-expanded={missReasonOpen}
+                    disabled={Boolean(refinementPending)}
+                    onClick={() => setMissReasonOpen((current) => !current)}
+                  >
+                    没说中重点
+                  </button>
+                </div>
+                {missReasonOpen ? (
+                  <div ref={missReasonMenu.popoverRef} className="coach-refinement-reasons" role="menu" aria-label="选择没说中重点的原因">
+                    {COACH_MISS_REASONS.map((reason) => (
+                      <button
+                        key={reason}
+                        type="button"
+                        role="menuitem"
+                        onClick={() => void requestRefinement(
+                          "重新分析",
+                          `当前补充没有说中重点，原因：${reason}。请重新判断问题意图，基于同一 Answer 和绑定证据生成有增量价值的新版本。`,
+                        )}
+                      >
+                        {reason}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+                {refinementPending ? <p className="coach-refinement-status" role="status">Pi 正在生成新版本，当前内容不会被覆盖。</p> : null}
+                {refinementError ? <p className="answer-copilot-error" role="alert">{refinementError}，已保留当前版本。</p> : null}
               </div>
             ) : null}
             <div className="suggestion-footer">
@@ -909,11 +1153,11 @@ export function NowRail({
                   <EyeOff size={15} />
                 </button>
                 <div className="feedback-menu-wrap">
-                  <button className="icon-button icon-button--small" type="button" onClick={() => setMenuOpen((value) => !value)} title="更多反馈" aria-label="更多反馈" aria-expanded={menuOpen}>
+                  <button ref={feedbackMenu.triggerRef} className="icon-button icon-button--small" type="button" onClick={() => setMenuOpen((value) => !value)} title="更多反馈" aria-label="更多反馈" aria-haspopup="menu" aria-expanded={menuOpen}>
                     <MoreHorizontal size={16} />
                   </button>
                   {menuOpen ? (
-                    <div className="feedback-menu" role="menu">
+                    <div ref={feedbackMenu.popoverRef} className="feedback-menu" role="menu">
                       <button type="button" role="menuitem" onClick={() => void saveFeedback("false_positive")}><Flag size={14} />误报</button>
                       <button type="button" role="menuitem" onClick={() => void saveFeedback("too_late")}><TimerOff size={14} />太晚</button>
                     </div>
@@ -924,45 +1168,63 @@ export function NowRail({
           </div>
         ) : (
           <div className="coach-loop-empty" data-state={coachLifecycle?.state ?? coachRuntime?.state ?? "idle"}>
-            {coachLifecycle ? (
-              <div className="coach-lifecycle-heading">
-                <strong>{coachLifecycle.label}</strong>
-                <CoachOriginBadge origin={coachDecision?.origin ?? formalFollowUpCandidate?.origin} />
-              </div>
-            ) : coachRuntime?.decision ? <strong>{coachRuntime.decision}</strong> : null}
+            <div className="coach-lifecycle-heading">
+              <strong>{coachLifecycle?.label ?? (coachRuntime?.state === "error" ? "实时教练暂不可用" : "等待可回答的问题")}</strong>
+              {coachLifecycle ? <CoachOriginBadge origin={coachDecision?.origin ?? formalFollowUpCandidate?.origin} /> : null}
+            </div>
             <p>{coachLifecycle?.detail ?? coachRuntime?.detail ?? "等待下一段稳定对话"}</p>
+            {!coachLifecycle && coachRuntime?.decision ? (
+              <small className="coach-loop-decision">本轮状态：{coachRuntime.decision}</small>
+            ) : null}
             <ul aria-label="教练检查项">
               {coachCheckLabels.map((label) => <li key={label}>{label}</li>)}
             </ul>
           </div>
         )}
 
-        {pastAnswers.length ? (
+        {selectedAnswerId && answerThreads[0]?.answerId !== answer?.suggestionId ? (
+          <button className="answer-history-new" type="button" onClick={() => setSelectedAnswerId(null)}>
+            有新回答，回到最新
+          </button>
+        ) : null}
+
+        {pastAnswerThreads.length ? (
           <div className="answer-history">
             <div className="answer-history-heading">
-              <span><History size={13} />最近回答 <small>{pastAnswers.length}</small></span>
+              <span><History size={13} />回答与 Pi 记录 <small>{pastAnswerThreads.length}</small></span>
             </div>
-            <ol className="answer-history-list" aria-label="最近回答">
-              {pastAnswers.map((item) => (
-                <li key={item.suggestionId}>
+            <ol className="answer-history-list" aria-label="回答与 Pi 历史">
+              {pastAnswerThreads.map((thread) => {
+                const item = thread.answer;
+                const piRevision = thread.piRevisions.find((revision) => revision.status === undefined || revision.status === "intervention");
+                return (
+                <li key={thread.answerId}>
                   <details>
-                    <summary>
+                    <summary onClick={() => setSelectedAnswerId(thread.answerId)}>
                       <span className="answer-history-summary">
                         <span className="answer-history-meta">
                           <time dateTime={new Date(item.updatedAtMs).toISOString()}>{coachHistoryTime(item.updatedAtMs)}</time>
                           <span className="answer-history-state" data-status={item.status}>{answerHistoryState(item)}</span>
+                          {thread.piRevisions.length ? <span>{thread.piRevisions.length} 个 Pi 版本</span> : null}
                         </span>
                         <span className="answer-history-question">{item.questionText ?? "历史问题"}</span>
                       </span>
                       <ChevronDown className="answer-history-chevron" size={14} aria-hidden="true" />
                     </summary>
                     <p>{answerHistoryText(item)}</p>
+                    {piRevision ? (
+                      <p className="answer-history-pi">
+                        <strong>{piRevision.coachingPackage?.headline ?? "Pi 补充"}：</strong>
+                        {piRevision.coachingPackage?.sayThisAddition ?? piRevision.sayThis ?? piRevision.question}
+                      </p>
+                    ) : null}
                     <button className="evidence-link" type="button" onClick={() => onEvidence(item.evidenceSegmentId)}>
                       <Quote size={12} />查看问题原话
                     </button>
                   </details>
                 </li>
-              ))}
+                );
+              })}
             </ol>
           </div>
         ) : null}
@@ -1006,6 +1268,25 @@ export function NowRail({
             </ol>
           </div>
         ) : null}
+      </section>
+
+      <section className="rail-section topic-section" aria-labelledby="topic-title">
+        <header className="rail-heading">
+          <Flag size={15} />
+          <h2 id="topic-title">当前议题</h2>
+        </header>
+        {formalTopic ? (
+          <button
+            className="topic-content evidence-content"
+            type="button"
+            onClick={() => formalTopic.evidenceSegmentIds[0] && onEvidence(formalTopic.evidenceSegmentIds[0])}
+            disabled={!formalTopic.evidenceSegmentIds.length}
+          >
+            {formalTopic.text}
+          </button>
+        ) : (
+          <p className="rail-empty">尚未形成明确议题</p>
+        )}
       </section>
 
       <section className="rail-section questions-section" aria-labelledby="questions-title">

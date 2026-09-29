@@ -1,4 +1,4 @@
-import { parseMeetingSnapshot } from "./schema";
+import { parseMeetingHistory, parseMeetingSnapshot } from "./schema";
 
 function formalMetadata(segmentId: string) {
   return {
@@ -14,6 +14,35 @@ function formalMetadata(segmentId: string) {
     },
   };
 }
+
+it("parses the same capture freshness contract in snapshots and meeting history", () => {
+  const capture = {
+    state: "active",
+    active_track_count: 1,
+    track_count: 2,
+    last_heartbeat_at_ms: 10_000,
+    lease_until_ms: 40_000,
+  };
+  const snapshot = parseMeetingSnapshot({
+    meeting_id: "meeting-capture",
+    last_seq: 0,
+    segments: [],
+    suggestions: [],
+    runtime: { phase: "live", capture },
+  });
+  const history = parseMeetingHistory({
+    meetings: [{ id: "meeting-capture", state: "live", capture }],
+  });
+
+  expect(snapshot.runtime.capture).toEqual({
+    state: "active",
+    activeTrackCount: 1,
+    trackCount: 2,
+    lastHeartbeatAtMs: 10_000,
+    leaseUntilMs: 40_000,
+  });
+  expect(history.meetings[0].capture).toEqual(snapshot.runtime.capture);
+});
 
 it("parses bounded coach and recent-context history from a snapshot", () => {
   const snapshot = parseMeetingSnapshot({
@@ -488,4 +517,61 @@ it.each([
   expect(snapshot.followUp).toBeNull();
   expect(snapshot.coachDecision).toBeNull();
   expect(snapshot.coachHistory).toEqual([]);
+});
+
+it("preserves a structured Pi coaching revision from the snapshot contract", () => {
+  const intervention = {
+    origin: "pi",
+    status: "intervention",
+    prompt_profile: "deep_answer",
+    answer_id: "answer-1",
+    decision_id: "decision-pi-v2",
+    revision: 2,
+    trigger_type: "user_request",
+    user_request: "请更具体",
+    supersedes_decision_id: "decision-pi-v1",
+    say_this: "可以补充失败消费、积压监控和重新选型的触发条件。",
+    why_now: "当前回答解释了成本，但可靠性边界仍不完整。",
+    evidence_segment_ids: ["segment-1"],
+    evidence_quote: "为什么选择 Redis Stream？",
+    urgency: "medium",
+    confidence: 0.88,
+    coaching_package: {
+      headline: "补齐可靠性边界",
+      question_intent: "判断选型是否有清晰边界",
+      core_judgement: "当前回答遗漏异常恢复",
+      why_it_matters: "当前回答解释了成本，但可靠性边界仍不完整。",
+      say_this_addition: "可以补充失败消费、积压监控和重新选型的触发条件。",
+      missing_points: ["失败消费处理"],
+      constraints: ["当前吞吐规模可控"],
+      risks: ["积压处理未说明"],
+      next_actions: ["补充验证方式"],
+      likely_follow_ups: [{ question: "如何处理失败消费？", answer_angle: "说明重试和幂等" }],
+      evidence_refs: [{ segment_id: "segment-1", quote: "为什么选择 Redis Stream？" }],
+      confidence: 0.88,
+    },
+  };
+  const snapshot = parseMeetingSnapshot({
+    meeting_id: "meeting-pi-package",
+    last_seq: 8,
+    segments: [],
+    suggestions: [],
+    coach_intervention: intervention,
+    coach_history: [{ ...intervention, history_id: "history-pi-v2", created_at_ms: 8_000 }],
+  });
+
+  expect(snapshot.followUp).toMatchObject({
+    answerId: "answer-1",
+    revision: 2,
+    triggerType: "user_request",
+    userRequest: "请更具体",
+    supersedesDecisionId: "decision-pi-v1",
+    coachingPackage: {
+      headline: "补齐可靠性边界",
+      sayThisAddition: "可以补充失败消费、积压监控和重新选型的触发条件。",
+      likelyFollowUps: [{ question: "如何处理失败消费？", answerAngle: "说明重试和幂等" }],
+      evidenceRefs: [{ segmentId: "segment-1", quote: "为什么选择 Redis Stream？" }],
+    },
+  });
+  expect(snapshot.coachHistory[0].coachingPackage?.nextActions).toEqual(["补充验证方式"]);
 });

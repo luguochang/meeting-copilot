@@ -23,6 +23,7 @@ import type {
   MeetingSpeaker,
   MeetingViewState,
   OpenQuestionProjection,
+  PiCoachingPackage,
   RecentContextEntry,
   RiskProjection,
   ReviewJobKind,
@@ -465,6 +466,51 @@ function eventQuestion(event: MeetingEvent): OpenQuestionProjection | null {
   };
 }
 
+function eventPiCoachingPackage(value: unknown): PiCoachingPackage | null {
+  const item = asRecord(value);
+  if (!item) return null;
+  const headline = stringValue(item, "headline");
+  const questionIntent = stringValue(item, "question_intent", "questionIntent");
+  const coreJudgement = stringValue(item, "core_judgement", "coreJudgement");
+  const whyItMatters = stringValue(item, "why_it_matters", "whyItMatters");
+  const sayThisAddition = stringValue(item, "say_this_addition", "sayThisAddition");
+  const confidence = numberValue(item, "confidence");
+  const followUpsRaw = item.likely_follow_ups ?? item.likelyFollowUps;
+  const refsRaw = item.evidence_refs ?? item.evidenceRefs;
+  if (!headline || !questionIntent || !coreJudgement || !whyItMatters || !sayThisAddition
+    || confidence === null || confidence < 0 || confidence > 1
+    || !Array.isArray(followUpsRaw) || !Array.isArray(refsRaw)) return null;
+  const likelyFollowUps = followUpsRaw.flatMap((value) => {
+    const followUp = asRecord(value);
+    if (!followUp) return [];
+    const question = stringValue(followUp, "question");
+    const answerAngle = stringValue(followUp, "answer_angle", "answerAngle");
+    return question && answerAngle ? [{ question, answerAngle }] : [];
+  }).slice(0, 2);
+  const evidenceRefs = refsRaw.flatMap((value) => {
+    const ref = asRecord(value);
+    if (!ref) return [];
+    const segmentId = stringValue(ref, "segment_id", "segmentId");
+    const quote = stringValue(ref, "quote");
+    return segmentId && quote ? [{ segmentId, quote }] : [];
+  }).slice(0, 12);
+  if (!evidenceRefs.length) return null;
+  return {
+    headline,
+    questionIntent,
+    coreJudgement,
+    whyItMatters,
+    sayThisAddition,
+    missingPoints: stringArray(item.missing_points ?? item.missingPoints).slice(0, 3),
+    constraints: stringArray(item.constraints).slice(0, 3),
+    risks: stringArray(item.risks).slice(0, 3),
+    nextActions: stringArray(item.next_actions ?? item.nextActions).slice(0, 3),
+    likelyFollowUps,
+    evidenceRefs,
+    confidence,
+  };
+}
+
 function eventFollowUp(event: MeetingEvent, lane: "coach" | "semantic" = "coach"): FollowUpProjection | null {
   const hasSemanticLane = "semantic_follow_up" in event.payload || "semanticFollowUp" in event.payload;
   const explicitCoach = asRecord(event.payload.coach_intervention ?? event.payload.coachIntervention);
@@ -523,6 +569,10 @@ function eventFollowUp(event: MeetingEvent, lane: "coach" | "semantic" = "coach"
   const decisionId = stringValue(metadata, "decision_id", "decisionId");
   const promptProfile = stringValue(metadata, "prompt_profile", "promptProfile");
   const answerId = stringValue(metadata, "answer_id", "answerId");
+  const revision = numberValue(metadata, "revision");
+  const triggerType = stringValue(metadata, "trigger_type", "triggerType");
+  const userRequest = stringValue(metadata, "user_request", "userRequest");
+  const coachingPackage = eventPiCoachingPackage(value.coaching_package ?? value.coachingPackage);
   const validUntil = numberValue(
     metadata,
     "valid_until_ms",
@@ -563,6 +613,10 @@ function eventFollowUp(event: MeetingEvent, lane: "coach" | "semantic" = "coach"
     ...(decisionId ? { decisionId } : {}),
     ...(promptProfile ? { promptProfile } : {}),
     ...(answerId ? { answerId } : {}),
+    ...(revision !== null ? { revision } : {}),
+    ...(triggerType ? { triggerType } : {}),
+    ...(userRequest ? { userRequest } : {}),
+    ...(coachingPackage ? { coachingPackage } : {}),
     ...(evidenceRevision !== null ? { evidenceRevision } : {}),
     ...(validUntil !== null ? { validUntil } : {}),
     ...(lifecycleAction ? { lifecycleAction } : {}),
@@ -630,6 +684,15 @@ function eventCoachDecision(event: MeetingEvent): CoachDecisionProjection | null
       : {}),
     ...(stringValue(value, "answer_id", "answerId")
       ? { answerId: stringValue(value, "answer_id", "answerId")! }
+      : {}),
+    ...(numberValue(value, "revision") !== null
+      ? { revision: numberValue(value, "revision")! }
+      : {}),
+    ...(stringValue(value, "trigger_type", "triggerType")
+      ? { triggerType: stringValue(value, "trigger_type", "triggerType")! }
+      : {}),
+    ...(stringValue(value, "user_request", "userRequest")
+      ? { userRequest: stringValue(value, "user_request", "userRequest")! }
       : {}),
     ...(lifecycleAction ? { lifecycleAction } : {}),
     ...(typeof value.lifecycle_refresh === "boolean"

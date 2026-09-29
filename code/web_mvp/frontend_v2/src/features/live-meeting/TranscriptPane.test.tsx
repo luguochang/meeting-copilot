@@ -89,6 +89,10 @@ describe("TranscriptPane", () => {
       { text: "先确认发布窗口", segmentIds: ["s1"] },
       "extract_action_items",
     ));
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByRole("toolbar", { name: "选中文字操作" })).toBeNull();
+    expect(document.getElementById("segment-s1")).toHaveFocus();
+    expect(onSelectionChange).toHaveBeenLastCalledWith(null);
   });
 
   it("assembles adjacent ASR checkpoints into readable natural paragraphs without repeating text", () => {

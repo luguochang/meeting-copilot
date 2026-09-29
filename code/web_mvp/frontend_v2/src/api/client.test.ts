@@ -779,6 +779,23 @@ describe("HttpMeetingApi", () => {
     expect(revokeObjectUrl).toHaveBeenCalledWith(objectUrl);
   });
 
+  it("binds a Pi refinement request to the selected answer", async () => {
+    const fetchSpy = vi.fn().mockResolvedValue(response({ accepted: true }));
+    vi.stubGlobal("fetch", fetchSpy);
+    const api = new HttpMeetingApi("http://localhost:8767/");
+
+    await api.requestRealtimeCoach("meeting/1", "请补充关键风险", "answer/7");
+
+    expect(fetchSpy).toHaveBeenCalledOnce();
+    const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("http://localhost:8767/v2/meetings/meeting%2F1/coach/request");
+    expect(init).toMatchObject({
+      method: "POST",
+      body: JSON.stringify({ request: "请补充关键风险", answer_id: "answer/7" }),
+    });
+    expect((init.headers as Record<string, string>)["Idempotency-Key"]).toBeTruthy();
+  });
+
   it("downloads the allowlist-only runtime diagnostic bundle", async () => {
     const bundleResponse = new Response(new Blob(["diagnostic-zip"]), {
       headers: {

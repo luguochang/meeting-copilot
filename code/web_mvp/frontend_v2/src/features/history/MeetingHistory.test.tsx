@@ -1,6 +1,6 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { MeetingApi } from "../../api/client";
 import type { MeetingHistoryItem } from "../../domain/events";
 import { MeetingHistory } from "./MeetingHistory";
@@ -41,7 +41,21 @@ function apiWithPages() {
   } as unknown as MeetingApi;
 }
 
+async function openDataManagementDialog(
+  user: ReturnType<typeof userEvent.setup>,
+  title: string,
+) {
+  const trigger = await screen.findByRole("button", { name: `会议操作：${title}` });
+  await user.click(trigger);
+  await user.click(screen.getByRole("menuitem", { name: `管理本地数据：${title}` }));
+  return trigger;
+}
+
 describe("MeetingHistory", () => {
+  beforeEach(() => {
+    window.sessionStorage.clear();
+  });
+
   it("loads additional history through the server cursor instead of slicing a local list", async () => {
     const user = userEvent.setup();
     const api = apiWithPages();
@@ -80,6 +94,71 @@ describe("MeetingHistory", () => {
     ));
   });
 
+  it("restores search, filter, sort order and scroll after returning from a meeting", async () => {
+    window.sessionStorage.setItem("talktrace.meeting-history.view.v1", JSON.stringify({
+      query: "支付",
+      filter: "ready",
+      sortOrder: "oldest",
+      scrollY: 420,
+    }));
+    const scrollTo = vi.spyOn(window, "scrollTo").mockImplementation(() => undefined);
+    const api = {
+      listMeetingsPage: vi.fn().mockResolvedValue({
+        meetings: [meeting("meeting-2", "支付评审", 2_000)],
+        hasMore: false,
+        nextCursor: null,
+      }),
+      listMeetings: vi.fn().mockResolvedValue({ meetings: [] }),
+      deleteMeeting: vi.fn(),
+      retryImportJob: vi.fn(),
+    } as unknown as MeetingApi;
+
+    render(<MeetingHistory api={api} onOpenMeeting={vi.fn()} />);
+
+    expect(await screen.findByDisplayValue("支付")).toBeVisible();
+    expect(screen.getByLabelText("按状态筛选")).toHaveValue("ready");
+    expect(screen.getByLabelText("会议排序")).toHaveValue("oldest");
+    await waitFor(() => expect(scrollTo).toHaveBeenCalledWith({ top: 420, behavior: "auto" }));
+  });
+
+  it("distinguishes local, cross-window, recoverable, and never-started live meetings", async () => {
+    const active = { ...meeting("meeting-active", "正在录制", 3_000), phase: "live" as const };
+    const recoverable = { ...meeting("meeting-stale", "待恢复会议", 2_000), phase: "live" as const };
+    const external = {
+      ...meeting("meeting-external", "其他窗口会议", 1_500),
+      phase: "live" as const,
+      capture: { state: "active" as const, activeTrackCount: 1, trackCount: 1, lastHeartbeatAtMs: 1_400, leaseUntilMs: 31_400 },
+    };
+    const inactive = {
+      ...meeting("meeting-inactive", "尚未开始会议", 1_000),
+      phase: "live" as const,
+      capture: { state: "inactive" as const, activeTrackCount: 0, trackCount: 0, lastHeartbeatAtMs: null, leaseUntilMs: null },
+    };
+    const api = {
+      listMeetingsPage: vi.fn().mockResolvedValue({
+        meetings: [active, recoverable, external, inactive],
+        hasMore: false,
+        nextCursor: null,
+      }),
+      listMeetings: vi.fn().mockResolvedValue({ meetings: [] }),
+      deleteMeeting: vi.fn(),
+      retryImportJob: vi.fn(),
+    } as unknown as MeetingApi;
+
+    render(
+      <MeetingHistory
+        api={api}
+        activeMeetingId="meeting-active"
+        onOpenMeeting={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText("会议进行中")).toBeVisible();
+    expect(screen.getByText("会议未结束 · 可恢复")).toBeVisible();
+    expect(screen.getByText("另一窗口录音中")).toBeVisible();
+    expect(screen.getByText("会议未结束 · 可开始")).toBeVisible();
+  });
+
   it("uses the explicit deletion dialog and refreshes after a scoped deletion", async () => {
     const currentMeeting = meeting("meeting-2", "支付评审", 2_000);
     const listMeetingsPage = vi.fn().mockResolvedValue({
@@ -98,7 +177,7 @@ describe("MeetingHistory", () => {
     const user = userEvent.setup();
     render(<MeetingHistory api={api} onOpenMeeting={vi.fn()} />);
 
-    await user.click(await screen.findByRole("button", { name: "管理本地数据：支付评审" }));
+    await openDataManagementDialog(user, "支付评审");
     expect(screen.getByRole("dialog", { name: "删除会议数据" })).toBeVisible();
     expect(screen.getByText("删除原始录音和音频切片，保留会议文字、AI 整理和历史记录。")).toBeVisible();
     await user.click(screen.getByRole("radio", { name: /仅 AI 整理/ }));
@@ -108,6 +187,35 @@ describe("MeetingHistory", () => {
     await waitFor(() => expect(listMeetingsPage).toHaveBeenCalledTimes(2));
     expect(screen.getByText("支付评审")).toBeVisible();
     expect(confirmSpy).not.toHaveBeenCalled();
+  });
+
+  it("focuses the safe deletion action, closes with Escape, and restores the row action", async () => {
+    const api = {
+      listMeetingsPage: vi.fn().mockResolvedValue({
+        meetings: [meeting("meeting-2", "支付评审", 2_000)],
+        hasMore: false,
+        nextCursor: null,
+      }),
+      listMeetings: vi.fn().mockResolvedValue({ meetings: [] }),
+      deleteMeeting: vi.fn(),
+      retryImportJob: vi.fn(),
+    } as unknown as MeetingApi;
+    const user = userEvent.setup();
+    render(<MeetingHistory api={api} onOpenMeeting={vi.fn()} />);
+
+    const trigger = await screen.findByRole("button", { name: "会议操作：支付评审" });
+    await user.click(trigger);
+    expect(screen.getByRole("menu", { name: "会议操作：支付评审" })).toBeVisible();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("menu", { name: "会议操作：支付评审" })).not.toBeInTheDocument();
+    await waitFor(() => expect(trigger).toHaveFocus());
+
+    await openDataManagementDialog(user, "支付评审");
+    await waitFor(() => expect(screen.getByRole("button", { name: "取消" })).toHaveFocus());
+
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog", { name: "删除会议数据" })).not.toBeInTheDocument();
+    await waitFor(() => expect(trigger).toHaveFocus());
   });
 
   it("removes the history row only when the entire meeting is deleted", async () => {
@@ -126,7 +234,7 @@ describe("MeetingHistory", () => {
     const user = userEvent.setup();
     render(<MeetingHistory api={api} onOpenMeeting={vi.fn()} />);
 
-    await user.click(await screen.findByRole("button", { name: "管理本地数据：支付评审" }));
+    await openDataManagementDialog(user, "支付评审");
     await user.click(screen.getByRole("radio", { name: /整场会议/ }));
     await user.click(screen.getByRole("button", { name: "删除整场会议" }));
 
@@ -149,7 +257,7 @@ describe("MeetingHistory", () => {
     const user = userEvent.setup();
     render(<MeetingHistory api={api} onOpenMeeting={vi.fn()} />);
 
-    await user.click(await screen.findByRole("button", { name: "管理本地数据：支付评审" }));
+    await openDataManagementDialog(user, "支付评审");
     await user.click(screen.getByRole("button", { name: "删除仅录音" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent("录音文件正被占用");
@@ -186,6 +294,38 @@ describe("MeetingHistory", () => {
     await waitFor(() => expect(updateDataGovernanceSettings).toHaveBeenCalledWith("90_days"));
     expect(await screen.findByText("保留策略已保存")).toBeVisible();
     expect(screen.getByRole("radio", { name: /90 天/ })).toBeChecked();
+  });
+
+  it("does not silently discard an unsaved retention-policy change", async () => {
+    const api = {
+      listMeetingsPage: vi.fn().mockResolvedValue({ meetings: [], hasMore: false, nextCursor: null }),
+      listMeetings: vi.fn().mockResolvedValue({ meetings: [] }),
+      deleteMeeting: vi.fn(),
+      retryImportJob: vi.fn(),
+      getDataGovernanceSettings: vi.fn().mockResolvedValue({
+        retentionPolicy: "local_until_user_deletes",
+        updatedAtMs: 1_000,
+      }),
+      updateDataGovernanceSettings: vi.fn(),
+    } as unknown as MeetingApi;
+    const user = userEvent.setup();
+    render(<MeetingHistory api={api} onOpenMeeting={vi.fn()} />);
+
+    const trigger = await screen.findByRole("button", { name: "本地数据" });
+    await user.click(trigger);
+    await user.click(await screen.findByRole("radio", { name: /30 天/ }));
+    await user.click(screen.getByRole("button", { name: "关闭" }));
+
+    expect(screen.getByText("放弃未保存的修改？")).toBeVisible();
+    expect(screen.getByRole("dialog", { name: "数据保留策略" })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "继续编辑" }));
+    expect(screen.queryByText("放弃未保存的修改？")).not.toBeInTheDocument();
+
+    await user.keyboard("{Escape}");
+    expect(screen.getByText("放弃未保存的修改？")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "放弃修改" }));
+    expect(screen.queryByRole("dialog", { name: "数据保留策略" })).not.toBeInTheDocument();
+    await waitFor(() => expect(trigger).toHaveFocus());
   });
 
   it("can retry a failed retention-policy load before enabling save", async () => {
