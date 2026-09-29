@@ -5126,6 +5126,108 @@ def test_acceptance_evidence_is_revision_pinned_and_self_verifiable(persistence)
     assert repeated["capture_sha256"] == capture["capture_sha256"]
 
 
+def test_acceptance_evidence_compares_live_final_with_original_text_after_correction(
+    persistence,
+):
+    raw_text = "发布负人需要在周五前确认回滚条件。"
+    original_text = "发布负责人需要在周五前确认回滚条件。"
+    segment_id = "acceptance-refined-segment"
+    committed = persistence.commit_final_and_enqueue(
+        meeting_id="acceptance-meeting",
+        final_id="acceptance-refined-final",
+        segment_id=segment_id,
+        text=raw_text,
+        normalized_text=original_text,
+        started_at_ms=100,
+        ended_at_ms=900,
+        evidence_hash=transcript_evidence_hash(segment_id, original_text),
+        now_ms=1_000,
+    )
+    with persistence._write_transaction():
+        persistence._conn.execute(
+            "INSERT INTO asr_live_sessions "
+            "(session_id, record_json, created_at_ms, last_activity_ms, source, has_audio) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "acceptance-meeting",
+                json.dumps(
+                    {
+                        "session_id": "acceptance-meeting",
+                        "events": [
+                            {
+                                "event_type": "transcript_final",
+                                "payload": {
+                                    "authoritative": True,
+                                    "segment_id": committed["segment_id"],
+                                    "normalized_text": original_text,
+                                },
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                1_000,
+                1_100,
+                "browser_live_mic",
+                1,
+            ),
+        )
+    revised = persistence.commit_transcript_revision(
+        meeting_id="acceptance-meeting",
+        segment_id=committed["segment_id"],
+        expected_evidence_hash=transcript_evidence_hash(
+            committed["segment_id"], original_text
+        ),
+        corrected_text="发布负责人需要在本周五前确认回滚条件。",
+        revision_id="acceptance-correction-1",
+        now_ms=1_200,
+    )
+
+    assert revised is not None
+    assert revised["text"] == raw_text
+    assert revised["normalized_text"] == "发布负责人需要在本周五前确认回滚条件。"
+    capture = persistence.capture_acceptance_evidence("acceptance-meeting")
+    assert capture["consistency"] == {"acceptance_eligible": True, "errors": []}
+
+
+def test_acceptance_evidence_accepts_source_duplicate_terminal_event(persistence):
+    text = "压测验收没有结束。"
+    first_segment_id = "acceptance-microphone-segment"
+    duplicate_segment_id = "acceptance-system-audio-segment"
+    persistence.commit_final_and_enqueue(
+        meeting_id="acceptance-duplicate-meeting",
+        final_id="acceptance-microphone-final",
+        segment_id=first_segment_id,
+        text=text,
+        normalized_text=text,
+        started_at_ms=100,
+        ended_at_ms=900,
+        evidence_hash=transcript_evidence_hash(first_segment_id, text),
+        now_ms=1_000,
+        source_track="microphone",
+    )
+    duplicate = persistence.commit_final_and_enqueue(
+        meeting_id="acceptance-duplicate-meeting",
+        final_id="acceptance-system-audio-final",
+        segment_id=duplicate_segment_id,
+        text=text,
+        normalized_text=text,
+        started_at_ms=100,
+        ended_at_ms=900,
+        evidence_hash=transcript_evidence_hash(duplicate_segment_id, text),
+        now_ms=1_100,
+        source_track="system_audio",
+    )
+
+    assert duplicate["duplicate_of_segment_id"] == first_segment_id
+    capture = persistence.capture_acceptance_evidence(
+        "acceptance-duplicate-meeting"
+    )
+    assert capture["consistency"] == {"acceptance_eligible": True, "errors": []}
+    assert capture["transcript"]["segment_count"] == 2
+    assert capture["events"][-1]["type"] == "transcript.segment.source_duplicate"
+
+
 def test_acceptance_evidence_truncation_is_fail_closed(persistence):
     _seed_atomic_acceptance_meeting(persistence)
     second_text = "第二项承诺需要补充验收人。"

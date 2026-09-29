@@ -10197,6 +10197,7 @@ class V2Persistence:
         # describe the same revisions.  The latest finalized/revised event is
         # authoritative for text fields; speaker-only revisions intentionally
         # do not replace that payload.
+        initial_transcript_events: dict[str, Mapping[str, Any]] = {}
         latest_transcript_events: dict[str, Mapping[str, Any]] = {}
         event_sequences: list[int] = []
         for event in events:
@@ -10204,9 +10205,11 @@ class V2Persistence:
                 event_sequences.append(int(event.get("seq") or 0))
             except (TypeError, ValueError, OverflowError):
                 consistency_errors.append("event_sequence_invalid")
-            if str(event.get("type") or "") not in {
+            event_type = str(event.get("type") or "")
+            if event_type not in {
                 "transcript.segment.finalized",
                 "transcript.segment.revised",
+                "transcript.segment.source_duplicate",
             }:
                 continue
             payload = event.get("payload")
@@ -10219,6 +10222,11 @@ class V2Persistence:
             if not segment_id:
                 consistency_errors.append("transcript_event_segment_id_missing")
                 continue
+            if event_type in {
+                "transcript.segment.finalized",
+                "transcript.segment.source_duplicate",
+            }:
+                initial_transcript_events.setdefault(segment_id, payload)
             latest_transcript_events[segment_id] = payload
         if not event_truncated and event_sequences != list(
             range(1, event_high_water_mark + 1)
@@ -10286,7 +10294,22 @@ class V2Persistence:
                     consistency_errors.append(
                         f"live_session_segment_missing:{segment_id}"
                     )
-                elif str(durable_segment.get("normalized_text") or "").strip() != live_text:
+                    continue
+                # The live final is the initial locally refined canonical
+                # observation. Later correction events update the durable
+                # canonical text, while raw ``text`` may predate local
+                # refinement. Compare the live observation with its initial
+                # finalized event; the latest revision is verified separately.
+                initial_payload = initial_transcript_events.get(segment_id, {})
+                initial_text = str(
+                    initial_payload.get("normalized_text")
+                    or initial_payload.get("text")
+                    or durable_segment.get("correction_before_text")
+                    or durable_segment.get("normalized_text")
+                    or durable_segment.get("text")
+                    or ""
+                ).strip()
+                if initial_text != live_text:
                     consistency_errors.append(
                         f"live_session_segment_text_mismatch:{segment_id}"
                     )
