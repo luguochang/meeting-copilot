@@ -82,7 +82,11 @@
 - 压缩合同后的最后一次真实回放：`job_0e348dd7ed517344c68eca36`，20.008 秒命中 `agent_deadline_exceeded`，仍无 terminal tool result；会议已恢复为 `ended`，原 `ended_at_ms=1790693124659`。
 - 结论：当前阻塞已不再是 React、Answer 证据绑定、流式 SSE、session affinity 或明显的 schema/Prompt 膨胀；`codexai.club + gpt-5.5` 对完整深度工具调用的服务端完成时延仍不满足 8 秒产品门槛。不得再增加 timeout、重复消耗测试额度或把 timeout/fallback 记为 Pi 成功。
 - 上述 20 秒仅为根因定位期间最后一次受控实验，不是交付配置；代码中的 deep job 和 Provider hard deadline 已恢复为 8 秒，Pi bridge 总上限为 10 秒。超时只记录失败并保留上一成功版本，不能让右栏继续等待 20 秒。该调整未再次调用真实 Provider。
-- 受控备份：`artifacts/tmp/ui-remediation-real-provider-20260929-03-user-revision/pre-non-streaming-responses-retry.sqlite3` 和 `pre-compact-non-streaming-retry.sqlite3`；均为本地验收数据，不提交仓库。
+- 网关 `/v1/models` 清单包含 `gpt-5.3-codex-spark`；历史真实连接探测曾在 Chat Completions 下约 1.84 秒成功，因此将其作为与 `gpt-5.5` 不同的低延迟策略，只执行两次受控应用链路复验。
+- Spark Responses：`job_0cff38f71c14be767f1274fc`，Pi E2E 2391ms，Provider 约 2033ms 后返回 HTTP 502，0 token、0 tool call、无 revision。
+- Spark Chat Completions：`job_961820e6982ca46ac7fe408d`，Pi E2E 1189ms，Provider 约 1165ms 后返回 HTTP 502，0 token、0 tool call、无 revision。两种 API 风格同样失败，证明该网关当前“模型在清单中”不等于推理路由可用；不再继续真实重试。
+- 两次 Spark 失败均未覆盖已有内容；Provider 已恢复为 `gpt-5.5 / Responses`，会议已恢复为 `ended`，原 `ended_at_ms=1790693124659`。
+- 受控备份：`artifacts/tmp/ui-remediation-real-provider-20260929-03-user-revision/pre-non-streaming-responses-retry.sqlite3`、`pre-compact-non-streaming-retry.sqlite3` 和 `pre-spark-8s-retry.sqlite3`；均为本地验收数据，不提交仓库，最新备份权限为 `0600`。
 - 用户约束：在用户再次明确允许前，持续禁止扬声器外放、真实麦克风自动采集和 loopback 验收；允许固定音频、代码测试、数据库回放、静默浏览器测试和 Provider API。当前轮没有启动麦克风或播放声音。
 - 2026-09-30 静默复验：`8991` 使用当前源码和原验收数据目录重新启动，runtime identity 全项通过；桌面返回、AI 设置的独立“测试连接 / 保存配置”、Escape 关闭和焦点恢复正常；375x667 下 `scrollWidth=innerWidth=375`，会议文字/实时教练切换可被浏览器返回恢复，console 为 0 error / 0 warn。复验未点击“立即开始录音”、未请求麦克风权限、未播放声音，也未调用真实 Provider。
 - 最终静默质量门：Pi bridge 54 项、前端 34 个文件/361 项、后端 1802 项（1 项跳过）全部通过；Ruff、ESLint、TypeScript、生产构建、Pi smoke 和 `git diff --check` 通过。构建仅保留既有的约 683KB 主 bundle 警告。
@@ -861,7 +865,7 @@ PiRevision
 
 ## 22. 真实 Provider 验收
 
-当前结论：未通过。`job_0e348dd7ed517344c68eca36` 是最新受控复验，20.008 秒命中 deadline；以下门槛和 DoD 保持未勾选，不能用 mock、Fast Answer 或本地 fallback 替代。
+当前结论：未通过。`gpt-5.5` 在压缩合同和非流式 Responses 下仍超过 8 秒；低延迟候选 `gpt-5.3-codex-spark` 的 Responses 与 Chat Completions 应用链路均在约 1-2 秒返回 HTTP 502，未产生 token、terminal tool 或 revision。以下门槛和 DoD 保持未勾选，不能用模型清单、连接探测、mock、Fast Answer 或本地 fallback 替代真实 Pi 成功。
 
 ### 22.1 五分钟会议流程
 
