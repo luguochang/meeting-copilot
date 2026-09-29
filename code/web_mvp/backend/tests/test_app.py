@@ -2428,6 +2428,8 @@ def test_manual_provider_probe_success_closes_app_realtime_circuit(
         "probe_gateway",
         lambda probe_config: {
             "operational": True,
+            "probe_kind": "pi_tool_call",
+            "tool_call_ready": True,
             "provider": probe_config.provider_label,
             "model": probe_config.model,
             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
@@ -2468,6 +2470,8 @@ def test_provider_probe_cache_is_bypassed_after_realtime_circuit_failures(
         calls += 1
         return {
             "operational": True,
+            "probe_kind": "pi_tool_call",
+            "tool_call_ready": True,
             "provider": probe_config.provider_label,
             "model": probe_config.model,
             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},

@@ -827,6 +827,46 @@ export function requiresTerminalToolChoice(context) {
     && tools.every((tool) => TERMINAL_TOOL_NAMES.has(String(tool?.name || "")));
 }
 
+function messageTextContent(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((block) => block && block.type === "text" && typeof block.text === "string")
+    .map((block) => block.text)
+    .join("");
+}
+
+export function terminalToolChoiceForContext(context) {
+  if (!requiresTerminalToolChoice(context)) return undefined;
+  const tools = Array.isArray(context?.tools) ? context.tools : [];
+  const submitTool = tools.find((tool) => tool?.name === "submit_intervention");
+  const deepTerminal = Boolean(
+    submitTool?.parameters?.properties?.key_points
+    && submitTool?.parameters?.properties?.say_this_addition,
+  );
+  if (!deepTerminal) return "required";
+  const latestUserMessage = Array.isArray(context?.messages)
+    ? context.messages.findLast((message) => message?.role === "user")
+    : null;
+  const text = messageTextContent(latestUserMessage?.content);
+  try {
+    const payload = JSON.parse(text);
+    if (
+      payload?.task === "deepen_current_answer"
+      && typeof payload.user_request === "string"
+      && payload.user_request.trim()
+    ) {
+      // An explicit correction request must produce a revision. Forcing the
+      // one valid terminal action also avoids spending the realtime budget on
+      // choosing between submit_intervention and keep_silent.
+      return { type: "function", name: "submit_intervention" };
+    }
+  } catch {
+    // Non-JSON user messages use the ordinary required-tool choice.
+  }
+  return "required";
+}
+
 export function outputTokenLimitForContext(context) {
   const deepTerminal = (Array.isArray(context?.tools) ? context.tools : []).some((tool) => (
     tool?.name === "submit_intervention"
@@ -1180,7 +1220,9 @@ export function createOpenAICompatibleBackend(providerInput) {
                 }),
               }
               : {}),
-            ...(requiresTerminalToolChoice(context) ? { tool_choice: "required" } : {}),
+            ...(requiresTerminalToolChoice(context)
+              ? { tool_choice: terminalToolChoiceForContext(context) }
+              : {}),
             ...(activeModel.reasoning && activeModel.thinkingLevelMap?.off !== null
               ? { reasoning: { effort: activeModel.thinkingLevelMap?.off ?? "none" } }
               : {}),

@@ -438,6 +438,11 @@ def _provider_probe_result_with_readiness(
 
     if result.get("operational") is not True:
         raise ValueError("gateway probe did not report operational=true")
+    if (
+        result.get("probe_kind") != "pi_tool_call"
+        or result.get("tool_call_ready") is not True
+    ):
+        raise ValueError("gateway probe did not prove Pi tool-call readiness")
     raw_latency_ms = result.get("probe_latency_ms")
     if raw_latency_ms is None:
         probe_latency_ms = fallback_latency_ms
@@ -463,6 +468,8 @@ def _provider_probe_result_with_readiness(
     return {
         **dict(result),
         "operational": True,
+        "probe_kind": "pi_tool_call",
+        "tool_call_ready": True,
         "realtime_ready": probe_latency_ms <= REALTIME_COACH_SOFT_CUTOFF_MS,
         "probe_latency_ms": probe_latency_ms,
         "realtime_cutoff_ms": REALTIME_COACH_SOFT_CUTOFF_MS,

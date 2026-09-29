@@ -13,6 +13,7 @@ import {
   PiCoachProtocolError,
   PiCoachRuntime,
   createOpenAICompatibleBackend,
+  terminalToolChoiceForContext,
   outputTokenLimitForContext,
   requiresTerminalToolChoice,
   validateEvaluationRequest,
@@ -881,6 +882,42 @@ test("candidate fast path identifies when a terminal provider tool is required",
   }), false);
 });
 
+test("explicit deep-answer corrections force the submit terminal tool", () => {
+  const deepTools = [
+    {
+      name: "submit_intervention",
+      parameters: {
+        properties: {
+          key_points: { type: "array" },
+          say_this_addition: { type: "string" },
+        },
+      },
+    },
+    { name: "keep_silent", parameters: { properties: {} } },
+  ];
+  assert.deepEqual(terminalToolChoiceForContext({
+    tools: deepTools,
+    messages: [{
+      role: "user",
+      content: JSON.stringify({
+        task: "deepen_current_answer",
+        user_request: "没说中重点：补充判断边界。",
+      }),
+    }],
+  }), { type: "function", name: "submit_intervention" });
+  assert.equal(terminalToolChoiceForContext({
+    tools: deepTools,
+    messages: [{
+      role: "user",
+      content: JSON.stringify({ task: "deepen_current_answer", user_request: null }),
+    }],
+  }), "required");
+  assert.equal(terminalToolChoiceForContext({
+    tools: [{ name: "search_prior_evidence" }, ...deepTools],
+    messages: [],
+  }), undefined);
+});
+
 test("candidate fast path bounds provider output and request shape", async () => {
   const evaluateOnce = async (compactTerminal) => {
     const { faux, runtime } = harness();
@@ -1595,7 +1632,7 @@ test("Provider requests cannot exceed the ten-second bridge ceiling", () => {
   assert.equal(backend.decisionTimeoutMs, 10_000);
 });
 
-test("deep Answer uses bounded non-streaming Responses while preserving the Pi tool loop", async () => {
+test("explicit deep Answer revision forces the submit tool through non-streaming Responses", async () => {
   const backend = createOpenAICompatibleBackend({
     base_url: "https://provider.example.test/v1",
     api_key: "test-only-key",
@@ -1664,7 +1701,8 @@ test("deep Answer uses bounded non-streaming Responses while preserving the Pi t
     }),
   });
   const deep = fullRequest("deep-non-streaming");
-  deep.context.trigger_type = "answer_ready";
+  deep.context.trigger_type = "user_request";
+  deep.context.user_request = "没说中重点：补充异常恢复边界。";
   deep.context.priority_mode = "deep";
   deep.context.work_item_id = "answer:job-non-streaming";
   deep.context.rolling_state.current_answer = {
@@ -1679,7 +1717,7 @@ test("deep Answer uses bounded non-streaming Responses while preserving the Pi t
   const result = await runtime.evaluate(deep);
 
   assert.equal(requestBody.stream, false);
-  assert.equal(requestBody.tool_choice, "required");
+  assert.deepEqual(requestBody.tool_choice, { type: "function", name: "submit_intervention" });
   assert.equal(requestBody.max_output_tokens, 280);
   assert.equal(requestHeaders.has("session_id"), false);
   assert.equal(requestHeaders.has("x-client-request-id"), false);

@@ -170,7 +170,13 @@ def test_probe_gateway_uses_max_tokens_for_deepseek_labelled_relay():
         def post_json(self, url, headers, body, timeout):
             calls.append({"url": url, "headers": headers, "body": body, "timeout": timeout})
             return {
-                "choices": [{"message": {"content": "OK"}}],
+                "choices": [{"message": {"tool_calls": [{
+                    "type": "function",
+                    "function": {
+                        "name": "confirm_pi_tool_call",
+                        "arguments": '{"status":"ok"}',
+                    },
+                }]}}],
                 "usage": {"prompt_tokens": 7, "completion_tokens": 2, "total_tokens": 9},
             }
 
@@ -184,10 +190,40 @@ def test_probe_gateway_uses_max_tokens_for_deepseek_labelled_relay():
     result = llm_service.probe_gateway(config, client=ProbeClient())
 
     assert result["operational"] is True
+    assert result["probe_kind"] == "pi_tool_call"
+    assert result["tool_call_ready"] is True
     assert calls[0]["url"] == "https://relay.example/deepseek/v1/chat/completions"
-    assert calls[0]["body"]["max_tokens"] == 16
+    assert calls[0]["body"]["max_tokens"] == 64
     assert "max_completion_tokens" not in calls[0]["body"]
     assert calls[0]["body"]["thinking"] == {"type": "disabled"}
+    assert calls[0]["body"]["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "confirm_pi_tool_call"},
+    }
+
+
+def test_probe_gateway_uses_no_reasoning_for_gpt5_and_rejects_plain_text():
+    calls = []
+
+    class PlainTextClient:
+        def post_json(self, url, headers, body, timeout):
+            calls.append({"url": url, "headers": headers, "body": body, "timeout": timeout})
+            return {
+                "choices": [{"message": {"content": "OK"}}],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 2, "total_tokens": 9},
+            }
+
+    config = llm_service.LlmConfig(
+        base_url="https://gateway.example",
+        api_key="sk-test",
+        model="gpt-5.5",
+        api_style="responses",
+    )
+
+    with pytest.raises(ValueError, match="required Pi tool call"):
+        llm_service.probe_gateway(config, client=PlainTextClient())
+
+    assert calls[0]["body"]["reasoning_effort"] == "none"
     assert calls[0]["timeout"] == 10.0
 
 

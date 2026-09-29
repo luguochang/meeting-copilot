@@ -86,6 +86,8 @@ _SAFE_PROVIDER_ERROR_CODES = frozenset(
         "UNSUPPORTED_PARAMETER",
     }
 )
+_PROVIDER_PROBE_TOOL_NAME = "confirm_pi_tool_call"
+_PROVIDER_PROBE_KIND = "pi_tool_call"
 
 
 class LlmClient(Protocol):
@@ -786,12 +788,14 @@ def probe_gateway(
     config: LlmConfig,
     client: LlmClient | None = None,
 ) -> dict[str, Any]:
-    """Make one bounded request to verify gateway operability.
+    """Make one bounded required-tool request to verify Pi operability.
 
     A connection test and the realtime readiness gate answer different
     questions. The test must be allowed to finish after the realtime window so
     the UI can distinguish "reachable but slow" from "unreachable". Readiness
-    is calculated from the measured latency by the route layer.
+    is calculated from the measured latency by the route layer. A plain text
+    completion is deliberately insufficient: Pi requires the configured model
+    and API style to complete a function call.
     """
     if config.is_mock:
         raise ValueError("mock LLM provider cannot pass production verification")
@@ -805,22 +809,75 @@ def probe_gateway(
         },
         {
             "model": config.model,
-            "messages": [{"role": "user", "content": "只回复 OK"}],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "调用 confirm_pi_tool_call，status 必须为 ok；不要输出正文。",
+                }
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": _PROVIDER_PROBE_TOOL_NAME,
+                        "description": "确认模型能够完成 Pi 实时教练所需的工具调用。",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "status": {"type": "string", "enum": ["ok"]}
+                            },
+                            "required": ["status"],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            ],
+            "tool_choice": {
+                "type": "function",
+                "function": {"name": _PROVIDER_PROBE_TOOL_NAME},
+            },
             "temperature": 0,
-            "reasoning_effort": "low",
+            "reasoning_effort": _provider_probe_reasoning_effort(config),
             **_reasoning_compatibility_parameters(config),
-            **_completion_token_parameter(config, 16),
+            **_completion_token_parameter(config, 64),
         },
         min(float(config.timeout_seconds), _provider_probe_timeout_seconds()),
     )
     choices = data.get("choices") if isinstance(data, dict) else None
-    content = (
-        ((choices or [{}])[0].get("message") or {}).get("content")
+    message = (
+        (choices[0].get("message") or {})
         if isinstance(choices, list) and choices
-        else None
+        else {}
     )
-    if not isinstance(content, str) or not content.strip():
-        raise ValueError("gateway returned no assistant content")
+    tool_calls = message.get("tool_calls") if isinstance(message, Mapping) else None
+    if not isinstance(tool_calls, list):
+        raise ValueError("gateway did not return the required Pi tool call")
+    matched_call = next(
+        (
+            call
+            for call in tool_calls
+            if isinstance(call, Mapping)
+            and isinstance(call.get("function"), Mapping)
+            and str(call["function"].get("name") or "").strip()
+            == _PROVIDER_PROBE_TOOL_NAME
+        ),
+        None,
+    )
+    if matched_call is None:
+        raise ValueError("gateway returned the wrong Pi tool call")
+    raw_arguments = matched_call["function"].get("arguments")
+    try:
+        arguments = (
+            json.loads(raw_arguments)
+            if isinstance(raw_arguments, str)
+            else dict(raw_arguments)
+            if isinstance(raw_arguments, Mapping)
+            else None
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        arguments = None
+    if arguments != {"status": "ok"}:
+        raise ValueError("gateway returned invalid Pi tool arguments")
     usage = data.get("usage") if isinstance(data, dict) else None
     if not isinstance(usage, dict) or not {
         "prompt_tokens",
@@ -842,8 +899,11 @@ def probe_gateway(
     probe_latency_ms = (elapsed_ns + 999_999) // 1_000_000
     return {
         "operational": True,
+        "probe_kind": _PROVIDER_PROBE_KIND,
+        "tool_call_ready": True,
         "provider": provider_identifier(config),
         "model": config.model,
+        "api_style": config.api_style,
         "probe_latency_ms": probe_latency_ms,
         "usage": {
             "prompt_tokens": prompt_tokens,
@@ -867,6 +927,15 @@ def _provider_probe_timeout_seconds() -> float:
     except ValueError:
         return 10.0
     return value if 1.0 <= value <= 30.0 else 10.0
+
+
+def _provider_probe_reasoning_effort(config: LlmConfig) -> str:
+    """Mirror Pi's lowest safe reasoning level for a terminal-only probe."""
+
+    model = str(config.model or "").strip().lower()
+    if model.startswith("gpt-5") and "codex-spark" not in model:
+        return "none"
+    return "low"
 
 
 def _safe_audit_value(value: Any, *, fallback: str) -> str:

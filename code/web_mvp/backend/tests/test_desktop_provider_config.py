@@ -290,6 +290,8 @@ def test_provider_status_is_stable_across_refresh_probe_and_model_switch(monkeyp
         probed_models.append(config.model)
         return {
             "operational": True,
+            "probe_kind": "pi_tool_call",
+            "tool_call_ready": True,
             "provider": config.provider_label,
             "model": config.model,
             "usage": {

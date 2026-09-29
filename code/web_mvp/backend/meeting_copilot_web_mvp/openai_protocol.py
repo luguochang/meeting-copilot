@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, Mapping
 
 
@@ -53,13 +54,27 @@ def chat_body_to_responses(body: Mapping[str, Any], *, stream: bool | None = Non
     if reasoning_effort:
         response_body["reasoning"] = {"effort": reasoning_effort}
 
+    tools = _chat_tools_to_responses(body.get("tools"))
+    if tools:
+        response_body["tools"] = tools
+        tool_choice = _chat_tool_choice_to_responses(body.get("tool_choice"))
+        if tool_choice is not None:
+            response_body["tool_choice"] = tool_choice
+
     return response_body
 
 
 def responses_payload_to_chat(payload: Mapping[str, Any]) -> dict[str, Any]:
     content = responses_output_text(payload)
-    if not content:
-        raise ValueError("responses payload contained no assistant text")
+    tool_calls = responses_tool_calls(payload)
+    if not content and not tool_calls:
+        raise ValueError("responses payload contained no assistant output")
+    message: dict[str, Any] = {
+        "role": "assistant",
+        "content": content or None,
+    }
+    if tool_calls:
+        message["tool_calls"] = tool_calls
     return {
         "id": payload.get("id"),
         "object": "chat.completion",
@@ -67,8 +82,10 @@ def responses_payload_to_chat(payload: Mapping[str, Any]) -> dict[str, Any]:
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": content},
-                "finish_reason": responses_finish_reason(payload),
+                "message": message,
+                "finish_reason": (
+                    "tool_calls" if tool_calls else responses_finish_reason(payload)
+                ),
             }
         ],
         "usage": responses_usage_to_chat(payload.get("usage")),
@@ -101,6 +118,41 @@ def responses_output_text(payload: Mapping[str, Any]) -> str:
     return "".join(parts)
 
 
+def responses_tool_calls(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Normalize completed Responses function calls to Chat Completions shape."""
+
+    output = payload.get("output")
+    if not isinstance(output, list):
+        return []
+    tool_calls: list[dict[str, Any]] = []
+    for index, item in enumerate(output):
+        if not isinstance(item, Mapping) or item.get("type") != "function_call":
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            raise ValueError("responses function call omitted its name")
+        raw_arguments = item.get("arguments")
+        if isinstance(raw_arguments, str):
+            arguments = raw_arguments
+        elif isinstance(raw_arguments, Mapping):
+            arguments = json.dumps(
+                dict(raw_arguments),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        else:
+            raise ValueError("responses function call omitted its arguments")
+        call_id = str(item.get("call_id") or item.get("id") or f"call_{index}")
+        tool_calls.append(
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {"name": name, "arguments": arguments},
+            }
+        )
+    return tool_calls
+
+
 def responses_usage_to_chat(raw_usage: Any) -> dict[str, int]:
     if not isinstance(raw_usage, Mapping):
         return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
@@ -119,6 +171,55 @@ def responses_usage_to_chat(raw_usage: Any) -> dict[str, int]:
 def responses_finish_reason(payload: Mapping[str, Any]) -> str:
     status = str(payload.get("status") or "").strip().lower()
     return "length" if status == "incomplete" else "stop"
+
+
+def _chat_tools_to_responses(raw_tools: Any) -> list[dict[str, Any]]:
+    if raw_tools is None:
+        return []
+    if not isinstance(raw_tools, list):
+        raise ValueError("chat completion tools must be an array")
+    tools: list[dict[str, Any]] = []
+    for raw_tool in raw_tools:
+        if not isinstance(raw_tool, Mapping) or raw_tool.get("type") != "function":
+            raise ValueError("only function tools can be converted to Responses")
+        function = raw_tool.get("function")
+        if not isinstance(function, Mapping):
+            raise ValueError("chat completion function tool is malformed")
+        name = str(function.get("name") or "").strip()
+        parameters = function.get("parameters")
+        if not name or not isinstance(parameters, Mapping):
+            raise ValueError("chat completion function tool is incomplete")
+        tool: dict[str, Any] = {
+            "type": "function",
+            "name": name,
+            "parameters": dict(parameters),
+        }
+        description = function.get("description")
+        if isinstance(description, str) and description.strip():
+            tool["description"] = description.strip()
+        if isinstance(function.get("strict"), bool):
+            tool["strict"] = function["strict"]
+        tools.append(tool)
+    return tools
+
+
+def _chat_tool_choice_to_responses(raw_choice: Any) -> Any:
+    if raw_choice is None:
+        return None
+    if isinstance(raw_choice, str):
+        normalized = raw_choice.strip().lower()
+        if normalized in {"auto", "none", "required"}:
+            return normalized
+        raise ValueError("chat completion tool_choice is unsupported")
+    if not isinstance(raw_choice, Mapping) or raw_choice.get("type") != "function":
+        raise ValueError("chat completion tool_choice is malformed")
+    function = raw_choice.get("function")
+    if not isinstance(function, Mapping):
+        raise ValueError("chat completion function tool_choice is malformed")
+    name = str(function.get("name") or "").strip()
+    if not name:
+        raise ValueError("chat completion function tool_choice omitted its name")
+    return {"type": "function", "name": name}
 
 
 def _message_text(content: Any) -> str:

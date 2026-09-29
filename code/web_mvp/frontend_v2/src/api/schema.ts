@@ -78,6 +78,8 @@ export interface ProviderProbeUsage {
 
 export interface ProviderProbeResult {
   operational: true;
+  probe_kind: "pi_tool_call";
+  tool_call_ready: true;
   realtime_ready: boolean;
   probe_latency_ms: number;
   realtime_cutoff_ms: number;
@@ -282,6 +284,9 @@ export function parseProviderProbeResult(value: unknown): ProviderProbeResult {
   if (source.ok !== true || source.operational !== true) {
     throw new ContractError("provider probe did not report an operational success");
   }
+  if (source.probe_kind !== "pi_tool_call" || source.tool_call_ready !== true) {
+    throw new ContractError("provider probe did not prove Pi tool-call readiness");
+  }
   const probeLatencyMs = nonNegativeInteger(
     source.probe_latency_ms,
     "provider probe result.probe_latency_ms",
@@ -300,6 +305,8 @@ export function parseProviderProbeResult(value: unknown): ProviderProbeResult {
   }
   return {
     operational: true,
+    probe_kind: "pi_tool_call",
+    tool_call_ready: true,
     realtime_ready: realtimeReady,
     probe_latency_ms: probeLatencyMs,
     realtime_cutoff_ms: realtimeCutoffMs,

@@ -12,6 +12,21 @@ from meeting_copilot_web_mvp.app import create_app
 PROBE_HEADERS = {"X-Meeting-Copilot-Verification": "1"}
 
 
+def _tool_probe_response(usage=None):
+    payload = {
+        "choices": [{"message": {"tool_calls": [{
+            "type": "function",
+            "function": {
+                "name": "confirm_pi_tool_call",
+                "arguments": '{"status":"ok"}',
+            },
+        }]}}],
+    }
+    if usage is not None:
+        payload["usage"] = usage
+    return payload
+
+
 def test_llm_provider_probe_fails_closed_when_not_configured(monkeypatch):
     monkeypatch.delenv("LLM_GATEWAY_BASE_URL", raising=False)
     monkeypatch.delenv("LLM_GATEWAY_API_KEY", raising=False)
@@ -29,10 +44,9 @@ def test_llm_provider_probe_uses_running_service_configuration(monkeypatch):
     class Client:
         def post_json(self, url, headers, body, timeout):
             calls.append((url, headers, body, timeout))
-            return {
-                "choices": [{"message": {"content": "OK"}}],
-                "usage": {"prompt_tokens": 7, "completion_tokens": 2, "total_tokens": 9},
-            }
+            return _tool_probe_response(
+                {"prompt_tokens": 7, "completion_tokens": 2, "total_tokens": 9}
+            )
 
     monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gateway.example")
     monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-probe-secret")
@@ -48,8 +62,11 @@ def test_llm_provider_probe_uses_running_service_configuration(monkeypatch):
     assert response.json() == {
         "ok": True,
         "operational": True,
+        "probe_kind": "pi_tool_call",
+        "tool_call_ready": True,
         "provider": "openai_compatible_gateway",
         "model": "probe-fast-model",
+        "api_style": "chat_completions",
         "realtime_ready": True,
         "probe_latency_ms": 1,
         "realtime_cutoff_ms": 2500,
@@ -58,9 +75,13 @@ def test_llm_provider_probe_uses_running_service_configuration(monkeypatch):
     assert calls[0][0] == "https://gateway.example/v1/chat/completions"
     assert calls[0][2]["model"] == "probe-fast-model"
     assert calls[0][2]["reasoning_effort"] == "low"
-    assert calls[0][2]["max_completion_tokens"] == 16
+    assert calls[0][2]["max_completion_tokens"] == 64
     assert "max_tokens" not in calls[0][2]
     assert "thinking" not in calls[0][2]
+    assert calls[0][2]["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "confirm_pi_tool_call"},
+    }
     assert b"sk-probe-secret" not in response.content
     stats = client.get("/settings/cost-stats").json()
     assert any(item["purpose"] == "provider_probe" for item in stats["breakdown"])
@@ -112,7 +133,7 @@ def test_llm_provider_probe_returns_safe_gateway_failure(monkeypatch):
 def test_llm_provider_probe_fails_closed_when_usage_metadata_is_missing(monkeypatch):
     class MissingUsageClient:
         def post_json(self, *_args, **_kwargs):
-            return {"choices": [{"message": {"content": "OK"}}]}
+            return _tool_probe_response()
 
     monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gateway.example")
     monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-probe-secret")
@@ -152,10 +173,9 @@ def test_retryable_probe_failure_opens_shared_realtime_circuit(monkeypatch):
 def test_llm_provider_probe_rejects_inconsistent_usage_metadata(monkeypatch):
     class InconsistentUsageClient:
         def post_json(self, *_args, **_kwargs):
-            return {
-                "choices": [{"message": {"content": "OK"}}],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 1},
-            }
+            return _tool_probe_response(
+                {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 1}
+            )
 
     monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gateway.example")
     monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-probe-secret")
@@ -202,10 +222,9 @@ def test_llm_provider_probe_reuses_short_lived_success_without_second_paid_call(
         def post_json(self, *_args, **_kwargs):
             nonlocal calls
             calls += 1
-            return {
-                "choices": [{"message": {"content": "OK"}}],
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-            }
+            return _tool_probe_response(
+                {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            )
 
     monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gateway.example")
     monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-probe-secret")
@@ -230,10 +249,9 @@ def test_llm_provider_probe_checks_budget_before_warm_success_cache(monkeypatch)
         def post_json(self, *_args, **_kwargs):
             nonlocal calls
             calls += 1
-            return {
-                "choices": [{"message": {"content": "OK"}}],
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-            }
+            return _tool_probe_response(
+                {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            )
 
     monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://warm-cache-budget.example")
     monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-probe-secret")
@@ -274,14 +292,9 @@ def test_llm_provider_probe_route_single_flight_is_not_masked_by_success_cache(m
             calls += 1
             provider_entered.set()
             assert release_provider.wait(timeout=3)
-            return {
-                "choices": [{"message": {"content": "OK"}}],
-                "usage": {
-                    "prompt_tokens": 1,
-                    "completion_tokens": 1,
-                    "total_tokens": 2,
-                },
-            }
+            return _tool_probe_response(
+                {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            )
 
     monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gateway.example")
     monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-probe-secret")

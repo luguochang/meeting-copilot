@@ -140,9 +140,9 @@ function statusAfterProbe(
 }
 
 function probeSuccessMessage(probeResult: ProviderProbeResult | null, suffix = ""): string {
-  if (probeResult?.realtime_ready === true) return `Provider 探测通过，实时稳定性待验收${suffix}`;
-  if (probeResult?.realtime_ready === false) return `Provider 已连接，但单次探测超过实时窗口${suffix}`;
-  return `Provider 已连接，实时性待确认${suffix}`;
+  if (probeResult?.realtime_ready === true) return `模型工具调用通过，Pi 实时链路待验收${suffix}`;
+  if (probeResult?.realtime_ready === false) return `模型可调用工具，但超过实时窗口${suffix}`;
+  return `Provider 已连接，模型工具调用待确认${suffix}`;
 }
 
 async function getJson<T>(path: string): Promise<T> {
@@ -382,7 +382,7 @@ export function ProviderSettingsControl() {
       setProviderStatus(savedStatus);
       setPhase("configured");
       setApiKey("");
-      setMessage("AI 配置已保存，请点击“测试连接”验证 Provider");
+      setMessage("AI 配置已保存，请点击“测试连接”验证模型工具调用");
       setConfirmingClear(false);
       setConfirmingClose(false);
       setDirty(false);
@@ -546,11 +546,11 @@ export function ProviderSettingsControl() {
           : "配置 AI";
 
   const connectionLabel = connectionState === "testing"
-    ? "正在测试连接"
+    ? "正在测试模型工具调用"
     : connectionState === "connected"
-      ? "Provider 探测通过"
+      ? "模型工具调用通过"
       : connectionState === "slow"
-        ? "已连接，但实时响应过慢"
+        ? "模型可调用工具，但实时响应过慢"
         : connectionState === "unknown"
           ? "已连接，实时性待确认"
           : connectionState === "failed"
@@ -562,11 +562,11 @@ export function ProviderSettingsControl() {
               : "尚未配置";
 
   const realtimeReadinessLabel = connectionState === "slow"
-    ? `单次探测超过实时窗口${providerStatus.probe_latency_ms !== null
-      ? ` · 探测 ${providerStatus.probe_latency_ms}ms > 实时窗口 ${providerStatus.realtime_cutoff_ms}ms`
+    ? `工具调用超过实时窗口${providerStatus.probe_latency_ms !== null
+      ? ` · 工具调用 ${providerStatus.probe_latency_ms}ms > 实时窗口 ${providerStatus.realtime_cutoff_ms}ms`
       : ""}`
     : connectionState === "connected"
-      ? `Provider 探测通过 · 实时稳定性待验收 · 探测 ${providerStatus.probe_latency_ms ?? 0}ms`
+      ? `模型工具调用通过 · Pi 实时链路待验收 · ${providerStatus.probe_latency_ms ?? 0}ms`
       : connectionState === "unknown"
         ? "实时性待确认 · 请完成一次完整连接测试"
         : connectionState === "untested"
@@ -774,7 +774,7 @@ export function ProviderSettingsControl() {
                     ) : null}
                   </details>
 
-                  <p className="provider-settings-note">AI 仅接收会议文字，不上传录音。测试连接会发送一次最小请求，可能产生少量费用。</p>
+                  <p className="provider-settings-note">AI 仅接收会议文字，不上传录音。测试连接会按当前实时模型和协议发送一次最小 Pi 工具调用，可能产生少量费用。</p>
                   {error ? <p className="inline-error" role="alert">{error}</p> : null}
                   {message ? <p className="inline-success" role="status">{message}</p> : null}
 

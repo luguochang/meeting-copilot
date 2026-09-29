@@ -77,7 +77,7 @@
 - 已新增仅用于 `deep_answer` 的 Responses 非流式适配器；Pi `Agent`、session、tool execution、terminal action 和 loop 保持不变，10 秒 realtime candidate lane 继续使用原 SDK streaming。
 - Provider 端合同压缩为 `headline + say_this_addition + 两个 key_points + confidence`；两个 key point 固定表示“遗漏判断”和“下一步”，host 再展开为稳定 `coaching_package`、绑定证据和 legacy 字段，避免让模型重复生成同义内容。
 - Deep Agent 请求由约 5450 字符降到 2348 字符，工具 schema 由约 971 字符降到 826 字符；输出上限 280 token；自定义网关请求不再携带无必要的 `session_id` / `x-client-request-id` affinity 头。
-- Pi bridge：54 项全部通过；后端全量：1802 项通过、1 项跳过；前端：34 个文件、361 项通过；TypeScript、ESLint、生产构建和 `git diff --check` 通过。
+- Pi bridge：55 项全部通过；后端全量：1804 项通过、1 项跳过；前端：34 个文件、361 项通过；TypeScript、ESLint、生产构建和 `git diff --check` 通过。
 - 第一次真实非流式回放：`job_cfc0c8ec006e917b19552e6a`，约 19.68 秒后 `pi_timeout`，无 revision，旧成功内容未被覆盖。
 - 压缩合同后的最后一次真实回放：`job_0e348dd7ed517344c68eca36`，20.008 秒命中 `agent_deadline_exceeded`，仍无 terminal tool result；会议已恢复为 `ended`，原 `ended_at_ms=1790693124659`。
 - 结论：当前阻塞已不再是 React、Answer 证据绑定、流式 SSE、session affinity 或明显的 schema/Prompt 膨胀；`codexai.club + gpt-5.5` 对完整深度工具调用的服务端完成时延仍不满足 8 秒产品门槛。不得再增加 timeout、重复消耗测试额度或把 timeout/fallback 记为 Pi 成功。
@@ -86,10 +86,14 @@
 - Spark Responses：`job_0cff38f71c14be767f1274fc`，Pi E2E 2391ms，Provider 约 2033ms 后返回 HTTP 502，0 token、0 tool call、无 revision。
 - Spark Chat Completions：`job_961820e6982ca46ac7fe408d`，Pi E2E 1189ms，Provider 约 1165ms 后返回 HTTP 502，0 token、0 tool call、无 revision。两种 API 风格同样失败，证明该网关当前“模型在清单中”不等于推理路由可用；不再继续真实重试。
 - 两次 Spark 失败均未覆盖已有内容；Provider 已恢复为 `gpt-5.5 / Responses`，会议已恢复为 `ended`，原 `ended_at_ms=1790693124659`。
-- 受控备份：`artifacts/tmp/ui-remediation-real-provider-20260929-03-user-revision/pre-non-streaming-responses-retry.sqlite3`、`pre-compact-non-streaming-retry.sqlite3` 和 `pre-spark-8s-retry.sqlite3`；均为本地验收数据，不提交仓库，最新备份权限为 `0600`。
-- 用户约束：在用户再次明确允许前，持续禁止扬声器外放、真实麦克风自动采集和 loopback 验收；允许固定音频、代码测试、数据库回放、静默浏览器测试和 Provider API。当前轮没有启动麦克风或播放声音。
+- Provider “测试连接”已从只要求文本 `OK` 改为强制 `confirm_pi_tool_call`；Chat Completions / Responses 均必须返回工具名、可解析参数和一致 usage 才算成功，不再把“网关能回文本”当成 Pi 可用。
+- `gpt-5.5 / Responses` 真实工具探针成功：`probe_latency_ms=3162`、`tool_call_ready=true`、`realtime_ready=false`、`4476 tokens`。该结果只证明模型和协议具备函数调用能力，不代表 Pi harness/loop 完整链路通过。
+- 绑定 `answer:job_5e21176ec3b2f6fcdb656a27` 的用户纠偏已在本地回归中证明最终 Responses 请求精确指定唯一 `submit_intervention`；真实任务 `job_f0e0dcdb4c5ce1106e80fc65` 仍为 E2E 7608ms、bridge 7248ms、0 token、0 tool call、0 revision、`provider_timeout`。
+- 因此最终根因是“最小工具探针可返回，完整 Pi 深度请求超过产品预算”，而非麦克风、React 渲染、Pi SDK 未加载或工具选择错误。当前 Provider 不能作为真实教练验收依据，不再重复消耗测试 Key。
+- 受控备份：`artifacts/tmp/ui-remediation-real-provider-20260929-03-user-revision/pre-non-streaming-responses-retry.sqlite3`、`pre-compact-non-streaming-retry.sqlite3`、`pre-spark-8s-retry.sqlite3` 以及 `artifacts/tmp/ui-remediation-real-provider-20260930-04-exact-user-tool/pre-exact-user-request-after-restart.sqlite3`；均为本地验收数据，不提交仓库，最新备份权限为 `0600`。
+- 用户约束：在用户再次明确允许前，持续禁止扬声器外放、真实麦克风自动采集和 audible loopback 验收；允许固定音频、代码测试、数据库回放、静默浏览器测试和 Provider API。本轮只做了 HTTP Provider 请求和数据库回放，没有启动麦克风或播放声音。
 - 2026-09-30 静默复验：`8991` 使用当前源码和原验收数据目录重新启动，runtime identity 全项通过；桌面返回、AI 设置的独立“测试连接 / 保存配置”、Escape 关闭和焦点恢复正常；375x667 下 `scrollWidth=innerWidth=375`，会议文字/实时教练切换可被浏览器返回恢复，console 为 0 error / 0 warn。复验未点击“立即开始录音”、未请求麦克风权限、未播放声音，也未调用真实 Provider。
-- 最终静默质量门：Pi bridge 54 项、前端 34 个文件/361 项、后端 1802 项（1 项跳过）全部通过；Ruff、ESLint、TypeScript、生产构建、Pi smoke 和 `git diff --check` 通过。构建仅保留既有的约 683KB 主 bundle 警告。
+- 最终静默质量门：Pi bridge 55 项、前端 34 个文件/361 项、后端 1804 项（1 项跳过）全部通过；Ruff、ESLint、TypeScript、生产构建、Pi smoke 和 `git diff --check` 通过。构建仅保留既有的约 683KB 主 bundle 警告。
 
 ## 1. 结论
 

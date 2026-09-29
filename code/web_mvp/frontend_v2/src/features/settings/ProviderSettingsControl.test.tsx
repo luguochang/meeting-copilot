@@ -45,6 +45,8 @@ const configured = {
 const realtimeProbe = {
   ok: true,
   operational: true,
+  probe_kind: "pi_tool_call",
+  tool_call_ready: true,
   realtime_ready: true,
   probe_latency_ms: 120,
   realtime_cutoff_ms: 2_500,
@@ -281,15 +283,15 @@ describe("ProviderSettingsControl", () => {
     await user.type(within(dialog).getByLabelText("API Key"), "sk-web-test");
     await user.click(within(dialog).getByRole("button", { name: "保存配置" }));
 
-    await waitFor(() => expect(within(dialog).getByText("AI 配置已保存，请点击“测试连接”验证 Provider")).toBeVisible());
+    await waitFor(() => expect(within(dialog).getByText("AI 配置已保存，请点击“测试连接”验证模型工具调用")).toBeVisible());
     expect(fetchMock.mock.calls.some(([input]) => String(input) === "/providers/llm/probe")).toBe(false);
     expect(within(dialog).getByRole("region", { name: "AI 连接状态" })).toHaveClass("provider-connection--untested");
 
     await user.click(within(dialog).getByRole("button", { name: "测试连接" }));
 
     const connectionRegion = within(dialog).getByRole("region", { name: "AI 连接状态" });
-    await waitFor(() => expect(within(connectionRegion).getByText("Provider 探测通过")).toBeVisible());
-    expect(within(dialog).getByText("Provider 探测通过，实时稳定性待验收")).toBeVisible();
+    await waitFor(() => expect(within(connectionRegion).getByText("模型工具调用通过")).toBeVisible());
+    expect(within(dialog).getByText("模型工具调用通过，Pi 实时链路待验收")).toBeVisible();
     expect(screen.getByRole("dialog", { name: "AI 设置" })).toBeVisible();
     expect(within(dialog).getByRole("button", { name: "测试连接" })).toHaveClass("provider-test-button--connected");
     const saveCall = fetchMock.mock.calls.find(([input, init]) =>
@@ -422,7 +424,7 @@ describe("ProviderSettingsControl", () => {
 
     await waitFor(() => expect(invoke).toHaveBeenCalledWith("provider_config_sync"));
     const connectionRegion = within(dialog).getByRole("region", { name: "AI 连接状态" });
-    await waitFor(() => expect(within(connectionRegion).getByText("Provider 探测通过")).toBeVisible());
+    await waitFor(() => expect(within(connectionRegion).getByText("模型工具调用通过")).toBeVisible());
   });
 
   it("uses a warning state when the provider is reachable but misses the realtime cutoff", async () => {
@@ -448,8 +450,8 @@ describe("ProviderSettingsControl", () => {
 
     await waitFor(() => expect(region).toHaveClass("provider-connection--slow"));
     expect(region).not.toHaveClass("provider-connection--connected");
-    expect(within(region).getByText("已连接，但实时响应过慢")).toBeVisible();
-    expect(within(region).getByText(/3000ms > 实时窗口 2500ms/)).toBeVisible();
+    expect(within(region).getByText("模型可调用工具，但实时响应过慢")).toBeVisible();
+    expect(within(region).getByText(/工具调用 3000ms > 实时窗口 2500ms/)).toBeVisible();
   });
 
   it("keeps readiness unknown when a legacy probe omits evidence", async () => {
