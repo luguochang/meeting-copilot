@@ -8,7 +8,7 @@
 
 此前“标题闪动但正文无价值”的两个 P0 已处理：Fast Answer 与 Pi Deep 使用独立 durable lane，失败/静默不再清除有效回答或上一张卡；Provider 费率未知不再错误禁用 correction，Answer/Pi/correction 的 reservation 和公平调度也已分开。五分钟真实硬件样本和后续回归证明 system audio -> ASR -> Fast Answer -> Pi Deep 主链可用。
 
-当前不宣称桌面端达到 Go 标准，原因已收敛为两项可验证缺口：MacBook Air 物理麦克风在系统设置和 AVAudioEngine 中仍为零电平，尚未形成真正双方发声的物理双轨证据；Pi 相对只使用 Fast Answer 的增量价值仍缺至少两名独立标注者的盲评。
+当前不宣称桌面端达到 Go 标准，原因已收敛为两项可验证缺口：MacBook Air 处于合盖状态（`AppleClamshellState = Yes`），Apple Silicon 在该状态下硬件断开内建麦克风，因此系统设置和 AVAudioEngine 均只能得到零电平，尚未形成真正双方发声的物理双轨证据；Pi 相对只使用 Fast Answer 的增量价值仍缺至少两名独立标注者的盲评。
 
 ## 2. 运行链路
 
@@ -113,7 +113,7 @@ cargo check --locked
 | Pi bridge | `50 passed` |
 | 前端 | ESLint 通过，`329 passed`，TypeScript/Vite build 通过 |
 | 真实 Provider | Fast Answer `1/1`；Pi `deep_answer`、单轮工具调用和多段证据绑定成功 |
-| 真实五分钟硬件 | system audio `12` 条 final；物理麦克风 helper 连续运行但 PCM 为零 |
+| 真实五分钟硬件 | system audio `12` 条 final；物理麦克风 helper 连续运行但因 MacBook 合盖而 PCM 为零 |
 | Git 差异 | `git diff --check` 与凭据扫描通过，不包含本地录音或 `artifacts/` |
 
 后端唯一跳过项是显式环境集成测试，不在普通源码运行环境伪造通过。Vite 仍提示主包超过 500 kB，这是已记录的性能优化项，不影响本次构建正确性。
@@ -131,7 +131,7 @@ cargo check --locked
 - [x] 有效 Pi 卡片不会被后续 `not_triggered`/`protected_silent` 空状态清除。
 - [x] 显式测试 Provider 下 realtime/deep/correction 使用独立 reservation；未知费率不再错误禁用 correction。
 - [x] 真实 system audio 会议达到 Fast Answer 首字、完成时延和 ASR 可读性门槛。
-- [ ] 物理麦克风取得非零 PCM 后完成真正双方发声的双轨稳定性验收。
+- [ ] 打开 MacBook 上盖（或连接外置麦克风），确认系统输入电平与 3 秒 AVAudioEngine probe 为非零后，完成真正双方发声的双轨稳定性验收。
 - [ ] 至少两名独立标注者证明 Pi 相对 direct/local 具有增量价值。
 
 ## 8. 建议评审顺序

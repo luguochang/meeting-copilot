@@ -3,7 +3,7 @@
 > 版本：v1.0
 > 日期：2026-09-29（最新复验）
 > 目标分支：`feat/pi-realtime-coach-agent-loop`
-> 状态：Fast Answer、Pi Deep、Correction 已完成真实 Provider 验收；同音频 `main` 基线、原生双轨协议、五分钟物理 system audio 连续采集和会中 Answer/Pi 布局均已有证据。MacBook Air 物理麦克风 helper 已获权限并持续运行，但系统输入电平与 PCM 仍为零，因此真正的双人双轨验收仍是发布阻塞项。后续代码、测试和验收必须能回到本文件中的用户效果与指标。
+> 状态：Fast Answer、Pi Deep、Correction 已完成真实 Provider 验收；同音频 `main` 基线、原生双轨协议、五分钟物理 system audio 连续采集和会中 Answer/Pi 布局均已有证据。MacBook Air 物理麦克风 helper 已获权限并持续运行，但设备处于合盖状态（`AppleClamshellState = Yes`），Apple Silicon 在该状态下硬件断开内建麦克风，因此系统输入电平与 PCM 为零。打开上盖或连接外置麦克风后的真正双人双轨验收仍是发布阻塞项。后续代码、测试和验收必须能回到本文件中的用户效果与指标。
 
 ## 0. 决策摘要
 
@@ -295,7 +295,7 @@ created_at_ms / updated_at_ms
 
 随后增加 Pi Deep 提交前事实落地屏障：仅替换无证据的日期、数字、负责人、产品名或完成状态所在行，结构错误、证据错误和其他安全错误仍 fail closed。最小真实 Provider 复验 `accept_real_grounded_pi_20260929_03` 中，Fast Answer 首字/提交约为 `2.27s / 3.30s`；Pi SDK 使用 `deep_answer` profile、单轮 `submit_intervention`、两段宿主证据，约 `2.74s` 首字、`4.88s` 决策、`4.96s` 投影，最终卡片补充了上线判断边界、无依据承诺风险和验收未通过时的追问。
 
-物理麦克风没有被误报为通过：默认输入已确认是 MacBook Air 麦克风，输入音量为 53%，ChatGPT/Chrome/桌面 helper 权限均已开启；但 macOS“声音 > 输入”的系统电平和 AVAudioEngine PCM 在外放期间都保持为零。当前结论是 system audio 物理链路通过，麦克风可启动且协议可传输静音帧，但仍需一次有人对着机器发声且系统输入电平非零的验收。
+物理麦克风没有被误报为通过：默认输入已确认是 MacBook Air 麦克风，ChatGPT/Chrome/桌面 helper 权限均已开启；输入音量复核时调至 `60%`，输出为 MacBook Air 扬声器、`18%` 且未静音。macOS“声音 > 输入”和 3 秒 AVAudioEngine probe 均为零，随后系统级复核得到 `AppleClamshellState = Yes`，证明设备当前合盖；Apple Silicon 合盖时会在硬件层断开内建麦克风。当前结论是 system audio 物理链路通过，麦克风 helper、权限和协议正常，零 PCM 的已知物理原因是合盖；下一次验收必须先打开上盖或连接外置麦克风，确认系统输入电平和 `peak_rms` 非零，再运行真正双方发声的双轨样本。
 
 ## 12. 本轮非目标
 

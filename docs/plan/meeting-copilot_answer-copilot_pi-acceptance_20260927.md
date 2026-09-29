@@ -3,7 +3,7 @@
 > 日期：2026-09-29（最新复验）
 > 分支：`feat/pi-realtime-coach-agent-loop`
 > 基线：`0b69f1a`
-> 结论：Fast Answer、Pi Deep Coach、后台转写精修三条独立通道已通过真实 FunASR + 真实 Provider 验收，Pi 已能给出绑定当前回答的边界、风险和追问。相同固定音频的 `main` 基线、原生双轨协议、五分钟物理 system audio 连续采集以及桌面/移动布局均已有证据。MacBook Air 麦克风 helper 已获权限并连续运行，但系统输入电平和 PCM 仍为零；因此 system audio 主链可用，真正双方发声的物理双轨仍未达到发布线。
+> 结论：Fast Answer、Pi Deep Coach、后台转写精修三条独立通道已通过真实 FunASR + 真实 Provider 验收，Pi 已能给出绑定当前回答的边界、风险和追问。相同固定音频的 `main` 基线、原生双轨协议、五分钟物理 system audio 连续采集以及桌面/移动布局均已有证据。MacBook Air 麦克风 helper 已获权限并连续运行，但设备处于合盖状态（`AppleClamshellState = Yes`），内建麦克风被硬件断开，系统输入电平和 PCM 因此为零；system audio 主链可用，打开上盖或连接外置麦克风后的真正双方发声双轨仍未达到发布线。
 
 ## 1. 这次解决的产品问题
 
@@ -283,7 +283,9 @@ Redis Stream为什么选择Redis Stream，而不是Kafka？请说明架构取舍
 
 同轮发现静音 microphone track 写入全局 `asr_no_final`，错误阻塞已有 system audio final 的 correction、minutes 和 approach。现改为：诊断仍保留，但只要任一轨已有持久化非空 final，校对和已启用的 LLM 派生可以继续；所有轨都没有 final 时仍 fail closed。
 
-物理麦克风结论保持保守：macOS 已显示 Chrome、ChatGPT 和桌面 helper 均允许访问麦克风；默认输入为 MacBook Air 麦克风，输入音量 53%。但“声音 > 输入”的系统输入电平和 AVAudioEngine 样本在外放期间均为零。因系统层同样无输入，本轮不能把它归类为浏览器权限或 WebSocket bug，也不能宣称物理双轨通过。
+物理麦克风结论保持保守：macOS 已显示 Chrome、ChatGPT 和桌面 helper 均允许访问麦克风；默认输入为 MacBook Air 麦克风，复核时输入音量调至 `60%`，默认输出为 MacBook Air 扬声器、音量 `18%` 且未静音。“声音 > 输入”的系统电平和 3 秒 AVAudioEngine probe 均为零；系统级 `ioreg` 进一步返回 `AppleClamshellState = Yes`，确认 MacBook 正处于合盖状态，Apple Silicon 会在该状态下硬件断开内建麦克风。因此它不是浏览器权限、WebSocket、ASR 或 Pi bug；打开上盖或连接外置麦克风并取得非零 `peak_rms` 前，仍不能宣称物理双轨通过。
+
+复测入口固定为：先确认 `AppleClamshellState = No`，再在 macOS“声音 > 输入”观察到非零电平，并运行原生 helper 的 3 秒 probe；只有 `probe_status=audible` 且 `peak_rms > 0` 才启动新的双轨会议样本。这样不会再把“helper 已启动并发送静音帧”误当成“麦克风真实可用”。
 
 ## 10. 证据绑定、事实落地与真实回归
 
