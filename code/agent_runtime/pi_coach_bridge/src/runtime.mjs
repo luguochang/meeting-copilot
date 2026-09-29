@@ -194,7 +194,8 @@ const DEEP_ANSWER_SYSTEM_PROMPT = [
   "Your job is not to rewrite or summarize current_answer. Add only the highest-value missing boundary, risk, evidence-backed nuance, or likely follow-up preparation. Honor user_request when present; answer_ready is an automatic second pass over the visible answer.",
   "Submit one structured deep-coaching card with boundary, risk, and follow_up. Keep each point to one concise phrase; do not repeat current_answer in any field.",
   "A point may contain a bounded professional inference, but uncertain project details must be phrased as a check or possible risk rather than a claim that they happened.",
-  "The host binds the card to the exact transcript paragraph behind current_answer. Never invent a person, project result, number, deadline, or user experience.",
+  "The host binds the card to the exact bounded transcript evidence used by current_answer. Never invent a person, project result, number, deadline, product name, completion state, or user experience.",
+  "Every date, number, threshold, owner, product name, and completion state in boundary, risk, follow_up, title, or why_now must appear verbatim in bound_evidence or current_answer. Otherwise use a fact-free check such as '需要确认适用边界' without adding specifics.",
   "Use only an allowed_event_type. Match the dialogue language; Chinese context requires Chinese title, recommendation, and reason.",
   "If the supplied evidence and current_answer are sufficient, call submit_intervention in the first response. Search or read history only when a missing earlier fact is necessary. Use keep_silent only when no incremental value remains.",
   "Finish with exactly one terminal tool and never return ordinary assistant text.",
@@ -436,27 +437,55 @@ function boundedDeepPoint(value, field) {
   return normalized.slice(0, 120).replace(/[，,：:]$/u, "");
 }
 
-function deepAnswerEvidence(context) {
+function deepAnswerParagraphs(context) {
   const currentAnswer = context?.rolling_state?.current_answer;
   const answerEvidenceId = typeof currentAnswer?.evidence_segment_id === "string"
     ? currentAnswer.evidence_segment_id.trim()
     : "";
-  const paragraphs = [
+  const paragraphList = [
     ...context.new_paragraphs,
     ...context.context_paragraphs,
     ...context.candidate_evidence_paragraphs,
     ...context.retrieval_paragraphs,
   ];
-  const paragraph = paragraphs.find((item) => item.id === answerEvidenceId);
-  if (!answerEvidenceId || !paragraph?.text?.trim()) {
+  const paragraphs = new Map(paragraphList.map((item) => [item.id, item]));
+  const answerParagraph = paragraphs.get(answerEvidenceId);
+  if (!answerEvidenceId || !answerParagraph?.text?.trim()) {
     throw new PiCoachProtocolError(
       "deep answer is missing its host-bound evidence paragraph",
       "invalid_request",
     );
   }
+  const contextEvidenceIds = Array.isArray(currentAnswer?.context_evidence_segment_ids)
+    ? currentAnswer.context_evidence_segment_ids
+      .filter((item) => typeof item === "string" && item.trim())
+      .map((item) => item.trim())
+    : [];
+  const requestedIds = [...new Set([...contextEvidenceIds, answerEvidenceId])];
+  const selected = requestedIds
+    .map((id) => paragraphs.get(id))
+    .filter((item) => item?.text?.trim())
+    .slice(-8);
+  if (!selected.some((item) => item.id === answerEvidenceId)) {
+    selected.push(answerParagraph);
+  }
+  return selected.slice(-8);
+}
+
+function deepAnswerEvidence(context) {
+  const paragraphs = deepAnswerParagraphs(context);
+  const bounded = [];
+  let remaining = 4000;
+  for (const paragraph of [...paragraphs].reverse()) {
+    if (remaining <= 0) break;
+    const text = paragraph.text.trim().slice(0, Math.min(900, remaining));
+    if (!text) continue;
+    bounded.unshift({ paragraph, text });
+    remaining -= text.length + 1;
+  }
   return {
-    evidence_segment_ids: [answerEvidenceId],
-    evidence_quote: paragraph.text.trim().slice(0, 1000),
+    evidence_segment_ids: bounded.map(({ paragraph }) => paragraph.id),
+    evidence_quote: bounded.map(({ text }) => text).join("\n"),
   };
 }
 
@@ -1847,22 +1876,14 @@ function buildSparkCandidatePrompt(context) {
 
 function buildDeepAnswerPrompt(context) {
   const signals = contextSignals(context);
-  const paragraphsById = new Map();
-  for (const paragraph of [
-    ...context.retrieval_paragraphs,
-    ...context.context_paragraphs,
-    ...context.candidate_evidence_paragraphs,
-    ...context.new_paragraphs,
-  ]) {
-    paragraphsById.set(paragraph.id, compactPromptParagraph(paragraph));
-  }
+  const boundEvidence = deepAnswerParagraphs(context).map(compactPromptParagraph);
   return JSON.stringify({
     task: "deepen_current_answer",
     output_language: outputLanguage(context),
     host_checklist_reviewed: true,
     user_request: context.user_request,
     current_answer: signals.rolling_state.current_answer ?? null,
-    recent_evidence_paragraphs: [...paragraphsById.values()].slice(-8),
+    bound_evidence: boundEvidence,
     meeting_goal: context.meeting_goal,
     open_items: signals.rolling_state.open_items ?? [],
     skill: {
@@ -1870,7 +1891,7 @@ function buildDeepAnswerPrompt(context) {
       objective: context.coach_skill.objective,
       allowed_event_types: [...allowedEventTypes(context)].filter(Boolean).sort(),
     },
-    instruction: "Do not repeat current_answer. Submit one incremental boundary, risk, missing point, or likely follow-up preparation. The host owns evidence binding; search older evidence only when necessary.",
+    instruction: "Do not repeat current_answer. Submit one incremental boundary, risk, missing point, or likely follow-up preparation. Every concrete date, number, threshold, owner, product name, or completion state must appear verbatim in bound_evidence or current_answer; otherwise use a fact-free check without specifics.",
   });
 }
 

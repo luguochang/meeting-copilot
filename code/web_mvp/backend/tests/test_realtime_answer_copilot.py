@@ -7,6 +7,8 @@ import pytest
 from meeting_copilot_web_mvp.realtime_answer_copilot import (
     build_realtime_answer_messages,
     detect_answer_trigger,
+    ground_realtime_answer,
+    is_low_information_question_tail,
 )
 
 
@@ -127,6 +129,16 @@ def test_non_questions_and_unreadable_noise_do_not_trigger(text: str) -> None:
     assert trigger.should_answer is False
 
 
+@pytest.mark.parametrize("text", ["你吗？", "是吗", "那呢？", "可以嘛？"])
+def test_low_information_question_tail_is_detected(text: str) -> None:
+    assert is_low_information_question_tail(text) is True
+
+
+@pytest.mark.parametrize("text", ["能上线吗？", "为什么呢？", "风险是什么？"])
+def test_meaningful_short_question_is_not_treated_as_a_tail(text: str) -> None:
+    assert is_low_information_question_tail(text) is False
+
+
 def test_answer_prompt_is_bounded_role_aware_and_forbids_invention() -> None:
     messages = build_realtime_answer_messages(
         question_text="为什么选择 Redis Stream？",
@@ -149,6 +161,7 @@ def test_answer_prompt_is_bounded_role_aware_and_forbids_invention() -> None:
     assert [message["role"] for message in messages] == ["system", "user"]
     assert "第一句就回答问题" in messages[0]["content"]
     assert "绝不编造" in messages[0]["content"]
+    assert "未逐字出现的具体日期" in messages[0]["content"]
     assert "会议摘要" in messages[0]["content"]
     payload = json.loads(messages[1]["content"])
     assert payload["current_question"] == "为什么选择 Redis Stream？"
@@ -203,3 +216,52 @@ def test_single_track_prompt_never_treats_mixed_speech_as_user_history() -> None
         {"speaker": "参会者（单轨混合）", "text": "我们当时把订单号作为幂等键。"},
         {"speaker": "参会者（单轨混合）", "text": "请介绍一下你负责的项目。"},
     ]
+
+
+def test_answer_grounding_removes_unseen_deadline_and_owner_but_keeps_safe_clause() -> None:
+    grounded = ground_realtime_answer(
+        "周四下班前由王工负责闭环，压测达标后再决定是否上线。",
+        evidence_texts=["本周五到底能不能上线？压测达标是放行前提。"],
+    )
+
+    assert grounded.changed is True
+    assert grounded.removed_claim_types == ("deadline", "owner")
+    assert "周四" not in grounded.text
+    assert "王工" not in grounded.text
+    assert grounded.text.startswith("压测达标后再决定是否上线。")
+    assert grounded.text.endswith("具体时间、责任归属以会议原话为准。")
+
+
+def test_answer_grounding_keeps_numbers_and_states_present_in_evidence() -> None:
+    answer = "错误率低于0.1%才上线，目前还没有确认达标。"
+    grounded = ground_realtime_answer(
+        answer,
+        evidence_texts=["错误率要低于0.1%，现在还没有确认达标。"],
+    )
+
+    assert grounded.changed is False
+    assert grounded.text == answer
+
+
+def test_answer_grounding_allows_a_cautious_non_commitment() -> None:
+    answer = "目前不能直接承诺周五上线，需要先确认放行条件。"
+    grounded = ground_realtime_answer(
+        answer,
+        evidence_texts=["周五可以上线吗？放行条件是什么？"],
+    )
+
+    assert grounded.changed is False
+    assert grounded.text == answer
+
+
+def test_answer_grounding_falls_back_when_every_clause_invents_material_facts() -> None:
+    grounded = ground_realtime_answer(
+        "明天下午六点前必须完成500并发压测。",
+        evidence_texts=["压测方案还需要继续讨论。"],
+    )
+
+    assert grounded.changed is True
+    assert grounded.removed_claim_types == ("number", "deadline")
+    assert "明天" not in grounded.text
+    assert "500" not in grounded.text
+    assert "需要先确认" in grounded.text

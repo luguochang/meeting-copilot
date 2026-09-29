@@ -23,8 +23,8 @@ def test_llm_first_system_question_runs_independent_streaming_answer_lane(
             200,
             headers={"content-type": "text/event-stream"},
             content=(
-                'data: {"type":"response.output_text.delta","delta":"我们优先复用了现有 Redis 基础设施，"}\n\n'
-                'data: {"type":"response.output_text.delta","delta":"同时把吞吐和消息保留需求作为迁移 Kafka 的边界。"}\n\n'
+                'data: {"type":"response.output_text.delta","delta":"周四下班前由王工负责闭环，"}\n\n'
+                'data: {"type":"response.output_text.delta","delta":"我们优先复用了现有 Redis 基础设施，并把吞吐和消息保留需求作为迁移 Kafka 的边界。"}\n\n'
                 'data: {"type":"response.completed","response":{"id":"answer-1","model":"fast-model","status":"completed","usage":{"input_tokens":80,"output_tokens":30,"total_tokens":110}}}\n\n'
             ),
         )
@@ -74,6 +74,10 @@ def test_llm_first_system_question_runs_independent_streaming_answer_lane(
         assert answer["status"] == "committed"
         assert answer["question_text"] == "为什么选择 Redis Stream，而不是 Kafka？"
         assert answer["text"].startswith("我们优先复用了现有 Redis")
+        assert "周四" not in answer["text"]
+        assert "王工" not in answer["text"]
+        assert result["final_text_transformed"] is True
+        assert result["grounding_removed_claim_types"] == ["deadline", "owner"]
         assert answer["model"] == "fast-model"
         assert answer["ttft_ms"] is not None
         deep_job = persistence.get_job(result["deep_coach_job_id"])
@@ -93,6 +97,50 @@ def test_llm_first_system_question_runs_independent_streaming_answer_lane(
         assert "为什么选择 Redis Stream" in prompt_text
     finally:
         asyncio.run(client.aclose())
+        persistence.close()
+
+
+def test_low_information_same_track_tail_does_not_replace_prior_answer(
+    tmp_path,
+) -> None:
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    persistence = app.state.v2_persistence
+
+    first = app.state.commit_v2_final(
+        "meeting-question-tail",
+        {
+            "segment_id": "question-main",
+            "text": "本周五到底能不能上线？前提条件是什么？",
+            "normalized_text": "本周五到底能不能上线？前提条件是什么？",
+            "start_ms": 100,
+            "end_ms": 1_000,
+            "source_track": "system_audio",
+        },
+    )
+    tail = app.state.commit_v2_final(
+        "meeting-question-tail",
+        {
+            "segment_id": "question-tail",
+            "text": "你吗？",
+            "normalized_text": "你吗？",
+            "start_ms": 1_150,
+            "end_ms": 1_400,
+            "source_track": "system_audio",
+        },
+    )
+
+    try:
+        assert first is not None
+        assert first["job_ids"].get("answer")
+        assert tail is not None
+        assert "answer" not in tail["job_ids"]
+        answer_jobs = persistence.list_jobs(
+            meeting_id="meeting-question-tail",
+            lane="answer",
+        )
+        assert len(answer_jobs) == 1
+        assert answer_jobs[0]["evidence_segment_id"].endswith("question-main")
+    finally:
         persistence.close()
 
 

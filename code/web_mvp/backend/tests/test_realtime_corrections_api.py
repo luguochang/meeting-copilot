@@ -224,6 +224,63 @@ def test_realtime_correction_allows_persisted_final_after_boundary_ack_timeout()
     assert app_module._realtime_correction_blockers(record) == []
 
 
+def test_silent_dual_track_diagnostic_does_not_block_valid_other_track_final():
+    record = {
+        "session_id": "silent-microphone-valid-system-audio",
+        "source": "live_asr_stream",
+        "trace_kind": "live_event",
+        "provider": "funasr_realtime",
+        "provider_mode": "real",
+        "is_mock": False,
+        "input_source": "browser_live_mic",
+        "ingest_mode": "live_asr_stream",
+        "asr_fallback_used": False,
+        "degradation_reasons": ["asr_no_final"],
+        "events": [
+            {
+                "event_type": "transcript_final",
+                "payload": {
+                    "segment_id": "system-audio-segment-1",
+                    "text": "系统音轨已经产生可用的会议正文。",
+                    "source_track": "system_audio",
+                },
+            }
+        ],
+    }
+
+    assert app_module._realtime_correction_blockers(record) == []
+    app_module._ensure_enabled_llm_allowed(
+        record,
+        allow_non_acceptance_execution=False,
+    )
+
+
+def test_asr_no_final_still_blocks_when_the_entire_meeting_has_no_final():
+    record = {
+        "session_id": "all-tracks-empty",
+        "source": "live_asr_stream",
+        "trace_kind": "live_event",
+        "provider": "funasr_realtime",
+        "provider_mode": "real",
+        "is_mock": False,
+        "input_source": "browser_live_mic",
+        "ingest_mode": "live_asr_stream",
+        "asr_fallback_used": False,
+        "degradation_reasons": ["asr_no_final"],
+        "events": [],
+    }
+
+    blockers = app_module._realtime_correction_blockers(record)
+    assert "degraded_asr_session" in blockers
+    assert "asr_final_missing" in blockers
+    assert "asr_transcript_empty" in blockers
+    with pytest.raises(HTTPException, match="asr_final_missing"):
+        app_module._ensure_enabled_llm_allowed(
+            record,
+            allow_non_acceptance_execution=False,
+        )
+
+
 def test_online_only_resource_policy_is_audited_without_blocking_correction_or_llm():
     record = {
         "session_id": "online-only-policy-final",

@@ -3,7 +3,7 @@
 > 版本：v1.0
 > 日期：2026-09-29（最新复验）
 > 目标分支：`feat/pi-realtime-coach-agent-loop`
-> 状态：Fast Answer、Pi Deep、Correction 的真实静音端到端验收已完成；同音频 `main` 基线和原生双轨协议已通过静音注入验证；会中 Answer/Pi 桌面和移动布局已完成无声视觉验收。真实物理麦克风 + system audio 五分钟采集待完成。后续代码、测试和验收必须能回到本文件中的用户效果与指标。
+> 状态：Fast Answer、Pi Deep、Correction 已完成真实 Provider 验收；同音频 `main` 基线、原生双轨协议、五分钟物理 system audio 连续采集和会中 Answer/Pi 布局均已有证据。MacBook Air 物理麦克风 helper 已获权限并持续运行，但系统输入电平与 PCM 仍为零，因此真正的双人双轨验收仍是发布阻塞项。后续代码、测试和验收必须能回到本文件中的用户效果与指标。
 
 ## 0. 决策摘要
 
@@ -226,6 +226,7 @@ created_at_ms / updated_at_ms
 - [x] 给 durable draft 增加 `answer` 类型、问题文本、运行来源和耗时字段。
 - [x] 新问题 supersede 旧在途 Answer，旧已完成回答进入有界历史。
 - [x] Provider 失败显式落为 unavailable，不转成 Pi 静默。
+- [x] Fast Answer 在持久化前移除无证据的日期、数字、负责人和完成状态，同时保留可用的有依据语句。
 
 ### C. Pi Deep Coach
 
@@ -237,6 +238,7 @@ created_at_ms / updated_at_ms
 - [x] Pi/direct/fallback/unavailable provenance 在 UI 可见但不抢占正文。
 - [x] 同一证据已创建 Answer Task 时，普通 Pi candidate 可审计静默，不再与 Fast Answer 争抢 Provider。
 - [x] `answer_ready` 自动 Deep 只开放 `submit_intervention` / `keep_silent`，证据与 Answer ID 由宿主绑定。
+- [x] Pi Deep 绑定当前 Answer 实际使用的多段上下文；无证据硬事实在提交前改写为事实无关的检查问题，并保留审计字段。
 
 ### D. 前端效果
 
@@ -262,7 +264,8 @@ created_at_ms / updated_at_ms
 - [x] 使用真实浏览器麦克风完成单轨问题、离题门禁和 Fast Answer 测试；用户后续要求禁止外放，新增静音 PCM 注入复验。
 - [x] 使用同一固定音频对比 `origin/main@5cd0ed5` 与当前分支；相同本地 refiner 配置下 canonical transcript 逐字一致。
 - [x] 使用 `native_pcm_v2` 静音注入 microphone/system audio 两条独立 WebSocket，验证 track/epoch/sequence、并发 ASR、Fast Answer 和 Pi Deep。
-- [ ] 使用桌面原生麦克风 + system audio 完成真正双轨双方对话测试。
+- [x] 使用桌面原生 helper 连续运行约五分钟，完成物理扬声器 -> system audio -> ASR -> Answer/Pi 主链并保存指标。
+- [ ] 取得 MacBook Air 麦克风非零 PCM，完成真正双方发声的双轨对话和 speaker/track 验收。
 - [x] 保存脱敏快照指标并形成验收报告；真实页面已使用禁用音频输出和 MediaDevices 的 Chromium 完成视觉验收。
 
 详细证据、真实输出和剩余风险见 [meeting-copilot_answer-copilot_pi-acceptance_20260927.md](./meeting-copilot_answer-copilot_pi-acceptance_20260927.md)。
@@ -284,7 +287,17 @@ created_at_ms / updated_at_ms
 
 同轮修复了 V1 -> V2 shadow migration 的校对状态假 pending：迁移后的 raw `text` 与 canonical `normalized_text` 分离保存，已有 revision 投影为 `changed/no_change`，且不会为已完成的历史 revision 创建虚假 correction job。修复受“整场 migration-only”、migration causation、已登记历史/当前 checksum marker、canonical 一致性和“无真实 correction job”多层条件保护；新增无关会议造成整表 checksum 变化时仍可修复旧 migration-only 段落，含任意真实 final 的混合/实时会议则整体跳过。
 
-## 10. 本轮非目标
+## 11. 2026-09-29 真实硬件与事实落地复验
+
+五分钟样本 `accept_real_dual_answer_pi_20260929_01` 同时启动了 AVAudioEngine 麦克风 helper 和 ScreenCaptureKit system audio helper，并通过 MacBook Air 扬声器播放固定中文会议题集。system audio 获得 12 条 final，问题命中约 `6/7 = 85.7%`；Fast Answer TTFT 为 `P50 1.79s / P95 2.29s`，完成时间为 `P50 3.14s / P95 3.71s`。Pi Provider `6/6` 连通，但旧证据边界下只有 `1/6` 卡通过事实校验，证明问题是业务取证而不是 SDK 未调用。
+
+该轮暴露并修复四个根因：静音 microphone 的全局 `asr_no_final` 不再阻塞已有 system audio final 的校对和派生；Pi Deep 改为绑定 Fast Answer 实际使用的多段上下文；Fast Answer 在 commit 前移除无证据硬事实；同轨低信息尾句不再覆盖完整问题。85 秒回归 `accept_real_regression_pi_20260929_02` 产生 4 条可读 system audio final、3/3 Fast Answer，Pi Deep 从 `1/6` 提升到 `2/3`，剩余一张因无证据完成状态被宿主拒绝。
+
+随后增加 Pi Deep 提交前事实落地屏障：仅替换无证据的日期、数字、负责人、产品名或完成状态所在行，结构错误、证据错误和其他安全错误仍 fail closed。最小真实 Provider 复验 `accept_real_grounded_pi_20260929_03` 中，Fast Answer 首字/提交约为 `2.27s / 3.30s`；Pi SDK 使用 `deep_answer` profile、单轮 `submit_intervention`、两段宿主证据，约 `2.74s` 首字、`4.88s` 决策、`4.96s` 投影，最终卡片补充了上线判断边界、无依据承诺风险和验收未通过时的追问。
+
+物理麦克风没有被误报为通过：默认输入已确认是 MacBook Air 麦克风，输入音量为 53%，ChatGPT/Chrome/桌面 helper 权限均已开启；但 macOS“声音 > 输入”的系统电平和 AVAudioEngine PCM 在外放期间都保持为零。当前结论是 system audio 物理链路通过，麦克风可启动且协议可传输静音帧，但仍需一次有人对着机器发声且系统输入电平非零的验收。
+
+## 12. 本轮非目标
 
 - 不开发隐身、反录屏或规避监控能力。
 - 不引入屏幕持续录制。

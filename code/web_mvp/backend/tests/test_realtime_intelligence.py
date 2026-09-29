@@ -2652,6 +2652,65 @@ async def _test_pi_coach_runner_preserves_the_existing_evidence_contract() -> No
     assert usages == [(1, {"prompt_tokens": 90, "completion_tokens": 20, "total_tokens": 110})]
 
 
+def test_pi_deep_runner_grounds_an_unsupported_state_clause_before_commit() -> None:
+    async def scenario() -> None:
+        recommendation = "\n".join(
+            (
+                "边界：本周五作为目标，压测是放行条件。",
+                "风险：压测已经通过，可以无条件上线。",
+                "追问：还需要用什么方式验证放行条件？",
+            )
+        )
+        request = replace(
+            _coach_request(),
+            trigger_type="answer_ready",
+            work_item_id="answer:job-grounding",
+            rolling_state={
+                "current_answer": {
+                    "answer_id": "answer:job-grounding",
+                    "question": "本周五能不能上线？",
+                    "answer": "本周五可以作为目标，但目前压测还没有完成，不能无条件放行。",
+                    "status": "committed",
+                }
+            },
+        )
+        runtime = _PiRuntime(
+            {
+                "action": "intervention",
+                "intervention": {
+                    "event_type": "question_to_user",
+                    "title": "补充上线判断边界",
+                    "recommendation": recommendation,
+                    "say_this": recommendation,
+                    "reason": "当前问题要求补充上线边界和验证方式。",
+                    "why_now": "当前问题要求补充上线边界和验证方式。",
+                    "evidence_segment_ids": ["local-3", "remote-4"],
+                    "evidence_quote": "压测还没有完成。\n你能承诺周五一定上线吗？",
+                    "urgency": "medium",
+                    "confidence": 0.9,
+                },
+                "metrics": {"elapsed_ms": 840, "prompt_profile": "deep_answer"},
+            }
+        )
+
+        result = await run_realtime_coach_via_pi(
+            request=request,
+            pi_runtime=runtime,
+            provider_config=_pi_provider_config(),
+            priority_mode="deep",
+        )
+
+        assert result["intervention"] is not None
+        assert "风险：信息口径不足可能造成误解" in result["intervention"].recommendation
+        assert "已经通过" not in result["intervention"].recommendation
+        assert "边界：本周五作为目标，压测是放行条件。" in result["intervention"].recommendation
+        assert result["agent_metrics"]["host_grounding_applied"] is True
+        assert result["agent_metrics"]["host_grounding_fields"] == ["recommendation"]
+        assert "introduces material facts" in result["agent_metrics"]["host_grounding_reason"]
+
+    asyncio.run(scenario())
+
+
 def test_pi_coach_runner_exposes_only_observed_timing_stages() -> None:
     asyncio.run(_test_pi_coach_runner_exposes_only_observed_timing_stages())
 

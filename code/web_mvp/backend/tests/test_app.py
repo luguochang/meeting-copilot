@@ -2824,6 +2824,7 @@ def test_v2_answer_ready_enters_pi_deep_with_committed_fast_answer(
         assert request.rolling_state["current_answer"] == {
             "answer_id": "answer:automatic-deep",
             "evidence_segment_id": "answer-ready-segment",
+            "context_evidence_segment_ids": ["answer-ready-segment"],
             "question": "你们为什么选择 Redis Stream？",
             "answer": "因为当前规模可控，且可以复用现有 Redis 基础设施。",
             "status": "committed",

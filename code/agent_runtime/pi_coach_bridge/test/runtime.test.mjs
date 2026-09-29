@@ -211,6 +211,7 @@ test("deep answer coaching sees the Fast Answer and submits an incremental card 
   deep.context.rolling_state.current_answer = {
     answer_id: "answer:job-1",
     evidence_segment_id: "remote-1",
+    context_evidence_segment_ids: ["local-1", "remote-1"],
     question: "为什么选择 Redis Stream 而不是 Kafka？",
     answer: "因为已有 Redis 集群且当前吞吐规模可控，先用 Stream 降低接入和运维成本。",
     status: "committed",
@@ -229,7 +230,12 @@ test("deep answer coaching sees the Fast Answer and submits an incremental card 
         status: "committed",
       });
       assert.equal(payload.user_request, null);
+      assert.deepEqual(
+        payload.bound_evidence.map((paragraph) => paragraph.id),
+        ["local-1", "remote-1"],
+      );
       assert.match(context.systemPrompt, /not to rewrite or summarize current_answer/);
+      assert.match(context.systemPrompt, /must appear verbatim in bound_evidence or current_answer/);
       assert.deepEqual(
         context.tools.map((tool) => tool.name),
         ["submit_intervention", "keep_silent"],
@@ -275,8 +281,11 @@ test("deep answer coaching sees the Fast Answer and submits an incremental card 
     "风险：需要确认消费异常后的恢复和重复消费处理",
     "追问：如何保证消息不丢并处理消费者积压",
   ].join("\n"));
-  assert.deepEqual(result.intervention.evidence_segment_ids, ["remote-1"]);
-  assert.equal(result.intervention.evidence_quote, "周五一定上线吗");
+  assert.deepEqual(result.intervention.evidence_segment_ids, ["local-1", "remote-1"]);
+  assert.equal(
+    result.intervention.evidence_quote,
+    "压测通过后才能确定日期\n周五一定上线吗",
+  );
 });
 
 test("deep answer coaching removes provider-written field labels before composing the card", async () => {

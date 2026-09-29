@@ -129,6 +129,8 @@ from meeting_copilot_web_mvp.v2_streaming_suggestions import (
 from meeting_copilot_web_mvp.realtime_answer_copilot import (
     build_realtime_answer_messages,
     detect_answer_trigger,
+    ground_realtime_answer,
+    is_low_information_question_tail,
 )
 from meeting_copilot_web_mvp.coach_lifecycle import (
     coach_decision_replaces_prior_intervention,
@@ -2747,6 +2749,7 @@ def create_app(
             and preparation is not None
             and preparation.input_source == "microphone"
         )
+        timeline_offset_ms = max(0, int(event.get("timeline_offset_ms") or 0))
         answer_trigger = detect_answer_trigger(
             text=normalized_text,
             source_track=source_track,
@@ -2758,8 +2761,46 @@ def create_app(
                 else ()
             ),
         )
+        if answer_trigger.should_answer and is_low_information_question_tail(normalized_text):
+            current_started_at_ms = timeline_offset_ms + int(event.get("start_ms") or 0)
+            prior_segments = [
+                item
+                for item in v2_persistence.get_snapshot(
+                    session_id,
+                    segment_limit=32,
+                ).get("segments")
+                or []
+                if str(item.get("source_track") or "") == str(source_track or "")
+                and int(item.get("ended_at_ms") or 0) <= current_started_at_ms
+            ]
+            prior_segment = prior_segments[-1] if prior_segments else None
+            prior_segment_id = str(
+                (prior_segment or {}).get("segment_id") or ""
+            ).strip()
+            prior_ended_at_ms = int((prior_segment or {}).get("ended_at_ms") or 0)
+            prior_answer_exists = bool(
+                prior_segment_id
+                and any(
+                    str(candidate.get("evidence_segment_id") or "")
+                    == prior_segment_id
+                    for candidate in v2_persistence.list_jobs(
+                        meeting_id=session_id,
+                        lane="answer",
+                    )
+                )
+            )
+            if (
+                prior_answer_exists
+                and 0 <= current_started_at_ms - prior_ended_at_ms <= 3_000
+            ):
+                answer_trigger = replace(
+                    answer_trigger,
+                    should_answer=False,
+                    question_text=None,
+                    reason="low_information_tail_preserved_previous_answer",
+                    confidence=0.99,
+                )
         evidence_hash = transcript_evidence_hash(segment_id, normalized_text)
-        timeline_offset_ms = max(0, int(event.get("timeline_offset_ms") or 0))
         realtime_reservation_id = (
             f"intelligence-commit:{uuid.uuid4().hex}"
             if v2_persistence.semantic_projection_mode == "llm_first"
@@ -10720,6 +10761,17 @@ def create_app(
             raise IntelligenceEvidenceSuperseded(
                 "answer_ready job no longer resolves to its bound Fast Answer"
             )
+        current_answer_context_ids = (
+            [
+                str(item.get("segment_id") or "")
+                for item in snapshot.get("segments") or []
+                if int(item.get("transcript_seq") or 0)
+                <= int(current_answer.get("evidence_transcript_seq") or 0)
+                and str(item.get("segment_id") or "").strip()
+            ][-12:]
+            if current_answer is not None
+            else []
+        )
         rolling_state = {
             "topic": {
                 "title": str(topic.get("text") or ""),
@@ -10749,6 +10801,7 @@ def create_app(
                         current_answer.get("evidence_segment_id") or ""
                     )
                     or None,
+                    "context_evidence_segment_ids": current_answer_context_ids,
                     "question": str(current_answer.get("question_text") or "")[:1_000],
                     "answer": str(
                         current_answer.get("text")
@@ -14059,6 +14112,21 @@ def create_app(
                     and segment.get("source_track") == "microphone"
                 ),
             )
+            grounding_audit: dict[str, Any] = {}
+
+            def ground_answer(final_text: str) -> str:
+                grounded = ground_realtime_answer(
+                    final_text,
+                    evidence_texts=[
+                        item.get("normalized_text") or item.get("text") or ""
+                        for item in context_segments
+                    ],
+                )
+                grounding_audit["removed_claim_types"] = list(
+                    grounded.removed_claim_types
+                )
+                return grounded.text
+
             streaming_client = _provider_client_for_lane("answer")
             if streaming_client is None:
                 raise RuntimeError("answer streaming LLM client is not started")
@@ -14088,6 +14156,7 @@ def create_app(
                         "temperature": 0.25,
                         "max_completion_tokens": 140,
                     },
+                    final_text_transform=ground_answer,
                 )
             except Exception as exc:
                 category = getattr(exc, "category", None)
@@ -14137,6 +14206,10 @@ def create_app(
                 "generated_answer_count": 1,
                 "trigger_reason": trigger.reason,
                 "trigger_confidence": trigger.confidence,
+                "grounding_removed_claim_types": grounding_audit.get(
+                    "removed_claim_types",
+                    [],
+                ),
                 "deep_coach_job_id": str(deep_job["id"]),
             }
         finally:
@@ -16289,6 +16362,10 @@ _RECOVERABLE_TRANSCRIPT_DEGRADATION_REASONS = {
     "stream_interrupted",
     "offline_refinement_unavailable",
     "offline_refinement_text_too_short",
+    # In a dual-track meeting one participant lane may be intentionally silent.
+    # Keep that diagnosis, but do not let it poison valid finals from the other
+    # lane or block correction and post-meeting derivations.
+    "asr_no_final",
     # A resident worker can still produce an authoritative offline final when
     # its online boundary ACK arrives late. Once that final is persisted,
     # correction and post-meeting derivations can safely use the evidence.

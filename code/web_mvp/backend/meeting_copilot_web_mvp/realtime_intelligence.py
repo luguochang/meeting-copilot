@@ -2491,17 +2491,39 @@ async def run_realtime_coach_via_pi(
     metrics = dict(result.get("metrics")) if isinstance(result.get("metrics"), Mapping) else {}
     usage = metrics.get("usage") if isinstance(metrics.get("usage"), Mapping) else None
     await _notify_callback(on_usage, dict(usage) if usage is not None else None, 1)
+    raw_intervention = result.get("intervention")
     try:
         intervention = parse_realtime_coach_response(
-            json.dumps({"intervention": result.get("intervention")}, ensure_ascii=False),
+            json.dumps({"intervention": raw_intervention}, ensure_ascii=False),
             request=request,
         )
     except IntelligenceResponseValidationError as exc:
-        # The bridge completed successfully, so retain its bounded diagnostics
-        # when the host rejects the card. This keeps deep-answer failures bound
-        # to their prompt profile and Answer without persisting model output.
-        exc.metrics = metrics
-        raise
+        grounded_intervention, grounded_fields = _ground_pi_deep_intervention(
+            raw_intervention,
+            request=request,
+            validation_error=exc,
+        )
+        if not grounded_fields:
+            # The bridge completed successfully, so retain its bounded diagnostics
+            # when the host rejects the card. This keeps deep-answer failures bound
+            # to their prompt profile and Answer without persisting model output.
+            exc.metrics = metrics
+            raise
+        try:
+            intervention = parse_realtime_coach_response(
+                json.dumps({"intervention": grounded_intervention}, ensure_ascii=False),
+                request=request,
+            )
+        except IntelligenceResponseValidationError as grounded_exc:
+            grounded_exc.metrics = metrics
+            raise
+        metrics.update(
+            {
+                "host_grounding_applied": True,
+                "host_grounding_fields": list(grounded_fields),
+                "host_grounding_reason": str(exc)[:240],
+            }
+        )
     if intervention is not None and intervention.confidence < 0.78:
         intervention = None
     decision_reason = str(result.get("decision_reason") or "")[:160] or None
@@ -3429,6 +3451,145 @@ def _validate_coach_claim_grounding(
             "provisional ASR evidence may only support a clarification, not a material coach claim",
             category="semantic_safety",
         )
+
+
+_DEEP_COACH_GROUNDED_LINES = {
+    "边界": "需要明确适用范围和判断条件",
+    "风险": "信息口径不足可能造成误解",
+    "追问": "适用范围、判断条件和验证方式分别是什么？",
+}
+
+
+def _coach_claim_violations_against_grounding(
+    value: str,
+    *,
+    grounding_text: str,
+    request: RealtimeIntelligenceRequest,
+) -> set[str]:
+    violations: set[str] = set()
+    if _number_claim_tokens(value) - _number_claim_tokens(grounding_text):
+        violations.add("number")
+    if _claim_tokens(_COACH_TIME_RE, value) - _claim_tokens(_COACH_TIME_RE, grounding_text):
+        violations.add("deadline")
+    if _owner_assignment_values(value) - _owner_assignment_values(grounding_text):
+        violations.add("owner")
+    if _state_polarities(value) - _state_polarities(grounding_text):
+        violations.add("state")
+    if _glossary_claim_terms(value, request=request) - _glossary_claim_terms(
+        grounding_text,
+        request=request,
+    ):
+        violations.add("product_name")
+    return violations
+
+
+def _ground_pi_deep_intervention(
+    value: Any,
+    *,
+    request: RealtimeIntelligenceRequest,
+    validation_error: IntelligenceResponseValidationError,
+) -> tuple[Mapping[str, Any] | Any, tuple[str, ...]]:
+    """Replace only unsupported hard-fact clauses before a Deep card commits.
+
+    The strict parser remains authoritative. This narrow repair is limited to
+    Pi's second-pass Answer supplement and never repairs structural or evidence
+    failures. It mirrors the Fast Answer commit barrier: useful grounded text is
+    retained while an unsupported hard fact becomes an explicit check.
+    """
+
+    if (
+        validation_error.category != "semantic_safety"
+        or "introduces material facts" not in str(validation_error)
+        or not isinstance(value, Mapping)
+        or request.trigger_type not in {"answer_ready", "user_request", "task_due"}
+    ):
+        return value, ()
+    current_answer = (
+        request.rolling_state.get("current_answer")
+        if isinstance(request.rolling_state, Mapping)
+        else None
+    )
+    answer_text = (
+        str(current_answer.get("answer") or "").strip()
+        if isinstance(current_answer, Mapping)
+        else ""
+    )
+    evidence_quote = value.get("evidence_quote")
+    if not answer_text or not isinstance(evidence_quote, str) or not evidence_quote.strip():
+        return value, ()
+    grounding_text = "\n".join((evidence_quote.strip(), answer_text))
+    grounded = dict(value)
+    changed_fields: list[str] = []
+
+    title = value.get("title")
+    if isinstance(title, str) and _coach_claim_violations_against_grounding(
+        title,
+        grounding_text=grounding_text,
+        request=request,
+    ):
+        grounded["title"] = "补齐判断边界"
+        changed_fields.append("title")
+
+    recommendation_values = tuple(
+        text.strip()
+        for key in ("recommendation", "say_this", "sayThis")
+        if isinstance((text := value.get(key)), str) and text.strip()
+    )
+    if recommendation_values and len(set(recommendation_values)) == 1:
+        recommendation = recommendation_values[0]
+        grounded_lines: list[str] = []
+        recommendation_changed = False
+        for line in recommendation.splitlines():
+            normalized = line.strip()
+            if not normalized:
+                continue
+            violations = _coach_claim_violations_against_grounding(
+                normalized,
+                grounding_text=grounding_text,
+                request=request,
+            )
+            if not violations:
+                grounded_lines.append(normalized)
+                continue
+            label_match = re.match(r"^(边界|风险|追问)\s*[：:]", normalized)
+            if label_match is None:
+                grounded_lines = [
+                    f"{label}：{replacement}"
+                    for label, replacement in _DEEP_COACH_GROUNDED_LINES.items()
+                ]
+                recommendation_changed = True
+                break
+            label = label_match.group(1)
+            grounded_lines.append(f"{label}：{_DEEP_COACH_GROUNDED_LINES[label]}")
+            recommendation_changed = True
+        if recommendation_changed:
+            grounded_recommendation = "\n".join(grounded_lines)
+            grounded["recommendation"] = grounded_recommendation
+            for alias in ("say_this", "sayThis"):
+                if alias in value:
+                    grounded[alias] = grounded_recommendation
+            changed_fields.append("recommendation")
+
+    reason_values = tuple(
+        text.strip()
+        for key in ("reason", "why_now", "whyNow")
+        if isinstance((text := value.get(key)), str) and text.strip()
+    )
+    if reason_values and len(set(reason_values)) == 1:
+        reason = reason_values[0]
+        if _coach_claim_violations_against_grounding(
+            reason,
+            grounding_text=grounding_text,
+            request=request,
+        ):
+            grounded_reason = "当前回答仍可补充适用范围、判断条件和验证方式。"
+            grounded["reason"] = grounded_reason
+            for alias in ("why_now", "whyNow"):
+                if alias in value:
+                    grounded[alias] = grounded_reason
+            changed_fields.append("reason")
+
+    return grounded, tuple(changed_fields)
 
 
 def _validate_evidence_quote(

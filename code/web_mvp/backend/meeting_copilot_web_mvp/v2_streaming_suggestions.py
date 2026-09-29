@@ -74,6 +74,7 @@ async def generate_streaming_suggestion(
     checkpoint_characters: int = 64,
     max_characters: int = 240,
     completion_parameters: Mapping[str, Any] | None = None,
+    final_text_transform: Callable[[str], str] | None = None,
     monotonic: Callable[[], float] = time.monotonic,
     now_ms: Callable[[], int] = _wall_clock_ms,
 ) -> dict[str, Any]:
@@ -180,6 +181,13 @@ async def generate_streaming_suggestion(
             "provider final suggestion does not match its streamed deltas"
         )
 
+    provider_final_text = final_text
+    if final_text_transform is not None:
+        final_text = _normalized_text(final_text_transform(final_text))
+        if not final_text:
+            raise SuggestionValidationError("final suggestion transform returned empty text")
+        _validate_length(final_text, max_characters=max_characters)
+
     if checkpoint_text != final_text:
         await checkpoint(final_text, monotonic())
     if draft_seq <= 0:
@@ -223,6 +231,7 @@ async def generate_streaming_suggestion(
             "completed_at": result.timings.completed_at,
         },
         "usage": _usage_dict(result.usage),
+        "final_text_transformed": final_text != provider_final_text,
         "suggestion": committed,
     }
 
