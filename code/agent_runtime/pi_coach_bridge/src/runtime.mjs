@@ -1077,11 +1077,15 @@ export function createOpenAICompatibleBackend(providerInput) {
   // custom OpenAI-compatible models must opt in explicitly through the
   // provider payload instead of receiving an unknown parameter by default.
   const isGpt5Model = /^gpt-5(?:[.-]|$)/i.test(modelId);
+  // The configured relay exposes gpt-6-sol and this product requests its low
+  // reasoning effort explicitly; omitting the field falls back to the relay
+  // default and would make the requested operating mode unverifiable.
+  const isGpt6Sol = /^gpt-6-sol(?:[.-]|$)/i.test(modelId);
   const configuredReasoningEffort = typeof providerInput.reasoning_effort === "string"
     ? providerInput.reasoning_effort.trim().toLowerCase()
     : "";
   const explicitReasoningEffort = configuredReasoningEffort
-    || (isGpt5Model && !isCodexSpark ? "none" : "");
+    || (isGpt6Sol ? "low" : isGpt5Model && !isCodexSpark ? "none" : "");
   const model = {
     id: modelId,
     name: modelId,

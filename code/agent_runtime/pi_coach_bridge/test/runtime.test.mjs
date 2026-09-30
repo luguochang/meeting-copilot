@@ -1618,6 +1618,20 @@ test("GPT-5 compatible gateways explicitly disable hidden default reasoning", ()
   assert.equal(backend.model.thinkingLevelMap.off, "none");
 });
 
+test("gpt-6-sol selects the relay low reasoning effort", () => {
+  const backend = createOpenAICompatibleBackend({
+    base_url: "https://codexai.club",
+    api_key: "test-only-key",
+    model: "gpt-6-sol",
+    api_style: "responses",
+    timeout_ms: 2250,
+    decision_timeout_ms: 2250,
+  });
+
+  assert.equal(backend.model.reasoning, true);
+  assert.equal(backend.model.thinkingLevelMap.off, "low");
+});
+
 test("Provider requests cannot exceed the ten-second bridge ceiling", () => {
   const backend = createOpenAICompatibleBackend({
     base_url: "https://provider.example.test/v1",
