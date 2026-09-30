@@ -6,6 +6,10 @@ export interface AnswerThread {
   piRevisions: CoachHistoryEntry[];
 }
 
+export function piRevisionIdentity(item: FollowUpProjection): string {
+  return item.decisionId ?? `${item.answerId}:${item.revision ?? 0}:${item.question}`;
+}
+
 export function buildAnswerThreads(
   suggestions: Suggestion[],
   coachHistory: CoachHistoryEntry[],

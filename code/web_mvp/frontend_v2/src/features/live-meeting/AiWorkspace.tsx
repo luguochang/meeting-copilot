@@ -4,6 +4,7 @@ import ReactMarkdown from "react-markdown";
 import type { MeetingApi } from "../../api/client";
 import type { AskAiMessage, AskAiScope, AskAiThread, MeetingChapter, MeetingPreparationSnapshot } from "../../domain/events";
 import { NowRail } from "./NowRail";
+import { MeetingFactsPanel } from "./MeetingFactsPanel";
 import type { TranscriptSelection, TranscriptSelectionAction } from "./TranscriptPane";
 
 interface AiWorkspaceProps extends ComponentProps<typeof NowRail> {
@@ -350,9 +351,7 @@ export function AiWorkspace({
     .sort((left, right) => right.updatedAtMs - left.updatedAtMs)
     .slice(0, 10);
   const visibleRecentContext = recentContextExpanded ? recentContextItems : recentContextItems.slice(0, 5);
-  const availableTabs: WorkspaceTab[] = api.getMeetingPreparation
-    ? ["insights", "ask", "context"]
-    : ["insights", "ask"];
+  const availableTabs: WorkspaceTab[] = ["insights", "ask", "context"];
   const selectAdjacentTab = (event: ReactKeyboardEvent<HTMLButtonElement>, currentTab: WorkspaceTab) => {
     if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
     event.preventDefault();
@@ -396,7 +395,7 @@ export function AiWorkspace({
         >
           <MessageSquareText size={15} />询问 AI
         </button>
-        {api.getMeetingPreparation ? (
+        {(
           <button
             id={`${workspaceId}-tab-context`}
             type="button"
@@ -410,7 +409,7 @@ export function AiWorkspace({
           >
             <Target size={15} />会议目标
           </button>
-        ) : null}
+        )}
       </div>
 
       {tab === "insights" ? (
@@ -440,7 +439,7 @@ export function AiWorkspace({
           aria-labelledby={`${workspaceId}-tab-context`}
           tabIndex={0}
         >
-          <header>
+          {api.getMeetingPreparation ? <><header>
             <div><span>会中上下文</span><strong>会议目标</strong></div>
             <small>{preparation ? `版本 ${preparation.version} · 共 ${Math.max(preparationVersionCount, preparation.version)} 个版本` : "正在加载"}</small>
           </header>
@@ -461,6 +460,8 @@ export function AiWorkspace({
             {contextSaving ? <LoaderCircle className="spin" size={15} /> : <Save size={15} />}
             {contextSaving ? "正在保存" : "保存新版本"}
           </button>
+          </> : <header><strong>会议上下文</strong></header>}
+          <MeetingFactsPanel {...railProps} onEvidence={onEvidence} onMessage={onMessage} />
         </section>
       ) : (
         <div

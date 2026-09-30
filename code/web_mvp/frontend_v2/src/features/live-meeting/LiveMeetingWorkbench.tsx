@@ -32,6 +32,7 @@ import type {
 } from "../../domain/events";
 import { segmentDomId } from "./domIds";
 import { AiWorkspace } from "./AiWorkspace";
+import { MeetingSplitPane } from "./MeetingSplitPane";
 import { MeetingPreflightDialog } from "./MeetingPreflightDialog";
 import { captureHealthSummary, resolveMeetingSessionState, type MeetingSessionState } from "./meetingSessionState";
 import { TranscriptPane, type TranscriptSelection, type TranscriptSelectionAction } from "./TranscriptPane";
@@ -824,7 +825,7 @@ export function LiveMeetingWorkbench({
           onRefresh={actions.refresh}
         />
       ) : (
-        <main className="meeting-grid">
+        <MeetingSplitPane>
           <div className="meeting-mobile-view-switch" role="group" aria-label="会中视图">
             <button
               type="button"
@@ -928,7 +929,7 @@ export function LiveMeetingWorkbench({
               onMessage={setMessage}
             />
           </section>
-        </main>
+        </MeetingSplitPane>
       )}
 
       <div className="sr-live" role="status" aria-live="polite">{message}</div>

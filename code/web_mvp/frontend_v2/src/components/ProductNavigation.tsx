@@ -47,11 +47,12 @@ function readNavigationTheme(): NavigationTheme {
   }
 }
 
-function readNavigationCollapsed(): boolean {
+function readNavigationCollapsed(active: NavigationPage): boolean {
   try {
-    return window.localStorage.getItem("meeting-copilot-navigation-collapsed") === "true";
+    const saved = window.localStorage.getItem(active === "live" ? "meeting-copilot-live-navigation-collapsed" : "meeting-copilot-navigation-collapsed");
+    return saved === null ? active === "live" : saved === "true";
   } catch {
-    return false;
+    return active === "live";
   }
 }
 
@@ -112,7 +113,11 @@ function activeMeetingLabel(activeMeeting: ActiveMeetingNavigation): string {
   return elapsed ? `${prefix} · ${elapsed}` : prefix;
 }
 
-export function ProductNavigation({
+export function ProductNavigation(props: ProductNavigationProps) {
+  return <ProductNavigationBody key={props.active === "live" ? "live" : "workspace"} {...props} />;
+}
+
+function ProductNavigationBody({
   active,
   onOpenMeetings,
   onOpenNotes,
@@ -121,7 +126,7 @@ export function ProductNavigation({
   onOpenActiveMeeting,
 }: ProductNavigationProps) {
   const [theme, setTheme] = useState<NavigationTheme>(readNavigationTheme);
-  const [collapsed, setCollapsed] = useState(readNavigationCollapsed);
+  const [collapsed, setCollapsed] = useState(() => readNavigationCollapsed(active));
 
   useEffect(() => {
     try {
@@ -133,11 +138,11 @@ export function ProductNavigation({
 
   useEffect(() => {
     try {
-      window.localStorage.setItem("meeting-copilot-navigation-collapsed", String(collapsed));
+      window.localStorage.setItem(active === "live" ? "meeting-copilot-live-navigation-collapsed" : "meeting-copilot-navigation-collapsed", String(collapsed));
     } catch {
       // The navigation still works when browser storage is unavailable.
     }
-  }, [collapsed]);
+  }, [active, collapsed]);
 
   return (
     <aside

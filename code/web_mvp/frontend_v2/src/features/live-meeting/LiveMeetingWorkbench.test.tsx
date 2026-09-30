@@ -874,7 +874,7 @@ describe("LiveMeetingWorkbench", () => {
     expect(screen.queryByRole("button", { name: "结束并整理" })).not.toBeInTheDocument();
 
     resolveSnapshot?.(realSnapshot());
-    expect(await screen.findByText("支付服务上线安排")).toBeVisible();
+    expect(await screen.findByText("支付服务周五上线，但是负责人还没确定。")).toBeVisible();
   });
 
   it("shows the complete live projection and exactly one end-meeting command", async () => {
@@ -891,9 +891,9 @@ describe("LiveMeetingWorkbench", () => {
 
     expect(await screen.findByText("支付服务周五上线，但是负责人还没确定。")).toBeVisible();
     expect(screen.getByText("回滚窗口我们还需要再确认")).toBeVisible();
-    expect(screen.getByText("支付服务上线安排")).toBeVisible();
+    expect(screen.queryByText("支付服务上线安排")).not.toBeInTheDocument();
     expect(screen.getByText("谁负责本次上线，并在什么条件下执行回滚？")).toBeVisible();
-    expect(screen.getByText("上线负责人是谁？")).toBeVisible();
+    expect(screen.queryByText("上线负责人是谁？")).not.toBeInTheDocument();
     expect(screen.getByText("已校对")).toBeVisible();
     expect(screen.getByRole("button", { name: "返回会议列表" })).toBeVisible();
     expect(screen.queryByRole("button", { name: "结束并整理" })).not.toBeInTheDocument();
@@ -995,7 +995,7 @@ describe("LiveMeetingWorkbench", () => {
     const user = userEvent.setup();
     const { api, transport } = dependencies();
     render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} />);
-    await screen.findByText("支付服务上线安排");
+    await screen.findByText("支付服务周五上线，但是负责人还没确定。");
 
     expect(screen.queryByText("provider_mode")).not.toBeInTheDocument();
     expect(screen.queryByText("acceptance_gate")).not.toBeInTheDocument();
@@ -1010,7 +1010,7 @@ describe("LiveMeetingWorkbench", () => {
     const user = userEvent.setup();
     const { api, transport } = dependencies();
     render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} />);
-    await screen.findByText("支付服务上线安排");
+    await screen.findByText("支付服务周五上线，但是负责人还没确定。");
     const readsBefore = vi.mocked(api.getSnapshot).mock.calls.length;
 
     await user.click(screen.getByRole("button", { name: /采集健康：/ }));
@@ -1039,7 +1039,7 @@ describe("LiveMeetingWorkbench", () => {
     const user = userEvent.setup();
     const { api, transport } = dependencies();
     render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} />);
-    await screen.findByText("支付服务上线安排");
+    await screen.findByText("支付服务周五上线，但是负责人还没确定。");
 
     await user.click(screen.getByRole("button", { name: /采集健康：/ }));
     const drawer = screen.getByRole("dialog", { name: "会议连接详情" });
@@ -1246,7 +1246,7 @@ describe("LiveMeetingWorkbench", () => {
         microphoneController={microphone}
       />,
     );
-    await screen.findByText("支付服务上线安排");
+    await screen.findByText("支付服务周五上线，但是负责人还没确定。");
     await user.click(screen.getByRole("button", { name: "结束并整理" }));
 
     await waitFor(() => expect(api.endMeeting).toHaveBeenCalledWith("meeting-1"));
@@ -1278,7 +1278,7 @@ describe("LiveMeetingWorkbench", () => {
         microphoneController={microphone}
       />,
     );
-    await screen.findByText("支付服务上线安排");
+    await screen.findByText("支付服务周五上线，但是负责人还没确定。");
     await user.click(screen.getByRole("button", { name: "结束并整理" }));
 
     await waitFor(() => expect(api.endMeeting).toHaveBeenCalledTimes(2), { timeout: 2_000 });
@@ -1311,7 +1311,7 @@ describe("LiveMeetingWorkbench", () => {
       />,
     );
 
-    await screen.findByText("支付服务上线安排");
+    await screen.findByText("支付服务周五上线，但是负责人还没确定。");
     expect(screen.queryByRole("button", { name: "暂停录音" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: /采集健康：采集正常 · 当前静音/ })).toBeVisible();
     expect(screen.getByLabelText("系统音频分层健康状态")).toHaveTextContent("传输已连接PCM已接收声音当前静音识别准备中");
@@ -1688,6 +1688,7 @@ describe("LiveMeetingWorkbench", () => {
 
     render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} />);
 
+    await user.click(await screen.findByRole("tab", { name: "会议目标" }));
     const facts = await screen.findByRole("region", { name: "会议事实" });
     expect(within(facts).getByText("候选决策")).toBeVisible();
     expect(within(facts).getByText("已确认决策")).toBeVisible();
@@ -1712,10 +1713,10 @@ describe("LiveMeetingWorkbench", () => {
     expect(api.saveFactStatus).toHaveBeenCalledWith("meeting-1", "risk", "risk-1", "dismissed");
     await waitFor(() => expect(within(facts).queryByText("P99 延迟可能超标")).not.toBeInTheDocument());
 
-    const coachHeading = screen.getByRole("heading", { name: "AI 实时教练" });
-    const topicHeading = screen.getByRole("heading", { name: "当前议题" });
-    expect(coachHeading).toBeVisible();
-    expect(coachHeading.compareDocumentPosition(topicHeading) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "当前议题" })).toBeVisible();
     expect(screen.getByRole("heading", { name: "未闭环问题" })).toBeVisible();
+    await user.click(screen.getByRole("tab", { name: "实时教练" }));
+    expect(screen.getByRole("heading", { name: "AI 实时教练" })).toBeVisible();
+    expect(screen.queryByRole("region", { name: "会议事实" })).not.toBeInTheDocument();
   });
 });

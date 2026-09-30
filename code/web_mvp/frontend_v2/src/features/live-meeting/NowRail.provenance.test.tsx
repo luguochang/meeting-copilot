@@ -111,39 +111,43 @@ it("keeps a completed answer during streaming and returns from history to live",
   expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("回答 1");
   expect(screen.getByText(/下一条回应正在生成/)).toBeVisible();
   view.rerender(<NowRail {...props} suggestions={[first, readingAnswer(2)]} />);
+  expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("回答 1");
+  await user.click(screen.getByRole("button", { name: /1 条新建议.*查看最新/ }));
   expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("回答 2");
-  await user.click(screen.getByRole("button", { name: "全部记录（2）" }));
+  await user.click(screen.getByRole("button", { name: "历史 2" }));
   await user.click(within(screen.getByRole("list", { name: "回答与 Pi 历史" })).getByRole("button", { name: /问题 1/ }));
   view.rerender(<NowRail {...props} suggestions={[first, readingAnswer(2), readingAnswer(3)]} />);
   expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("回答 1");
-  await user.click(screen.getByRole("button", { name: "2 条较新回答，回到实时" }));
+  await user.click(screen.getByRole("button", { name: /2 条新建议.*查看最新/ }));
   expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("回答 3");
 });
 
-it("follows live answers, pins explicitly opened history and restores the selected question", async () => {
+it("offers new answers without replacing reading and restores the selected history question", async () => {
   const user = userEvent.setup();
   const props = readingProps();
   const view = render(<NowRail {...props} suggestions={[readingAnswer(1)]} />);
   const allAnswers = Array.from({ length: 25 }, (_, index) => readingAnswer(index + 1));
   view.rerender(<NowRail {...props} suggestions={allAnswers} />);
+  expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("问题 1");
+  await user.click(screen.getByRole("button", { name: /24 条新建议.*查看最新/ }));
   expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("问题 25");
-  await user.click(screen.getByRole("button", { name: "全部记录（25）" }));
+  await user.click(screen.getByRole("button", { name: "历史 25" }));
   expect(within(screen.getByRole("list", { name: "回答与 Pi 历史" })).getAllByRole("button")).toHaveLength(25);
   await user.type(screen.getByRole("textbox", { name: "搜索问答记录" }), "问题 2");
-  await user.click(within(screen.getByRole("list", { name: "回答与 Pi 历史" })).getByRole("button", { name: /问题 2 0 个/ }));
+  await user.click(within(screen.getByRole("list", { name: "回答与 Pi 历史" })).getByRole("button", { name: /问题 2 0 次/ }));
   expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("问题 2");
   view.rerender(<NowRail {...props} suggestions={[...allAnswers, readingAnswer(26)]} />);
   expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("问题 2");
-  expect(screen.getByRole("button", { name: "24 条较新回答，回到实时" })).toBeVisible();
-  await waitFor(() => expect(sessionStorage.getItem("meeting-copilot-now-rail:reading-flow")).toContain('"answer-2"'));
+  expect(screen.getByRole("button", { name: /24 条新建议.*查看最新/ })).toBeVisible();
+  await waitFor(() => expect(sessionStorage.getItem("meeting-copilot-coach-reader:reading-flow")).toContain('"answer-2"'));
   view.unmount();
   render(<NowRail {...props} historyOnly suggestions={allAnswers} />);
   expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("问题 2");
-  expect(screen.getByText("正在回看")).toBeVisible();
+  expect(screen.getByText("正在阅读")).toBeVisible();
   expect(screen.getByRole("heading", { name: "会中问答与 Pi 补充" })).toBeVisible();
 });
 
-it("keeps the visible Pi revision when a new one arrives and copies the selected full version", async () => {
+it("appends Pi revisions without removing prior content and copies every supplement", async () => {
   const user = userEvent.setup();
   const clipboard = vi.spyOn(navigator.clipboard, "writeText").mockResolvedValue();
   const props = { ...readingProps(), suggestions: [readingAnswer(1)] };
@@ -156,11 +160,12 @@ it("keeps the visible Pi revision when a new one arrives and copies the selected
   view.rerender(<NowRail {...props} coachHistory={[revision(1), revision(2)]} />);
   const card = screen.getByTestId("answer-copilot-card");
   expect(card).toHaveTextContent("补充说法 1");
-  expect(card).not.toHaveTextContent("补充说法 2");
+  expect(card).toHaveTextContent("补充说法 2");
+  expect(screen.getByRole("button", { name: /本题有新补充/ })).toBeVisible();
   await user.click(screen.getByRole("button", { name: "复制完整建议" }));
   expect(clipboard).toHaveBeenLastCalledWith(expect.stringContaining("补充说法 1"));
   expect(clipboard).toHaveBeenLastCalledWith(expect.stringContaining("关键风险"));
-  await user.click(screen.getByRole("button", { name: "v2" }));
+  await user.click(screen.getByRole("button", { name: /本题有新补充/ }));
   await user.click(screen.getByRole("button", { name: "复制完整建议" }));
   expect(clipboard).toHaveBeenLastCalledWith(expect.stringContaining("补充说法 2"));
   expect(clipboard).toHaveBeenLastCalledWith(expect.stringContaining("依据原话"));
@@ -172,10 +177,10 @@ it("restores a pending refinement after navigation and retries the original answ
   const status = vi.fn().mockResolvedValue("pending");
   const props = { ...readingProps(), suggestions: [readingAnswer(1)], onCoachRefine: request, onCoachRequestStatus: status };
   const first = render(<NowRail {...props} />);
-  await user.click(screen.getByText("调整建议"));
-  await user.click(screen.getByRole("button", { name: "更具体" }));
+  await user.type(screen.getByRole("textbox", { name: "调整当前回答" }), "更具体");
+  await user.click(screen.getByRole("button", { name: "提交补充" }));
   await waitFor(() => expect(status).toHaveBeenCalledWith("pi-job-1", expect.any(AbortSignal)));
-  expect(screen.getByRole("button", { name: "更具体" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "提交补充" })).toBeDisabled();
   expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("回答 1");
   first.unmount();
   status.mockResolvedValue("failed");
@@ -255,13 +260,13 @@ it("keeps the current streamed answer primary while Pi remains a supplement", ()
   const card = screen.getByTestId("answer-copilot-card");
   expect(card).toHaveTextContent("为什么选择 Redis Stream，而不是 Kafka？");
   expect(card).toHaveTextContent("我们当时更看重现有 Redis 的复用");
-  expect(card).toHaveTextContent("Pi 深度补充");
+  expect(card).toHaveTextContent("Pi 补充");
   expect(card).toHaveTextContent("迁移 Kafka 的触发条件");
   expect(screen.queryByTestId("follow-up-card")).toBeNull();
   expect(screen.getByRole("button", { name: "复制完整建议" })).toBeVisible();
 });
 
-it("renders the structured Pi package and lets the user switch retained revisions", async () => {
+it("shows complete Pi packages in chronological order with evidence available", async () => {
   const user = userEvent.setup();
   const onEvidence = vi.fn();
   const answer: Suggestion = {
@@ -336,16 +341,14 @@ it("renders the structured Pi package and lets the user switch retained revision
   const first = render(<NowRail {...props} />);
 
   const card = screen.getByTestId("answer-copilot-card");
-  expect(card).toHaveTextContent("根据你的反馈更新 · v2");
+  expect(card).toHaveTextContent("根据你的调整补充");
   expect(card).toHaveTextContent("给出迁移判断");
   expect(card).toHaveTextContent("第二版：补充吞吐、留存和运维成本的迁移判断。");
-  expect(card).toHaveTextContent("可能追问与回答方向");
-  await user.click(within(card).getByRole("button", { name: "v1" }));
+  expect(card).toHaveTextContent("可能追问");
   expect(card).toHaveTextContent("先补齐可靠性");
   expect(card).toHaveTextContent("第一版：补充失败消费和积压处理。");
-  await waitFor(() => expect(window.sessionStorage.getItem("meeting-copilot-now-rail:meeting-1")).toContain("pi-v1"));
-  await user.click(within(card).getByText("展开详细依据、风险与追问"));
-  await user.click(within(card).getByRole("button", { name: "原话 1" }));
+  await user.click(within(card).getAllByText("查看分析依据")[0]);
+  await user.click(within(card).getAllByRole("button", { name: "原话 1" })[0]);
   expect(onEvidence).toHaveBeenCalledWith("segment-1");
 
   first.unmount();
@@ -437,12 +440,13 @@ it("separates prior answers and prior coach cards without duplicating the curren
   expect(currentCard).toHaveTextContent("当前规模优先复用 Redis");
   expect(currentCard).toHaveTextContent("补充压测阈值、监控指标和回滚条件");
 
-  await userEvent.setup().click(screen.getByRole("button", { name: "全部记录（2）" }));
+  await userEvent.setup().click(screen.getByRole("button", { name: "历史 2" }));
   const answerHistory = screen.getByRole("list", { name: "回答与 Pi 历史" });
   expect(answerHistory).toHaveTextContent("如何保证消息不会丢失？");
-  expect(answerHistory).toHaveTextContent("已替换");
+  expect(answerHistory).toHaveTextContent("已保存");
   expect(answerHistory).toHaveTextContent("为什么选择 Redis Stream，而不是 Kafka？");
 
+  await userEvent.setup().click(screen.getByText("其他会中提示"));
   const coachHistory = screen.getByRole("list", { name: "过去的教练建议" });
   expect(coachHistory).toHaveTextContent("先确认失败恢复的验收条件。");
   expect(within(coachHistory).queryByText("补充压测阈值、监控指标和回滚条件。")).toBeNull();
@@ -450,7 +454,7 @@ it("separates prior answers and prior coach cards without duplicating the curren
 
 it("requests a Pi revision against the selected answer without removing the current content", async () => {
   const user = userEvent.setup();
-  const onCoachRefine = vi.fn(async () => undefined);
+  const onCoachRefine = vi.fn(async () => "refine-job");
   const answer: Suggestion = {
     suggestionId: "answer-feedback",
     meetingId: "meeting-1",
@@ -491,15 +495,10 @@ it("requests a Pi revision against the selected answer without removing the curr
     />,
   );
 
-  await user.click(screen.getByText("调整建议"));
-  const missReasonTrigger = screen.getByRole("button", { name: "没说中重点" });
-  await user.click(missReasonTrigger);
-  expect(screen.getByRole("menu", { name: "选择没说中重点的原因" })).toBeVisible();
-  await user.keyboard("{Escape}");
-  expect(screen.queryByRole("menu", { name: "选择没说中重点的原因" })).toBeNull();
-  expect(missReasonTrigger).toHaveFocus();
-
-  await user.click(screen.getByRole("button", { name: "补风险" }));
+  await user.click(screen.getByRole("button", { name: "常用调整" }));
+  await user.click(screen.getByRole("button", { name: "补充关键风险与适用边界" }));
+  expect(onCoachRefine).not.toHaveBeenCalled();
+  await user.click(screen.getByRole("button", { name: "提交补充" }));
 
   expect(onCoachRefine).toHaveBeenCalledWith(
     "answer-feedback",
