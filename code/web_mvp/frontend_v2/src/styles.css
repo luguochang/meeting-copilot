@@ -1722,9 +1722,15 @@ button:focus-visible,
 
 .answer-reader-toolbar button[aria-pressed="true"],
 .answer-history-list button[aria-pressed="true"] {
-  border-color: #16826c;
-  background: #eef8f4;
+  border-color: var(--accent);
+  background: var(--accent-soft);
 }
+
+.answer-reader-toolbar { align-items: center; }
+.answer-reader-toolbar button { display: inline-flex; align-items: center; gap: 6px; }
+.answer-reading-mode { flex: 1; color: var(--text-secondary); font-size: 12px; }
+.answer-history-list { list-style: none; padding: 0; display: grid; gap: 8px; max-height: 320px; overflow-y: auto; }
+.answer-history-list button > span { color: var(--text-secondary); font-size: 12px; }
 
 .answer-history > input {
   width: 100%;
@@ -2055,10 +2061,10 @@ button:focus-visible,
 }
 
 .answer-copilot-supplement {
-  padding: 9px 10px;
-  background: #f4f8f6;
-  border: 1px solid #d6e5dc;
-  border-radius: 5px;
+  padding: 12px;
+  background: var(--accent-soft);
+  border: 1px solid var(--border);
+  border-radius: 8px;
 }
 
 .answer-copilot-supplement p {

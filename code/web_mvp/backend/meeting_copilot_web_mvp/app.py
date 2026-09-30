@@ -129,6 +129,7 @@ from meeting_copilot_web_mvp.v2_streaming_suggestions import (
 from meeting_copilot_web_mvp.realtime_answer_copilot import (
     build_realtime_answer_messages,
     detect_answer_trigger,
+    detect_discussion_trigger,
     ground_realtime_answer,
     is_low_information_question_tail,
 )
@@ -1083,6 +1084,24 @@ def _coach_runtime_capability(
             "detail": "等待下一段稳定对话",
         }
 
+    failure_reason = " ".join(
+        str(coach.get(key) or "")
+        for key in ("fallback_reason", "status_reason", "fallback_error_code")
+    )
+    provider_failed = coach.get("status") in {
+        "timed_out", "failed", "provider_error", "invalid_output"
+    } or any(
+        marker in failure_reason
+        for marker in ("timeout", "circuit_open", "provider_temporarily_unavailable", "runtime_unavailable")
+    )
+    if coach.get("runtime_used") != "direct" and provider_failed:
+        return {
+            "state": "error",
+            "label": "Pi 补充暂不可用",
+            "detail": "本轮 Pi 补充未完成，已有回答和会议文字仍保留；后续新内容会再次尝试。",
+            "decision": None,
+            "error_class": str(coach.get("fallback_error_code") or coach.get("status_reason") or "pi_provider_error"),
+        }
     if not capture_active and str(coach.get("status") or "") not in {"intervention", "silent"}:
         return {
             "state": "idle",
@@ -2342,6 +2361,17 @@ def create_app(
             key=lambda job: (int(job.get("updated_at_ms") or 0), str(job.get("id") or "")),
             default=None,
         )
+        # A later lexical-gate skip must not erase a real provider failure (or
+        # a successful Pi decision) from the user-facing coach status.
+        latest_coach_job = max(
+            (
+                job for job in intelligence_jobs
+                if str(((job.get("output") or {}).get("coach") or {}).get("status") or "")
+                not in {"", "not_triggered", "suppressed"}
+            ),
+            key=lambda job: (int(job.get("updated_at_ms") or 0), str(job.get("id") or "")),
+            default=latest_job,
+        )
         provider_config = llm_service.LlmConfig.from_env()
         runtime = dict(projected.get("runtime") or {})
         if provider_config is None or deferred is not None:
@@ -2430,7 +2460,7 @@ def create_app(
                 active=bool(active_jobs),
                 capture_active=(projected.get("audio") or {}).get("status") == "recording",
                 requested_runtime=configured_coach_runtime(),
-                latest_job=latest_job,
+                latest_job=latest_coach_job,
             ),
             "review": {
                 "state": "error" if review.get("status") == "failed" else "busy" if review.get("status") == "processing" else "idle",
@@ -2815,6 +2845,21 @@ def create_app(
                     reason="low_information_tail_preserved_previous_answer",
                     confidence=0.99,
                 )
+        if answer_trigger.reason == "no_question_boundary":
+            recent_segments = v2_persistence.get_snapshot(session_id, segment_limit=100).get("segments") or []
+            next_seq = max((int(item.get("transcript_seq") or 0) for item in recent_segments), default=0) + 1
+            answer_trigger = detect_discussion_trigger(
+                segments=[
+                    *recent_segments,
+                    {
+                        "text": normalized_text,
+                        "transcript_seq": next_seq,
+                        "started_at_ms": timeline_offset_ms + int(event.get("start_ms") or 0),
+                        "ended_at_ms": timeline_offset_ms + int(event.get("end_ms") or event.get("received_at_ms") or 0),
+                    },
+                ],
+                answer_jobs=v2_persistence.list_jobs(meeting_id=session_id, lane="answer"),
+            )
         evidence_hash = transcript_evidence_hash(segment_id, normalized_text)
         realtime_reservation_id = (
             f"intelligence-commit:{uuid.uuid4().hex}"
@@ -2845,6 +2890,7 @@ def create_app(
                 correlation_id=session_id,
                 source_track=source_track,
                 enqueue_answer=answer_trigger.should_answer,
+                answer_trigger_type="discussion" if answer_trigger.reason == "discussion" else "delta",
             )
         except BaseException:
             if realtime_reservation_id is not None:
@@ -10748,8 +10794,10 @@ def create_app(
             or not target_evidence_hash
             or target_evidence_hash != expected_evidence_hash
             or target_paragraph is None
-            or int(target_paragraph.get("revision") or 0)
-            != int(job.get("input_version") or 0)
+            or (
+                not (trigger_type in {"answer_ready", "user_request"} and job.get("work_item_id"))
+                and int(target_paragraph.get("revision") or 0) != int(job.get("input_version") or 0)
+            )
         ):
             raise IntelligenceEvidenceSuperseded(
                 "intelligence job evidence changed before execution"
@@ -14099,6 +14147,11 @@ def create_app(
                 else ()
             ),
         )
+        if job.get("trigger_type") == "discussion":
+            trigger = replace(
+                trigger, should_answer=True, question_text="当前讨论重点",
+                reason="discussion", confidence=0.85,
+            )
         if not trigger.should_answer or not trigger.question_text:
             return {
                 "generated_answer_count": 0,
@@ -14160,6 +14213,7 @@ def create_app(
                 if int(item.get("transcript_seq") or 0) <= int(job["input_transcript_seq"])
             ][-12:]
             messages = build_realtime_answer_messages(
+                response_mode="discussion" if trigger.reason == "discussion" else "question",
                 question_text=trigger.question_text,
                 context_segments=context_segments,
                 preset_id=preparation.preset_id if preparation is not None else "general",
@@ -14214,7 +14268,7 @@ def create_app(
                     completion_parameters={
                         "reasoning_effort": "low",
                         "temperature": 0.25,
-                        "max_completion_tokens": 140,
+                        "max_completion_tokens": 480,
                     },
                     final_text_transform=ground_answer,
                 )

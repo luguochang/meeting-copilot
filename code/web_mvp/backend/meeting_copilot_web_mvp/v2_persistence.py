@@ -73,10 +73,10 @@ REVIEW_DOCUMENT_KINDS = frozenset({"minutes", "decisions", "action_items", "risk
 # The absolute deadline and minimum execution reserve remain the hard guards.
 INTELLIGENCE_DEBOUNCE_MS = 750
 INTELLIGENCE_REALTIME_BUDGET_MS = 10_000
-# Fast Answer remains visible while Pi deepens it. The optional second pass
-# must either add value inside the product SLO or fail without replacing the
-# current successful version; a slower gateway must not extend the UI wait.
-INTELLIGENCE_DEEP_BUDGET_MS = 8_000
+# Fast Answer remains visible while Pi deepens it asynchronously. This bounded
+# background deadline includes queue/projection time and is independent of the
+# live interruption cutoff; a failure must preserve the current readable answer.
+INTELLIGENCE_DEEP_BUDGET_MS = 30_000
 # Post-meeting derivations must not keep a durable row running forever when a
 # gateway stalls.  The executor applies this deadline to the handler and the
 # persistence claim path closes expired pending/retry rows after restarts.
@@ -3741,11 +3741,14 @@ class V2Persistence:
         enqueue_jobs: bool = True,
         source_track: str | None = None,
         enqueue_answer: bool | None = None,
+        answer_trigger_type: str = "delta",
     ) -> dict[str, Any]:
         """Commit one final and its derived jobs as a single durable unit."""
 
         meeting_id = _required(meeting_id, "meeting_id")
         final_id = _required(final_id, "final_id")
+        if answer_trigger_type not in {"delta", "discussion"}:
+            raise ValueError("unsupported answer trigger type")
         segment_id = _required(segment_id, "segment_id")
         text = _required(text, "text")
         normalized_text = _required(normalized_text, "normalized_text")
@@ -4000,6 +4003,7 @@ class V2Persistence:
                     recent_jobs = self._conn.execute(
                         "SELECT id, status, input_transcript_seq, deadline_at_ms, created_at_ms FROM jobs "
                         "WHERE meeting_id = ? AND kind = 'intelligence' "
+                        "AND trigger_type IN ('delta', 'transcript_delta') "
                         "ORDER BY input_transcript_seq DESC, created_at_ms DESC, id DESC LIMIT 2",
                         (meeting_id,),
                     ).fetchall()
@@ -4132,6 +4136,11 @@ class V2Persistence:
                             now_ms,
                         ),
                     )
+                    if kind == "answer" and created:
+                        self._conn.execute(
+                            "UPDATE jobs SET trigger_type = ? WHERE id = ?",
+                            (answer_trigger_type, job_id),
+                        )
                     if kind == "intelligence":
                         # A replay of an already committed final is idempotent:
                         # it must not move the original evidence clock or wake
@@ -5749,7 +5758,13 @@ class V2Persistence:
                 (meeting_id, job_row["evidence_segment_id"]),
             ).fetchone()
             expected_paragraph_revision = int(job_row["input_version"]) + len(own_revisions)
-            if paragraph_row is None or int(paragraph_row["revision"]) != expected_paragraph_revision:
+            bound_answer = (
+                job_row["trigger_type"] in {"answer_ready", "user_request"}
+                and bool(job_row["work_item_id"])
+            )
+            if paragraph_row is None or (
+                not bound_answer and int(paragraph_row["revision"]) != expected_paragraph_revision
+            ):
                 raise IntelligenceEvidenceSuperseded("intelligence paragraph evidence is stale")
             if is_local_reflex and isinstance(raw_coach_intervention, Mapping):
                 evidence_ids = raw_coach_intervention.get("evidence_segment_ids")

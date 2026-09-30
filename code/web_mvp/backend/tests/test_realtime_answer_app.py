@@ -11,6 +11,32 @@ from fastapi.testclient import TestClient
 from meeting_copilot_web_mvp.app import ProviderRuntimeNotConfiguredDeferred, create_app
 
 
+def test_continuous_statements_schedule_discussion_without_question_and_cool_down(tmp_path):
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    texts = [
+        "财政贴息可以降低居民购房的实际融资成本，但贴息对象和适用范围目前还没有明确。银行也可能受益于贷款需求恢复。",
+        "目前讨论主要围绕居民负担以及银行收益，居民利息减少和银行利润增加之间仍然存在传导条件，还要关注补贴承担方以及新增贷款的信用风险。",
+        "对于政策效果我们需要继续观察，不应直接把贷款规模增长等同于利润改善。",
+    ]
+    try:
+        results = [app.state.commit_v2_final("discussion-meeting", {
+            "segment_id": f"speech-{index}", "text": text,
+            "start_ms": index * 12_000, "end_ms": (index + 1) * 12_000,
+            "source_track": "system_audio",
+        }) for index, text in enumerate(texts)]
+        assert "answer" not in results[0]["job_ids"]
+        discussion = app.state.v2_persistence.get_job(results[1]["job_ids"]["answer"])
+        assert discussion["trigger_type"] == "discussion"
+        assert "answer" not in results[2]["job_ids"]
+        question = app.state.commit_v2_final("discussion-meeting", {
+            "segment_id": "question", "text": "那么银行实际受益的前提是什么？",
+            "start_ms": 36_000, "end_ms": 39_000, "source_track": "system_audio",
+        })
+        assert app.state.v2_persistence.get_job(question["job_ids"]["answer"])["trigger_type"] == "delta"
+    finally:
+        app.state.v2_persistence.close()
+
+
 def test_llm_first_system_question_runs_independent_streaming_answer_lane(
     monkeypatch,
     tmp_path,
@@ -91,7 +117,7 @@ def test_llm_first_system_question_runs_independent_streaming_answer_lane(
         assert len(requests) == 1
         assert requests[0]["stream"] is True
         assert requests[0]["reasoning"] == {"effort": "low"}
-        assert requests[0]["max_output_tokens"] == 140
+        assert requests[0]["max_output_tokens"] == 480
         prompt_text = json.dumps(requests[0]["input"], ensure_ascii=False)
         assert "只输出用户现在可以直接说出口的中文回答" in requests[0]["instructions"]
         assert "为什么选择 Redis Stream" in prompt_text

@@ -1632,18 +1632,18 @@ test("gpt-6-sol selects the relay low reasoning effort", () => {
   assert.equal(backend.model.thinkingLevelMap.off, "low");
 });
 
-test("Provider requests cannot exceed the ten-second bridge ceiling", () => {
+test("Provider requests cannot exceed the asynchronous deep bridge ceiling", () => {
   const backend = createOpenAICompatibleBackend({
     base_url: "https://provider.example.test/v1",
     api_key: "test-only-key",
     model: "gpt-5.5",
     api_style: "responses",
-    timeout_ms: 25_000,
-    decision_timeout_ms: 25_000,
+    timeout_ms: 60_000,
+    decision_timeout_ms: 60_000,
   });
 
-  assert.equal(backend.providerTimeoutMs, 10_000);
-  assert.equal(backend.decisionTimeoutMs, 10_000);
+  assert.equal(backend.providerTimeoutMs, 25_000);
+  assert.equal(backend.decisionTimeoutMs, 25_000);
 });
 
 test("explicit deep Answer revision forces the submit tool through non-streaming Responses", async () => {

@@ -2720,7 +2720,8 @@ async def _test_pi_coach_runner_preserves_the_existing_evidence_contract() -> No
     assert usages == [(1, {"prompt_tokens": 90, "completion_tokens": 20, "total_tokens": 110})]
 
 
-def test_pi_deep_runner_grounds_an_unsupported_state_clause_before_commit() -> None:
+@pytest.mark.parametrize("confidence", [0.65, 0.9])
+def test_pi_deep_runner_grounds_an_unsupported_state_clause_before_commit(confidence) -> None:
     async def scenario() -> None:
         recommendation = "\n".join(
             (
@@ -2755,7 +2756,7 @@ def test_pi_deep_runner_grounds_an_unsupported_state_clause_before_commit() -> N
                     "evidence_segment_ids": ["local-3", "remote-4"],
                     "evidence_quote": "压测还没有完成。\n你能承诺周五一定上线吗？",
                     "urgency": "medium",
-                    "confidence": 0.9,
+                    "confidence": confidence,
                 },
                 "metrics": {"elapsed_ms": 840, "prompt_profile": "deep_answer"},
             }

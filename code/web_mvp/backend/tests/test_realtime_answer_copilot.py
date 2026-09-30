@@ -7,9 +7,32 @@ import pytest
 from meeting_copilot_web_mvp.realtime_answer_copilot import (
     build_realtime_answer_messages,
     detect_answer_trigger,
+    detect_discussion_trigger,
     ground_realtime_answer,
     is_low_information_question_tail,
 )
+
+
+def test_discussion_deduplicates_repeated_fragments_and_requires_new_information():
+    text = "财政贴息降低居民融资成本但银行收益还需要确认贷款需求和风险。"
+    segments = [{"transcript_seq": index + 1, "text": text, "started_at_ms": index * 10_000,
+                 "ended_at_ms": (index + 1) * 10_000} for index in range(8)]
+    assert not detect_discussion_trigger(segments=segments, answer_jobs=[]).should_answer
+    assert not detect_discussion_trigger(segments=segments, answer_jobs=[{"input_transcript_seq": 8}]).should_answer
+
+
+def test_discussion_prompt_asks_for_incremental_response_not_invented_question():
+    messages = build_realtime_answer_messages(question_text="当前讨论重点", context_segments=[], response_mode="discussion")
+    assert json.loads(messages[1]["content"])["response_mode"] == "discussion"
+    assert "不要虚构对方提问" in messages[0]["content"]
+
+
+@pytest.mark.parametrize("text", [
+    "我们还要把居民是否得到实际减负作为政策效果的判断依据。",
+    "需要确认是否产生新增需求。",
+])
+def test_embedded_uncertainty_does_not_replace_the_current_question(text):
+    assert not detect_answer_trigger(text=text, source_track="system_audio").should_answer
 
 
 @pytest.mark.parametrize(

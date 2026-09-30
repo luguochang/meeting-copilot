@@ -2789,9 +2789,11 @@ def test_v2_user_request_enters_pi_lane_without_fresh_candidate(
     assert app.state.provider_priority_arbiter.active_realtime_count == 0
 
 
+@pytest.mark.parametrize("append_speech", [False, True, "anchor_changed"])
 def test_v2_answer_ready_enters_pi_deep_with_committed_fast_answer(
     tmp_path,
     monkeypatch,
+    append_speech,
 ):
     monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
     monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
@@ -2930,6 +2932,25 @@ def test_v2_answer_ready_enters_pi_deep_with_committed_fast_answer(
         answer_id="answer:automatic-deep",
         now_ms=finalized_at_ms + 30,
     )
+
+    if append_speech == "anchor_changed":
+        persistence.commit_transcript_revision(
+            meeting_id="answer-ready-pi-meeting", segment_id="answer-ready-segment",
+            expected_evidence_hash="answer-ready-hash", corrected_text="实际没有选择 Redis Stream。",
+            revision_id="anchor-correction", now_ms=finalized_at_ms + 40,
+        )
+        with pytest.raises(app_module.IntelligenceEvidenceSuperseded):
+            asyncio.run(app.state.v2_intelligence_job_handler_impl(deep_job))
+        persistence.close()
+        return
+    if append_speech:
+        persistence.commit_final_and_enqueue(
+            meeting_id="answer-ready-pi-meeting", final_id="continued-final",
+            segment_id="continued-segment", text="接下来继续讨论监控。", normalized_text="接下来继续讨论监控。",
+            started_at_ms=1_000, ended_at_ms=2_000, evidence_hash="continued-hash",
+            source_track="system_audio", now_ms=finalized_at_ms + 40, enqueue_answer=False,
+        )
+        assert persistence.get_job(deep_job["id"])["evidence_segment_id"] == "answer-ready-segment"
 
     output = asyncio.run(app.state.v2_intelligence_job_handler_impl(deep_job))
 
@@ -4549,6 +4570,17 @@ def test_coach_runtime_capability_surfaces_completed_body_analysis_without_captu
         "detail": "本轮完成 3 项检查 · 1 轮 Agent · 1 次工具调用 · 响应约 4.3 秒 · 已延续会议上下文 · 当前没有录音输入，开始录音后继续检查新内容",
         "decision": None,
     }
+
+
+@pytest.mark.parametrize("status,reason", [("timed_out", "provider_timeout"), ("protected_silent", "realtime_provider_circuit_open"), ("failed", "IntelligenceResponseValidationError")])
+def test_pi_failure_is_not_presented_as_an_intentional_silent_decision(status, reason):
+    capability = app_module._coach_runtime_capability(
+        enabled=True, provider_configured=True, active=False, requested_runtime="pi",
+        latest_job={"output": {"coach": {"status": status, "status_reason": reason, "runtime_used": "pi"}}},
+    )
+    assert capability["state"] == "error"
+    assert capability["label"] == "Pi 补充暂不可用"
+    assert capability["decision"] is None
 
 
 def test_coach_runtime_capability_makes_pi_fallback_visible():

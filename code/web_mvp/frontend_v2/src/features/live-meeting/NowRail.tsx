@@ -60,6 +60,7 @@ interface NowRailProps {
 }
 
 interface NowRailViewState {
+  version?: 2;
   selectedAnswerId: string | null;
   selectedPiRevisionByAnswer: Record<string, string>;
   historyOpen?: boolean;
@@ -89,7 +90,7 @@ function readNowRailViewState(viewStateKey: string | undefined): NowRailViewStat
     if (!raw) return { selectedAnswerId: null, selectedPiRevisionByAnswer: {} };
     const parsed = JSON.parse(raw) as Partial<NowRailViewState>;
     return {
-      selectedAnswerId: typeof parsed.selectedAnswerId === "string" ? parsed.selectedAnswerId : null,
+      selectedAnswerId: parsed.version === 2 && typeof parsed.selectedAnswerId === "string" ? parsed.selectedAnswerId : null,
       historyOpen: typeof parsed.historyOpen === "boolean" ? parsed.historyOpen : undefined,
       historyQuery: typeof parsed.historyQuery === "string" ? parsed.historyQuery : "",
       selectedPiRevisionByAnswer: parsed.selectedPiRevisionByAnswer && typeof parsed.selectedPiRevisionByAnswer === "object"
@@ -125,7 +126,7 @@ function PiCoachingPackageView({
   onEvidence(segmentId: string): void;
 }) {
   const groups = [
-    { key: "missing", label: "遗漏重点", items: value.missingPoints },
+    { key: "missing", label: "遗漏重点", items: value.missingPoints.filter((item) => item !== value.coreJudgement && item !== value.whyItMatters) },
     { key: "constraints", label: "适用约束", items: value.constraints },
     { key: "risks", label: "关键风险", items: value.risks },
     { key: "actions", label: "下一步", items: value.nextActions },
@@ -151,10 +152,10 @@ function PiCoachingPackageView({
           <dt>核心判断</dt>
           <dd>{value.coreJudgement}</dd>
         </div>
-        <div>
+        {value.whyItMatters !== value.coreJudgement ? <div>
           <dt>为什么重要</dt>
           <dd>{value.whyItMatters}</dd>
-        </div>
+        </div> : null}
       </dl>
       {groups.length ? (
         <div className="pi-coaching-groups">
@@ -179,7 +180,6 @@ function PiCoachingPackageView({
           </ol>
         </details>
       ) : null}
-      </details>
       <div className="pi-evidence-links" aria-label="Pi 证据依据">
         <span>证据依据</span>
         {value.evidenceRefs.map((ref, index) => (
@@ -188,6 +188,7 @@ function PiCoachingPackageView({
           </button>
         ))}
       </div>
+      </details>
     </div>
   );
 }
@@ -708,7 +709,7 @@ export function NowRail({
       try {
         window.sessionStorage.setItem(
           `meeting-copilot-now-rail:${viewStateKey}`,
-          JSON.stringify({ selectedAnswerId, selectedPiRevisionByAnswer, historyOpen, historyQuery } satisfies NowRailViewState),
+          JSON.stringify({ version: 2, selectedAnswerId, selectedPiRevisionByAnswer, historyOpen, historyQuery } satisfies NowRailViewState),
         );
       } catch {
         // The rail still works when browser storage is unavailable.
@@ -717,13 +718,15 @@ export function NowRail({
     return () => window.clearTimeout(timer);
   }, [selectedAnswerId, selectedPiRevisionByAnswer, historyOpen, historyQuery, viewStateKey]);
   const selectedAnswerThread = useMemo(
-    () => answerThreads.find((item) => item.answerId === selectedAnswerId) ?? answerThreads[0] ?? null,
+    () => answerThreads.find((item) => item.answerId === selectedAnswerId)
+      ?? answerThreads.find((item) => item.answer.status === "committed")
+      ?? answerThreads[0] ?? null,
     [answerThreads, selectedAnswerId],
   );
-  // Pin the first visible thread. New arrivals are announced, never substituted for reading.
-  useEffect(() => {
-    if (!selectedAnswerId && answerThreads[0]) setSelectedAnswerId(answerThreads[0].answerId);
-  }, [answerThreads, selectedAnswerId]);
+  // null follows completed answers. Only explicitly opening history pins reading.
+  const arrivingAnswer = answerThreads[0]?.answer;
+  const answerInProgress = arrivingAnswer && ["draft", "validating"].includes(arrivingAnswer.status)
+    && arrivingAnswer.suggestionId !== selectedAnswerThread?.answerId;
   const answer = selectedAnswerThread?.answer ?? currentAnswer(suggestions);
   const suggestion = useMemo(
     () => answer ?? currentSuggestion(suggestions.filter((item) => isFormalAi(item))),
@@ -955,11 +958,13 @@ export function NowRail({
     <aside className="now-rail" aria-label="当前会议重点">
       <section className="rail-section suggestion-section" aria-labelledby="suggestion-title">
         <div className="answer-reader-toolbar">
-          <button type="button" aria-pressed={!historyOpen} onClick={() => setHistoryOpen(false)}>当前回答</button>
-          <button type="button" aria-pressed={historyOpen} onClick={() => setHistoryOpen(true)}>全部记录（{answerThreads.length}）</button>
-          {newerAnswerCount > 0 ? (
-            <button type="button" onClick={() => { setSelectedAnswerId(answerThreads[0]?.answerId ?? null); setHistoryOpen(false); }}>
-              {newerAnswerCount} 条较新回答，回到最新
+          <span className="answer-reading-mode">{selectedAnswerId ? "正在回看" : historyOnly ? "会议记录" : "跟随实时"}</span>
+          <button type="button" aria-pressed={historyOpen} onClick={() => { if (!historyOpen) setSelectedAnswerId(selectedAnswerThread?.answerId ?? null); setHistoryOpen(!historyOpen); }}>
+            <History size={14} />{historyOpen ? "收起记录" : `全部记录（${answerThreads.length}）`}
+          </button>
+          {selectedAnswerId && !historyOnly ? (
+            <button type="button" onClick={() => { setSelectedAnswerId(null); setHistoryOpen(false); }}>
+              {newerAnswerCount > 0 ? `${newerAnswerCount} 条较新回答，` : ""}回到实时
             </button>
           ) : null}
         </div>
@@ -1001,12 +1006,11 @@ export function NowRail({
           ) : null}
         </header>
 
-        {coachRuntime?.detail && (formalFollowUp || (suggestion && text)) ? (
+        {coachRuntime?.detail && coachRuntime.state === "error" ? (
           <p className="coach-runtime-detail" role="status">{coachRuntime.detail}</p>
         ) : null}
-        {coachRuntime?.decision && (formalFollowUp || (suggestion && text)) ? (
-          <p className="coach-runtime-decision" role="status">{coachRuntime.decision}</p>
-        ) : null}
+        {answerInProgress ? <p className="coach-runtime-detail" role="status">下一条回应正在生成，当前建议保留。</p> : null}
+        {arrivingAnswer?.errorClass && arrivingAnswer.suggestionId !== selectedAnswerThread?.answerId ? <p className="answer-copilot-error" role="status">新回应生成失败，当前保留上一条建议。可在全部记录查看失败详情。</p> : null}
 
         {isAnswer && suggestion ? (
           <div
@@ -1016,11 +1020,11 @@ export function NowRail({
             data-ui-render-job-id={suggestion.jobId ?? undefined}
           >
             <div className="answer-copilot-field">
-              <span className="follow-up-field-label">当前问题</span>
+              <span className="follow-up-field-label">{suggestion.questionText === "当前讨论重点" ? "讨论焦点" : "当前问题"}</span>
               <p className="answer-copilot-question">{suggestion.questionText ?? "正在确认对方的问题..."}</p>
             </div>
             <div className="answer-copilot-field answer-copilot-field--response">
-              <span className="follow-up-field-label">建议回答</span>
+              <span className="follow-up-field-label">{suggestion.questionText === "当前讨论重点" ? "重点与回应角度" : "建议回答"}</span>
               {suggestion.status === "rejected" ? (
                 <p className="answer-copilot-error" role="alert" title={suggestion.errorClass ?? undefined}>
                   {answerErrorMessage(suggestion)}
@@ -1081,7 +1085,8 @@ export function NowRail({
               </div>
             ) : null}
             {suggestion.status === "committed" && onCoachRefine ? (
-              <div className="coach-refinement" aria-label="调整 Pi 教练回答">
+              <details className="coach-refinement pi-reading-details" aria-label="调整 Pi 教练回答">
+                <summary>调整建议</summary>
                 <div className="coach-refinement-actions">
                   {COACH_REFINEMENT_ACTIONS.map((action) => (
                     <button
@@ -1122,10 +1127,10 @@ export function NowRail({
                   </div>
                 ) : null}
                 {refinementPending ? <p className="coach-refinement-status" role="status">Pi 正在生成新版本，当前内容不会被覆盖。</p> : null}
-              </div>
+              </details>
             ) : null}
             <div className="suggestion-footer">
-              {text ? <button type="button" onClick={copyCompleteAnswer}>复制完整建议</button> : null}
+              {text ? <button className="secondary-button" type="button" onClick={copyCompleteAnswer}><Copy size={14} />复制完整建议</button> : null}
               <button
                 className="evidence-link"
                 type="button"
@@ -1133,17 +1138,6 @@ export function NowRail({
               >
                 <Quote size={13} />查看问题原话
               </button>
-              {text ? (
-                <button
-                  className="icon-button icon-button--small"
-                  type="button"
-                  onClick={copySuggestion}
-                  title="复制回答"
-                  aria-label="复制回答"
-                >
-                  <Copy size={15} />
-                </button>
-              ) : null}
             </div>
           </div>
         ) : formalFollowUp ? (
@@ -1301,16 +1295,16 @@ export function NowRail({
         ) : (
           <div className="coach-loop-empty" data-state={coachLifecycle?.state ?? coachRuntime?.state ?? "idle"}>
             <div className="coach-lifecycle-heading">
-              <strong>{coachLifecycle?.label ?? (coachRuntime?.state === "error" ? "实时教练暂不可用" : "等待可回答的问题")}</strong>
+              <strong>{coachRuntime?.state === "error" ? "Pi 补充暂不可用" : coachLifecycle?.label ?? "正在积累讨论内容"}</strong>
               {coachLifecycle ? <CoachOriginBadge origin={coachDecision?.origin ?? formalFollowUpCandidate?.origin} /> : null}
             </div>
-            <p>{coachLifecycle?.detail ?? coachRuntime?.detail ?? "等待下一段稳定对话"}</p>
+            <p>{coachRuntime?.state === "error" ? coachRuntime.detail : coachLifecycle?.detail ?? "明确问题会立即生成回应；连续讨论积累足够信息后，也会给出重点和回应角度。"}</p>
             {!coachLifecycle && coachRuntime?.decision ? (
               <small className="coach-loop-decision">本轮状态：{coachRuntime.decision}</small>
             ) : null}
-            <ul aria-label="教练检查项">
+            <details className="pi-reading-details"><summary>关注范围</summary><ul aria-label="教练检查项">
               {coachCheckLabels.map((label) => <li key={label}>{label}</li>)}
-            </ul>
+            </ul></details>
           </div>
         )}
 

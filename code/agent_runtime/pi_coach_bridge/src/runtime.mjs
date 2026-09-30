@@ -72,7 +72,7 @@ const MAX_TOOL_CALLS_PER_EVALUATION = 4;
 const MAX_SESSIONS = 8;
 const MAX_RETRIEVAL_PARAGRAPHS = 48;
 const DECISION_LATENCY_BUDGET_MS = 10_000;
-const MAX_DECISION_TIMEOUT_MS = 10_000;
+const MAX_DECISION_TIMEOUT_MS = 25_000;
 const TERMINAL_TOOL_NAMES = new Set(["submit_intervention", "keep_silent"]);
 const MAX_RETRY_AFTER_MS = 300_000;
 const OPENAI_RESPONSES_TOOL_CALL_PROVIDERS = new Set([
@@ -205,6 +205,7 @@ const DEEP_ANSWER_SYSTEM_PROMPT = [
   "You are Talktrace's second-pass answer coach, running after a Fast Answer is already visible to the user.",
   "Do not rewrite or summarize current_answer. Add only material information that helps answer the same question better.",
   "Use facts only from current_answer and bound_evidence. Phrase uncertain details as checks; never invent a person, number, deadline, product, or completion state.",
+  "ASR may still be awaiting correction. Frame the addition as a clarification or conditional check, starting with 先确认 in Chinese; do not present provisional speech as an established fact.",
   "submit_intervention needs a headline, one concrete speakable addition, and exactly two key_points: first the missing judgement, then the next action.",
   "The speakable addition is the primary result and should normally be 60 to 180 Chinese characters. Do not repeat current_answer in any field.",
   "Match the dialogue language. If no material addition is possible, call keep_silent. Call exactly one terminal tool in the first response; never return ordinary text.",
@@ -472,7 +473,8 @@ function deepAnswerParagraphs(context) {
 function deepAnswerEvidence(context) {
   const paragraphs = deepAnswerParagraphs(context);
   const bounded = [];
-  let remaining = 4000;
+  // Python's exact-quote contract allows 1000 characters, including separators.
+  let remaining = 980;
   for (const paragraph of [...paragraphs].reverse()) {
     if (remaining <= 0) break;
     const text = paragraph.text.trim().slice(0, Math.min(900, remaining));

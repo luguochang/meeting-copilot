@@ -157,6 +157,14 @@ def detect_answer_trigger(
     has_english_question = bool(_ENGLISH_QUESTION_RE.search(normalized))
     has_english_request = bool(_ENGLISH_REQUEST_RE.search(normalized))
 
+    # Embedded uncertainty in a statement is not a new turn addressed to the
+    # assistant (e.g. 把居民是否减负作为依据). Keep the current question alive.
+    if not has_mark and not has_chinese_request and re.search(
+        r"(?:把|将).*(?:是否|能否|有没有).*作为|(?:需要|还要|我们要|仍需)(?:先)?(?:确认|核实|观察|关注|区分).*(?:是否|能否|有没有)",
+        normalized,
+    ):
+        return AnswerTrigger(False, None, "no_question_boundary", 0.9)
+
     reason_prefix = "single_track_" if single_track_mixed else ""
     confidence_penalty = 0.10 if single_track_mixed else 0.0
     if has_mark:
@@ -189,6 +197,36 @@ def is_low_information_question_tail(value: Any) -> bool:
 
     compact = "".join(_normalize(value).split())
     return bool(compact and _LOW_INFORMATION_TAIL_RE.fullmatch(compact))
+
+
+def detect_discussion_trigger(
+    *,
+    segments: Sequence[Mapping[str, Any]],
+    answer_jobs: Sequence[Mapping[str, Any]],
+) -> AnswerTrigger:
+    """Accumulate new readable speech, bounded by the last scheduled response.
+
+    This is admission control, not keyword summarization. The model decides
+    which distinction or response is useful. Failed attempts also cool down so
+    a broken provider cannot cause one request for every ASR fragment.
+    """
+    ordered = sorted(segments, key=lambda item: int(item.get("transcript_seq") or 0))
+    last_seq = max((int(job.get("input_transcript_seq") or 0) for job in answer_jobs), default=0)
+    fresh = [item for item in ordered if int(item.get("transcript_seq") or 0) > last_seq]
+    if not fresh:
+        return AnswerTrigger(False, None, "discussion_no_new_content", 1.0)
+    latest_end = int(fresh[-1].get("ended_at_ms") or 0)
+    previous_end = max((int(item.get("ended_at_ms") or 0) for item in ordered
+                        if int(item.get("transcript_seq") or 0) <= last_seq), default=0)
+    if last_seq and latest_end - previous_end < 20_000:
+        return AnswerTrigger(False, None, "discussion_cooldown", 1.0)
+    texts = list(dict.fromkeys(_normalize(item.get("normalized_text") or item.get("text")) for item in fresh))
+    readable = [text for text in texts if _is_readable(text)]
+    size = sum(len(_READABLE_RE.findall(text)) for text in readable)
+    duration = latest_end - int(fresh[0].get("started_at_ms") or 0)
+    if size < 100 or (duration < 15_000 and size < 220):
+        return AnswerTrigger(False, None, "discussion_accumulating", 0.9)
+    return AnswerTrigger(True, "当前讨论重点", "discussion", 0.85)
 
 
 def ground_realtime_answer(
@@ -265,6 +303,7 @@ def build_realtime_answer_messages(
     participant_role: Any = None,
     focus_points: Sequence[Any] = (),
     single_track_mixed: bool = False,
+    response_mode: str = "question",
 ) -> list[dict[str, str]]:
     """Build a bounded prompt whose first responsibility is a speakable answer."""
 
@@ -309,6 +348,7 @@ def build_realtime_answer_messages(
     focus = [_normalize(item) for item in focus_points]
     focus = [item for item in focus if item][:12]
     payload = {
+        "response_mode": response_mode,
         "scene": preset,
         "current_question": question,
         "meeting_goal": _normalize(meeting_goal) or None,
@@ -328,8 +368,10 @@ def build_realtime_answer_messages(
             "content": (
                 "你是会议中的实时回答副驾。只输出用户现在可以直接说出口的中文回答，第一句就回答问题；"
                 "不要输出标题、JSON、分析过程、会议摘要，也不要说‘你可以说’或‘建议回答’。"
-                "默认 1 到 2 句、不超过 180 个汉字，适合 10 到 20 秒口述；"
-                "只保留结论、最关键依据和一个边界，其他扩展交给深度教练。"
+                "先给可立即使用的结论，再给具体依据、回应角度和必要边界，通常 3 到 5 句、120 到 280 个汉字；"
+                "不要为了凑长度复述，也不要把必要解释全部留给深度教练。"
+                "response_mode=discussion 时没有明确问题：指出近期对话最有价值的区分、权衡或遗漏，"
+                "再给一句可以直接接话的回应以及需要确认的条件；不要虚构对方提问，不要只做摘要。"
                 "只能把上下文明确提供的经历、数据、公司和项目当成用户事实；资料不足时使用限定表达，"
                 "明确需要补充的信息，绝不编造个人经历或数字。不得新增上下文中未逐字出现的具体日期、"
                 "数字、阈值、负责人、产品名或已完成状态；缺少依据时必须写成待确认条件。"

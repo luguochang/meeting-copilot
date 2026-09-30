@@ -102,25 +102,44 @@ function readingAnswer(index: number): Suggestion {
   };
 }
 
-it("pins reading across new questions, searches beyond 19 answers and restores the selected question", async () => {
+it("keeps a completed answer during streaming and returns from history to live", async () => {
+  const user = userEvent.setup();
+  const props = readingProps();
+  const first = readingAnswer(1);
+  const draft = { ...readingAnswer(2), status: "draft" as const, text: null, draftText: "未完成" };
+  const view = render(<NowRail {...props} suggestions={[first, draft]} />);
+  expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("回答 1");
+  expect(screen.getByText(/下一条回应正在生成/)).toBeVisible();
+  view.rerender(<NowRail {...props} suggestions={[first, readingAnswer(2)]} />);
+  expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("回答 2");
+  await user.click(screen.getByRole("button", { name: "全部记录（2）" }));
+  await user.click(within(screen.getByRole("list", { name: "回答与 Pi 历史" })).getByRole("button", { name: /问题 1/ }));
+  view.rerender(<NowRail {...props} suggestions={[first, readingAnswer(2), readingAnswer(3)]} />);
+  expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("回答 1");
+  await user.click(screen.getByRole("button", { name: "2 条较新回答，回到实时" }));
+  expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("回答 3");
+});
+
+it("follows live answers, pins explicitly opened history and restores the selected question", async () => {
   const user = userEvent.setup();
   const props = readingProps();
   const view = render(<NowRail {...props} suggestions={[readingAnswer(1)]} />);
   const allAnswers = Array.from({ length: 25 }, (_, index) => readingAnswer(index + 1));
   view.rerender(<NowRail {...props} suggestions={allAnswers} />);
-  expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("问题 1");
-  await user.click(screen.getByRole("button", { name: "24 条较新回答，回到最新" }));
   expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("问题 25");
   await user.click(screen.getByRole("button", { name: "全部记录（25）" }));
   expect(within(screen.getByRole("list", { name: "回答与 Pi 历史" })).getAllByRole("button")).toHaveLength(25);
   await user.type(screen.getByRole("textbox", { name: "搜索问答记录" }), "问题 2");
   await user.click(within(screen.getByRole("list", { name: "回答与 Pi 历史" })).getByRole("button", { name: /问题 2 0 个/ }));
   expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("问题 2");
+  view.rerender(<NowRail {...props} suggestions={[...allAnswers, readingAnswer(26)]} />);
+  expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("问题 2");
+  expect(screen.getByRole("button", { name: "24 条较新回答，回到实时" })).toBeVisible();
   await waitFor(() => expect(sessionStorage.getItem("meeting-copilot-now-rail:reading-flow")).toContain('"answer-2"'));
   view.unmount();
   render(<NowRail {...props} historyOnly suggestions={allAnswers} />);
   expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("问题 2");
-  expect(screen.getByRole("button", { name: "当前回答" })).toHaveAttribute("aria-pressed", "true");
+  expect(screen.getByText("正在回看")).toBeVisible();
   expect(screen.getByRole("heading", { name: "会中问答与 Pi 补充" })).toBeVisible();
 });
 
@@ -153,6 +172,7 @@ it("restores a pending refinement after navigation and retries the original answ
   const status = vi.fn().mockResolvedValue("pending");
   const props = { ...readingProps(), suggestions: [readingAnswer(1)], onCoachRefine: request, onCoachRequestStatus: status };
   const first = render(<NowRail {...props} />);
+  await user.click(screen.getByText("调整建议"));
   await user.click(screen.getByRole("button", { name: "更具体" }));
   await waitFor(() => expect(status).toHaveBeenCalledWith("pi-job-1", expect.any(AbortSignal)));
   expect(screen.getByRole("button", { name: "更具体" })).toBeDisabled();
@@ -182,8 +202,8 @@ it("keeps the empty coach heading stable while runtime state remains secondary",
   renderRail(null);
 
   expect(screen.getByRole("heading", { name: "AI 实时教练" })).toBeVisible();
-  expect(screen.getByText("等待可回答的问题")).toBeVisible();
-  expect(screen.getByText("等待下一段稳定对话")).toBeVisible();
+  expect(screen.getByText("正在积累讨论内容")).toBeVisible();
+  expect(screen.getByText(/连续讨论积累足够信息后/)).toBeVisible();
 });
 
 it("keeps the current streamed answer primary while Pi remains a supplement", () => {
@@ -238,7 +258,7 @@ it("keeps the current streamed answer primary while Pi remains a supplement", ()
   expect(card).toHaveTextContent("Pi 深度补充");
   expect(card).toHaveTextContent("迁移 Kafka 的触发条件");
   expect(screen.queryByTestId("follow-up-card")).toBeNull();
-  expect(screen.getByRole("button", { name: "复制回答" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "复制完整建议" })).toBeVisible();
 });
 
 it("renders the structured Pi package and lets the user switch retained revisions", async () => {
@@ -324,6 +344,7 @@ it("renders the structured Pi package and lets the user switch retained revision
   expect(card).toHaveTextContent("先补齐可靠性");
   expect(card).toHaveTextContent("第一版：补充失败消费和积压处理。");
   await waitFor(() => expect(window.sessionStorage.getItem("meeting-copilot-now-rail:meeting-1")).toContain("pi-v1"));
+  await user.click(within(card).getByText("展开详细依据、风险与追问"));
   await user.click(within(card).getByRole("button", { name: "原话 1" }));
   expect(onEvidence).toHaveBeenCalledWith("segment-1");
 
@@ -470,6 +491,7 @@ it("requests a Pi revision against the selected answer without removing the curr
     />,
   );
 
+  await user.click(screen.getByText("调整建议"));
   const missReasonTrigger = screen.getByRole("button", { name: "没说中重点" });
   await user.click(missReasonTrigger);
   expect(screen.getByRole("menu", { name: "选择没说中重点的原因" })).toBeVisible();

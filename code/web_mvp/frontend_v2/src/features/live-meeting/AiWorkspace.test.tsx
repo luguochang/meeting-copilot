@@ -141,7 +141,8 @@ it("shows the active Pi checklist loop when no intervention is needed", async ()
   expect(document.querySelector(".coach-loop-decision")).toHaveTextContent(
     "本轮状态：本轮结论：暂不打断，没有发现需要立刻介入的表达问题",
   );
-  expect(screen.getByText("本轮完成 6 项检查 · 检索历史 1 次 · 已延续会议上下文")).toBeVisible();
+  expect(screen.getByText("Pi 教练监听中")).toHaveAttribute("title", "本轮完成 6 项检查 · 检索历史 1 次 · 已延续会议上下文");
+  fireEvent.click(screen.getByText("关注范围"));
   expect(screen.getByRole("list", { name: "教练检查项" })).toHaveTextContent("问题回应");
   expect(screen.getByRole("list", { name: "教练检查项" })).toHaveTextContent("承诺条件");
   expect(screen.getByRole("list", { name: "教练检查项" })).toHaveTextContent("表达清晰");
@@ -214,8 +215,8 @@ it("keeps the latest coach intervention prominent and exposes prior advice", asy
   );
 
   expect(await screen.findByText(latestAdvice.question, { selector: "blockquote" })).toBeVisible();
-  expect(screen.getAllByRole("status")[0]).toHaveTextContent("本轮完成 7 项检查");
-  expect(screen.getByText("本轮结论：暂不打断，新内容与当前议题无关")).toBeVisible();
+  expect(screen.getByText("Pi 教练已分析正文")).toHaveAttribute("title", "本轮完成 7 项检查 · 已延续会议上下文");
+  expect(screen.queryByText("本轮结论：暂不打断，新内容与当前议题无关")).not.toBeInTheDocument();
   expect(screen.getByRole("list", { name: "过去的教练建议" })).toHaveTextContent(oldAdvice.question);
   expect(screen.getByText("过去建议").parentElement).toHaveTextContent("1");
 });

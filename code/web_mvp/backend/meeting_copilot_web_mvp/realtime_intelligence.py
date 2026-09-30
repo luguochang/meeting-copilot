@@ -2757,7 +2757,12 @@ async def run_realtime_coach_via_pi(
                 "host_grounding_reason": str(exc)[:240],
             }
         )
-    if intervention is not None and intervention.confidence < 0.78:
+    # An asynchronous supplement is requested reading, not an interruption.
+    # All evidence/hard-fact checks above still apply. Do not discard useful
+    # conditional guidance using the unsolicited-interruption threshold.
+    minimum_confidence = 0.60 if priority_mode == "deep" else 0.78
+    if intervention is not None and intervention.confidence < minimum_confidence:
+        metrics.update({"intervention_suppressed": True, "suppression_reason": "low_confidence"})
         intervention = None
     decision_reason = str(result.get("decision_reason") or "")[:160] or None
     allowed_evidence_ids = (

@@ -24,7 +24,7 @@ PI_BRIDGE_ENTRY_ENV = "MEETING_COPILOT_PI_BRIDGE_ENTRY"
 PI_NODE_EXECUTABLE_ENV = "MEETING_COPILOT_NODE_EXECUTABLE"
 DEFAULT_TIMEOUT_SECONDS = 12.0
 REALTIME_PROVIDER_TIMEOUT_SECONDS = 10.0
-DEEP_PROVIDER_TIMEOUT_SECONDS = 8.0
+DEEP_PROVIDER_TIMEOUT_SECONDS = 25.0
 BRIDGE_RESPONSE_GRACE_SECONDS = 0.25
 MAX_REQUEST_BYTES = 200_000
 MAX_RESPONSE_BYTES = 200_000
@@ -149,7 +149,7 @@ def build_pi_coach_request(
             # Pi is a decision lane, not the transcript index. Keep its
             # prompt small and let the bounded search tool retrieve older
             # evidence only when the current decision needs it.
-            "context_paragraphs": [asdict(item) for item in request.context_paragraphs[-2:]],
+            "context_paragraphs": [asdict(item) for item in request.context_paragraphs[-3 if normalized_priority_mode == "deep" else -2:]],
             # Historical evidence is available through Pi's bounded search
             # tool. Keep the initial prompt small; replaying a long meeting
             # here made later coach turns pay for the same text repeatedly.
