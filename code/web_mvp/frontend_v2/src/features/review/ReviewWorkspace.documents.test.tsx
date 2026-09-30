@@ -104,6 +104,30 @@ beforeEach(() => {
 });
 
 describe("ReviewWorkspace document editing", () => {
+  it("shows corrected canonical text instead of a stale AI document and warns about older minutes", async () => {
+    const user = userEvent.setup();
+    const state = endedState();
+    state.fullTranscriptState = "ready";
+    state.fullTranscript = [{ ...transcriptSegment("支持一百病发"), normalizedText: "支持一百并发", correctionStatus: "changed", correctionUpdatedAtMs: 5_000 }];
+    state.documents = {
+      transcript: reviewDocument("transcript", { segments: [{ segment_id: "segment-1", text: "支持一百病发" }] }, 1, "ai_generated"),
+      minutes: reviewDocument("minutes", { markdown: "旧会议纪要" }, 1, "ai_generated"),
+    };
+    state.semanticParagraphs = [{
+      meetingId: state.meetingId, paragraphId: "paragraph-1", revision: 1, text: "支持一百病发",
+      startMs: 1_000, endMs: 2_000, status: "stable", checkpointIds: ["segment-1"], createdAtMs: 1_000, updatedAtMs: 2_000,
+    }];
+    render(<ReviewWorkspace {...workspaceProps(state)} />);
+    expect(screen.getByText(/会议文字已更新，当前复盘可能基于旧版本/)).toBeVisible();
+    await user.click(screen.getByRole("tab", { name: "会议文字" }));
+    expect(screen.getByText("支持一百并发")).toBeVisible();
+    expect(screen.getByText("支持一百病发")).not.toBeVisible();
+    await user.click(screen.getByText("查看识别原文"));
+    expect(screen.getByText("支持一百病发")).toBeVisible();
+    await user.click(screen.getByRole("tab", { name: "会中问答" }));
+    expect(screen.getByText("本场会议还没有问答记录。")).toBeVisible();
+  });
+
   it("auto-saves minutes, decisions, action items, risks, and transcript to their own document kinds", async () => {
     const user = userEvent.setup();
     const state = endedState();

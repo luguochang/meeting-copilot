@@ -312,8 +312,12 @@ export function AiWorkspace({
 
   const requestCoachRefinement = async (answerId: string, request: string) => {
     if (!api.requestRealtimeCoach) throw new Error("当前版本未启用 Pi 回答精修");
-    await api.requestRealtimeCoach(meetingId, request, answerId);
+    return api.requestRealtimeCoach(meetingId, request, answerId);
   };
+  const getCoachRequestStatus = useCallback((jobId: string, signal?: AbortSignal) => {
+    if (!api.getCoachRequestStatus) return Promise.reject(new Error("任务进度接口不可用"));
+    return api.getCoachRequestStatus(meetingId, jobId, signal);
+  }, [api, meetingId]);
 
   const historyContext = railProps.recentContextHistory ?? [];
   const fallbackContext = historyContext.length ? [] : [
@@ -418,12 +422,14 @@ export function AiWorkspace({
           tabIndex={0}
         >
           <NowRail
+            key={meetingId}
             {...railProps}
             viewStateKey={meetingId}
             activeCoachSkillId={preparation?.presetId ?? "general"}
             onEvidence={onEvidence}
             onMessage={onMessage}
             onCoachRefine={requestCoachRefinement}
+            onCoachRequestStatus={getCoachRequestStatus}
           />
         </div>
       ) : tab === "context" ? (

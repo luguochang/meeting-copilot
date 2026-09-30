@@ -1,6 +1,6 @@
 import { Bookmark, Check, ChevronDown, ChevronUp, CircleAlert, CircleHelp, Copy, EyeOff, Flag, GitMerge, History, ListChecks, MessageCircleQuestion, MoreHorizontal, Pencil, Quote, Save, ShieldAlert, TimerOff, X } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useDismissablePopover } from "../../components/useDismissablePopover";
 import { isCoachInterventionProjection, isLocalReflexCoachProjection } from "../../domain/events";
 import type {
@@ -20,10 +20,12 @@ import type {
   SuggestionFeedback,
   TopicProjection,
 } from "../../domain/events";
-import { buildAnswerThreads } from "./answerThreads";
+import { buildAnswerThreads, completeAnswerText } from "./answerThreads";
 
 interface NowRailProps {
   viewStateKey?: string;
+  historyOnly?: boolean;
+  onCoachRequestStatus?(jobId: string, signal?: AbortSignal): Promise<"pending" | "succeeded" | "failed" | "no_change">;
   currentTopic: TopicProjection | null;
   followUp: FollowUpProjection | null | undefined;
   semanticFollowUp?: FollowUpProjection | null;
@@ -54,12 +56,30 @@ interface NowRailProps {
     expectedSourceVersion: number,
   ): Promise<void>;
   onMessage(message: string): void;
-  onCoachRefine?(answerId: string, request: string): Promise<void>;
+  onCoachRefine?(answerId: string, request: string): Promise<string | void>;
 }
 
 interface NowRailViewState {
   selectedAnswerId: string | null;
   selectedPiRevisionByAnswer: Record<string, string>;
+  historyOpen?: boolean;
+  historyQuery?: string;
+}
+
+interface PendingCoachRequest {
+  answerId: string;
+  jobId: string;
+  label: string;
+  request: string;
+  outcome?: "succeeded" | "failed" | "no_change";
+}
+
+function readPendingRequest(key: string): PendingCoachRequest | null {
+  try {
+    const value = JSON.parse(window.sessionStorage.getItem(key) ?? "null");
+    return value && ["answerId", "label", "request"].every((field) => typeof value[field] === "string" && value[field]) &&
+      typeof value.jobId === "string" && (!value.outcome || ["succeeded", "failed", "no_change"].includes(value.outcome)) ? value : null;
+  } catch { return null; }
 }
 
 function readNowRailViewState(viewStateKey: string | undefined): NowRailViewState {
@@ -70,6 +90,8 @@ function readNowRailViewState(viewStateKey: string | undefined): NowRailViewStat
     const parsed = JSON.parse(raw) as Partial<NowRailViewState>;
     return {
       selectedAnswerId: typeof parsed.selectedAnswerId === "string" ? parsed.selectedAnswerId : null,
+      historyOpen: typeof parsed.historyOpen === "boolean" ? parsed.historyOpen : undefined,
+      historyQuery: typeof parsed.historyQuery === "string" ? parsed.historyQuery : "",
       selectedPiRevisionByAnswer: parsed.selectedPiRevisionByAnswer && typeof parsed.selectedPiRevisionByAnswer === "object"
         ? parsed.selectedPiRevisionByAnswer
         : {},
@@ -114,6 +136,12 @@ function PiCoachingPackageView({
         <strong>{value.headline}</strong>
         <span>{Math.round(value.confidence * 100)}% 依据置信度</span>
       </header>
+      <div className="pi-say-this">
+        <span>可以接着说</span>
+        <blockquote>{value.sayThisAddition}</blockquote>
+      </div>
+      <details className="pi-reading-details">
+      <summary>展开详细依据、风险与追问</summary>
       <dl className="pi-coaching-summary">
         <div>
           <dt>问题意图</dt>
@@ -128,10 +156,6 @@ function PiCoachingPackageView({
           <dd>{value.whyItMatters}</dd>
         </div>
       </dl>
-      <div className="pi-say-this">
-        <span>可以接着说</span>
-        <blockquote>{value.sayThisAddition}</blockquote>
-      </div>
       {groups.length ? (
         <div className="pi-coaching-groups">
           {groups.map((group) => (
@@ -143,7 +167,7 @@ function PiCoachingPackageView({
         </div>
       ) : null}
       {value.likelyFollowUps.length ? (
-        <details className="pi-likely-follow-ups" open>
+        <details className="pi-likely-follow-ups">
           <summary>可能追问与回答方向</summary>
           <ol>
             {value.likelyFollowUps.map((item) => (
@@ -155,6 +179,7 @@ function PiCoachingPackageView({
           </ol>
         </details>
       ) : null}
+      </details>
       <div className="pi-evidence-links" aria-label="Pi 证据依据">
         <span>证据依据</span>
         {value.evidenceRefs.map((ref, index) => (
@@ -618,6 +643,8 @@ function FactGroup({
 }
 
 export function NowRail({
+  historyOnly = false,
+  onCoachRequestStatus,
   viewStateKey,
   currentTopic,
   followUp,
@@ -664,39 +691,44 @@ export function NowRail({
   const [selectedPiRevisionByAnswer, setSelectedPiRevisionByAnswer] = useState<Record<string, string>>(
     () => readNowRailViewState(viewStateKey).selectedPiRevisionByAnswer,
   );
+  const [historyOpen, setHistoryOpen] = useState(() => readNowRailViewState(viewStateKey).historyOpen ?? historyOnly);
+  const [historyQuery, setHistoryQuery] = useState(() => readNowRailViewState(viewStateKey).historyQuery ?? "");
+  const matchingThreads = answerThreads.filter((thread) => [thread.answer.questionText, answerHistoryText(thread.answer), ...thread.piRevisions.map((item) => JSON.stringify(item.coachingPackage ?? item.question))].join(" ").toLocaleLowerCase().includes(historyQuery.trim().toLocaleLowerCase()));
+  const newerAnswerCount = Math.max(0, answerThreads.findIndex((thread) => thread.answerId === selectedAnswerId));
   useEffect(() => {
     const stored = readNowRailViewState(viewStateKey);
     setSelectedAnswerId(stored.selectedAnswerId);
     setSelectedPiRevisionByAnswer(stored.selectedPiRevisionByAnswer);
-  }, [viewStateKey]);
+    setHistoryOpen(stored.historyOpen ?? historyOnly);
+    setHistoryQuery(stored.historyQuery ?? "");
+  }, [viewStateKey, historyOnly]);
   useEffect(() => {
     if (!viewStateKey) return undefined;
     const timer = window.setTimeout(() => {
       try {
         window.sessionStorage.setItem(
           `meeting-copilot-now-rail:${viewStateKey}`,
-          JSON.stringify({ selectedAnswerId, selectedPiRevisionByAnswer } satisfies NowRailViewState),
+          JSON.stringify({ selectedAnswerId, selectedPiRevisionByAnswer, historyOpen, historyQuery } satisfies NowRailViewState),
         );
       } catch {
         // The rail still works when browser storage is unavailable.
       }
     }, 0);
     return () => window.clearTimeout(timer);
-  }, [selectedAnswerId, selectedPiRevisionByAnswer, viewStateKey]);
+  }, [selectedAnswerId, selectedPiRevisionByAnswer, historyOpen, historyQuery, viewStateKey]);
   const selectedAnswerThread = useMemo(
     () => answerThreads.find((item) => item.answerId === selectedAnswerId) ?? answerThreads[0] ?? null,
     [answerThreads, selectedAnswerId],
   );
+  // Pin the first visible thread. New arrivals are announced, never substituted for reading.
+  useEffect(() => {
+    if (!selectedAnswerId && answerThreads[0]) setSelectedAnswerId(answerThreads[0].answerId);
+  }, [answerThreads, selectedAnswerId]);
   const answer = selectedAnswerThread?.answer ?? currentAnswer(suggestions);
   const suggestion = useMemo(
     () => answer ?? currentSuggestion(suggestions.filter((item) => isFormalAi(item))),
     [answer, suggestions],
   );
-  const pastAnswerThreads = answerThreads
-    .filter((item) => item.answerId !== answer?.suggestionId)
-    .filter((item) => item.answer.status === "committed" || item.answer.status === "superseded")
-    .filter((item) => Boolean(answerHistoryText(item.answer).trim()))
-    .slice(0, 19);
   const isAnswer = suggestion?.kind === "answer";
   const questions = openQuestions.filter((question) => isFormalAi(question) && questionIsOpen(question)).slice(0, 3);
   const formalTopic = currentTopic && isFormalAi(currentTopic) ? currentTopic : null;
@@ -743,6 +775,13 @@ export function NowRail({
   const deepAnswerFollowUp = availablePiRevisions.find((item, index) => (
     piRevisionIdentity(item, index) === selectedPiRevisionId
   )) ?? availablePiRevisions[0] ?? null;
+  const firstPiRevision = availablePiRevisions[0];
+  const visibleAnswerId = suggestion?.suggestionId;
+  useEffect(() => {
+    if (visibleAnswerId && firstPiRevision && !selectedPiRevisionId) {
+      setSelectedPiRevisionByAnswer((current) => ({ ...current, [visibleAnswerId]: piRevisionIdentity(firstPiRevision, 0) }));
+    }
+  }, [visibleAnswerId, firstPiRevision, selectedPiRevisionId]);
   const currentCoachHistoryId = formalFollowUp
     ? [...formalCoachHistory].reverse().find((item) =>
       formalFollowUp.decisionId && item.decisionId
@@ -765,6 +804,50 @@ export function NowRail({
   const [refinementPending, setRefinementPending] = useState<string | null>(null);
   const [refinementError, setRefinementError] = useState<string | null>(null);
   const [missReasonOpen, setMissReasonOpen] = useState(false);
+  const requestStorageKey = `meeting-copilot-coach-request:${viewStateKey ?? "current"}`;
+  const [pendingRequest, setPendingRequest] = useState<PendingCoachRequest | null>(() => {
+    const stored = readPendingRequest(requestStorageKey);
+    return stored?.outcome ? null : stored;
+  });
+  const [lastRequest, setLastRequest] = useState<PendingCoachRequest | null>(null);
+  const requestScope = useRef<object>({});
+  const [requestNotice, setRequestNotice] = useState("");
+  useEffect(() => {
+    requestScope.current = {};
+    const stored = readPendingRequest(requestStorageKey);
+    setPendingRequest(stored?.outcome ? null : stored);
+    setLastRequest(stored);
+    setRefinementPending(null);
+    setRequestNotice(stored?.outcome === "succeeded" ? "新的 Pi 补充已生成，可在对应问题的版本中查看" : stored?.outcome === "no_change" ? "本次分析未产生新的补充，原回答仍保留" : "");
+    setRefinementError(stored?.outcome === "failed" ? "本次补充未完成，原回答和已有版本仍保留" : null);
+    return () => { requestScope.current = {}; };
+  }, [requestStorageKey]);
+  useEffect(() => {
+    if (!pendingRequest || !onCoachRequestStatus) return;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = async () => {
+      try {
+        const status = await onCoachRequestStatus(pendingRequest.jobId, controller.signal);
+        if (controller.signal.aborted) return;
+        if (status !== "pending") {
+          setLastRequest(pendingRequest);
+          setPendingRequest(null);
+          try { window.sessionStorage.setItem(requestStorageKey, JSON.stringify({ ...pendingRequest, outcome: status })); } catch { /* optional storage */ }
+          if (status === "failed") setRefinementError("本次补充未完成，原回答和已有版本仍保留");
+          else setRequestNotice(status === "succeeded" ? "新的 Pi 补充已生成，可在对应问题的版本中查看" : "本次分析未产生新的补充，原回答仍保留");
+          return;
+        }
+        setRequestNotice("Pi 正在分析，当前回答仍可阅读");
+      } catch {
+        if (controller.signal.aborted) return;
+        setRequestNotice("暂时无法读取任务进度，正在自动重新连接，当前回答仍保留");
+      }
+      timer = setTimeout(() => void poll(), 1500);
+    };
+    void poll();
+    return () => { controller.abort(); clearTimeout(timer); };
+  }, [pendingRequest, onCoachRequestStatus, requestStorageKey]);
   const feedbackMenu = useDismissablePopover<HTMLButtonElement, HTMLDivElement>(
     menuOpen,
     () => setMenuOpen(false),
@@ -831,30 +914,78 @@ export function NowRail({
       onMessage("复制失败，请检查剪贴板权限");
     }
   };
+  const copyCompleteAnswer = async () => {
+    if (!suggestion) return;
+    try {
+      await navigator.clipboard.writeText(completeAnswerText(suggestion, deepAnswerFollowUp));
+      onMessage(deepAnswerFollowUp ? "完整建议已复制（包含当前 Pi 版本）" : "完整建议已复制");
+    } catch { onMessage("复制失败，请重试或选择文字复制"); }
+  };
 
-  const requestRefinement = async (label: string, request: string) => {
-    if (!suggestion || suggestion.kind !== "answer" || !onCoachRefine || refinementPending) return;
+  const requestRefinement = async (label: string, request: string, targetAnswerId = suggestion?.suggestionId) => {
+    if (!targetAnswerId || !onCoachRefine || refinementPending || pendingRequest) return;
     setRefinementPending(label);
     setRefinementError(null);
     setMissReasonOpen(false);
+    setLastRequest({ answerId: targetAnswerId, request, label, jobId: "" });
+    const scope = requestScope.current;
     try {
-      await onCoachRefine(suggestion.suggestionId, request);
+      const jobId = await onCoachRefine(targetAnswerId, request);
+      if (jobId) {
+        const pending = { jobId, answerId: targetAnswerId, label, request };
+        try { window.sessionStorage.setItem(requestStorageKey, JSON.stringify(pending)); } catch { /* optional storage */ }
+        if (requestScope.current !== scope) return;
+        setPendingRequest(pending);
+        setLastRequest(pending);
+      }
+      if (requestScope.current !== scope) return;
       onMessage(`${label}请求已提交，旧版本会保留`);
     } catch (error) {
+      try { window.sessionStorage.setItem(requestStorageKey, JSON.stringify({ answerId: targetAnswerId, request, label, jobId: "", outcome: "failed" })); } catch { /* optional storage */ }
+      if (requestScope.current !== scope) return;
       const detail = error instanceof Error ? error.message : "Pi 精修请求失败";
       setRefinementError(detail);
       onMessage(detail);
     } finally {
-      setRefinementPending(null);
+      if (requestScope.current === scope) setRefinementPending(null);
     }
   };
 
   return (
     <aside className="now-rail" aria-label="当前会议重点">
       <section className="rail-section suggestion-section" aria-labelledby="suggestion-title">
+        <div className="answer-reader-toolbar">
+          <button type="button" aria-pressed={!historyOpen} onClick={() => setHistoryOpen(false)}>当前回答</button>
+          <button type="button" aria-pressed={historyOpen} onClick={() => setHistoryOpen(true)}>全部记录（{answerThreads.length}）</button>
+          {newerAnswerCount > 0 ? (
+            <button type="button" onClick={() => { setSelectedAnswerId(answerThreads[0]?.answerId ?? null); setHistoryOpen(false); }}>
+              {newerAnswerCount} 条较新回答，回到最新
+            </button>
+          ) : null}
+        </div>
+        {historyOpen ? (
+          <div className="answer-history">
+            <input aria-label="搜索问答记录" placeholder="搜索问题、回答或 Pi 补充" value={historyQuery} onChange={(event) => setHistoryQuery(event.target.value)} />
+            <ol className="answer-history-list" aria-label="回答与 Pi 历史">
+              {matchingThreads.map((thread) => (
+                <li key={thread.answerId}>
+                  <button type="button" aria-pressed={thread.answerId === selectedAnswerId} onClick={() => { setSelectedAnswerId(thread.answerId); setHistoryOpen(false); }}>
+                    <time>{coachHistoryTime(thread.answer.createdAtMs)}</time> · {answerHistoryState(thread.answer)}
+                    <strong>{thread.answer.questionText ?? "会议建议"}</strong>
+                    <span>{thread.piRevisions.length} 个 Pi 版本</span>
+                  </button>
+                </li>
+              ))}
+            </ol>
+            {!answerThreads.length ? <p>本场会议还没有问答记录。</p> : null}
+            {answerThreads.length > 0 && !matchingThreads.length ? <p>没有匹配的记录，请尝试其他关键词。</p> : null}
+          </div>
+        ) : null}
+        {pendingRequest ? <p role="status">{pendingRequest.label}处理中 · {requestNotice || "当前内容保持不变"}<button type="button" onClick={() => { setSelectedAnswerId(pendingRequest.answerId); setHistoryOpen(false); }}>查看对应问题</button></p> : requestNotice ? <p role="status">{requestNotice}{lastRequest ? <button type="button" onClick={() => { setSelectedAnswerId(lastRequest.answerId); setHistoryOpen(false); }}>查看对应问题</button> : null}</p> : null}
+        {refinementError ? <p role="alert">{refinementError}{lastRequest && onCoachRefine ? <button type="button" onClick={() => void requestRefinement(lastRequest.label, lastRequest.request, lastRequest.answerId)}>重试这次补充</button> : null}</p> : null}
         <header className="rail-heading">
           <MessageCircleQuestion size={16} />
-          <h2 id="suggestion-title">AI 实时教练</h2>
+          <h2 id="suggestion-title">{historyOnly ? "会中问答与 Pi 补充" : "AI 实时教练"}</h2>
           {activeCoachSkillId ? (
             <span className="coach-skill-badge" title="本轮实时教练使用的场景技能包">
               {COACH_SKILL_LABELS[activeCoachSkillId]}
@@ -941,6 +1072,7 @@ export function NowRail({
                     })}
                   </div>
                 ) : null}
+                {deepAnswerFollowUp !== availablePiRevisions[0] ? <p role="status">有新的 Pi 补充，请选择版本查看；当前内容保持不变。</p> : null}
                 {deepAnswerFollowUp.coachingPackage ? (
                   <PiCoachingPackageView value={deepAnswerFollowUp.coachingPackage} onEvidence={onEvidence} />
                 ) : (
@@ -955,7 +1087,7 @@ export function NowRail({
                     <button
                       key={action.id}
                       type="button"
-                      disabled={Boolean(refinementPending)}
+                      disabled={Boolean(refinementPending || pendingRequest)}
                       onClick={() => void requestRefinement(action.label, action.request)}
                     >
                       {refinementPending === action.label ? `${action.label}处理中` : action.label}
@@ -966,7 +1098,7 @@ export function NowRail({
                     type="button"
                     aria-haspopup="menu"
                     aria-expanded={missReasonOpen}
-                    disabled={Boolean(refinementPending)}
+                    disabled={Boolean(refinementPending || pendingRequest)}
                     onClick={() => setMissReasonOpen((current) => !current)}
                   >
                     没说中重点
@@ -990,10 +1122,10 @@ export function NowRail({
                   </div>
                 ) : null}
                 {refinementPending ? <p className="coach-refinement-status" role="status">Pi 正在生成新版本，当前内容不会被覆盖。</p> : null}
-                {refinementError ? <p className="answer-copilot-error" role="alert">{refinementError}，已保留当前版本。</p> : null}
               </div>
             ) : null}
             <div className="suggestion-footer">
+              {text ? <button type="button" onClick={copyCompleteAnswer}>复制完整建议</button> : null}
               <button
                 className="evidence-link"
                 type="button"
@@ -1182,52 +1314,6 @@ export function NowRail({
           </div>
         )}
 
-        {selectedAnswerId && answerThreads[0]?.answerId !== answer?.suggestionId ? (
-          <button className="answer-history-new" type="button" onClick={() => setSelectedAnswerId(null)}>
-            有新回答，回到最新
-          </button>
-        ) : null}
-
-        {pastAnswerThreads.length ? (
-          <div className="answer-history">
-            <div className="answer-history-heading">
-              <span><History size={13} />回答与 Pi 记录 <small>{pastAnswerThreads.length}</small></span>
-            </div>
-            <ol className="answer-history-list" aria-label="回答与 Pi 历史">
-              {pastAnswerThreads.map((thread) => {
-                const item = thread.answer;
-                const piRevision = thread.piRevisions.find((revision) => revision.status === undefined || revision.status === "intervention");
-                return (
-                <li key={thread.answerId}>
-                  <details>
-                    <summary onClick={() => setSelectedAnswerId(thread.answerId)}>
-                      <span className="answer-history-summary">
-                        <span className="answer-history-meta">
-                          <time dateTime={new Date(item.updatedAtMs).toISOString()}>{coachHistoryTime(item.updatedAtMs)}</time>
-                          <span className="answer-history-state" data-status={item.status}>{answerHistoryState(item)}</span>
-                          {thread.piRevisions.length ? <span>{thread.piRevisions.length} 个 Pi 版本</span> : null}
-                        </span>
-                        <span className="answer-history-question">{item.questionText ?? "历史问题"}</span>
-                      </span>
-                      <ChevronDown className="answer-history-chevron" size={14} aria-hidden="true" />
-                    </summary>
-                    <p>{answerHistoryText(item)}</p>
-                    {piRevision ? (
-                      <p className="answer-history-pi">
-                        <strong>{piRevision.coachingPackage?.headline ?? "Pi 补充"}：</strong>
-                        {piRevision.coachingPackage?.sayThisAddition ?? piRevision.sayThis ?? piRevision.question}
-                      </p>
-                    ) : null}
-                    <button className="evidence-link" type="button" onClick={() => onEvidence(item.evidenceSegmentId)}>
-                      <Quote size={12} />查看问题原话
-                    </button>
-                  </details>
-                </li>
-                );
-              })}
-            </ol>
-          </div>
-        ) : null}
 
         {pastCoachHistory.length ? (
           <div className="coach-history">
@@ -1270,6 +1356,7 @@ export function NowRail({
         ) : null}
       </section>
 
+      {!historyOnly ? <>
       <section className="rail-section topic-section" aria-labelledby="topic-title">
         <header className="rail-heading">
           <Flag size={15} />
@@ -1398,6 +1485,7 @@ export function NowRail({
           />
         </div>
       </section>
+      </> : null}
     </aside>
   );
 }

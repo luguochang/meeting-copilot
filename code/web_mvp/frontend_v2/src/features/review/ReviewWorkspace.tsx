@@ -44,9 +44,10 @@ import type {
 import { MarkdownDocumentEditor } from "./MarkdownDocumentEditor";
 import { useReviewDocumentDraft } from "./useReviewDocumentDraft";
 import { TranscriptPane } from "../live-meeting/TranscriptPane";
+import { NowRail } from "../live-meeting/NowRail";
 import { segmentDomId } from "../live-meeting/domIds";
 
-type ReviewTab = "review" | "actions" | "transcript" | "audio";
+type ReviewTab = "review" | "actions" | "transcript" | "audio" | "answers";
 
 interface ReviewWorkspaceProps {
   state: MeetingViewState;
@@ -66,6 +67,7 @@ interface ReviewWorkspaceProps {
 const tabs: Array<{ id: ReviewTab; label: string; icon: typeof Sparkles }> = [
   { id: "review", label: "复盘", icon: Sparkles },
   { id: "actions", label: "决策与待办", icon: ListChecks },
+  { id: "answers", label: "会中问答", icon: History },
   { id: "transcript", label: "会议文字", icon: FileText },
   { id: "audio", label: "录音", icon: FileAudio },
 ];
@@ -725,6 +727,7 @@ export function ReviewWorkspace({
   const refreshAction = onRefresh ?? (() => undefined);
   const [activeTab, setActiveTab] = useState<ReviewTab>("review");
   const [pendingEvidence, setPendingEvidence] = useState<string | null>(null);
+  const [evidenceReturnTab, setEvidenceReturnTab] = useState<ReviewTab | null>(null);
   const [pendingAudioOffsetMs, setPendingAudioOffsetMs] = useState<number | null>(null);
   const [exportMenuOpen, setExportMenuOpen] = useState(false);
   const exportMenu = useDismissablePopover<HTMLButtonElement, HTMLDivElement>(
@@ -889,13 +892,20 @@ export function ReviewWorkspace({
     toContent: risksContent,
     onSave: saveRisks,
   });
+  const transcriptSource = state.documents?.transcript?.source;
+  const readTranscriptContent = useCallback((content: unknown, fallback: ReturnType<typeof editableTranscript>) => (
+    transcriptSource === "user_final" ? editableTranscript(content, fallback) : fallback
+  ), [transcriptSource]);
+  const readCoachRequestStatus = useCallback((jobId: string, signal?: AbortSignal) => (
+    new HttpMeetingApi().getCoachRequestStatus(state.meetingId, jobId, signal)
+  ), [state.meetingId]);
   const transcriptEditor = useReviewDocumentDraft({
     meetingId: state.meetingId,
     kind: "transcript",
     document: state.documents?.transcript,
     fallback: transcriptFallback,
     enabled: transcriptEditing,
-    fromContent: editableTranscript,
+    fromContent: readTranscriptContent,
     toContent: transcriptContent,
     onSave: saveTranscript,
   });
@@ -904,7 +914,7 @@ export function ReviewWorkspace({
     [transcriptEditor.draft],
   );
   const displayTranscript = useMemo(() => transcript.map((segment) => {
-    const override = transcriptOverrides.get(segment.segmentId);
+    const override = transcriptEditor.isUserFinal ? transcriptOverrides.get(segment.segmentId) : undefined;
     return {
       ...segment,
       normalizedText: override?.text ?? displayText(segment),
@@ -912,11 +922,14 @@ export function ReviewWorkspace({
       speakerLabel: override?.speakerLabel ?? segment.speakerLabel ?? null,
       speakerConfidence: override?.speakerConfidence ?? segment.speakerConfidence ?? null,
     };
-  }), [transcript, transcriptOverrides]);
+  }), [transcript, transcriptOverrides, transcriptEditor.isUserFinal]);
   const reviewSemanticParagraphs = transcriptEditor.isUserFinal ? [] : (state.semanticParagraphs ?? []);
   const reviewBasedOnOldTranscript = Boolean(
-    state.documents?.transcript?.source === "user_final" &&
-    (state.documents.minutes?.updatedAtMs ?? state.minutes?.updatedAtMs ?? 0) < (state.documents.transcript.updatedAtMs ?? 0),
+    (state.documents?.minutes || state.minutes) &&
+    (state.documents?.minutes?.updatedAtMs ?? state.minutes?.updatedAtMs ?? 0) < Math.max(
+      state.documents?.transcript?.source === "user_final" ? state.documents.transcript.updatedAtMs ?? 0 : 0,
+      ...transcript.filter((segment) => segment.correctionStatus === "changed").map((segment) => segment.correctionUpdatedAtMs ?? segment.updatedAtMs ?? 0),
+    ),
   );
   const hasDecisionContent = decisionsEditor.draft.length > 0 || actionsEditor.draft.length > 0 || keptSuggestions.length > 0;
   const hasRiskContent = risksEditor.draft.length > 0 || reviewQuestions.length > 0;
@@ -1062,6 +1075,7 @@ export function ReviewWorkspace({
   const reviewCompletionPercent = Math.round((completedReviewSteps / (2 + reviewJobEntries.length)) * 100);
 
   const showEvidence = (segmentId: string) => {
+    setEvidenceReturnTab(activeTab);
     setPendingEvidence(segmentId);
     setActiveTab("transcript");
   };
@@ -1369,6 +1383,31 @@ export function ReviewWorkspace({
         className={`review-tab-panel${activeTab === "transcript" ? " review-tab-panel--transcript" : ""}`}
         role="tabpanel"
       >
+        {activeTab === "transcript" && evidenceReturnTab ? (
+          <button className="evidence-return-button" type="button" onClick={() => { setActiveTab(evidenceReturnTab); setEvidenceReturnTab(null); }}>
+            返回{tabs.find((tab) => tab.id === evidenceReturnTab)?.label}
+          </button>
+        ) : null}
+        {activeTab === "answers" ? (
+          <NowRail
+            key={state.meetingId}
+            viewStateKey={state.meetingId}
+            onCoachRequestStatus={readCoachRequestStatus}
+            historyOnly
+            currentTopic={null}
+            followUp={null}
+            coachHistory={state.coachHistory}
+            suggestions={state.suggestions}
+            openQuestions={[]}
+            decisionCandidates={[]}
+            actionItems={[]}
+            risks={[]}
+            onEvidence={showEvidence}
+            onFeedback={async () => undefined}
+            onFactStatus={async () => undefined}
+            onMessage={(text) => setExportNotice({ text, error: false })}
+          />
+        ) : null}
         {activeTab === "review" ? (
           <div className="review-summary-layout">
             <section className="review-document" aria-labelledby="minutes-heading">
@@ -1383,7 +1422,7 @@ export function ReviewWorkspace({
               />
               {reviewBasedOnOldTranscript ? (
                 <div className="inline-warning stale-review-warning">
-                  <span>完整文字已由用户修改，当前复盘基于旧版本。</span>
+                  <span>{transcriptEditor.isUserFinal ? "完整文字已由用户修改，当前复盘基于旧版本。" : "会议文字已更新，当前复盘可能基于旧版本，请重新生成后核对。"}</span>
                   <button className="secondary-button compact-button" type="button" onClick={() => void regenerateDocument("minutes")}>
                     <RefreshCw size={13} />基于最新文字重新整理
                   </button>

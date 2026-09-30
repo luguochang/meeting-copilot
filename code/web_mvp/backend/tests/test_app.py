@@ -3534,6 +3534,36 @@ def _formal_projection_event(
     }
 
 
+def test_snapshot_keeps_complete_coach_archive_beyond_runtime_window(tmp_path, monkeypatch):
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    persistence = app.state.v2_persistence
+    meeting_id = "complete-coach-archive"
+    persistence.create_meeting(meeting_id=meeting_id, title="Complete coach archive", now_ms=1_000)
+    events = [
+        _formal_projection_event(
+            seq=index,
+            event_type="meeting.intelligence.applied",
+            projection={
+                "question": f"建议 {index}", "reason": "需要补充具体条件",
+                "coach_event_type": "commitment_risk", "decision_id": f"decision-{index}",
+                "prompt_profile": "deep_answer", "answer_id": f"answer-{index}",
+            },
+        )
+        for index in range(1, 26)
+    ]
+    monkeypatch.setattr(persistence, "list_event_page", lambda *_args, **_kwargs: {
+        "events": events, "has_more": False, "next_after_seq": 25,
+    })
+    monkeypatch.setattr(app_module.llm_service.LlmConfig, "from_env", classmethod(lambda _cls: None))
+    response = TestClient(app).get(f"/v2/meetings/{meeting_id}/snapshot")
+    assert response.status_code == 200
+    history = response.json()["coach_history"]
+    assert len(history) == 25
+    assert history[0]["decision_id"] == "decision-1"
+    assert history[-1]["decision_id"] == "decision-25"
+    assert len(app_module._bounded_formal_coach_history(events, limit=12)) == 12
+
+
 def test_coach_history_retains_advice_across_silent_rounds_and_deduplicates():
     first = {
         "question": "建议先说清楚验收标准。",

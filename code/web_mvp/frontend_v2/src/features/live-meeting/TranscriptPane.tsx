@@ -250,7 +250,7 @@ function mergeCorrectionStatus(current: string | undefined, incoming: string | u
 function correctionDetails(segments: TranscriptSegment[]): Array<{ before: string; after: string }> {
   return segments.flatMap((segment) => {
     if (segment.correctionStatus !== "changed") return [];
-    const before = segment.correctionBeforeText?.trim();
+    const before = segment.correctionBeforeText?.trim() || segment.text.trim();
     const after = segment.correctionAfterText?.trim() || segment.normalizedText.trim();
     return before && after && before !== after ? [{ before, after }] : [];
   });
@@ -279,12 +279,21 @@ function displaySemanticParagraphs(
 ): DisplayParagraph[] {
   const segmentsById = new Map(segments.map((segment) => [segment.segmentId, segment]));
   return paragraphs.flatMap((paragraph) => {
-    const text = paragraph.text.trim();
-    if (!text) return [];
     const checkpoints = paragraph.checkpointIds.flatMap((checkpointId) => {
       const segment = segmentsById.get(checkpointId);
       return segment ? [segment] : [];
     });
+    // Use the same corrected text for reading, searching and text selection.
+    // A paginated transcript may not yet contain all paragraph checkpoints.
+    const complete = checkpoints.length > 0 && checkpoints.length === paragraph.checkpointIds.length;
+    const runs = buildDisplayRuns(complete ? checkpoints : [], paragraph.text.trim());
+    const hasNewerCorrection = checkpoints.some((segment) => segment.normalizedText !== segment.text && (
+      segment.correctionUpdatedAtMs !== undefined && segment.correctionUpdatedAtMs !== null
+        ? segment.correctionUpdatedAtMs >= paragraph.updatedAtMs
+        : (segment.updatedAtMs ?? 0) > paragraph.updatedAtMs
+    ));
+    const text = complete && hasNewerCorrection ? runs.map((run) => run.text).join("\n").trim() : paragraph.text.trim();
+    if (!text) return [];
     const revisedSpeaker = semanticParagraphSpeaker(paragraph, checkpoints);
     return [{
       id: paragraph.paragraphId,
@@ -305,7 +314,7 @@ function displaySemanticParagraphs(
         .map((checkpointId) => segmentsById.get(checkpointId)?.correctionStatus)
         .reduce(mergeCorrectionStatus, undefined),
       corrections: correctionDetails(checkpoints),
-      runs: buildDisplayRuns(checkpoints, text),
+      runs,
     }];
   });
 }
@@ -815,10 +824,10 @@ export function TranscriptPane({
                   ) : <p>{paragraph.text}</p>}
                   {paragraph.corrections.length ? (
                     <details className="transcript-correction-detail">
-                      <summary>查看校对稿</summary>
+                      <summary>查看识别原文</summary>
                       <div className="transcript-correction-diff">
-                        <span>校对稿</span>
-                        <p>{paragraph.text}</p>
+                        <span>识别原文（正文已展示校对稿）</span>
+                        {paragraph.corrections.map((correction, index) => <p key={index}>{correction.before}</p>)}
                       </div>
                     </details>
                   ) : null}

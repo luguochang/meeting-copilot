@@ -741,8 +741,7 @@ function mergeCoachHistory(current: CoachHistoryEntry[], incoming: CoachHistoryE
     if (!existing || item.createdAtMs >= existing.createdAtMs) byKey.set(key, item);
   }
   return [...byKey.values()]
-    .sort((left, right) => left.createdAtMs - right.createdAtMs || left.historyId.localeCompare(right.historyId))
-    .slice(-12);
+    .sort((left, right) => left.createdAtMs - right.createdAtMs || left.historyId.localeCompare(right.historyId));
 }
 
 function applyCoachSupersession(

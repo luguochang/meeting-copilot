@@ -1694,11 +1694,64 @@ button:focus-visible,
 }
 
 .rail-section {
+  flex-shrink: 0;
   min-width: 0;
   min-height: 0;
   overflow: visible;
   padding: 16px 18px;
   border-bottom: 1px solid var(--border);
+}
+
+.answer-reader-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.answer-reader-toolbar button,
+.answer-history-list button {
+  min-height: 44px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  background: var(--surface, #fff);
+  color: inherit;
+  cursor: pointer;
+}
+
+.answer-reader-toolbar button[aria-pressed="true"],
+.answer-history-list button[aria-pressed="true"] {
+  border-color: #16826c;
+  background: #eef8f4;
+}
+
+.answer-history > input {
+  width: 100%;
+  min-height: 44px;
+  margin-bottom: 10px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.answer-history-list button {
+  width: 100%;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.answer-history-list button strong,
+.answer-history-list button > span {
+  display: block;
+  margin-top: 4px;
+}
+
+.pi-reading-details > summary {
+  min-height: 44px;
+  padding: 12px 0;
+  cursor: pointer;
+  font-weight: 600;
 }
 
 .suggestion-section {

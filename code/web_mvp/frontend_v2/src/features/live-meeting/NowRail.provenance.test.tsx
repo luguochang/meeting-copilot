@@ -83,6 +83,101 @@ function renderRail(nextFollowUp: FollowUpProjection | null) {
   return render(<NowRail {...props} />);
 }
 
+function readingProps(): ComponentProps<typeof NowRail> {
+  return {
+    viewStateKey: "reading-flow", currentTopic: null, followUp: null, coachHistory: [],
+    suggestions: [], openQuestions: [], decisionCandidates: [], actionItems: [], risks: [],
+    onEvidence: vi.fn(), onFeedback: vi.fn(), onFactStatus: vi.fn(), onMessage: vi.fn(),
+  };
+}
+
+function readingAnswer(index: number): Suggestion {
+  return {
+    suggestionId: `answer-${index}`, meetingId: "reading-flow", jobId: `job-${index}`,
+    generationId: `generation-${index}`, kind: "answer", questionText: `问题 ${index}`,
+    evidenceSegmentId: `segment-${index}`, evidenceTranscriptSeq: index, evidenceHash: `hash-${index}`,
+    stateRevision: index, status: "committed", draftText: "", draftSeq: 1,
+    text: `回答 ${index}`, finalDraftSeq: 1, feedback: null,
+    createdAtMs: index * 1000, updatedAtMs: index * 1000, committedAtMs: index * 1000,
+  };
+}
+
+it("pins reading across new questions, searches beyond 19 answers and restores the selected question", async () => {
+  const user = userEvent.setup();
+  const props = readingProps();
+  const view = render(<NowRail {...props} suggestions={[readingAnswer(1)]} />);
+  const allAnswers = Array.from({ length: 25 }, (_, index) => readingAnswer(index + 1));
+  view.rerender(<NowRail {...props} suggestions={allAnswers} />);
+  expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("问题 1");
+  await user.click(screen.getByRole("button", { name: "24 条较新回答，回到最新" }));
+  expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("问题 25");
+  await user.click(screen.getByRole("button", { name: "全部记录（25）" }));
+  expect(within(screen.getByRole("list", { name: "回答与 Pi 历史" })).getAllByRole("button")).toHaveLength(25);
+  await user.type(screen.getByRole("textbox", { name: "搜索问答记录" }), "问题 2");
+  await user.click(within(screen.getByRole("list", { name: "回答与 Pi 历史" })).getByRole("button", { name: /问题 2 0 个/ }));
+  expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("问题 2");
+  await waitFor(() => expect(sessionStorage.getItem("meeting-copilot-now-rail:reading-flow")).toContain('"answer-2"'));
+  view.unmount();
+  render(<NowRail {...props} historyOnly suggestions={allAnswers} />);
+  expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("问题 2");
+  expect(screen.getByRole("button", { name: "当前回答" })).toHaveAttribute("aria-pressed", "true");
+  expect(screen.getByRole("heading", { name: "会中问答与 Pi 补充" })).toBeVisible();
+});
+
+it("keeps the visible Pi revision when a new one arrives and copies the selected full version", async () => {
+  const user = userEvent.setup();
+  const clipboard = vi.spyOn(navigator.clipboard, "writeText").mockResolvedValue();
+  const props = { ...readingProps(), suggestions: [readingAnswer(1)] };
+  const revision = (index: number): CoachHistoryEntry => ({
+    ...followUp({ origin: "pi", status: "intervention", promptProfile: "deep_answer", answerId: "answer-1", decisionId: `pi-${index}`, revision: index }),
+    historyId: `history-${index}`, createdAtMs: index * 1000,
+    coachingPackage: coachingPackage(`判断 ${index}`, `补充说法 ${index}`),
+  });
+  const view = render(<NowRail {...props} coachHistory={[revision(1)]} />);
+  view.rerender(<NowRail {...props} coachHistory={[revision(1), revision(2)]} />);
+  const card = screen.getByTestId("answer-copilot-card");
+  expect(card).toHaveTextContent("补充说法 1");
+  expect(card).not.toHaveTextContent("补充说法 2");
+  await user.click(screen.getByRole("button", { name: "复制完整建议" }));
+  expect(clipboard).toHaveBeenLastCalledWith(expect.stringContaining("补充说法 1"));
+  expect(clipboard).toHaveBeenLastCalledWith(expect.stringContaining("关键风险"));
+  await user.click(screen.getByRole("button", { name: "v2" }));
+  await user.click(screen.getByRole("button", { name: "复制完整建议" }));
+  expect(clipboard).toHaveBeenLastCalledWith(expect.stringContaining("补充说法 2"));
+  expect(clipboard).toHaveBeenLastCalledWith(expect.stringContaining("依据原话"));
+});
+
+it("restores a pending refinement after navigation and retries the original answer after failure", async () => {
+  const user = userEvent.setup();
+  const request = vi.fn().mockResolvedValue("pi-job-1");
+  const status = vi.fn().mockResolvedValue("pending");
+  const props = { ...readingProps(), suggestions: [readingAnswer(1)], onCoachRefine: request, onCoachRequestStatus: status };
+  const first = render(<NowRail {...props} />);
+  await user.click(screen.getByRole("button", { name: "更具体" }));
+  await waitFor(() => expect(status).toHaveBeenCalledWith("pi-job-1", expect.any(AbortSignal)));
+  expect(screen.getByRole("button", { name: "更具体" })).toBeDisabled();
+  expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("回答 1");
+  first.unmount();
+  status.mockResolvedValue("failed");
+  const second = render(<NowRail {...props} suggestions={[readingAnswer(1), readingAnswer(2)]} />);
+  await screen.findByRole("button", { name: "重试这次补充" });
+  second.unmount();
+  render(<NowRail {...props} suggestions={[readingAnswer(1), readingAnswer(2)]} />);
+  await user.click(await screen.findByRole("button", { name: "重试这次补充" }));
+  expect(request).toHaveBeenLastCalledWith("answer-1", expect.any(String));
+  expect(request).toHaveBeenCalledTimes(2);
+});
+
+it("retains every Pi revision when loading a long meeting snapshot", () => {
+  const state = createInitialMeetingState("meeting-1");
+  const history = Array.from({ length: 25 }, (_, index) => ({
+    ...followUp({ origin: "pi", status: "intervention", decisionId: `pi-${index}` }),
+    historyId: `history-${index}`, createdAtMs: index * 1000,
+  }));
+  const next = meetingReducer(state, { type: "snapshot.received", snapshot: { ...state, coachHistory: history }, receivedAtMs: 30_000 });
+  expect(next.coachHistory).toHaveLength(25);
+});
+
 it("keeps the empty coach heading stable while runtime state remains secondary", () => {
   renderRail(null);
 
@@ -237,7 +332,7 @@ it("renders the structured Pi package and lets the user switch retained revision
   expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("第一版：补充失败消费和积压处理。");
 });
 
-it("separates prior answers and prior coach cards without duplicating the current deep supplement", () => {
+it("separates prior answers and prior coach cards without duplicating the current deep supplement", async () => {
   const current: Suggestion = {
     suggestionId: "answer-current",
     meetingId: "meeting-1",
@@ -321,10 +416,11 @@ it("separates prior answers and prior coach cards without duplicating the curren
   expect(currentCard).toHaveTextContent("当前规模优先复用 Redis");
   expect(currentCard).toHaveTextContent("补充压测阈值、监控指标和回滚条件");
 
+  await userEvent.setup().click(screen.getByRole("button", { name: "全部记录（2）" }));
   const answerHistory = screen.getByRole("list", { name: "回答与 Pi 历史" });
   expect(answerHistory).toHaveTextContent("如何保证消息不会丢失？");
   expect(answerHistory).toHaveTextContent("已替换");
-  expect(answerHistory).not.toHaveTextContent("为什么选择 Redis Stream，而不是 Kafka？");
+  expect(answerHistory).toHaveTextContent("为什么选择 Redis Stream，而不是 Kafka？");
 
   const coachHistory = screen.getByRole("list", { name: "过去的教练建议" });
   expect(coachHistory).toHaveTextContent("先确认失败恢复的验收条件。");

@@ -980,14 +980,14 @@ describe("LiveMeetingWorkbench", () => {
 
     render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} />);
 
-    await user.click(await screen.findByText("查看校对稿"));
-    const details = screen.getByText("查看校对稿").closest("details");
+    await user.click(await screen.findByText("查看识别原文"));
+    const details = screen.getByText("查看识别原文").closest("details");
     expect(details).not.toBeNull();
     if (details) {
       expect(details.parentElement).toHaveClass("segment-content");
-      expect(within(details).getByText("校对稿")).toBeVisible();
-      expect(within(details).getByText("支付服务周五上线，但是负责人还没确定。")).toBeVisible();
-      expect(within(details).queryByText("支付服务周五上线但是负责人还没定")).not.toBeInTheDocument();
+      expect(within(details).getByText("识别原文（正文已展示校对稿）")).toBeVisible();
+      expect(within(details).getByText("支付服务周五上线但是负责人还没定")).toBeVisible();
+      expect(within(details).queryByText("支付服务周五上线，但是负责人还没确定。")).not.toBeInTheDocument();
     }
   });
 
@@ -1362,7 +1362,7 @@ describe("LiveMeetingWorkbench", () => {
     expect(screen.queryByRole("button", { name: "打开会议：网关改造评审" })).not.toBeInTheDocument();
   });
 
-  it("shows the four-tab review and saved recording after meeting end", async () => {
+  it("shows review including meeting answers and saved recording after meeting end", async () => {
     const user = userEvent.setup();
     const { api, transport } = dependencies();
     const onBackToMeetings = vi.fn();
@@ -1408,7 +1408,7 @@ describe("LiveMeetingWorkbench", () => {
     expect(screen.getByRole("heading", { level: 1, name: "支付服务发布评审" })).toBeVisible();
     expect(screen.queryByRole("heading", { level: 1, name: "实时会议" })).not.toBeInTheDocument();
     expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual([
-      "复盘", "决策与待办", "会议文字", "录音",
+      "复盘", "决策与待办", "会中问答", "会议文字", "录音",
     ]);
     expect(screen.getByRole("heading", { level: 3, name: "会议结论" })).toBeVisible();
     expect(screen.getByRole("heading", { level: 3, name: "行动项" })).toBeVisible();

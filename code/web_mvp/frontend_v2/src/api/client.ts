@@ -113,12 +113,13 @@ export interface MeetingApi {
     feedback: SuggestionFeedback,
     signal?: AbortSignal,
   ): Promise<void>;
+  getCoachRequestStatus?(meetingId: string, jobId: string, signal?: AbortSignal): Promise<"pending" | "succeeded" | "failed" | "no_change">;
   requestRealtimeCoach?(
     meetingId: string,
     request: string,
     answerId?: string | null,
     signal?: AbortSignal,
-  ): Promise<void>;
+  ): Promise<string | void>;
   saveFactStatus(
     meetingId: string,
     factType: MeetingFactKind,
@@ -902,11 +903,11 @@ export class HttpMeetingApi implements MeetingApi {
     request: string,
     answerId: string | null = null,
     signal?: AbortSignal,
-  ): Promise<void> {
+  ): Promise<string> {
     const idempotencyKey = typeof crypto.randomUUID === "function"
       ? crypto.randomUUID()
       : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    await this.request(
+    const response = await this.request(
       `/v2/meetings/${encodeURIComponent(meetingId)}/coach/request`,
       {
         method: "POST",
@@ -915,6 +916,25 @@ export class HttpMeetingApi implements MeetingApi {
         signal,
       },
     );
+    const jobId = (response as { job?: { id?: string } }).job?.id;
+    if (!jobId) throw new Error("请求已提交，但未返回任务编号，请刷新会议查看结果");
+    return jobId;
+  }
+
+  async getCoachRequestStatus(meetingId: string, jobId: string, signal?: AbortSignal): Promise<"pending" | "succeeded" | "failed" | "no_change"> {
+    const snapshot = await this.request(`/v2/meetings/${encodeURIComponent(meetingId)}/snapshot`, { signal }) as {
+      jobs?: Array<{ id: string; status: string }>;
+      coach_history?: Array<{ job_id?: string; status?: string }>;
+      diagnostics?: { coach_runtime_history?: Array<{ job_id?: string; status?: string; outcome?: string }> };
+    };
+    if (snapshot.coach_history?.some((item) => item.job_id === jobId && item.status === "intervention")) return "succeeded";
+    const result = snapshot.diagnostics?.coach_runtime_history?.find((item) => item.job_id === jobId);
+    if (result?.outcome === "failure" || ["failed", "timed_out"].includes(result?.status ?? "")) return "failed";
+    const job = snapshot.jobs?.find((item) => item.id === jobId);
+    if (!job) return "failed";
+    if (job?.status === "succeeded") return "no_change";
+    if (["failed", "cancelled"].includes(job?.status ?? "")) return "failed";
+    return "pending";
   }
 
   async saveFactStatus(

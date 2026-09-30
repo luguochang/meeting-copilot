@@ -780,11 +780,11 @@ describe("HttpMeetingApi", () => {
   });
 
   it("binds a Pi refinement request to the selected answer", async () => {
-    const fetchSpy = vi.fn().mockResolvedValue(response({ accepted: true }));
+    const fetchSpy = vi.fn().mockResolvedValue(response({ accepted: true, job: { id: "coach-job-7" } }));
     vi.stubGlobal("fetch", fetchSpy);
     const api = new HttpMeetingApi("http://localhost:8767/");
 
-    await api.requestRealtimeCoach("meeting/1", "请补充关键风险", "answer/7");
+    await expect(api.requestRealtimeCoach("meeting/1", "请补充关键风险", "answer/7")).resolves.toBe("coach-job-7");
 
     expect(fetchSpy).toHaveBeenCalledOnce();
     const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
@@ -794,6 +794,18 @@ describe("HttpMeetingApi", () => {
       body: JSON.stringify({ request: "请补充关键风险", answer_id: "answer/7" }),
     });
     expect((init.headers as Record<string, string>)["Idempotency-Key"]).toBeTruthy();
+  });
+
+  it.each([
+    [{ jobs: [{ id: "job-1", status: "running" }] }, "pending"],
+    [{ jobs: [{ id: "job-1", status: "succeeded" }], coach_history: [{ job_id: "job-1", status: "intervention" }] }, "succeeded"],
+    [{ jobs: [{ id: "job-1", status: "succeeded" }], diagnostics: { coach_runtime_history: [{ job_id: "job-1", status: "timed_out", outcome: "failure" }] } }, "failed"],
+    [{ jobs: [{ id: "job-1", status: "succeeded" }] }, "no_change"],
+    [{ jobs: [{ id: "job-1", status: "failed" }] }, "failed"],
+    [{ jobs: [] }, "failed"],
+  ])("reports the actual coach result rather than POST acceptance (%j)", async (snapshot, expected) => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(snapshot)));
+    await expect(new HttpMeetingApi().getCoachRequestStatus("meeting-1", "job-1")).resolves.toBe(expected);
   });
 
   it("downloads the allowlist-only runtime diagnostic bundle", async () => {

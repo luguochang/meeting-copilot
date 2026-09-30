@@ -2193,7 +2193,9 @@ def create_app(
         if v2_persistence is None or v2_persistence.semantic_projection_mode != "llm_first":
             return snapshot
         formal_events = _all_v2_formal_events(meeting_id)
-        coach_history = _bounded_formal_coach_history(formal_events)
+        # Snapshots power the searchable meeting archive. Runtime prompts keep
+        # their bounded history, but reading must not discard older revisions.
+        coach_history = _bounded_formal_coach_history(formal_events, limit=len(formal_events))
         current_answer_id = next(
             (
                 str(item.get("suggestion_id") or "").strip()
@@ -2212,7 +2214,7 @@ def create_app(
         current_coach_decision = _latest_formal_coach_decision(formal_events)
         current_semantic_follow_up = _latest_formal_semantic_follow_up(formal_events)
         recent_context_history = _bounded_recent_context_history(formal_events)
-        coach_runtime_history = _bounded_coach_runtime_history(formal_events)
+        coach_runtime_history = _bounded_coach_runtime_history(formal_events, limit=len(formal_events))
         reservation_states = snapshot.get("realtime_provider_reservations")
         if not isinstance(reservation_states, Mapping):
             reservation_states = {}
