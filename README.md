@@ -10,7 +10,7 @@
 
 > 当前 `feat/pi-realtime-coach-agent-loop` 分支集成 Pi SDK 作为实时教练 Agent runtime，尚未合并到 `main`。Pi 不替代 ASR 或底层 LLM，而是在稳定转写之上增加持续会话、工具调用、历史检索、介入判断和可审计的 Agent Loop。场景技能包的产品与技术方案见 [`docs/pi-coach-skill-packs.md`](docs/pi-coach-skill-packs.md)。
 
-> 2026-09-12 的最新验收差距、整改方案、产品头脑风暴、逐项 checklist 和最终完成审计见 [`Pi 实时会议教练：验收差距、整改方案与产品优化路线图`](docs/pi-agent-acceptance-gap-and-optimization-roadmap-20260904.md)、[`PI 评审执行 checklist`](docs/plan/meeting-copilot_PI_review_execution_checklist_20260908.md)、[`PI 实现状态报告`](docs/pi-agent-implementation-status-20260911.md) 和 [`PI 核心交付完成审计`](docs/pi-agent-completion-audit-20260912.md)。本分支仍未合并到 `main`，Overall 仍 **No-Go**：Pi SDK、session、bounded tool loop、shared Provider admission、meeting-scoped evidence、deep lane、迟到结果屏障、refiner prewarm recovery 和麦克风权限超时保护已接通；当前 backend 正式 `uv` 全量 `1732 passed, 1 skipped, 1 warning`，PI/Stage-0 子集 `119 passed`，frontend `319 passed`，Pi bridge `47 passed`。但真实 Provider 的稳定 terminal action、真实物理外放/ASR 实体安全、真实生命周期闭环、local/direct/Pi 盲评和长时设备稳定性尚未通过；自动化回归绿不等于产品 Go。
+> 2026-10-01 换机继续开发请先读 [交接文档与剩余任务清单](docs/handoff-20261001.md)、[完整网页版部署](docs/web-deployment.md) 和 [当前架构与 Pi 职责](docs/architecture-current-pi.md)。本机已有语音精修、Pi 工具协议与阅读交互验证记录；全新 Windows/其他平台验收及新的完整 Pi 安装包尚未完成。旧日期的方案和审计仅代表当时状态，不作为当前交付结论。
 
 ## 产品工作方式
 
@@ -241,37 +241,21 @@ Pi 相对单次 LLM 增加的是运行机制，而不是一个新的模型能力
 
 ## 从源码运行
 
-环境要求：Windows 10/11、Python 3.11-3.13、Node.js 22，以及 [uv](https://docs.astral.sh/uv/)。
+换机首次安装请按 [交接文档](docs/handoff-20261001.md#3-新电脑从源码恢复先网页版) 或 [完整部署手册](docs/web-deployment.md) 完成 Git、Node.js 22.19+、uv、两套 Python 依赖、前端/Pi 构建与五类语音模型下载。它们包含 Windows PowerShell 与 macOS/Linux 的不同路径；不要克隆默认 main 后直接套用 Pi 命令。
+
+首次安装完成后，在仓库根目录使用固定质量入口：
 
 ```powershell
-git clone https://github.com/luguochang/meeting-copilot.git
-cd meeting-copilot\code\web_mvp\frontend_v2
-npm ci
-npm run build
-
-cd ..\..\agent_runtime\pi_coach_bridge
-npm ci
-
-cd ..\..\web_mvp\backend
-uv sync --frozen --group dev
-uv run python ..\..\..\tools\workbench_server.py start
+uv run --project code/web_mvp/backend python tools/web_quality.py doctor
+uv run --project code/web_mvp/backend python tools/web_quality.py start
+uv run --project code/web_mvp/backend python tools/web_quality.py status
+# 用完再停止
+uv run --project code/web_mvp/backend python tools/web_quality.py stop
 ```
 
-Pi 是本分支默认的实时教练 runtime。仍需在设置中配置可用的 OpenAI-compatible Provider；Pi SDK 不自带模型。需要临时切回原有单次 LLM 路径时设置：
+打开 <http://127.0.0.1:8765/workbench>。后端托管已构建前端，无需另外启动 Vite。此入口显式启用本地精修与 Pi；仍需在 AI 设置配置并验证自己的远程 Provider。Pi SDK 不自带模型或额度。当前浏览器只采集麦克风，系统音频/双轨需桌面原生桥。
 
-```powershell
-$env:MEETING_COPILOT_REALTIME_COACH_RUNTIME = "direct"
-```
-
-完全关闭实时教练时设置 `MEETING_COPILOT_REALTIME_COACH_ENABLED=0`。默认 Agent 路径、回退行为和无声验证结果见 [Pi 持续教练实现说明](docs/pi-continuous-coach-loop.md)。
-
-打开 `http://127.0.0.1:8765/workbench`。停止服务：
-
-```powershell
-uv run python ..\..\..\tools\workbench_server.py stop
-```
-
-模型能力包、桌面构建和配置方式见 [安装指南](docs/installation.md) 与 [开发指南](docs/development.md)。
+原开发机保留 8991 和既有会议数据的命令见 [启动手册](docs/pi-workbench-startup.md)。桌面构建另见 [安装指南](docs/installation.md) 与 [开发指南](docs/development.md)。
 
 ## 代码结构
 
@@ -326,6 +310,7 @@ npm run check
 
 | 文档 | 内容 |
 | --- | --- |
+| [换机开发交接](docs/handoff-20261001.md) | 当前基线、Windows/其他电脑恢复、数据迁移、待办与验收、后续 Agent 接手提示 |
 | [安装指南](docs/installation.md) | 安装、能力包、源码运行和 AI 服务配置 |
 | [使用指南](docs/user-guide.md) | 会议、导入、复盘、笔记和离线能力 |
 | [架构说明](docs/architecture.md) | 组件职责、数据流和安全边界 |

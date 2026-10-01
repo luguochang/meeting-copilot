@@ -1,6 +1,6 @@
 # 完整网页版部署、模型下载与默认效果
 
-日期：2026-10-01。适用分支：`feat/pi-realtime-coach-agent-loop`。配套 [完整架构与 Pi 职责](architecture-current-pi.md)。
+日期：2026-10-01。适用分支：`feat/pi-realtime-coach-agent-loop`。配套 [完整架构与 Pi 职责](architecture-current-pi.md)。换机后的任务顺序、数据迁移和验收清单见 [开发交接](handoff-20261001.md)。
 
 ## 1. 不安装客户端，怎么交给别人用
 
@@ -38,13 +38,13 @@
 
 以下命令从仓库根目录执行，Mac 与 PowerShell 均可运行：
 
-也可解压本轮 `Talktrace-web-source-20261001.zip`，进入 `Talktrace-web`，跳过下面的 `git clone` 和 `cd meeting-copilot`。这份源码包已包含新脚本；若远程分支尚未同步本轮提交，直接克隆旧版本会找不到 `tools/web_quality.py`。
+也可解压 `Talktrace-web-source-20261001.zip`，进入 `Talktrace-web`，跳过下面的 `git clone` 和 `cd meeting-copilot`。源码 ZIP 是当时的静态快照；后续开发优先克隆下面指定的 Pi 分支最新版本，以获得交接说明与更新。
 
 ```bash
 git clone --branch feat/pi-realtime-coach-agent-loop --single-branch https://github.com/luguochang/meeting-copilot.git
 cd meeting-copilot
 uv python install 3.13 3.11
-uv sync --project code/web_mvp/backend --frozen
+uv sync --project code/web_mvp/backend --python 3.13 --frozen
 npm --prefix code/web_mvp/frontend_v2 ci
 npm --prefix code/web_mvp/frontend_v2 run build
 npm --prefix code/agent_runtime/pi_coach_bridge ci
