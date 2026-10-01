@@ -1,5 +1,7 @@
 # 安装指南
 
+> 最新 Pi 分支的模型下载、精修默认配置和 Node 依赖见 [完整网页版部署与效果一致性](web-deployment.md)。下述历史 Windows base 包不等于最新 Pi 完整安装包。
+
 ## Windows 安装程序
 
 在 [GitHub Release v0.1.0](https://github.com/luguochang/meeting-copilot/releases/tag/v0.1.0) 下载 `Talktrace-0.1.0-windows-x64-base-unsigned.exe`。

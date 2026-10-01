@@ -1,5 +1,7 @@
 # Pi 持续实时教练 Agent Loop 实施说明
 
+> 历史记录，非当前配置规范。见 2026-10-01 核对的 [完整架构与 Pi 实际职责](architecture-current-pi.md)：当前是 2 turn / 4 tool-call 上限、宿主 checklist，深化路径未开放历史检索。下文旧轮次、工具和 UI 描述不应作为当前验收标准。
+
 > 分支：`feat/pi-continuous-coach-loop`
 >
 > 实施提交：`8c36b09`、`9ef5364`、`0cb383d`、`3d271c2`、`6f106eb`、`e2ec16a`、`09e050c`、`fe64d78`、`cb2cd5f`、`ba3cb54`

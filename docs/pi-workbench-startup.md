@@ -1,5 +1,21 @@
 # Pi 工作台启动手册
 
+> 新电脑部署请使用 [完整网页版部署与模型下载](web-deployment.md) 和 `tools/web_quality.py`。下文保留开发机目录和端口，不应原样发给接收者。新版入口固定模型路径、启用精修并检查组件，避免依赖本机缓存。
+
+## 当前开发机入口（2026-10-01）
+
+已有会议和 Provider 设置保留在 `artifacts/tmp/web_mvp_ui_review`，当前使用 8991。不要直接运行默认 8765 并误以为新数据目录里的空列表是历史丢失。
+
+在 Pi 工作树根目录执行：
+
+```bash
+uv run --project code/web_mvp/backend python tools/web_quality.py start --port 8991 --data-dir artifacts/tmp/web_mvp_ui_review
+uv run --project code/web_mvp/backend python tools/web_quality.py status --port 8991 --data-dir artifacts/tmp/web_mvp_ui_review
+uv run --project code/web_mvp/backend python tools/web_quality.py stop --port 8991 --data-dir artifacts/tmp/web_mvp_ui_review
+```
+
+打开 `http://127.0.0.1:8991/workbench`。这组命令使用校验过的固定模型路径与精修预热；后续旧 8981 示例仅用于理解开发模式。
+
 本文记录 `feat/pi-realtime-coach-agent-loop` 分支的本地启动方式。命令默认使用独立 Pi worktree，不会修改或复用当前 `main` 工作区的源码。
 
 ## 运行前确认
