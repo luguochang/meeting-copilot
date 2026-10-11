@@ -67,6 +67,7 @@ def _configure_llm(monkeypatch):
     monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
     monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-test")
     monkeypatch.setenv("LLM_GATEWAY_MODEL", "gpt-5.5")
+    monkeypatch.delenv("LLM_GATEWAY_CORRECTION_MODEL", raising=False)
     monkeypatch.setenv("LLM_GATEWAY_PROVIDER_LABEL", "team_gateway")
     monkeypatch.delenv("LLM_GATEWAY_IS_MOCK", raising=False)
     monkeypatch.setenv("LLM_PROMPT_CNY_PER_1M_TOKENS", "1")
@@ -714,6 +715,9 @@ def test_partial_correction_keeps_accepted_revision_and_reports_rejected_segment
         del cfg
         first_marker = "<<<MC_SEGMENT:0001:corr_seg_1>>>"
         second_marker = "<<<MC_SEGMENT:0002:corr_seg_2>>>"
+        if first_marker not in raw:
+            assert "灰度" in kwargs["read_only_context"]
+            return raw.replace(raw.splitlines()[1], "完全不同的事实。"), {"total_tokens": 3}, False
         first = raw.split(first_marker, 1)[1].split("<<<MC_END:0001>>>", 1)[0].strip()
         return (
             "\n".join(
@@ -757,6 +761,14 @@ def test_partial_correction_keeps_accepted_revision_and_reports_rejected_segment
         fetched = client.get("/live/asr/sessions/correction_partial_batch/events").json()
         audit = fetched["realtime_transcript_correction"]["batch_audits"][0]
         assert audit["status"] == "partially_completed"
+        assert audit["rejection_reasons"] == {"corr_seg_2": "length_ratio_out_of_bounds"}
+        rejected = client.post(
+            "/live/asr/sessions/correction_partial_batch/realtime-corrections/run-once",
+            json={"force": True},
+        ).json()
+        assert rejected["status"]["status"] == "partially_completed"
+        assert rejected["status"]["batch_audits"][-1]["status"] == "rejected"
+        assert rejected["status"]["terminal_failed_segment_ids"] == ["corr_seg_2"]
     finally:
         ws.send_text("END")
         websocket.__exit__(None, None, None)
@@ -1055,6 +1067,7 @@ def test_realtime_correction_rejects_batch_when_markers_are_not_preserved(monkey
         assert body["called"] is True
         assert body["revision_count"] == 0
         assert body["status"]["status"] == "mapping_rejected"
+        assert body["status"]["rejection_reasons"] == {"corr_seg_1": "batch_mapping_invalid"}
         fetched = client.get("/live/asr/sessions/correction_mapping_reject/events").json()
         assert not any(event.get("event_type") == "transcript_revision" for event in fetched["events"])
     finally:
@@ -1089,11 +1102,38 @@ def test_rejected_correction_is_not_processed_and_gets_one_forced_retry(monkeypa
         ).json()
 
         assert first["status"]["status"] == "correction_rejected"
+        assert first["status"]["rejection_reasons"] == {"corr_seg_1": "meeting_fact_changed"}
         assert "corr_seg_1" not in first["status"].get("processed_segment_ids", [])
         assert second["called"] is True
         assert third["called"] is False
         assert third["gate"]["reason"] == "no_unrevised_final"
         assert len(calls) == 2
+    finally:
+        ws.send_text("END")
+        context.__exit__(None, None, None)
+
+
+def test_format_only_correction_is_a_successful_noop_without_paid_retry(monkeypatch, tmp_path):
+    _configure_llm(monkeypatch)
+    calls = []
+
+    def formatting(raw, cfg, **kwargs):
+        calls.append(raw)
+        return raw.replace("先核对材料", "先核对材料。"), {"total_tokens": 2}, False
+
+    monkeypatch.setattr(asr_correct, "correct_transcript", formatting)
+    client = TestClient(create_app(data_dir=tmp_path))
+    _enable_l2(client)
+    context, ws = _start_live_session(monkeypatch, client, "correction_format_only", "先核对材料")
+    try:
+        route = "/live/asr/sessions/correction_format_only/realtime-corrections/run-once"
+        first = client.post(route, json={"force": True}).json()
+        second = client.post(route, json={"force": True}).json()
+        assert first["status"]["status"] == "no_revision_needed"
+        assert first["no_revision_segment_ids"] == ["corr_seg_1"]
+        assert first["status"].get("failed_segment_ids", []) == []
+        assert second["called"] is False
+        assert len(calls) == 1
     finally:
         ws.send_text("END")
         context.__exit__(None, None, None)

@@ -23,6 +23,8 @@ SUPPORTED_INPUT_SOURCES = frozenset({"microphone", "system_audio", "dual_track"}
 SUPPORTED_PRESETS = frozenset({"general", "decision", "project", "interview", "brainstorm"})
 SUPPORTED_OUTPUT_FORMATS = frozenset({"standard", "decision_log", "action_plan", "brief"})
 SUPPORTED_SUGGESTION_POLICIES = frozenset({"off", "low_frequency", "standard"})
+SUPPORTED_LIVE_ANALYSIS_PROFILES = frozenset({"participation", "legacy"})
+SUPPORTED_CORRECTION_MODES = frozenset({"local_and_llm", "llm_only"})
 MAX_FOCUS_POINTS = 12
 
 
@@ -42,6 +44,8 @@ class MeetingPreparation:
     proactive_suggestion_policy: str
     version: int
     updated_at_ms: int
+    live_analysis_profile: str = "legacy"
+    correction_mode: str = "local_and_llm"
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -85,6 +89,8 @@ class MeetingPreparationStore:
         focus_points: Iterable[object] = (),
         output_format: str = "standard",
         proactive_suggestion_policy: str = "low_frequency",
+        live_analysis_profile: str | None = None,
+        correction_mode: str | None = None,
         updated_at_ms: int,
     ) -> MeetingPreparation:
         normalized_id = normalize_meeting_id(meeting_id)
@@ -116,6 +122,14 @@ class MeetingPreparationStore:
                     "proactive_suggestion_policy",
                     SUPPORTED_SUGGESTION_POLICIES,
                     "low_frequency",
+                ),
+                live_analysis_profile=normalize_live_analysis_profile(
+                    existing_payload.get("live_analysis_profile")
+                    if live_analysis_profile is None else live_analysis_profile
+                ),
+                correction_mode=normalize_correction_mode(
+                    existing_payload.get("correction_mode")
+                    if correction_mode is None else correction_mode
                 ),
                 version=max(0, int(existing_payload.get("version") or 0)) + 1,
                 updated_at_ms=max(0, int(updated_at_ms)),
@@ -184,6 +198,22 @@ def normalize_meeting_id(value: object) -> str:
     if not _MEETING_ID_RE.fullmatch(normalized):
         raise ValueError("meeting_id contains unsupported characters")
     return normalized
+
+
+def normalize_live_analysis_profile(value: object) -> str:
+    if value is None:
+        return "legacy"
+    if not isinstance(value, str) or value not in SUPPORTED_LIVE_ANALYSIS_PROFILES:
+        raise ValueError("live_analysis_profile must be participation or legacy")
+    return value
+
+
+def normalize_correction_mode(value: object) -> str:
+    if value is None:
+        return "local_and_llm"
+    if not isinstance(value, str) or value not in SUPPORTED_CORRECTION_MODES:
+        raise ValueError("correction_mode must be local_and_llm or llm_only")
+    return value
 
 
 def normalize_hotwords(values: Iterable[object]) -> tuple[str, ...]:
@@ -299,4 +329,6 @@ def preparation_from_mapping(
         ),
         version=max(0, int(payload.get("version") or 0)),
         updated_at_ms=max(0, int(payload.get("updated_at_ms") or 0)),
+        live_analysis_profile=normalize_live_analysis_profile(payload.get("live_analysis_profile")),
+        correction_mode=normalize_correction_mode(payload.get("correction_mode")),
     )

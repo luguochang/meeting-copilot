@@ -9,6 +9,15 @@ const indicator = (state: "active" | "busy" | "paused" | "idle" | "error" | "off
 });
 
 describe("meetingSessionState", () => {
+  it("separates saved audio capture from blocked transcription in either recording window", () => {
+    for (const state of ["capturing", "capturing_elsewhere"] as const) {
+      const result = captureHealthSummary(state, indicator("active"), indicator("paused"), indicator("active"));
+      expect(result.state).toBe("paused");
+      expect(result.label).toContain("文字待恢复");
+      expect(result.label).not.toContain("采集异常");
+    }
+  });
+
   it("treats a backend-live meeting without a browser MediaStream as recoverable", () => {
     expect(resolveMeetingSessionState({
       meetingPhase: "live",

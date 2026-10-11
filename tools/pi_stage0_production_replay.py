@@ -25,7 +25,7 @@ from pathlib import Path
 import re
 import sys
 import time
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 import unicodedata
 from urllib.parse import quote, urlencode, urlsplit
 import wave
@@ -655,6 +655,8 @@ def stream_wav(
     finalize_timeout_seconds: float,
     event_sink: list[dict[str, Any]],
     audio_source: str = "browser_live_mic",
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    write_timeout_seconds: float = 5.0,
 ) -> dict[str, Any]:
     """Stream F32LE frames through the production ASR socket.
 
@@ -665,6 +667,8 @@ def stream_wav(
 
     if audio_source not in {"browser_live_mic", "simulated_realtime_wav", "speaker_loopback"}:
         raise ReplayFailure("argument_validation", "unsupported --audio-source")
+    if not math.isfinite(write_timeout_seconds) or not 1 <= write_timeout_seconds <= 10:
+        raise ReplayFailure("argument_validation", "write timeout must be finite and between1and10seconds")
 
     chunk_frames = max(1, round(SAMPLE_RATE_HZ * chunk_seconds))
     expected_duration_seconds = max(
@@ -711,11 +715,17 @@ def stream_wav(
     end_send_error_message: str | None = None
     receive_error_class: str | None = None
     receive_error_message: str | None = None
+    send_error_class: str | None = None
+    send_error_operation: str | None = None
+    send_error_elapsed_ms: float | None = None
     asr_shutdown_diagnostics: dict[str, Any] | None = None
     close_code: int | None = None
     close_reason: str | None = None
     close_received_at_ms: int | None = None
     termination = "unknown"
+    # A receive poll shares the underlying socket timeout with writes. Restore
+    # a bounded write budget before each frame so a 20 ms receive poll cannot
+    # abort a valid producer when the server briefly applies backpressure.
 
     def transport_stats() -> dict[str, Any]:
         """Return a redacted, failure-safe snapshot of the socket exchange."""
@@ -765,6 +775,7 @@ def stream_wav(
             "chunk_frames": chunk_frames,
             "chunk_seconds": chunk_seconds,
             "pace": pace,
+            "write_timeout_seconds": write_timeout_seconds,
             "termination": termination,
             "eos_observed": eos_observed,
             "socket_closed_by_server": closed,
@@ -773,6 +784,9 @@ def stream_wav(
             "socket_close_received_at_ms": close_received_at_ms,
             "receive_error_class": receive_error_class,
             "receive_error_message": receive_error_message,
+            "send_error_class": send_error_class,
+            "send_error_operation": send_error_operation,
+            "send_error_elapsed_ms": send_error_elapsed_ms,
             "event_counts": dict(sorted(event_counts.items())),
             "partial_count": int(event_counts.get("partial", 0)),
             "final_count": int(event_counts.get("final", 0)),
@@ -796,6 +810,20 @@ def stream_wav(
             ),
             "asr_shutdown_diagnostics": asr_shutdown_diagnostics,
         }
+
+    def notify_progress() -> None:
+        if progress_callback is not None:
+            progress_callback({
+                "sent_audio_frames": sent_audio_frames,
+                "sent_audio_seconds": round(sent_audio_frames / SAMPLE_RATE_HZ, 3),
+                "sent_silence_frames": sent_silence_frames,
+                "non_empty_final_count": len(final_events),
+                "authoritative_local_final_count": sum(
+                    event.get("final_source") == "local_offline_refinement" for event in final_events
+                ),
+                "asr_error_event_count": sum(event_counts.get(key, 0) for key in ("provider_error", "recording_rejected", "error")),
+                "asr_ready": ready,
+            })
 
     def receive_available(timeout_seconds: float) -> None:
         nonlocal ready, closed, eos_observed, rejected_event, last_event_at, ready_at
@@ -910,9 +938,14 @@ def stream_wav(
             wav_path,
             chunk_frames=chunk_frames,
         ):
+            ws.settimeout(write_timeout_seconds)
+            write_started_at = time.monotonic()
             try:
                 ws.send_binary(float32_chunk)
-            except (websocket.WebSocketConnectionClosedException, OSError) as exc:
+            except (websocket.WebSocketConnectionClosedException, websocket.WebSocketTimeoutException, OSError) as exc:
+                send_error_class = type(exc).__name__
+                send_error_operation = "source_audio_binary_write"
+                send_error_elapsed_ms = round((time.monotonic() - write_started_at) * 1000, 2)
                 receive_error_class = type(exc).__name__
                 receive_error_message = str(exc)[:300]
                 raise ReplayFailure(
@@ -925,6 +958,7 @@ def stream_wav(
             if not ready:
                 sent_audio_frames_before_ready += actual_frames
             receive_available(0.02)
+            notify_progress()
             if rejected_event is not None:
                 code = str(rejected_event.get("error_code") or rejected_event.get("message") or "unknown")
                 raise ReplayFailure("asr_stream", f"ASR failed while streaming: {code}")
@@ -939,9 +973,14 @@ def stream_wav(
         zero_chunk = b"\x00" * (chunk_frames * 4)
         while sent_silence_frames < total_silence_frames:
             frame_count = min(chunk_frames, total_silence_frames - sent_silence_frames)
+            ws.settimeout(write_timeout_seconds)
+            write_started_at = time.monotonic()
             try:
                 ws.send_binary(zero_chunk[: frame_count * 4])
-            except (websocket.WebSocketConnectionClosedException, OSError) as exc:
+            except (websocket.WebSocketConnectionClosedException, websocket.WebSocketTimeoutException, OSError) as exc:
+                send_error_class = type(exc).__name__
+                send_error_operation = "tail_silence_binary_write"
+                send_error_elapsed_ms = round((time.monotonic() - write_started_at) * 1000, 2)
                 receive_error_class = type(exc).__name__
                 receive_error_message = str(exc)[:300]
                 raise ReplayFailure(
@@ -954,6 +993,7 @@ def stream_wav(
             if not ready:
                 sent_silence_frames_before_ready += frame_count
             receive_available(0.02)
+            notify_progress()
             if rejected_event is not None:
                 code = str(rejected_event.get("error_code") or rejected_event.get("message") or "unknown")
                 raise ReplayFailure("asr_stream", f"ASR failed while streaming: {code}")
@@ -968,9 +1008,14 @@ def stream_wav(
             require_ready(layer="asr_ready")
 
         end_send_attempted = True
+        ws.settimeout(write_timeout_seconds)
+        write_started_at = time.monotonic()
         try:
             ws.send("END")
-        except (websocket.WebSocketConnectionClosedException, OSError) as exc:
+        except (websocket.WebSocketConnectionClosedException, websocket.WebSocketTimeoutException, OSError) as exc:
+            send_error_class = type(exc).__name__
+            send_error_operation = "end_text_write"
+            send_error_elapsed_ms = round((time.monotonic() - write_started_at) * 1000, 2)
             end_send_error_class = type(exc).__name__
             end_send_error_message = str(exc)[:300]
             raise ReplayFailure(
@@ -1022,6 +1067,7 @@ def stream_wav(
         except Exception:
             pass
 
+    notify_progress()
     return transport_stats()
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from copy import deepcopy
 import json
+import re
 import sqlite3
 import time
 from pathlib import Path, PurePosixPath
@@ -695,6 +696,19 @@ class SqlitePersistenceCoordinator(_SqliteRepositoryBase):
 # Settings and LLM usage ledger
 # ---------------------------------------------------------------------------
 
+_BACKGROUND_USAGE_ACCOUNT_PATTERN = re.compile(
+    r"(?:memory|preparation):project_[0-9a-f]{32}"
+)
+
+
+def _validate_usage_account_id(account_id: str) -> str:
+    """Accept scoped background accounts only in the non-path usage ledger."""
+    value = str(account_id or "")
+    if _BACKGROUND_USAGE_ACCOUNT_PATTERN.fullmatch(value):
+        return value
+    return _validate_session_id(value)
+
+
 _SETTINGS_CREATE_TABLE_SQL = (
     "CREATE TABLE IF NOT EXISTS app_settings ("
     "singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1), "
@@ -776,6 +790,8 @@ class InMemorySettingsUsageRepository:
         since_ms: int | None = None,
         session_id: str | None = None,
     ) -> list[dict[str, Any]]:
+        if session_id is not None:
+            session_id = _validate_usage_account_id(session_id)
         with self._lock:
             records = [
                 deepcopy(record)
@@ -873,7 +889,7 @@ class SqliteSettingsUsageRepository(_SqliteRepositoryBase):
             parameters.append(max(0, int(since_ms)))
         if session_id is not None:
             where.append("session_id = ?")
-            parameters.append(str(session_id))
+            parameters.append(_validate_usage_account_id(session_id))
         query = (
             "SELECT session_id, purpose, provider, model, prompt_tokens, "
             "completion_tokens, total_tokens, timestamp_ms FROM llm_usage_ledger"
@@ -912,7 +928,7 @@ def _usage_record(
     completion = max(0, int(completion_tokens or 0))
     total = max(prompt + completion, int(total_tokens or 0))
     return {
-        "session_id": _validate_session_id(session_id),
+        "session_id": _validate_usage_account_id(session_id),
         "purpose": str(purpose),
         "provider": str(provider),
         "model": str(model),

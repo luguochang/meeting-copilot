@@ -64,12 +64,15 @@ export function captureHealthSummary(
   if (sessionState === "ended") return { state: "idle", label: "会议已结束", aiLabel: "录音和文字已保存" };
   if (sessionState === "ending") return { state: "busy", label: "正在保存会议", aiLabel };
   if (sessionState === "recoverable") return { state: "paused", label: "录音待恢复", aiLabel };
-  if (sessionState === "capturing_elsewhere") return { state: "active", label: "另一窗口录音中", aiLabel };
   if (sessionState === "error") return { state: "error", label: "采集异常", aiLabel };
   if (sessionState === "reconnecting") return { state: "busy", label: "正在恢复采集", aiLabel };
   if (sessionState === "paused") return { state: "paused", label: "录音已暂停", aiLabel };
   if (sessionState === "preparing") return { state: "busy", label: "正在准备采集", aiLabel };
   if (sessionState === "idle") return { state: "idle", label: "尚未开始录音", aiLabel };
+  if (["paused", "error", "offline"].includes(asr.state) && !["error", "offline"].includes(input.state)) {
+    return { state: "paused", label: sessionState === "capturing_elsewhere" ? "另一窗口录音 · 文字待恢复" : "录音继续 · 文字待恢复", aiLabel };
+  }
+  if (sessionState === "capturing_elsewhere") return { state: "active", label: "另一窗口录音中", aiLabel };
   if (input.state === "error" || input.state === "offline" || asr.state === "error" || asr.state === "offline") {
     return { state: "error", label: "采集异常", aiLabel };
   }

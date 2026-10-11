@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass
 import logging
 import math
 import time
 from threading import RLock
 from types import MappingProxyType
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 
 PIPELINE_STAGES = (
@@ -446,6 +447,39 @@ def observe_provider_timing(
         ),
     )
     return normalization
+
+
+def ui_render_requirement(lane: str, output: Any) -> tuple[str, str]:
+    """Classify an explicit visible result; absent output stays unknown.
+
+    This describes the existing frontend receipt contract. A silent coach can
+    persist a useful decision without creating a new card to acknowledge.
+    """
+    if not isinstance(output, Mapping):
+        return "unknown", "ui_target_output_unavailable"
+    if lane in {"intelligence", "pi_deep"}:
+        coach = output.get("coach")
+        if not isinstance(coach, Mapping):
+            applied = output.get("applied")
+            coach = applied.get("coach_decision") if isinstance(applied, Mapping) else None
+        if not isinstance(coach, Mapping):
+            return "unknown", "ui_target_coach_decision_unavailable"
+        if coach.get("late_result_discarded") is True:
+            return "not_required", "ui_target_coach_result_discarded"
+        status = str(coach.get("status") or "").strip()
+        if status == "intervention" or isinstance(coach.get("intervention"), Mapping):
+            return "required", "ui_target_coach_intervention"
+        if status in {"silent", "disabled", "stale", "timed_out", "failed", "suppressed"}:
+            return "not_required", "ui_target_no_coach_intervention"
+        return "unknown", "ui_target_coach_status_unknown"
+    count_field = {"correction": "revision_count", "answer": "generated_answer_count"}.get(lane)
+    count = output.get(count_field) if count_field else None
+    if type(count) is int and count >= 0:
+        return (
+            ("required", "ui_target_content_result")
+            if count > 0 else ("not_required", "ui_target_empty_content_result")
+        )
+    return "unknown", "ui_target_contract_unknown"
 
 
 def classify_pipeline_failure(error: BaseException, *, deadline_reached: bool = False) -> str:
@@ -1136,8 +1170,38 @@ class PipelineTrace:
             "evaluation": dict(normalization.evaluation),
         }
         with self._lock:
-            if self._timing_contract is None or status == "invalid":
+            existing = self._timing_contract
+            if existing is None or existing["status"] == "missing":
                 self._timing_contract = contract
+            elif status == "invalid":
+                # Keep already observed evaluation boundaries even when a
+                # later observation proves that the contract is incomplete.
+                self._timing_contract = {
+                    **existing,
+                    "status": "invalid",
+                    "invalid_reasons": list(dict.fromkeys((*existing["invalid_reasons"], *reasons))),
+                }
+            elif existing["status"] != "invalid" and status != "missing":
+                if existing["source_clock"] != contract["source_clock"]:
+                    self._timing_contract = {
+                        **existing,
+                        "status": "invalid",
+                        "invalid_reasons": ["conflicting_timing_source_clock"],
+                    }
+                else:
+                    # Re-observation uses a fresh paired clock anchor. Preserve
+                    # the first timestamp rather than shifting it by drift.
+                    evaluation = {**contract["evaluation"], **existing["evaluation"]}
+                    self._timing_contract = {
+                        **(existing if existing["status"] == "complete" else contract),
+                        "status": "complete" if "complete" in {status, existing["status"]} else "partial",
+                        "evaluation": evaluation,
+                        "attempt_started_monotonic_ns": (
+                            existing["attempt_started_monotonic_ns"]
+                            if existing["attempt_started_monotonic_ns"] is not None
+                            else contract["attempt_started_monotonic_ns"]
+                        ),
+                    }
             result = dict(self._timing_contract)
         try:
             for stage, stage_timestamp in normalization.stages.items():
@@ -1473,6 +1537,20 @@ class PipelineTraceCollector:
         self._on_evict = on_evict
         self._traces: OrderedDict[str, PipelineTrace] = OrderedDict()
         self._lock = RLock()
+        self._publication_lock = RLock()
+
+    @contextmanager
+    def publication_guard(self) -> Iterator[None]:
+        """Publish a committed input before a worker first observes its trace.
+
+        This lock is separate from the collector's data lock. The producer may
+        hold it across its SQLite commit and the resulting stage publication;
+        consumers enter it before sampling their handler observation time.
+        Durable claim timestamps remain independent provenance facts.
+        """
+
+        with self._publication_lock:
+            yield
 
     def create(
         self,

@@ -33,6 +33,7 @@ import type {
   ReviewJob,
   ReviewJobKind,
   TranscriptSegment,
+  DocumentSourceEvidence,
 } from "../../domain/events";
 import { HttpMeetingApi, type MeetingExportFormat } from "../../api/client";
 import type {
@@ -45,13 +46,26 @@ import { MarkdownDocumentEditor } from "./MarkdownDocumentEditor";
 import { useReviewDocumentDraft } from "./useReviewDocumentDraft";
 import { TranscriptPane } from "../live-meeting/TranscriptPane";
 import { NowRail } from "../live-meeting/NowRail";
+import { TranscriptRecoveryStatus } from "../live-meeting/TranscriptRecoveryStatus";
 import { segmentDomId } from "../live-meeting/domIds";
+import type { KnowledgeApi } from "../../api/knowledge";
+import type { ProjectOutcomesApi } from "../../api/projectOutcomes";
+import type { ProjectReconcileApi } from "../../api/projectReconcile";
+import { ReviewProjectActions } from "./ReviewProjectActions";
+import type { DocumentSaveState } from "./useReviewDocumentDraft";
+import type { TranscriptRecoveryApi } from "../../api/transcriptRecovery";
+import { RecoveryPanel } from "./RecoveryPanel";
+import { isUncorrectedRecovery } from "../../domain/transcriptRecovery";
 
 type ReviewTab = "review" | "actions" | "transcript" | "audio" | "answers";
 
 interface ReviewWorkspaceProps {
+  recoveryApi?: TranscriptRecoveryApi;
+  knowledgeApi?: KnowledgeApi; projectApi?: ProjectOutcomesApi; reconcileApi?: ProjectReconcileApi;
+  onKnowledgeSource?: (source: DocumentSourceEvidence, meetingId?: string) => void;
+  onOpenKnowledgeDocument?: (target: { documentId: string; projectId: string }) => void; onOpenProjectProposals?: (projectId: string) => void;
   state: MeetingViewState;
-  onReloadTranscript(): void;
+  onReloadTranscript(): Promise<void> | void;
   onReloadAudio(): void;
   onExport(format: MeetingExportFormat): Promise<void>;
   onSaveDocument?(kind: ReviewDocumentKind, expectedRevision: number, content: unknown): Promise<ReviewDocument>;
@@ -67,7 +81,7 @@ interface ReviewWorkspaceProps {
 const tabs: Array<{ id: ReviewTab; label: string; icon: typeof Sparkles }> = [
   { id: "review", label: "复盘", icon: Sparkles },
   { id: "actions", label: "决策与待办", icon: ListChecks },
-  { id: "answers", label: "会中问答", icon: History },
+  { id: "answers", label: "会中建议与问答", icon: History },
   { id: "transcript", label: "会议文字", icon: FileText },
   { id: "audio", label: "录音", icon: FileAudio },
 ];
@@ -254,19 +268,38 @@ function jobState(job: ReviewJob | undefined, qualityPaused: boolean): { text: s
     if (qualityPaused && (job.kind === "minutes" || job.kind === "approach")) {
       return { text: "识别质量不足，已暂停", tone: "warning" };
     }
-    return { text: "生成失败", tone: "error" };
+    return job.status === "cancelled" ? { text: "已取消", tone: "muted" } : { text: "生成失败", tone: "error" };
   }
   if (job.status === "retry_wait") {
     return providerNotConfigured(job)
       ? { text: "等待配置 AI", tone: "warning" }
-      : { text: "正在重试", tone: "working" };
+      : { text: "等待重试", tone: "working" };
   }
   if (job.status === "running") return { text: "正在生成", tone: "working" };
+  if (job.status === "unknown") return { text: "状态未知", tone: "warning" };
   return { text: "等待处理", tone: "working" };
+}
+
+function emptyReviewProductText(kind: "minutes" | "approach", job: ReviewJob | undefined): string {
+  const name = jobNames[kind];
+  if (!job) return `${name}尚未开始生成，可按需手动生成。`;
+  if (job.status === "retry_wait" && providerNotConfigured(job)) return `${name}尚未生成。`;
+  if (job.status === "running") return kind === "minutes" ? "会议纪要正在生成，完成后会自动出现在这里。" : "分析建议正在整理。";
+  if (job.status === "pending") return `${name}已排队，等待处理。`;
+  if (job.status === "retry_wait") return `${name}等待重试，尚未生成。`;
+  if (job.status === "cancelled") return `${name}任务已取消，不会自动继续；可按需手动重新生成。`;
+  if (job.status === "failed") return `${name}生成失败，可按需重试；会议文字仍保留。`;
+  if (job.status === "succeeded") return `${name}任务已结束，但没有可显示的结果；请刷新状态后核对，或手动重新生成。`;
+  return `${name}任务状态暂不可用，请先刷新状态。`;
+}
+
+function canRequestReviewProduct(job: ReviewJob | undefined) {
+  return !job || ["failed", "cancelled", "succeeded"].includes(job.status);
 }
 
 function reviewJobError(job: ReviewJob): string {
   if (job.errorMessage) return job.errorMessage;
+  if (job.status === "cancelled") return "任务已取消，不会自动继续。会议文字仍保留，可按需手动重新生成。";
   const error = (job.errorClass ?? "").toLocaleLowerCase();
   if (error === PROVIDER_NOT_CONFIGURED_ERROR.toLocaleLowerCase()) {
     return "AI 尚未配置；会议文字和录音已保存，配置 AI 后可继续生成。";
@@ -277,6 +310,27 @@ function reviewJobError(job: ReviewJob): string {
   if (/schema|validation|json/.test(error)) return "AI 返回结构不完整，可以重新生成此产物。";
   if (/local|service|connection/.test(error)) return "本地会议服务暂不可用，请恢复后重试。";
   return "此产物生成失败，文字、录音和其他会议结果不受影响。";
+}
+
+function matchingArtifactOutput(job: ReviewJob | undefined, artifactJobId: string | null | undefined) {
+  return artifactJobId && artifactJobId === job?.id ? job.output : null;
+}
+
+function retainedProductNotice(job: ReviewJob | undefined): string | null {
+  if (!job) return null;
+  if (["failed", "cancelled"].includes(job.status)) return "本轮未完成，已保留内容请核对。";
+  if (["pending", "running", "retry_wait"].includes(job.status)) return "本轮正在处理，当前展示已保留内容。";
+  if (job.status === "unknown") return "本轮任务状态需核对，当前展示已保留内容。";
+  return null;
+}
+
+function lateArrivalNotice(job: ReviewJob | undefined, artifactJobId: string | null | undefined,
+  artifactUpdatedAtMs: number | null | undefined): string | null {
+  return job?.status === "cancelled" && job.errorClass === "deadline_exceeded"
+    && Boolean(artifactJobId) && artifactJobId === job.id
+    && typeof job.completedAtMs === "number" && job.completedAtMs > 0
+    && typeof artifactUpdatedAtMs === "number" && artifactUpdatedAtMs > job.completedAtMs
+    ? "本轮产物在超时后到达，请核对后使用。" : null;
 }
 
 function displayText(segment: TranscriptSegment): string {
@@ -294,25 +348,20 @@ interface TranscriptCorrectionSummary {
 }
 
 function transcriptCorrectionFailureReason(segments: TranscriptSegment[]): string | null {
-  const classes = new Set(
-    segments
-      .filter((segment) => segment.correctionStatus === "failed_preserved_original")
-      .map((segment) => segment.correctionErrorClass)
-      .filter((value): value is string => Boolean(value)),
-  );
-  if (classes.has("correction_provider_rates_not_configured")) {
-    return "远程语义校对未执行：Provider 未配置价格费率。";
+  // These are final segment outcomes, not provider attempts or batch counts.
+  const counts = new Map<string, number>();
+  for (const segment of segments) {
+    if (segment.correctionStatus !== "failed_preserved_original") continue;
+    const error = segment.correctionErrorClass;
+    const reason = error === "correction_not_evaluated" ? "未取得有效校对结果"
+      : ["provider_timeout", "TimeoutError", "deadline_exceeded"].includes(error ?? "") ? "响应超时"
+        : ["correction_speech_mode_changed", "correction_meeting_fact_changed"].includes(error ?? "") ? "未通过原意校验"
+          : error === "correction_provider_rates_not_configured" ? "因 Provider 未配置价格费率未执行"
+            : error === "correction_provider_budget_exhausted" ? "因本轮校对预算已用尽未执行"
+              : "失败原因未明确";
+    counts.set(reason, (counts.get(reason) ?? 0) + 1);
   }
-  if (classes.has("correction_provider_budget_exhausted")) {
-    return "远程语义校对未执行：本轮校对预算已用尽。";
-  }
-  if (["provider_timeout", "TimeoutError", "deadline_exceeded"].some((value) => classes.has(value))) {
-    return "远程语义校对响应超时，原始识别文字已保留。";
-  }
-  if (classes.size > 0) {
-    return "远程语义校对失败，原始识别文字已保留。";
-  }
-  return null;
+  return counts.size ? `${[...counts].map(([reason, count]) => `${count} 段${reason}`).join("；")}。原始识别文字已保留。` : null;
 }
 
 function summarizeTranscriptCorrection(segments: TranscriptSegment[]): TranscriptCorrectionSummary {
@@ -320,7 +369,7 @@ function summarizeTranscriptCorrection(segments: TranscriptSegment[]): Transcrip
   const changed = segments.filter((segment) => segment.correctionStatus === "changed").length;
   const verified = segments.filter((segment) => ["changed", "no_change"].includes(segment.correctionStatus ?? "")).length;
   const failed = segments.filter((segment) => segment.correctionStatus === "failed_preserved_original").length;
-  const pending = segments.filter((segment) => ["pending", "processing"].includes(segment.correctionStatus ?? "")).length;
+  const pending = segments.filter((segment) => ["pending", "processing"].includes(segment.correctionStatus ?? "") && !isUncorrectedRecovery(segment)).length;
   return {
     total,
     changed,
@@ -405,6 +454,13 @@ function editableDecisions(content: unknown, fallback: EditableDecision[]): Edit
         : typeof item.evidenceSegmentId === "string" ? item.evidenceSegmentId : null,
     }];
   });
+}
+
+function decisionConfirmationLabel(status: string): string {
+  if (status === "confirmed") return "已确认";
+  if (status === "candidate") return "待确认";
+  if (status === "dismissed") return "已放弃";
+  return "状态待核对";
 }
 
 function editableActions(content: unknown, fallback: EditableActionItem[]): EditableActionItem[] {
@@ -695,6 +751,9 @@ function StructuredRevisionHistory({
 }
 
 export function ReviewWorkspace({
+  recoveryApi,
+  knowledgeApi, projectApi, reconcileApi, onOpenKnowledgeDocument, onOpenProjectProposals,
+  onKnowledgeSource,
   state,
   onReloadTranscript,
   onReloadAudio,
@@ -726,6 +785,7 @@ export function ReviewWorkspace({
   });
   const refreshAction = onRefresh ?? (() => undefined);
   const [activeTab, setActiveTab] = useState<ReviewTab>("review");
+  const [minutesSaveState, setMinutesSaveState] = useState<DocumentSaveState>("saved");
   const [pendingEvidence, setPendingEvidence] = useState<string | null>(null);
   const [evidenceReturnTab, setEvidenceReturnTab] = useState<ReviewTab | null>(null);
   const [pendingAudioOffsetMs, setPendingAudioOffsetMs] = useState<number | null>(null);
@@ -775,7 +835,15 @@ export function ReviewWorkspace({
     || (Array.isArray(state.diagnostics.degradation_reasons)
       && state.diagnostics.degradation_reasons.includes("asr_semantic_quality_blocked"));
   const reviewQuestions = mergeOpenQuestions(minutesActionData.openQuestions, pendingQuestions);
-  const minutesJobFailed = ["failed", "cancelled"].includes(state.reviewJobs.minutes?.status ?? "");
+  const minutesJob = state.reviewJobs.minutes;
+  const minutesOutput = matchingArtifactOutput(minutesJob, state.minutes?.jobId);
+  const minutesQuality = minutesOutput?.degraded === false ? "complete"
+    : minutesOutput?.degraded === true ? "degraded" : "unknown";
+  const minutesCorrectionDegraded = typeof minutesOutput?.correction_degraded === "boolean"
+    ? minutesOutput.correction_degraded : null;
+  const firstUncorrectedSegment = transcript.find((segment) => !["changed", "no_change"].includes(segment.correctionStatus ?? ""));
+  const minutesRunning = minutesJob?.status === "running";
+  const minutesJobFailed = ["failed", "cancelled"].includes(minutesJob?.status ?? "");
   const decisionFallback = useMemo<EditableDecision[]>(() => {
     const realtime = state.decisionCandidates
       .filter((item) => item.status !== "dismissed")
@@ -925,27 +993,27 @@ export function ReviewWorkspace({
   }), [transcript, transcriptOverrides, transcriptEditor.isUserFinal]);
   const reviewSemanticParagraphs = transcriptEditor.isUserFinal ? [] : (state.semanticParagraphs ?? []);
   const reviewBasedOnOldTranscript = Boolean(
-    (state.documents?.minutes || state.minutes) &&
+    state.documents?.minutes?.dirtyState === "stale" || ((state.documents?.minutes || state.minutes) &&
     (state.documents?.minutes?.updatedAtMs ?? state.minutes?.updatedAtMs ?? 0) < Math.max(
       state.documents?.transcript?.source === "user_final" ? state.documents.transcript.updatedAtMs ?? 0 : 0,
       ...transcript.filter((segment) => segment.correctionStatus === "changed").map((segment) => segment.correctionUpdatedAtMs ?? segment.updatedAtMs ?? 0),
-    ),
+    )),
   );
   const hasDecisionContent = decisionsEditor.draft.length > 0 || actionsEditor.draft.length > 0 || keptSuggestions.length > 0;
   const hasRiskContent = risksEditor.draft.length > 0 || reviewQuestions.length > 0;
-  const actionUnavailable = !hasDecisionContent && !state.minutes
+  const actionUnavailable = !hasDecisionContent && !state.minutes && !state.documents?.minutes
       ? qualityPaused
       ? { className: "inline-warning", text: "识别语义质量不足，决策与行动项提取已暂停。" }
       : minutesJobFailed
         ? { className: "review-empty", text: "决策与行动项暂未生成，请从页面顶部重试会议纪要。" }
-        : { className: "review-empty", text: "会议纪要正在生成，完成后显示决策与行动项。" }
+        : { className: "review-empty", text: minutesRunning ? "会议纪要正在生成，完成后显示决策与行动项。" : "会议纪要尚未就绪，决策与行动项暂未提取；可在复盘中查看任务状态。" }
     : null;
-  const riskUnavailable = !hasRiskContent && !state.minutes
+  const riskUnavailable = !hasRiskContent && !state.minutes && !state.documents?.minutes
       ? qualityPaused
       ? { className: "inline-warning", text: "识别语义质量不足，风险与待确认问题提取已暂停。" }
       : minutesJobFailed
         ? { className: "review-empty", text: "风险与待确认问题暂未生成，请从页面顶部重试会议纪要。" }
-        : { className: "review-empty", text: "会议纪要正在生成，完成后显示风险与待确认问题。" }
+        : { className: "review-empty", text: minutesRunning ? "会议纪要正在生成，完成后显示风险与待确认问题。" : "会议纪要尚未就绪，风险与待确认问题暂未提取；可在复盘中查看任务状态。" }
     : null;
 
   const audioTrackRows = useMemo(() => {
@@ -1068,8 +1136,30 @@ export function ReviewWorkspace({
     .filter(({ job, blockedByQuality }) => (
       job && ["failed", "cancelled"].includes(job.status) && !blockedByQuality
     ))
-    .map(({ kind }) => jobNames[kind]);
-  const completedReviewSteps = 1
+    .map(({ kind }) => {
+      const hasContent = kind === "minutes" ? Boolean(state.minutes || state.documents?.minutes)
+        : kind === "approach" ? state.approach.cards.length > 0 : false;
+      return hasContent ? `${jobNames[kind]}本轮未完成，已保留内容请核对。` : `${jobNames[kind]}未能生成。`;
+    });
+  const savedHumanTranscript = Boolean(state.documents?.transcript?.documentId
+    && state.documents.transcript.source === "user_final" && state.documents.transcript.userVersion > 0
+    && state.documents.transcript.dirtyState === "saved" && transcriptEditor.saveState === "saved");
+  const textProgressLabel = transcriptEditor.saveState !== "saved" ? "文字修改尚未保存"
+    : savedHumanTranscript ? "人工文字已保存"
+      : transcript.length ? "已有文字，待人工核对" : "暂无可核对文字";
+  const audioStatuses = [state.audio.status, audioDetail?.overallStatus, audioDetail?.status];
+  const audioProgress = state.runtime.recording.state === "active" || audioStatuses.includes("recording")
+    ? { tone: "working", label: "正在录音" }
+    : audioStatuses.includes("partial_failure")
+      ? { tone: "warning", label: "部分录音未成功，已保存部分可回放" }
+      : audioStatuses.includes("failed")
+        ? { tone: "error", label: "录音整理失败" }
+        : audioStatuses.includes("assembling")
+          ? { tone: "working", label: "录音整理中" }
+          : state.audioDetail?.assembled || audioStatuses.includes("saved")
+            ? { tone: "success", label: "录音已保存" }
+            : { tone: "working", label: "录音状态待读取" };
+  const completedReviewSteps = (transcript.length || savedHumanTranscript ? 1 : 0)
     + (state.audioDetail?.assembled ? 1 : 0)
     + reviewJobEntries.filter(({ state: status }) => status.tone === "success").length;
   const reviewCompletionPercent = Math.round((completedReviewSteps / (2 + reviewJobEntries.length)) * 100);
@@ -1087,6 +1177,13 @@ export function ReviewWorkspace({
 
   const retryReviewJob = async (kind: ReviewJobKind) => {
     if (retryingJobs[kind]) return;
+    if (kind !== "index" && (qualityPaused || transcript.length === 0)) {
+      setJobErrors((current) => ({
+        ...current,
+        [kind]: qualityPaused ? "识别语义质量不足，正式会后产物已暂停；请先核对会议文字。" : "尚无可确认的会议文字，暂不能生成会后产物。",
+      }));
+      return;
+    }
     setRetryingJobs((current) => ({ ...current, [kind]: true }));
     setJobErrors((current) => ({ ...current, [kind]: undefined }));
     try {
@@ -1189,8 +1286,16 @@ export function ReviewWorkspace({
 
   const exportMeeting = async (format: MeetingExportFormat) => {
     if (exporting) return;
-    setExporting(format);
     setExportMenuOpen(false);
+    const saveStates = [minutesSaveState, decisionsEditor.saveState, actionsEditor.saveState, risksEditor.saveState, transcriptEditor.saveState];
+    if (saveStates.some((value) => value !== "saved")) {
+      setExportNotice({
+        text: saveStates.includes("saving") ? "修改正在保存，请保存完成后再导出。" : "还有修改尚未保存，请先在对应文档完成编辑或重试保存，再导出。",
+        error: true,
+      });
+      return;
+    }
+    setExporting(format);
     setExportNotice(null);
     try {
       await onExport(format);
@@ -1232,17 +1337,19 @@ export function ReviewWorkspace({
         <div className="review-progress-summary">
           <span className={`review-progress-ring${reviewCompletionPercent === 100 ? " is-complete" : ""}`}>{reviewCompletionPercent}%</span>
           <span>
-            <strong>纪要完成度</strong>
-            <small>基于文字、录音与 AI 整理任务</small>
+            <strong>整理进度</strong>
+            <small>文件与任务就绪情况，不代表人工核对完成</small>
           </span>
         </div>
-        <div className="review-progress-item review-progress-item--success">
-          <Check size={16} />
-          <span>文字已确认</span>
+        <div className={`review-progress-item ${savedHumanTranscript ? "review-progress-item--success" : "review-progress-item--working"}`}>
+          {savedHumanTranscript ? <Check size={16} /> : <CircleEllipsis size={16} />}
+          <span>{textProgressLabel}</span>
         </div>
-        <div className={`review-progress-item ${state.audioDetail?.assembled ? "review-progress-item--success" : "review-progress-item--working"}`}>
-          {state.audioDetail?.assembled ? <Check size={16} /> : <CircleEllipsis size={16} />}
-          <span>{state.audioDetail?.assembled ? "录音已保存" : "录音整理中"}</span>
+        <div className={`review-progress-item review-progress-item--${audioProgress.tone}`} aria-label="录音整理状态">
+          {audioProgress.tone === "success" ? <Check size={16} />
+            : audioProgress.tone === "error" || audioProgress.tone === "warning" ? <AlertCircle size={16} />
+              : <CircleEllipsis size={16} />}
+          <span>{audioProgress.label}</span>
         </div>
         {reviewJobEntries.map(({ kind, job, state: status, blockedByQuality }) => (
           <div
@@ -1270,7 +1377,7 @@ export function ReviewWorkspace({
           </div>
         ))}
       </section>
-      {reviewJobEntries.some(({ job }) => providerNotConfigured(job)) ? (
+      {reviewJobEntries.some(({ job }) => providerNotConfigured(job) && job?.status === "retry_wait") ? (
         <p className="inline-warning" role="status">
           AI 尚未配置，会议文字和录音已保存；配置 AI 后会自动继续生成会后产物。
         </p>
@@ -1279,7 +1386,7 @@ export function ReviewWorkspace({
         <p className="inline-error review-failure-summary" role="status">
           <strong>部分 AI 内容未完成</strong>
           <span>
-            {failedReviewJobNames.join("、")}未能生成。会议文字和录音已保存，可使用上方对应的重试按钮重新生成。
+            {failedReviewJobNames.join(" ")}会议文字和录音已保存，可使用上方对应的重试按钮重新生成。
           </span>
         </p>
       ) : null}
@@ -1290,18 +1397,24 @@ export function ReviewWorkspace({
         >
           <strong>
             {transcriptCorrection.state === "failed"
-              ? "当前文字是原始 ASR"
+              ? transcriptCorrection.verified > 0 ? "部分文字仍为原始 ASR" : "当前文字是原始 ASR"
               : transcriptCorrection.state === "processing"
                 ? "AI 正在校对会议文字"
                 : "会议文字尚未完成校对"}
           </strong>
           <span>
             {transcriptCorrection.state === "failed"
-              ? `有 ${transcriptCorrection.failed} 段校对失败。${transcriptCorrection.failureReason ?? "原始文字已保留。"}`
+              ? `已校对 ${transcriptCorrection.verified}/${transcriptCorrection.total} 段；${transcriptCorrection.failureReason ?? "原始文字已保留。"}`
               : transcriptCorrection.state === "processing"
-                ? `已校对 ${transcriptCorrection.verified}/${transcriptCorrection.total} 段，剩余 ${transcriptCorrection.pending} 段处理中。`
+                ? `已校对 ${transcriptCorrection.verified}/${transcriptCorrection.total} 段，剩余 ${transcriptCorrection.pending} 段处理中。${transcriptCorrection.failureReason ?? ""}`
                 : "当前没有可用的 AI 校对结果，页面仍展示原始识别文字。"}
           </span>
+          {firstUncorrectedSegment ? (
+            <button className="secondary-button compact-button" type="button"
+              onClick={() => showEvidence(firstUncorrectedSegment.segmentId)}>
+              查看未完成校对的原文
+            </button>
+          ) : null}
           {onRetryTranscriptCorrection ? (
             <button
               className="secondary-button compact-button"
@@ -1324,6 +1437,13 @@ export function ReviewWorkspace({
         <div key={kind} className="toast toast--error" role="alert">{error}</div>
       ) : null)}
 
+      <TranscriptRecoveryStatus diagnostic={state.diagnostics.transcript_backfill ?? state.diagnostics.transcriptBackfill}
+        audioAvailable={Boolean(audioDetail?.assembled && audioDetail.playbackUrl || readyAudioTracks.length)}
+        onOpenAudio={() => setActiveTab("audio")} />
+      {recoveryApi ? <RecoveryPanel key={state.meetingId} api={recoveryApi} meetingId={state.meetingId} onMerged={async () => {
+        await onReloadTranscript();
+        await refreshAction();
+      }} /> : null}
       <div className="review-tab-row">
         <div className="review-tabs" role="tablist" aria-label="会后内容">
           {tabs.map((tab) => {
@@ -1379,6 +1499,7 @@ export function ReviewWorkspace({
         </div>
       ) : null}
 
+      {knowledgeApi ? <ReviewProjectActions knowledgeApi={knowledgeApi} projectApi={projectApi} reconcileApi={reconcileApi} meetingId={state.meetingId} documents={state.documents ?? {}} saveStates={{ minutes: minutesSaveState, decisions: decisionsEditor.saveState, action_items: actionsEditor.saveState, risks: risksEditor.saveState, transcript: transcriptEditor.saveState }} onOpenDocument={onOpenKnowledgeDocument} onOpenProposals={onOpenProjectProposals} /> : null}
       <section
         className={`review-tab-panel${activeTab === "transcript" ? " review-tab-panel--transcript" : ""}`}
         role="tabpanel"
@@ -1391,6 +1512,9 @@ export function ReviewWorkspace({
         {activeTab === "answers" ? (
           <NowRail
             key={state.meetingId}
+            knowledgeApi={knowledgeApi}
+            sourceMeetingId={state.meetingId}
+            onKnowledgeSource={onKnowledgeSource}
             viewStateKey={state.meetingId}
             onCoachRequestStatus={readCoachRequestStatus}
             historyOnly
@@ -1412,13 +1536,21 @@ export function ReviewWorkspace({
           <div className="review-summary-layout">
             <section className="review-document" aria-labelledby="minutes-heading">
               <MarkdownDocumentEditor
+                onDraftStateChange={setMinutesSaveState}
                 meetingId={state.meetingId}
                 document={state.documents?.minutes}
                 fallbackMarkdown={state.minutes?.markdown ?? ""}
-                degraded={state.minutes?.status === "degraded"}
+                generationQuality={minutesQuality}
+                correctionDegraded={minutesCorrectionDegraded}
+                taskNotice={retainedProductNotice(minutesJob)}
+                lateArrivalNotice={lateArrivalNotice(minutesJob, state.minutes?.jobId, state.minutes?.updatedAtMs)}
                 onSave={(revision, content) => saveDocument("minutes", revision, content)}
                 onLoadRevisions={() => loadDocumentRevisions("minutes")}
                 onRegenerate={() => regenerateDocument("minutes")}
+                generationBlockedReason={!state.minutes && !state.documents?.minutes
+                  ? qualityPaused ? "识别语义质量不足，正式会议纪要已暂停。"
+                    : transcript.length === 0 ? "尚无可确认的会议文字，暂不能生成会议纪要。" : undefined
+                  : undefined}
               />
               {reviewBasedOnOldTranscript ? (
                 <div className="inline-warning stale-review-warning">
@@ -1432,12 +1564,13 @@ export function ReviewWorkspace({
                 <p className="inline-warning">识别语义质量不足，正式会议纪要已暂停；会议文字和录音仍已保存。</p>
               ) : !state.minutes && !state.documents?.minutes && transcript.length === 0 ? (
                 <p className="inline-warning">本次没有形成可确认的会议文字，录音已保存；补充有效音频后可重新整理。</p>
-              ) : !state.minutes && !state.documents?.minutes && providerNotConfigured(state.reviewJobs.minutes) ? (
-                <p className="review-empty">会议纪要尚未生成。</p>
-              ) : !state.minutes && !state.documents?.minutes && state.reviewJobs.minutes?.status === "failed" ? (
-                <p className="review-empty">会议复盘暂未生成，可从上方状态栏重试。</p>
               ) : !state.minutes && !state.documents?.minutes ? (
-                <p className="review-empty">会议纪要正在生成，完成后会自动出现在这里。</p>
+                <div className="review-empty">
+                  <p>{emptyReviewProductText("minutes", minutesJob)}</p>
+                  {onRetryReviewJob && canRequestReviewProduct(minutesJob) ? <button type="button" className="secondary-button compact-button" disabled={retryingJobs.minutes} onClick={() => void retryReviewJob("minutes")}>
+                    {retryingJobs.minutes ? "正在提交纪要任务…" : minutesJob ? "手动重新生成会议纪要" : "生成会议纪要"}
+                  </button> : null}
+                </div>
               ) : null}
             </section>
 
@@ -1448,6 +1581,12 @@ export function ReviewWorkspace({
                   <h2 id="considerations-heading">分析建议</h2>
                 </div>
               </div>
+              {state.approach.cards.length > 0 && retainedProductNotice(state.reviewJobs.approach) ? (
+                <p className="inline-warning" role="status">{retainedProductNotice(state.reviewJobs.approach)}</p>
+              ) : null}
+              {state.approach.cards.length > 0 && lateArrivalNotice(state.reviewJobs.approach, state.approach.jobId, state.approach.updatedAtMs) ? (
+                <p className="inline-warning" role="status">{lateArrivalNotice(state.reviewJobs.approach, state.approach.jobId, state.approach.updatedAtMs)}</p>
+              ) : null}
               {state.approach.cards.length ? (
                 <div className="consideration-list">
                   {state.approach.cards.map((card, index) => (
@@ -1467,12 +1606,13 @@ export function ReviewWorkspace({
                 <p className="inline-warning">识别语义质量不足，分析建议生成已暂停。</p>
               ) : transcript.length === 0 ? (
                 <p className="inline-warning">本次没有形成可确认的会议文字，暂时没有可生成的分析建议。</p>
-              ) : providerNotConfigured(state.reviewJobs.approach) ? (
-                <p className="review-empty">分析建议尚未生成。</p>
-              ) : state.reviewJobs.approach?.status === "failed" ? (
-                <p className="review-empty">分析建议暂未生成，可从上方状态栏重试。</p>
               ) : (
-                <p className="review-empty">分析建议正在整理。</p>
+                <div className="review-empty">
+                  <p>{state.reviewJobs.approach?.status === "succeeded" && state.approach.updatedAtMs !== null ? "本次没有生成补充分析建议。" : emptyReviewProductText("approach", state.reviewJobs.approach)}</p>
+                  {onRetryReviewJob && canRequestReviewProduct(state.reviewJobs.approach) ? <button type="button" className="secondary-button compact-button" disabled={retryingJobs.approach} onClick={() => void retryReviewJob("approach")}>
+                    {retryingJobs.approach ? "正在提交分析任务…" : state.reviewJobs.approach ? "重新生成分析建议" : "生成分析建议"}
+                  </button> : null}
+                </div>
               )}
             </aside>
           </div>
@@ -1517,10 +1657,10 @@ export function ReviewWorkspace({
               {factsEditing && risksEditor.recoveredLocalDraft ? <p className="inline-warning">已恢复上次未保存的风险草稿。</p> : null}
               {decisionsEditor.draft.length || factsEditing ? (
                 <>
-                  <h3 className="action-group-title">已确认决策</h3>
+                  <h3 className="action-group-title">决策记录</h3>
                   <div className="action-list">
                     {decisionsEditor.draft.map((decision, index) => (
-                      <article key={decision.id} className={`action-item${factsEditing ? " action-item--editing" : ""}`}>
+                      <article key={decision.id} className={`action-item${factsEditing ? " action-item--editing" : !["confirmed", "dismissed"].includes(decision.status) ? " fact-row--unknown" : ""}`}>
                         {factsEditing ? (
                           <>
                             <textarea
@@ -1543,6 +1683,7 @@ export function ReviewWorkspace({
                           </>
                         ) : (
                           <>
+                            <span className="fact-status-label" aria-label={`决策 ${index + 1} 状态：${decisionConfirmationLabel(decision.status)}`}>{decisionConfirmationLabel(decision.status)}</span>
                             <p>{decision.text}</p>
                             {decision.evidenceSegmentId ? <button type="button" onClick={() => showEvidence(decision.evidenceSegmentId!)}>查看依据</button> : null}
                           </>
@@ -1685,7 +1826,7 @@ export function ReviewWorkspace({
                 <span className="section-kicker">
                   {reviewSemanticParagraphs.length
                     ? `${reviewSemanticParagraphs.length} 个语义段落 · ${transcript.length} 条识别片段`
-                    : `${transcript.length} 段已确认`}
+                    : `${transcript.length} 段已保存`}
                 </span>
                 <h2>完整会议文字</h2>
               </div>
@@ -1698,7 +1839,9 @@ export function ReviewWorkspace({
                       : transcriptCorrection.state === "processing"
                         ? "AI 校对中"
                         : transcriptCorrection.state === "failed"
-                          ? "原始 ASR（校对失败）"
+                          ? transcriptCorrection.verified > 0
+                            ? `部分已校对（${transcriptCorrection.verified}/${transcriptCorrection.total}）`
+                            : "原始 ASR（校对失败）"
                           : "原始 ASR"}
                 </span>
                 <button className="icon-button" type="button" onClick={() => void showDocumentRevisions("transcript")} title="完整文字版本历史" aria-label="查看完整文字版本历史">

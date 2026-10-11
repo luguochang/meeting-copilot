@@ -390,7 +390,7 @@ def test_resident_mode_marks_the_short_tail_as_final_for_funasr(monkeypatch):
     assert any(event["event_type"] == "final" for event in events)
 
 
-def test_flush_utterance_decodes_residual_as_final_and_acks_after_partial(monkeypatch):
+def test_flush_utterance_invalidates_voiced_preview_tail_without_final_inference(monkeypatch):
     commands = b"".join(
         [
             funasr_stream_worker.encode_resident_command("start_session", session_id="flush-session"),
@@ -415,17 +415,20 @@ def test_flush_utterance_decodes_residual_as_final_and_acks_after_partial(monkey
         ["--resident", "--chunk-size", "0,1,0"],
     )
 
-    assert FakeResidentAutoModel.is_final_flags == [True]
-    assert [event["event_type"] for event in events[:4]] == [
+    assert FakeResidentAutoModel.is_final_flags == []
+    assert [event["event_type"] for event in events[:3]] == [
         "ready",
         "session_started",
-        "partial",
         "utterance_boundary_complete",
     ]
-    assert events[2]["text"] == "第一场内容"
-    assert events[3]["boundary_id"] == "flush-session:utterance:1:boundary-1"
-    assert events[3]["utterance_index"] == 1
-    assert events[3]["duplicate"] is False
+    assert events[2]["boundary_id"] == "flush-session:utterance:1:boundary-1"
+    assert events[2]["utterance_index"] == 1
+    assert events[2]["duplicate"] is False
+    assert events[2]["skipped_preview_bytes"] == 480 * 4
+    assert "skipped_silence_bytes" not in events[2]
+    assert events[2]["inference_calls"] == 0
+    assert events[2]["inference_max_ms"] == 0
+    assert not any(event["event_type"] in {"partial", "final"} for event in events)
 
 
 def test_flush_utterance_skips_silent_tail_without_final_inference(monkeypatch):
@@ -498,13 +501,13 @@ def test_flush_resets_utterance_state_and_next_audio_uses_fresh_cache(monkeypatc
         [
             funasr_stream_worker.encode_resident_command("start_session", session_id="flush-session"),
             funasr_stream_worker.encode_resident_command(
-                "audio", session_id="flush-session", pcm_bytes=_audio_payload(1, 480)
+                "audio", session_id="flush-session", pcm_bytes=_audio_payload(1, 960)
             ),
             funasr_stream_worker.encode_resident_command(
                 "flush_utterance", session_id="flush-session", boundary_id=boundary_id
             ),
             funasr_stream_worker.encode_resident_command(
-                "audio", session_id="flush-session", pcm_bytes=_audio_payload(2, 480)
+                "audio", session_id="flush-session", pcm_bytes=_audio_payload(2, 960)
             ),
             funasr_stream_worker.encode_resident_command(
                 "flush_utterance",
@@ -542,7 +545,7 @@ def test_duplicate_flush_only_replays_duplicate_ack_without_reinference(monkeypa
         [
             funasr_stream_worker.encode_resident_command("start_session", session_id="flush-session"),
             funasr_stream_worker.encode_resident_command(
-                "audio", session_id="flush-session", pcm_bytes=_audio_payload(1, 480)
+                "audio", session_id="flush-session", pcm_bytes=_audio_payload(1, 960)
             ),
             funasr_stream_worker.encode_resident_command(
                 "flush_utterance", session_id="flush-session", boundary_id=boundary_id
@@ -572,7 +575,7 @@ def test_duplicate_flush_only_replays_duplicate_ack_without_reinference(monkeypa
         False,
         True,
     ]
-    assert FakeResidentAutoModel.is_final_flags == [True]
+    assert FakeResidentAutoModel.is_final_flags == [False]
     assert FakeResidentAutoModel.cache_call_numbers == [1]
 
 
@@ -640,6 +643,8 @@ def test_slow_inference_pressure_prioritizes_causal_flush_and_isolates_next_utte
         )
     )
     stdin.wait_for_reads(3 + backlog_count + 3)
+    # Queuing FLUSH must not acknowledge/reset a still-running generate call.
+    assert not [event for _, event in stdout.events if event.get("event_type") == "utterance_boundary_complete"]
     model.release_first_call.set()
 
     captured = stdout.wait_for(
@@ -663,6 +668,8 @@ def test_slow_inference_pressure_prioritizes_causal_flush_and_isolates_next_utte
     assert acknowledgements[0][1]["skipped_preview_bytes"] == (
         len(oversized_backlog_chunk) + backlog_count * len(backlog_chunk)
     )
+    assert acknowledgements[0][1]["inference_calls"] == 1
+    assert acknowledgements[0][1]["inference_max_ms"] >= 0
 
     captured = stdout.wait_for(
         lambda events: any(event.get("text") == "新句预览" for event in events),
@@ -854,7 +861,7 @@ def test_end_after_successful_flush_does_not_emit_duplicate_final(monkeypatch):
         [
             funasr_stream_worker.encode_resident_command("start_session", session_id="flush-session"),
             funasr_stream_worker.encode_resident_command(
-                "audio", session_id="flush-session", pcm_bytes=_audio_payload(1, 480)
+                "audio", session_id="flush-session", pcm_bytes=_audio_payload(1, 960)
             ),
             funasr_stream_worker.encode_resident_command(
                 "flush_utterance",

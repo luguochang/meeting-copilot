@@ -1,5 +1,6 @@
 from meeting_copilot_web_mvp import asr_correct
 from meeting_copilot_web_mvp import realtime_transcript_correction as correction
+import pytest
 
 
 def _final(segment_id: str, text: str, *, at_ms: int = 1_000) -> dict:
@@ -36,6 +37,53 @@ def test_policy_contract_constants_are_stable():
     assert correction.POLICY_VERSION == "realtime-transcript-correction.v1"
     assert correction.MIN_BATCH_CHARS == 80
     assert correction.MIN_INTERVAL_MS == 15_000
+
+
+@pytest.mark.parametrize(
+    ("original", "corrected", "reason"),
+    [
+        ("", "正文", "empty_text"),
+        ("先核对材料。", "先核对材料。", "text_unchanged"),
+        ("先核对材料", "先核对材料。", "format_only"),
+        ("先核对材料。", "<<<MC_SEGMENT:0001:x>>>", "batch_marker_in_text"),
+        ("先核对材料。", "新" * 100, "length_ratio_out_of_bounds"),
+        ("负责人是张三。", "负责人是李四。", "meeting_fact_changed"),
+        ("这次可能先安排演练。", "这次先安排演练。", "speech_mode_changed"),
+        ("如果预算足够，先开展演练。", "预算足够，先开展演练。", "speech_mode_changed"),
+        ("他问先安排演练吗。", "他问先安排演练。", "speech_mode_changed"),
+        ("他说先安排演练。", "我们先安排演练。", "speech_mode_changed"),
+        ("这次不考虑安排演练。", "这次考虑安排演练。", "speech_mode_changed"),
+    ],
+)
+def test_rejection_reasons_preserve_utterance_mode_without_storing_text(original, corrected, reason):
+    assert correction.correction_rejection_reason(original, corrected) == reason
+    assert correction.correction_is_safe(original, corrected) is False
+
+
+def test_safe_typo_correction_preserves_question_and_quoted_speech():
+    assert correction.correction_rejection_reason(
+        "他说：“这次可能先安排恢度演练吗？”",
+        "他说：“这次可能先安排灰度演练吗？”",
+    ) is None
+
+
+def test_readonly_context_uses_prior_corrected_evidence_and_excludes_targets_and_future():
+    prior = _final("prior", "讨论通用对话。")
+    revision = correction.build_revision_event(
+        session_id="corr_session", final_event=prior, corrected_text="讨论普通对话。",
+        source="fallback_batch", usage={},
+    )
+    record = _record(prior, _final("target", "待修正文。"), _final("later", "稍后才发生。"), revision)
+    assert correction.readonly_correction_context(record, ["target"]) == "讨论普通对话。"
+    assert correction.readonly_correction_context(record, ["missing"]) == ""
+
+
+def test_readonly_context_is_bounded_by_chars_and_segment_count():
+    record = _record(*[_final(str(i), str(i) * 300) for i in range(5)])
+    context = correction.readonly_correction_context(record, ["4"])
+    assert len(context) == correction.MAX_READONLY_CONTEXT_CHARS
+    assert "0" not in context
+    assert "4" not in context
 
 
 def test_llm_correction_prompt_requires_index_markers_and_facts_to_survive():

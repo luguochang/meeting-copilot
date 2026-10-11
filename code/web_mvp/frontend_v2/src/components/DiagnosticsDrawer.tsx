@@ -39,13 +39,18 @@ function coachRuntimeIssue(state: MeetingViewState): string | null {
     if (decision.status === "timed_out") return "Pi 实时教练超时，本轮未生成建议";
     if (decision.status === "failed") return "Pi 实时教练执行失败，本轮未生成建议";
   }
+  return null;
+}
 
+function historicalCoachFailureInfo(state: MeetingViewState): string | null {
   const history = state.diagnostics.coach_runtime_history;
   if (!Array.isArray(history)) return null;
   const failures = history.filter((item): item is Record<string, unknown> => {
     if (!item || typeof item !== "object" || Array.isArray(item)) return false;
     const value = item as Record<string, unknown>;
-    return value.outcome === "failure" && (value.origin === "pi" || value.pi_provider_attempted === true);
+    return value.outcome === "failure"
+      && ["failed", "timed_out", "invalid", "invalid_output", "provider_error"].includes(String(value.status))
+      && (value.origin === "pi" || value.pi_provider_attempted === true);
   });
   const latest = failures.at(-1);
   if (!latest) return null;
@@ -55,7 +60,7 @@ function coachRuntimeIssue(state: MeetingViewState): string | null {
       ? "Pi 实时教练超时"
       : "Pi 实时教练执行失败";
   const count = failures.length > 1 ? `（${failures.length} 次）` : "";
-  return `本场曾发生 ${reason}，本场未生成 Pi 建议${count}`;
+  return `本场记录过 ${reason}${count}；当前结果请查看实时教练`;
 }
 
 function coachRuntimeInfo(state: MeetingViewState): string | null {
@@ -82,15 +87,23 @@ export function DiagnosticsDrawer({ open, onClose, onRefresh, onExport, state, t
   const dialogRef = useModalDialog(open, onClose);
   if (!open) return null;
   const coachIssue = coachRuntimeIssue(state);
-  const coachInfo = coachRuntimeInfo(state);
+  const coachInfo = [historicalCoachFailureInfo(state), coachRuntimeInfo(state)].filter(Boolean).join("；") || null;
+  const transcript = state.runtime.ai.capabilities?.transcript;
+  const transcriptIssue = transcript && ["paused", "offline", "error"].includes(transcript.state)
+    ? transcript.detail || transcript.label
+    : null;
+  const hasConfirmedTranscript = state.archivedSegmentCount + state.segments.length > 0 || state.fullTranscript.length > 0;
+  const waitingForTranscript = state.runtime.phase === "live" && !hasConfirmedTranscript;
+  const waitingCoach = waitingForTranscript ? "尚无已确认文字，教练等待可分析的内容" : null;
   const connectionHealthy = state.connection === "live" && !state.transportError;
-  const healthy = connectionHealthy && !coachIssue;
+  const healthy = connectionHealthy && !coachIssue && !transcriptIssue && !waitingForTranscript;
   const healthTitle = healthy
     ? "运行正常"
-    : connectionHealthy
-      ? "AI 实时能力异常"
-      : "连接异常";
-  const healthDetail = coachIssue ?? connectionLabels[state.connection];
+    : !connectionHealthy ? "连接异常"
+      : transcriptIssue ? (hasConfirmedTranscript ? "会议文字需留意" : "会议文字待恢复")
+        : coachIssue ? "AI 实时能力异常" : "等待会议文字";
+  const healthDetail = !connectionHealthy ? state.transportError || connectionLabels[state.connection]
+    : transcriptIssue ?? coachIssue ?? "本地服务已连接，尚未收到可用于现场分析的已确认文字。";
   const technicalDetails = {
     ...state.diagnostics,
     ...(state.coachDecision?.agentMetrics
@@ -144,8 +157,9 @@ export function DiagnosticsDrawer({ open, onClose, onRefresh, onExport, state, t
           <div><dt>最新序号</dt><dd>{state.lastSeq}</dd></div>
           <div><dt>最后读取</dt><dd>{formattedTime(state.lastSyncedAtMs)}</dd></div>
           <div><dt>已确认段落</dt><dd>{state.archivedSegmentCount + state.segments.length}</dd></div>
+          <div><dt>文字识别</dt><dd>{transcript?.label ?? (waitingForTranscript ? "尚无已确认文字" : "待读取识别状态")}</dd></div>
           <div><dt>建议记录</dt><dd>{state.suggestions.length}</dd></div>
-          <div><dt>AI 教练</dt><dd>{coachIssue ?? coachInfo ?? "未发现运行异常"}</dd></div>
+          <div><dt>AI 教练</dt><dd>{coachIssue ?? waitingCoach ?? coachInfo ?? "未发现运行异常"}</dd></div>
         </dl>
 
         {state.transportError ? (

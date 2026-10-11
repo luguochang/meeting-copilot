@@ -36,6 +36,15 @@ from meeting_copilot_web_mvp.application_schema import APPLICATION_SCHEMA_VERSIO
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
 
+def _set_test_realtime_cutoff(monkeypatch, milliseconds):
+    # The production cutoff is captured at import, so this fixture must also
+    # isolate those constants from a source-quality launcher's 8s profile.
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_READY_CUTOFF_MS", str(milliseconds))
+    monkeypatch.setattr(app_module.provider_config_runtime, "REALTIME_READY_CUTOFF_MS", milliseconds)
+    monkeypatch.setattr(app_module, "REALTIME_COACH_SOFT_CUTOFF_MS", milliseconds)
+    monkeypatch.setattr(app_module, "REALTIME_COACH_SOFT_DELIVERY_CUTOFF_MS", milliseconds)
+
+
 async def _wait_for_v2_job_status(
     persistence: V2Persistence,
     job_id: str,
@@ -132,6 +141,7 @@ def test_v2_local_reflex_projects_without_provider_or_pi_budget(
     tmp_path,
     monkeypatch,
 ):
+    monkeypatch.setenv("MEETING_COPILOT_PI_LOCAL_REFLEX_FIRST", "1")
     monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
     monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
     app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
@@ -266,6 +276,7 @@ def test_v2_transcript_delta_reaches_production_handler(
 ):
     """The production worker accepts the trigger contract used by live ASR."""
 
+    monkeypatch.setenv("MEETING_COPILOT_PI_LOCAL_REFLEX_FIRST", "1")
     monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
     monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
     app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
@@ -303,6 +314,7 @@ def test_v2_real_asr_owner_gap_reaches_local_reflex_production_handler(
 ):
     """Natural ASR owner-gap wording must yield an evidence-bound action card."""
 
+    monkeypatch.setenv("MEETING_COPILOT_PI_LOCAL_REFLEX_FIRST", "1")
     monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
     monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
     app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
@@ -375,6 +387,7 @@ def test_v2_local_reflex_rechecks_a_vad_split_close_from_latest_evidence(
     tmp_path,
     monkeypatch,
 ):
+    monkeypatch.setenv("MEETING_COPILOT_PI_LOCAL_REFLEX_FIRST", "1")
     monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
     monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
     app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
@@ -488,6 +501,7 @@ def test_v2_local_reflex_durable_executor_bypasses_blocked_provider_lane(
     tmp_path,
     monkeypatch,
 ):
+    monkeypatch.setenv("MEETING_COPILOT_PI_LOCAL_REFLEX_FIRST", "1")
     monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
     monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
     app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
@@ -608,6 +622,7 @@ def test_v2_local_reflex_same_kind_active_card_is_silently_suppressed(
     tmp_path,
     monkeypatch,
 ):
+    monkeypatch.setenv("MEETING_COPILOT_PI_LOCAL_REFLEX_FIRST", "1")
     monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
     monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
     app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
@@ -945,6 +960,33 @@ def test_public_coach_agent_metrics_are_bounded_and_secret_free():
     assert "api_key" not in metrics
 
 
+@pytest.mark.parametrize("mode", ["filtered", "source_quote_fallback"])
+def test_public_coach_reason_grounding_keeps_only_static_diagnostics(mode):
+    metrics = app_module._public_coach_agent_metrics({"reason_grounding": {
+        "mode": mode, "removed_lines": 1, "retained_lines": 0,
+        "source_type": "document", "original_reason": "must never persist",
+        "quote": "must never enter diagnostics", "api_key": "must never persist",
+    }})
+    assert metrics == {"reason_grounding": {"mode": mode, "removed_lines": 1,
+        "retained_lines": 0, "source_type": "document"}}
+    for invalid in ({"mode": {}}, {"mode": "arbitrary", "original_reason": "unsafe"}, []):
+        assert "reason_grounding" not in app_module._public_coach_agent_metrics({"reason_grounding": invalid})
+    assert app_module._public_coach_agent_metrics({"reason_grounding": {
+        "mode": mode, "removed_lines": True, "retained_lines": -1, "source_type": {},
+    }}) == {"reason_grounding": {"mode": mode}}
+
+
+def test_public_coach_quantity_reference_normalization_keeps_only_static_diagnostics():
+    assert app_module._public_coach_agent_metrics({"quantity_reference_normalization": {
+        "mode": "remove_anaphoric_count", "removed_references": 1,
+        "original_recommendation": "must never persist", "api_key": "must never persist",
+    }}) == {"quantity_reference_normalization": {"mode": "remove_anaphoric_count", "removed_references": 1}}
+    for invalid in ({"mode": "arbitrary", "removed_references": 1},
+                    {"mode": "remove_anaphoric_count", "removed_references": True},
+                    {"mode": "remove_anaphoric_count", "removed_references": 7}):
+        assert app_module._public_coach_agent_metrics({"quantity_reference_normalization": invalid}) == {}
+
+
 def test_v2_intelligence_skips_pi_when_only_projection_reserve_remains(
     tmp_path,
     monkeypatch,
@@ -1042,6 +1084,7 @@ def test_v2_pi_soft_budget_skip_releases_half_open_circuit_permit(
         def advance(self, seconds: float) -> None:
             self.value += seconds
 
+    _set_test_realtime_cutoff(monkeypatch, 2_500)
     monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
     monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
     config = app_module.llm_service.LlmConfig(
@@ -1312,6 +1355,7 @@ def test_v2_intelligence_provider_deadline_projects_timeout_instead_of_cancellin
 ):
     """A task-level Pi timeout must leave a durable explainable decision."""
 
+    _set_test_realtime_cutoff(monkeypatch, 2_500)
     monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
     monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
     config = app_module.llm_service.LlmConfig(
@@ -1699,11 +1743,11 @@ def test_v2_pi_realtime_circuit_keeps_high_signal_local_reflex_available(
     assert pi_runtime.calls == 0
 
 
-def test_direct_semantic_cannot_take_its_expired_half_open_trial(
+def test_direct_semantic_recovers_its_own_expired_circuit_with_one_trial(
     tmp_path,
     monkeypatch,
 ):
-    """A non-candidate final must not bypass its own known failure state."""
+    """Scoped direct work recovers after cooldown without borrowing Pi success."""
 
     monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
     monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
@@ -1781,17 +1825,41 @@ def test_direct_semantic_cannot_take_its_expired_half_open_trial(
         app_module._realtime_provider_identity(config, scope="direct_semantic")
     ).state == "open"
 
-    # The normal cooldown elapsed, but no explicit/short-budget recovery probe
-    # has succeeded. Direct semantic must fail fast instead of taking a new
-    # ten-second half-open request.
+    # The first failure still suppresses work during cooldown. After expiry,
+    # direct semantic must recover its own scope, since Pi uses another scope.
+    direct_identity = app_module._realtime_provider_identity(config, scope="direct_semantic")
+    assert app_module._acquire_direct_semantic_provider_admission(
+        circuit, direct_identity
+    ).admitted is False
     clock[0] = 2.0
 
-    async def forbidden_direct_semantic(**_kwargs):
+    async def recovering_direct_semantic(**kwargs):
         nonlocal provider_calls
         provider_calls += 1
-        raise AssertionError("direct semantic must not bypass shared Provider recovery")
+        kwargs["before_attempt"](1)
+        # Only this admitted job can own the recovery trial.
+        concurrent = app_module._acquire_direct_semantic_provider_admission(
+            circuit, direct_identity
+        )
+        assert concurrent.admitted is False
+        assert concurrent.snapshot.reason == "realtime_provider_circuit_half_open"
+        return {
+            "response": RealtimeIntelligenceResponse((), None, (), None),
+            "idempotency_key": "direct-semantic-recovery",
+            "transport_mode": "streaming",
+            "fallback_reason": None,
+            "ttft_ms": 50,
+            "repair_ttft_ms": None,
+            "provider_attempt_count": 1,
+            "repair_attempted": False,
+            "timings": {},
+            "usage": None,
+            "response_id": "direct-semantic-recovery-response",
+            "model": config.model,
+            "finish_reason": "stop",
+        }
 
-    monkeypatch.setattr(app_module, "run_realtime_intelligence", forbidden_direct_semantic)
+    monkeypatch.setattr(app_module, "run_realtime_intelligence", recovering_direct_semantic)
     second = app.state.v2_persistence.commit_final_and_enqueue(
         meeting_id="shared-circuit-second-direct",
         final_id="shared-circuit-second-final",
@@ -1806,45 +1874,28 @@ def test_direct_semantic_cannot_take_its_expired_half_open_trial(
     )
     second_job = app.state.v2_persistence.get_job(second["job_ids"]["intelligence"])
 
-    started = time.perf_counter()
     output = asyncio.run(app.state.v2_intelligence_job_handler_impl(second_job))
-    elapsed = time.perf_counter() - started
 
-    assert provider_calls == 1
-    assert elapsed < 0.25
-    assert output["semantic"] == {
-        "status": "suppressed_by_realtime_provider_circuit",
-        "error_class": None,
-    }
+    assert provider_calls == 2
     availability = output["provider_availability"]
-    assert availability == {
-        "policy_version": "scoped_realtime_provider.v2",
-        "scope": "direct_semantic",
-        "admitted": False,
-        "provider_attempted": False,
-        "provider_attempt_count": 0,
-        "circuit_scope_bypassed": None,
-        "admission_state": "open",
-        "admission_reason": "realtime_provider_recovery_probe_required",
-        "terminal_status": "denied",
-        "terminal_reason": "realtime_provider_recovery_probe_required",
-        "final_circuit_state": "open",
-        "final_failure_count": 1,
-        "final_failure_class": "timeout",
-    }
+    assert availability["scope"] == "direct_semantic"
+    assert availability["admitted"] is True
+    assert availability["admission_state"] == "half_open"
+    assert availability["provider_attempt_count"] == 1
+    assert availability["terminal_status"] == "completed"
+    assert availability["final_circuit_state"] == "closed"
+    assert availability["final_failure_count"] == 0
     coach = output["coach"]
     assert coach["origin"] == "direct_intelligence"
-    assert coach["status"] == "protected_silent"
-    assert coach["status_reason"] == "realtime_provider_recovery_probe_required"
-    assert coach["llm_called"] is False
-    assert coach["llm_call_status"] == "not_called"
+    assert coach["status"] == "not_triggered"
+    assert coach["llm_called"] is True
+    assert coach["llm_call_status"] == "called"
     assert coach["provider_access_scope"] == "direct_semantic"
     assert coach["circuit_scope_bypassed"] is None
     assert coach["provider_availability"] == availability
-    assert coach["durable_terminal_status"] == "denied"
-    assert coach["durable_terminal_reason"] == "realtime_provider_recovery_probe_required"
-    assert output["formal_event_context"]["llm_called"] is False
-    assert output["formal_event_context"]["llm_call_status"] == "not_called"
+    assert coach["durable_terminal_status"] == "completed"
+    assert output["formal_event_context"]["llm_called"] is True
+    assert output["formal_event_context"]["llm_call_status"] == "called"
 
     applied_events = [
         event
@@ -1854,11 +1905,8 @@ def test_direct_semantic_cannot_take_its_expired_half_open_trial(
     assert len(applied_events) == 1
     durable_decision = applied_events[0]["payload"]["coach_decision"]
     assert durable_decision["provider_availability"] == availability
-    assert durable_decision["llm_called"] is False
-    assert durable_decision["durable_terminal_status"] == "denied"
-    assert durable_decision["durable_terminal_reason"] == (
-        "realtime_provider_recovery_probe_required"
-    )
+    assert durable_decision["llm_called"] is True
+    assert durable_decision["durable_terminal_status"] == "completed"
 
 
 def test_successful_direct_semantic_closes_its_scoped_circuit_permit(
@@ -1954,6 +2002,7 @@ def test_v2_pi_timeout_keeps_failure_and_projects_owner_gap_local_reflex(
 ):
     """A timed-out Pi attempt may yield a separately labeled local safety hint."""
 
+    _set_test_realtime_cutoff(monkeypatch, 2_500)
     monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
     monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
     config = app_module.llm_service.LlmConfig(
@@ -2014,9 +2063,11 @@ def test_v2_pi_timeout_keeps_failure_and_projects_owner_gap_local_reflex(
     assert output["applied"]["coach_decision"]["runtime_used"] == "local_reflex"
 
 
+@pytest.mark.parametrize("failure_has_identity", [False, True])
 def test_v2_pi_response_validation_keeps_failure_and_projects_owner_gap_local_reflex(
     tmp_path,
     monkeypatch,
+    failure_has_identity,
 ):
     """A rejected Pi response gets a visible local hint without being mislabeled as Pi."""
 
@@ -2042,9 +2093,11 @@ def test_v2_pi_response_validation_keeps_failure_and_projects_owner_gap_local_re
         lambda *_args, **_kwargs: None,
     )
 
+    failure_decision = {}
+
     async def rejected_coach(**kwargs):
         kwargs["before_attempt"](0)
-        return {
+        result = {
             "intervention": None,
             "status": "failed",
             "status_reason": "IntelligenceResponseValidationError",
@@ -2059,6 +2112,13 @@ def test_v2_pi_response_validation_keeps_failure_and_projects_owner_gap_local_re
                 "fallback_suppressed": True,
             },
         }
+        if failure_has_identity:
+            result.update(build_realtime_coach_provenance_decision(
+                request=kwargs["request"], origin="pi", status="failed",
+                status_reason="response_validation_error",
+            ))
+            failure_decision["id"] = result["decision_id"]
+        return result
 
     monkeypatch.setattr(app_module, "run_realtime_coach_routed", rejected_coach)
     app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
@@ -2093,6 +2153,15 @@ def test_v2_pi_response_validation_keeps_failure_and_projects_owner_gap_local_re
     assert coach["intervention"]["local_reflex_kind"] == "missing_next_step"
     assert output["execution_status"] == "runtime_fallback"
     assert output["applied"]["coach_decision"]["runtime_used"] == "local_reflex"
+    decision_id = output["applied"]["coach_decision"]["decision_id"]
+    assert decision_id.startswith("coach-decision:")
+    assert decision_id != failure_decision.get("id")
+    assert output["applied"]["coach_decision"]["origin"] == "local_reflex"
+    with app.state.v2_persistence._lock:
+        binding = app.state.v2_persistence._conn.execute(
+            "SELECT decision_id,input_context_json FROM coach_source_bindings WHERE meeting_id=?", (meeting_id,),
+        ).fetchone()
+    assert binding["decision_id"] == decision_id and json.loads(binding["input_context_json"])
 
 
 def test_timeout_local_reflex_can_be_resolved_by_a_later_pi_lifecycle_refresh(
@@ -2101,6 +2170,7 @@ def test_timeout_local_reflex_can_be_resolved_by_a_later_pi_lifecycle_refresh(
 ):
     """A fallback card remains an auditable episode without becoming Pi success."""
 
+    _set_test_realtime_cutoff(monkeypatch, 2_500)
     monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_ENABLED", "1")
     monkeypatch.setenv("MEETING_COPILOT_REALTIME_COACH_RUNTIME", "pi")
     config = app_module.llm_service.LlmConfig(
@@ -2890,6 +2960,9 @@ def test_v2_answer_ready_enters_pi_deep_with_committed_fast_answer(
     app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
     app.state.streaming_llm_client = object()
     persistence = app.state.v2_persistence
+    app.state.meeting_preparation_store.save(
+        "answer-ready-pi-meeting", proactive_suggestion_policy="standard", updated_at_ms=1,
+    )
     finalized_at_ms = time.time_ns() // 1_000_000
     committed = persistence.commit_final_and_enqueue(
         meeting_id="answer-ready-pi-meeting",
@@ -3060,6 +3133,9 @@ def test_v2_bound_user_request_retains_answer_evidence_and_versions_revision(
     app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
     app.state.streaming_llm_client = object()
     persistence = app.state.v2_persistence
+    app.state.meeting_preparation_store.save(
+        "bound-user-revision-meeting", proactive_suggestion_policy="standard", updated_at_ms=1,
+    )
     finalized_at_ms = time.time_ns() // 1_000_000
     segment_texts = (
         "先同步背景，两个性能指标采用了不同统计口径。",
@@ -4795,9 +4871,10 @@ def test_pi_bridge_prewarm_is_best_effort_and_provider_free(monkeypatch):
             "ready": True,
             "bridge_process_reused": False,
             "bridge_startup_ms": 12.5,
+            "sidecar_lane": "realtime",
         }
 
-    assert lifecycle_calls == ["prewarm", "shutdown"]
+    assert lifecycle_calls == ["prewarm", "shutdown", "shutdown"]
 
 
 def test_base_runtime_starts_without_prewarming_optional_funasr(monkeypatch, tmp_path):
@@ -4872,7 +4949,7 @@ def test_base_runtime_does_not_prewarm_available_offline_refiner_by_default(
     assert "refiner_shutdown" in lifecycle_calls
 
 
-def test_base_runtime_explicit_prewarm_policy_preserves_offline_refiner_compatibility(
+def test_base_runtime_explicit_prewarm_policy_defers_offline_until_meeting_choice(
     monkeypatch,
     tmp_path,
 ):
@@ -4909,11 +4986,11 @@ def test_base_runtime_explicit_prewarm_policy_preserves_offline_refiner_compatib
     with TestClient(app_module.create_runtime_app()) as client:
         assert client.get("/health").status_code == 200
         assert client.app.state.funasr_resident_prewarm_ready is False
-        assert client.app.state.funasr_refiner_prewarm_ready is True
+        assert client.app.state.funasr_refiner_prewarm_ready is False
         assert client.app.state.funasr_refiner_policy["mode"] == "prewarm"
         assert client.app.state.funasr_refiner_policy["source"] == "environment"
 
-    assert "refiner_prewarm" in lifecycle_calls
+    assert "refiner_prewarm" not in lifecycle_calls
     assert "realtime_prewarm" not in lifecycle_calls
     assert "refiner_shutdown" in lifecycle_calls
 
@@ -4969,7 +5046,11 @@ def test_asr_refiner_prewarm_is_local_verification_gated(monkeypatch):
         "refinement_capability",
         lambda: {"status": "ready", "process_resident": True},
     )
-    monkeypatch.setattr(app_module.asr_refiner, "prewarm_refiner_worker", lambda: True)
+    recovery_calls = []
+    monkeypatch.setattr(
+        app_module.asr_refiner, "prewarm_refiner_worker",
+        lambda **kwargs: recovery_calls.append(kwargs) or True,
+    )
     monkeypatch.setattr(
         app_module.asr_refiner,
         "refiner_worker_status",
@@ -4984,6 +5065,7 @@ def test_asr_refiner_prewarm_is_local_verification_gated(monkeypatch):
 
     forbidden = client.post("/providers/asr/prewarm")
     assert forbidden.status_code == 403
+    assert recovery_calls == []
 
     response = client.post(
         "/providers/asr/prewarm",
@@ -4995,6 +5077,7 @@ def test_asr_refiner_prewarm_is_local_verification_gated(monkeypatch):
     assert response.status_code == 200
     assert response.json()["ok"] is True
     assert response.json()["worker"]["process_ready"] is True
+    assert recovery_calls == [{"retry_failed": True}]
 
 
 def test_execution_preview_uses_locally_normalized_final_as_llm_evidence():
@@ -5889,6 +5972,7 @@ def test_provider_health_endpoint_masks_llm_secret_and_disables_remote_asr_by_de
     monkeypatch,
     tmp_path,
 ):
+    _set_test_realtime_cutoff(monkeypatch, 2_500)
     monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
     monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-provider-health-secret")
     monkeypatch.setenv("LLM_GATEWAY_MODEL", "gpt-provider-health")
@@ -9885,10 +9969,13 @@ def test_create_app_closes_all_created_sqlite_repositories_on_shutdown(tmp_path)
 
     with TestClient(app) as client:
         assert client.get("/health").status_code == 200
-        assert all(repository.closed is False for repository in repositories)
+        assert app.state.knowledge_repository in repositories
+        assert all(repository._conn.execute("SELECT 1").fetchone()[0] == 1 for repository in repositories)
 
     assert repositories
-    assert all(repository.closed is True for repository in repositories)
+    for repository in repositories:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            repository._conn.execute("SELECT 1")
     db_path = tmp_path / "meeting_copilot.db"
     moved_path = tmp_path / "meeting_copilot.after_shutdown.db"
     db_path.replace(moved_path)

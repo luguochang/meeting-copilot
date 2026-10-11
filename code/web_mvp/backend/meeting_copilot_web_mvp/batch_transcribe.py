@@ -5,9 +5,14 @@ import json
 import os
 import shutil
 import subprocess
+import threading
+import time
+import wave
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Mapping
 
+from meeting_copilot_web_mvp import asr_resource_guard
 from meeting_copilot_web_mvp.logging_config import get_logger
 from meeting_copilot_web_mvp.local_runtime_paths import (
     packaged_funasr_environment,
@@ -19,6 +24,8 @@ _log = get_logger("meeting_copilot_web_mvp.batch_transcribe")
 _RUNTIME_MANIFEST_SCHEMA = "meeting_copilot.runtime_bundle.v1"
 _COMPONENT_INVENTORY_SCHEMA = "meeting_copilot.runtime_component_inventory.v1"
 _RUNTIME_MANIFEST_ENV = "MEETING_COPILOT_RUNTIME_MANIFEST"
+_SOURCE_RUNTIME_ENV = "MEETING_COPILOT_SOURCE_RUNTIME"
+_SOURCE_ROOT = Path(__file__).resolve().parents[4]
 _COMPONENT_ENV = {
     "funasr_python": "MEETING_COPILOT_BATCH_FUNASR_PYTHON",
     "worker": "MEETING_COPILOT_BATCH_TRANSCRIBE_WORKER",
@@ -56,6 +63,152 @@ _FORBIDDEN_PATH_MARKERS = (
 )
 _ffmpeg_path: str | None = None
 _ffmpeg_packaged_mode: bool | None = None
+_resource_lock = threading.Lock()
+_last_resource_error_code: str | None = None
+_last_resource_check: dict[str, Any] | None = None
+
+
+def runtime_status() -> dict[str, Any]:
+    """Return cached diagnostics; reading status never probes or starts ASR."""
+    with _resource_lock:
+        return {"resource": {
+            "last_error_code": _last_resource_error_code,
+            "last_check": deepcopy(_last_resource_check),
+        }}
+
+
+def _windows_resource_guard_enabled() -> bool:
+    return os.name == "nt"
+
+
+def _record_resource_failure(error: asr_resource_guard.AsrResourceError) -> None:
+    global _last_resource_error_code, _last_resource_check
+    with _resource_lock:
+        _last_resource_error_code = error.code
+        if isinstance(getattr(error, "capacity_check", None), dict):
+            _last_resource_check = deepcopy(error.capacity_check)
+
+
+def _check_resource_capacity(profile: Any, *, input_bytes: int = 0) -> None:
+    global _last_resource_check
+    try:
+        check = asr_resource_guard.check_capacity(profile, input_bytes=input_bytes)
+        if check is None or not check.checked:
+            raise asr_resource_guard.AsrResourceError("asr_resource_probe_failed")
+    except asr_resource_guard.AsrResourceError as error:
+        _record_resource_failure(error)
+        raise
+    if check is not None:
+        with _resource_lock:
+            _last_resource_check = check.as_dict()
+
+
+def _normalized_pcm_bytes(path: Path) -> int:
+    """Read only the WAV header, without allocating the audio buffer."""
+    try:
+        with wave.open(str(path), "rb") as audio:
+            return audio.getnframes() * audio.getnchannels() * audio.getsampwidth()
+    except (OSError, EOFError, wave.Error):
+        # Preserve the worker's existing invalid/unknown-format handling.
+        return 0
+
+
+def _release_lease_after_owned_exit(process: Any, lease: Any, monitor: Any = None) -> None:
+    """Keep admission closed when cleanup cannot establish owned-process exit."""
+    def wait_for_exit() -> None:
+        try:
+            process.wait()
+        except Exception:
+            if process.poll() is None:
+                return
+        if monitor is not None:
+            monitor.wait_closed()
+        if process.poll() is not None and (monitor is None or not monitor.is_alive):
+            lease.release()
+
+    threading.Thread(
+        target=wait_for_exit, name="file-asr-owned-exit", daemon=True,
+    ).start()
+
+
+def _remove_converted_after_owned_exit(path: Path, lease: Any) -> None:
+    def cleanup() -> None:
+        while not lease.is_released:
+            time.sleep(0.1)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as error:
+            _log.warning("batch.converted_audio.cleanup_failed", error_class=type(error).__name__)
+    threading.Thread(target=cleanup, name="file-asr-owned-audio-cleanup", daemon=True).start()
+
+
+def _run_guarded_batch(
+    command: list[str], *, env: dict[str, str], timeout: int, input_bytes: int,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        lease = asr_resource_guard.cold_start_lease()
+    except asr_resource_guard.AsrResourceError as error:
+        error.execution_phase = "before_spawn"
+        raise
+    process = None
+    monitor = None
+    primary_error: BaseException | None = None
+    try:
+        # Recheck while holding the shared cold lease, immediately before spawn.
+        _check_resource_capacity(asr_resource_guard.COLD_LOAD_PROFILE, input_bytes=input_bytes)
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            encoding="utf-8", errors="replace", env=env,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        monitor = asr_resource_guard.OwnedPopenMonitor(process)
+        monitor.start()
+        stdout, stderr = process.communicate(timeout=timeout)
+        if not monitor.close():
+            raise asr_resource_guard.AsrResourceError("asr_resource_guard_triggered")
+        monitor.raise_if_failed()
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        cleanup_failed = False
+        if monitor is not None:
+            try:
+                if not monitor.close():
+                    cleanup_failed = True
+                if process.poll() is None:
+                    monitor.stop_owned()
+                if primary_error is not None and process.poll() is not None:
+                    # Drain both pipes after a timeout/guard stop without a
+                    # second process or any PID-based cleanup.
+                    process.communicate(timeout=2)
+            except Exception:
+                cleanup_failed = True
+        cleanup_pending = process is not None and (process.poll() is None or (monitor is not None and monitor.is_alive))
+        if cleanup_pending:
+            # A failed kill/wait is not evidence that the model has gone away.
+            _release_lease_after_owned_exit(process, lease, monitor)
+            cleanup_failed = True
+        else:
+            lease.release()
+        def annotate(error: BaseException) -> None:
+            if isinstance(error, asr_resource_guard.AsrResourceError):
+                error.execution_phase = "before_spawn" if process is None else "inference_or_cleanup"
+                error.owned_cleanup_lease = lease if cleanup_pending else None
+        if primary_error is not None:
+            annotate(primary_error)
+        if not isinstance(primary_error, asr_resource_guard.AsrResourceError):
+            if monitor is not None:
+                try:
+                    monitor.raise_if_failed()
+                except asr_resource_guard.AsrResourceError as error:
+                    annotate(error)
+                    raise
+            if cleanup_failed:
+                error = asr_resource_guard.AsrResourceError("asr_resource_guard_triggered")
+                annotate(error)
+                raise error
 
 
 def _nested(payload: Mapping[str, Any], *keys: str) -> Any:
@@ -303,6 +456,29 @@ def _forbidden_runtime_path(path: Path) -> bool:
     return any(marker in normalized for marker in _FORBIDDEN_PATH_MARKERS)
 
 
+def _source_runtime_path_allowed(path: Path, environ: Mapping[str, str], name: str) -> bool:
+    """Allow only the repository's explicit source interpreter/converter.
+
+    Installed bundles still use their sealed inventory. This does not admit
+    model caches, arbitrary virtual environments, or another checkout.
+    """
+    if environ.get(_SOURCE_RUNTIME_ENV) != "1" or environ.get(_RUNTIME_MANIFEST_ENV):
+        return False
+    relative_root = {
+        "funasr_python": "code/asr_runtime/.venv-funasr",
+        "converter": "code/web_mvp/backend/.venv",
+    }.get(name)
+    if relative_root is None:
+        return False
+    try:
+        path.expanduser().resolve(strict=False).relative_to(
+            (_SOURCE_ROOT / relative_root).resolve(strict=False),
+        )
+    except ValueError:
+        return False
+    return True
+
+
 def _resolve_runtime_components(
     environ: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
@@ -336,7 +512,9 @@ def _resolve_runtime_components(
                 env_value = str(effective_env.get(_CONVERTER_ENV[1]) or "").strip()
             resolved = Path(os.path.abspath(Path(env_value).expanduser())) if env_value else None
             component_errors: list[str] = []
-            if resolved is not None and _forbidden_runtime_path(resolved):
+            if resolved is not None and _forbidden_runtime_path(resolved) and not _source_runtime_path_allowed(
+                resolved, effective_env, name,
+            ):
                 component_errors.append("development_or_user_cache_path_forbidden")
             components[name] = {
                 "path": resolved,
@@ -434,7 +612,9 @@ def _get_ffmpeg(
 
         candidate = Path(imageio_ffmpeg.get_ffmpeg_exe()).expanduser().resolve(strict=False)
         allowed = True
-        if _forbidden_runtime_path(candidate):
+        if _forbidden_runtime_path(candidate) and not _source_runtime_path_allowed(
+            candidate, os.environ, "converter",
+        ):
             _log.warning("ffmpeg.forbidden_path", path=str(candidate))
             allowed = False
         if allowed:
@@ -485,7 +665,7 @@ def ensure_wav_16k_mono(input_path: Path) -> Path:
         proc = subprocess.run(
             [ffmpeg, "-i", str(input_path), "-vn", "-ar", "16000",
              "-ac", "1", "-f", "wav", "-y", str(output_path)],
-            capture_output=True, text=True, timeout=120,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
         )
         if proc.returncode != 0:
             raise RuntimeError(f"ffmpeg转码失败: {proc.stderr[-400:]}")
@@ -617,6 +797,7 @@ def transcribe_file_report(
     *,
     preserve_preprocessed: bool = False,
 ) -> dict[str, Any]:
+    global _last_resource_error_code
     runtime = _resolve_runtime_components()
     capability = capability_status()
     if not capability["available"]:
@@ -626,8 +807,16 @@ def transcribe_file_report(
         name: item["path"]
         for name, item in runtime["components"].items()
     }
+    guarded = _windows_resource_guard_enabled()
+    if guarded:
+        try:
+            _check_resource_capacity(asr_resource_guard.WARM_INFERENCE_PROFILE)
+        except asr_resource_guard.AsrResourceError as error:
+            error.execution_phase = "before_spawn"
+            raise
     wav_path = ensure_wav_16k_mono(audio_path)
     _log.info("batch.transcribe.start", audio=str(wav_path), original=str(audio_path))
+    resource_failure: asr_resource_guard.AsrResourceError | None = None
     try:
         child_env = os.environ.copy()
         for key in list(child_env):
@@ -656,11 +845,11 @@ def transcribe_file_report(
         child_env.update({
             "PYTHONNOUSERSITE": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONIOENCODING": "utf-8",
             "HF_HUB_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",
         })
-        proc = subprocess.run(
-            [
+        command = [
                 str(resolved["funasr_python"]),
                 str(resolved["worker"]),
                 str(wav_path),
@@ -671,12 +860,17 @@ def transcribe_file_report(
                 str(resolved["vad_model"]),
                 "--punc-model",
                 str(resolved["punc_model"]),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=child_env,
-        )
+            ]
+        if guarded:
+            proc = _run_guarded_batch(
+                command, env=child_env, timeout=timeout,
+                input_bytes=_normalized_pcm_bytes(wav_path),
+            )
+        else:
+            proc = subprocess.run(
+                command, capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=timeout, env=child_env,
+            )
         if proc.returncode != 0:
             _log.error("batch.transcribe.failed", returncode=proc.returncode, stderr=proc.stderr[-400:])
             raise RuntimeError(f"本地文件转写失败: {proc.stderr[-300:]}")
@@ -693,10 +887,25 @@ def transcribe_file_report(
         if preserve_preprocessed:
             item["normalized_audio_path"] = str(wav_path)
         _log.info("batch.transcribe.end", chars=len(str(item.get("text") or "")))
+        with _resource_lock:
+            _last_resource_error_code = None
         return item
+    except asr_resource_guard.AsrResourceError as error:
+        resource_failure = error
+        _record_resource_failure(error)
+        raise
     finally:
         if wav_path != audio_path and not preserve_preprocessed:
-            wav_path.unlink(missing_ok=True)
+            try:
+                wav_path.unlink(missing_ok=True)
+            except OSError as error:
+                if resource_failure is None:
+                    raise
+                owned = resource_failure.owned_cleanup_lease
+                if owned is not None and not owned.is_released:
+                    _remove_converted_after_owned_exit(wav_path, owned)
+                else:
+                    _log.warning("batch.converted_audio.cleanup_failed", error_class=type(error).__name__)
 
 
 def transcribe_file(audio_path: Path, timeout: int = 180) -> str:

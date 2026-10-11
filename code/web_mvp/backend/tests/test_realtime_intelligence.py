@@ -1080,6 +1080,49 @@ def test_pi_trigger_routes_unpunctuated_owner_and_deadline_requests(text: str) -
     }
 
 
+@pytest.mark.parametrize("text", [
+    "主持人问：这个活动要怎么报名？",
+    "“这个产品如何使用？”是录像里引用的问题。",
+    "他问我，为什么选择这个方案？",
+    "为什么换缓存方案？因为原来的维护成本太高。",
+    "难道还需要解释吗？",
+    "这个功能没什么可争的，你知道吗？",
+    "那你是",
+    "你能介绍一下你负责的",
+    "最后谁付过钱就给忘了。",
+    "大家忘了谁拿了材料然后找了很久最后才找到之前保管材料的同事接着大家就回办公室没有再讨论了",
+    "说到这个工具我不知道那是什么功能其实也不理解对方当时想表达什么意思",
+    "是不是所有成员都应该为我",
+])
+def test_pi_pending_question_uses_the_same_local_rejection_as_fast_answer(text):
+    request = replace(
+        _coach_request(),
+        new_paragraphs=(replace(_coach_request().new_paragraphs[0], text=text),),
+    )
+    assert "question_pending" not in {item.event_type for item in realtime_coach_candidate_events(request)}
+
+
+def test_quoted_question_rejection_keeps_a_separate_actual_commitment_risk():
+    request = replace(
+        _coach_request(),
+        new_paragraphs=(replace(
+            _coach_request().new_paragraphs[0],
+            text="他问我为什么改缓存。我们保证周四一定上线。",
+        ),),
+    )
+    types = {item.event_type for item in realtime_coach_candidate_events(request)}
+    assert "question_pending" not in types
+    assert "commitment_without_condition" in types
+
+
+def test_explicit_coach_request_is_not_blocked_by_recorded_question_admission():
+    request = replace(
+        _coach_request(), trigger_type="user_request", user_request="请分析当前约束",
+        new_paragraphs=(replace(_coach_request().new_paragraphs[0], text="主持人问：活动怎么报名？"),),
+    )
+    assert should_run_realtime_coach(request, requested_runtime="pi")
+
+
 @pytest.mark.parametrize(
     "text",
     (
@@ -1898,6 +1941,63 @@ def test_answer_ready_deep_card_can_add_generic_professional_checks() -> None:
     assert "压测" in intervention.recommendation
     assert "监控" in intervention.recommendation
     assert "回滚" in intervention.recommendation
+
+
+@pytest.mark.parametrize(
+    ("ai_answer", "recommendation", "violation"),
+    [
+        ("压测已经通过，可以上线。", "压测已经通过，现在可以无条件上线。", "state"),
+        ("吞吐为每秒1000次。", "目前吞吐为每秒1000次，可以据此放行。", "number"),
+        ("上线时间为周六。", "我们将于周六上线，目前可以明确承诺。", "deadline"),
+        ("王五负责发布。", "由王五负责发布，可以明确责任人。", "owner"),
+        ("NeonEngine已经启用。", "NeonEngine已经启用，可以进入发布。", "product_name"),
+    ],
+)
+def test_deep_card_cannot_promote_ai_answer_hard_facts_into_evidence(
+    ai_answer: str, recommendation: str, violation: str,
+) -> None:
+    request = replace(
+        _coach_request(),
+        trigger_type="answer_ready",
+        work_item_id="answer:unverified-ai",
+        glossary=("NeonEngine",),
+        rolling_state={"current_answer": {"answer": ai_answer, "status": "committed"}},
+    )
+    payload = {"intervention": {
+        "event_type": "question_to_user",
+        "title": "补充上线条件",
+        "recommendation": recommendation,
+        "reason": "当前回答仍需对照原文核实。",
+        "evidence_segment_ids": ["remote-4"],
+        "evidence_quote": "你能承诺周五一定上线吗？",
+        "urgency": "medium",
+        "confidence": 0.9,
+    }}
+    with pytest.raises(IntelligenceResponseValidationError, match=violation):
+        parse_realtime_coach_response(json.dumps(payload, ensure_ascii=False), request=request)
+
+
+def test_explicit_role_and_focus_are_bounded_and_part_of_request_identity() -> None:
+    request = RealtimeIntelligenceRequest.from_payload(
+        meeting_id="role-context", state_revision=1,
+        new_paragraphs=[_paragraph("p1", "上一次具体遇到什么问题？")],
+        context_paragraphs=[], rolling_state={},
+        meeting_goal="了解实际使用障碍", participant_role="用户研究访谈者",
+        focus_points=["实际行为", "实际行为", "替代方案"],
+    )
+    assert request.focus_points == ("实际行为", "替代方案")
+    payload = json.loads(build_realtime_coach_messages(request)[1]["content"])
+    assert payload["participant_role"] == "用户研究访谈者"
+    assert payload["focus_points"] == ["实际行为", "替代方案"]
+    assert realtime_intelligence_idempotency_key(request) != realtime_intelligence_idempotency_key(
+        replace(request, participant_role="普通参会者")
+    )
+    with pytest.raises(ValueError, match="focus_points must be an array"):
+        RealtimeIntelligenceRequest.from_payload(
+            meeting_id="invalid-role-context", state_revision=1,
+            new_paragraphs=[_paragraph("p1", "内容")],
+            context_paragraphs=[], rolling_state={}, focus_points="不该逐字拆分",
+        )
 
 
 def test_answer_ready_preserves_the_structured_pi_coaching_package() -> None:
@@ -2725,7 +2825,7 @@ def test_pi_deep_runner_grounds_an_unsupported_state_clause_before_commit(confid
     async def scenario() -> None:
         recommendation = "\n".join(
             (
-                "边界：本周五作为目标，压测是放行条件。",
+                "边界：周五作为目标，压测是放行条件。",
                 "风险：压测已经通过，可以无条件上线。",
                 "追问：还需要用什么方式验证放行条件？",
             )
@@ -2770,13 +2870,38 @@ def test_pi_deep_runner_grounds_an_unsupported_state_clause_before_commit(confid
         )
 
         assert result["intervention"] is not None
-        assert "风险：信息口径不足可能造成误解" in result["intervention"].recommendation
+        assert "风险：" not in result["intervention"].recommendation
         assert "已经通过" not in result["intervention"].recommendation
-        assert "边界：本周五作为目标，压测是放行条件。" in result["intervention"].recommendation
+        assert "边界：周五作为目标，压测是放行条件。" in result["intervention"].recommendation
         assert result["agent_metrics"]["host_grounding_applied"] is True
         assert result["agent_metrics"]["host_grounding_fields"] == ["recommendation"]
         assert "introduces material facts" in result["agent_metrics"]["host_grounding_reason"]
 
+    asyncio.run(scenario())
+
+
+def test_pi_deep_runner_does_not_replace_an_entirely_unsafe_answer_with_a_template() -> None:
+    async def scenario() -> None:
+        request = replace(
+            _coach_request(), trigger_type="answer_ready", work_item_id="answer:unsafe",
+            rolling_state={"current_answer": {"answer": "压测已经通过。", "status": "committed"}},
+        )
+        runtime = _PiRuntime({
+            "action": "intervention",
+            "intervention": {
+                "event_type": "question_to_user", "title": "补充上线条件",
+                "recommendation": "压测已经通过，现在可以直接上线。",
+                "reason": "当前回答仍需核对放行条件。",
+                "evidence_segment_ids": ["remote-4"],
+                "evidence_quote": "你能承诺周五一定上线吗？",
+                "urgency": "medium", "confidence": 0.9,
+            }, "metrics": {"prompt_profile": "deep_answer"},
+        })
+        with pytest.raises(IntelligenceResponseValidationError, match="state"):
+            await run_realtime_coach_via_pi(
+                request=request, pi_runtime=runtime,
+                provider_config=_pi_provider_config(), priority_mode="deep",
+            )
     asyncio.run(scenario())
 
 
@@ -3026,6 +3151,30 @@ async def _test_pi_provider_timeout_does_not_double_call_the_model() -> None:
     assert result["status_reason"] == "provider_timeout"
     assert result["decision_reason"]
     assert direct_provider.calls == []
+
+
+def test_pi_failure_preserves_observed_evaluation_timing_without_claiming_a_decision() -> None:
+    class ExpectedPiError(RuntimeError):
+        code = "agent_provider_error"
+        metrics = {"timings": {
+            "clock": "unix_epoch_ms", "started_at_ms": 1_000,
+            "first_token_at_ms": 1_125, "completed_at_ms": 1_840,
+        }}
+
+    async def scenario() -> None:
+        provider = _Provider(json.dumps({"intervention": None}))
+        result = await run_realtime_coach_routed(
+            request=_coach_request(), provider=provider, requested_runtime="pi",
+            pi_runtime=_PiRuntime(error=ExpectedPiError("provider timeout")),
+            pi_provider_config=_pi_provider_config(),
+        )
+        assert result["timings"] == ExpectedPiError.metrics["timings"]
+        assert result["ttft_ms"] is None
+        assert result["decision_latency_ms"] is None
+        assert result["status"] == "timed_out"
+        assert provider.calls == []
+
+    asyncio.run(scenario())
 
 
 def test_pi_response_validation_failure_keeps_bounded_diagnostic() -> None:

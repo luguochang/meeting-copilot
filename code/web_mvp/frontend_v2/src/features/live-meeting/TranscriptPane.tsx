@@ -7,7 +7,9 @@ import type {
   SemanticParagraph,
   TranscriptSegment,
 } from "../../domain/events";
+import { isCompletePartialText, isPartialCoveredBySegment, isPartialTextTruncated } from "../../domain/events";
 import { segmentDomId } from "./domIds";
+import { isUncorrectedRecovery } from "../../domain/transcriptRecovery";
 
 interface TranscriptPaneProps {
   segments: TranscriptSegment[];
@@ -59,6 +61,7 @@ interface DisplayParagraph {
   speakerLabel: string | null;
   speakerConfidence: number | null;
   correctionStatus?: string;
+  recoveryRaw?: boolean;
   corrections: Array<{ before: string; after: string }>;
   runs: DisplayRun[];
 }
@@ -146,7 +149,10 @@ function buildDisplayRuns(segments: TranscriptSegment[], fallbackText = ""): Dis
 }
 
 function assembleDisplayParagraphs(segments: TranscriptSegment[]): DisplayParagraph[] {
-  const ordered = [...segments].sort((a, b) => a.transcriptSeq - b.transcriptSeq);
+  const recovered = segments.some((segment) => Boolean(segment.recoveryProvenance));
+  const ordered = [...segments].sort((a, b) => recovered
+    ? (a.startedAtMs ?? Infinity) - (b.startedAtMs ?? Infinity) || a.transcriptSeq - b.transcriptSeq
+    : a.transcriptSeq - b.transcriptSeq);
   const paragraphs: DisplayParagraph[] = [];
   let previousSegment: TranscriptSegment | undefined;
   for (const segment of ordered) {
@@ -181,6 +187,7 @@ function assembleDisplayParagraphs(segments: TranscriptSegment[]): DisplayParagr
       ["microphone", "system_audio"].includes(segment.sourceTrack),
     );
     const canJoin = Boolean(previous) &&
+      !(previousSegment?.recoveryProvenance?.jobId || segment.recoveryProvenance?.jobId) &&
       gap < FALLBACK_PARAGRAPH_GAP_MS &&
       !previousReadable &&
       !previousReachedHardLimit &&
@@ -221,6 +228,7 @@ function assembleDisplayParagraphs(segments: TranscriptSegment[]): DisplayParagr
       revised: segment.correctionStatus === "changed" ||
         (segment.correctionStatus === undefined && segment.revision > 1),
       correctionStatus: segment.correctionStatus,
+      recoveryRaw: isUncorrectedRecovery(segment),
       corrections: correctionDetails([segment]),
       runs: buildDisplayRuns([segment], text),
     });
@@ -259,17 +267,15 @@ function correctionDetails(segments: TranscriptSegment[]): Array<{ before: strin
 function correctionLabel(
   status: string | undefined,
   revised: boolean,
-  aiIndicator: RuntimeIndicator | undefined,
+  recoveryRaw = false,
 ): string | null {
-  if (status === "processing") return "AI 校对中";
-  if (status === "no_change") return "无需校对";
+  if (recoveryRaw) return "补识别原文，未做AI校对";
+  if (status === "processing") return "识别原文 · 校对中";
+  if (status === "failed_preserved_original") return revised ? "部分已校对，仍有原文" : "已保留原文";
+  if (status === "pending" && revised) return "部分已校对，仍有原文";
+  if (status === "no_change") return "校对未改字";
   if (status === "changed" || revised) return "已校对";
-  if (status === "failed_preserved_original") return "已保留原文";
-  if (status === "pending") {
-    return aiIndicator?.state === "paused" || aiIndicator?.state === "offline" || aiIndicator?.state === "error"
-      ? "识别原文"
-      : "等待校对";
-  }
+  if (status === "pending") return "识别原文";
   return null;
 }
 
@@ -314,6 +320,7 @@ function displaySemanticParagraphs(
         .map((checkpointId) => segmentsById.get(checkpointId)?.correctionStatus)
         .reduce(mergeCorrectionStatus, undefined),
       corrections: correctionDetails(checkpoints),
+      recoveryRaw: checkpoints.some(isUncorrectedRecovery),
       runs,
     }];
   });
@@ -402,7 +409,6 @@ export function TranscriptPane({
   archivedSegmentCount,
   activePartial,
   connection,
-  aiIndicator,
   mergeSegments = true,
   liveMode = true,
   speakers = [],
@@ -431,8 +437,11 @@ export function TranscriptPane({
   );
   const hasExperimentalSpeakers = speakers.some((speaker) => speaker.labelSource !== "user");
   const paragraphs = useMemo(
-    () => semanticParagraphs.length
-      ? displaySemanticParagraphs(semanticParagraphs, segments)
+    () => { const semanticRows = displaySemanticParagraphs(semanticParagraphs, segments);
+      const coveredIds = new Set(semanticRows.flatMap((paragraph) => paragraph.segmentIds));
+      const rows = semanticParagraphs.length
+      ? [...semanticRows,
+        ...assembleDisplayParagraphs(segments.filter((segment) => !coveredIds.has(segment.segmentId)))]
       : mergeSegments
         ? assembleDisplayParagraphs(segments)
         : segments.map((segment) => ({
@@ -447,20 +456,29 @@ export function TranscriptPane({
         revised: segment.correctionStatus === "changed" ||
           (segment.correctionStatus === undefined && segment.revision > 1),
         correctionStatus: segment.correctionStatus,
+        recoveryRaw: isUncorrectedRecovery(segment),
         corrections: correctionDetails([segment]),
         runs: buildDisplayRuns([segment], segment.normalizedText.trim() || segment.text.trim()),
-      })),
+      }));
+      return segments.some((segment) => Boolean(segment.recoveryProvenance))
+        ? rows.sort((a, b) => (a.startedAtMs ?? Infinity) - (b.startedAtMs ?? Infinity) || a.id.localeCompare(b.id))
+        : rows;
+    },
     [mergeSegments, segments, semanticParagraphs],
   );
   const visibleActivePartial = useMemo(() => {
     if (!activePartial) return null;
-    const committedSegmentIds = new Set(segments.map((segment) => segment.segmentId));
     const activeText = activePartial.text.trim();
+    // Display paragraphs combine checkpoints: only canonical segments own their spans.
     const coveredByDurableProjection = paragraphs.some((paragraph) =>
-      paragraph.segmentIds.includes(activePartial.segmentId) ||
-      (activeText.length > 0 && paragraph.text.trim() === activeText),
+      (paragraph.segmentIds.includes(activePartial.segmentId)
+        && activePartial.endedAtMs == null && !isPartialTextTruncated(activePartial))
+      || (isCompletePartialText(activePartial)
+        && (paragraph.segmentIds.includes(activePartial.segmentId)
+          ? paragraph.text.trim().includes(activeText)
+          : paragraph.text.trim() === activeText)),
     );
-    return committedSegmentIds.has(activePartial.segmentId) || coveredByDurableProjection
+    return segments.some((segment) => isPartialCoveredBySegment(activePartial, segment)) || coveredByDurableProjection
       ? null
       : activePartial;
   }, [activePartial, paragraphs, segments]);
@@ -651,7 +669,7 @@ export function TranscriptPane({
           ) : null}
           <div className="confirmed-count" title="已写入会议记录的文字段落">
             <Check size={14} />
-            {archivedSegmentCount + paragraphs.length} 段已确认
+            {archivedSegmentCount + paragraphs.length} 段已保存
           </div>
           <label className="transcript-search">
             <Search size={13} aria-hidden="true" />
@@ -678,7 +696,7 @@ export function TranscriptPane({
           <div className="transcript-empty">
             {connection === "connecting" || connection === "reconnecting" ? <LoaderCircle className="spin" size={22} /> : <Sparkles size={22} />}
             <p>{connection === "offline" ? "会议连接暂时中断" : "等待会议文字"}</p>
-            <span>{connection === "offline" ? "恢复连接后会继续追加已确认内容" : "识别后的内容会按发言顺序连续出现"}</span>
+            <span>{connection === "offline" ? "恢复连接后会继续追加已保存内容" : "识别后的内容会按发言顺序连续出现"}</span>
           </div>
         ) : null}
 
@@ -736,12 +754,12 @@ export function TranscriptPane({
                       {formatRange(paragraph.startedAtMs, paragraph.endedAtMs)}
                     </button>
                   ) : <time>{formatRange(paragraph.startedAtMs, paragraph.endedAtMs)}</time>}
-                  {correctionLabel(paragraph.correctionStatus, paragraph.revised, aiIndicator) ? (
+                  {correctionLabel(paragraph.correctionStatus, paragraph.revised, paragraph.recoveryRaw) ? (
                     <span
                       className={`correction-mark correction-mark--${paragraph.correctionStatus ?? "changed"}`}
-                      title={paragraph.correctionStatus === "changed" && paragraph.revised ? "文字已发生真实修正，可在复盘中查看原文与最终版本" : undefined}
+                      title={paragraph.correctionStatus === "changed" && paragraph.revised ? "文字已发生真实修正，可在复盘中查看原文与最终版本" : paragraph.correctionStatus === "pending" ? "AI 校对尚未完成，已保存识别原文，可先阅读或提问。" : undefined}
                     >
-                      <Sparkles size={12} />{correctionLabel(paragraph.correctionStatus, paragraph.revised, aiIndicator)}
+                      {paragraph.recoveryRaw ? <ScanText size={12} /> : <Sparkles size={12} />}{correctionLabel(paragraph.correctionStatus, paragraph.revised, paragraph.recoveryRaw)}
                     </span>
                   ) : null}
                 </div>
@@ -837,17 +855,6 @@ export function TranscriptPane({
           })}
         </div>
 
-        {liveMode ? (
-          <div className="active-partial-slot" data-active={Boolean(visibleActivePartial)}>
-            {visibleActivePartial ? (
-              <div className="active-partial" aria-label="正在识别">
-                <span className="listening-pulse" aria-hidden="true" />
-                <p>{visibleActivePartial.text}</p>
-              </div>
-            ) : null}
-          </div>
-        ) : null}
-
         {selection && selectionToolbarPosition && (onAskSelection || onSaveSelection) ? (
           <div
             className={`transcript-selection-toolbar transcript-selection-toolbar--${selectionToolbarPosition.placement}`}
@@ -880,6 +887,14 @@ export function TranscriptPane({
           </div>
         ) : null}
       </div>
+      {liveMode && visibleActivePartial ? (
+        <div className="active-partial-slot" data-active="true">
+          <div className="active-partial" aria-label="未确认识别草稿" title="尚未写入正文，不作为实时建议或会后结论的依据">
+            <small>正在识别<br />临时草稿</small>
+            <p>{visibleActivePartial.text}</p>
+          </div>
+        </div>
+      ) : null}
     </section>
   );
 }

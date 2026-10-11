@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { MeetingAudioWithTracks } from "../../api/schema";
 import { createInitialMeetingState } from "../../domain/reducer";
@@ -252,7 +252,8 @@ describe("ReviewWorkspace", () => {
     const panel = screen.getByRole("tabpanel");
     expect(panel).toHaveClass("review-tab-panel--transcript");
     expect(screen.getByText("2 个语义段落 · 3 条识别片段")).toBeVisible();
-    expect(screen.getAllByText("2 段已确认")).not.toHaveLength(0);
+    expect(screen.getByText("2 段已保存")).toBeVisible();
+    expect(screen.queryByText("2 段已确认")).not.toBeInTheDocument();
     expect(panel.querySelectorAll(".transcript-segment")).toHaveLength(2);
     expect(screen.getByText("已确认会议内容 1，已确认会议内容 2。")).toBeVisible();
     expect(screen.getByText("已确认会议内容 3。")).toBeVisible();
@@ -403,7 +404,7 @@ describe("ReviewWorkspace", () => {
 
   it("distinguishes an unconfigured AI provider from an active retry", async () => {
     const state = endedState();
-    state.fullTranscript = [segment(1)];
+    state.fullTranscript = [{ ...segment(1), normalizedText: "" }];
     state.fullTranscriptState = "ready";
     state.reviewJobs = {
       minutes: {
@@ -441,6 +442,13 @@ describe("ReviewWorkspace", () => {
     expect(screen.getByText("会议纪要尚未生成。")).toBeVisible();
     expect(screen.getByText("分析建议尚未生成。")).toBeVisible();
     expect(screen.queryByText("会议纪要：正在重试")).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("tab", { name: "会议文字" }));
+    const transcriptHeading = screen.getByRole("heading", { name: "完整会议文字" });
+    expect(within(transcriptHeading.parentElement!).getByText("1 段已保存")).toBeVisible();
+    expect(screen.queryByText("1 段已确认")).not.toBeInTheDocument();
+    expect(screen.getByText("原始会议内容 1")).toBeVisible();
+    expect(document.getElementById(segmentDomId("segment-1"))).not.toBeNull();
   });
 
   it("does not claim review jobs are generating when no final transcript exists", () => {

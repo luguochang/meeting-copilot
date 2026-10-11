@@ -1,3 +1,4 @@
+import { SourceEvidenceList } from "../knowledge-library/SourceEvidenceList";
 import { Check, CircleAlert, EyeOff, Flag, GitMerge, ListChecks, Pencil, Quote, Save, ShieldAlert, X, type LucideIcon } from "lucide-react";
 import { useState } from "react";
 import type { ActionItemProjection, DecisionCandidate, MeetingFactKind, MeetingFactStatus, RiskProjection, OpenQuestionProjection } from "../../domain/events";
@@ -8,6 +9,7 @@ function questionIsOpen(question: OpenQuestionProjection): boolean {
 }
 
 type RailFact = DecisionCandidate | ActionItemProjection | RiskProjection;
+type FactSourceProps = Pick<NowRailProps, "knowledgeApi" | "sourceMeetingId" | "onKnowledgeSource" | "onProjectCandidate">;
 type FactView = "active" | "changed" | "resolved";
 
 function isFormalAi(value: { formalAi?: { source: "llm_first"; llmCalled: true } | null }): boolean {
@@ -44,6 +46,7 @@ function factIsResolved(fact: RailFact): boolean {
 
 function FactRow({
   fact,
+  sourceProps,
   factType,
   onEvidence,
   onStatus,
@@ -52,6 +55,7 @@ function FactRow({
   onMerge,
 }: {
   fact: RailFact;
+  sourceProps?: FactSourceProps;
   factType: MeetingFactKind;
   onEvidence(segmentId: string): void;
   onStatus(factType: MeetingFactKind, factId: string, status: Extract<MeetingFactStatus, "confirmed" | "dismissed">): Promise<void>;
@@ -137,6 +141,8 @@ function FactRow({
           </div>
         ) : null}
       </div>
+      {fact.evidenceStatus === "stale" ? <p className="inline-error">依据已变化，此项仅供历史核对，请重新核实。</p> : fact.sourceMessageId ? <p>来自保存的 AI 回答，仍需你确认。</p> : null}
+      {fact.sourceEvidence?.length ? <SourceEvidenceList evidence={fact.sourceEvidence} api={sourceProps?.knowledgeApi} meetingId={sourceProps?.sourceMeetingId ?? ""} onTranscript={onEvidence} onDocument={sourceProps?.onKnowledgeSource} stale={fact.evidenceStatus === "stale"} /> : null}
       <div className="fact-row-footer">
         <button
           className="fact-evidence-link"
@@ -149,6 +155,7 @@ function FactRow({
           <span>{factEvidenceQuote(fact)}</span>
         </button>
         <div className="fact-actions" aria-label={`${fact.text}操作`}>
+          {sourceProps?.onProjectCandidate && (factType === "decision" || factType === "action_item") ? <button type="button" disabled={saving || fact.status !== "confirmed" || fact.evidenceStatus === "stale"} onClick={() => { setSaving(true); void sourceProps.onProjectCandidate!(factType, fact.id).finally(() => setSaving(false)); }}>加入项目候选</button> : null}
           {onEdit ? <button className="icon-button icon-button--small" type="button" onClick={() => setEditing(true)} disabled={saving || merging} title="编辑" aria-label={`编辑“${fact.text}”`}><Pencil size={14} /></button> : null}
           {onMerge && mergeCandidates.length ? <button className="icon-button icon-button--small" type="button" onClick={() => setMerging(true)} disabled={saving || editing} title="合并同类事项" aria-label={`合并“${fact.text}”`}><GitMerge size={14} /></button> : null}
           {fact.status !== "confirmed" ? (
@@ -156,7 +163,7 @@ function FactRow({
               className="icon-button icon-button--small"
               type="button"
               onClick={() => void save("confirmed")}
-              disabled={saving}
+              disabled={saving || fact.evidenceStatus === "stale"}
               title="确认事实"
               aria-label={`确认${factKindLabel(factType, fact.status)}“${fact.text}”`}
             >
@@ -180,6 +187,7 @@ function FactRow({
 }
 
 function FactGroup({
+  sourceProps,
   icon,
   label,
   facts,
@@ -191,6 +199,7 @@ function FactGroup({
   onEdit,
   onMerge,
 }: {
+  sourceProps?: FactSourceProps;
   icon: LucideIcon;
   label: string;
   facts: RailFact[];
@@ -204,7 +213,8 @@ function FactGroup({
 }) {
   const Icon = icon;
   const visible = facts
-    .filter((fact) => isFormalAi(fact))
+    .filter((fact) => isFormalAi(fact) || Boolean(fact.sourceEvidence?.length && (fact.evidenceStatus === "valid" || fact.evidenceStatus === "stale")))
+    .filter((fact) => view !== "active" || fact.evidenceStatus !== "stale")
     .filter((fact) => view === "resolved"
       ? factIsResolved(fact)
       : view === "changed"
@@ -226,6 +236,7 @@ function FactGroup({
             <FactRow
               key={fact.id}
               fact={fact}
+              sourceProps={sourceProps}
               factType={factType}
               onEvidence={onEvidence}
               onStatus={onStatus}
@@ -240,7 +251,7 @@ function FactGroup({
   );
 }
 
-export function MeetingFactsPanel({ currentTopic, openQuestions, decisionCandidates, actionItems, risks, onEvidence, onFactStatus, onFactEdit, onFactMerge, onMessage }: NowRailProps) {
+export function MeetingFactsPanel({ knowledgeApi, sourceMeetingId, onKnowledgeSource, onProjectCandidate, currentTopic, openQuestions, decisionCandidates, actionItems, risks, onEvidence, onFactStatus, onFactEdit, onFactMerge, onMessage }: NowRailProps) {
   const questions = openQuestions.filter((question) => isFormalAi(question) && questionIsOpen(question));
   const formalTopic = currentTopic && isFormalAi(currentTopic) ? currentTopic : null;
   const [dismissedFactIds, setDismissedFactIds] = useState<Set<string>>(new Set());
@@ -362,6 +373,7 @@ export function MeetingFactsPanel({ currentTopic, openQuestions, decisionCandida
         </div>
         <div className="fact-groups">
           <FactGroup
+            sourceProps={{ knowledgeApi, sourceMeetingId, onKnowledgeSource, onProjectCandidate }}
             icon={ListChecks}
             label="决策"
             facts={withFactStatusOverrides("decision", decisionCandidates)}
@@ -374,6 +386,7 @@ export function MeetingFactsPanel({ currentTopic, openQuestions, decisionCandida
             onMerge={onFactMerge}
           />
           <FactGroup
+            sourceProps={{ knowledgeApi, sourceMeetingId, onKnowledgeSource, onProjectCandidate }}
             icon={ListChecks}
             label="待办"
             facts={withFactStatusOverrides("action_item", actionItems)}
@@ -386,6 +399,7 @@ export function MeetingFactsPanel({ currentTopic, openQuestions, decisionCandida
             onMerge={onFactMerge}
           />
           <FactGroup
+            sourceProps={{ knowledgeApi, sourceMeetingId, onKnowledgeSource, onProjectCandidate }}
             icon={ShieldAlert}
             label="风险"
             facts={withFactStatusOverrides("risk", risks)}

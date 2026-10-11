@@ -5,13 +5,18 @@ import type { ReviewDocument, ReviewDocumentRevision } from "../../domain/events
 import { useReviewDocumentDraft } from "./useReviewDocumentDraft";
 
 interface MarkdownDocumentEditorProps {
+  onDraftStateChange?: (state: ReturnType<typeof useReviewDocumentDraft<string>>["saveState"]) => void;
   meetingId: string;
   document: ReviewDocument | undefined;
   fallbackMarkdown: string;
-  degraded: boolean;
+  generationQuality: "complete" | "degraded" | "unknown";
+  correctionDegraded: boolean | null;
+  taskNotice?: string | null;
+  lateArrivalNotice?: string | null;
   onSave(expectedRevision: number, content: unknown): Promise<ReviewDocument>;
   onLoadRevisions(): Promise<ReviewDocumentRevision[]>;
   onRegenerate(): Promise<void>;
+  generationBlockedReason?: string;
 }
 
 const fromMarkdownContent = (content: unknown, fallback: string): string => {
@@ -49,13 +54,18 @@ function saveLabel(state: ReturnType<typeof useReviewDocumentDraft<string>>["sav
 }
 
 export function MarkdownDocumentEditor({
+  onDraftStateChange,
   meetingId,
   document,
   fallbackMarkdown,
-  degraded,
+  generationQuality,
+  correctionDegraded,
+  taskNotice,
+  lateArrivalNotice,
   onSave,
   onLoadRevisions,
   onRegenerate,
+  generationBlockedReason,
 }: MarkdownDocumentEditorProps) {
   const [editing, setEditing] = useState(false);
   const [revisionsOpen, setRevisionsOpen] = useState(false);
@@ -76,6 +86,7 @@ export function MarkdownDocumentEditor({
     toContent: toMarkdownContent,
     onSave,
   });
+  useEffect(() => { onDraftStateChange?.(editor.saveState); }, [editor.saveState, onDraftStateChange]);
 
   useEffect(() => {
     if (!editing) return;
@@ -126,6 +137,18 @@ export function MarkdownDocumentEditor({
     }
   };
 
+  const toggleEditing = async () => {
+    if (!editing) {
+      setEditing(true);
+      return;
+    }
+    if (editor.saveState === "saving") return;
+    const saved = editor.saveState === "saved" || await editor.saveNow();
+    if (saved) setEditing(false);
+  };
+  const matchesArtifact = editor.draft.trim() === fallbackMarkdown.trim();
+  const displayedGenerationQuality = matchesArtifact ? generationQuality : "unknown";
+
   return (
     <>
       <div className="review-section-heading">
@@ -135,21 +158,30 @@ export function MarkdownDocumentEditor({
         </div>
         <div className="document-heading-actions">
           <span className={`document-source document-source--${editor.isUserFinal ? "user_final" : document?.source ?? "ai_generated"}`}>
-            {editor.isUserFinal ? "用户最终稿" : "AI 初稿"}
+            {editor.isUserFinal ? "用户最终稿" : document || fallbackMarkdown.trim() ? "AI 初稿" : "尚无 AI 初稿"}
           </span>
-          {degraded ? <span className="state-label state-label--warning">结果不完整</span> : null}
+          {!editor.isUserFinal && (document || fallbackMarkdown.trim()) ? <>
+            <span className={`state-label${displayedGenerationQuality === "complete" ? "" : " state-label--warning"}`}>
+              {displayedGenerationQuality === "complete" ? "AI 初稿已生成"
+                : displayedGenerationQuality === "degraded" ? "AI 生成已降级，请核对初稿" : "AI 生成质量需核对"}
+            </span>
+            {matchesArtifact && correctionDegraded === true ? <span className="state-label state-label--warning">原文校对未完成</span> : null}
+          </> : null}
           <button className="icon-button icon-button--small" type="button" onClick={() => void loadRevisions()} aria-label="查看复盘版本历史" title="版本历史">
             <History size={15} />
           </button>
-          <button className="icon-button icon-button--small" type="button" onClick={() => void regenerate()} disabled={regenerating} aria-label="重新生成会议纪要" title="生成新 AI 初稿，不覆盖用户最终稿">
+          <button className="icon-button icon-button--small" type="button" onClick={() => void regenerate()} disabled={regenerating || Boolean(generationBlockedReason)} aria-label="重新生成会议纪要" title={generationBlockedReason ?? "生成新 AI 初稿，不覆盖用户最终稿"}>
             {regenerating ? <LoaderCircle className="spin" size={15} /> : <RotateCcw size={15} />}
           </button>
-          <button className="secondary-button compact-button" type="button" onClick={() => setEditing((value) => !value)}>
+          <button className="secondary-button compact-button" type="button" onClick={() => void toggleEditing()} disabled={editing && editor.saveState === "saving"}>
             {editing ? <X size={14} /> : <Pencil size={14} />}
             {editing ? "退出编辑" : "编辑"}
           </button>
         </div>
       </div>
+
+      {!editor.isUserFinal && taskNotice ? <p className="inline-warning" role="status">{taskNotice}</p> : null}
+      {!editor.isUserFinal && lateArrivalNotice ? <p className="inline-warning" role="status">{lateArrivalNotice}</p> : null}
 
       {editing ? (
         <div className="document-editor">

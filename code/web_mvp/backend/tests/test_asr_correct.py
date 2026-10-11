@@ -1,5 +1,6 @@
 """Tests for L2 LLM correction (asr_correct)."""
 import pytest
+import asyncio
 
 from meeting_copilot_web_mvp import asr_correct, llm_service
 
@@ -109,3 +110,40 @@ def test_correct_transcript_empty_input():
     corrected, usage, degraded = asr_correct.correct_transcript("", config)
     assert corrected == ""
     assert degraded is False
+
+
+@pytest.mark.parametrize("async_call", [False, True])
+def test_correction_uses_one_call_with_bounded_readonly_context(async_call):
+    config = llm_service.LlmConfig(base_url="https://gw.example", api_key="sk-test", model="m1")
+    calls = []
+    raw = "<<<MC_SEGMENT:0001:target>>>\n待修正文。\n<<<MC_END:0001>>>"
+
+    def response(body):
+        calls.append(body)
+        return {"choices": [{"message": {"content": raw}}], "usage": {"total_tokens": 3}}
+
+    class FakeClient:
+        def post_json(self, url, headers, body, timeout):
+            return response(body)
+
+    class AsyncFakeClient:
+        async def post_json(self, url, headers, body, timeout, *, abort=None):
+            return response(body)
+
+    if async_call:
+        result = asyncio.run(asr_correct.async_correct_transcript(
+            raw, config, client=AsyncFakeClient(), read_only_context="只读前文" * 300,
+        ))
+    else:
+        result = asr_correct.correct_transcript(
+            raw, config, client=FakeClient(), read_only_context="只读前文" * 300,
+        )
+    assert result[0] == raw
+    assert len(calls) == 1
+    messages = calls[0]["messages"]
+    assert len(messages) == 3
+    assert "MC_READONLY_CONTEXT" in messages[1]["content"]
+    assert len(messages[1]["content"]) < 660
+    assert messages[2]["content"] == raw
+    assert "不预设会议属于技术场景" in messages[0]["content"]
+    assert "不得把未完结的话补成事实或承诺" in messages[0]["content"]

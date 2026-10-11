@@ -933,6 +933,10 @@ def test_correction_timeout_preserves_original_and_next_segment_continues(tmp_pa
             correction_calls.append(int(job["input_transcript_seq"]))
             if job["id"] == first["job_ids"]["correction"]:
                 raise TimeoutError("provider timed out")
+            persistence.mark_correction_segments_no_change(
+                meeting_id=str(job["meeting_id"]), segment_ids=[str(job["evidence_segment_id"])],
+                max_input_transcript_seq=int(job["input_transcript_seq"]), now_ms=time.time_ns() // 1_000_000,
+            )
             return {"no_revision_needed": True}
 
         async def suggestion_handler(job: dict):
@@ -1109,9 +1113,10 @@ def test_review_handler_deadline_cancels_stalled_provider_work(tmp_path):
         )
         job_id = str(review["job"]["id"])
         # Keep the test fast while exercising the same durable deadline path.
+        review_clock = [int(time.time() * 1_000)]
         persistence._conn.execute(
             "UPDATE jobs SET deadline_at_ms = ? WHERE id = ?",
-            (int(time.time() * 1_000) + 25, job_id),
+            (review_clock[0] + 25, job_id),
         )
         started = asyncio.Event()
         events: list[dict] = []
@@ -1127,11 +1132,15 @@ def test_review_handler_deadline_cancels_stalled_provider_work(tmp_path):
             additional_handlers={"approach": stalled_handler},
             worker_id="review-deadline-test",
             poll_interval_ms=2,
+            now_ms=lambda: review_clock[0],
             lifecycle_observer=lambda event: events.append(dict(event)),
         )
         try:
             await executor.start()
             await asyncio.wait_for(started.wait(), timeout=1)
+            # A loaded Windows host may spend the original 25 ms starting
+            # the worker. Advance the test clock only after its handler starts.
+            review_clock[0] += 26
             await _wait_until(
                 lambda: persistence.get_job(job_id)["status"] == "cancelled",
                 timeout_s=1,

@@ -7,7 +7,7 @@ is rejected while the canonical transcript remains available.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 import hashlib
 import inspect
 import json
@@ -16,6 +16,11 @@ import re
 import time
 from typing import Any, Mapping, Sequence
 
+from meeting_copilot_web_mvp.coach_contract import COACH_ROLE_CONTRACT, COACH_ROLE_CONTRACT_VERSION
+from meeting_copilot_web_mvp.participation_contract import (
+    PARTICIPATION_PROFILE, PARTICIPATION_ROLE_CONTRACT,
+    normalize_participation_metadata, participation_fields,
+)
 from meeting_copilot_web_mvp.coach_skills import (
     BASE_COACH_EVENT_TYPES,
     SCENE_COACH_EVENT_TYPES,
@@ -25,6 +30,7 @@ from meeting_copilot_web_mvp.coach_skills import (
 )
 from meeting_copilot_web_mvp.pi_coach_runtime import PiCoachSidecar, build_pi_coach_request
 from meeting_copilot_web_mvp.realtime_transcript_correction import correction_is_safe
+from meeting_copilot_web_mvp.realtime_answer_copilot import question_admission_rejection
 
 
 MAX_NEW_PARAGRAPHS = 8
@@ -47,7 +53,7 @@ _STATE_OPERATIONS = frozenset({"add", "update", "resolve", "noop"})
 _TOPIC_OPERATIONS = frozenset({"add", "update", "noop"})
 _URGENCY_VALUES = frozenset({"low", "medium", "high"})
 _ROLLING_STATE_KEYS = frozenset(
-    {"topic", "open_items", "summary", "version", "current_answer"}
+    {"topic", "open_items", "summary", "version", "current_answer", "discussion"}
 )
 _SOURCE_TRACKS = frozenset({"microphone", "system_audio", "unknown"})
 _ROLE_HINTS = frozenset({"self_or_room", "remote_mix", "unknown"})
@@ -57,7 +63,7 @@ _ASR_CORRECTION_STATUSES = frozenset(
 )
 _COACH_EVENT_TYPES = BASE_COACH_EVENT_TYPES | SCENE_COACH_EVENT_TYPES
 _TRIGGER_TYPES = frozenset(
-    {"delta", "transcript_delta", "task_due", "user_request", "answer_ready"}
+    {"delta", "transcript_delta", "task_due", "user_request", "answer_ready", "discussion_update"}
 )
 
 _COACH_MATERIAL_FACT_TERMS = frozenset(
@@ -99,9 +105,19 @@ _COACH_CHINESE_NUMBER_RE = re.compile(
     re.IGNORECASE,
 )
 _COACH_CONTEXTUAL_CHINESE_NUMBER_RE = re.compile(
-    r"(?:并发|qps|错误率|金额|预算|折扣|阈值|门槛|版本号).{0,8}?"
+    # Require a numeric relationship. An arbitrary gap made "并发时同一订单"
+    # look like an unsupported capacity of one, even across clause boundaries.
+    r"(?:并发|qps|错误率|金额|预算|折扣|阈值|门槛|版本号)"
+    r"(?:(?:用户数|请求数|数量|数|量|上限|下限|已经|已|达到|可达|超过|最多|至少|"
+    r"不超过|不低于|支持|需要|设置为|设为|应为|大约|大概|为|是|约|有)|[\s:=：]){0,4}"
     r"(?P<value>[零〇一二两三四五六七八九十百千万亿]+(?:点[零〇一二两三四五六七八九十]+)?)",
     re.IGNORECASE,
+)
+_COACH_ASSERTED_ITEM_QUANTITY_RE = re.compile(
+    r"(?:共|新增)\s*(?P<value>[零〇一二两三四五六七八九十百千万亿]+(?:项|个))"
+)
+_COACH_QUANTITY_REFERENCE_RE = re.compile(
+    r"(?:这|上述|前述|以上|列出的)(?P<value>(?P<count>\d+|[零〇一二两三四五六七八九十百千万亿]+)(?:项(?:条件)?|个条件))"
 )
 _COACH_TIME_RE = re.compile(
     r"(?:今天|明天|后天|本周(?:[一二三四五六日天])?|下周(?:[一二三四五六日天])?"
@@ -113,15 +129,18 @@ _COACH_TIME_RE = re.compile(
 _COACH_ORPHAN_LATIN_RE = re.compile(
     r"(?<![A-Za-z])[A-Za-z](?=[\u3400-\u9fff])|(?<=[\u3400-\u9fff])[A-Za-z](?![A-Za-z])"
 )
+_COACH_OWNER_CONTINUATION_RE = r"(?:并且|而且|同时|然后|另外|此外)"
 _COACH_OWNER_ASSIGNMENT_RES = (
     re.compile(
-        r"(?:^|[，。；：,:;\s])(?:请)?(?:由|让)"
-        r"([A-Za-z\u3400-\u9fff][A-Za-z0-9_.\-\u3400-\u9fff]{0,19})(?:来)?负责",
+        rf"(?:^|[，。；：,:;\s]|{_COACH_OWNER_CONTINUATION_RE})(?:建议|可以|考虑)?(?:请)?(?:由|让)"
+        rf"((?!{_COACH_OWNER_CONTINUATION_RE})[A-Za-z\u3400-\u9fff]"
+        rf"(?:(?!{_COACH_OWNER_CONTINUATION_RE})[A-Za-z0-9_.\-\u3400-\u9fff]){{0,19}})(?:来)?负责",
         re.IGNORECASE,
     ),
     re.compile(
-        r"(?:^|[，。；：,:;\s])"
-        r"([A-Za-z\u3400-\u9fff][A-Za-z0-9_.\-\u3400-\u9fff]{0,19})(?:作为|是|担任)负责人",
+        rf"(?:^|[，。；：,:;\s]|{_COACH_OWNER_CONTINUATION_RE})"
+        rf"((?!{_COACH_OWNER_CONTINUATION_RE})[A-Za-z\u3400-\u9fff]"
+        rf"(?:(?!{_COACH_OWNER_CONTINUATION_RE})[A-Za-z0-9_.\-\u3400-\u9fff]){{0,19}})(?:作为|是|担任)负责人",
         re.IGNORECASE,
     ),
     re.compile(
@@ -138,6 +157,9 @@ _COACH_NEGATIVE_STATE_RE = re.compile(
 _COACH_POSITIVE_STATE_RE = re.compile(
     r"(?:已经|已).{0,16}(?:完成|通过|确认|解决|关闭|交付|上线|发布|确定|定下|评估|验收|校验|测试)"
 )
+# Participation checks one predicate at a time; the legacy patterns stay intact.
+_PROPOSAL_NEGATIVE_STATE_RE = re.compile(_COACH_NEGATIVE_STATE_RE.pattern.replace(".{0,16}", ".{0,16}?"))
+_PROPOSAL_POSITIVE_STATE_RE = re.compile(_COACH_POSITIVE_STATE_RE.pattern.replace(".{0,16}", ".{0,16}?"))
 _COACH_OWNER_GAP_RE = re.compile(
     r"(?:(?:谁|哪位|哪个人|何人).{0,16}(?:负责|来(?:改|做|推进|处理)|修改|执行)"
     r"|(?:负责人|责任人).{0,10}(?:是谁|为谁|未定|没定|待定|待确认)"
@@ -212,9 +234,10 @@ class IntelligenceResponseValidationError(ValueError):
 
     retryable = False
 
-    def __init__(self, message: str, *, category: str = "structural") -> None:
+    def __init__(self, message: str, *, category: str = "structural", claim_fields: Mapping[str, Any] | None = None) -> None:
         super().__init__(message)
         self.category = category
+        self.claim_fields = dict(claim_fields or {})
 
 
 @dataclass(frozen=True)
@@ -411,6 +434,14 @@ class RealtimeIntelligenceRequest:
     meeting_goal: str | None
     coach_skill_id: str
     allow_paragraph_revisions: bool
+    participant_role: str | None = None
+    focus_points: tuple[str, ...] = ()
+    document_evidence: tuple[Mapping[str, Any], ...] = ()
+    knowledge_context: Mapping[str, Any] = field(default_factory=dict)
+    input_context: Mapping[str, Any] = field(default_factory=dict)
+    user_memory: Mapping[str, Any] = field(default_factory=dict)
+    coach_profile: str = "legacy"
+    request_metadata: Mapping[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_payload(
@@ -430,15 +461,27 @@ class RealtimeIntelligenceRequest:
         meeting_goal: Any = None,
         coach_skill_id: Any = "general",
         allow_paragraph_revisions: bool = True,
+        participant_role: Any = None,
+        focus_points: Sequence[Any] = (),
+        document_evidence: Sequence[Mapping[str, Any]] = (),
+        knowledge_context: Mapping[str, Any] | None = None,
+        input_context: Mapping[str, Any] | None = None,
+        user_memory: Mapping[str, Any] | None = None,
+        coach_profile: Any = "legacy",
+        request_metadata: Mapping[str, Any] | None = None,
     ) -> "RealtimeIntelligenceRequest":
         normalized_meeting_id = _required_text(meeting_id, "meeting_id", maximum=240)
+        bounded_metadata = normalize_participation_metadata(coach_profile, request_metadata)
+        source_limit, source_character_limit = (12, 8_000) if coach_profile == PARTICIPATION_PROFILE else (6, 3_600)
+        if len(document_evidence) > source_limit or any(item.get("source_type") not in {"document", "meeting_attachment"} for item in document_evidence) or sum(len(str(item.get("quote") or "")) for item in document_evidence) > source_character_limit:
+            raise ValueError("document evidence must be a bounded typed source list")
         normalized_revision = _positive_integer(state_revision, "state_revision")
         normalized_trigger_type = _required_text(
             trigger_type, "trigger_type", maximum=40
         ).casefold()
         if normalized_trigger_type not in _TRIGGER_TYPES:
             raise ValueError(
-                "trigger_type must be delta, transcript_delta, task_due, user_request, or answer_ready"
+                "trigger_type must be delta, transcript_delta, task_due, user_request, answer_ready, or discussion_update"
             )
         normalized_work_item_id = _optional_text(work_item_id, maximum=240)
         normalized_user_request = _optional_text(user_request, maximum=2_000)
@@ -521,6 +564,16 @@ class RealtimeIntelligenceRequest:
             if item and item not in glossary_items:
                 glossary_items.append(item)
 
+        if not isinstance(focus_points, Sequence) or isinstance(focus_points, (str, bytes)):
+            raise ValueError("focus_points must be an array")
+        if len(focus_points) > 12:
+            raise ValueError("focus_points must contain at most 12 items")
+        bounded_focus: list[str] = []
+        for raw_item in focus_points:
+            item = _optional_text(raw_item, maximum=200)
+            if item and item not in bounded_focus:
+                bounded_focus.append(item)
+
         return cls(
             meeting_id=normalized_meeting_id,
             state_revision=normalized_revision,
@@ -536,6 +589,14 @@ class RealtimeIntelligenceRequest:
             meeting_goal=_optional_text(meeting_goal, maximum=2_000),
             coach_skill_id=normalize_coach_skill_id(coach_skill_id),
             allow_paragraph_revisions=allow_paragraph_revisions,
+            participant_role=_optional_text(participant_role, maximum=200),
+            focus_points=tuple(bounded_focus),
+            document_evidence=tuple(dict(item) for item in document_evidence),
+            knowledge_context=dict(knowledge_context or {}),
+            input_context=dict(input_context or {}),
+            user_memory=dict(user_memory or {}),
+            coach_profile=str(coach_profile or "legacy"),
+            request_metadata=bounded_metadata,
         )
 
     @property
@@ -613,6 +674,13 @@ class CoachIntervention:
     pi_provider_attempted: bool | None = None
     valid_until_ms: int | None = None
     coaching_package: Mapping[str, Any] | None = None
+    source_evidence: tuple[Mapping[str, Any], ...] = ()
+    analysis_kind: str | None = None
+    proposal_type: str | None = None
+    topic_id: str | None = None
+    analysis_basis_revision: int | None = None
+    supporting_facts: tuple[Mapping[str, Any], ...] = ()
+    assumptions: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize one coach card for independent event persistence."""
@@ -645,6 +713,13 @@ class CoachIntervention:
             payload["valid_until_ms"] = self.valid_until_ms
         if self.coaching_package is not None:
             payload["coaching_package"] = dict(self.coaching_package)
+        if self.source_evidence:
+            payload["source_evidence"] = [dict(item) for item in self.source_evidence]
+        if self.analysis_kind is not None:
+            payload.update(analysis_kind=self.analysis_kind, proposal_type=self.proposal_type,
+                           topic_id=self.topic_id, analysis_basis_revision=self.analysis_basis_revision,
+                           supporting_facts=[dict(item) for item in self.supporting_facts],
+                           assumptions=list(self.assumptions))
         return payload
 
     def to_follow_up(self) -> FollowUp:
@@ -702,7 +777,7 @@ def build_realtime_intelligence_messages(
         if request.allow_paragraph_revisions
         else "正文校对由独立任务处理；paragraph_revisions 必须返回空数组，不得尝试修正文段。"
     )
-    system = "".join(
+    system = COACH_ROLE_CONTRACT + "当前作业是结构化会议理解，遵循下列 JSON 输出契约。" + "".join(
         (
             "你是中文会议实时理解引擎。只依据输入中的会议原话返回一个 JSON 对象，不要输出 Markdown。",
             "不得用关键词匹配、常识补全或猜测生成决定、待办、风险、问题或追问；没有充分证据时返回空数组或 null。",
@@ -734,6 +809,8 @@ def build_realtime_intelligence_messages(
         "rolling_state": request.rolling_state,
         "glossary": list(request.glossary),
         "meeting_goal": request.meeting_goal,
+        "participant_role": request.participant_role,
+        "focus_points": list(request.focus_points),
         "allow_paragraph_revisions": request.allow_paragraph_revisions,
         "output_contract": {
             "empty_result": {
@@ -838,6 +915,7 @@ def parse_realtime_intelligence_response(
 
 def realtime_intelligence_idempotency_key(request: RealtimeIntelligenceRequest) -> str:
     canonical = {
+        "role_contract_version": COACH_ROLE_CONTRACT_VERSION,
         "state_revision": request.state_revision,
         "trigger_type": request.trigger_type,
         "work_item_id": request.work_item_id,
@@ -848,6 +926,8 @@ def realtime_intelligence_idempotency_key(request: RealtimeIntelligenceRequest) 
         "rolling_state": request.rolling_state,
         "glossary": list(request.glossary),
         "meeting_goal": request.meeting_goal,
+        "participant_role": request.participant_role,
+        "focus_points": list(request.focus_points),
         "allow_paragraph_revisions": request.allow_paragraph_revisions,
     }
     private_identity = json.dumps(
@@ -1252,6 +1332,12 @@ def _resolved_prior_state_signal(text: str) -> bool:
 def _pending_question_signal(text: str) -> bool:
     """Recognize a direct question without routing subordinate ``whether`` clauses."""
 
+    rejection = question_admission_rejection(text)
+    if rejection is not None and rejection != "no_question_boundary":
+        return False
+    # Keep the existing bounded owner/deadline/gap requests below, while making
+    # explicit quotes, self-answers and fragments equally ineligible in Fast
+    # and Pi. A rejected question does not suppress independent risk candidates.
     if any(mark in text for mark in ("?", "？")):
         return True
 
@@ -2080,7 +2166,7 @@ def should_run_realtime_coach(
     # A user-request trigger is an explicit coaching command and may contain
     # no fresh transcript. It must not be forced through the lexical delta
     # gate, otherwise the production route silently drops valid requests.
-    if request.trigger_type in {"user_request", "task_due", "answer_ready"}:
+    if request.trigger_type in {"user_request", "task_due", "answer_ready", "discussion_update"}:
         return True
     source_tracks = {item.source_track for item in request.new_paragraphs}
     if str(requested_runtime or "direct").strip().lower() == "pi":
@@ -2095,7 +2181,24 @@ def build_realtime_coach_messages(
 ) -> list[dict[str, str]]:
     if not isinstance(request, RealtimeIntelligenceRequest):
         raise TypeError("request must be a RealtimeIntelligenceRequest")
-    system = "".join(
+    if request.coach_profile == PARTICIPATION_PROFILE:
+        return [
+            {"role": "system", "content": COACH_ROLE_CONTRACT + PARTICIPATION_ROLE_CONTRACT +
+             "只返回JSON对象intervention或null。有效贡献必须含event_type/title/recommendation/reason/"
+             "evidence_segment_ids/evidence_quote/urgency/confidence，及supporting_facts、assumptions。"
+             "证据quote必须逐字复制本场段落，资料与转写来源分开。recommendation为8至300字符。"},
+            {"role": "user", "content": json.dumps({
+                "task": "participation", "intent": request.request_metadata["intent"],
+                "topic_id": request.request_metadata["topic_id"],
+                "analysis_basis_revision": request.request_metadata["analysis_basis_revision"],
+                "user_request": request.user_request, "discussion": request.rolling_state.get("discussion"),
+                "new_paragraphs": [item.to_prompt_dict() for item in request.new_paragraphs],
+                "context_paragraphs": [item.to_prompt_dict() for item in request.context_paragraphs],
+                "document_evidence": list(request.document_evidence),
+                "allowed_event_types": sorted(_COACH_EVENT_TYPES),
+            }, ensure_ascii=False, separators=(",", ":"))},
+        ]
+    system = COACH_ROLE_CONTRACT + "当前作业是有限实时介入，遵循下列 JSON 输出契约。" + "".join(
         (
             "你是仅服务于软件使用者的实时私人对话教练。只返回 JSON，不要输出 Markdown。",
             "任务不是总结、复盘或重复原话，而是判断刚发生的时刻是否值得立刻给用户一句可说出口的建议。",
@@ -2109,7 +2212,7 @@ def build_realtime_coach_messages(
             "correction_status 为 pending、processing 或 failed_preserved_original 时，原话仍是待核实证据；只能建议澄清，不得据此断言负责人、期限、数字、完成状态或技术名词。",
             "但 communication_clarity 可以直接使用持续的 microphone/self_or_room 原话判断当前可听见的表达模式；建议只针对表达本身，不推断说话者身份，也不能仅因身份未确认而保持静默。",
             "candidate_evidence_paragraphs 只包含当前候选引用的极少量较早原话；引用时仍必须复制其 id 和逐字原文。",
-            "rolling_state.current_answer 是快速回答通道已经展示给用户的内容；不要重复或清空它，只在有证据时补充遗漏、边界、风险或可能追问。",
+            "rolling_state.current_answer 是已经展示的 AI 草答，不要重复或清空它；它不是已确认事实，数字、日期、责任和完成状态仍须由原文证据支持。只在有新价值时补充遗漏、边界、风险或可能追问。",
             "对 communication_clarity 而言，听众抓不住核心观点或错过及时收束结论属于具体损失，只要此刻能用一句下一步表达修正，就具有介入价值。",
             "没有高价值、可执行且仍来得及的介入时 intervention 必须是 null。不要为了显得有帮助而生成提示。",
             "不得猜测说话人身份、公司信息、数字、期限、关键技术名词或用户立场；title、reason 和 recommendation 中的实质事实都必须逐字来自 evidence_quote，不能借用同一引用段落里未逐字引用的其他内容。",
@@ -2127,6 +2230,9 @@ def build_realtime_coach_messages(
         "semantic_windows": [item.to_prompt_dict() for item in request.semantic_windows],
         "rolling_state": request.rolling_state,
         "meeting_goal": request.meeting_goal,
+        "participant_role": request.participant_role,
+        "focus_points": list(request.focus_points),
+        "glossary": list(request.glossary),
         "coach_skill_id": request.coach_skill_id,
         "output_contract": {
             "intervention": {
@@ -2382,7 +2488,8 @@ def parse_realtime_coach_response(
         return None
     item = _required_object(value, "intervention")
     event_type = _required_response_text(item.get("event_type"), "intervention.event_type", maximum=40)
-    if event_type not in coach_skill_event_types(request.coach_skill_id):
+    allowed_types = _COACH_EVENT_TYPES if request.coach_profile == PARTICIPATION_PROFILE else coach_skill_event_types(request.coach_skill_id)
+    if event_type not in allowed_types:
         raise IntelligenceResponseValidationError("intervention.event_type is unsupported")
     evidence_ids = _parse_evidence_ids(
         item.get("evidence_segment_ids"),
@@ -2427,7 +2534,7 @@ def parse_realtime_coach_response(
         alias_keys=("say_this", "sayThis"),
         field="intervention.recommendation",
         alias_field="intervention.say_this",
-        maximum=800 if is_deep_answer_card else 120,
+        maximum=800 if is_deep_answer_card else 300 if request.coach_profile == PARTICIPATION_PROFILE else 120,
     )
     if len(recommendation) < 8:
         raise IntelligenceResponseValidationError("intervention.recommendation is too short")
@@ -2449,6 +2556,25 @@ def parse_realtime_coach_response(
         request=request,
     )
     confidence = _response_confidence(item.get("confidence"), "intervention.confidence")
+    try:
+        contribution = participation_fields(item, request)
+    except ValueError as exc:
+        raise IntelligenceResponseValidationError(str(exc), category="evidence") from exc
+    direct_proposal = (
+        request.request_metadata.get("automatic_direct") is True
+        and request.request_metadata.get("proposal_contract") == "participation_proposal.v2"
+    )
+    if contribution.get("assumptions") and direct_proposal:
+        # These are explicitly unknown conditions, not verified source facts.
+        # Mark them once at the host boundary instead of guessing whether a
+        # Chinese state word turns a hypothesis into a factual assertion.
+        contribution["assumptions"] = [f"需要核对：{value}" for value in contribution["assumptions"]]
+    elif contribution.get("assumptions"):
+        _validate_coach_claim_grounding(
+            title=title, recommendation=recommendation,
+            reason="\n".join(contribution["assumptions"]),
+            evidence_quote=evidence_quote, evidence_ids=evidence_ids, request=request, reason_field="assumptions",
+        )
     coaching_package = _parse_structured_coaching_package(
         item.get("coaching_package"),
         request=request,
@@ -2469,6 +2595,8 @@ def parse_realtime_coach_response(
         urgency=urgency,
         confidence=confidence,
         coaching_package=coaching_package,
+        source_evidence=tuple(request.document_evidence),
+        **contribution,
     )
 
 
@@ -2707,11 +2835,37 @@ async def run_realtime_coach_via_pi(
         candidate_events=candidate_events,
         priority_mode=priority_mode,
     )
-    result = await pi_runtime.evaluate(payload)
-    if isinstance(pi_runtime, PiCoachSidecar) and result.get("host_evidence"):
+    try:
+        result = await pi_runtime.evaluate(payload)
+    except Exception as exc:
+        # The new terminal contract can reject in the SDK after a paid turn.
+        # Preserve only explicitly reported usage before propagating that
+        # rejection; this is not a second call or a guessed charge.
+        failure_metrics = getattr(exc, "metrics", None)
+        if (request.request_metadata.get("current_need_contract") == "participation_need.v1"
+                and isinstance(failure_metrics, Mapping) and isinstance(failure_metrics.get("usage"), Mapping)):
+            await _notify_callback(on_usage, dict(failure_metrics["usage"]), 1)
+        raise
+    # Tracing and the lane pool each wrap the host-owned Sidecar. Only accept
+    # registry results after a bounded, cycle-safe chain reaches its real type.
+    sidecar = pi_runtime
+    seen: set[int] = set()
+    for _ in range(4):
+        if isinstance(sidecar, PiCoachSidecar):
+            break
+        if sidecar is None or id(sidecar) in seen:
+            sidecar = None
+            break
+        seen.add(id(sidecar))
+        sidecar = getattr(sidecar, "_delegate", None)
+    trusted_host = isinstance(sidecar, PiCoachSidecar)
+    request = replace(request, document_evidence=tuple(result.get("host_source_evidence") or ()) if trusted_host else ())
+    if trusted_host and result.get("host_project_state"):
+        request = replace(request, knowledge_context={**request.knowledge_context, "project_state": result["host_project_state"]})
+    if trusted_host and result.get("host_evidence"):
         registered = tuple(
             IntelligenceParagraph.from_payload(
-                pi_runtime._host_evidence_paragraph(row), field="host_evidence",
+                sidecar._host_evidence_paragraph(row), field="host_evidence",
             ) for row in result["host_evidence"]
         )
         original = {p.id: p for p in (*request.retrieval_paragraphs,
@@ -2724,8 +2878,27 @@ async def run_realtime_coach_via_pi(
     metrics = dict(result.get("metrics")) if isinstance(result.get("metrics"), Mapping) else {}
     usage = metrics.get("usage") if isinstance(metrics.get("usage"), Mapping) else None
     await _notify_callback(on_usage, dict(usage) if usage is not None else None, 1)
+    from .discussion_persistence import validate_participation_current_need
+
+    try:
+        current_need = validate_participation_current_need(result.get("current_need"),
+            metadata=request.request_metadata, paragraphs_by_id=request.paragraphs_by_id,
+            action=str(result.get("action") or ""))
+    except ValueError as exc:
+        failure = IntelligenceResponseValidationError(str(exc))
+        failure.metrics = metrics
+        raise failure from exc
     raw_intervention = result.get("intervention")
     try:
+        raw_intervention, pending_assumptions = _mark_participation_unknown_assumptions(raw_intervention, request=request)
+        if pending_assumptions:
+            metrics["assumption_grounding"] = {"mode": "explicit_pending_check", "indices": pending_assumptions}
+        raw_intervention, quantity_normalization = _normalize_pi_quantity_reference(raw_intervention, request=request)
+        if quantity_normalization:
+            metrics["quantity_reference_normalization"] = quantity_normalization
+        raw_intervention, reason_grounding = _ground_pi_intervention_reason(raw_intervention, request=request)
+        if reason_grounding:
+            metrics["reason_grounding"] = reason_grounding
         intervention = parse_realtime_coach_response(
             json.dumps({"intervention": raw_intervention}, ensure_ascii=False),
             request=request,
@@ -2736,6 +2909,14 @@ async def run_realtime_coach_via_pi(
             request=request,
             validation_error=exc,
         )
+        try:
+            grounded_intervention, repaired_reason_grounding = _ground_pi_intervention_reason(grounded_intervention, request=request)
+        except IntelligenceResponseValidationError as reason_exc:
+            reason_exc.metrics = metrics
+            raise
+        if repaired_reason_grounding:
+            metrics["reason_grounding"] = repaired_reason_grounding
+            grounded_fields = (*grounded_fields, "reason")
         if not grounded_fields:
             # The bridge completed successfully, so retain its bounded diagnostics
             # when the host rejects the card. This keeps deep-answer failures bound
@@ -2765,9 +2946,11 @@ async def run_realtime_coach_via_pi(
         metrics.update({"intervention_suppressed": True, "suppression_reason": "low_confidence"})
         intervention = None
     decision_reason = str(result.get("decision_reason") or "")[:160] or None
+    if intervention is not None and metrics.get("reason_grounding"):
+        decision_reason = intervention.reason[:160]
     allowed_evidence_ids = (
         request.writable_paragraph_ids
-        if request.trigger_type not in {"user_request", "task_due", "answer_ready"}
+        if request.trigger_type not in {"user_request", "task_due", "answer_ready", "discussion_update"}
         else frozenset(request.paragraphs_by_id)
     )
     if intervention is not None and set(intervention.evidence_segment_ids).isdisjoint(allowed_evidence_ids):
@@ -2806,7 +2989,9 @@ async def run_realtime_coach_via_pi(
             "finish_reason": str(result.get("action") or ""),
             "decision_reason": decision_reason,
             "agent_metrics": metrics,
-            "host_evidence": result.get("host_evidence", []) if isinstance(pi_runtime, PiCoachSidecar) else [],
+            "host_evidence": result.get("host_evidence", []) if trusted_host else [],
+            "source_evidence": list(request.document_evidence) if trusted_host else [],
+            **({"current_need": current_need} if current_need is not None else {}),
         },
         request=request,
         origin="pi",
@@ -2902,6 +3087,7 @@ def _silent_pi_failure(
             {
                 "response_validation_category": str(error.category or "structural")[:40],
                 "response_validation_error": str(error)[:240],
+                "response_validation_claim_fields": error.claim_fields,
             }
         )
     failure_metrics["fallback_suppressed"] = True
@@ -2911,7 +3097,7 @@ def _silent_pi_failure(
             "transport_mode": "pi_agent_jsonl",
             "ttft_ms": None,
             "decision_latency_ms": None,
-            "timings": _pi_decision_timings({}),
+            "timings": _pi_decision_timings(failure_metrics),
             "usage": None,
             "model": str(provider_config.get("model") or ""),
             "response_id": f"{_coach_run_id(request)}:pi:v1",
@@ -3111,6 +3297,11 @@ def build_realtime_intelligence_repair_messages(
     return messages
 
 
+def _provider_ttft_ms(timings: Any) -> float | None:
+    seconds = timings.time_to_first_token_seconds
+    return None if seconds is None else seconds * 1_000
+
+
 async def run_realtime_intelligence(
     *,
     request: RealtimeIntelligenceRequest,
@@ -3118,6 +3309,7 @@ async def run_realtime_intelligence(
     on_delta: Any = None,
     before_attempt: Any = None,
     on_usage: Any = None,
+    allow_repair: bool = True,
 ) -> dict[str, Any]:
     """Run one bounded provider call and validate it before returning semantics."""
 
@@ -3138,7 +3330,7 @@ async def run_realtime_intelligence(
     try:
         response = parse_realtime_intelligence_response(result.content, request=request)
     except IntelligenceResponseValidationError as exc:
-        if exc.category not in {"structural", "truncated", "evidence"}:
+        if not allow_repair or exc.category not in {"structural", "truncated", "evidence"}:
             raise
         first_validation_error = exc
         await _notify_callback(before_attempt, 2)
@@ -3160,9 +3352,9 @@ async def run_realtime_intelligence(
         "idempotency_key": realtime_intelligence_idempotency_key(request),
         "transport_mode": result.transport_mode.value,
         "fallback_reason": result.fallback_reason,
-        "ttft_ms": first_result.timings.time_to_first_token_seconds * 1_000,
+        "ttft_ms": _provider_ttft_ms(first_result.timings),
         "repair_ttft_ms": (
-            result.timings.time_to_first_token_seconds * 1_000 if first_validation_error is not None else None
+            _provider_ttft_ms(result.timings) if first_validation_error is not None else None
         ),
         "provider_attempt_count": 2 if first_validation_error is not None else 1,
         "repair_attempted": first_validation_error is not None,
@@ -3438,7 +3630,39 @@ def _number_claim_tokens(value: str) -> set[str]:
         for match in _COACH_CONTEXTUAL_CHINESE_NUMBER_RE.finditer(str(value or ""))
         if (normalized := _normalize_claim_token(match.group("value")))
     )
+    tokens.update(
+        _normalize_claim_token(match.group("value"))
+        for match in _COACH_QUANTITY_REFERENCE_RE.finditer(str(value or ""))
+    )
+    tokens.update(
+        _normalize_claim_token(match.group("value"))
+        for match in _COACH_ASSERTED_ITEM_QUANTITY_RE.finditer(str(value or ""))
+    )
     return tokens
+
+
+def _professional_proposal_number_tokens(value: str) -> set[str]:
+    """Treat a proposed single-effect invariant as qualitative idempotence.
+
+    Only the recommendation can use this rule, within the same explicit
+    proposal clause and same operation. Retry limits, rates, business quotas,
+    factual claims and every other quantity retain the ordinary checks.
+    """
+    clauses = re.split(r"[，,。；;！？!?\n]+", str(value or ""))
+    normalized = []
+    for clause in clauses:
+        if re.search(r"建议|可以|考虑|是否|能否", clause):
+            clause = re.sub(
+                r"((?:建议|可以|考虑|是否|能否)[^，,。；;！？!?\n]{0,30}"
+                r"(?:同一|相同)(?:个|笔)?[^，,。；;！？!?\n]{0,10}"
+                r"(?:请求|事件|回调|订单|操作|业务)[^，,。；;！？!?\n]{0,10}"
+                r"(?:只|仅|至多|最多)(?:能|允许|应|会)?"
+                r"(?:生效|发放|扣款|记账|写入|退款|触发))(?:一|1)次",
+                r"\1",
+                clause,
+            )
+        normalized.append(clause)
+    return _number_claim_tokens("，".join(normalized))
 
 
 def _owner_assignment_values(value: str) -> set[str]:
@@ -3458,6 +3682,128 @@ def _state_polarities(value: str) -> set[str]:
     if _COACH_POSITIVE_STATE_RE.search(str(value or "")):
         polarities.add("positive")
     return polarities
+
+
+def _proposal_state_assertions(value: str, *, allow_future_target: bool = False) -> tuple[tuple[str, str], ...]:
+    """Locate asserted subject/state spans, keeping local checks out of facts.
+
+    No output is rewritten. Unknown grammar remains an assertion and must bind
+    to a source. A cue in a different clause or before another predicate does
+    not license this one; quantities, dates and owners are checked separately.
+    """
+    assertions: list[tuple[str, str]] = []
+    continuation = r"(?:并且|而且|但是|然后|同时|另外|此外|所以|因此|因而|从而|且|则|就)"
+    for part in re.finditer(r"([^，,。；;！？!?\n]+)([，,。；;！？!?\n]*)", str(value or "")):
+        clause, terminator = part.group(1), part.group(2)
+        negative_matches = tuple(_PROPOSAL_NEGATIVE_STATE_RE.finditer(clause))
+        for polarity, pattern in (("negative", _PROPOSAL_NEGATIVE_STATE_RE),
+                                  ("positive", _PROPOSAL_POSITIVE_STATE_RE)):
+            for match in pattern.finditer(clause):
+                # A positive word inside a negated predicate is not a second
+                # completed fact (e.g. "并非已经完成").
+                if polarity == "positive" and any(
+                    negative.start() <= match.start() < negative.end() for negative in negative_matches
+                ):
+                    continue
+                prefix = clause[:match.start()].strip()
+                suffix = clause[match.end():].strip()
+                has_prior_predicate = bool(_state_polarities(prefix))
+                conditional = bool(re.fullmatch(
+                    r"(?:(?:建议|可以|考虑|是否可以|能否)\s*)?(?:若|如果|假如|假设|一旦).{0,30}",
+                    prefix,
+                )) and not has_prior_predicate and not re.search(continuation, prefix)
+                temporal_condition = bool(re.fullmatch(
+                    r"(?:建议|可以|考虑|是否可以|能否)(?:仅在|只在|在|等|待).{0,24}", prefix,
+                )) and not has_prior_predicate and bool(re.match(
+                    r"(?:之后|以后|后|时)(?:再|才|可以|就|则|把|将)", suffix,
+                ))
+                pending_cue = re.search(
+                    r"(?:是否|能否|需(?:要)?(?:核对|确认|核实|验证)|待(?:确认|核实|验证)|先(?:确认|核实)|请(?:确认|核实)).{0,24}$",
+                    prefix,
+                )
+                pending_check = bool(pending_cue) and not has_prior_predicate and not re.search(
+                    continuation, prefix[pending_cue.start():] if pending_cue else "",
+                )
+                # Chinese yes/no forms can overlap the state predicate:
+                # 有没有完成 -> prefix ends 有, match starts 没有完成.
+                # Only exempt the immediately adjacent interrogative. A
+                # question in a different clause must not hide an assertion.
+                adjacent_question = (
+                    (polarity == "negative" and prefix.endswith("有")
+                     and not prefix.endswith(("拥有", "持有", "所有", "占有", "保有"))
+                     and match.group().startswith("没有"))
+                    or (polarity == "negative" and prefix.endswith("是")
+                        and match.group().startswith("不是"))
+                    or (polarity == "positive" and prefix.endswith("是不是"))
+                )
+                # Retain the terminator, and require the question particle to
+                # end this predicate's short object, not a later assertion.
+                postfix_question = bool(re.fullmatch(r".{0,12}?(?:了吗|了么|吗|么)", suffix)) and not (
+                    _state_polarities(suffix) or re.search(continuation, suffix)
+                ) and (not terminator or terminator[0] in "?？。；;,，")
+                future_target = allow_future_target and bool(re.fullmatch(
+                    r"(?:建议|可以|考虑|是否可以|能否)(?:在|等|待).{1,24}"
+                    r"(?:完成|通过|校验|验收)(?:之后|以后|后)"
+                    r"(?:把|将).{1,16}(?:切换为|转换为|显示为|标记为|设为)", prefix,
+                )) and bool(re.fullmatch(r"(?:了)?", suffix))
+                if allow_future_target and not future_target:
+                    display_target = re.fullmatch(
+                        r"(?:建议|可以|考虑|是否可以|能否)(?:在|等|待).{1,24}"
+                        r"(?:停止|完成|通过|校验|验收)(?:之后|以后|后)(?:再|才)?(?:把|将)"
+                        r"(?:页面(?:状态|文案|提示)?|状态|文案|提示)"
+                        r"(?:切换为|转换为|显示为|标记为|设为)(?P<quote>[“‘「『\"']?)", prefix,
+                    )
+                    if display_target and not has_prior_predicate:
+                        closing_quote = {"": "", "“": "”", "‘": "’", "「": "」", "『": "』",
+                                         '"': '"', "'": "'"}[display_target.group("quote")]
+                        # Only this complete target is proposed; a following
+                        # assertion or mismatched quote remains source-bound.
+                        future_target = suffix in {closing_quote, "了" + closing_quote}
+                if conditional or temporal_condition or pending_check or adjacent_question or postfix_question or future_target:
+                    continue
+                # Keep the subject and object, but do not demand that a
+                # separately marked professional inference is verbatim too.
+                # A connective-looking character may belong to a noun (e.g.
+                # "就绪检查"). Keep the full subject instead of guessing where
+                # a second assertion or a proposed subject begins.
+                subject = prefix
+                tail = re.split(r"(?:所以|因此|因而|从而)(?=可以|建议|考虑|需要核对|需要确认|请确认|请核实)", suffix, maxsplit=1)[0]
+                assertion = subject + match.group() + tail
+                # A bare polarity cannot establish which entity completed it.
+                assertions.append((polarity, assertion if subject else ""))
+    return tuple(assertions)
+
+
+def _asserted_proposal_state_polarities(value: str) -> set[str]:
+    return {polarity for polarity, _ in _proposal_state_assertions(value)}
+
+
+def _mark_participation_unknown_assumptions(value: Any, *, request: RealtimeIntelligenceRequest) -> tuple[Any, list[int]]:
+    """Turn an unverified negative assumption into an explicit check, once.
+
+    This never repairs recommendations, facts, positive completed-state claims,
+    quantities or owners. Multiple clauses stay strict to avoid masking another
+    assertion. The final full parser still validates every field and source.
+    """
+    if (request.request_metadata.get("automatic_direct") is True
+        and request.request_metadata.get("proposal_contract") == "participation_proposal.v2"):
+        return value, []
+    if request.coach_profile != PARTICIPATION_PROFILE or not isinstance(value, Mapping):
+        return value, []
+    assumptions = value.get("assumptions")
+    if not isinstance(assumptions, list) or len(assumptions) > 4:
+        return value, []
+    updated = list(assumptions)
+    indices: list[int] = []
+    for index, assumption in enumerate(assumptions):
+        if not isinstance(assumption, str) or not assumption.strip() or len(assumption) > 185:
+            continue
+        clauses = [c.strip() for c in re.split(r"[，,。；;！？!?\n]+", assumption) if c.strip()]
+        if len(clauses) != 1 or _asserted_proposal_state_polarities(assumption) != {"negative"}:
+            continue
+        updated[index] = "需要核对这项假设：" + assumption
+        indices.append(index)
+    return ({**value, "assumptions": updated}, indices) if indices else (value, [])
 
 
 def _material_fact_terms(value: str) -> set[str]:
@@ -3601,12 +3947,15 @@ def _validate_coach_claim_grounding(
     evidence_quote: str,
     evidence_ids: tuple[str, ...],
     request: RealtimeIntelligenceRequest,
+    reason_field: str = "reason",
 ) -> None:
     # The paragraph ids establish provenance, but only the exact quote establishes
     # which facts the card may repeat.  Otherwise a model can cite an innocuous
     # fragment and silently borrow an owner, deadline, number, polarity, or term
     # from somewhere else in the same (potentially noisy) ASR paragraph.
-    grounding_text = evidence_quote
+    project_state = request.knowledge_context.get("project_state") or {}
+    grounding_text = "\n".join((evidence_quote, *(str(item.get("quote") or "") for item in request.document_evidence),
+        *(str(item.get(key) or "") for item in project_state.get("items", []) for key in ("text", "owner", "due"))))
     current_answer = (
         request.rolling_state.get("current_answer")
         if isinstance(request.rolling_state, Mapping)
@@ -3617,47 +3966,97 @@ def _validate_coach_claim_grounding(
         and isinstance(current_answer, Mapping)
         and str(current_answer.get("answer") or "").strip()
     )
-    if is_deep_answer_card:
-        # A deep card supplements the committed Fast Answer, so its technical
-        # terms may be grounded in that visible answer as well as raw ASR. The
-        # verbatim quote and segment IDs remain bound to meeting evidence.
-        grounding_text = "\n".join(
-            (evidence_quote, str(current_answer["answer"]).strip())
-        )
+    # A previous AI answer is useful for avoiding repetition, but it cannot
+    # establish a number, deadline, owner, completed state, or product fact.
+    # Deep cards may propose generic professional checks below; hard facts
+    # remain bound to the exact, version-validated source quote.
 
     evidence_numbers = _number_claim_tokens(grounding_text)
     evidence_times = _claim_tokens(_COACH_TIME_RE, grounding_text)
     evidence_owners = _owner_assignment_values(grounding_text)
-    evidence_polarities = _state_polarities(grounding_text)
+    evidence_assertions = _proposal_state_assertions(grounding_text) if request.coach_profile == PARTICIPATION_PROFILE else ()
+    evidence_polarities = ({polarity for polarity, assertion in evidence_assertions if assertion}
+                          if request.coach_profile == PARTICIPATION_PROFILE else _state_polarities(grounding_text))
     evidence_terms = _material_fact_terms(grounding_text)
     evidence_products = _glossary_claim_terms(grounding_text, request=request)
 
     violations: set[str] = set()
-    for value in (title, recommendation, reason):
-        if _number_claim_tokens(value) - evidence_numbers:
+    claim_fields: dict[str, list[str]] = {}
+    for claim_field, value in (("title", title), ("recommendation", recommendation), (reason_field, reason)):
+        # The host's v2 direct contract separates exact sourced facts from a
+        # proposed design. Lexical state/quantity matching cannot distinguish
+        # a future target from an assertion about today's implementation.
+        # Keep the title, reason and cited facts strict; never promote this
+        # proposal field into confirmed project facts or decisions.
+        if (
+            claim_field == "recommendation"
+            and request.coach_profile == PARTICIPATION_PROFILE
+            and request.request_metadata.get("automatic_direct") is True
+            and request.request_metadata.get("proposal_contract") == "participation_proposal.v2"
+        ):
+            continue
+        field_violations: list[str] = []
+        number_tokens = (_professional_proposal_number_tokens(value)
+                         if request.coach_profile == PARTICIPATION_PROFILE and claim_field == "recommendation"
+                         else _number_claim_tokens(value))
+        if number_tokens - evidence_numbers:
             violations.add("number")
+            field_violations.append("number")
         if _claim_tokens(_COACH_TIME_RE, value) - evidence_times:
             violations.add("deadline")
+            field_violations.append("deadline")
         # A person's name being present in the quote does not establish their
         # ownership.  The exact quote must contain the same assignment relation.
         if _owner_assignment_values(value) - evidence_owners:
             violations.add("owner")
-        if _state_polarities(value) - evidence_polarities:
+            field_violations.append("owner")
+        state_assertions = (_proposal_state_assertions(value, allow_future_target=claim_field == "recommendation")
+                            if request.coach_profile == PARTICIPATION_PROFILE else ())
+        state_claims = ({polarity for polarity, _ in state_assertions}
+                        if request.coach_profile == PARTICIPATION_PROFILE else _state_polarities(value))
+        if state_claims - evidence_polarities:
             violations.add("state")
+            field_violations.append("state")
+        if request.coach_profile == PARTICIPATION_PROFILE:
+            # Neither a completed report nor an unfinished log establishes the
+            # state of an order test. Conditional source text is not a fact.
+            for polarity, assertion_text in state_assertions:
+                assertion = _normalize_for_evidence(assertion_text)
+                if not assertion or not any(
+                    source_polarity == polarity and assertion == _normalize_for_evidence(source_assertion)
+                    for source_polarity, source_assertion in evidence_assertions if source_assertion
+                ):
+                    violations.add("state_subject")
+                    field_violations.append("state_subject")
+                    break
         # Deep coaching is explicitly allowed to turn the committed Fast
         # Answer into bounded professional checks such as monitoring,
         # rollback, latency, or load testing. Those generic risk categories
         # are not meeting facts. Realtime cards remain strictly quote-bound,
         # while owners, deadlines, numbers, states, and product names stay
         # evidence-bound for every profile.
-        if not is_deep_answer_card and _material_fact_terms(value) - evidence_terms:
+        if not is_deep_answer_card and request.coach_profile != PARTICIPATION_PROFILE and _material_fact_terms(value) - evidence_terms:
             violations.add("material_term")
+            field_violations.append("material_term")
         if _glossary_claim_terms(value, request=request) - evidence_products:
             violations.add("product_name")
+            field_violations.append("product_name")
+        if field_violations:
+            claim_fields[claim_field] = field_violations
     if violations:
         raise IntelligenceResponseValidationError(
             "coach intervention introduces material facts absent from referenced ASR evidence: "
             + ", ".join(sorted(violations)),
+            category="semantic_safety",
+            claim_fields=claim_fields,
+        )
+
+    if request.coach_profile == PARTICIPATION_PROFILE and not re.search(
+        r"[?？]|可以|建议|考虑|如果|是否|能否|需要核对|待确认|不确定|\b(?:could|should|consider|if|suggest)\b",
+        recommendation, re.IGNORECASE,
+    ):
+        raise IntelligenceResponseValidationError(
+            "professional contribution must express a proposal or question, not an unsupported project fact",
             category="semantic_safety",
         )
 
@@ -3677,6 +4076,7 @@ def _validate_coach_claim_grounding(
     provisional = any(_coach_evidence_quality(paragraph) == "provisional" for paragraph in quoted_paragraphs)
     if (
         provisional
+        and request.coach_profile != PARTICIPATION_PROFILE
         and not _is_clarification_only_recommendation(recommendation)
         and _card_contains_material_assertion(
             title,
@@ -3691,11 +4091,159 @@ def _validate_coach_claim_grounding(
         )
 
 
-_DEEP_COACH_GROUNDED_LINES = {
-    "边界": "需要明确适用范围和判断条件",
-    "风险": "信息口径不足可能造成误解",
-    "追问": "适用范围、判断条件和验证方式分别是什么？",
-}
+def _normalize_pi_quantity_reference(
+    value: Any, *, request: RealtimeIntelligenceRequest,
+) -> tuple[Any, dict[str, Any]]:
+    """Drop only an anaphoric count following a source-grounded explicit list.
+
+    No new business quantity is accepted. The host removes the pronoun/count
+    instead of treating a derived cardinality as a fact, and strictly rechecks
+    the unchanged listed conditions and remainder of the recommendation.
+    """
+    if (request.request_metadata.get("automatic_direct") is True
+        and request.request_metadata.get("proposal_contract") == "participation_proposal.v2"):
+        return value, {}
+    if not isinstance(value, Mapping):
+        return value, {}
+    try:
+        title = _required_response_text(value.get("title"), "intervention.title", maximum=80)
+        recommendation = _response_alias_text(value, primary_key="recommendation", alias_keys=("say_this", "sayThis"),
+            field="intervention.recommendation", alias_field="intervention.say_this", maximum=800)
+        matches = list(_COACH_QUANTITY_REFERENCE_RE.finditer(recommendation))
+        if not matches or len(matches) > 6:
+            return value, {}
+        if any(match.group("count") not in {"1", "2", "3", "4", "5", "6", "一", "二", "两", "三", "四", "五", "六"} for match in matches):
+            return value, {}
+        evidence_ids = _parse_evidence_ids(value.get("evidence_segment_ids"), request=request, field="intervention")
+        evidence_quote = _required_response_text(value.get("evidence_quote"), "intervention.evidence_quote", maximum=1_000)
+        _validate_evidence_quote(evidence_quote, evidence_ids=evidence_ids, request=request, field="intervention.evidence_quote")
+        package = value.get("coaching_package")
+        if isinstance(package, Mapping) and _required_response_text(
+            package.get("say_this_addition"), "intervention.coaching_package.say_this_addition", maximum=800
+        ) != recommendation:
+            return value, {}
+        grounding = _normalize_claim_token("\n".join((evidence_quote,
+            *(str(item.get("quote") or "") for item in request.document_evidence))))
+        for match in matches:
+            # Stay inside the bounded recommendation; do not borrow an unseen
+            # list from another card, a prior AI answer, or the whole document.
+            clauses = [part.strip() for part in re.split(r"[；;。！？!?\n]", recommendation[:match.start()]) if part.strip()]
+            if not clauses:
+                return value, {}
+            parts = [part.strip() for part in re.split(r"、|以及|和|与|及", clauses[-1]) if part.strip()]
+            if not 2 <= len(parts) <= 6 or len(set(parts)) != len(parts):
+                return value, {}
+            for part in parts:
+                normalized = _normalize_claim_token(part)
+                has_literal_source_anchor = any(normalized[index:index + 4] in grounding for index in range(max(0, len(normalized) - 3)))
+                if not has_literal_source_anchor and not _card_contains_material_assertion(part, request=request):
+                    return value, {}
+                _validate_coach_claim_grounding(title="", recommendation=f"请确认{part}", reason="",
+                    evidence_quote=evidence_quote, evidence_ids=evidence_ids, request=request)
+        normalized_recommendation = _COACH_QUANTITY_REFERENCE_RE.sub("", recommendation)
+        if len(normalized_recommendation.strip()) < 8:
+            return value, {}
+        _validate_coach_claim_grounding(title=title, recommendation=normalized_recommendation, reason="",
+            evidence_quote=evidence_quote, evidence_ids=evidence_ids, request=request)
+    except IntelligenceResponseValidationError:
+        return value, {}
+    normalized_card = dict(value)
+    for key in ("recommendation", "say_this", "sayThis"):
+        if key == "recommendation" or key in normalized_card:
+            normalized_card[key] = normalized_recommendation
+    if isinstance(package, Mapping):
+        normalized_card["coaching_package"] = {**package, "say_this_addition": normalized_recommendation}
+    return normalized_card, {"mode": "remove_anaphoric_count", "removed_references": len(matches)}
+
+
+def _ground_pi_intervention_reason(
+    value: Any, *, request: RealtimeIntelligenceRequest,
+) -> tuple[Any, dict[str, Any]]:
+    """Validate the recommendation first, then retain only grounded explanation.
+
+    This host-only repair never invents a recommendation, a fact or confidence.
+    The strict parser still checks the whole final card and current source
+    bindings. Raw model explanation is deliberately absent from diagnostics.
+    """
+    if not isinstance(value, Mapping):
+        return value, {}
+    try:
+        evidence_ids = _parse_evidence_ids(value.get("evidence_segment_ids"), request=request, field="intervention")
+        evidence_quote = _required_response_text(value.get("evidence_quote"), "intervention.evidence_quote", maximum=1_000)
+        _validate_evidence_quote(evidence_quote, evidence_ids=evidence_ids, request=request, field="intervention.evidence_quote")
+        title = _required_response_text(value.get("title"), "intervention.title", maximum=80)
+        current_answer = request.rolling_state.get("current_answer")
+        deep = request.trigger_type in {"user_request", "task_due", "answer_ready"} and isinstance(current_answer, Mapping) and bool(str(current_answer.get("answer") or "").strip())
+        recommendation = _response_alias_text(value, primary_key="recommendation", alias_keys=("say_this", "sayThis"),
+            field="intervention.recommendation", alias_field="intervention.say_this", maximum=800 if deep else 300 if request.coach_profile == PARTICIPATION_PROFILE else 120)
+        reason = _response_alias_text(value, primary_key="reason", alias_keys=("why_now", "whyNow"),
+            field="intervention.reason", alias_field="intervention.why_now", maximum=300)
+        package = value.get("coaching_package")
+        if isinstance(package, Mapping) and _required_response_text(
+            package.get("why_it_matters"), "intervention.coaching_package.why_it_matters", maximum=300
+        ) != reason:
+            # Explanation repair cannot silently reconcile conflicting aliases.
+            return value, {}
+        if len(recommendation) < 8:
+            return value, {}
+        # A bad explanation must never rescue an unsupported recommendation.
+        _validate_coach_claim_grounding(title=title, recommendation=recommendation, reason="",
+            evidence_quote=evidence_quote, evidence_ids=evidence_ids, request=request)
+    except IntelligenceResponseValidationError:
+        return value, {}
+
+    lines = [line.strip() for line in reason.splitlines() if line.strip()]
+    retained: list[str] = []
+    for line in lines:
+        try:
+            _validate_coach_claim_grounding(title=title, recommendation=recommendation, reason=line,
+                evidence_quote=evidence_quote, evidence_ids=evidence_ids, request=request)
+        except IntelligenceResponseValidationError:
+            continue
+        retained.append(line)
+    if len(retained) == len(lines):
+        return value, {}
+
+    source_type = None
+    if retained:
+        grounded_reason = "\n".join(retained)
+        mode = "filtered"
+    else:
+        mode = "source_quote_fallback"
+        grounded_reason = ""
+        candidates = [("document", str(item.get("quote") or "")) for item in request.document_evidence]
+        candidates.append(("transcript", evidence_quote))
+        prefix = "原文依据：\n" if request.coach_profile == PARTICIPATION_PROFILE else "原文依据："
+        for kind, quote in candidates:
+            quote = quote.strip()
+            if request.coach_profile == PARTICIPATION_PROFILE and len(quote) > 300 - len(prefix):
+                # Keep a verbatim complete clause: a cut state predicate could
+                # falsely change the subject/object checked by strict grounding.
+                bounded = quote[:300 - len(prefix)]
+                boundary = max((match.end() for match in re.finditer(r"[。！？!?；;\n]", bounded)), default=0)
+                quote = bounded[:boundary].strip()
+            else:
+                quote = quote[:294].strip()
+            if not quote:
+                continue
+            replacement = f"{prefix}{quote}"
+            try:
+                _validate_coach_claim_grounding(title=title, recommendation=recommendation, reason=replacement,
+                    evidence_quote=evidence_quote, evidence_ids=evidence_ids, request=request)
+            except IntelligenceResponseValidationError:
+                continue
+            grounded_reason, source_type = replacement, kind
+            break
+        if not grounded_reason:
+            # reason is a required field in the existing card contract.
+            raise IntelligenceResponseValidationError("coach explanation has no grounded line or valid source quote", category="semantic_safety")
+    grounded = dict(value)
+    for key in ("reason", "why_now", "whyNow"):
+        if key == "reason" or key in grounded:
+            grounded[key] = grounded_reason
+    if isinstance(value.get("coaching_package"), Mapping):
+        grounded["coaching_package"] = {**value["coaching_package"], "why_it_matters": grounded_reason}
+    return grounded, {"mode": mode, "removed_lines": len(lines) - len(retained), "retained_lines": len(retained), "source_type": source_type}
 
 
 def _coach_claim_violations_against_grounding(
@@ -3727,12 +4275,12 @@ def _ground_pi_deep_intervention(
     request: RealtimeIntelligenceRequest,
     validation_error: IntelligenceResponseValidationError,
 ) -> tuple[Mapping[str, Any] | Any, tuple[str, ...]]:
-    """Replace only unsupported hard-fact clauses before a Deep card commits.
+    """Remove unsupported clauses while preserving useful grounded content.
 
     The strict parser remains authoritative. This narrow repair is limited to
     Pi's second-pass Answer supplement and never repairs structural or evidence
     failures. It mirrors the Fast Answer commit barrier: useful grounded text is
-    retained while an unsupported hard fact becomes an explicit check.
+    retained. No generic card is invented when all recommendations are unsafe.
     """
 
     if (
@@ -3755,7 +4303,7 @@ def _ground_pi_deep_intervention(
     evidence_quote = value.get("evidence_quote")
     if not answer_text or not isinstance(evidence_quote, str) or not evidence_quote.strip():
         return value, ()
-    grounding_text = "\n".join((evidence_quote.strip(), answer_text))
+    grounding_text = evidence_quote.strip()
     grounded = dict(value)
     package = (
         dict(value["coaching_package"])
@@ -3796,23 +4344,11 @@ def _ground_pi_deep_intervention(
             if not violations:
                 grounded_lines.append(normalized)
                 continue
-            label_match = re.match(r"^(边界|风险|追问)\s*[：:]", normalized)
-            if label_match is None:
-                grounded_lines = [
-                    f"{label}：{replacement}"
-                    for label, replacement in _DEEP_COACH_GROUNDED_LINES.items()
-                ]
-                recommendation_changed = True
-                break
-            label = label_match.group(1)
-            grounded_lines.append(f"{label}：{_DEEP_COACH_GROUNDED_LINES[label]}")
             recommendation_changed = True
         if recommendation_changed:
-            grounded_recommendation = (
-                "可以补充：当前结论的适用范围、判断条件和验证方式仍需明确。"
-                if package is not None
-                else "\n".join(grounded_lines)
-            )
+            if not grounded_lines:
+                return value, ()
+            grounded_recommendation = "\n".join(grounded_lines)
             grounded["recommendation"] = grounded_recommendation
             for alias in ("say_this", "sayThis"):
                 if alias in value:
@@ -3820,27 +4356,6 @@ def _ground_pi_deep_intervention(
             if package is not None:
                 package["say_this_addition"] = grounded_recommendation
             changed_fields.append("recommendation")
-
-    reason_values = tuple(
-        text.strip()
-        for key in ("reason", "why_now", "whyNow")
-        if isinstance((text := value.get(key)), str) and text.strip()
-    )
-    if reason_values and len(set(reason_values)) == 1:
-        reason = reason_values[0]
-        if _coach_claim_violations_against_grounding(
-            reason,
-            grounding_text=grounding_text,
-            request=request,
-        ):
-            grounded_reason = "当前回答仍可补充适用范围、判断条件和验证方式。"
-            grounded["reason"] = grounded_reason
-            for alias in ("why_now", "whyNow"):
-                if alias in value:
-                    grounded[alias] = grounded_reason
-            if package is not None:
-                package["why_it_matters"] = grounded_reason
-            changed_fields.append("reason")
 
     if package is not None and changed_fields:
         grounded["coaching_package"] = package

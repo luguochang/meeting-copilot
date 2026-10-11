@@ -1,7 +1,7 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { MeetingApi } from "../../api/client";
+import { HttpMeetingApi, type MeetingApi } from "../../api/client";
 import type { MeetingHistoryItem } from "../../domain/events";
 import { MeetingHistory } from "./MeetingHistory";
 
@@ -54,6 +54,60 @@ async function openDataManagementDialog(
 describe("MeetingHistory", () => {
   beforeEach(() => {
     window.sessionStorage.clear();
+  });
+
+  it("keeps ended records readable without claiming unavailable audio or nonexistent review products through the actual HTTP client", async () => {
+    const items = [
+      { id: "record-only", title: "只有会议记录", state: "ended", segment_count: 3, has_minutes: false },
+      { id: "audio-failed", title: "录音未保存", state: "ended", segment_count: 3, has_minutes: false, audio_status: "failed" },
+      { id: "audio-saved", title: "录音已实际保存", state: "ended", segment_count: 3, has_minutes: false, audio_status: "saved" },
+      { id: "review-ready", title: "已有会议纪要", state: "ended", segment_count: 3, has_minutes: true },
+    ];
+    const fetcher = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ meetings: items, has_more: false, next_cursor: null }), { status: 200, headers: { "content-type": "application/json" } }));
+    const onOpenMeeting = vi.fn();
+    const user = userEvent.setup();
+    render(<MeetingHistory api={new HttpMeetingApi()} onOpenMeeting={onOpenMeeting} />);
+
+    const recordOnly = await screen.findByRole("button", { name: "打开会议：只有会议记录" });
+    expect(within(recordOnly).getByText("会议记录已保存")).toBeVisible();
+    expect(recordOnly).not.toHaveTextContent("录音已保存");
+    expect(recordOnly).not.toHaveTextContent("复盘已就绪");
+    expect(screen.getByRole("button", { name: "打开会议：录音未保存" })).toHaveTextContent("会议记录已保存");
+    expect(screen.getByRole("button", { name: "打开会议：录音已实际保存" })).toHaveTextContent("文字和录音已保存");
+    expect(screen.getByRole("button", { name: "打开会议：已有会议纪要" })).toHaveTextContent("复盘已就绪");
+    const readySummary = within(screen.getByLabelText("会议记录统计")).getByText("已完成").parentElement!;
+    expect(readySummary).toHaveTextContent("4");
+    expect(within(readySummary).getByText("可回看")).toBeVisible();
+    expect(screen.queryByText("复盘就绪")).not.toBeInTheDocument();
+
+    await user.click(recordOnly);
+    expect(onOpenMeeting).toHaveBeenCalledWith("record-only");
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(fetcher).toHaveBeenCalledWith("/v2/meetings?limit=12&status=all", expect.objectContaining({ headers: { Accept: "application/json" } }));
+    expect(fetcher.mock.calls[0][1]?.method ?? "GET").toBe("GET");
+  });
+
+  it("preserves failed-review handling without asserting that missing or saved audio was retained", async () => {
+    const items = [
+      { id: "review-failed", title: "纪要生成失败", state: "ended", has_minutes: false, review_jobs: { minutes: { status: "failed" } } },
+      { id: "review-cancelled", title: "方案任务取消", state: "ended", has_minutes: false, audio_status: "saved", review_jobs: { approach: { status: "cancelled" } } },
+      { id: "review-working", title: "纪要仍在处理", state: "ended", has_minutes: false, review_jobs: { minutes: { status: "running" } } },
+    ];
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response(JSON.stringify({ meetings: items, has_more: false, next_cursor: null }), { status: 200, headers: { "content-type": "application/json" } }));
+    const user = userEvent.setup();
+    render(<MeetingHistory api={new HttpMeetingApi()} onOpenMeeting={vi.fn()} />);
+
+    const failed = await screen.findByRole("button", { name: "打开会议：纪要生成失败" });
+    expect(failed).toHaveTextContent("会议记录已保留 · 纪要失败");
+    expect(failed).not.toHaveTextContent("录音已保留");
+    expect(screen.getByRole("button", { name: "打开会议：方案任务取消" })).toHaveTextContent("会议记录已保留 · 方案失败");
+    expect(screen.getByRole("button", { name: "打开会议：纪要仍在处理" })).toHaveTextContent("会后整理中");
+    expect(within(screen.getByLabelText("会议记录统计")).getByText("已完成").parentElement).toHaveTextContent("0");
+
+    await user.selectOptions(screen.getByLabelText("按状态筛选"), "failed");
+    await waitFor(() => expect(fetcher).toHaveBeenLastCalledWith("/v2/meetings?limit=12&status=failed", expect.objectContaining({ headers: { Accept: "application/json" } })));
+    expect(fetcher.mock.calls.every(([, options]) => (options?.method ?? "GET") === "GET")).toBe(true);
+    expect(screen.getByLabelText("按状态筛选")).toHaveValue("failed");
   });
 
   it("loads additional history through the server cursor instead of slicing a local list", async () => {

@@ -1,4 +1,12 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useState } from "react";
+import { HttpKnowledgeApi } from "../api/knowledge";
+import { HttpMaterialsApi } from "../api/materials";
+import { HttpProjectOutcomesApi } from "../api/projectOutcomes";
+import { HttpMemoryApi } from "../api/memory";
+import { HttpMemoryReconcileApi } from "../api/memoryReconcile";
+import { HttpProjectReconcileApi } from "../api/projectReconcile";
+import { HttpTranscriptRecoveryApi } from "../api/transcriptRecovery";
+import { KnowledgeLibrary } from "../features/knowledge-library/KnowledgeLibrary";
 import { HttpMeetingApi } from "../api/client";
 import { PollingEventTransport, SseEventTransport } from "../api/eventTransport";
 import { resolveLocalApiBase } from "../api/localApiBase";
@@ -7,20 +15,22 @@ import type { MeetingSessionState } from "../features/live-meeting/meetingSessio
 import { useMeetingMicrophone } from "../features/live-meeting/useMeetingMicrophone";
 import { LocalCapabilities } from "../features/local-capabilities/LocalCapabilities";
 import { NotesCenter } from "../features/notes/NotesCenter";
+import type { DocumentSourceEvidence, MeetingAttachmentSourceEvidence } from "../domain/events";
 import type { ActiveMeetingNavigation } from "../components/ProductNavigation";
 import { createMeetingId, resolveMeetingId } from "./meetingId";
 import { discoverMeetingNavigation } from "./meetingNavigationState";
 
-type ProductView = "meetings" | "notes" | "capabilities";
+type ProductView = "meetings" | "notes" | "knowledge" | "capabilities";
 
 function resolveView(search: string): ProductView {
   const view = new URLSearchParams(search).get("view");
-  return view === "notes" || view === "capabilities" ? view : "meetings";
+  return view === "notes" || view === "knowledge" || view === "capabilities" ? view : "meetings";
 }
 
 export function App() {
   const [meetingId, setMeetingId] = useState(() => resolveMeetingId(window.location.search));
   const [view, setView] = useState<ProductView>(() => resolveView(window.location.search));
+  const [attachmentSource, setAttachmentSource] = useState<MeetingAttachmentSourceEvidence | null>(null);
   const [activeMeetingId, setActiveMeetingId] = useState<string | null>(null);
   const [recoverableMeetingId, setRecoverableMeetingId] = useState<string | null>(null);
   const [externalCaptureMeetingId, setExternalCaptureMeetingId] = useState<string | null>(null);
@@ -29,6 +39,13 @@ export function App() {
     [],
   );
   const api = useMemo(() => new HttpMeetingApi(apiBase), [apiBase]);
+  const knowledgeApi = useMemo(() => new HttpKnowledgeApi(apiBase), [apiBase]);
+  const materialsApi = useMemo(() => new HttpMaterialsApi(apiBase), [apiBase]);
+  const projectApi = useMemo(() => new HttpProjectOutcomesApi(apiBase), [apiBase]);
+  const memoryApi = useMemo(() => new HttpMemoryApi(apiBase), [apiBase]);
+  const memoryReconcileApi = useMemo(() => new HttpMemoryReconcileApi(apiBase), [apiBase]);
+  const reconcileApi = useMemo(() => new HttpProjectReconcileApi(apiBase), [apiBase]);
+  const recoveryApi = useMemo(() => new HttpTranscriptRecoveryApi(apiBase), [apiBase]);
   const microphone = useMeetingMicrophone({ asrBaseUrl: apiBase });
   const transport = useMemo(
     () =>
@@ -90,6 +107,9 @@ export function App() {
     url.searchParams.set("meeting_id", nextMeetingId);
     url.searchParams.delete("view");
     url.searchParams.delete("evidence");
+    for (const field of ["source_meeting_id", "source_context_revision", "source_version_id", "source_content_hash"]) url.searchParams.delete(field);
+    url.searchParams.delete("source");
+    url.searchParams.delete("project_id");
     for (const alias of ["meeting", "session_id", "session"]) url.searchParams.delete(alias);
     window.history.pushState(window.history.state, "", url);
     setMeetingId(nextMeetingId);
@@ -101,6 +121,9 @@ export function App() {
     url.searchParams.set("meeting_id", nextMeetingId);
     url.searchParams.set("evidence", segmentId);
     url.searchParams.delete("view");
+    for (const field of ["source_meeting_id", "source_context_revision", "source_version_id", "source_content_hash"]) url.searchParams.delete(field);
+    url.searchParams.delete("source");
+    url.searchParams.delete("project_id");
     for (const alias of ["meeting", "session_id", "session"]) url.searchParams.delete(alias);
     window.history.pushState(window.history.state, "", url);
     setMeetingId(nextMeetingId);
@@ -111,16 +134,70 @@ export function App() {
     const url = new URL(window.location.href);
     url.searchParams.set("view", "notes");
     url.searchParams.delete("evidence");
+    for (const field of ["source_meeting_id", "source_context_revision", "source_version_id", "source_content_hash"]) url.searchParams.delete(field);
+    url.searchParams.delete("source");
+    url.searchParams.delete("project_id");
     for (const alias of ["meeting_id", "meeting", "session_id", "session"]) url.searchParams.delete(alias);
     window.history.pushState(window.history.state, "", url);
     setMeetingId(null);
     setView("notes");
   }, []);
 
+  const openKnowledge = useCallback(() => {
+    const url = new URL(window.location.href);
+    url.searchParams.set("view", "knowledge");
+    url.searchParams.delete("document_id");
+    url.searchParams.delete("project_tab");
+    for (const alias of ["meeting_id", "meeting", "session_id", "session", "evidence", "source", "project_id"]) url.searchParams.delete(alias);
+    window.history.pushState(window.history.state, "", url);
+    for (const field of ["source_meeting_id", "source_context_revision", "source_version_id", "source_content_hash"]) url.searchParams.delete(field);
+    window.history.replaceState(window.history.state, "", url);
+    setMeetingId(null);
+    setView("knowledge");
+  }, []);
+
+  const openKnowledgeDocument = useCallback((target: { documentId: string; projectId: string }) => {
+    const url = new URL(window.location.href); url.searchParams.set("view", "knowledge"); url.searchParams.set("document_id", target.documentId); url.searchParams.set("project_id", target.projectId);
+    for (const field of ["meeting_id", "meeting", "session_id", "session", "evidence", "source", "project_tab", "source_meeting_id", "source_context_revision", "source_version_id", "source_content_hash"]) url.searchParams.delete(field);
+    window.history.pushState(window.history.state, "", url); setMeetingId(null); setView("knowledge");
+  }, []);
+  const openProjectProposals = useCallback((projectId: string) => {
+    const url = new URL(window.location.href); url.searchParams.set("view", "knowledge"); url.searchParams.set("project_id", projectId); url.searchParams.set("project_tab", "proposals");
+    for (const field of ["meeting_id", "meeting", "session_id", "session", "evidence", "document_id", "source", "source_meeting_id", "source_context_revision", "source_version_id", "source_content_hash"]) url.searchParams.delete(field);
+    window.history.pushState(window.history.state, "", url); setMeetingId(null); setView("knowledge");
+  }, []);
+
+  const openKnowledgeSource = useCallback((value: DocumentSourceEvidence, sourceMeetingId?: string) => {
+    if (value.sourceType === "meeting_attachment") {
+      const url = new URL(window.location.href);
+      url.searchParams.set("meeting_id", value.meetingId); url.searchParams.delete("view");
+      window.history.pushState(window.history.state, "", url);
+      setMeetingId(value.meetingId); setView("meetings"); setAttachmentSource(value);
+      return;
+    }
+    const url = new URL(window.location.href);
+    url.searchParams.set("view", "knowledge");
+    url.searchParams.set("source", value.sourceId);
+    url.searchParams.delete("project_tab");
+    url.searchParams.delete("document_id");
+    if (sourceMeetingId) url.searchParams.set("source_meeting_id", sourceMeetingId);
+    else url.searchParams.delete("source_meeting_id");
+    url.searchParams.set("source_context_revision", String(value.contextRevision));
+    url.searchParams.set("source_version_id", value.versionId);
+    url.searchParams.set("source_content_hash", value.contentHash);
+    url.searchParams.set("project_id", value.projectId);
+    for (const alias of ["meeting_id", "meeting", "session_id", "session", "evidence"]) url.searchParams.delete(alias);
+    window.history.pushState(window.history.state, "", url);
+    setMeetingId(null); setView("knowledge");
+  }, []);
+
   const openCapabilities = useCallback(() => {
     const url = new URL(window.location.href);
     url.searchParams.set("view", "capabilities");
     url.searchParams.delete("evidence");
+    for (const field of ["source_meeting_id", "source_context_revision", "source_version_id", "source_content_hash"]) url.searchParams.delete(field);
+    url.searchParams.delete("source");
+    url.searchParams.delete("project_id");
     for (const alias of ["meeting_id", "meeting", "session_id", "session"]) url.searchParams.delete(alias);
     window.history.pushState(window.history.state, "", url);
     setMeetingId(null);
@@ -132,6 +209,9 @@ export function App() {
     for (const alias of ["meeting_id", "meeting", "session_id", "session"]) url.searchParams.delete(alias);
     url.searchParams.delete("view");
     url.searchParams.delete("evidence");
+    for (const field of ["source_meeting_id", "source_context_revision", "source_version_id", "source_content_hash"]) url.searchParams.delete(field);
+    url.searchParams.delete("source");
+    url.searchParams.delete("project_id");
     window.history.pushState(window.history.state, "", url);
     setMeetingId(null);
     setView("meetings");
@@ -195,14 +275,25 @@ export function App() {
     window.history.replaceState(window.history.state, "", url);
   }, []);
 
+  if (view === "knowledge") {
+    const search = new URLSearchParams(window.location.search);
+    return <KnowledgeLibrary api={knowledgeApi} projectApi={projectApi} memoryApi={memoryApi} memoryReconcileApi={memoryReconcileApi} reconcileApi={reconcileApi} initialProjectTab={search.get("project_tab") === "proposals" ? "proposals" : undefined} onOpenMeetings={returnToMeetingList} onOpenNotes={openNotes}
+      onOpenCapabilities={openCapabilities} onOpenMeeting={openMeeting} activeMeeting={activeMeeting} initialDocumentId={search.get("document_id")}
+      onOpenActiveMeeting={openActiveMeeting} initialSourceId={search.get("source")} initialProjectId={search.get("project_id")} initialMeetingId={search.get("source_meeting_id")} initialContextRevision={search.has("source_context_revision") ? Number(search.get("source_context_revision")) : null} initialVersionId={search.get("source_version_id")} initialContentHash={search.get("source_content_hash")} />;
+  }
+
   if (view === "notes") {
     return (
       <NotesCenter
+        onOpenKnowledgeDocument={openKnowledgeDocument}
         api={api}
+        knowledgeApi={knowledgeApi}
+        onKnowledgeSource={openKnowledgeSource}
         onOpenMeetings={returnToMeetingList}
         onOpenMeeting={openMeeting}
         onOpenEvidence={openMeetingEvidence}
         onOpenCapabilities={openCapabilities}
+        onOpenKnowledge={openKnowledge}
         activeMeeting={activeMeeting}
         onOpenActiveMeeting={openActiveMeeting}
       />
@@ -215,6 +306,7 @@ export function App() {
         api={api}
         onOpenMeetings={returnToMeetingList}
         onOpenNotes={openNotes}
+        onOpenKnowledge={openKnowledge}
         activeMeeting={activeMeeting}
         onOpenActiveMeeting={openActiveMeeting}
       />
@@ -223,8 +315,19 @@ export function App() {
 
   return (
     <LiveMeetingWorkbench
+      materialsApi={materialsApi}
+      initialAttachmentSource={attachmentSource}
+      onAttachmentSourceClosed={() => setAttachmentSource(null)}
       meetingId={meetingId}
       api={api}
+      knowledgeApi={knowledgeApi}
+      projectApi={projectApi}
+      memoryApi={memoryApi}
+      reconcileApi={reconcileApi}
+      recoveryApi={recoveryApi}
+      onOpenKnowledgeDocument={openKnowledgeDocument}
+      onOpenProjectProposals={openProjectProposals}
+      onKnowledgeSource={openKnowledgeSource}
       transport={transport}
       asrBaseUrl={apiBase}
       onCreateMeeting={createMeeting}
@@ -232,6 +335,7 @@ export function App() {
       onBackToMeetings={returnToMeetingList}
       onOpenNotes={openNotes}
       onOpenCapabilities={openCapabilities}
+      onOpenKnowledge={openKnowledge}
       initialEvidenceSegmentId={new URLSearchParams(window.location.search).get("evidence")}
       onEvidenceFocused={clearEvidenceTarget}
       microphoneController={microphone}

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .audio_assets import inspect_realtime_audio_journal
+from .audio_assets import inspect_realtime_audio_journal, resolve_realtime_recording_layout
 from .v2_persistence import RecordingRecoveryConflict, V2Persistence
 
 
@@ -17,14 +17,19 @@ def _reconcile_recording_journals(
     root = Path(data_dir)
     for recording in recordings:
         meeting_id = str(recording["meeting_id"])
-        session_dir = root / "audio_assets" / meeting_id
-        if not session_dir.exists():
-            continue
         try:
+            committed = [chunk for chunk in persistence.list_audio_chunks(meeting_id)
+                         if chunk["track"] == recording["track"] and int(chunk["epoch"]) == int(recording["epoch"])]
+            by_sequence = {int(chunk["chunk_seq"]): chunk for chunk in committed}
+            layout = resolve_realtime_recording_layout(recording=recording, chunks=committed, data_dir=root)
+            if not (root / str(layout["output_relative_path"])).parent.exists():
+                continue
             journal = inspect_realtime_audio_journal(
                 data_dir=root,
                 session_id=meeting_id,
                 sample_rate_hz=int(recording["sample_rate_hz"]),
+                track_id=layout["track_id"],
+                epoch=int(recording["epoch"]),
             )
             for chunk in journal["chunks"]:
                 persistence.record_audio_chunk(
@@ -39,6 +44,11 @@ def _reconcile_recording_journals(
                     duration_ms=int(chunk["duration_ms"]),
                     file_size_bytes=int(chunk["file_size_bytes"]),
                     now_ms=now_ms,
+                    captured_at_ms=by_sequence.get(int(chunk["chunk_seq"]), {}).get("timestamp_ms", chunk.get("timestamp_ms")),
+                    source_sequence_start=chunk.get("source_sequence_start"),
+                    source_sequence_end=chunk.get("source_sequence_end"),
+                    source_timestamp_start_ms=chunk.get("source_timestamp_start_ms"),
+                    source_timestamp_end_ms=chunk.get("source_timestamp_end_ms"),
                     expected_capture_generation=int(recording["capture_generation"]),
                     **(
                         {"require_lease_expired_at_ms": now_ms}

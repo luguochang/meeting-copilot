@@ -1,0 +1,85 @@
+"""Reviewed schema 26 material statements, without repository import cycles."""
+
+MATERIAL_SCHEMA_STATEMENTS = (
+    """CREATE TABLE material_sets (
+        id TEXT PRIMARY KEY,
+        meeting_id TEXT,
+        state TEXT NOT NULL DEFAULT 'draft' CHECK(state IN ('draft','bound','deleted')),
+        revision INTEGER NOT NULL DEFAULT 1 CHECK(revision>0),
+        context_revision INTEGER NOT NULL DEFAULT 0 CHECK(context_revision>=0),
+        created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL,
+        deleted_at_ms INTEGER,
+        CHECK((state='draft' AND meeting_id IS NULL) OR (state='bound' AND meeting_id IS NOT NULL) OR state='deleted')
+    )""",
+    "CREATE UNIQUE INDEX idx_material_sets_meeting ON material_sets(meeting_id) WHERE state='bound'",
+    "CREATE INDEX idx_material_sets_page ON material_sets(state,updated_at_ms DESC,id DESC)",
+    """CREATE TABLE meeting_attachments (
+        id TEXT PRIMARY KEY,
+        set_id TEXT NOT NULL REFERENCES material_sets(id),
+        title TEXT NOT NULL,
+        filename TEXT NOT NULL,
+        content_type TEXT,
+        purpose TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','deleted')),
+        import_status TEXT NOT NULL DEFAULT 'pending' CHECK(import_status IN ('pending','extracted','needs_ocr','failed','unavailable')),
+        original_relative_path TEXT,
+        original_sha256 TEXT,
+        file_size_bytes INTEGER NOT NULL DEFAULT 0 CHECK(file_size_bytes>=0),
+        active_version_id TEXT,
+        enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)),
+        selected_span_ids_json TEXT,
+        revision INTEGER NOT NULL DEFAULT 1 CHECK(revision>0),
+        content_revision INTEGER NOT NULL DEFAULT 1 CHECK(content_revision>0),
+        error_code TEXT,
+        created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL,
+        deleted_at_ms INTEGER
+    )""",
+    "CREATE INDEX idx_meeting_attachments_set ON meeting_attachments(set_id,status,updated_at_ms DESC,id DESC)",
+    """CREATE TABLE meeting_attachment_versions (
+        id TEXT PRIMARY KEY,
+        attachment_id TEXT NOT NULL REFERENCES meeting_attachments(id),
+        number INTEGER NOT NULL CHECK(number>0),
+        content TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        content_characters INTEGER NOT NULL CHECK(content_characters>=0),
+        origin TEXT NOT NULL CHECK(origin IN ('extracted','user')),
+        structure_json TEXT NOT NULL,
+        warnings_json TEXT NOT NULL DEFAULT '[]',
+        created_at_ms INTEGER NOT NULL,
+        UNIQUE(attachment_id,number)
+    )""",
+    """CREATE TABLE meeting_attachment_spans (
+        id TEXT PRIMARY KEY,
+        version_id TEXT NOT NULL REFERENCES meeting_attachment_versions(id),
+        ordinal INTEGER NOT NULL CHECK(ordinal>=0),
+        text TEXT NOT NULL,
+        locator_json TEXT NOT NULL,
+        UNIQUE(version_id,ordinal)
+    )""",
+    """CREATE VIRTUAL TABLE meeting_attachment_search USING fts5(
+        span_id UNINDEXED,attachment_id UNINDEXED,version_id UNINDEXED,tokens,
+        tokenize='unicode61'
+    )""",
+    """CREATE TABLE meeting_attachment_jobs (
+        id TEXT PRIMARY KEY,
+        set_id TEXT NOT NULL REFERENCES material_sets(id),
+        attachment_id TEXT NOT NULL REFERENCES meeting_attachments(id),
+        type TEXT NOT NULL CHECK(type IN ('import','cleanup')),
+        input_revision INTEGER NOT NULL,
+        input_sha256 TEXT,
+        status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','succeeded','failed','cancelled')),
+        progress TEXT NOT NULL DEFAULT 'waiting',
+        attempt INTEGER NOT NULL DEFAULT 0,
+        next_retry_at_ms INTEGER NOT NULL DEFAULT 0,
+        lease_token TEXT,
+        lease_until_ms INTEGER,
+        result_version_id TEXT,
+        error_code TEXT,
+        created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL
+    )""",
+    "CREATE UNIQUE INDEX idx_attachment_jobs_live ON meeting_attachment_jobs(attachment_id,type) WHERE status IN ('queued','running')",
+    "CREATE INDEX idx_attachment_jobs_due ON meeting_attachment_jobs(status,next_retry_at_ms,created_at_ms)",
+)

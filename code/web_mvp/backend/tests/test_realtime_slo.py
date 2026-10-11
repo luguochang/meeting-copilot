@@ -80,12 +80,14 @@ def test_report_groups_by_meeting_and_lane_with_all_realtime_latency_metrics():
         "p50_ms": 500.0,
         "p95_ms": 680.0,
         "max_ms": 700.0,
+        "measurement_status": "observed",
     }
     assert correction["metrics"]["final_to_event_emitted_ms"] == {
         "count": 2,
         "p50_ms": 900.0,
         "p95_ms": 1080.0,
         "max_ms": 1100.0,
+        "measurement_status": "observed",
     }
     assert correction["metrics"]["queue_wait_ms"]["p50_ms"] == 100.0
     assert correction["metrics"]["provider_ttft_ms"]["p50_ms"] == 200.0
@@ -124,6 +126,7 @@ def test_missing_cancelled_and_retry_counts_are_explicit_and_no_sample_is_not_ze
         "p50_ms": None,
         "p95_ms": None,
         "max_ms": None,
+        "measurement_status": "unknown",
     }
     assert lane["slo_verdict"]["status"] == "no_data"
     assert lane["slo_verdict"]["metrics"]["provider_ttft_ms"]["status"] == "no_data"
@@ -260,6 +263,7 @@ def test_percentiles_use_an_explicit_bounded_recent_sample_window():
         "p50_ms": 800.0,
         "p95_ms": 980.0,
         "max_ms": 1000.0,
+        "measurement_status": "observed",
     }
 
 

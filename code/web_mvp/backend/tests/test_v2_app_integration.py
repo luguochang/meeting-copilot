@@ -317,6 +317,7 @@ def test_meeting_end_correction_bypasses_realtime_priority_gate(
     monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
     monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-test")
     monkeypatch.setenv("LLM_GATEWAY_MODEL", "gpt-5.5")
+    monkeypatch.delenv("LLM_GATEWAY_CORRECTION_MODEL", raising=False)
     app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
     meeting_id = "provider-priority-end-bypass"
     committed = app.state.commit_v2_final(meeting_id, _final_event())
@@ -404,6 +405,7 @@ def test_aged_live_correction_is_not_starved_by_continuous_realtime_work(
     monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
     monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-test")
     monkeypatch.setenv("LLM_GATEWAY_MODEL", "gpt-5.5")
+    monkeypatch.delenv("LLM_GATEWAY_CORRECTION_MODEL", raising=False)
     app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
     meeting_id = "provider-priority-fairness"
     event = _final_event(text="Redis Stream 和 Kafka 应该怎么选？")
@@ -1901,7 +1903,16 @@ def test_app_lifecycle_runs_durable_jobs_without_browser_trigger(tmp_path):
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
             jobs = app.state.v2_persistence.list_jobs(meeting_id="meeting-1")
-            if all(job["status"] == "succeeded" for job in jobs):
+            # DB completion precedes the worker's terminal trace observer.
+            # Wait for both under the same deadline; missing telemetry must
+            # still fail, without treating the brief commit/observer gap as
+            # a permanently missing lifecycle stage.
+            if all(job["status"] == "succeeded" for job in jobs) and all(
+                app.state.pipeline_traces.export(job_id)["execution"][
+                    "required_stage_completeness"
+                ]["complete"]
+                for job_id in committed["job_ids"].values()
+            ):
                 break
             time.sleep(0.01)
         else:
@@ -2550,9 +2561,10 @@ def test_correction_failure_does_not_block_review_outputs_and_marks_degraded(
         )
 
     review_jobs = {
-        job["kind"]: job
-        for job in persistence.list_jobs(meeting_id="meeting-1")
-        if job["kind"] in {"minutes", "approach", "index"}
+        kind: persistence.claim_next_job(
+            worker_id="review-output-test", lane=kind, now_ms=now_ms + 3, lease_ms=30_000,
+        )
+        for kind in ("minutes", "approach", "index")
     }
 
     outputs = {
@@ -2708,15 +2720,12 @@ def test_v2_minutes_job_persists_structured_minutes_for_review_actions(
             now_ms=now_ms + 2,
             output={"no_revision_needed": True},
         )
-    minutes_job = next(
-        job
-        for job in persistence.list_jobs(meeting_id=meeting_id)
-        if job["kind"] == "minutes"
+    minutes_job = persistence.claim_next_job(
+        worker_id="structured-minutes-review", lane="minutes", now_ms=now_ms + 3, lease_ms=30_000,
     )
 
     result = app.state.v2_post_job_handler_impls["minutes"]({
-        "id": minutes_job["id"],
-        "meeting_id": meeting_id,
+        **minutes_job,
         "evidence_segment_id": committed["segment_id"],
     })
     snapshot = persistence.get_snapshot(meeting_id)

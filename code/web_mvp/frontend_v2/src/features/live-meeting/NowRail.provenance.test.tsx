@@ -1,10 +1,11 @@
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ComponentProps } from "react";
+import type { KnowledgeApi } from "../../api/knowledge";
 import { afterEach } from "vitest";
 import { parseMeetingSnapshot } from "../../api/schema";
 import { createInitialMeetingState, meetingReducer } from "../../domain/reducer";
-import type { CoachHistoryEntry, FollowUpProjection, Suggestion } from "../../domain/events";
+import type { CoachHistoryEntry, FollowUpProjection, MeetingAttachmentSourceEvidence, Suggestion } from "../../domain/events";
 import { NowRail } from "./NowRail";
 
 afterEach(() => {
@@ -102,6 +103,232 @@ function readingAnswer(index: number): Suggestion {
   };
 }
 
+function participationRevision(id: string, overrides: Partial<CoachHistoryEntry> = {}): CoachHistoryEntry {
+  return { ...followUp({ origin: "pi", status: "intervention", analysisKind: "participation", promptProfile: "participation", proposalType: "professional_proposal", topicId: "orders", analysisBasisRevision: 3,
+    decisionId: id, sayThis: `建议正文 ${id}`, supportingFacts: [{ text: `条件 ${id}`, sourceRef: "segment-1" }], formalAi: formalAi(id) }), historyId: `history-${id}`, createdAtMs: id === "first" ? 1000 : 2000, ...overrides };
+}
+
+it("prioritizes participation actions and readable advice while preserving expandable diagnostics and history", async () => {
+  const user = userEvent.setup();
+  const p = readingProps();
+  const onOpenAsk = vi.fn();
+  const advice = participationRevision("current", { whyNow: "还没有讨论通知失败后的补偿。" });
+  const past = participationRevision("past", { status: "stale", lifecycleStatus: "retracted" });
+  render(<NowRail {...p} followUp={advice} coachHistory={[advice, past]} onOpenAsk={onOpenAsk}
+    onContribute={vi.fn()} discussionRuntime={{ state: "error", label: "理解失败", level: null,
+      detail: null, decision: "failed", errorClass: "provider_unavailable" }} />);
+  expect(screen.getByRole("group", { name: "请求现场建议" })).toBeVisible();
+  for (const label of ["我可以问什么", "还有什么方案", "帮我组织回应"]) {
+    expect(screen.getByRole("button", { name: label })).toBeEnabled();
+  }
+  expect(screen.getByTestId("follow-up-card")).toHaveTextContent(advice.sayThis!);
+  expect(screen.getByText(advice.sayThis!)).toBeVisible();
+  expect(screen.getByText(advice.whyNow!, { selector: "p" })).not.toBeVisible();
+  expect(screen.getByText("部分分析未完成，可展开核对")).toBeVisible();
+  expect(screen.getByRole("list", { name: "过去的教练建议" })).not.toBeVisible();
+  await user.click(screen.getByText("运行详情"));
+  expect(screen.getByRole("status", { name: "当前讨论的理解状态" })).toHaveTextContent("模型服务暂不可用");
+  await user.click(screen.getByText("为什么现在 · 依据原话"));
+  expect(screen.getByText(advice.whyNow!, { selector: "p" })).toBeVisible();
+  await user.click(screen.getByText("过去建议"));
+  expect(screen.getByRole("list", { name: "过去的教练建议" })).toHaveTextContent("已撤回");
+  await user.click(screen.getByRole("button", { name: "查看依据" }));
+  expect(p.onEvidence).toHaveBeenCalledWith("segment-1");
+  await user.click(screen.getByRole("button", { name: "自己提问" }));
+  expect(onOpenAsk).toHaveBeenCalledOnce();
+});
+
+it("keeps the frozen discussion time through later transcripts, refresh and history", () => {
+  const meetingId = "frozen-discussion";
+  const frozenAtMs = new Date(2026, 9, 11, 13, 24, 35).getTime();
+  const completedAtMs = frozenAtMs + 20_000;
+  const provenance = { source: "llm_first", job_id: "job-frozen", batch_id: "batch-frozen",
+    provider: "test-provider", model: "test-model", llm_called: true, llm_call_status: "called",
+    evidence: { segment_ids: ["segment-1"], quote: "验收条件还没定" } };
+  const intervention = { ...provenance, origin: "pi", status: "intervention", decision_id: "decision-frozen",
+    say_this: "先明确这次上线的验收条件。", why_now: "验收条件还没有确定。",
+    evidence_segment_ids: ["segment-1"], evidence_quote: "验收条件还没定", frozen_at_ms: frozenAtMs };
+  const decision = { origin: "pi", status: "intervention", decision_id: "decision-frozen",
+    frozen_at_ms: frozenAtMs, completed_at_ms: completedAtMs };
+  const snapshotData = { meeting_id: meetingId, last_seq: 0, segments: [], suggestions: [], runtime: { phase: "live" } };
+  let state = meetingReducer(createInitialMeetingState(meetingId), { type: "snapshot.received",
+    snapshot: parseMeetingSnapshot(snapshotData), receivedAtMs: completedAtMs });
+  state = meetingReducer(state, { type: "events.received", receivedAtMs: completedAtMs, events: [{
+    meetingId, seq: 1, eventId: "event-frozen", type: "meeting.intelligence.applied",
+    aggregateType: "meeting", aggregateId: meetingId, occurredAtMs: completedAtMs,
+    correlationId: null, causationId: null, idempotencyKey: "frozen", publishedAtMs: null,
+    payload: { ...provenance, coach_intervention: intervention, coach_decision: decision },
+  }] });
+  expect(state.followUp?.frozenAtMs).toBe(frozenAtMs);
+  expect(state.coachDecision?.frozenAtMs).toBe(frozenAtMs);
+  const props = { ...readingProps(), viewStateKey: meetingId, sourceMeetingId: meetingId };
+  const view = render(<NowRail {...props} followUp={state.followUp} coachDecision={state.coachDecision} coachHistory={state.coachHistory} />);
+  const label = "基于截至 13:24:35 的讨论";
+  expect(screen.getByTestId("follow-up-card")).toHaveTextContent(label);
+  state = meetingReducer(state, { type: "events.received", receivedAtMs: completedAtMs + 10_000, events: [{
+    meetingId, seq: 2, eventId: "later-transcript", type: "transcript.segment.finalized",
+    aggregateType: "transcript_segment", aggregateId: "segment-later", occurredAtMs: completedAtMs + 10_000,
+    correlationId: null, causationId: null, idempotencyKey: "later", publishedAtMs: null,
+    payload: { meeting_id: meetingId, segment_id: "segment-later", final_id: "later", transcript_seq: 2,
+      text: "新增讨论", normalized_text: "新增讨论", revision: 1 },
+  }] });
+  view.rerender(<NowRail {...props} followUp={state.followUp} coachDecision={state.coachDecision} coachHistory={state.coachHistory} />);
+  expect(screen.getByTestId("follow-up-card")).toHaveTextContent(label);
+  const refreshed = parseMeetingSnapshot({ ...snapshotData, last_seq: 2, coach_intervention: intervention,
+    coach_decision: decision, coach_history: [{ ...intervention, history_id: "event-frozen", created_at_ms: completedAtMs }] });
+  expect(refreshed.followUp?.frozenAtMs).toBe(frozenAtMs);
+  expect(refreshed.coachDecision?.frozenAtMs).toBe(frozenAtMs);
+  view.rerender(<NowRail {...props} followUp={null} coachDecision={null} coachHistory={refreshed.coachHistory} />);
+  expect(screen.getByRole("list", { name: "过去的教练建议" })).toHaveTextContent(label);
+  view.rerender(<NowRail {...props} followUp={followUp()} coachHistory={[]} />);
+  expect(screen.queryByText(/基于截至/)).not.toBeInTheDocument();
+});
+
+it("shows a new rejected understanding without replacing an older readable participation card", async () => {
+  const previous = participationRevision("first");
+  const props = readingProps();
+  const view = render(<NowRail {...props} followUp={previous} coachHistory={[previous]} coachDecision={{ decisionId: "first", status: "intervention" }}
+    coachRuntime={{ state: "idle", label: "Pi 教练监听中", detail: null, level: null }}
+    discussionRuntime={{ state: "paused", decision: "failed", errorClass: "evidence_rejected", label: "后台失败", detail: null, level: null }} />);
+  expect(screen.getByRole("status", { name: "当前讨论的理解状态" })).toHaveTextContent("未通过依据核对");
+  expect(screen.getByTestId("follow-up-card")).toHaveTextContent("建议正文 first");
+  expect(screen.queryByText("正在积累讨论内容")).not.toBeInTheDocument();
+  expect(screen.queryByText(/正在结合本场讨论分析/)).not.toBeInTheDocument();
+  view.rerender(<NowRail {...props} followUp={previous} coachHistory={[previous]} coachDecision={{ decisionId: "first", status: "intervention" }}
+    coachRuntime={{ state: "busy", label: "主动请求处理中", detail: null, level: null }}
+    discussionRuntime={{ state: "paused", decision: "failed", errorClass: "evidence_rejected", label: "后台失败", detail: null, level: null }} />);
+  expect(screen.getByTestId("follow-up-card")).toHaveTextContent("建议正文 first");
+  expect(screen.getByRole("status", { name: "当前会议的 Pi 状态" })).toHaveTextContent("正在结合本场讨论分析");
+  view.rerender(<NowRail {...props} followUp={null} coachHistory={[{ ...previous, status: "stale", lifecycleAction: "retract" }]}
+    coachDecision={{ decisionId: "first:stale", status: "stale", lifecycleAction: "retract", supersedesDecisionId: "first" }}
+    discussionRuntime={{ state: "idle", decision: "not_started", label: "新议题等待理解", detail: null, level: null }} />);
+  expect(screen.queryByTestId("follow-up-card")).not.toBeInTheDocument();
+  expect(screen.getByRole("status", { name: "当前讨论的理解状态" })).not.toHaveTextContent("未通过依据核对");
+  expect(props.onFeedback).not.toHaveBeenCalled();
+});
+
+it("distinguishes normal suggestion silence from independently rejected understanding", async () => {
+  render(<NowRail {...readingProps()} coachDecision={{ status: "protected_silent", decisionReason: "当前议题没有新的贡献机会" }}
+    discussionRuntime={{ state: "paused", decision: "failed", errorClass: "invalid_output", label: "失败", detail: null, level: null }} />);
+  expect(screen.getByRole("status", { name: "当前讨论的理解状态" })).toHaveTextContent("未通过格式校验");
+  expect(screen.getByRole("status", { name: "当前会议的 Pi 状态" })).toHaveTextContent("本轮保持静默");
+  await userEvent.setup().click(screen.getByText("运行详情"));
+  expect(screen.getByText("当前议题没有新的贡献机会")).toBeVisible();
+});
+
+it("hides only generic empty expectations when understanding is waiting, preserving legacy behavior", () => {
+  const props = readingProps();
+  const view = render(<NowRail {...props} discussionRuntime={{ state: "idle", decision: "retry_wait", label: "等待", detail: null, level: null }} />);
+  expect(screen.getByRole("status", { name: "当前讨论的理解状态" })).toHaveTextContent("当前未在执行");
+  expect(screen.queryByText("正在积累讨论内容")).not.toBeInTheDocument();
+  expect(screen.queryByText(/明确问题会立即生成回应/)).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "我可以问什么" })).toBeVisible();
+  view.rerender(<NowRail {...props} />);
+  expect(screen.getByText("可随时主动请求建议")).toBeVisible();
+  expect(screen.queryByRole("status", { name: "当前讨论的理解状态" })).not.toBeInTheDocument();
+});
+
+it.each([false, true])("holds an expanded participation decision through new results with Fast=%s", async (withFast) => {
+  const user = userEvent.setup();
+  const props = { ...readingProps(), suggestions: withFast ? [readingAnswer(1)] : [] };
+  const first = participationRevision("first");
+  const second = participationRevision("second");
+  const view = render(<NowRail {...props} followUp={first} coachHistory={[first]} coachDecision={{ decisionId: "first", jobId: "job-first", status: "intervention" }} />);
+  await user.click(within(screen.getByTestId("follow-up-card")).getByText("已知条件与待核实假设"));
+  view.rerender(<NowRail {...props} followUp={second} coachHistory={[first, second]} coachDecision={{ decisionId: "second", jobId: "job-second", status: "intervention" }} />);
+  const held = screen.getByTestId("follow-up-card");
+  expect(held).toHaveTextContent("建议正文 first");
+  expect(within(held).getByText("条件 first")).toBeVisible();
+  expect(held).toHaveAttribute("data-ui-render-job-id", "job-first");
+  await user.click(screen.getByRole("button", { name: "有新建议，查看最新" }));
+  expect(screen.getByTestId("follow-up-card")).toHaveTextContent("建议正文 second");
+  expect(screen.getByTestId("follow-up-card")).toHaveAttribute("data-ui-render-job-id", "job-second");
+});
+
+it("retains historical reading after material invalidation and restores it without claiming a new card", async () => {
+  const user = userEvent.setup();
+  const props = { ...readingProps(), suggestions: [readingAnswer(1)] };
+  const first = participationRevision("first");
+  const stale = { ...first, status: "stale" as const, lifecycleAction: "retract" as const, lifecycleStatus: "retracted" as const };
+  const view = render(<NowRail {...props} followUp={first} coachHistory={[first]} />);
+  await user.click(within(screen.getByTestId("follow-up-card")).getByRole("button", { name: "查看依据" }));
+  expect(props.onEvidence).toHaveBeenCalledWith("segment-1");
+  const staleProps = { ...props, followUp: null, coachHistory: [stale], coachDecision: { decisionId: "retract", status: "stale" as const, lifecycleAction: "retract" as const, supersedesDecisionId: "first" } };
+  view.rerender(<NowRail {...staleProps} />);
+  expect(screen.getByTestId("historical-contribution-card")).toHaveTextContent("建议正文 first");
+  expect(screen.getByText("这条建议已失效，仅保留供核对。")).toBeVisible();
+  expect(screen.getByTestId("historical-contribution-card")).not.toHaveAttribute("data-ui-render-card");
+  expect(screen.queryByRole("button", { name: "有新建议，查看最新" })).not.toBeInTheDocument();
+  view.unmount();
+  render(<NowRail {...staleProps} />);
+  expect(screen.getByTestId("historical-contribution-card")).toHaveTextContent("建议正文 first");
+});
+
+it("does not treat a failed new job as a new contribution while reading", async () => {
+  const user = userEvent.setup();
+  const first = participationRevision("first");
+  const props = readingProps();
+  const view = render(<NowRail {...props} followUp={first} coachHistory={[first]} />);
+  await user.click(screen.getByText("已知条件与待核实假设"));
+  view.rerender(<NowRail {...props} followUp={null} coachHistory={[first]} coachDecision={{ decisionId: "failed", status: "timed_out", jobId: "failed-job" }} />);
+  expect(screen.getByTestId("follow-up-card")).toHaveTextContent("建议正文 first");
+  expect(screen.getByTestId("follow-up-card")).toHaveAttribute("data-ui-render-job-id", "job-first");
+  expect(screen.queryByRole("button", { name: "有新建议，查看最新" })).not.toBeInTheDocument();
+});
+
+it("marks a held contribution historical on topic change and keeps expired text for verification", async () => {
+  const user = userEvent.setup();
+  const first = participationRevision("first");
+  const second = participationRevision("second", { topicId: "billing" });
+  const props = readingProps();
+  const view = render(<NowRail {...props} followUp={first} coachHistory={[first]} />);
+  await user.click(screen.getByText("已知条件与待核实假设"));
+  view.rerender(<NowRail {...props} followUp={second} coachHistory={[first, second]} />);
+  expect(screen.getByTestId("historical-contribution-card")).toHaveTextContent("建议正文 first");
+  await user.click(screen.getByRole("button", { name: "有新建议，查看最新" }));
+  expect(screen.getByTestId("follow-up-card")).toHaveTextContent("建议正文 second");
+  view.unmount();
+  vi.useFakeTimers();
+  try {
+    vi.setSystemTime(100000);
+    const expiring = participationRevision("expiring", { validUntil: 101000 });
+    render(<NowRail {...props} followUp={expiring} coachHistory={[expiring]} />);
+    act(() => screen.getByText("已知条件与待核实假设").focus());
+    await act(async () => vi.advanceTimersByTime(1100));
+    expect(screen.getByTestId("historical-contribution-card")).toHaveTextContent("建议正文 expiring");
+    expect(screen.getByTestId("historical-contribution-card")).not.toHaveAttribute("data-ui-render-card");
+  } finally { vi.useRealTimers(); }
+});
+
+it.each([false, true])("reviews independent participation history and its exact attachment source with Fast=%s", async (withFast) => {
+  const user = userEvent.setup();
+  const source: MeetingAttachmentSourceEvidence = { sourceType: "meeting_attachment", sourceId: "material-span", setId: "material-set", meetingId: "reading-flow", attachmentId: "attachment", title: "下单需求", versionId: "attachment-v1", version: 1, contentHash: "attachment-hash", locator: { page: 2 }, quote: "订单成功与通知成功绑定。", contextRevision: 2 };
+  const old: CoachHistoryEntry = { ...followUp({ origin: "pi", status: "stale", analysisKind: "participation", proposalType: "professional_proposal", promptProfile: "participation", lifecycleAction: "retract", title: "确认通知失败边界", question: "通知失败如何影响下单？", sayThis: "建议将下单与通知的失败边界拆开确认。", supportingFacts: [{ text: "原需求把订单与通知成功绑定", sourceRef: source.sourceId }], assumptions: ["通知渠道可能暂时不可用"], sourceEvidence: [source] }), historyId: "participation-history", createdAtMs: 1000 };
+  const failed: CoachHistoryEntry = { ...followUp({ origin: "pi", status: "timed_out", question: "失败轮不能算新建议" }), historyId: "failed-round", createdAtMs: 2000 };
+  const historicalSource = { ...source, sourceState: "stale" as const, staleReason: "attachment_scope_or_version_changed", ordinal: 3 };
+  const knowledgeApi = { getMeetingAttachmentSource: vi.fn().mockResolvedValue(historicalSource) } as unknown as KnowledgeApi;
+  const onKnowledgeSource = vi.fn();
+  render(<NowRail {...readingProps()} historyOnly suggestions={withFast ? [readingAnswer(1)] : []} coachHistory={[old, failed]} sourceMeetingId="reading-flow" knowledgeApi={knowledgeApi} onKnowledgeSource={onKnowledgeSource} />);
+  expect(screen.queryByText(/本场会议还没有问答/)).not.toBeInTheDocument();
+  expect(screen.queryByTestId("follow-up-card")).not.toBeInTheDocument();
+  if (withFast) await user.click(screen.getByText("其他会中提示"));
+  await user.click(screen.getByText("过去建议"));
+  const history = screen.getByRole("list", { name: "过去的教练建议" });
+  expect(history).toHaveTextContent("已撤回");
+  expect(history).not.toHaveTextContent("失败轮不能算新建议");
+  await user.click(within(history).getByText("查看当时建议与依据"));
+  expect(within(history).getByText("建议将下单与通知的失败边界拆开确认。")).toBeVisible();
+  expect(within(history).getByText("专业提议 · 供讨论")).toBeVisible();
+  await user.click(within(history).getByText("已知条件与待核实假设"));
+  expect(within(history).getByText("原需求把订单与通知成功绑定")).toBeVisible();
+  expect(within(history).getByText("通知渠道可能暂时不可用")).toBeVisible();
+  await user.click(within(history).getByText("查看全部依据 · 1 条"));
+  await user.click(within(history).getByRole("button", { name: /本场附件 · 下单需求 · 第 1 版 · 第 2 页/ }));
+  await waitFor(() => expect(onKnowledgeSource).toHaveBeenCalledWith(historicalSource, "reading-flow"));
+  expect(knowledgeApi.getMeetingAttachmentSource).toHaveBeenCalledWith("reading-flow", "material-span");
+  expect(screen.getByText("这一版附件的使用范围或版本已变化；当前打开的是历史原文，仅供核对，不作为当前建议的依据。")).toBeVisible();
+});
+
 it("keeps a completed answer during streaming and returns from history to live", async () => {
   const user = userEvent.setup();
   const props = readingProps();
@@ -111,8 +338,6 @@ it("keeps a completed answer during streaming and returns from history to live",
   expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("回答 1");
   expect(screen.getByText(/下一条回应正在生成/)).toBeVisible();
   view.rerender(<NowRail {...props} suggestions={[first, readingAnswer(2)]} />);
-  expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("回答 1");
-  await user.click(screen.getByRole("button", { name: /1 条新建议.*查看最新/ }));
   expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("回答 2");
   await user.click(screen.getByRole("button", { name: "历史 2" }));
   await user.click(within(screen.getByRole("list", { name: "回答与 Pi 历史" })).getByRole("button", { name: /问题 1/ }));
@@ -122,14 +347,12 @@ it("keeps a completed answer during streaming and returns from history to live",
   expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("回答 3");
 });
 
-it("offers new answers without replacing reading and restores the selected history question", async () => {
+it("follows live answers by default, retains explicit historical reading, and restores it in review", async () => {
   const user = userEvent.setup();
   const props = readingProps();
   const view = render(<NowRail {...props} suggestions={[readingAnswer(1)]} />);
   const allAnswers = Array.from({ length: 25 }, (_, index) => readingAnswer(index + 1));
   view.rerender(<NowRail {...props} suggestions={allAnswers} />);
-  expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("问题 1");
-  await user.click(screen.getByRole("button", { name: /24 条新建议.*查看最新/ }));
   expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("问题 25");
   await user.click(screen.getByRole("button", { name: "历史 25" }));
   expect(within(screen.getByRole("list", { name: "回答与 Pi 历史" })).getAllByRole("button")).toHaveLength(25);
@@ -143,7 +366,7 @@ it("offers new answers without replacing reading and restores the selected histo
   view.unmount();
   render(<NowRail {...props} historyOnly suggestions={allAnswers} />);
   expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("问题 2");
-  expect(screen.getByText("正在阅读")).toBeVisible();
+  expect(screen.getByText("历史记录")).toBeVisible();
   expect(screen.getByRole("heading", { name: "会中问答与 Pi 补充" })).toBeVisible();
 });
 
@@ -185,9 +408,13 @@ it("restores a pending refinement after navigation and retries the original answ
   first.unmount();
   status.mockResolvedValue("failed");
   const second = render(<NowRail {...props} suggestions={[readingAnswer(1), readingAnswer(2)]} />);
+  expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("回答 2");
+  await user.click(await screen.findByRole("button", { name: /另一问题的补充未完成/ }));
   await screen.findByRole("button", { name: "重试这次补充" });
   second.unmount();
   render(<NowRail {...props} suggestions={[readingAnswer(1), readingAnswer(2)]} />);
+  expect(screen.getByTestId("answer-copilot-card")).toHaveTextContent("回答 2");
+  await user.click(await screen.findByRole("button", { name: /另一问题的补充未完成/ }));
   await user.click(await screen.findByRole("button", { name: "重试这次补充" }));
   expect(request).toHaveBeenLastCalledWith("answer-1", expect.any(String));
   expect(request).toHaveBeenCalledTimes(2);
@@ -207,8 +434,8 @@ it("keeps the empty coach heading stable while runtime state remains secondary",
   renderRail(null);
 
   expect(screen.getByRole("heading", { name: "AI 实时教练" })).toBeVisible();
-  expect(screen.getByText("正在积累讨论内容")).toBeVisible();
-  expect(screen.getByText(/连续讨论积累足够信息后/)).toBeVisible();
+  expect(screen.getByText("Pi 教练监听中")).toBeVisible();
+  expect(screen.getByRole("button", { name: "我可以问什么" })).toBeVisible();
 });
 
 it("keeps the current streamed answer primary while Pi remains a supplement", () => {
@@ -679,7 +906,7 @@ it("keeps a retained local reflex current until its validity boundary, then move
   }
 });
 
-it("keeps a deprioritized intervention out of the current card and in history", () => {
+it("keeps a deprioritized intervention out of the current card and in history", async () => {
   const deprioritized = followUp({
     origin: "pi",
     status: "intervention",
@@ -720,6 +947,7 @@ it("keeps a deprioritized intervention out of the current card and in history", 
 
   expect(screen.queryByTestId("follow-up-card")).toBeNull();
   expect(screen.getByText("建议已替换")).toBeVisible();
+  await userEvent.setup().click(screen.getByText("运行详情"));
   expect(screen.getByText("已有更新的高优先级建议。")).toBeVisible();
   const history = screen.getByRole("list", { name: "过去的教练建议" });
   expect(history).toHaveTextContent("已替换");
@@ -799,7 +1027,7 @@ it("renders the explicit coach card contract and validity window", () => {
   expect(card).toHaveAttribute("data-valid-until-ms");
   expect(card).toHaveTextContent("为什么现在");
   expect(card).toHaveTextContent("对方刚要求日期，但验收条件还没有说清。");
-  expect(card).toHaveTextContent("建议说");
+  expect(card).toHaveTextContent("可以这样说");
   expect(card).toHaveTextContent("我可以先给目标日期，但需要先确认验收条件。");
   expect(screen.getByLabelText("依据原话")).toHaveTextContent("周五上线，但验收条件还没定");
   expect(card).toHaveTextContent(/当前窗口剩余 \d+ 秒/);
@@ -818,7 +1046,7 @@ it("renders direct semantic follow-up separately instead of calling it a Pi card
   expect(screen.queryByTestId("follow-up-card")).toBeNull();
 });
 
-it("clears silent and expired cards while exposing the decision lifecycle", () => {
+it("clears silent and expired cards while exposing the decision lifecycle", async () => {
   const { rerender } = renderRail(followUp({
     origin: "pi",
     status: "protected_silent",
@@ -827,9 +1055,10 @@ it("clears silent and expired cards while exposing the decision lifecycle", () =
   }));
 
   expect(screen.getByText("本轮保持静默")).toBeVisible();
+  await userEvent.setup().click(screen.getByText("运行详情"));
   expect(screen.getByText("本轮没有高价值、可立即执行的介入建议。")).toBeVisible();
   expect(screen.queryByTestId("follow-up-card")).toBeNull();
-  expect(screen.getByText("Pi Agent")).toBeVisible();
+  expect(screen.getByRole("button", { name: "我可以问什么" })).toBeVisible();
 
   rerender(
     <NowRail
@@ -858,7 +1087,7 @@ it("clears silent and expired cards while exposing the decision lifecycle", () =
   expect(screen.queryByTestId("follow-up-card")).toBeNull();
 });
 
-it("shows a retract decision without restoring the prior intervention card", () => {
+it("shows a retract decision without restoring the prior intervention card", async () => {
   const prior = {
     ...followUp({
       origin: "pi" as const,
@@ -898,7 +1127,9 @@ it("shows a retract decision without restoring the prior intervention card", () 
 
   expect(screen.queryByTestId("follow-up-card")).toBeNull();
   expect(screen.getByText("建议已撤回")).toBeVisible();
+  await userEvent.setup().click(screen.getByText("运行详情"));
   expect(screen.getByText("负责人已经确认，旧建议不再成立。")).toBeVisible();
+  await userEvent.setup().click(screen.getByText("过去建议"));
   expect(screen.getByRole("list", { name: "过去的教练建议" })).toHaveTextContent("先限定承诺条件");
   expect(screen.getByRole("list", { name: "过去的教练建议" })).toHaveTextContent("已撤回");
   expect(screen.getByRole("button", { name: "先确认这次承诺的验收条件。" })).toBeVisible();

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .knowledge_context import source_evidence_state
+
 from contextlib import contextmanager
 from difflib import SequenceMatcher
 import hashlib
@@ -16,13 +18,52 @@ import unicodedata
 
 from .application_schema import bootstrap_application_schema, fallback_meeting_title
 from .coach_lifecycle import coach_decision_replaces_prior_intervention
+from .coach_ui_render_receipt import publication_marker
 from .meeting_state_extractor import extract_meeting_state
-from .audio_assets import audio_chunk_journal_sha256
+from .audio_assets import audio_chunk_journal_sha256, resolve_realtime_recording_layout
+from .transcript_recovery_persistence import TranscriptRecoveryPersistence, order_transcript_for_reading
+from .discussion_persistence import DiscussionPersistence, participation_request, validate_participation_current_need
+from .discussion_state_diagnostics import sanitize_state_failure_output
+from .recording_status import recording_attempt_failed, recording_needs_assembly
 from .storage_governance import (
     ensure_private_directory,
     harden_private_file,
     harden_sqlite_files,
 )
+
+
+def transcript_revision_requires_refresh(original_text: str, corrected_text: str) -> bool:
+    """Only whitespace and trailing full stops are safe automatic remaps.
+
+    Any lexical change is conservatively material. Retain question marks,
+    internal punctuation, decimal points and signs: they can change a fact.
+    """
+
+    def normalized(value: str) -> str:
+        value = unicodedata.normalize("NFKC", value)
+        value = re.sub(r"\s+", "", value)
+        return value.rstrip("。.")
+
+    return normalized(original_text) != normalized(corrected_text)
+
+
+def _project_terminal_correction_status(segments: list[dict[str, Any]], *, meeting_state: str, active_correction: bool) -> None:
+    """Keep snapshot and transcript pages consistent without rewriting history."""
+    if meeting_state != "ended" or active_correction:
+        return
+    for segment in segments:
+        if (
+            segment["correction_status"] == "pending"
+            and (segment.get("recovery_provenance") or {}).get("correction") == "not_requested"
+        ):
+            segment["correction_status"] = "not_requested"
+            segment["correction_error_class"] = None
+            segment["correction_status_provenance"] = "historical_recovery_not_requested"
+            continue
+        if segment["correction_status"] in {"pending", "processing"}:
+            segment["correction_status"] = "failed_preserved_original"
+            segment["correction_error_class"] = "correction_not_evaluated"
+            segment["correction_status_provenance"] = "terminal_job_projection"
 
 
 JOB_STATUSES = (
@@ -203,7 +244,9 @@ PUBLIC_JOB_ERROR_CLASSES = frozenset(
     {
         "ConnectionError",
         "CorrectionProjectionFailed",
+        "AutomaticCoachCorrectionDeferred",
         "CorrectionProviderPriorityDeferred",
+        "CorrectionProviderAvailabilityDeferred",
         "CorrectionLaneCapacityDeferred",
         "DeferredCorrection",
         "meeting_ended",
@@ -212,12 +255,33 @@ PUBLIC_JOB_ERROR_CLASSES = frozenset(
         "correction_provider_budget_exhausted",
         "correction_provider_rates_not_configured",
         "correction_blocked_by_asr_quality",
+        "correction_batch_mapping_invalid",
+        "correction_empty_text",
+        "correction_batch_marker_in_text",
+        "correction_empty_semantic_text",
+        "correction_length_ratio_out_of_bounds",
+        "correction_meeting_fact_changed",
+        "correction_speech_mode_changed",
+        "correction_text_similarity_too_low",
+        "correction_result_rejected",
+        "correction_not_evaluated",
+        "correction_usage_record_failed",
+        "correction_terminology_changed_after_response",
+        "correction_post_response_failed",
         "degraded_asr_session",
         "ReservationChanged",
         "TranscriptRevisionIdentityConflict",
         "TimeoutError",
         "deadline_exceeded",
         "evidence_superseded",
+        "discussion_evidence_revised",
+        "discussion_sources_changed",
+        "discussion_basis_changed",
+        "discussion_topic_changed",
+        "discussion_constraints_changed",
+        "discussion_attention_changed",
+        "discussion_coalesced",
+        "preempted_by_user_request",
         "intelligence_validation_evidence",
         "intelligence_validation_semantic_safety",
         "intelligence_validation_stale",
@@ -230,6 +294,11 @@ PUBLIC_JOB_ERROR_CLASSES = frozenset(
         "provider_timeout",
         "provider_transport",
         "provider_not_synced",
+        "post_meeting_source_missing",
+        "post_meeting_source_ineligible",
+        "post_meeting_provider_ineligible",
+        "post_meeting_provider_auth_invalid",
+        "post_meeting_request_invalid",
     }
 )
 
@@ -771,26 +840,52 @@ def _public_job_error_message(value: Any) -> str | None:
     if error_class is None:
         return None
     messages = {
+        "AutomaticCoachCorrectionDeferred": "正在等待本场文字校对，完成后继续分析。",
         "ProviderRuntimeNotConfiguredDeferred": "AI 模型尚未连接，连接后可重试。",
         "correction_provider_rates_not_configured": "转写精修未配置价格费率，已保留原始文字。",
         "correction_provider_budget_exhausted": "转写精修预算已用尽，已保留原始文字。",
         "correction_blocked_by_asr_quality": "转写质量未达到精修安全门槛，已保留原始文字。",
         "degraded_asr_session": "实时转写链路存在质量降级，未执行精修，已保留原始文字。",
         "CorrectionProviderPriorityDeferred": "实时教练优先处理中，转写精修将在其结束后继续。",
+        "CorrectionProviderAvailabilityDeferred": "AI校对暂不可用，识别原文已保存，等待后续恢复检查。",
         "CorrectionLaneCapacityDeferred": "转写精修通道正在处理其他精修任务，将在通道空闲后继续。",
         "provider_not_synced": "AI 配置尚未同步到本地运行时。",
         "provider_429": "AI 服务当前限流，请稍后重试。",
         "provider_502": "AI 中转站暂时不可用，已保留原始文字。",
         "provider_timeout": "AI 中转站响应超时，已保留原始文字。",
         "provider_transport": "无法连接 AI 中转站，已保留原始文字。",
+        "correction_usage_record_failed": "AI 已返回校对结果，但本地用量记录未确认，已保留识别原文。",
+        "correction_terminology_changed_after_response": "校对期间已确认术语发生变化，已保留识别原文。",
+        "correction_post_response_failed": "AI 已返回，本地校对结果未能安全保存，已保留识别原文。",
         "ConnectionError": "无法连接 AI 服务，请检查网络后重试。",
         "TimeoutError": "AI 服务响应超时，请重试。",
         "deadline_exceeded": "任务等待时间过长，已停止本轮处理。",
         "meeting_ended": "会议已结束，未开始的实时教练任务已停止。",
+        "discussion_evidence_revised": "校对已更新原文，旧版本理解已取消，等待核对新版本。",
+        "discussion_sources_changed": "资料来源已更新，旧版本分析已取消。",
+        "discussion_basis_changed": "讨论依据已更新，旧版本分析已取消。",
+        "discussion_topic_changed": "当前话题已变化，旧话题分析已取消。",
+        "discussion_constraints_changed": "讨论条件已更新，旧版本分析已取消。",
+        "discussion_attention_changed": "当前讨论重点已更新，旧建议已取消，等待新的参与机会。",
+        "discussion_coalesced": "已有较新分析接替，本轮后台任务已合并。",
+        "preempted_by_user_request": "正在优先处理你的主动请求，本轮后台分析已取消。",
         "job_failed": "本轮 AI 处理失败，原始录音和文字已保留。",
+        "post_meeting_source_missing": "会议识别素材缺失，请确认已保存识别文字后再试。",
+        "post_meeting_source_ineligible": "当前会议来源不满足整理条件，原文已保留。",
+        "post_meeting_provider_ineligible": "当前 AI 配置不支持正式整理，请修改配置后再试。",
+        "post_meeting_provider_auth_invalid": "AI 服务拒绝身份验证，请修改配置后再试。",
+        "post_meeting_request_invalid": "本轮整理请求无法执行，请核对会议素材和 AI 配置后再试。",
     }
+    if error_class == "correction_not_evaluated":
+        return "校对任务已结束，此段尚未取得有效校对结果，已保留原文，可重新校对。"
     if error_class.startswith("intelligence_validation_"):
         return "AI 返回内容未通过证据校验，未写入会议事实。"
+    if error_class in {
+        "correction_batch_mapping_invalid", "correction_empty_text", "correction_batch_marker_in_text",
+        "correction_empty_semantic_text", "correction_length_ratio_out_of_bounds", "correction_meeting_fact_changed",
+        "correction_speech_mode_changed", "correction_text_similarity_too_low", "correction_result_rejected",
+    }:
+        return "精修结果未通过原意与事实校验，已保留原稿，可核对后重试。"
     return messages.get(error_class, "本轮 AI 处理失败，可重试。")
 
 
@@ -954,6 +1049,12 @@ class ReviewDocumentConflict(RuntimeError):
         self.current_document = dict(current_document) if current_document is not None else None
 
 
+class ReviewSourceChangedError(RuntimeError):
+    """Retry against fresh source instead of labeling late AI output current."""
+
+    durable_error_class = "review_source_changed"
+
+
 class SpeakerLabelConflict(ValueError):
     """A manual speaker label is already assigned within the same meeting."""
 
@@ -966,7 +1067,7 @@ class SpeakerAttributionRevisionConflict(ValueError):
     """A speaker attribution arrived after a newer segment projection exists."""
 
 
-class V2Persistence:
+class V2Persistence(DiscussionPersistence, TranscriptRecoveryPersistence):
     """Additive normalized persistence and durable outbox/job storage.
 
     Normalized rows are the source of truth. ``meeting_events`` is an outbox
@@ -2136,6 +2237,12 @@ class V2Persistence:
                 last_updated_seq,
             ),
         )
+        if existing is not None and changed:
+            from .source_library_provenance import invalidate_bound_sources
+
+            invalidate_bound_sources(self._conn, "meeting_entity", entity_id,
+                                     max(0, int(updated_at_ms)) if updated_at_ms is not None else int(time.time() * 1000),
+                                     source_meeting_id=meeting_id)
         row = self._conn.execute(
             "SELECT * FROM meeting_entities WHERE meeting_id = ? AND entity_id = ?",
             (meeting_id, entity_id),
@@ -2151,6 +2258,8 @@ class V2Persistence:
         text: str,
         evidence: Any,
         now_ms: int,
+        source_evidence: Sequence[Mapping[str, Any]] | None = None,
+        source_message_id: str | None = None,
     ) -> dict[str, Any]:
         meeting_id = _required(meeting_id, "meeting_id")
         entity_id = _required(entity_id, "entity_id")
@@ -2202,6 +2311,23 @@ class V2Persistence:
                     (meeting_id,),
                 ).fetchone()[0]
             )
+            document_sources = list(source_evidence or [])
+            verified_source_message_id = None
+            if source_message_id:
+                source_message = self._conn.execute(
+                    "SELECT * FROM ask_messages WHERE message_id=? AND meeting_id=? AND role='assistant' AND status='completed'",
+                    (source_message_id, meeting_id),
+                ).fetchone()
+                if source_message is not None:
+                    verified_source_message_id = source_message["message_id"]
+                    document_sources = [item for item in json.loads(source_message["evidence_json"] or "[]") if item.get("source_type") in {"document", "meeting_attachment"}]
+            if len(document_sources) > 6 or any(not isinstance(item, Mapping) or item.get("source_type") not in {"document", "meeting_attachment"} for item in document_sources):
+                raise ValueError("entity sources must contain at most 6 typed document references")
+            if document_sources and source_evidence_state(self._conn, meeting_id, document_sources) != "valid":
+                raise ValueError("资料来源已经变化，请重新核对后保存")
+            stored_evidence = ({"source_evidence": document_sources, "transcript_evidence": normalized_evidence,
+                                "source_message_id": verified_source_message_id}
+                               if document_sources else normalized_evidence[-1] if normalized_evidence else {})
             entity = self._upsert_entity_locked(
                 meeting_id,
                 normalized_kind,
@@ -2211,8 +2337,8 @@ class V2Persistence:
                     "text": normalized_text,
                     "confidence": 1.0,
                     "evidence_segment_ids": [item["segment_id"] for item in normalized_evidence],
-                    "evidence": normalized_evidence[-1] if normalized_evidence else {},
-                    "evidence_items": normalized_evidence,
+                    "evidence": stored_evidence,
+                    "evidence_items": [stored_evidence] if document_sources else normalized_evidence,
                     "owner": None,
                     "deadline": None,
                     "mitigation": None,
@@ -2292,6 +2418,9 @@ class V2Persistence:
                 correlation_id=correlation_id or meeting_id,
                 causation_id=entity_id,
             )
+            from .source_library_provenance import invalidate_bound_sources
+
+            invalidate_bound_sources(self._conn, "meeting_entity", entity_id, now_ms, source_meeting_id=meeting_id)
             return entity
 
     def update_entity_fields(
@@ -2380,6 +2509,9 @@ class V2Persistence:
                 correlation_id=correlation_id or meeting_id,
                 causation_id=entity_id,
             )
+            from .source_library_provenance import invalidate_bound_sources
+
+            invalidate_bound_sources(self._conn, "meeting_entity", entity_id, now_ms, source_meeting_id=meeting_id)
             self._conn.execute(
                 "UPDATE meeting_entities SET last_updated_seq = ? WHERE meeting_id = ? AND entity_id = ?",
                 (event_seq, meeting_id, entity_id),
@@ -2572,6 +2704,11 @@ class V2Persistence:
         title: str | None,
         now_ms: int,
         title_source: str | None = None,
+        material_set_id: str | None = None,
+        expected_material_set_revision: int | None = None,
+        idempotency_key: str | None = None,
+        creation_fingerprint: str | None = None,
+        storage_preflight: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         meeting_id = _required(meeting_id, "meeting_id")
         now_ms = max(0, int(now_ms))
@@ -2581,6 +2718,10 @@ class V2Persistence:
         )
         with self._write_transaction():
             self._raise_if_tombstoned_locked(meeting_id)
+            if idempotency_key:
+                receipt = self.get_meeting_creation_receipt(idempotency_key, creation_fingerprint or "")
+                if receipt is not None:
+                    return {**receipt["meeting"], "material_set": receipt.get("material_set"), "creation_replayed": True}
             result = self._conn.execute(
                 "INSERT OR IGNORE INTO meetings ("
                 "id, state, title, title_source, started_at_ms, latest_seq, revision, "
@@ -2609,7 +2750,31 @@ class V2Persistence:
                 "SELECT * FROM meetings WHERE id = ?",
                 (meeting_id,),
             ).fetchone()
-            return self._meeting_dict(row)
+            meeting = self._meeting_dict(row)
+            material_set = None
+            if material_set_id is not None:
+                from .meeting_materials import bind_material_set
+                material_set = bind_material_set(self._conn, material_set_id, meeting_id,
+                                                expected_revision=expected_material_set_revision, now_ms=now_ms)
+            if idempotency_key:
+                self._append_event_locked(meeting_id=meeting_id, event_type="meeting.creation.accepted", aggregate_type="meeting",
+                                          aggregate_id=meeting_id, occurred_at_ms=now_ms, idempotency_key=idempotency_key,
+                                          payload={"request_fingerprint": creation_fingerprint, "meeting": meeting,
+                                                   "material_set": material_set, "storage_preflight": dict(storage_preflight or {})}, correlation_id=meeting_id)
+            return {**meeting, **({"material_set": material_set} if material_set is not None else {})}
+
+    def get_meeting_creation_receipt(self, idempotency_key: str, fingerprint: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute("SELECT meeting_id,payload_json FROM meeting_events WHERE type='meeting.creation.accepted' AND idempotency_key=? LIMIT 1", (idempotency_key,)).fetchone()
+            if row is None:
+                return None
+            payload = json.loads(row["payload_json"] or "{}")
+            if payload.get("request_fingerprint") != fingerprint:
+                raise RuntimeError("meeting creation idempotency conflict")
+            self._raise_if_tombstoned_locked(row["meeting_id"])
+            if self._conn.execute("SELECT 1 FROM meetings WHERE id=?", (row["meeting_id"],)).fetchone() is None:
+                raise KeyError("meeting creation result is unavailable")
+            return payload
 
     def update_meeting_title(
         self,
@@ -3739,6 +3904,7 @@ class V2Persistence:
         causation_id: str | None = None,
         max_attempts: int = 3,
         enqueue_jobs: bool = True,
+        enqueue_intelligence: bool = True,
         source_track: str | None = None,
         enqueue_answer: bool | None = None,
         answer_trigger_type: str = "delta",
@@ -3900,8 +4066,8 @@ class V2Persistence:
                     causation_id=causation_id,
                 )
                 if duplicate_of_segment_id is None:
-                    coverage_status = "pending"
-                    coverage_reason = None
+                    coverage_status = "pending" if enqueue_intelligence else "excluded"
+                    coverage_reason = None if enqueue_intelligence else "legacy_analysis_disabled"
                 else:
                     coverage_status = "excluded"
                     coverage_reason = "source_duplicate"
@@ -3923,6 +4089,9 @@ class V2Persistence:
                     ),
                 )
                 if duplicate_of_segment_id is None:
+                    self._invalidate_review_sources_locked(
+                        meeting_id=meeting_id, now_ms=now_ms, source_id=event_id,
+                    )
                     self._update_meeting_state_locked(
                         meeting_id=meeting_id,
                         segments=[payload],
@@ -3985,7 +4154,7 @@ class V2Persistence:
             effective_enqueue_jobs = enqueue_jobs and duplicate_of_segment_id is None
             if effective_enqueue_jobs:
                 job_specs: list[tuple[str, str, int, str | None, int]] = []
-                if self.semantic_projection_mode == "llm_first":
+                if self.semantic_projection_mode == "llm_first" and enqueue_intelligence:
                     if paragraph_projection is None:
                         raise RuntimeError("LLM-first intelligence requires a semantic paragraph")
                     paragraph_id = str(paragraph_projection["paragraph_id"])
@@ -4074,13 +4243,20 @@ class V2Persistence:
                     # The executor currently claims lanes independently, so
                     # the app-level priority gate remains authoritative.
                     job_specs.append(("correction", correction_job_id, 80, None, transcript_seq))
+                elif self.semantic_projection_mode == "llm_first":
+                    # Participation schedules its semantic reads separately;
+                    # correction remains durable even with legacy analysis off.
+                    job_specs.append(("correction", correction_job_id, 80, None, transcript_seq))
+                    if should_enqueue_answer:
+                        job_specs.append(("answer", answer_job_id, 140, answer_generation_id, transcript_seq))
                 else:
                     job_specs.extend(
                         (
                             ("correction", correction_job_id, 100, None, transcript_seq),
-                            ("suggestion", suggestion_job_id, 90, generation_id, transcript_seq),
                         )
                     )
+                    if enqueue_intelligence:
+                        job_specs.append(("suggestion", suggestion_job_id, 90, generation_id, transcript_seq))
                 for kind, job_id, priority, job_generation_id, input_version in job_specs:
                     # The budget starts when ASR committed the first final for
                     # this job. Coalescing later finals must never move it.
@@ -4185,15 +4361,16 @@ class V2Persistence:
                 (
                     {
                         "correction": correction_job_id,
-                        "intelligence": intelligence_job_id,
+                        **({"intelligence": intelligence_job_id} if intelligence_job_id is not None else {}),
                         **(
                             {"answer": answer_job_id}
                             if should_enqueue_answer
                             else {}
                         ),
                     }
-                    if self.semantic_projection_mode == "llm_first" and intelligence_job_id is not None
-                    else {"correction": correction_job_id, "suggestion": suggestion_job_id}
+                    if self.semantic_projection_mode == "llm_first"
+                    else {"correction": correction_job_id,
+                          **({"suggestion": suggestion_job_id} if enqueue_intelligence else {})}
                 )
                 if effective_enqueue_jobs
                 else {}
@@ -4208,11 +4385,16 @@ class V2Persistence:
         idempotency_key: str,
         now_ms: int,
         answer_id: str | None = None,
+        intent: str | None = None,
+        topic_id: str | None = None,
+        expected_basis_revision: int | None = None,
+        selected_segment_ids: Sequence[str] = (),
+        source_evidence: Sequence[Mapping[str, Any]] = (),
     ) -> dict[str, Any]:
         """Persist one explicit live-meeting coach request over current evidence."""
 
         meeting_id = _required(meeting_id, "meeting_id")
-        user_request = " ".join(str(user_request or "").split())
+        intent, user_request = participation_request(intent, user_request)
         if not user_request:
             raise ValueError("user_request must not be empty")
         if len(user_request) > 4_000:
@@ -4222,6 +4404,9 @@ class V2Persistence:
             raise ValueError("idempotency_key is invalid")
         now_ms = max(0, int(now_ms))
         answer_id = str(answer_id or "").strip() or None
+        fingerprint = hashlib.sha256(_json_dump({"intent": intent, "request": user_request, "answer_id": answer_id,
+                                                 "topic_id": topic_id, "expected_basis_revision": expected_basis_revision,
+                                                 "selected_segment_ids": list(selected_segment_ids)}).encode()).hexdigest()
         if self.semantic_projection_mode != "llm_first":
             raise ValueError("realtime coach requires llm_first semantic projection")
         with self._write_transaction():
@@ -4239,9 +4424,12 @@ class V2Persistence:
             if existing is not None:
                 if str(existing["meeting_id"]) != meeting_id or str(existing["kind"]) != "intelligence":
                     raise ValueError("idempotency_key is already used by another job")
+                prior_metadata = json.loads(existing["request_context_json"] or "{}")
+                if intent is not None and prior_metadata.get("request_fingerprint") != fingerprint:
+                    raise RuntimeError("participation idempotency conflict")
                 return self._job_dict(existing)
             answer = None
-            if answer_id is not None:
+            if answer_id is not None and intent is None:
                 answer = self._conn.execute(
                     "SELECT * FROM suggestions WHERE meeting_id = ? AND suggestion_id = ? "
                     "AND kind = 'answer' AND status = 'committed'",
@@ -4270,6 +4458,16 @@ class V2Persistence:
             ).fetchone()
             if paragraph is None:
                 raise ValueError("当前会议文字尚未形成可验证的语义段落")
+            request_metadata = {}
+            if intent is not None:
+                request_metadata = self._freeze_participation_locked(
+                    meeting_id=meeting_id, now_ms=now_ms, intent=intent, user_request=user_request,
+                    topic_id=topic_id, expected_basis_revision=expected_basis_revision,
+                    selected_segment_ids=selected_segment_ids, source_evidence=source_evidence,
+                )
+                request_metadata["request_fingerprint"] = fingerprint
+                request_metadata["preempted_job_ids"] = self._preempt_automatic_analysis_locked(meeting_id, now_ms)
+                self._bound_participation_packet(request_metadata)
             if answer_id is not None:
                 self._conn.execute(
                     "UPDATE jobs SET status = 'cancelled', lease_owner = NULL, "
@@ -4289,8 +4487,8 @@ class V2Persistence:
                 "id, meeting_id, kind, status, priority, input_transcript_seq, input_version, "
                 "evidence_segment_id, evidence_hash, generation_id, trigger_type, work_item_id, "
                 "trigger_reference_seq, user_request, idempotency_key, attempts, max_attempts, "
-                "next_attempt_at_ms, deadline_at_ms, final_committed_at_ms, created_at_ms, updated_at_ms"
-                ") VALUES (?, ?, 'intelligence', 'pending', 130, ?, ?, ?, ?, ?, 'user_request', ?, ?, ?, ?, 0, 3, ?, ?, ?, ?, ?)",
+                "next_attempt_at_ms, deadline_at_ms, final_committed_at_ms, created_at_ms, updated_at_ms,request_context_json"
+                ") VALUES (?, ?, 'intelligence', 'pending', 130, ?, ?, ?, ?, ?, 'user_request', ?, ?, ?, ?, 0, 3, ?, ?, ?, ?, ?, ?)",
                 (
                     job_id,
                     meeting_id,
@@ -4308,6 +4506,7 @@ class V2Persistence:
                     now_ms,
                     now_ms,
                     now_ms,
+                    _json_dump(request_metadata),
                 ),
             )
             row = self._conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
@@ -4497,22 +4696,38 @@ class V2Persistence:
             "running": "processing",
             "succeeded": "succeeded",
             "failed": "failed_preserved_original",
+            "cancelled": "failed_preserved_original",
         }.get(status)
         if normalized_status is None:
             return
         segment_ids = self._job_evidence_segment_ids_locked(job_row)
+        if status == "cancelled":
+            active_rows = self._conn.execute(
+                "SELECT * FROM jobs WHERE meeting_id = ? AND kind = 'correction' "
+                "AND status IN ('pending', 'retry_wait', 'running')",
+                (job_row["meeting_id"],),
+            ).fetchall()
+            active_segment_ids = {
+                segment_id for row in active_rows
+                for segment_id in self._job_evidence_segment_ids_locked(row)
+            }
+            segment_ids = [item for item in segment_ids if item not in active_segment_ids]
+            if not segment_ids:
+                return
         placeholders = ",".join("?" for _ in segment_ids)
         if normalized_status == "succeeded":
+            # A job can succeed because its batch gate did not open, or because
+            # another checkpoint in the same paragraph was corrected. Only
+            # commit_transcript_revision/mark_correction_segments_no_change can
+            # settle individual results. Never turn an unchecked/rejected
+            # neighbour into a supposedly checked no_change result here.
             self._conn.execute(
-                "UPDATE transcript_segments SET correction_status = CASE "
-                "WHEN correction_before_text IS NOT NULL AND correction_after_text IS NOT NULL "
-                "AND correction_before_text != correction_after_text THEN 'changed' ELSE 'no_change' END, "
-                "correction_before_text = COALESCE(correction_before_text, normalized_text), "
-                "correction_after_text = COALESCE(correction_after_text, normalized_text), "
-                "correction_error_class = NULL, correction_updated_at_ms = ? "
-                "WHERE meeting_id = ? AND segment_id IN (" + placeholders + ")",
+                "UPDATE transcript_segments SET correction_status = 'pending', correction_updated_at_ms = ? "
+                "WHERE meeting_id = ? AND segment_id IN (" + placeholders + ") "
+                "AND correction_status = 'processing'",
                 (now_ms, job_row["meeting_id"], *segment_ids),
             )
+            self._settle_ended_correction_orphans_locked(str(job_row["meeting_id"]), now_ms)
             return
         terminal_guard = (
             " AND correction_status NOT IN ('changed', 'no_change')"
@@ -4533,6 +4748,8 @@ class V2Persistence:
                 *segment_ids,
             ),
         )
+        if status in {"failed", "cancelled"}:
+            self._settle_ended_correction_orphans_locked(str(job_row["meeting_id"]), now_ms)
 
     def claim_next_job(
         self,
@@ -4551,7 +4768,7 @@ class V2Persistence:
 
         with self._write_transaction():
             self._recover_expired_leases_locked(now_ms)
-            if lane in {"intelligence", "pi_deep"}:
+            if lane in {"intelligence", "pi_deep", "discussion_state"}:
                 # Intelligence work is useful only inside its bounded realtime
                 # window. Do not replay an old backlog when a Provider is
                 # configured hours later.
@@ -4584,16 +4801,20 @@ class V2Persistence:
                 "AND deadline_at_ms IS NOT NULL AND deadline_at_ms <= ?",
                 (now_ms, now_ms, now_ms),
             )
-            if lane == "pi_deep":
+            if lane == "discussion_state":
+                kind = "intelligence"
+                trigger_filter = "AND json_extract(request_context_json,'$.task_mode')='discussion_state'"
+            elif lane == "pi_deep":
                 kind = "intelligence"
                 trigger_filter = (
-                    "AND trigger_type IN ('task_due', 'user_request', 'answer_ready')"
+                    "AND trigger_type IN ('task_due', 'user_request', 'answer_ready','discussion_update') "
+                    "AND COALESCE(json_extract(request_context_json,'$.task_mode'),'')!='discussion_state'"
                 )
             elif lane == "intelligence":
                 kind = "intelligence"
                 trigger_filter = (
                     "AND (trigger_type IS NULL OR trigger_type NOT IN "
-                    "('task_due', 'user_request', 'answer_ready'))"
+                    "('task_due', 'user_request', 'answer_ready','discussion_update'))"
                 )
             else:
                 kind = lane
@@ -4905,11 +5126,14 @@ class V2Persistence:
         worker_id: str,
         now_ms: int,
         output: Mapping[str, Any] | list[Any] | str | int | float | bool | None,
+        expected_attempt: int | None = None,
     ) -> dict[str, Any] | None:
         job_id = _required(job_id, "job_id")
         worker_id = _required(worker_id, "worker_id")
         now_ms = max(0, int(now_ms))
         with self._write_transaction():
+            if not self._job_attempt_matches_locked(job_id, expected_attempt):
+                return None
             result = self._conn.execute(
                 "UPDATE jobs SET status = 'succeeded', output_json = ?, "
                 "lease_owner = NULL, lease_until_ms = NULL, error_class = NULL, "
@@ -4935,12 +5159,15 @@ class V2Persistence:
         worker_id: str,
         now_ms: int,
         error_class: str = "evidence_superseded",
+        expected_attempt: int | None = None,
     ) -> dict[str, Any] | None:
         job_id = _required(job_id, "job_id")
         worker_id = _required(worker_id, "worker_id")
         error_class = _public_job_error_class(_required(error_class, "error_class"))
         now_ms = max(0, int(now_ms))
         with self._write_transaction():
+            if not self._job_attempt_matches_locked(job_id, expected_attempt):
+                return None
             result = self._conn.execute(
                 "UPDATE jobs SET status = 'cancelled', lease_owner = NULL, "
                 "lease_until_ms = NULL, error_class = ?, completed_at_ms = ?, updated_at_ms = ? "
@@ -4972,6 +5199,8 @@ class V2Persistence:
         now_ms: int,
         next_attempt_at_ms: int,
         error_class: str,
+        failure_output: Mapping[str, Any] | None = None,
+        expected_attempt: int | None = None,
     ) -> dict[str, Any] | None:
         job_id = _required(job_id, "job_id")
         worker_id = _required(worker_id, "worker_id")
@@ -4979,12 +5208,18 @@ class V2Persistence:
         now_ms = max(0, int(now_ms))
         next_attempt_at_ms = max(now_ms, int(next_attempt_at_ms))
         with self._write_transaction():
+            if not self._job_attempt_matches_locked(job_id, expected_attempt):
+                return None
+            row = self._conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            safe_output = (self._safe_state_failure_output(row, error_class, failure_output)
+                if row is not None and row["attempts"] >= row["max_attempts"] else None)
             result = self._conn.execute(
                 "UPDATE jobs SET "
                 "status = CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'retry_wait' END, "
                 "next_attempt_at_ms = ?, lease_owner = NULL, lease_until_ms = NULL, "
                 "error_class = ?, completed_at_ms = CASE "
-                "WHEN attempts >= max_attempts THEN ? ELSE NULL END, updated_at_ms = ? "
+                "WHEN attempts >= max_attempts THEN ? ELSE NULL END, updated_at_ms = ?, "
+                "output_json = COALESCE(?, output_json) "
                 "WHERE id = ? AND status = 'running' AND lease_owner = ? "
                 "AND lease_until_ms > ?",
                 (
@@ -4992,6 +5227,7 @@ class V2Persistence:
                     error_class,
                     now_ms,
                     now_ms,
+                    json.dumps(safe_output, ensure_ascii=False) if safe_output is not None else None,
                     job_id,
                     worker_id,
                     now_ms,
@@ -5009,6 +5245,21 @@ class V2Persistence:
             self._reject_failed_suggestion_drafts_locked(job_row=row, now_ms=now_ms)
         return self._job_dict(row)
 
+    @staticmethod
+    def _safe_state_failure_output(row, error_class: str, failure_output: Mapping[str, Any] | None) -> dict[str, Any] | None:
+        if row is None or row["kind"] != "intelligence":
+            return None
+        context = json.loads(row["request_context_json"] or "{}")
+        if context.get("task_mode") != "discussion_state":
+            return None
+        safe = sanitize_state_failure_output(failure_output)
+        if safe is None:
+            return None
+        category = safe["failure_diagnostics"]["category"]
+        if error_class.startswith("intelligence_validation_"):
+            return safe if error_class == "intelligence_validation_" + category else None
+        return safe if category == "unclassified" else None
+
     def defer_job(
         self,
         *,
@@ -5017,6 +5268,7 @@ class V2Persistence:
         now_ms: int,
         next_attempt_at_ms: int,
         error_class: str,
+        expected_attempt: int | None = None,
     ) -> dict[str, Any] | None:
         job_id = _required(job_id, "job_id")
         worker_id = _required(worker_id, "worker_id")
@@ -5024,6 +5276,8 @@ class V2Persistence:
         now_ms = max(0, int(now_ms))
         next_attempt_at_ms = max(now_ms, int(next_attempt_at_ms))
         with self._write_transaction():
+            if not self._job_attempt_matches_locked(job_id, expected_attempt):
+                return None
             result = self._conn.execute(
                 "UPDATE jobs SET status = 'retry_wait', "
                 "attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END, "
@@ -5058,18 +5312,25 @@ class V2Persistence:
         worker_id: str,
         now_ms: int,
         error_class: str,
+        failure_output: Mapping[str, Any] | None = None,
+        expected_attempt: int | None = None,
     ) -> dict[str, Any] | None:
         job_id = _required(job_id, "job_id")
         worker_id = _required(worker_id, "worker_id")
         error_class = _required(error_class, "error_class")
         now_ms = max(0, int(now_ms))
         with self._write_transaction():
+            if not self._job_attempt_matches_locked(job_id, expected_attempt):
+                return None
+            row = self._conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            safe_output = self._safe_state_failure_output(row, error_class, failure_output)
             result = self._conn.execute(
                 "UPDATE jobs SET status = 'failed', lease_owner = NULL, "
                 "lease_until_ms = NULL, error_class = ?, completed_at_ms = ?, "
-                "updated_at_ms = ? WHERE id = ? AND status = 'running' "
+                "updated_at_ms = ?, output_json = COALESCE(?, output_json) WHERE id = ? AND status = 'running' "
                 "AND lease_owner = ? AND lease_until_ms > ?",
-                (error_class, now_ms, now_ms, job_id, worker_id, now_ms),
+                (error_class, now_ms, now_ms, json.dumps(safe_output, ensure_ascii=False) if safe_output is not None else None,
+                 job_id, worker_id, now_ms),
             )
             if result.rowcount != 1:
                 return None
@@ -5082,6 +5343,14 @@ class V2Persistence:
             )
             self._reject_failed_suggestion_drafts_locked(job_row=row, now_ms=now_ms)
         return self._job_dict(row)
+
+    def _job_attempt_matches_locked(self, job_id: str, expected_attempt: int | None) -> bool:
+        if expected_attempt is None:
+            return True
+        if type(expected_attempt) is not int or expected_attempt < 1:
+            return False
+        row = self._conn.execute("SELECT attempts FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        return row is not None and int(row["attempts"]) == expected_attempt
 
     def recover_expired_leases(self, *, now_ms: int) -> int:
         with self._write_transaction():
@@ -5265,6 +5534,91 @@ class V2Persistence:
             )
         return len(job_ids)
 
+    def get_coach_input_context(self, meeting_id: str, scene: str = "general") -> dict[str, Any]:
+        from .user_memory import capture_input_context, memory_context
+
+        with self._write_transaction():
+            return {"input_context": capture_input_context(self._conn, meeting_id, scene),
+                    "user_memory": memory_context(self._conn, meeting_id, scene)}
+
+    def bind_answer_context_evidence(
+        self,
+        *,
+        suggestion_id: str,
+        segments: Sequence[Mapping[str, Any]] | None = None,
+        now_ms: int,
+        expected_job_id: str,
+        expected_lease_owner: str,
+        supersedes_suggestion_id: str | None = None,
+        source_evidence: Sequence[Mapping[str, Any]] = (),
+        input_context: Mapping[str, Any] | None = None,
+        memory_scene: str = "general",
+    ) -> dict[str, Any]:
+        """Persist every source version used by a fast answer before the call."""
+
+        if segments is not None and (isinstance(segments, (str, bytes)) or len(segments) > 16):
+            raise ValueError("answer context must contain at most 16 segments")
+        if isinstance(source_evidence, (str, bytes)) or len(source_evidence) > 6 or sum(len(str(item.get("quote") or "")) for item in source_evidence) > 3_600:
+            raise ValueError("answer document evidence exceeds its bounded context")
+        with self._write_transaction():
+            from .user_memory import capture_input_context, input_context_state, memory_context
+
+            self._assert_job_lease_locked(
+                job_id=expected_job_id, lease_owner=expected_lease_owner, now_ms=now_ms,
+            )
+            row = self._conn.execute(
+                "SELECT * FROM suggestions WHERE suggestion_id = ?", (suggestion_id,),
+            ).fetchone()
+            if row is None or row["kind"] != "answer" or row["status"] != "draft" or row["job_id"] != expected_job_id:
+                raise StaleEvidenceError("answer draft no longer accepts context bindings")
+            if source_evidence and source_evidence_state(self._conn, row["meeting_id"], source_evidence) != "valid":
+                raise StaleEvidenceError("answer document source changed before binding")
+            binding = dict(input_context) if input_context is not None else capture_input_context(self._conn, row["meeting_id"], memory_scene)
+            if input_context_state(self._conn, row["meeting_id"], binding) != "valid":
+                raise StaleEvidenceError("answer project state or memory changed before binding")
+            memory = memory_context(self._conn, row["meeting_id"], binding["memory_scene"])
+            if segments is None:
+                # Select by the question anchor before limiting, and bind in
+                # the same transaction. Later transcript must not push the
+                # original context out of a snapshot tail or race this read.
+                sources = self._conn.execute(
+                    "SELECT * FROM transcript_segments WHERE meeting_id = ? AND transcript_seq <= ? "
+                    "AND duplicate_of_segment_id IS NULL ORDER BY transcript_seq DESC LIMIT 12",
+                    (row["meeting_id"], row["evidence_transcript_seq"]),
+                ).fetchall()
+                segments = [self._segment_dict(source) for source in reversed(sources)]
+            if not any(item.get("segment_id") == row["evidence_segment_id"] for item in segments):
+                raise ValueError("answer context must include its question anchor")
+            bindings: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            for segment in segments:
+                segment_id = _required(segment.get("segment_id"), "segment_id")
+                if segment_id in seen:
+                    raise ValueError("answer context segment ids must be unique")
+                seen.add(segment_id)
+                evidence_hash = _required(segment.get("evidence_hash"), "evidence_hash")
+                current = self._conn.execute(
+                    "SELECT evidence_hash, revision FROM transcript_segments WHERE meeting_id = ? AND segment_id = ?",
+                    (row["meeting_id"], segment_id),
+                ).fetchone()
+                if current is None or current["evidence_hash"] != evidence_hash or int(current["revision"]) != int(segment.get("revision") or 1):
+                    raise StaleEvidenceError("answer context changed before binding")
+                bindings.append({"segment_id": segment_id, "evidence_hash": evidence_hash, "revision": int(current["revision"])})
+            if supersedes_suggestion_id:
+                previous = self._conn.execute(
+                    "SELECT 1 FROM suggestions WHERE suggestion_id = ? AND meeting_id = ? AND kind = 'answer'",
+                    (supersedes_suggestion_id, row["meeting_id"]),
+                ).fetchone()
+                if previous is None:
+                    raise ValueError("revised answer must refer to an answer in the same meeting")
+            self._conn.execute(
+                "UPDATE suggestions SET context_evidence_json = ?, source_evidence_json = ?, input_context_json = ?, supersedes_suggestion_id = ?, updated_at_ms = ? WHERE suggestion_id = ?",
+                (json.dumps(bindings, ensure_ascii=False), json.dumps(list(source_evidence), ensure_ascii=False), json.dumps(binding, ensure_ascii=False), supersedes_suggestion_id, now_ms, suggestion_id),
+            )
+            return {**self._suggestion_dict(self._conn.execute(
+                "SELECT * FROM suggestions WHERE suggestion_id = ?", (suggestion_id,),
+            ).fetchone()), "context_segments": list(segments), "user_memory": memory}
+
     def commit_transcript_revision(
         self,
         *,
@@ -5328,6 +5682,12 @@ class V2Persistence:
             if original_text == corrected_text:
                 return self._segment_dict(row)
             new_evidence_hash = transcript_evidence_hash(segment_id, corrected_text)
+            refresh_required = transcript_revision_requires_refresh(original_text, corrected_text)
+            latest_answer = self._conn.execute(
+                "SELECT suggestion_id FROM suggestions WHERE meeting_id = ? AND kind = 'answer' "
+                "AND status IN ('draft', 'committed') ORDER BY evidence_transcript_seq DESC, created_at_ms DESC LIMIT 1",
+                (meeting_id,),
+            ).fetchone()
 
             result = self._conn.execute(
                 "UPDATE transcript_segments SET normalized_text = ?, evidence_hash = ?, "
@@ -5356,6 +5716,11 @@ class V2Persistence:
                 (meeting_id, segment_id),
             ).fetchone()
             updated = self._segment_dict(updated_row)
+            self._observe_discussion_revision_locked(meeting_id, segment_id, now_ms)
+            if refresh_required:
+                self._invalidate_review_sources_locked(
+                    meeting_id=meeting_id, now_ms=now_ms, source_id=revision_id,
+                )
             self._conn.execute(
                 "UPDATE asr_checkpoints SET normalized_text = ?, updated_at_ms = ? "
                 "WHERE meeting_id = ? AND checkpoint_id = ?",
@@ -5384,6 +5749,7 @@ class V2Persistence:
                     "corrected_text": corrected_text,
                     "revision_id": revision_id,
                     "previous_evidence_hash": expected_evidence_hash,
+                    "refresh_required": refresh_required,
                 },
                 correlation_id=correlation_id,
                 causation_id=causation_id,
@@ -5391,23 +5757,49 @@ class V2Persistence:
 
             suggestion_rows = self._conn.execute(
                 "SELECT * FROM suggestions WHERE meeting_id = ? "
-                "AND evidence_segment_id = ? AND evidence_hash = ? "
+                "AND ((evidence_segment_id = ? AND evidence_hash = ?) OR EXISTS ("
+                "SELECT 1 FROM json_each(suggestions.context_evidence_json) AS binding "
+                "WHERE json_extract(binding.value, '$.segment_id') = ? "
+                "AND json_extract(binding.value, '$.evidence_hash') = ?)) "
                 "AND status IN ('draft', 'committed')",
-                (meeting_id, segment_id, expected_evidence_hash),
+                (meeting_id, segment_id, expected_evidence_hash, segment_id, expected_evidence_hash),
             ).fetchall()
             for suggestion_row in suggestion_rows:
                 suggestion_id = str(suggestion_row["suggestion_id"])
-                can_remap = evidence_remap_reason is not None and suggestion_row["status"] == "committed"
+                can_remap = not refresh_required and evidence_remap_reason is not None and suggestion_row["status"] == "committed"
                 if can_remap:
+                    bindings = json.loads(suggestion_row["context_evidence_json"] or "[]")
+                    for binding in bindings:
+                        if binding.get("segment_id") == segment_id:
+                            binding.update(evidence_hash=new_evidence_hash, revision=int(updated["revision"]))
+                    is_anchor = suggestion_row["evidence_segment_id"] == segment_id
                     self._conn.execute(
-                        "UPDATE suggestions SET evidence_hash = ?, state_revision = ?, "
+                        "UPDATE suggestions SET evidence_hash = ?, state_revision = ?, context_evidence_json = ?, "
                         "updated_at_ms = ? WHERE suggestion_id = ?",
-                        (new_evidence_hash, int(updated["revision"]), now_ms, suggestion_id),
+                        (
+                            new_evidence_hash if is_anchor else suggestion_row["evidence_hash"],
+                            int(updated["revision"]) if is_anchor else int(suggestion_row["state_revision"]),
+                            json.dumps(bindings, ensure_ascii=False), now_ms, suggestion_id,
+                        ),
                     )
+                    if suggestion_row["kind"] == "answer":
+                        # Unstarted Deep work may reuse meaning-preserved
+                        # text, but must carry the current anchor/paragraph
+                        # versions when it eventually builds its request.
+                        self._conn.execute(
+                            "UPDATE jobs SET evidence_hash = (SELECT evidence_hash FROM transcript_segments "
+                            "WHERE meeting_id = jobs.meeting_id AND segment_id = jobs.evidence_segment_id), "
+                            "input_version = COALESCE((SELECT p.revision FROM semantic_paragraph_checkpoints c "
+                            "JOIN semantic_paragraphs p ON p.meeting_id = c.meeting_id AND p.paragraph_id = c.paragraph_id "
+                            "WHERE c.meeting_id = jobs.meeting_id AND c.checkpoint_id = jobs.evidence_segment_id), input_version), "
+                            "updated_at_ms = ? WHERE meeting_id = ? AND kind = 'intelligence' AND work_item_id = ? "
+                            "AND status IN ('pending', 'retry_wait')",
+                            (now_ms, meeting_id, suggestion_id),
+                        )
                     relation_event = "suggestion.evidence.remapped"
                 else:
                     self._conn.execute(
-                        "UPDATE suggestions SET status = 'superseded', updated_at_ms = ? WHERE suggestion_id = ?",
+                        "UPDATE suggestions SET status = 'superseded', error_class = 'transcript_revised', updated_at_ms = ? WHERE suggestion_id = ?",
                         (now_ms, suggestion_id),
                     )
                     relation_event = "suggestion.superseded"
@@ -5426,9 +5818,64 @@ class V2Persistence:
                         **self._suggestion_dict(relation_row),
                         "previous_evidence_hash": expected_evidence_hash,
                         "evidence_remap_reason": evidence_remap_reason,
+                        "revised_segment_id": segment_id,
+                        "refresh_required": refresh_required,
                     },
                     correlation_id=correlation_id,
                     causation_id=revision_id,
+                )
+
+            # Cancel old fast/deep generations immediately, including those
+            # whose question anchor is unchanged but whose earlier context is
+            # revised. A late Provider response cannot cross the lease barrier.
+            affected_answers = [item for item in suggestion_rows if item["kind"] == "answer"]
+            invalidated_answers = [
+                item for item in affected_answers
+                if refresh_required or evidence_remap_reason is None or item["status"] == "draft"
+            ]
+            for answer in invalidated_answers:
+                self._conn.execute(
+                    "UPDATE jobs SET status = 'cancelled', lease_owner = NULL, lease_until_ms = NULL, "
+                    "error_class = 'evidence_superseded', completed_at_ms = ?, updated_at_ms = ? "
+                    "WHERE meeting_id = ? AND status IN ('pending', 'retry_wait', 'running') "
+                    "AND (id = ? OR (kind = 'intelligence' AND work_item_id = ?))",
+                    (now_ms, now_ms, meeting_id, answer["job_id"], answer["suggestion_id"]),
+                )
+            newest_affected = next((
+                item for item in invalidated_answers
+                if latest_answer is not None and item["suggestion_id"] == latest_answer["suggestion_id"]
+            ), None)
+            if newest_affected is not None:
+                self._enqueue_revised_answer_locked(
+                    answer=newest_affected, revision_id=revision_id, now_ms=now_ms,
+                )
+
+            # A correction can arrive after enqueue/claim but before the
+            # first draft exists. Replace those old-anchor jobs too, otherwise
+            # their initial evidence check fails permanently with no answer.
+            unbound_answer_jobs = self._conn.execute(
+                "SELECT * FROM jobs WHERE meeting_id = ? AND kind = 'answer' "
+                "AND evidence_segment_id = ? AND evidence_hash = ? "
+                "AND status IN ('pending', 'retry_wait', 'running') "
+                "AND NOT EXISTS (SELECT 1 FROM suggestions WHERE suggestions.job_id = jobs.id)",
+                (meeting_id, segment_id, expected_evidence_hash),
+            ).fetchall()
+            for answer_job in unbound_answer_jobs:
+                self._conn.execute(
+                    "UPDATE jobs SET status = 'cancelled', lease_owner = NULL, lease_until_ms = NULL, "
+                    "error_class = 'evidence_superseded', completed_at_ms = ?, updated_at_ms = ? WHERE id = ?",
+                    (now_ms, now_ms, answer_job["id"]),
+                )
+            if unbound_answer_jobs:
+                newest_unbound = max(unbound_answer_jobs, key=lambda item: (int(item["input_transcript_seq"]), int(item["created_at_ms"])))
+                self._enqueue_revised_answer_locked(
+                    answer={
+                        "meeting_id": meeting_id,
+                        "evidence_segment_id": segment_id,
+                        "suggestion_id": newest_unbound["work_item_id"],
+                        "job_id": newest_unbound["id"],
+                    },
+                    revision_id=revision_id, now_ms=now_ms,
                 )
 
             active_suggestion_jobs = self._conn.execute(
@@ -5454,7 +5901,7 @@ class V2Persistence:
                     ),
                 )
                 has_remapped_commit = any(
-                    evidence_remap_reason is not None and row["status"] == "committed" for row in suggestion_rows
+                    not refresh_required and evidence_remap_reason is not None and row["status"] == "committed" for row in suggestion_rows
                 )
                 if not has_remapped_commit:
                     replacement_job_id = _stable_id("job", meeting_id, revision_id, "suggestion")
@@ -5486,6 +5933,59 @@ class V2Persistence:
                 causation_id=revision_id,
             )
         return updated
+
+    def _enqueue_revised_answer_locked(self, *, answer: Mapping[str, Any] | sqlite3.Row, revision_id: str, now_ms: int) -> None:
+        meeting_id = str(answer["meeting_id"])
+        meeting = self._conn.execute("SELECT state FROM meetings WHERE id = ?", (meeting_id,)).fetchone()
+        if meeting is None or meeting["state"] != "live":
+            return
+        anchor = self._conn.execute(
+            "SELECT * FROM transcript_segments WHERE meeting_id = ? AND segment_id = ?",
+            (meeting_id, answer["evidence_segment_id"]),
+        ).fetchone()
+        if anchor is None:
+            return
+        newer_job = self._conn.execute(
+            "SELECT 1 FROM jobs WHERE meeting_id = ? AND kind = 'answer' "
+            "AND input_transcript_seq > ? AND status IN ('pending', 'retry_wait', 'running') LIMIT 1",
+            (meeting_id, anchor["transcript_seq"]),
+        ).fetchone()
+        if newer_job is not None:
+            return
+        old_job = self._conn.execute("SELECT trigger_type FROM jobs WHERE id = ?", (answer["job_id"],)).fetchone()
+        is_discussion = old_job is not None and old_job["trigger_type"] in {"discussion", "transcript_revision_discussion"}
+        trigger_type = "transcript_revision_discussion" if is_discussion else "transcript_revision"
+        previous_answer_id = str(answer["suggestion_id"] or "").strip() or None
+        source_identity = previous_answer_id or str(answer["job_id"])
+        job_id = _stable_id("job", meeting_id, source_identity, revision_id, "answer")
+        self._conn.execute(
+            "INSERT OR IGNORE INTO jobs (id, meeting_id, kind, status, priority, input_transcript_seq, input_version, "
+            "evidence_segment_id, evidence_hash, generation_id, trigger_type, work_item_id, idempotency_key, "
+            "attempts, max_attempts, next_attempt_at_ms, final_committed_at_ms, created_at_ms, updated_at_ms) "
+            "VALUES (?, ?, 'answer', 'pending', 140, ?, ?, ?, ?, ?, ?, ?, ?, 0, 3, ?, ?, ?, ?)",
+            (
+                job_id, meeting_id, int(anchor["transcript_seq"]), int(anchor["revision"]),
+                str(anchor["segment_id"]), str(anchor["evidence_hash"]), f"answer-revision:{job_id}", trigger_type,
+                previous_answer_id, f"answer:revision:{source_identity}:{revision_id}",
+                now_ms, now_ms, now_ms, now_ms,
+            ),
+        )
+
+    def _settle_ended_correction_orphans_locked(self, meeting_id: str, now_ms: int) -> None:
+        """Settle unchecked segments conservatively after all work is terminal."""
+        eligible = self._conn.execute(
+            "SELECT 1 FROM meetings WHERE id = ? AND state = 'ended' "
+            "AND NOT EXISTS (SELECT 1 FROM jobs WHERE meeting_id = ? AND kind = 'correction' "
+            "AND status IN ('pending', 'retry_wait', 'running'))",
+            (meeting_id, meeting_id),
+        ).fetchone()
+        if eligible is not None:
+            self._conn.execute(
+                "UPDATE transcript_segments SET correction_status = 'failed_preserved_original', "
+                "correction_error_class = 'correction_not_evaluated', correction_updated_at_ms = ? "
+                "WHERE meeting_id = ? AND correction_status IN ('pending', 'processing')",
+                (now_ms, meeting_id),
+            )
 
     def _latest_active_coach_intervention_decision_locked(
         self,
@@ -5547,12 +6047,21 @@ class V2Persistence:
         applied_event_context = _intelligence_event_context(event_context)
         is_local_reflex = applied_event_context["source"] == "local_reflex"
         response_event_key = f"meeting.intelligence.applied:{job_id}"
+        state_projection = None
+        current_attention = None
+        current_need = None
         raw_revisions = response.get("paragraph_revisions") or []
         raw_changes = response.get("state_changes") or []
         raw_topic = response.get("topic_update")
         raw_follow_up = response.get("follow_up")
         raw_coach_intervention = response.get("coach_intervention")
         raw_coach_decision = response.get("coach_decision")
+        document_sources = response.get("source_evidence") or []
+        input_binding = response.get("input_context") or {}
+        if not isinstance(input_binding, Mapping):
+            raise IntelligenceProjectionError("coach input context must be an object")
+        if not isinstance(document_sources, list) or len(document_sources) > 6 or any(not isinstance(item, Mapping) or item.get("source_type") not in {"document", "meeting_attachment"} for item in document_sources):
+            raise IntelligenceProjectionError("coach document sources must be a bounded typed array")
         if not isinstance(raw_revisions, list) or not isinstance(raw_changes, list):
             raise IntelligenceProjectionError("intelligence response arrays are invalid")
         if raw_coach_intervention is not None and not isinstance(raw_coach_intervention, Mapping):
@@ -5630,7 +6139,8 @@ class V2Persistence:
             soft_deadline = _timing_ms(raw_coach_decision.get("soft_deadline_at_ms"))
             if soft_deadline is None or int(observed_ms) < soft_deadline:
                 return False
-            origin_ms = soft_deadline - COACH_SOFT_DELIVERY_CUTOFF_MS
+            frozen_at_ms = _timing_ms(raw_coach_decision.get("frozen_at_ms"))
+            origin_ms = frozen_at_ms if frozen_at_ms is not None else soft_deadline - COACH_SOFT_DELIVERY_CUTOFF_MS
             raw_coach_intervention = None
             raw_coach_decision = {
                 **dict(raw_coach_decision),
@@ -5697,6 +6207,8 @@ class V2Persistence:
                 "work_item": payload.get("work_item"),
                 "timing": payload.get("timing"),
                 "event_context": payload.get("event_context"),
+                **({"state_projection": payload["state_projection"]} if "state_projection" in payload else {}),
+                **({key: payload[key] for key in ("current_attention", "accepted_topic_update", "current_need") if key in payload}),
             }
 
         with self._lock:
@@ -5706,12 +6218,31 @@ class V2Persistence:
             ).fetchone()
             if applied_event is not None:
                 return idempotent_result(applied_event)
+            if document_sources and source_evidence_state(self._conn, meeting_id, document_sources) != "valid":
+                raise IntelligenceEvidenceSuperseded("coach document source changed before projection")
+            if input_binding:
+                from .user_memory import input_context_state
+
+                if input_context_state(self._conn, meeting_id, input_binding) != "valid":
+                    raise IntelligenceEvidenceSuperseded("coach project state or memory changed before projection")
             job_row = self._conn.execute(
                 "SELECT * FROM jobs WHERE id = ? AND meeting_id = ? AND kind = 'intelligence'",
                 (job_id, meeting_id),
             ).fetchone()
             if job_row is None:
                 raise IntelligenceProjectionError("intelligence response references an unknown job")
+            request_metadata = json.loads(job_row["request_context_json"] or "{}")
+            participation = request_metadata.get("profile") == "participation"
+            state_only = participation and request_metadata.get("task_mode") == "discussion_state"
+            if state_only and (raw_coach_intervention or raw_coach_decision or raw_follow_up or raw_revisions):
+                raise IntelligenceProjectionError("discussion state may only project topic and state changes")
+            if job_row["status"] == "cancelled" and job_row["error_class"] == "preempted_by_user_request":
+                raise IntelligenceEvidenceSuperseded("automatic analysis was preempted by a user request")
+            if participation and (
+                job_row["status"] in {"cancelled", "failed"}
+                or self._discussion_request_state_locked(meeting_id, request_metadata) != "valid"
+            ):
+                raise IntelligenceEvidenceSuperseded("participation discussion evidence is stale")
             deadline_at_ms = job_row["deadline_at_ms"]
             if deadline_at_ms is not None and now_ms >= int(deadline_at_ms) and not late_timeout_audit:
                 # This barrier belongs next to the durable projection, rather
@@ -5763,7 +6294,7 @@ class V2Persistence:
                 and bool(job_row["work_item_id"])
             )
             if paragraph_row is None or (
-                not bound_answer and int(paragraph_row["revision"]) != expected_paragraph_revision
+                not (bound_answer or participation) and int(paragraph_row["revision"]) != expected_paragraph_revision
             ):
                 raise IntelligenceEvidenceSuperseded("intelligence paragraph evidence is stale")
             if is_local_reflex and isinstance(raw_coach_intervention, Mapping):
@@ -5906,6 +6437,32 @@ class V2Persistence:
                 (job_id, meeting_id),
             ).fetchone()
             transaction_deadline_at_ms = transaction_job["deadline_at_ms"] if transaction_job else None
+            if transaction_job is not None and transaction_job["status"] == "cancelled" and transaction_job["error_class"] == "preempted_by_user_request":
+                raise IntelligenceEvidenceSuperseded("automatic analysis was preempted during projection")
+            if participation and (
+                transaction_job is None or transaction_job["status"] in {"cancelled", "failed"}
+                or self._discussion_request_state_locked(meeting_id, request_metadata) != "valid"
+            ):
+                raise IntelligenceEvidenceSuperseded("participation discussion changed during projection")
+            if request_metadata.get("current_need_contract") is not None:
+                # Failed/timed-out/no-attempt decisions remain auditable without
+                # inventing a model assessment. Any actual card or completed
+                # silence must carry the current contract, rechecked in this
+                # same write transaction against the frozen source versions.
+                failed_without_assessment = (raw_coach_intervention is None and response.get("current_need") is None
+                    and isinstance(raw_coach_decision, Mapping)
+                    and raw_coach_decision.get("status") in {"failed", "timed_out", "not_triggered", "suppressed"})
+                if not failed_without_assessment:
+                    frozen_ids = [item["segment_id"] for item in request_metadata["evidence"]]
+                    need_sources = {item["segment_id"]: str(item["normalized_text"] or item["text"]) for item in self._conn.execute(
+                        "SELECT segment_id,text,normalized_text FROM transcript_segments WHERE meeting_id=? AND segment_id IN ("
+                        + ",".join("?" for _ in frozen_ids) + ")", (meeting_id, *frozen_ids)).fetchall()}
+                    try:
+                        current_need = validate_participation_current_need(response.get("current_need"),
+                            metadata=request_metadata, paragraphs_by_id=need_sources,
+                            action="intervention" if raw_coach_intervention is not None else "silent")
+                    except ValueError as exc:
+                        raise IntelligenceProjectionError(str(exc)) from exc
             if (
                 transaction_deadline_at_ms is not None
                 and projection_now_ms >= int(transaction_deadline_at_ms)
@@ -5937,6 +6494,17 @@ class V2Persistence:
             if current_seq <= 0:
                 raise IntelligenceProjectionError("intelligence response requires transcript evidence")
 
+            frozen_state_evidence = {item["segment_id"]: (item["revision"], item["evidence_hash"])
+                for item in request_metadata.get("evidence") or []} if state_only else {}
+            if state_only and isinstance(raw_topic, Mapping):
+                for source_id in raw_topic.get("evidence_segment_ids") or []:
+                    source = self._conn.execute("SELECT revision,evidence_hash FROM transcript_segments WHERE meeting_id=? AND segment_id=?",
+                        (meeting_id, source_id)).fetchone()
+                    if source is None or frozen_state_evidence.get(source_id) != (int(source["revision"]), source["evidence_hash"]):
+                        raise IntelligenceEvidenceSuperseded("discussion topic evidence is outside frozen input")
+
+            # Validate every declared operation before selectively rejecting an
+            # unproven closure. Bad schema/quotes remain atomic failures.
             for index, raw_change in enumerate(raw_changes):
                 if not isinstance(raw_change, Mapping):
                     raise IntelligenceProjectionError(f"state change {index} is invalid")
@@ -5969,6 +6537,8 @@ class V2Persistence:
                         raise IntelligenceProjectionError(
                             f"state change {index} references unknown evidence: {evidence_id}"
                         )
+                    if state_only and frozen_state_evidence.get(str(evidence_id)) != (int(row["revision"]), row["evidence_hash"]):
+                        raise IntelligenceEvidenceSuperseded("discussion state operation evidence is outside frozen input")
                     evidence_rows.append(row)
                 # The intelligence prompt uses canonical normalized_text. The
                 # durable barrier must therefore accept a verbatim quote from
@@ -5980,8 +6550,39 @@ class V2Persistence:
                     for row in evidence_rows
                 ):
                     raise IntelligenceProjectionError(f"state change {index} evidence quote is not present")
+
+            if state_only:
+                # One effective topic drives both formal entities and the
+                # historical discussion lifecycle. An interlude must not be
+                # stored as a topic switch in only one of those projections.
+                raw_topic = self._attention_topic_update_locked(
+                    meeting_id=meeting_id, topic_update=raw_topic,
+                    attention=response.get("current_attention"), metadata=request_metadata,
+                )
+            if not participation or state_only:
+                raw_changes, state_projection = self._filter_question_closures_locked(
+                    meeting_id=meeting_id, changes=raw_changes, topic_update=raw_topic,
+                    state_request_metadata=request_metadata if state_only else None)
+
+            for raw_change in raw_changes:
+                kind = {"decision": "decision_candidate", "action_item": "action_item",
+                        "risk": "risk", "open_question": "open_question"}[str(raw_change["type"]).strip()]
+                operation = str(raw_change["operation"]).strip()
+                requested_entity_id = _required(str(raw_change["item_id"]), "item_id")
+                entity_id = requested_entity_id
+                text = _required(str(raw_change["content"]), "content")
+                evidence_ids = raw_change["evidence_segment_ids"]
+                quote = _required(str(raw_change["evidence_quote"]), "evidence_quote")
+                declared_status = str(raw_change.get("status") or "").strip()
+                if state_only and kind == "decision_candidate" and declared_status.lower() == "confirmed":
+                    # This source-validated declaration is a known background
+                    # fact. Keep raw_changes for discussion memory below, but
+                    # do not create or rewrite a formal (possibly human) decision.
+                    continue
                 deduplicated = False
-                if operation == "add":
+                # Question IDs name an audited question, not merely equivalent
+                # prose. Content dedup must not substitute a different owner.
+                if operation == "add" and not (kind == "open_question" and state_projection is not None):
                     content_key = _entity_content_key(text)
                     for candidate in self._conn.execute(
                         "SELECT * FROM meeting_entities WHERE meeting_id = ? AND kind = ? "
@@ -5996,7 +6597,7 @@ class V2Persistence:
                     "SELECT status FROM meeting_entities WHERE meeting_id = ? AND entity_id = ?",
                     (meeting_id, entity_id),
                 ).fetchone()
-                status = str(raw_change.get("status") or "").strip() or (
+                status = declared_status or (
                     "done"
                     if operation == "resolve" and kind == "action_item"
                     else "answered"
@@ -6007,6 +6608,10 @@ class V2Persistence:
                     if existing is not None
                     else "candidate"
                 )
+                if state_only and kind == "decision_candidate" and operation in {"add", "update"} and declared_status.lower() == "adopted":
+                    # Only the formal entity uses its existing confirmed label;
+                    # the accepted declaration and semantic memory stay adopted.
+                    status = "confirmed"
                 confidence = _bounded_confidence(raw_change.get("confidence"))
                 entity = {
                     "id": entity_id,
@@ -6057,6 +6662,7 @@ class V2Persistence:
                 )
                 state_change_count += 1
 
+            previous_topic = self._meeting_state_locked(meeting_id).get("current_topic") or {}
             if isinstance(raw_topic, Mapping) and str(raw_topic.get("operation") or "").strip() != "noop":
                 topic_title = _required(str(raw_topic.get("title") or ""), "topic.title")
                 topic_summary = _required(str(raw_topic.get("summary") or ""), "topic.summary")
@@ -6085,6 +6691,22 @@ class V2Persistence:
                     correlation_id=meeting_id,
                     causation_id=job_id,
                 )
+
+            if not participation or state_only:
+                self._observe_discussion_semantics_locked(meeting_id=meeting_id, topic_update=raw_topic,
+                                                          state_changes=raw_changes, previous_topic_title=str(previous_topic.get("text") or ""),
+                                                          current_seq=int(request_metadata["anchor_seq"]) if state_only else current_seq, now_ms=now_ms,
+                                                          excluding_job_id=job_id if state_only else None,
+                                                          state_request_metadata=request_metadata if state_only else None,
+                                                          state_attention=response.get("current_attention") if state_only else None)
+                self._mark_discussion_semantic_checked_locked(meeting_id, int(request_metadata["anchor_seq"]) if state_only else current_seq, now_ms)
+                if state_only:
+                    # Attention-only/noop responses still update in this same
+                    # transaction; invalid references roll all entities back.
+                    current_attention = self._apply_current_attention_locked(
+                        meeting_id=meeting_id, attention=response.get("current_attention"),
+                        metadata=request_metadata, now_ms=now_ms, excluding_job_id=job_id,
+                    )
 
             # Re-sample immediately before the formal applied event. Entity
             # writes above are in this same transaction and therefore roll
@@ -6138,6 +6760,18 @@ class V2Persistence:
                 dict(raw_coach_intervention) if isinstance(raw_coach_intervention, Mapping) else None
             )
             coach_decision_payload = dict(raw_coach_decision) if isinstance(raw_coach_decision, Mapping) else None
+            for ui_candidate in (coach_intervention_payload, coach_decision_payload):
+                if ui_candidate is not None:
+                    for ui_key in ("ui_render_receipt", "ui_render_measurement_version", "ui_render_input_version"):
+                        ui_candidate.pop(ui_key, None)
+            if participation and not state_only:
+                # Coverage describes this job's actual frozen initial packet.
+                # Model output and a later GET must never replace that history.
+                frozen_material_context = json.loads(_json_dump(request_metadata.get("material_context") or {}))
+                if coach_decision_payload is not None:
+                    coach_decision_payload["material_context"] = frozen_material_context
+                if coach_intervention_payload is not None:
+                    coach_intervention_payload["material_context"] = json.loads(_json_dump(frozen_material_context))
             if (
                 coach_decision_payload is not None
                 and str(coach_decision_payload.get("status") or "") == "timed_out"
@@ -6146,10 +6780,12 @@ class V2Persistence:
             ):
                 soft_deadline = _timing_ms(coach_decision_payload.get("soft_deadline_at_ms"))
                 if soft_deadline is not None:
+                    frozen_at_ms = _timing_ms(coach_decision_payload.get("frozen_at_ms"))
+                    origin_ms = frozen_at_ms if frozen_at_ms is not None else soft_deadline - COACH_SOFT_DELIVERY_CUTOFF_MS
                     coach_decision_payload["soft_timeout_projection_at_ms"] = now_ms
                     coach_decision_payload["soft_cutoff_elapsed_ms"] = max(
                         0,
-                        now_ms - (soft_deadline - COACH_SOFT_DELIVERY_CUTOFF_MS),
+                        now_ms - origin_ms,
                     )
                 coach_decision_payload["delivery_status"] = "too_late"
                 coach_decision_payload["soft_cutoff_triggered"] = True
@@ -6200,6 +6836,7 @@ class V2Persistence:
                         )
                         coach_intervention_payload.setdefault("superseded_by", None)
             if coach_intervention_payload is not None:
+                coach_intervention_payload["source_evidence"] = list(document_sources)
                 coach_intervention_payload["projected_at_ms"] = now_ms
                 coach_intervention_payload["dropped_at_ms"] = None
             if coach_decision_payload is not None:
@@ -6262,6 +6899,8 @@ class V2Persistence:
                         coach_intervention_payload.get("evidence_segment_ids") or []
                     ),
                     "evidence_quote": str(coach_intervention_payload.get("evidence_quote") or ""),
+                    "source_evidence": list(document_sources),
+                    "trigger_type": coach_intervention_payload.get("trigger_type") or (coach_decision_payload or {}).get("trigger_type"),
                     "urgency": str(coach_intervention_payload.get("urgency") or "medium"),
                     "coach_event_type": str(coach_intervention_payload.get("event_type") or ""),
                     "title": str(coach_intervention_payload.get("title") or ""),
@@ -6297,9 +6936,14 @@ class V2Persistence:
                     "delivery_status",
                     "late_result_discarded",
                     "valid_until_ms",
+                    "frozen_at_ms",
+                    "proposal_contract",
                             "lifecycle_action",
                             "supersedes_decision_id",
                             "superseded_by",
+                            "coach_profile", "analysis_kind", "proposal_type", "topic_id", "analysis_basis_revision",
+                             "supporting_facts", "assumptions",
+                             "material_context",
                         )
                         if coach_intervention_payload.get(key) is not None
                     },
@@ -6313,6 +6957,16 @@ class V2Persistence:
                 # responses always include an explicit coach decision, so the
                 # two lanes remain distinguishable there.
                 follow_up_payload = semantic_follow_up_payload
+            if document_sources and source_evidence_state(self._conn, meeting_id, document_sources) != "valid":
+                raise IntelligenceEvidenceSuperseded("coach document source changed during projection")
+            if input_binding and input_context_state(self._conn, meeting_id, input_binding) != "valid":
+                raise IntelligenceEvidenceSuperseded("coach project state or memory changed during projection")
+            if (document_sources or input_binding) and coach_decision_payload is not None and coach_intervention_payload is not None:
+                coach_decision_payload["source_evidence"] = list(document_sources)
+                self._conn.execute(
+                    "INSERT INTO coach_source_bindings(meeting_id,decision_id,job_id,source_evidence_json,input_context_json,payload_json,created_at_ms) VALUES(?,?,?,?,?,?,?)",
+                    (meeting_id, coach_decision_payload["decision_id"], job_id, json.dumps(document_sources, ensure_ascii=False), json.dumps(input_binding, ensure_ascii=False), json.dumps(coach_decision_payload, ensure_ascii=False), now_ms),
+                )
             self._append_event_locked(
                 meeting_id=meeting_id,
                 event_type="meeting.intelligence.applied",
@@ -6324,6 +6978,10 @@ class V2Persistence:
                     "job_id": job_id,
                     "revision_count": revision_count,
                     "state_change_count": state_change_count,
+                    **({"state_projection": state_projection} if state_projection is not None else {}),
+                    **({"current_attention": current_attention, "accepted_topic_update": raw_topic}
+                       if current_attention is not None else {}),
+                    **({"current_need": current_need} if current_need is not None else {}),
                     "follow_up": follow_up_payload,
                     "semantic_follow_up": semantic_follow_up_payload,
                     "coach_intervention": coach_intervention_payload,
@@ -6336,6 +6994,8 @@ class V2Persistence:
                     "decision_completed_at_ms": timing_envelope["decision_completed_at_ms"],
                     "projected_at_ms": timing_envelope["projected_at_ms"],
                     **applied_event_context,
+                    **publication_marker(request_metadata, coach_decision_payload, coach_intervention_payload,
+                                         input_version=int(transaction_job["input_version"])),
                     **(
                         {"event_context": dict(applied_event_context)}
                         if is_local_reflex
@@ -6351,6 +7011,10 @@ class V2Persistence:
             "idempotent": False,
             "revision_count": revision_count,
             "state_change_count": state_change_count,
+            **({"state_projection": state_projection} if state_projection is not None else {}),
+            **({"current_attention": current_attention, "accepted_topic_update": raw_topic}
+               if current_attention is not None else {}),
+            **({"current_need": current_need} if current_need is not None else {}),
             "follow_up": follow_up_payload,
             "semantic_follow_up": semantic_follow_up_payload,
             "coach_intervention": coach_intervention_payload,
@@ -6759,14 +7423,22 @@ class V2Persistence:
                     (meeting_id, suggestion_id),
                 ).fetchone()
                 updated = self._suggestion_dict(updated_row)
+                feedback_seq = int(self._conn.execute("SELECT COALESCE(MAX(seq),0)+1 FROM meeting_events WHERE meeting_id=?", (meeting_id,)).fetchone()[0])
+                feedback_context = {
+                    "question": row["question_text"] if "question_text" in row.keys() else None,
+                    "generation_id": row["generation_id"],
+                    "evidence_hash": row["evidence_hash"],
+                    "input_context": json.loads(row["input_context_json"] or "{}"),
+                    "source_evidence": json.loads(row["source_evidence_json"] or "[]"),
+                }
                 self._append_event_locked(
                     meeting_id=meeting_id,
                     event_type="suggestion.feedback.updated",
                     aggregate_type="suggestion",
                     aggregate_id=suggestion_id,
                     occurred_at_ms=now_ms,
-                    idempotency_key=f"suggestion.feedback:{suggestion_id}:{feedback}",
-                    payload=updated,
+                    idempotency_key=f"suggestion.feedback:{suggestion_id}:{feedback}:{feedback_seq}",
+                    payload={**updated, "feedback_context": feedback_context},
                     correlation_id=correlation_id,
                 )
             else:
@@ -7168,6 +7840,7 @@ class V2Persistence:
         lease_owner: str,
         lease_ms: int,
         now_ms: int,
+        output_relative_path: str | None = None,
     ) -> dict[str, Any]:
         meeting_id = _required(meeting_id, "meeting_id")
         track = _required(track, "track")
@@ -7181,6 +7854,11 @@ class V2Persistence:
             raise ValueError("recording epoch must be non-negative")
         if sample_rate_hz <= 0 or lease_ms <= 0:
             raise ValueError("sample_rate_hz and lease_ms must be positive")
+        if output_relative_path is not None:
+            output_relative_path = resolve_realtime_recording_layout(
+                recording={"meeting_id": meeting_id, "track": track, "epoch": epoch,
+                           "output_relative_path": output_relative_path}, chunks=[],
+            )["output_relative_path"]
 
         with self._write_transaction():
             self._raise_if_tombstoned_locked(meeting_id)
@@ -7248,7 +7926,7 @@ class V2Persistence:
                     lease_owner,
                     now_ms + lease_ms,
                     aggregate["journal_sha256"],
-                    f"audio_assets/{meeting_id}/audio.wav",
+                    output_relative_path or f"audio_assets/{meeting_id}/audio.wav",
                     now_ms if existing is None else int(existing["started_at_ms"]),
                     now_ms,
                 ),
@@ -7734,6 +8412,7 @@ class V2Persistence:
             int(existing["input_chunk_count"]) != chunk_count
             or int(existing["input_sample_count"]) != sample_count
             or str(existing["input_journal_sha256"] or "") != journal_sha256
+            or existing["output_relative_path"] != recording["output_relative_path"]
         )
         if existing is None:
             self._conn.execute(
@@ -8133,11 +8812,28 @@ class V2Persistence:
                 "SELECT * FROM recording_exports WHERE id = ?",
                 (export_id,),
             ).fetchone()
+            output_relative_path = str(output.get("relative_path") or export_row["output_relative_path"])
+            if output.get("relative_path") is not None:
+                chunk_rows = self._conn.execute(
+                    "SELECT * FROM audio_chunks WHERE meeting_id = ? AND track = ? AND epoch = ? "
+                    "AND status = 'committed' ORDER BY chunk_seq",
+                    (export_row["meeting_id"], export_row["track"], int(export_row["epoch"])),
+                ).fetchall()
+                layout = resolve_realtime_recording_layout(
+                    recording=dict(export_row), chunks=[self._audio_chunk_dict(chunk) for chunk in chunk_rows],
+                )
+                if output_relative_path != layout["output_relative_path"]:
+                    raise ValueError("recording export output does not match its journal layout")
+                self._conn.execute(
+                    "UPDATE recording_exports SET output_relative_path = ? WHERE id = ?",
+                    (output_relative_path, export_id),
+                )
             self._conn.execute(
-                "UPDATE recording_sessions SET status = 'ready', output_sha256 = ?, "
+                "UPDATE recording_sessions SET status = 'ready', output_relative_path = ?, output_sha256 = ?, "
                 "output_file_size_bytes = ?, error_class = NULL, completed_at_ms = ?, "
                 "updated_at_ms = ? WHERE meeting_id = ? AND track = ? AND epoch = ?",
                 (
+                    output_relative_path,
                     output_sha256,
                     output_file_size_bytes,
                     now_ms,
@@ -8167,6 +8863,63 @@ class V2Persistence:
                 (export_id,),
             ).fetchone()
         return self._recording_export_dict(completed_row)
+
+    def retry_failed_recording_export(
+        self, *, export_id: str, expected_journal_sha256: str, now_ms: int,
+    ) -> dict[str, Any]:
+        """Explicitly retry one failed immutable journal, retaining the failure audit."""
+        export_id = _required(export_id, "export_id")
+        expected_journal_sha256 = _required(expected_journal_sha256, "expected_journal_sha256")
+        now_ms = max(0, int(now_ms))
+        with self._write_transaction():
+            job = self._conn.execute("SELECT * FROM recording_exports WHERE id = ?", (export_id,)).fetchone()
+            if job is None:
+                raise KeyError("recording export not found")
+            self._raise_if_tombstoned_locked(str(job["meeting_id"]))
+            if job["status"] != "failed":
+                raise RuntimeError("only a failed recording export can be explicitly retried")
+            row = self._conn.execute(
+                "SELECT * FROM recording_sessions WHERE meeting_id = ? AND track = ? AND epoch = ?",
+                (job["meeting_id"], job["track"], int(job["epoch"])),
+            ).fetchone()
+            if row is None or row["status"] != "failed":
+                raise RuntimeError("recording capture changed after its export failure")
+            aggregate = self._recording_aggregate_locked(str(job["meeting_id"]), str(job["track"]), int(job["epoch"]))
+            if (expected_journal_sha256 != job["input_journal_sha256"]
+                    or aggregate["journal_sha256"] != expected_journal_sha256
+                    or aggregate["chunk_count"] != int(job["input_chunk_count"])
+                    or aggregate["sample_count"] != int(job["input_sample_count"])):
+                raise ValueError("recording journal changed before explicit retry")
+            chunks = self._conn.execute(
+                "SELECT * FROM audio_chunks WHERE meeting_id = ? AND track = ? AND epoch = ? "
+                "AND status = 'committed' ORDER BY chunk_seq",
+                (job["meeting_id"], job["track"], int(job["epoch"])),
+            ).fetchall()
+            layout = resolve_realtime_recording_layout(
+                recording=self._recording_session_dict(row), chunks=[self._audio_chunk_dict(chunk) for chunk in chunks],
+            )
+            self._conn.execute(
+                "UPDATE recording_exports SET status = 'pending', attempts = 0, lease_owner = NULL, "
+                "lease_until_ms = NULL, next_attempt_at_ms = ?, completed_at_ms = NULL, error_class = NULL, "
+                "output_json = NULL, output_relative_path = ?, updated_at_ms = ? WHERE id = ?",
+                (now_ms, layout["output_relative_path"], now_ms, export_id),
+            )
+            self._conn.execute(
+                "UPDATE recording_sessions SET status = 'sealed', error_class = NULL, output_relative_path = ?, "
+                "completed_at_ms = NULL, updated_at_ms = ? WHERE meeting_id = ? AND track = ? AND epoch = ?",
+                (layout["output_relative_path"], now_ms, job["meeting_id"], job["track"], int(job["epoch"])),
+            )
+            self._append_event_locked(
+                meeting_id=str(job["meeting_id"]), event_type="recording.export.retry_requested",
+                aggregate_type="recording_export", aggregate_id=export_id, occurred_at_ms=now_ms,
+                idempotency_key=f"recording.export.retry_requested:{export_id}:{now_ms}",
+                payload={"export_id": export_id, "previous_error_class": job["error_class"],
+                         "previous_attempts": int(job["attempts"]), "journal_sha256": expected_journal_sha256,
+                         "output_relative_path": layout["output_relative_path"]},
+                correlation_id=str(job["meeting_id"]),
+            )
+            pending = self._conn.execute("SELECT * FROM recording_exports WHERE id = ?", (export_id,)).fetchone()
+        return self._recording_export_dict(pending)
 
     def retry_recording_export(
         self,
@@ -8358,6 +9111,20 @@ class V2Persistence:
             (meeting_id, row["track"], int(row["epoch"])),
         ).fetchone()
         recording = self._recording_session_dict(updated_row)
+        if int(recording["chunk_count"]) > 0:
+            chunk_rows = self._conn.execute(
+                "SELECT * FROM audio_chunks WHERE meeting_id = ? AND track = ? AND epoch = ? "
+                "AND status = 'committed' ORDER BY chunk_seq",
+                (meeting_id, row["track"], int(row["epoch"])),
+            ).fetchall()
+            layout = resolve_realtime_recording_layout(
+                recording=recording, chunks=[self._audio_chunk_dict(chunk) for chunk in chunk_rows],
+            )
+            recording["output_relative_path"] = layout["output_relative_path"]
+            self._conn.execute(
+                "UPDATE recording_sessions SET output_relative_path = ? WHERE meeting_id = ? AND track = ? AND epoch = ?",
+                (layout["output_relative_path"], meeting_id, row["track"], int(row["epoch"])),
+            )
         self._append_event_locked(
             meeting_id=meeting_id,
             event_type="recording.interrupted",
@@ -8660,6 +9427,7 @@ class V2Persistence:
     def _purge_recording_data_locked(self, meeting_id: str) -> dict[str, int]:
         counts: dict[str, int] = {}
         for table in (
+            "transcript_recovery_jobs",
             "recording_import_jobs",
             "recording_derivations",
             "recording_exports",
@@ -8681,6 +9449,7 @@ class V2Persistence:
     def _purge_transcript_data_locked(self, meeting_id: str) -> dict[str, int]:
         counts = self._purge_derived_data_locked(meeting_id)
         for table in (
+            "transcript_recovery_jobs",
             "semantic_paragraph_checkpoints",
             "semantic_paragraphs",
             "asr_checkpoints",
@@ -8700,8 +9469,17 @@ class V2Persistence:
         counts["transcript_events"] = int(result.rowcount)
         return counts
 
-    def _purge_all_meeting_data_locked(self, meeting_id: str) -> dict[str, int]:
+    def _purge_all_meeting_data_locked(self, meeting_id: str, *, now_ms: int | None = None) -> dict[str, int]:
         counts: dict[str, int] = {}
+        linked_final_ids = [row[0] for row in self._conn.execute("SELECT document_id FROM review_documents WHERE meeting_id=?", (meeting_id,)).fetchall()]
+        linked_entity_ids = [row[0] for row in self._conn.execute("SELECT entity_id FROM meeting_entities WHERE meeting_id=?", (meeting_id,)).fetchall()]
+        timestamp = max(0, int(now_ms)) if now_ms is not None else int(time.time() * 1000)
+        from .meeting_materials import delete_meeting_materials
+        delete_meeting_materials(self._conn, meeting_id, timestamp)
+        self._conn.execute("INSERT OR IGNORE INTO memory_exclusions(fingerprint,created_at_ms) "
+                           "SELECT fingerprint,? FROM user_memories WHERE scope='meeting' AND scope_id=?", (timestamp, meeting_id))
+        counts["user_memories"] = int(self._conn.execute("DELETE FROM user_memories WHERE scope='meeting' AND scope_id=?", (meeting_id,)).rowcount)
+        counts["project_reconcile_jobs"] = int(self._conn.execute("SELECT COUNT(*) FROM project_reconcile_jobs WHERE meeting_id=?", (meeting_id,)).fetchone()[0])
         counts["review_document_revisions"] = int(
             self._conn.execute(
                 "SELECT COUNT(*) FROM review_document_revisions WHERE document_id IN ("
@@ -8712,6 +9490,7 @@ class V2Persistence:
         for table in (
             "suggestions",
             "jobs",
+            "transcript_recovery_jobs",
             "recording_import_jobs",
             "meeting_entities",
             "minutes",
@@ -8737,8 +9516,17 @@ class V2Persistence:
                 (meeting_id,),
             )
             counts[table] = int(result.rowcount)
+        from .source_library_provenance import invalidate_bound_sources
+
+        for source_id in linked_final_ids:
+            invalidate_bound_sources(self._conn, "review_document", source_id, timestamp)
+        for source_id in linked_entity_ids:
+            invalidate_bound_sources(self._conn, "meeting_entity", source_id, timestamp, source_meeting_id=meeting_id)
         result = self._conn.execute("DELETE FROM meetings WHERE id = ?", (meeting_id,))
         counts["meetings"] = int(result.rowcount)
+        self._conn.execute("UPDATE project_reconcile_jobs SET result_proposal_id=NULL WHERE result_proposal_id IN "
+                           "(SELECT id FROM project_change_proposals WHERE meeting_id=? AND status!='confirmed')", (meeting_id,))
+        counts["project_change_proposals"] = int(self._conn.execute("DELETE FROM project_change_proposals WHERE meeting_id=? AND status!='confirmed'", (meeting_id,)).rowcount)
         return counts
 
     def complete_deletion_and_purge(
@@ -8778,7 +9566,7 @@ class V2Persistence:
             elif deletion_scope == "transcript":
                 deleted_counts = self._purge_transcript_data_locked(meeting_id)
             else:
-                deleted_counts = self._purge_all_meeting_data_locked(meeting_id)
+                deleted_counts = self._purge_all_meeting_data_locked(meeting_id, now_ms=now_ms)
             if deletion_scope != "all":
                 self._conn.execute(
                     "UPDATE meetings SET revision = revision + 1, updated_at_ms = ? WHERE id = ?",
@@ -9061,7 +9849,7 @@ class V2Persistence:
 
     def _canonical_transcript_state_locked(self, meeting_id: str) -> dict[str, Any]:
         rows = self._conn.execute(
-            "SELECT segment_id, transcript_seq, revision, normalized_text FROM transcript_segments "
+            "SELECT segment_id, transcript_seq, revision, normalized_text, started_at_ms, recovery_job_id FROM transcript_segments "
             "WHERE meeting_id = ? AND duplicate_of_segment_id IS NULL ORDER BY transcript_seq",
             (meeting_id,),
         ).fetchall()
@@ -9072,7 +9860,7 @@ class V2Persistence:
                 "revision": int(row["revision"]),
                 "text": row["normalized_text"],
             }
-            for row in rows
+            for row in order_transcript_for_reading([dict(row) for row in rows])
         ]
         return {
             "revision": sum(item["revision"] for item in material),
@@ -9080,8 +9868,45 @@ class V2Persistence:
             "latest": rows[-1] if rows else None,
         }
 
-    @staticmethod
-    def _review_document_dict(row: sqlite3.Row) -> dict[str, Any]:
+    def capture_review_source(self, meeting_id: str) -> dict[str, Any]:
+        with self._lock:
+            state = self._canonical_transcript_state_locked(_required(meeting_id, "meeting_id"))
+            return {"revision": state["revision"], "hash": state["hash"]}
+
+    def _invalidate_review_sources_locked(self, *, meeting_id: str, now_ms: int, source_id: str) -> None:
+        rows = self._conn.execute(
+            "SELECT document_id, document_kind, revision FROM review_documents "
+            "WHERE meeting_id = ? AND dirty_state = 'saved'", (meeting_id,),
+        ).fetchall()
+        self._conn.execute(
+            "UPDATE review_documents SET dirty_state = 'stale', revision = revision + 1, updated_at_ms = ? "
+            "WHERE meeting_id = ? AND dirty_state = 'saved'", (now_ms, meeting_id),
+        )
+        # An old search projection must stop answering queries immediately.
+        # Rebuilding is local work requested through the existing index job.
+        self._conn.execute("DELETE FROM search_documents WHERE meeting_id = ?", (meeting_id,))
+        for row in rows:
+            from .source_library_provenance import invalidate_bound_sources
+
+            invalidate_bound_sources(self._conn, "review_document", row["document_id"], now_ms)
+            self._append_event_locked(
+                meeting_id=meeting_id, event_type="review_document.source.changed",
+                aggregate_type="review_document", aggregate_id=row["document_id"],
+                occurred_at_ms=now_ms,
+                idempotency_key=f"review_document.source:{row['document_id']}:{source_id}",
+                payload={"document_kind": row["document_kind"], "revision": int(row["revision"]) + 1, "dirty_state": "stale"},
+                correlation_id=meeting_id, causation_id=source_id,
+            )
+
+    def _review_document_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        with self._lock:
+            origins = self._conn.execute(
+                "SELECT version_kind, source_transcript_revision FROM review_document_revisions "
+                "WHERE document_id = ? AND ((version_kind = 'ai_generated' AND version = ?) "
+                "OR (version_kind = 'user_final' AND version = ?))",
+                (row["document_id"], row["ai_version"], row["user_version"]),
+            ).fetchall()
+        source_revisions = {item["version_kind"]: int(item["source_transcript_revision"]) for item in origins}
         return {
             "document_id": row["document_id"],
             "meeting_id": row["meeting_id"],
@@ -9090,10 +9915,12 @@ class V2Persistence:
             "revision": int(row["revision"]),
             "ai_generated": {
                 "version": int(row["ai_version"]),
+                "source_transcript_revision": source_revisions.get("ai_generated", int(row["source_transcript_revision"])),
                 "content": json.loads(row["ai_content_json"]) if row["ai_content_json"] is not None else None,
             },
             "user_final": {
                 "version": int(row["user_version"]),
+                "source_transcript_revision": source_revisions.get("user_final", int(row["source_transcript_revision"])),
                 "content": json.loads(row["user_content_json"]) if row["user_content_json"] is not None else None,
                 "modified": bool(row["user_modified"]),
             },
@@ -9235,6 +10062,9 @@ class V2Persistence:
                 payload={"document_kind": document_kind, "revision": revision, "user_version": user_version},
                 correlation_id=meeting_id,
             )
+            from .source_library_provenance import invalidate_bound_sources
+
+            invalidate_bound_sources(self._conn, "review_document", document_id, now_ms)
         return self._review_document_dict(stored)
 
     def _save_ai_generated_document_locked(
@@ -9274,10 +10104,12 @@ class V2Persistence:
             "user_content_json, user_modified, dirty_state, created_at_ms, updated_at_ms) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'saved', ?, ?) "
             "ON CONFLICT(meeting_id, document_kind) DO UPDATE SET "
-            "source_transcript_revision = excluded.source_transcript_revision, "
+            "source_transcript_revision = CASE WHEN review_documents.user_modified = 1 "
+            "THEN review_documents.source_transcript_revision ELSE excluded.source_transcript_revision END, "
             "revision = excluded.revision, ai_version = excluded.ai_version, "
             "user_version = excluded.user_version, ai_content_json = excluded.ai_content_json, "
             "user_content_json = COALESCE(review_documents.user_content_json, excluded.user_content_json), "
+            "dirty_state = CASE WHEN review_documents.user_modified = 1 THEN review_documents.dirty_state ELSE 'saved' END, "
             "updated_at_ms = excluded.updated_at_ms",
             (
                 document_id,
@@ -9531,6 +10363,72 @@ class V2Persistence:
             "segment_count": len(jobs),
         }
 
+    def _review_publication_time_locked(
+        self,
+        *,
+        meeting_id: str,
+        job_id: str,
+        kind: str,
+        claim: Mapping[str, Any] | None,
+        now_ms: int,
+        expected_transcript_hash: str | None,
+        expected_transcript_revision: int | None,
+    ) -> int:
+        # Direct historical/manual persistence remains compatible. Durable
+        # handlers must pass the exact claim returned by claim_next_job.
+        if claim is None:
+            return now_ms
+        clock = self._projection_clock_ms or (lambda: time.time_ns() // 1_000_000)
+        now_ms = max(now_ms, int(clock()))
+        self._raise_if_tombstoned_locked(meeting_id)
+        row = self._conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        if (
+            row is None or claim.get("id") != job_id
+            or claim.get("meeting_id") != meeting_id or row["meeting_id"] != meeting_id
+            or claim.get("kind") != kind or row["kind"] != kind
+            or claim.get("status") != "running" or row["status"] != "running"
+            or not claim.get("lease_owner") or row["lease_owner"] != claim.get("lease_owner")
+            or type(claim.get("attempts")) is not int or row["attempts"] != claim["attempts"]
+            or type(claim.get("lease_until_ms")) is not int
+            or int(row["lease_until_ms"] or 0) < claim["lease_until_ms"]
+            or int(row["lease_until_ms"] or 0) <= now_ms
+            or claim.get("deadline_at_ms") != row["deadline_at_ms"]
+        ):
+            raise JobLeaseLostError("post-meeting publication lost its durable claim")
+        if row["deadline_at_ms"] is not None and now_ms >= int(row["deadline_at_ms"]):
+            raise IntelligenceDeadlineExceeded("post-meeting publication exceeded its deadline")
+        source = self._canonical_transcript_state_locked(meeting_id)
+        if (
+            expected_transcript_hash is None or source["hash"] != expected_transcript_hash
+            or (expected_transcript_revision is not None and source["revision"] != expected_transcript_revision)
+        ):
+            raise ReviewSourceChangedError("review source changed during generation")
+        return now_ms
+
+    def _save_legacy_review_fields_locked(
+        self, meeting_id: str, *, minutes: Mapping[str, Any] | None = None,
+        approach_cards: Sequence[Mapping[str, Any]] | None = None,
+    ) -> None:
+        # Both repositories use this database. Updating the latest row here
+        # keeps the legacy projection in the same guarded publication transaction.
+        row = self._conn.execute(
+            "SELECT record_json FROM asr_live_sessions WHERE session_id = ?", (meeting_id,),
+        ).fetchone()
+        if row is None:
+            raise ReviewSourceChangedError("review source record is no longer available")
+        record = json.loads(row["record_json"])
+        if minutes is not None:
+            record["minutes"] = dict(minutes)
+        if approach_cards:
+            merged = {str(card.get("card_id")): dict(card) for card in record.get("approach_cards") or []}
+            merged.update({str(card.get("card_id")): dict(card) for card in approach_cards})
+            record["approach_cards"] = list(merged.values())
+        stored_minutes = record.get("minutes") or {}
+        self._conn.execute(
+            "UPDATE asr_live_sessions SET record_json = ?, has_minutes = ? WHERE session_id = ?",
+            (_json_dump(record), int(bool(stored_minutes.get("minutes_md") or stored_minutes.get("minutes_json"))), meeting_id),
+        )
+
     def save_minutes(
         self,
         *,
@@ -9540,6 +10438,10 @@ class V2Persistence:
         structured: Mapping[str, Any] | None,
         degraded: bool,
         now_ms: int,
+        expected_transcript_hash: str | None = None,
+        expected_transcript_revision: int | None = None,
+        expected_claim: Mapping[str, Any] | None = None,
+        legacy_minutes: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         meeting_id = _required(meeting_id, "meeting_id")
         job_id = _required(job_id, "job_id")
@@ -9547,6 +10449,13 @@ class V2Persistence:
         now_ms = max(0, int(now_ms))
         structured_payload = dict(structured) if structured is not None else {}
         with self._write_transaction():
+            now_ms = self._review_publication_time_locked(
+                meeting_id=meeting_id, job_id=job_id, kind="minutes", claim=expected_claim,
+                now_ms=now_ms, expected_transcript_hash=expected_transcript_hash,
+                expected_transcript_revision=expected_transcript_revision,
+            )
+            if expected_transcript_hash is not None and self._canonical_transcript_state_locked(meeting_id)["hash"] != expected_transcript_hash:
+                raise ReviewSourceChangedError("review source changed during generation")
             existing = self._conn.execute(
                 "SELECT version, created_at_ms FROM minutes WHERE meeting_id = ?",
                 (meeting_id,),
@@ -9639,6 +10548,10 @@ class V2Persistence:
                 now_ms=now_ms,
             )
             artifact = self._minutes_locked(meeting_id)
+            if legacy_minutes is not None:
+                if expected_claim is None:
+                    raise ValueError("legacy minutes publication requires a durable claim")
+                self._save_legacy_review_fields_locked(meeting_id, minutes=dict(legacy_minutes))
             self._append_event_locked(
                 meeting_id=meeting_id,
                 event_type="meeting.minutes.ready",
@@ -9650,6 +10563,11 @@ class V2Persistence:
                 correlation_id=meeting_id,
                 causation_id=job_id,
             )
+            self._review_publication_time_locked(
+                meeting_id=meeting_id, job_id=job_id, kind="minutes", claim=expected_claim,
+                now_ms=now_ms, expected_transcript_hash=expected_transcript_hash,
+                expected_transcript_revision=expected_transcript_revision,
+            )
         return artifact
 
     def save_approach_cards(
@@ -9660,11 +10578,22 @@ class V2Persistence:
         cards: list[Mapping[str, Any]],
         degraded: bool,
         now_ms: int,
+        expected_transcript_hash: str | None = None,
+        expected_transcript_revision: int | None = None,
+        expected_claim: Mapping[str, Any] | None = None,
+        legacy_cards: Sequence[Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
         meeting_id = _required(meeting_id, "meeting_id")
         job_id = _required(job_id, "job_id")
         now_ms = max(0, int(now_ms))
         with self._write_transaction():
+            now_ms = self._review_publication_time_locked(
+                meeting_id=meeting_id, job_id=job_id, kind="approach", claim=expected_claim,
+                now_ms=now_ms, expected_transcript_hash=expected_transcript_hash,
+                expected_transcript_revision=expected_transcript_revision,
+            )
+            if expected_transcript_hash is not None and self._canonical_transcript_state_locked(meeting_id)["hash"] != expected_transcript_hash:
+                raise ReviewSourceChangedError("review source changed during generation")
             existing = self._conn.execute(
                 "SELECT created_at_ms FROM approach_artifacts WHERE meeting_id = ?",
                 (meeting_id,),
@@ -9692,6 +10621,10 @@ class V2Persistence:
                 "degraded": bool(degraded),
                 "updated_at_ms": now_ms,
             }
+            if legacy_cards is not None:
+                if expected_claim is None:
+                    raise ValueError("legacy approach publication requires a durable claim")
+                self._save_legacy_review_fields_locked(meeting_id, approach_cards=legacy_cards)
             self._append_event_locked(
                 meeting_id=meeting_id,
                 event_type="meeting.approach.ready",
@@ -9703,6 +10636,11 @@ class V2Persistence:
                 correlation_id=meeting_id,
                 causation_id=job_id,
             )
+            self._review_publication_time_locked(
+                meeting_id=meeting_id, job_id=job_id, kind="approach", claim=expected_claim,
+                now_ms=now_ms, expected_transcript_hash=expected_transcript_hash,
+                expected_transcript_revision=expected_transcript_revision,
+            )
         return artifact
 
     def rebuild_search_document(
@@ -9711,11 +10649,19 @@ class V2Persistence:
         meeting_id: str,
         job_id: str,
         now_ms: int,
+        expected_claim: Mapping[str, Any] | None = None,
+        expected_transcript_hash: str | None = None,
+        expected_transcript_revision: int | None = None,
     ) -> dict[str, Any]:
         meeting_id = _required(meeting_id, "meeting_id")
         job_id = _required(job_id, "job_id")
         now_ms = max(0, int(now_ms))
         with self._write_transaction():
+            now_ms = self._review_publication_time_locked(
+                meeting_id=meeting_id, job_id=job_id, kind="index", claim=expected_claim,
+                now_ms=now_ms, expected_transcript_hash=expected_transcript_hash,
+                expected_transcript_revision=expected_transcript_revision,
+            )
             rows = self._conn.execute(
                 "SELECT * FROM transcript_segments WHERE meeting_id = ? "
                 "AND duplicate_of_segment_id IS NULL ORDER BY transcript_seq",
@@ -9764,6 +10710,11 @@ class V2Persistence:
                 payload=artifact,
                 correlation_id=meeting_id,
                 causation_id=job_id,
+            )
+            self._review_publication_time_locked(
+                meeting_id=meeting_id, job_id=job_id, kind="index", claim=expected_claim,
+                now_ms=now_ms, expected_transcript_hash=expected_transcript_hash,
+                expected_transcript_revision=expected_transcript_revision,
             )
         return artifact
 
@@ -9824,6 +10775,27 @@ class V2Persistence:
                     lease_owner=normalized_lease_owner,
                     now_ms=now_ms,
                 )
+            context_row = self._conn.execute(
+                "SELECT meeting_id, context_evidence_json,source_evidence_json,input_context_json FROM suggestions WHERE suggestion_id = ?",
+                (suggestion_id,),
+            ).fetchone()
+            if context_row is not None:
+                document_bindings = json.loads(context_row["source_evidence_json"] or "[]")
+                if document_bindings and source_evidence_state(self._conn, context_row["meeting_id"], document_bindings) != "valid":
+                    return None
+                input_binding = json.loads(context_row["input_context_json"] or "{}")
+                if input_binding:
+                    from .user_memory import input_context_state
+
+                    if input_context_state(self._conn, context_row["meeting_id"], input_binding) != "valid":
+                        return None
+                for binding in json.loads(context_row["context_evidence_json"] or "[]"):
+                    source = self._conn.execute(
+                        "SELECT evidence_hash FROM transcript_segments WHERE meeting_id = ? AND segment_id = ?",
+                        (context_row["meeting_id"], binding["segment_id"]),
+                    ).fetchone()
+                    if source is None or source["evidence_hash"] != binding["evidence_hash"]:
+                        return None
             result = self._conn.execute(
                 "UPDATE suggestions SET status = 'committed', text = ?, final_draft_seq = ?, "
                 "runtime = COALESCE(?, runtime), provider = COALESCE(?, provider), "
@@ -9931,6 +10903,8 @@ class V2Persistence:
                 (meeting_id,),
             ).fetchone()
             state = self._meeting_state_locked(meeting_id)
+            discussion_row = self._current_discussion_locked(meeting_id)
+            discussion = self._agent_work_item_dict(discussion_row) if discussion_row is not None else None
             jobs = self.list_jobs(meeting_id=meeting_id)
             minutes = self._minutes_locked(meeting_id)
             approach_row = self._conn.execute(
@@ -10016,6 +10990,10 @@ class V2Persistence:
             for row in paragraph_rows
         ]
         review_documents = {str(row["document_kind"]): self._review_document_dict(row) for row in review_document_rows}
+        snapshot_segments = [self._segment_dict(row) for row in segment_rows]
+        _project_terminal_correction_status(snapshot_segments,
+            meeting_state=str(meeting["state"] if meeting is not None else "unknown"),
+            active_correction=any(item["kind"] == "correction" and item["status"] in {"pending", "running", "retry_wait"} for item in jobs))
         recording_dicts = [self._recording_session_dict(row) for row in recording_rows]
         capture = _capture_freshness_summary(
             recording_dicts,
@@ -10023,13 +11001,15 @@ class V2Persistence:
             now_ms=snapshot_now_ms,
         )
         recording_statuses = {str(row["status"]) for row in recording_rows}
-        if "failed" in recording_statuses:
-            audio_status = "failed"
-        elif capture["state"] == "active":
+        # A failed export from an earlier capture remains inspectable, but
+        # must not hide the fresh lease of a successfully resumed recording.
+        if capture["state"] == "active":
             audio_status = "recording"
+        elif any(recording_attempt_failed(row) for row in recording_dicts):
+            audio_status = "partial_failure" if "ready" in recording_statuses else "failed"
         elif "active" in recording_statuses:
             audio_status = "unknown"
-        elif recording_statuses & {"sealed", "exporting", "interrupted"}:
+        elif any(recording_needs_assembly(row) for row in recording_dicts):
             audio_status = "assembling"
         elif "ready" in recording_statuses or (
             audio_rows and meeting is not None and meeting["state"] != "live"
@@ -10043,6 +11023,9 @@ class V2Persistence:
             # waiting state instead of claiming that recording is active.
             audio_status = "unknown"
         recording_indicator = (
+            {"state": "error", "label": "部分录音未成功，已保存部分可回放"}
+            if audio_status == "partial_failure"
+            else
             {"state": "error", "label": "录音整理失败"}
             if audio_status == "failed"
             else {"state": "paused", "label": "录音待恢复"}
@@ -10077,11 +11060,50 @@ class V2Persistence:
                 "updated_at_ms": job["updated_at_ms"],
                 "completed_at_ms": job["completed_at_ms"],
             }
+            raw_output = job.get("output")
+            if isinstance(raw_output, Mapping):
+                safe_output = {key: raw_output[key] for key in ("degraded", "correction_degraded")
+                               if type(raw_output.get(key)) is bool}
+                reason = raw_output.get("correction_degraded_reason")
+                if isinstance(reason, str) and reason in {
+                    "correction_partial_coverage", "correction_jobs_missing", "correction_has_no_successful_job",
+                    "correction_wait_timeout", "correction_provider_not_configured",
+                    "correction_provider_rates_not_configured", "correction_provider_budget_exhausted",
+                    "v2_persistence_unavailable",
+                }:
+                    safe_output["correction_degraded_reason"] = reason
+                if safe_output:
+                    review_jobs[kind]["output"] = safe_output
+        imported_recordings = [
+            row for row in recording_rows if row["source_type"] == "imported_file"
+        ]
+        if import_job_row is not None or imported_recordings:
+            # Upload/processing/retry timestamps are audit clocks, not the
+            # duration of a prerecorded meeting. Do not invent a duration
+            # before its normalized recording has been registered.
+            ready_imports = [row for row in imported_recordings if row["status"] == "ready"]
+            runtime_elapsed_ms = (
+                sum(int(row["duration_ms"]) for row in ready_imports)
+                if ready_imports
+                else None
+            )
+        else:
+            runtime_elapsed_ms = (
+                max(
+                    0,
+                    int(
+                        (meeting["ended_at_ms"] or meeting["updated_at_ms"])
+                        - (meeting["started_at_ms"] or meeting["created_at_ms"])
+                    ),
+                )
+                if meeting is not None
+                else None
+            )
         return {
             "meeting_id": meeting_id,
             "title": meeting["title"] if meeting is not None else None,
             "last_seq": last_seq,
-            "segments": [self._segment_dict(row) for row in segment_rows],
+            "segments": order_transcript_for_reading(snapshot_segments),
             "semantic_paragraphs": semantic_paragraphs,
             "active_paragraph": next(
                 (paragraph for paragraph in semantic_paragraphs if paragraph["status"] == "active"),
@@ -10098,6 +11120,7 @@ class V2Persistence:
             "suggestions": [self._suggestion_dict(row) for row in suggestion_rows],
             "jobs": [self._job_status_summary(job) for job in jobs],
             "current_topic": state["current_topic"],
+            "discussion": discussion,
             "open_questions": state["open_questions"],
             "follow_up": follow_up,
             "coach_decision": coach_decision,
@@ -10109,6 +11132,11 @@ class V2Persistence:
             "active_partial": None,
             "minutes": minutes,
             "approach_cards": json.loads(approach_row["cards_json"]) if approach_row is not None else [],
+            "approach_artifact": {
+                "job_id": approach_row["job_id"],
+                "created_at_ms": int(approach_row["created_at_ms"]),
+                "updated_at_ms": int(approach_row["updated_at_ms"]),
+            } if approach_row is not None else None,
             "review_jobs": review_jobs,
             "import_job": self._import_job_dict(import_job_row) if import_job_row is not None else None,
             "documents": review_documents,
@@ -10118,6 +11146,9 @@ class V2Persistence:
                     if any(job["status"] == "failed" for job in review_jobs.values())
                     else "processing"
                     if any(job["status"] in {"pending", "running", "retry_wait"} for job in review_jobs.values())
+                    else "degraded"
+                    if (minutes is not None and minutes["status"] == "degraded")
+                    or (approach_row is not None and approach_row["degraded"])
                     else "ready"
                     if meeting is not None and meeting["state"] == "ended"
                     else "unavailable"
@@ -10145,17 +11176,7 @@ class V2Persistence:
                     "label": "AI 正在处理" if ai_busy else "AI 已同步",
                     "error_class": None,
                 },
-                "elapsed_ms": (
-                    max(
-                        0,
-                        int(
-                            (meeting["ended_at_ms"] or meeting["updated_at_ms"])
-                            - (meeting["started_at_ms"] or meeting["created_at_ms"])
-                        ),
-                    )
-                    if meeting is not None
-                    else None
-                ),
+                "elapsed_ms": runtime_elapsed_ms,
             },
         }
 
@@ -10528,9 +11549,16 @@ class V2Persistence:
                 "AND transcript_seq > ? " + duplicate_filter + "ORDER BY transcript_seq LIMIT ?",
                 (meeting_id, after_transcript_seq, limit + 1),
             ).fetchall()
+            meeting = self._conn.execute("SELECT state FROM meetings WHERE id = ?", (meeting_id,)).fetchone()
+            active_correction = self._conn.execute(
+                "SELECT 1 FROM jobs WHERE meeting_id=? AND kind='correction' AND status IN ('pending','running','retry_wait') LIMIT 1",
+                (meeting_id,),
+            ).fetchone() is not None
         has_more = len(rows) > limit
         visible = rows[:limit]
         segments = [self._segment_dict(row) for row in visible]
+        _project_terminal_correction_status(segments,
+            meeting_state=str(meeting["state"] if meeting is not None else "unknown"), active_correction=active_correction)
         return {
             "meeting_id": meeting_id,
             "after_transcript_seq": after_transcript_seq,
@@ -11511,6 +12539,7 @@ class V2Persistence:
         scope: str,
         evidence: list[dict[str, Any]],
         now_ms: int,
+        input_context: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         meeting_id = _required(meeting_id, "meeting_id")
         thread_id = _required(thread_id, "thread_id")
@@ -11520,7 +12549,7 @@ class V2Persistence:
         if len(question) > 4_000:
             raise ValueError("question must not exceed 4000 characters")
         scope = _required(scope, "scope")
-        if scope not in {"selection", "recent", "chapter", "meeting"}:
+        if scope not in {"selection", "recent", "chapter", "meeting", "project"}:
             raise ValueError("unsupported Ask AI scope")
         evidence_json = json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))
         if len(evidence_json.encode("utf-8")) > 256 * 1024:
@@ -11556,6 +12585,11 @@ class V2Persistence:
                 "SELECT * FROM ask_messages WHERE message_id IN (?, ?) ORDER BY created_at_ms, role DESC",
                 (user_message_id, assistant_message_id),
             ).fetchall()
+            if input_context:
+                self._conn.execute("UPDATE ask_messages SET input_context_json=? WHERE message_id IN (?,?)",
+                                   (json.dumps(dict(input_context), ensure_ascii=False), user_message_id, assistant_message_id))
+                rows = self._conn.execute("SELECT * FROM ask_messages WHERE message_id IN (?,?) ORDER BY created_at_ms,role DESC",
+                                          (user_message_id, assistant_message_id)).fetchall()
         return {"thread_id": thread_id, "messages": [self._ask_message_dict(row) for row in rows]}
 
     def finish_ask_message(
@@ -11574,6 +12608,17 @@ class V2Persistence:
         if status == "completed" and not normalized_content:
             raise ValueError("assistant response must not be empty")
         with self._write_transaction():
+            if error_class is None:
+                source_row = self._conn.execute(
+                    "SELECT evidence_json,input_context_json FROM ask_messages WHERE meeting_id=? AND message_id=? AND role='assistant' AND status='pending'",
+                    (meeting_id, message_id),
+                ).fetchone()
+                if source_row is not None and source_evidence_state(self._conn, meeting_id, json.loads(source_row["evidence_json"] or "[]")) == "stale":
+                    status, error_class = "failed", "EvidenceSuperseded"
+                if source_row is not None:
+                    from .user_memory import input_context_state
+                    if input_context_state(self._conn, meeting_id, json.loads(source_row["input_context_json"] or "{}")) == "stale":
+                        status, error_class = "failed", "InputContextSuperseded"
             result = self._conn.execute(
                 "UPDATE ask_messages SET content = ?, status = ?, error_class = ?, updated_at_ms = ? "
                 "WHERE meeting_id = ? AND message_id = ? AND role = 'assistant' AND status = 'pending'",
@@ -11781,13 +12826,15 @@ class V2Persistence:
                 raise KeyError(f"meeting not found: {normalized_meeting_id}")
             if normalized_source_message_id:
                 message = self._conn.execute(
-                    "SELECT meeting_id, role, status FROM ask_messages WHERE message_id = ?",
+                    "SELECT meeting_id, role, status, evidence_json FROM ask_messages WHERE message_id = ?",
                     (normalized_source_message_id,),
                 ).fetchone()
                 if message is None or message["role"] != "assistant" or message["status"] != "completed":
                     raise KeyError(f"completed Ask AI message not found: {normalized_source_message_id}")
                 if normalized_meeting_id and str(message["meeting_id"]) != normalized_meeting_id:
                     raise ValueError("Ask AI message belongs to a different meeting")
+                if source_evidence_state(self._conn, str(message["meeting_id"]), json.loads(message["evidence_json"] or "[]")) == "stale":
+                    raise ValueError("回答来源已经变化，请重新核对后保存笔记")
             self._conn.execute(
                 "INSERT INTO meeting_notes ("
                 "note_id, meeting_id, title, body, source_kind, source_message_id, version, status, "
@@ -11893,6 +12940,51 @@ class V2Persistence:
             "limit": limit,
         }
 
+    def list_notes_page(
+        self, *, meeting_id: str | None = None, status: str = "active", query: str = "",
+        limit: int = 100, cursor: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """A timestamp plus ID cursor keeps notes sharing a timestamp on distinct pages."""
+        if status not in {"active", "archived", "deleted", "all"}:
+            raise ValueError("unsupported note status")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
+            raise ValueError("limit must be between 1 and 200")
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if meeting_id:
+            clauses.append("meeting_id=?")
+            parameters.append(meeting_id)
+        if status != "all":
+            clauses.append("status=?")
+            parameters.append(status)
+        if query.strip():
+            clauses.append("(instr(lower(title),lower(?))>0 OR instr(lower(body),lower(?))>0)")
+            parameters.extend((query.strip()[:200], query.strip()[:200]))
+        if cursor is not None:
+            if (not isinstance(cursor, Mapping) or set(cursor) != {"id", "updated_at_ms"}
+                    or not isinstance(cursor["id"], str) or not 1 <= len(cursor["id"]) <= 200
+                    or any(ord(character) < 32 for character in cursor["id"])
+                    or isinstance(cursor["updated_at_ms"], bool) or not isinstance(cursor["updated_at_ms"], int)
+                    or not 0 <= cursor["updated_at_ms"] < 2**63):
+                raise ValueError("invalid note cursor")
+            clauses.append("(updated_at_ms<? OR (updated_at_ms=? AND note_id<?))")
+            parameters.extend((cursor["updated_at_ms"], cursor["updated_at_ms"], cursor["id"]))
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        with self._lock:
+            fetched = self._conn.execute("SELECT * FROM meeting_notes" + where
+                                         + " ORDER BY updated_at_ms DESC,note_id DESC LIMIT ?", (*parameters, limit + 1)).fetchall()
+            rows = fetched[:limit]
+            note_ids = [row["note_id"] for row in rows]
+            evidence = self._conn.execute("SELECT * FROM meeting_note_evidence WHERE note_id IN ("
+                                         + ",".join("?" for _ in note_ids) + ") ORDER BY note_id,ordinal", note_ids).fetchall() if note_ids else []
+            evidence_by_note: dict[str, list[sqlite3.Row]] = {}
+            for row in evidence:
+                evidence_by_note.setdefault(row["note_id"], []).append(row)
+            items = [self._note_dict(row, evidence_rows=evidence_by_note.get(row["note_id"], [])) for row in rows]
+        more = len(fetched) > limit
+        return {"items": items, "has_more": more,
+                "next_cursor": {"id": rows[-1]["note_id"], "updated_at_ms": rows[-1]["updated_at_ms"]} if more else None}
+
     def update_note(
         self,
         note_id: str,
@@ -11925,6 +13017,9 @@ class V2Persistence:
                 "updated_at_ms = ? WHERE note_id = ?",
                 (next_title, next_body, next_status, max(0, int(now_ms)), note_id),
             )
+            from .source_library_provenance import invalidate_bound_sources
+
+            invalidate_bound_sources(self._conn, "note", note_id, max(0, int(now_ms)))
             updated = self._conn.execute("SELECT * FROM meeting_notes WHERE note_id = ?", (note_id,)).fetchone()
             evidence_rows = self._conn.execute(
                 "SELECT * FROM meeting_note_evidence WHERE note_id = ? ORDER BY ordinal",
@@ -11974,6 +13069,9 @@ class V2Persistence:
                 "UPDATE meeting_notes SET version = version + 1, updated_at_ms = ? WHERE note_id = ?",
                 (max(0, int(now_ms)), note_id),
             )
+            from .source_library_provenance import invalidate_bound_sources
+
+            invalidate_bound_sources(self._conn, "note", note_id, max(0, int(now_ms)))
         return self.get_note(note_id)
 
     def delete_note_evidence(self, note_id: str, ordinal: int, *, now_ms: int) -> dict[str, Any]:
@@ -12000,6 +13098,9 @@ class V2Persistence:
                 "UPDATE meeting_notes SET version = version + 1, updated_at_ms = ? WHERE note_id = ?",
                 (max(0, int(now_ms)), note_id),
             )
+            from .source_library_provenance import invalidate_bound_sources
+
+            invalidate_bound_sources(self._conn, "note", note_id, max(0, int(now_ms)))
         return self.get_note(note_id)
 
     def _upsert_agent_work_item_locked(
@@ -12031,6 +13132,12 @@ class V2Persistence:
         self._raise_if_tombstoned_locked(meeting_id)
 
         decision_id = str(decision.get("decision_id") or "").strip() or None
+        job = self._conn.execute("SELECT request_context_json FROM jobs WHERE id=? AND meeting_id=?", (job_id, meeting_id)).fetchone()
+        metadata = json.loads(job["request_context_json"] or "{}") if job is not None else {}
+        if metadata.get("profile") == "participation":
+            return self._complete_discussion_locked(meeting_id=meeting_id, job_id=job_id, metadata=metadata,
+                                                    decision=decision, intervention=intervention,
+                                                    now_ms=now_ms, current_seq=current_seq)
         lifecycle_refresh = bool(decision.get("lifecycle_refresh"))
         previous_decision_id = (
             str(decision.get("lifecycle_refresh_previous_decision_id") or "").strip()
@@ -12248,6 +13355,7 @@ class V2Persistence:
         meeting_id: str,
         *,
         state: str | None = None,
+        kind: str | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         meeting_id = _required(meeting_id, "meeting_id")
@@ -12266,6 +13374,11 @@ class V2Persistence:
             if normalized_state is not None:
                 clauses.append("state = ?")
                 parameters.append(normalized_state)
+            if kind is not None:
+                if kind not in {"commitment", "discussion"}:
+                    raise ValueError("unsupported agent work item kind")
+                clauses.append("kind = ?")
+                parameters.append(kind)
             parameters.append(limit)
             rows = self._conn.execute(
                 "SELECT * FROM agent_work_items WHERE " + " AND ".join(clauses) +
@@ -12322,6 +13435,8 @@ class V2Persistence:
             ).fetchone()
             if row is None:
                 raise KeyError(f"agent work item not found: {work_item_id}")
+            if row["kind"] == "discussion":
+                raise ValueError("discussion state must use the versioned discussion update")
             if expected_version is not None and int(row["version"]) != int(expected_version):
                 raise RuntimeError("agent work item version conflict")
             resolved_at_ms = now_ms if state == "resolved" else None
@@ -12353,6 +13468,110 @@ class V2Persistence:
                 parameters,
             ).fetchall()
         return [self._job_dict(row) for row in rows]
+
+    def reconcile_terminal_correction_batch(
+        self,
+        *,
+        meeting_id: str,
+        batch_id: str,
+        error_class: str,
+        expected_evidence_hashes: Mapping[str, str],
+        completed_at_ms: int,
+        causation_job_id: str,
+        expected_lease_owner: str | None,
+        now_ms: int,
+    ) -> dict[str, Any]:
+        """Settle exact failed batch evidence, without charging other jobs an attempt.
+
+        A correction batch can contain later finals than its durable job anchor.
+        Only frozen original hashes can settle those targets. The current worker
+        retains its lease so the executor still owns its terminal transition.
+        """
+        meeting_id = _required(meeting_id, "meeting_id")
+        batch_id = _required(batch_id, "batch_id")
+        causation_job_id = _required(causation_job_id, "causation_job_id")
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", batch_id):
+            raise ValueError("unsafe correction batch id")
+        if error_class not in {
+            "provider_timeout", "provider_transport", "provider_502",
+            "realtime_correction_provider_failed",
+            "correction_usage_record_failed", "correction_terminology_changed_after_response",
+            "correction_post_response_failed",
+        }:
+            raise ValueError("unsupported terminal correction provider failure")
+        completed_at_ms = max(0, int(completed_at_ms))
+        now_ms = max(0, int(now_ms))
+        hashes = {str(segment_id): str(evidence_hash)
+                  for segment_id, evidence_hash in expected_evidence_hashes.items()
+                  if re.fullmatch(r"[0-9a-f]{64}", str(evidence_hash))}
+        result = {
+            "segment_ids": [], "settled_job_count": 0, "batch_id": batch_id,
+            "error_class": error_class, "failure_provenance": "shared_correction_batch",
+        }
+        if not hashes:
+            return result
+        with self._write_transaction():
+            self._raise_if_tombstoned_locked(meeting_id)
+            current = self._conn.execute(
+                "SELECT * FROM jobs WHERE id = ? AND meeting_id = ? AND kind = 'correction'",
+                (causation_job_id, meeting_id),
+            ).fetchone()
+            if (current is None or int(current["created_at_ms"]) > completed_at_ms
+                or completed_at_ms > now_ms):
+                return result
+            if expected_lease_owner:
+                if (current["status"] != "running"
+                    or current["lease_owner"] != expected_lease_owner
+                    or int(current["lease_until_ms"] or 0) <= now_ms):
+                    return result
+            elif current["status"] not in {"pending", "retry_wait"}:
+                # Retain the established direct pending-handler test seam;
+                # unowned callers can never seize a running or cancelled task.
+                return result
+            for segment_id, evidence_hash in hashes.items():
+                row = self._conn.execute(
+                    "SELECT * FROM transcript_segments WHERE meeting_id = ? AND segment_id = ? "
+                    "AND revision = 1 AND evidence_hash = ? "
+                    "AND correction_status IN ('pending','processing','failed_preserved_original')",
+                    (meeting_id, segment_id, evidence_hash),
+                ).fetchone()
+                if row is None:
+                    continue
+                newer_repair = self._conn.execute(
+                    "SELECT 1 FROM jobs WHERE meeting_id = ? AND kind = 'correction' "
+                    "AND evidence_segment_id = ? AND id != ? "
+                    "AND status IN ('pending','retry_wait','running') AND created_at_ms > ? LIMIT 1",
+                    (meeting_id, segment_id, causation_job_id, completed_at_ms),
+                ).fetchone()
+                if newer_repair is not None:
+                    continue
+                self._conn.execute(
+                    "UPDATE transcript_segments SET correction_status = 'failed_preserved_original', "
+                    "correction_error_class = ?, correction_updated_at_ms = ? "
+                    "WHERE meeting_id = ? AND segment_id = ? AND revision = 1 AND evidence_hash = ?",
+                    (error_class, now_ms, meeting_id, segment_id, evidence_hash),
+                )
+                result["segment_ids"].append(segment_id)
+                shared_output = {
+                    "schema_version": "v2_correction_shared_batch_failure.v1",
+                    "called": False, "provider_attempt_count": 0,
+                    "failure_provenance": "shared_correction_batch",
+                    "batch_id": batch_id, "error_class": error_class,
+                    "segment_id": segment_id, "evidence_hash": evidence_hash,
+                    "source_completed_at_ms": completed_at_ms, "usage_known": False,
+                }
+                settled = self._conn.execute(
+                    "UPDATE jobs SET status = 'failed', error_class = ?, output_json = ?, "
+                    "completed_at_ms = ?, updated_at_ms = ?, lease_owner = NULL, lease_until_ms = NULL "
+                    "WHERE meeting_id = ? AND kind = 'correction' AND id != ? "
+                    "AND evidence_segment_id = ? AND evidence_hash = ? "
+                    "AND status IN ('pending','retry_wait') AND created_at_ms <= ?",
+                    (error_class, _json_dump(shared_output), now_ms, now_ms,
+                     meeting_id, causation_job_id, segment_id, evidence_hash, completed_at_ms),
+                )
+                result["settled_job_count"] += int(settled.rowcount)
+        result["segment_ids"].sort()
+        return result
 
     def supersede_correction_jobs(
         self,
@@ -12396,6 +13615,7 @@ class V2Persistence:
         segment_ids: list[str],
         max_input_transcript_seq: int,
         now_ms: int,
+        expected_evidence_hashes: Mapping[str, str] | None = None,
     ) -> list[str]:
         """Commit unchanged correction results without overwriting newer revisions."""
 
@@ -12414,12 +13634,17 @@ class V2Persistence:
         max_transcript_seq = max(0, int(max_input_transcript_seq))
         with self._write_transaction():
             rows = self._conn.execute(
-                "SELECT segment_id FROM transcript_segments WHERE meeting_id = ? "
+                "SELECT segment_id, evidence_hash FROM transcript_segments WHERE meeting_id = ? "
                 f"AND segment_id IN ({placeholders}) AND transcript_seq <= ? "
                 "AND revision = 1 AND correction_status IN ('pending', 'processing', 'no_change')",
                 (meeting_id, *normalized_segment_ids, max_transcript_seq),
             ).fetchall()
-            committed_segment_ids = sorted(str(row["segment_id"]) for row in rows)
+            expected_hashes = dict(expected_evidence_hashes or {})
+            committed_segment_ids = sorted(
+                str(row["segment_id"]) for row in rows
+                if str(row["segment_id"]) not in expected_hashes
+                or str(row["evidence_hash"]) == expected_hashes[str(row["segment_id"])]
+            )
             if not committed_segment_ids:
                 return []
             committed_placeholders = ",".join("?" for _ in committed_segment_ids)
@@ -12441,8 +13666,7 @@ class V2Persistence:
             raise KeyError(f"job not found: {job_id}")
         return self._job_dict(row)
 
-    @staticmethod
-    def _entity_dict(row: sqlite3.Row) -> dict[str, Any]:
+    def _entity_dict(self, row: sqlite3.Row) -> dict[str, Any]:
         entity = {
             "id": row["entity_id"],
             "text": row["text"],
@@ -12460,6 +13684,15 @@ class V2Persistence:
                 "evidence": json.loads(row["evidence_json"] or "{}"),
             }
         )
+        structured_evidence = entity["evidence"]
+        document_sources = structured_evidence.get("source_evidence", []) if isinstance(structured_evidence, Mapping) else []
+        if document_sources:
+            with self._lock:
+                state = source_evidence_state(self._conn, row["meeting_id"], document_sources)
+            entity.update(source_evidence=document_sources, evidence_status=state)
+            entity["source_message_id"] = structured_evidence.get("source_message_id")
+            if state == "stale" and entity["status"] not in {"dismissed", "cancelled", "done", "closed", "ignored"}:
+                entity["status"] = "needs_review"
         if kind == "action_item":
             entity.update({"owner": row["owner"], "deadline": row["deadline"]})
         if kind == "risk":
@@ -12497,6 +13730,8 @@ class V2Persistence:
             "created_at_ms": int(row["created_at_ms"]),
             "updated_at_ms": int(row["updated_at_ms"]),
             "resolved_at_ms": row["resolved_at_ms"],
+            "context": json.loads(row["context_json"] or "{}"),
+            "input_context": json.loads(row["input_context_json"] or "{}"),
         }
         if evidence_rows is not None:
             item["evidence_links"] = [
@@ -12822,7 +14057,7 @@ class V2Persistence:
 
     @staticmethod
     def _segment_dict(row: sqlite3.Row) -> dict[str, Any]:
-        return {
+        segment = {
             "meeting_id": row["meeting_id"],
             "segment_id": row["segment_id"],
             "final_id": row["final_id"],
@@ -12850,6 +14085,10 @@ class V2Persistence:
             "created_at_ms": int(row["created_at_ms"]),
             "updated_at_ms": int(row["updated_at_ms"]),
         }
+        if row["recovery_job_id"]:
+            segment["recovery_job_id"] = row["recovery_job_id"]
+            segment["recovery_provenance"] = json.loads(row["recovery_provenance_json"])
+        return segment
 
     @staticmethod
     def _event_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -12885,6 +14124,7 @@ class V2Persistence:
             "work_item_id": row["work_item_id"],
             "trigger_reference_seq": row["trigger_reference_seq"],
             "user_request": row["user_request"],
+            "request_context": json.loads(row["request_context_json"] or "{}"),
             "idempotency_key": row["idempotency_key"],
             "attempts": int(row["attempts"]),
             "max_attempts": int(row["max_attempts"]),
@@ -12935,12 +14175,27 @@ class V2Persistence:
                     "decision_completed_at_ms": job.get("decision_completed_at_ms"),
                     "projected_at_ms": job.get("projected_at_ms"),
                     "timing": job.get("timing"),
+                    "trigger_type": job.get("trigger_type"),
+                    "work_item_id": job.get("work_item_id"),
+                    "user_request": str(job.get("user_request") or "")[:300] or None,
+                    "request_context": {key: (job.get("request_context") or {})[key] for key in
+                        ("profile", "intent", "topic_id", "analysis_basis_revision", "task_mode") if key in (job.get("request_context") or {})},
                 }
             )
+            if job.get("status") == "failed" and (job.get("request_context") or {}).get("task_mode") == "discussion_state":
+                failure_output = sanitize_state_failure_output(job.get("output"))
+                if failure_output is not None:
+                    summary.update(failure_diagnostics=failure_output["failure_diagnostics"],
+                                   provider_attempt_count=failure_output["provider_attempt_count"], usage=failure_output["usage"])
         return summary
 
-    @staticmethod
-    def _ask_message_dict(row: sqlite3.Row) -> dict[str, Any]:
+    def _ask_message_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        evidence = json.loads(row["evidence_json"] or "[]")
+        with self._lock:
+            evidence_status = source_evidence_state(self._conn, row["meeting_id"], evidence)
+            from .user_memory import input_context_state
+            if input_context_state(self._conn, row["meeting_id"], json.loads(row["input_context_json"] or "{}")) == "stale":
+                evidence_status = "stale"
         return {
             "message_id": row["message_id"],
             "thread_id": row["thread_id"],
@@ -12948,7 +14203,8 @@ class V2Persistence:
             "role": row["role"],
             "content": row["content"],
             "scope": row["scope"],
-            "evidence": json.loads(row["evidence_json"] or "[]"),
+            "evidence": evidence,
+            "evidence_status": evidence_status,
             "status": row["status"],
             "error_class": row["error_class"],
             "pinned_kind": row["pinned_kind"],
@@ -12956,12 +14212,21 @@ class V2Persistence:
             "updated_at_ms": int(row["updated_at_ms"]),
         }
 
-    @staticmethod
     def _note_dict(
+        self,
         row: sqlite3.Row,
         *,
         evidence_rows: list[sqlite3.Row],
     ) -> dict[str, Any]:
+        document_sources: list[dict[str, Any]] = []
+        state = "unknown"
+        if row["source_kind"] == "ask_ai" and row["source_message_id"]:
+            with self._lock:
+                source = self._conn.execute("SELECT evidence_json FROM ask_messages WHERE message_id=? AND meeting_id=?", (row["source_message_id"], row["meeting_id"])).fetchone()
+                if source is not None:
+                    original_sources = json.loads(source["evidence_json"] or "[]")
+                    document_sources = [item for item in original_sources if item.get("source_type") in {"document", "meeting_attachment"}]
+                    state = source_evidence_state(self._conn, row["meeting_id"], original_sources)
         return {
             "note_id": row["note_id"],
             "meeting_id": row["meeting_id"],
@@ -12969,6 +14234,8 @@ class V2Persistence:
             "body": row["body"],
             "source_kind": row["source_kind"],
             "source_message_id": row["source_message_id"],
+            "source_evidence": document_sources,
+            "evidence_status": state,
             "version": int(row["version"]),
             "status": row["status"],
             "created_at_ms": int(row["created_at_ms"]),
@@ -13000,6 +14267,10 @@ class V2Persistence:
             "evidence_transcript_seq": int(row["evidence_transcript_seq"]),
             "evidence_hash": row["evidence_hash"],
             "state_revision": int(row["state_revision"]),
+            "context_evidence": json.loads(row["context_evidence_json"] or "[]"),
+            "source_evidence": json.loads(row["source_evidence_json"] or "[]"),
+            "input_context": json.loads(row["input_context_json"] or "{}"),
+            "supersedes_suggestion_id": row["supersedes_suggestion_id"],
             "status": row["status"],
             "draft_text": row["draft_text"],
             "draft_seq": int(row["draft_seq"]),

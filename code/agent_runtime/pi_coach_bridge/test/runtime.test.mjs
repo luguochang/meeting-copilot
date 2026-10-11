@@ -15,6 +15,7 @@ import {
   createOpenAICompatibleBackend,
   terminalToolChoiceForContext,
   outputTokenLimitForContext,
+  normalizeInterventionCardFields,
   requiresTerminalToolChoice,
   validateEvaluationRequest,
 } from "../src/runtime.mjs";
@@ -84,14 +85,38 @@ function fullRequest(requestId = "request-1") {
   return value;
 }
 
-function harness() {
+function boundDeepRequest(requestId = "deep-contract") {
+  const value = fullRequest(requestId);
+  value.context.trigger_type = "answer_ready";
+  value.context.work_item_id = "answer:contract";
+  value.context.priority_mode = "deep";
+  value.context.rolling_state.current_answer = {
+    answer_id: "answer:contract",
+    evidence_segment_id: "remote-1",
+    context_evidence_segment_ids: ["local-1", "remote-1"],
+    question: "发布前需要满足什么条件？",
+    answer: "先确认发布条件。",
+    status: "committed",
+  };
+  return value;
+}
+
+function promptPayload(context) {
+  const message = context.messages.findLast((item) => item.role === "user");
+  const text = typeof message.content === "string"
+    ? message.content
+    : message.content.find((block) => block.type === "text").text;
+  return JSON.parse(text);
+}
+
+function harness({ modelId } = {}) {
   const faux = fauxProvider({ provider: `talktrace-test-${Math.random()}` });
   const models = createModels();
   models.setProvider(faux.provider);
   const runtime = new PiCoachRuntime({
     backendFactory: () => ({
       identity: "faux-test",
-      model: faux.getModel(),
+      model: modelId ? { ...faux.getModel(), id: modelId } : faux.getModel(),
       streamFn: models.streamSimple.bind(models),
     }),
   });
@@ -236,11 +261,14 @@ test("deep answer coaching sees the Fast Answer and submits an incremental card 
         ["local-1", "remote-1"],
       );
       assert.match(context.systemPrompt, /do not rewrite or summarize current_answer/i);
-      assert.match(context.systemPrompt, /facts only from current_answer and bound_evidence/i);
+      assert.match(context.systemPrompt, /current_answer is a prior AI answer.*never an authoritative source/i);
+      assert.match(context.systemPrompt, /meeting facts only from bound_evidence or exact evidence/i);
+      assert.match(context.systemPrompt, /Reviewed evidence can support a direct response/i);
+      assert.doesNotMatch(context.systemPrompt, /starting with 先确认/i);
       assert.match(context.systemPrompt, /speakable addition is the primary result/i);
       assert.deepEqual(
         context.tools.map((tool) => tool.name),
-        ["submit_intervention", "keep_silent"],
+        ["search_prior_evidence", "read_transcript_span", "submit_intervention", "keep_silent"],
       );
       assert.ok(!context.tools.some((tool) => tool.name === "read_realtime_context"));
       const terminalSchema = context.tools.find((tool) => tool.name === "submit_intervention").parameters;
@@ -276,7 +304,7 @@ test("deep answer coaching sees the Fast Answer and submits an incremental card 
   assert.equal(result.metrics.prompt_profile, "deep_answer");
   assert.deepEqual(
     result.metrics.available_tool_names,
-    ["submit_intervention", "keep_silent"],
+    ["search_prior_evidence", "read_transcript_span", "submit_intervention", "keep_silent"],
   );
   assert.equal(result.metrics.turns, 1);
   assert.equal(result.metrics.tool_calls, 1);
@@ -323,7 +351,7 @@ test("deep answer coaching preserves a structured user-request revision", async 
   assert.equal(result.intervention.coaching_package.next_actions[0], "补充失败消费验证方式");
   assert.deepEqual(
     result.metrics.available_tool_names,
-    ["submit_intervention", "keep_silent"],
+    ["search_prior_evidence", "read_transcript_span", "submit_intervention", "keep_silent"],
   );
   assert.equal(result.metrics.history_searches, 0);
 });
@@ -444,15 +472,15 @@ test("realtime candidates produce a grounded intervention in the first provider 
   assert.equal(faux.state.callCount, 1);
 });
 
-test("accepts canonical why_now and say_this intervention fields", async () => {
+test("single full model fields mechanically produce product aliases", async () => {
   const { faux, runtime } = harness();
   faux.setResponses([
     fauxAssistantMessage(
       fauxToolCall("submit_intervention", {
         event_type: "question_to_user",
         title: "先回答上线条件",
-        say_this: "我先确认压测结果，再给出准确的上线日期。",
-        why_now: "对方刚询问日期，条件不清会造成错误承诺。",
+        recommendation: "我先确认压测结果，再给出准确的上线日期。",
+        reason: "对方刚询问日期，条件不清会造成错误承诺。",
         evidence_segment_ids: ["remote-1"],
         evidence_quote: "周五一定上线吗",
         urgency: "high",
@@ -482,7 +510,7 @@ test("realtime candidate fast path sends exact evidence and only terminal tools"
       const payload = JSON.parse(text);
       assert.equal(payload.task, "decide_realtime_candidate");
       assert.equal(payload.output_language, "zh-CN");
-      assert.match(payload.output_language_contract, /title,recommendation,reason/);
+      assert.match(payload.output_language_contract, /title, recommendation, and reason/);
       assert.equal(payload.host_checklist_reviewed, true);
       assert.equal(payload.checklist, undefined);
       assert.equal(payload.candidate_events[0].evidence_text, undefined);
@@ -491,19 +519,19 @@ test("realtime candidate fast path sends exact evidence and only terminal tools"
       assert.equal(payload.new_paragraphs[0].correction_status, "failed_preserved_original");
       assert.equal(payload.new_paragraphs[0].evidence_quality, "provisional");
       assert.deepEqual(context.tools.map((tool) => tool.name), ["submit_intervention", "keep_silent"]);
-      assert.match(context.systemPrompt, /retry submit_intervention with the exact paragraph text/i);
-      assert.match(context.systemPrompt, /latest explicit resolution as authoritative/i);
-      assert.match(context.systemPrompt, /do not intervene merely to repeat, reconfirm, or compress/i);
-      assert.match(context.systemPrompt, /for experiment_gap, keep silent.*bounded prototype/i);
-      assert.match(context.systemPrompt, /do not ask for optional experiment refinements/i);
-      assert.match(context.systemPrompt, /conditional or tentative plan.*is not commitment_risk/i);
-      assert.match(context.systemPrompt, /newer evidence-backed status update.*is not contradiction/i);
-      assert.match(context.systemPrompt, /provisional.*ask only for clarification/i);
-      assert.match(context.systemPrompt, /do not add a digit.*最近一次.*多久.*几次/i);
-      assert.match(context.systemPrompt, /scope every owner and deadline to the same action or topic/i);
-      assert.match(context.systemPrompt, /when the evidence grounds only an owner gap, ask only who owns it/i);
-      assert.match(context.systemPrompt, /confidence measures whether.*evidence supports.*at least 0\.80/i);
-      assert.match(context.systemPrompt, /preserve the wording and polarity supported by the evidence/i);
+      assert.match(context.systemPrompt, /工具拒绝引文.*第二轮复制准确原文重试/);
+      assert.match(context.systemPrompt, /已补条件、已解决.*静默/);
+      assert.match(context.systemPrompt, /不重复追问或提醒/);
+      assert.match(context.systemPrompt, /已有可运行实验、指标与下一决定/);
+      assert.match(context.systemPrompt, /不追问非必要细节/);
+      assert.match(context.systemPrompt, /条件式验证计划不当作无条件承诺/);
+      assert.match(context.systemPrompt, /有据状态更新不当作矛盾/);
+      assert.match(context.systemPrompt, /provisional.*只可澄清或静默/);
+      assert.match(context.systemPrompt, /澄清不新增来源没有的数字\/假设/);
+      assert.match(context.systemPrompt, /owner\/deadline只属于同主题同语句/);
+      assert.match(context.systemPrompt, /只缺负责人则只问谁/);
+      assert.match(context.systemPrompt, /confidence只衡量证据支持.*>=0\.80/);
+      assert.match(context.systemPrompt, /保留原意及否定极性/);
       return fauxAssistantMessage(
         fauxToolCall("keep_silent", { reason: "The candidate is not actionable enough." }),
         { stopReason: "toolUse" },
@@ -545,9 +573,9 @@ test("compact candidate contract lets the host reconstruct auditable evidence", 
       const payload = JSON.parse(text);
       assert.equal(context.tools.find((tool) => tool.name === "submit_intervention").parameters.properties.reason, undefined);
       assert.equal(payload.task, "decide_realtime_candidate");
-      assert.match(context.systemPrompt, /directly relevant recent context paragraph may support the card/i);
-      assert.match(context.systemPrompt, /meeting goals and rolling state.*never quote evidence/i);
-      assert.match(context.systemPrompt, /do not repeat or paraphrase the question/i);
+      assert.match(context.systemPrompt, /当前直接相关recent_context可支撑增量/);
+      assert.match(context.systemPrompt, /目标和rolling_state仅供方向，不当作引文/);
+      assert.match(context.systemPrompt, /不复述刚听到的问题/);
       assert.equal(payload.skill.objective, compactRequest.context.coach_skill.objective);
       assert.equal(
         payload.skill.intervention_style,
@@ -557,7 +585,7 @@ test("compact candidate contract lets the host reconstruct auditable evidence", 
         fauxToolCall("submit_intervention", {
           event_type: "question_to_user",
           title: "先回答上线条件",
-          recommendation: "我先确认压测结果，再给出准确的上线日期。",
+          say_this: "我先确认压测结果，再给出准确的上线日期。",
           urgency: "high",
           confidence: 0.94,
         }),
@@ -679,7 +707,7 @@ test("compact candidate contract removes a deadline borrowed from another topic"
       fauxToolCall("submit_intervention", {
         event_type: "question_to_user",
         title: "监控阈值负责人待确认",
-        recommendation: "监控阈值具体由谁来改？需要在下周一前定下来。",
+        say_this: "监控阈值具体由谁来改？需要在下周一前定下来。",
         urgency: "medium",
         confidence: 0.85,
       }),
@@ -689,7 +717,7 @@ test("compact candidate contract removes a deadline borrowed from another topic"
       fauxToolCall("submit_intervention", {
         event_type: "question_to_user",
         title: "先落下负责人",
-        recommendation: "先把监控阈值负责人写进行动项，再进入下一个议题。",
+        say_this: "先把监控阈值负责人写进行动项，再进入下一个议题。",
         urgency: "medium",
         confidence: 0.85,
       }),
@@ -733,7 +761,7 @@ test("compact candidate contract keeps a deadline scoped to the same owner gap",
       fauxToolCall("submit_intervention", {
         event_type: "question_to_user",
         title: "确认监控阈值负责人和期限",
-        recommendation,
+        say_this: recommendation,
         urgency: "medium",
         confidence: 0.9,
       }),
@@ -743,7 +771,7 @@ test("compact candidate contract keeps a deadline scoped to the same owner gap",
       fauxToolCall("submit_intervention", {
         event_type: "question_to_user",
         title: "先形成执行项",
-        recommendation: "先把负责人和完成期限写进行动项，再继续讨论。",
+        say_this: "先把负责人和完成期限写进行动项，再继续讨论。",
         urgency: "medium",
         confidence: 0.9,
       }),
@@ -787,7 +815,7 @@ test("compact candidate contract fail-closes an ungrounded host reason", async (
       fauxToolCall("submit_intervention", {
         event_type: "decision_readiness",
         title: "先确认上线条件",
-        recommendation: "先确认压测结果，再给出上线日期。",
+        say_this: "先确认压测结果，再给出上线日期。",
         urgency: "high",
         confidence: 0.9,
       }),
@@ -847,7 +875,7 @@ test("cross-batch clarity prompt exposes exact prior evidence and quotes both pa
         fauxToolCall("submit_intervention", {
           event_type: "communication_clarity",
           title: "先说结论",
-          recommendation: "下一句先给结论，再补一个直接依据。",
+          say_this: "下一句先给结论，再补一个直接依据。",
           urgency: "medium",
           confidence: 0.9,
         }),
@@ -942,12 +970,15 @@ test("candidate fast path bounds provider output and request shape", async () =>
     tools: [{ name: "read_realtime_context" }, { name: "keep_silent" }],
   }), 512);
   assert.ok(compactCandidate.metrics.system_prompt_characters < fullCandidate.metrics.system_prompt_characters);
+  // R01 recorded the unchanged default-role compact input at 3484 characters.
+  // This bound measures compression without imposing a cap on custom roles.
+  assert.ok(compactCandidate.metrics.system_prompt_characters <= 3484 * 0.70);
   assert.ok(compactCandidate.metrics.tool_schema_characters < fullCandidate.metrics.tool_schema_characters);
   assert.ok(compactCandidate.metrics.request_characters < fullCandidate.metrics.request_characters);
   assert.ok(compactCandidate.metrics.request_characters <= fullCandidate.metrics.request_characters - 500);
 });
 
-test("compact candidate path recovers a provider empty-argument terminal call safely", async () => {
+test("compact candidate path rejects empty arguments without synthesizing a card", async () => {
   const { faux, runtime } = harness();
   const candidateRequest = request("empty-argument-candidate");
   candidateRequest.context.compact_terminal_contract = true;
@@ -956,14 +987,649 @@ test("compact candidate path recovers a provider empty-argument terminal call sa
       fauxToolCall("submit_intervention", {}),
       { stopReason: "toolUse" },
     ),
+    fauxAssistantMessage(
+      fauxToolCall("keep_silent", { reason: "没有完整有效的建议内容。" }),
+      { stopReason: "toolUse" },
+    ),
   ]);
 
   const result = await runtime.evaluate(candidateRequest);
 
+  assert.equal(result.action, "silent");
+  assert.equal(result.intervention, null);
+  assert.equal(result.metrics.turns, 2);
+});
+
+for (const invalid of [
+  { title: "回应发布条件", event_type: "question_to_user", urgency: "medium", confidence: 0.8 },
+  { title: "回应发布条件", event_type: "question_to_user", urgency: "medium", confidence: 0.8, say_this: "        " },
+  { title: "回应发布条件", event_type: "question_to_user", urgency: "medium", say_this: "先核实压测结果，再确认可执行的发布条件。" },
+]) {
+  test(`compact candidate rejects missing sentence or confidence: ${Object.keys(invalid).join(",")}:${Boolean(invalid.say_this?.trim())}`, async () => {
+    const { faux, runtime } = harness();
+    const value = request("partial-compact");
+    value.context.compact_terminal_contract = true;
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("submit_intervention", invalid), { stopReason: "toolUse" }),
+      fauxAssistantMessage(fauxToolCall("keep_silent", { reason: "建议字段不完整，保持静默。" }), { stopReason: "toolUse" }),
+    ]);
+    const result = await runtime.evaluate(value);
+    assert.equal(result.action, "silent");
+    assert.equal(result.intervention, null);
+    assert.equal(result.metrics.turns, 2);
+  });
+}
+
+function documentSource(overrides = {}) {
+  return { source_type: "document", source_id: "span:legal", document_id: "doc:legal", project_id: "project:release",
+    title: "发布规则", version_id: "version:legal:1", version: 1, content_hash: "confirmed-hash", locator: { line_start: 1 },
+    quote: "发布需要法务批准，预算五万元。", context_revision: 2, ...overrides };
+}
+
+function withDocuments(value, sources = []) {
+  value.context.knowledge_context = { project_id: "project:release", selection_mode: "project", context_revision: 2 };
+  value.context.document_evidence = sources;
+  return value;
+}
+
+function reconciliationRequest(requestId = "project-reconcile") {
+  const source = { source_type: "review_document", source_id: "review:final", project_id: "project:release", meeting_id: "meeting-1",
+    document_kind: "minutes", version_kind: "user_final", version: 2, content_hash: "human-final-hash",
+    locator: { type: "review_document", document_kind: "minutes" }, quote: "本场发布讨论。" };
+  const value = withDocuments(fullRequest(requestId));
+  value.task_mode = value.context.task_mode = "project_reconcile";
+  value.context.new_paragraphs = [];
+  value.context.context_paragraphs = [];
+  value.context.retrieval_paragraphs = [];
+  value.context.knowledge_context.project_revision = 9;
+  value.context.knowledge_context.project_state = { project_id: source.project_id, project_revision: 9, items: [], truncated: false };
+  value.context.reconciliation_evidence = [source];
+  value.context.review_final_content = "本场发布讨论。" + "前文讨论。".repeat(900) + "王工明天核对发布条件。";
+  return value;
+}
+
+function memoryRequest(requestId = "memory-reconcile") {
+  const source = documentSource({ quote: '术语纠正：将“托克吹斯”改为“Talktrace”。', context_revision: 0 });
+  const clue = { kind: "term", memory_key: "talktrace", value: "Talktrace", aliases: ["托克吹斯"], source_refs: [source] };
+  return { request_id: requestId, session_id: "memory:project:release", task_mode: "memory_reconcile", provider: {},
+    context: { task_mode: "memory_reconcile", document_evidence: [source], knowledge_context: { project_id: source.project_id, project_revision: 9 },
+      memory_reconciliation: { input_hash: "a".repeat(64), clues: [clue], existing_memories: [] } } };
+}
+
+function minimalMemoryTerminal(value) {
+  return { input_hash: value.context.memory_reconciliation.input_hash, clue_indices: [0] };
+}
+
+test("memory background exposes only source-bound candidate proposal and waits for host acceptance", async () => {
+  const { faux, runtime } = harness();
+  const value = memoryRequest();
+  let calls = 0;
+  faux.setResponses([(context) => {
+    assert.deepEqual(context.tools.map((tool) => tool.name), ["propose_memory_update"]);
+    assert.equal(outputTokenLimitForContext(context), 256);
+    assert.deepEqual(Object.keys(context.tools[0].parameters.properties).sort(), ["clue_indices", "input_hash"]);
+    assert.ok(context.systemPrompt.includes("他人发言"));
+    return fauxAssistantMessage(fauxToolCall("propose_memory_update", minimalMemoryTerminal(value)), { stopReason: "toolUse" });
+  }]);
+  const result = await runtime.evaluate(value, { proposeMemoryUpdate: async (terminal) => {
+    calls += 1;
+    assert.deepEqual(terminal.candidates, value.context.memory_reconciliation.clues);
+    return terminal;
+  } });
+  assert.equal(result.action, "memory_update");
+  assert.equal(result.metrics.turns, 1);
+  assert.equal(result.metrics.tool_calls, 1);
+  assert.equal(result.metrics.decision_timeout_ms, 25000);
+  assert.equal(result.metrics.checklist_reviewed, false);
+  assert.equal(calls, 1);
+});
+
+for (const mutation of ["hash", "negative", "out_of_range", "duplicate", "fraction", "string_index", "extra", "legacy_candidates", "too_many"]) {
+  test(`memory rejects ${mutation} and never asks host to accept an unregistered candidate`, async () => {
+    const { faux, runtime } = harness();
+    const value = memoryRequest(`bad-memory-${mutation}`);
+    const bad = minimalMemoryTerminal(value);
+    if (mutation === "hash") bad.input_hash = "b".repeat(64);
+    if (mutation === "negative") bad.clue_indices = [-1];
+    if (mutation === "out_of_range") bad.clue_indices = [1];
+    if (mutation === "duplicate") bad.clue_indices = [0, 0];
+    if (mutation === "fraction") bad.clue_indices = [0.5];
+    if (mutation === "string_index") bad.clue_indices = ["0"];
+    if (mutation === "extra") bad.value = "AnotherProduct";
+    if (mutation === "legacy_candidates") { delete bad.clue_indices; bad.candidates = value.context.memory_reconciliation.clues; }
+    if (mutation === "too_many") bad.clue_indices = Array(7).fill(0);
+    const empty = { input_hash: value.context.memory_reconciliation.input_hash, clue_indices: [] };
+    const capturedEmpty = { input_hash: empty.input_hash, candidates: [] };
+    const accepted = [];
+    faux.setResponses([fauxAssistantMessage(fauxToolCall("propose_memory_update", bad), { stopReason: "toolUse" }),
+      fauxAssistantMessage(fauxToolCall("propose_memory_update", empty), { stopReason: "toolUse" })]);
+    const result = await runtime.evaluate(value, { proposeMemoryUpdate: async (terminal) => { accepted.push(terminal); return terminal; } });
+    assert.deepEqual(accepted, [capturedEmpty]);
+    assert.equal(result.metrics.turns, 2);
+    assert.ok(result.metrics.tool_calls <= 3);
+    assert.deepEqual(result.memory_update, capturedEmpty);
+  });
+}
+
+test("memory selections expand independent clones of all six exact registered clues", async () => {
+  const { faux, runtime } = harness();
+  const value = memoryRequest("six-memory-clones");
+  const declarations = Array.from({ length: 6 }, (_, index) => `术语纠正：将“错误${index}”改为“Term${index}”。`);
+  const source = { ...value.context.document_evidence[0], quote: declarations.join("\n") };
+  value.context.document_evidence = [source];
+  value.context.memory_reconciliation.clues = declarations.map((quote, index) => ({
+    kind: "term", memory_key: `term${index}`, value: `Term${index}`, aliases: [`错误${index}`],
+    source_refs: [{ ...source, quote }],
+  }));
+  const original = structuredClone(value.context.memory_reconciliation.clues);
+  const selected = { input_hash: value.context.memory_reconciliation.input_hash, clue_indices: [5, 4, 3, 2, 1, 0] };
+  assert.ok(JSON.stringify(selected).length < 128);
+  faux.setResponses([fauxAssistantMessage(fauxToolCall("propose_memory_update", selected), { stopReason: "toolUse" })]);
+  let captured;
+  const result = await runtime.evaluate(value, { proposeMemoryUpdate: async (terminal) => {
+    captured = terminal;
+    return terminal;
+  } });
+  assert.deepEqual(Object.keys(captured).sort(), ["candidates", "input_hash"]);
+  assert.deepEqual(captured.candidates, [...original].reverse());
+  for (const [index, candidate] of captured.candidates.entries()) {
+    const originalSource = value.context.memory_reconciliation.clues[5 - index];
+    assert.notEqual(candidate.aliases, originalSource.aliases);
+    assert.notEqual(candidate.source_refs[0].locator, originalSource.source_refs[0].locator);
+  }
+  assert.deepEqual(value.context.memory_reconciliation.clues, original);
+  assert.deepEqual(result.memory_update.candidates, [...original].reverse());
+  assert.equal(result.metrics.turns, 1);
+});
+
+test("memory cannot expand a clue from a different project", async () => {
+  const { runtime } = harness();
+  const value = memoryRequest("cross-project-memory-clue");
+  value.context.memory_reconciliation.clues[0].source_refs[0] = { ...value.context.memory_reconciliation.clues[0].source_refs[0], project_id: "different-project" };
+  let called = false;
+  await assert.rejects(runtime.evaluate(value, { proposeMemoryUpdate: async (terminal) => { called = true; return terminal; } }), /memory source|not registered/);
+  assert.equal(called, false);
+});
+
+test("memory host rejection cannot be bypassed by the final bridge response", async () => {
+  const { faux, runtime } = harness();
+  const value = memoryRequest("host-reject-memory");
+  faux.setResponses(Array.from({ length: 2 }, () => fauxAssistantMessage(fauxToolCall("propose_memory_update", minimalMemoryTerminal(value)), { stopReason: "toolUse" })));
+  await assert.rejects(() => runtime.evaluate(value, { proposeMemoryUpdate: async (terminal) => ({ ...terminal, candidates: [] }) }), (error) => {
+    assert.equal(error.code, "missing_terminal_action");
+    assert.equal(error.metrics.turns, 2);
+    assert.equal(error.metrics.tool_calls, 2);
+    return true;
+  });
+});
+
+test("memory terminal is absent from realtime and project-background SDK schemas", async () => {
+  for (const value of [fullRequest("realtime-no-memory-write"), reconciliationRequest("project-no-memory-write")]) {
+    const { faux, runtime } = harness();
+    faux.setResponses([(context) => {
+      assert.equal(context.tools.some((tool) => tool.name === "propose_memory_update"), false);
+      return fauxAssistantMessage(fauxToolCall(value.context.task_mode === "project_reconcile" ? "propose_project_changes" : "keep_silent",
+        value.context.task_mode === "project_reconcile" ? { base_project_revision: 9, changes: [] } : { reason: "没有增量。" }), { stopReason: "toolUse" });
+    }]);
+    await runtime.evaluate(value, { proposeProjectChanges: async (terminal) => terminal });
+  }
+});
+
+function projectProposal(value) {
+  return { base_project_revision: 9, changes: [{ action: "create", type: "task", text: "核对发布条件", status: "active", owner: "王工", due: "明天",
+    source_refs: [{ ...value.context.reconciliation_evidence[0], quote: "王工明天核对发布条件。" }] }] };
+}
+
+test("background reconciliation validates the full human final and calls the host before producing pending changes", async () => {
+  const { faux, runtime } = harness();
+  const value = reconciliationRequest();
+  const proposal = projectProposal(value);
+  let hostCalls = 0;
+  faux.setResponses([(context) => {
+    assert.deepEqual(context.tools.map((tool) => tool.name), ["propose_project_changes"]);
+    assert.equal(promptPayload(context).review_final_content, value.context.review_final_content);
+    assert.equal(outputTokenLimitForContext(context), 4096);
+    return fauxAssistantMessage(fauxToolCall("propose_project_changes", proposal), { stopReason: "toolUse" });
+  }]);
+  const result = await runtime.evaluate(value, { proposeProjectChanges: async (params) => { hostCalls += 1; return params; } });
+  assert.equal(hostCalls, 1);
+  assert.equal(result.action, "project_changes");
+  assert.deepEqual(result.project_changes, proposal);
+  assert.equal(result.intervention, null);
+  assert.equal(result.metrics.decision_timeout_ms, 60000);
+  assert.equal(result.metrics.prompt_profile, "project_reconcile");
+  assert.equal(result.metrics.checklist_reviewed, false);
+});
+
+test("an explicit zero-change background terminal is successful and still requires host acceptance", async () => {
+  const { faux, runtime } = harness();
+  faux.setResponses([fauxAssistantMessage(fauxToolCall("propose_project_changes", { base_project_revision: 9, changes: [] }), { stopReason: "toolUse" })]);
+  const result = await runtime.evaluate(reconciliationRequest("no-project-changes"), { proposeProjectChanges: async (params) => params });
+  assert.deepEqual(result.project_changes.changes, []);
+  assert.equal(result.action, "project_changes");
+});
+
+test("background reference schema resolves typed IDs and quote to exact registered source metadata", async () => {
+  const { faux, runtime } = harness();
+  const value = reconciliationRequest("minimal-project-source");
+  const proposal = projectProposal(value);
+  const expected = structuredClone(proposal);
+  proposal.changes[0].source_refs = proposal.changes[0].source_refs.map(({ source_type, source_id, quote }) => ({ source_type, source_id, quote }));
+  faux.setResponses([fauxAssistantMessage(fauxToolCall("propose_project_changes", proposal), { stopReason: "toolUse" })]);
+  const result = await runtime.evaluate(value, { proposeProjectChanges: async (params) => {
+    assert.deepEqual(params, expected);
+    return params;
+  } });
+  assert.deepEqual(result.project_changes, expected);
+  assert.equal(result.metrics.tool_errors.length, 0);
+});
+
+test("background reference resolver rejects any explicitly forged metadata", async () => {
+  const { faux, runtime } = harness();
+  const value = reconciliationRequest("forged-project-source-version");
+  const proposal = projectProposal(value);
+  proposal.changes[0].source_refs[0].version += 1;
+  let calls = 0;
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("propose_project_changes", proposal), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("propose_project_changes", { base_project_revision: 9, changes: [] }), { stopReason: "toolUse" }),
+  ]);
+  const result = await runtime.evaluate(value, { proposeProjectChanges: async (params) => { calls += 1; return params; } });
+  assert.equal(calls, 1);
+  assert.equal(result.metrics.tool_errors[0].code, "project_source_mismatch");
+});
+
+for (const damage of ["quote", "owner", "revision"]) {
+  test(`background rejects unregistered project ${damage} before asking the host to accept`, async () => {
+    const { faux, runtime } = harness();
+    const value = reconciliationRequest(`forged-project-${damage}`);
+    const proposal = projectProposal(value);
+    if (damage === "quote") proposal.changes[0].source_refs[0].quote = "未经讨论决定直接上线。";
+    if (damage === "owner") proposal.changes[0].owner = "李工";
+    if (damage === "revision") proposal.base_project_revision = 8;
+    let calls = 0;
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("propose_project_changes", proposal), { stopReason: "toolUse" }),
+      fauxAssistantMessage(fauxToolCall("propose_project_changes", { base_project_revision: 9, changes: [] }), { stopReason: "toolUse" }),
+    ]);
+    const result = await runtime.evaluate(value, { proposeProjectChanges: async (params) => { calls += 1; return params; } });
+    assert.equal(calls, 1);
+    assert.equal(result.metrics.tool_errors[0].tool, "propose_project_changes");
+    assert.deepEqual(result.project_changes.changes, []);
+  });
+}
+
+test("background evidence reads stop at four model turns and six executed tools", async () => {
+  for (const manyTools of [false, true]) {
+    const { faux, runtime } = harness();
+    let reads = 0;
+    const state = { source_type: "project_state", project_id: "project:release", project_revision: 9, snapshot_hash: "a".repeat(64), items: [], truncated: false };
+    faux.setResponses(manyTools
+      ? [fauxAssistantMessage(Array.from({ length: 7 }, () => fauxToolCall("read_project_state", {})), { stopReason: "toolUse" })]
+      : Array.from({ length: 5 }, () => fauxAssistantMessage(fauxToolCall("read_project_state", {}), { stopReason: "toolUse" })));
+    await assert.rejects(() => runtime.evaluate(reconciliationRequest(`background-budget-${manyTools}`),
+      { readProjectState: async () => { reads += 1; return [state]; }, proposeProjectChanges: async (params) => params }),
+    (error) => error.code === "missing_terminal_action" && error.metrics.turns <= 4 && error.metrics.tool_calls <= 6);
+    assert.equal(reads, manyTools ? 6 : 4);
+  }
+});
+
+test("only explicit project mode admits a human final without transcript and expands Provider deadline", () => {
+  const background = reconciliationRequest();
+  assert.equal(validateEvaluationRequest(background).context.task_mode, "project_reconcile");
+  background.task_mode = "realtime_coach";
+  assert.throws(() => validateEvaluationRequest(background), PiCoachProtocolError);
+  const config = { base_url: "https://gateway.example", api_key: "test-key", model: "gpt-6-sol", timeout_ms: 60000, decision_timeout_ms: 60000 };
+  assert.equal(createOpenAICompatibleBackend({ ...config, task_mode: "project_reconcile" }).decisionTimeoutMs, 60000);
+  assert.equal(createOpenAICompatibleBackend(config).decisionTimeoutMs, 25000);
+});
+
+test("deep document lookup is typed and finishes with verified citations in two model turns", async () => {
+  const { faux, runtime } = harness();
+  const source = documentSource();
+  const value = withDocuments(boundDeepRequest("deep-document-search"));
+  let searches = 0;
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("search_project_documents", { query: "发布法务", max_results: 1 }), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("submit_intervention", { headline: "补充资料条件",
+        say_this_addition: "我先核对法务批准，再确定发布安排。", key_points: ["资料要求法务批准", "核对批准后确定发布安排"], confidence: 0.9,
+        document_evidence_refs: [{ source_id: source.source_id, quote: "发布需要法务批准" }] }), { stopReason: "toolUse" }),
+  ]);
+  const result = await runtime.evaluate(value, { searchDocuments: async () => { searches += 1; return [source]; } });
+  assert.equal(searches, 1);
+  assert.equal(result.metrics.turns, 2);
+  assert.deepEqual(result.metrics.tool_names, ["search_project_documents", "submit_intervention"]);
+  assert.deepEqual(result.intervention.source_evidence, [{ ...source, quote: "发布需要法务批准" }]);
+  assert.ok(!result.intervention.evidence_segment_ids.includes(source.source_id));
+});
+
+for (const documentAsTranscript of [false, true]) {
+  test(`full manual document lookup keeps transcript and document quote provenance distinct: ${documentAsTranscript}`, async () => {
+    const { faux, runtime } = harness();
+    const source = documentSource();
+    const value = withDocuments(fullRequest(`full-document-quote-${documentAsTranscript}`));
+    value.context.trigger_type = "user_request";
+    value.context.user_request = "请读取发布资料后给一句可直接说出口的建议。";
+    value.context.priority_mode = "deep";
+    value.context.document_evidence = [];
+    value.context.new_paragraphs = [{ id: "current-question", text: "发布还需什么条件？", revision: 1, source_track: "system_audio" }];
+    faux.setResponses([
+      (context) => {
+        assert.ok(context.systemPrompt.includes("those fields refer only to the current meeting transcript"));
+        return fauxAssistantMessage(fauxToolCall("search_project_documents", { query: "发布" }), { stopReason: "toolUse" });
+      },
+      fauxAssistantMessage(fauxToolCall("submit_intervention", {
+        event_type: "question_to_user", title: "核对发布条件", recommendation: "请先核对法务批准，再讨论具体发布安排。",
+        reason: "资料要求核对发布的法务批准条件。", evidence_segment_ids: ["current-question"],
+        evidence_quote: documentAsTranscript ? "发布需要法务批准" : "发布还需什么条件？",
+        urgency: "medium", confidence: 0.9, document_evidence_refs: [{ source_id: source.source_id, quote: "发布需要法务批准" }],
+      }), { stopReason: "toolUse" }),
+    ]);
+    const execute = () => runtime.evaluate(value, { searchDocuments: async () => [source] });
+    if (documentAsTranscript) {
+      await assert.rejects(execute, (error) => error.code === "missing_terminal_action"
+        && error.metrics.turns === 2 && error.metrics.tool_errors[0].code === "evidence_quote_not_verbatim");
+    } else {
+      const result = await execute();
+      assert.equal(result.metrics.turns, 2);
+      assert.equal(result.intervention.source_evidence[0].source_id, source.source_id);
+      assert.equal(result.intervention.evidence_quote, "发布还需什么条件？");
+    }
+  });
+}
+
+test("advertised full and compact terminals expose one required field per meaning", async () => {
+  for (const compact of [false, true]) {
+    const { faux, runtime } = harness();
+    const value = compact ? request("canonical-compact") : fullRequest("canonical-full");
+    value.context.compact_terminal_contract = compact;
+    faux.setResponses([(context) => {
+      const schema = context.tools.find((tool) => tool.name === "submit_intervention").parameters;
+      assert.equal(schema.additionalProperties, false);
+      assert.ok(schema.required.includes(compact ? "say_this" : "recommendation"));
+      assert.equal(Object.hasOwn(schema.properties, compact ? "recommendation" : "say_this"), false);
+      assert.equal(Object.hasOwn(schema.properties, "why_now"), false);
+      assert.equal(Object.hasOwn(schema.properties, "reason"), !compact);
+      if (!compact) {
+        assert.ok(schema.required.includes("reason"));
+        assert.ok(context.systemPrompt.includes("once in recommendation"));
+        assert.equal(promptPayload(context).output_language_contract.includes("accepted aliases"), false);
+      }
+      return fauxAssistantMessage(fauxToolCall("keep_silent", { reason: "没有新增可用信息。" }), { stopReason: "toolUse" });
+    }]);
+    const result = await runtime.evaluate(value);
+    assert.equal(result.metrics.turns, 1);
+    assert.equal(result.action, "silent");
+  }
+});
+
+test("compatibility parser accepts equal aliases but rejects legacy sentence and reason mismatches", () => {
+  const canonical = { recommendation: "请核对法务批准和预算是否落实。", reason: "原文列出了发布条件。" };
+  const fields = normalizeInterventionCardFields(canonical);
+  assert.equal(fields.say_this, canonical.recommendation);
+  assert.equal(fields.why_now, canonical.reason);
+  assert.deepEqual(normalizeInterventionCardFields({ ...canonical, say_this: canonical.recommendation, why_now: canonical.reason }), fields);
+  assert.throws(() => normalizeInterventionCardFields({ ...canonical, say_this: "我先确认发布条件，再讨论执行。" }), /recommendation and say_this must match/);
+  assert.throws(() => normalizeInterventionCardFields({ ...canonical, why_now: "当前是另一句解释。" }), /reason and why_now must match/);
+});
+
+test("preloaded document citations cannot invent quotes or masquerade as transcript sources", async () => {
+  const { faux, runtime } = harness();
+  const source = documentSource();
+  const value = withDocuments(fullRequest("forged-document-ref"), [source]);
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("submit_intervention", { event_type: "commitment_risk", title: "发布条件",
+      recommendation: "我先核对批准状态。", reason: "应核对发布条件。", evidence_segment_ids: ["remote-1"],
+      evidence_quote: value.context.new_paragraphs[0].text, urgency: "medium", confidence: 0.9,
+      document_evidence_refs: [{ source_id: source.source_id, quote: "法务已经批准" }] }), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("keep_silent", { reason: "引用内容不匹配，保留原文。" }), { stopReason: "toolUse" }),
+  ]);
+  const result = await runtime.evaluate(value);
+  assert.equal(result.action, "silent");
+  assert.equal(result.metrics.tool_errors[0].tool, "submit_intervention");
+});
+
+test("document lookup cannot consume a second lookup turn or exceed the existing tool budget", async () => {
+  const { faux, runtime } = harness();
+  let calls = 0;
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("search_project_documents", { query: "发布条件" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("search_project_documents", { query: "预算" }), { stopReason: "toolUse" }),
+  ]);
+  await assert.rejects(() => runtime.evaluate(withDocuments(boundDeepRequest("document-budget")),
+    { searchDocuments: async () => { calls += 1; return []; } }), (error) => error.code === "missing_terminal_action" && error.metrics.turns === 2);
+  assert.equal(calls, 1);
+});
+
+test("switching document scope clears retained Pi messages instead of replaying earlier sources", async () => {
+  const { faux, runtime } = harness();
+  const first = withDocuments(fullRequest("document-scope-first"), [documentSource()]);
+  faux.setResponses([fauxAssistantMessage(fauxToolCall("keep_silent", { reason: "暂不打断。" }), { stopReason: "toolUse" })]);
+  await runtime.evaluate(first);
+  const second = withDocuments(fullRequest("document-scope-second"));
+  second.context.knowledge_context.project_id = "different-project";
+  second.context.knowledge_context.context_revision = 3;
+  faux.setResponses([(context) => {
+    assert.equal(context.messages.filter((message) => message.role === "user").length, 1);
+    assert.ok(!JSON.stringify(context.messages).includes("confirmed-hash"));
+    return fauxAssistantMessage(fauxToolCall("keep_silent", { reason: "新资料范围未发现相关条件。" }), { stopReason: "toolUse" });
+  }]);
+  const result = await runtime.evaluate(second);
+  assert.equal(result.metrics.session_message_count_before, 0);
+});
+
+test("project state reads remain readonly and consume the shared two-turn budget", async () => {
+  const { faux, runtime } = harness();
+  const value = withDocuments(boundDeepRequest("read-project-state"));
+  value.context.knowledge_context.project_revision = 9;
+  const state = { source_type: "project_state", project_id: "project:release", project_revision: 9, snapshot_hash: "a".repeat(64),
+    items: [{ id: "task:1", type: "task", text: "补齐法务批准", status: "active", revision: 1, origin: "user", source_refs: [] }], truncated: false };
+  faux.setResponses([
+    (context) => {
+      assert.ok(context.tools.some((tool) => tool.name === "read_project_state"));
+      assert.ok(!context.tools.some((tool) => tool.name === "propose_project_changes"));
+      return fauxAssistantMessage(fauxToolCall("read_project_state", {}), { stopReason: "toolUse" });
+    },
+    fauxAssistantMessage(fauxToolCall("keep_silent", { reason: "已确认事项当前没有新进展。" }), { stopReason: "toolUse" }),
+  ]);
+  const result = await runtime.evaluate(value, { readProjectState: async () => [state] });
+  assert.equal(result.metrics.turns, 2);
+  assert.deepEqual(result.metrics.tool_names, ["read_project_state", "keep_silent"]);
+});
+
+test("changed project revision cannot replace the original bound state during a tool read", async () => {
+  const { faux, runtime } = harness();
+  const value = withDocuments(boundDeepRequest("stale-project-state"));
+  value.context.knowledge_context.project_revision = 9;
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("read_project_state", {}), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("keep_silent", { reason: "项目状态版本已变化，等待重新取证。" }), { stopReason: "toolUse" }),
+  ]);
+  const result = await runtime.evaluate(value, { readProjectState: async () => [{ source_type: "project_state", project_id: "project:release", project_revision: 10,
+    snapshot_hash: "a".repeat(64), items: [], truncated: false }] });
+  assert.equal(result.action, "silent");
+  assert.equal(result.metrics.tool_errors[0].tool, "read_project_state");
+});
+
+test("explicit memory terms and brief preference enter every prompt without becoming evidence", async () => {
+  for (const profile of ["candidate", "full", "deep"]) {
+    const { faux, runtime } = harness();
+    const value = profile === "candidate" ? request(`memory-${profile}`)
+      : profile === "deep" ? boundDeepRequest(`memory-${profile}`) : fullRequest(`memory-${profile}`);
+    value.context.user_memory = { terms: [{ canonical: "法务", aliases: ["legal"] }], preferences: { response_length: "brief" } };
+    faux.setResponses([(context) => {
+      assert.deepEqual(promptPayload(context).user_memory, value.context.user_memory);
+      assert.ok(context.systemPrompt.includes("通常不超过80"));
+      return fauxAssistantMessage(fauxToolCall("keep_silent", { reason: "术语只辅助表达，没有新增事实。" }), { stopReason: "toolUse" });
+    }]);
+    const result = await runtime.evaluate(value);
+    assert.equal(result.action, "silent");
+  }
+});
+
+test("compact safety repair never fabricates a replacement for a fused cross-topic deadline", async () => {
+  const { faux, runtime } = harness();
+  const value = request("fused-owner-deadline");
+  value.context.compact_terminal_contract = true;
+  value.context.context_paragraphs = [];
+  value.context.new_paragraphs[0].text = "复盘报告我们下周一发，但监控阈值谁来改？还没定。";
+  value.context.new_paragraphs[0].correction_status = "no_change";
+  value.context.new_paragraphs[0].evidence_quality = "reviewed";
+  value.context.candidate_events = [value.context.candidate_events[0]];
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("submit_intervention", {
+      event_type: "question_to_user", title: "监控阈值负责人待确认",
+      say_this: "请明确下周一前负责监控阈值修改的人。", urgency: "medium", confidence: 0.85,
+    }), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("keep_silent", { reason: "日期不属于当前行动。" }), { stopReason: "toolUse" }),
+  ]);
+  const result = await runtime.evaluate(value);
+  assert.equal(result.action, "silent");
+  assert.equal(result.intervention, null);
+  assert.deepEqual(result.metrics.tool_errors, [{ tool: "submit_intervention", code: "cross_topic_deadline" }]);
+});
+
+for (const profile of ["full", "candidate", "spark", "deep"]) {
+  test(`shared host role, scene context and balanced unresolved items reach ${profile}`, async () => {
+    const { faux, runtime } = harness({ modelId: profile === "spark" ? "gpt-5.3-codex-spark" : undefined });
+    const value = profile === "deep" ? boundDeepRequest(`role-${profile}`)
+      : profile === "full" ? fullRequest(`role-${profile}`) : request(`role-${profile}`);
+    value.context.compact_terminal_contract = profile === "candidate" || profile === "spark";
+    value.context.role_contract = "你是用户的私人对话副驾；本次以中立访谈追问帮助主持者。";
+    value.context.role_contract_version = "fixture.role.v1";
+    value.context.participant_role = "用户研究访谈者";
+    value.context.focus_points = ["真实使用场景", "已确认条件"];
+    value.context.glossary = ["Talktrace", "SeACo"];
+    value.context.meeting_goal = { goal: "了解实际工作行为", participant_role: "用户研究访谈者" };
+    value.context.rolling_state.open_items = [
+      { id: "decision", type: "decision", status: "pending", text: "决定尚未确认" },
+      { id: "action", type: "action_item", status: "open", text: "后续行动" },
+      { id: "risk", type: "risk", status: "open", text: "关键前提缺失" },
+      ...Array.from({ length: 9 }, (_, i) => ({ id: `q-${i}`, type: "open_question", status: "open", text: "仍待了解的问题" })),
+      { id: "closed", type: "risk", status: "resolved", text: "已解决风险" },
+    ];
+    faux.setResponses([(context) => {
+      assert.ok(context.systemPrompt.includes(value.context.role_contract));
+      assert.match(context.systemPrompt, /fixture\.role\.v1/);
+      const payload = promptPayload(context);
+      assert.equal(payload.participant_role, value.context.participant_role);
+      assert.deepEqual(payload.focus_points, value.context.focus_points);
+      assert.deepEqual(payload.glossary, value.context.glossary);
+      const goal = profile === "full" ? payload.context_signals.meeting_goal
+        : profile === "spark" ? payload.goal : payload.meeting_goal;
+      assert.deepEqual(goal, value.context.meeting_goal);
+      const items = profile === "full" ? payload.context_signals.rolling_state.open_items
+        : profile === "candidate" ? payload.rolling_state.open_items : payload.open_items;
+      assert.equal(items.length, 6);
+      assert.ok(["decision", "action", "risk"].every((id) => items.some((item) => item.id === id)));
+      assert.ok(!items.some((item) => item.id === "closed"));
+      if (profile === "deep") assert.equal(payload.current_answer_authority, "prior_ai_output_for_comparison_only");
+      return fauxAssistantMessage(fauxToolCall("keep_silent", { reason: "本轮没有需要补充的新信息。" }), { stopReason: "toolUse" });
+    }]);
+    const result = await runtime.evaluate(value);
+    assert.equal(result.action, "silent");
+    assert.equal(result.metrics.turns, 1);
+  });
+}
+
+test("legacy and blank host contracts retain the conservative Chinese shared role", async () => {
+  for (const roleContract of [undefined, ""]) {
+    const { faux, runtime } = harness();
+    const value = fullRequest("legacy-role-contract");
+    value.context.role_contract = roleContract;
+    faux.setResponses([(context) => {
+      assert.match(context.systemPrompt, /你是当前用户的私人工作与对话副驾/);
+      assert.match(context.systemPrompt, /旧AI答案仅用于比较，不是事实来源/);
+      return fauxAssistantMessage(fauxToolCall("keep_silent", { reason: "没有增量。" }), { stopReason: "toolUse" });
+    }]);
+    assert.equal((await runtime.evaluate(value)).action, "silent");
+  }
+});
+
+test("shared context rejects non-text contracts and unbounded focus lists", () => {
+  const invalidRole = request("invalid-role-contract");
+  invalidRole.context.role_contract = { guessed: "role" };
+  assert.throws(() => validateEvaluationRequest(invalidRole), /context\.role_contract must be text/);
+  const invalidFocus = request("invalid-focus");
+  invalidFocus.context.focus_points = Array(13).fill("范围");
+  assert.throws(() => validateEvaluationRequest(invalidFocus), /context\.focus_points must be a bounded array/);
+});
+
+test("deep coach completes one host search with exact neighbors and a cited terminal action in two turns", async () => {
+  const { faux, runtime } = harness();
+  const value = boundDeepRequest("deep-bounded-search");
+  value.context.retrieval_paragraphs = [];
+  let searches = 0;
+  const prior = [
+    { id: "prior-condition", text: "压测通过后才能发布。", revision: 3, source_track: "system_audio", role_hint: "remote_mix", correction_status: "no_change", evidence_quality: "reviewed" },
+    { id: "condition-neighbor", text: "发布前需要提供压测报告。", revision: 2, source_track: "system_audio", role_hint: "remote_mix", correction_status: "no_change", evidence_quality: "reviewed" },
+  ];
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("search_prior_evidence", { query: "发布压测条件", max_results: 2 }), { stopReason: "toolUse" }),
+    (context) => {
+      const toolMessage = context.messages.findLast((item) => item.role === "toolResult");
+      const results = JSON.parse(toolMessage.content[0].text).results;
+      assert.deepEqual(results.map(({ id, text, revision, correction_status, evidence_quality }) =>
+        ({ id, text, revision, correction_status, evidence_quality })),
+      prior.map(({ id, text, revision, correction_status, evidence_quality }) =>
+        ({ id, text, revision, correction_status, evidence_quality })));
+      return fauxAssistantMessage(fauxToolCall("submit_intervention", {
+        headline: "补充发布前提",
+        say_this_addition: "发布前应补齐压测通过的依据和报告，再据此确定可执行的发布安排。",
+        key_points: ["旧条件要求压测通过才发布", "补齐压测报告并核对发布条件"], confidence: 0.9,
+      }), { stopReason: "toolUse" });
+    },
+  ]);
+  const result = await runtime.evaluate(value, {
+    searchEvidence: async (params) => {
+      searches += 1;
+      assert.equal(params.include_neighbors, true);
+      assert.equal(params.max_results, 2);
+      return prior;
+    },
+  });
+  assert.equal(searches, 1);
   assert.equal(result.action, "intervention");
-  assert.equal(result.intervention.event_type, "question_to_user");
-  assert.equal(result.intervention.recommendation, "请确认这件事具体由谁负责？");
-  assert.equal(result.intervention.evidence_segment_ids[0], "remote-1");
+  assert.equal(result.metrics.turns, 2);
+  assert.equal(result.metrics.history_searches, 1);
+  assert.deepEqual(result.metrics.tool_names, ["search_prior_evidence", "submit_intervention"]);
+  assert.ok(result.intervention.evidence_segment_ids.includes("prior-condition"));
+  assert.ok(result.intervention.evidence_segment_ids.includes("condition-neighbor"));
+  assert.ok(result.intervention.evidence_quote.includes(prior[0].text));
+  assert.ok(result.intervention.evidence_quote.includes(prior[1].text));
+});
+
+test("deep coach rejects changed revisions from a host lookup without replacing bound evidence", async () => {
+  const { faux, runtime } = harness();
+  const value = boundDeepRequest("deep-stale-search");
+  value.context.retrieval_paragraphs = [];
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("search_prior_evidence", { query: "上线条件" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("keep_silent", { reason: "原文版本发生变化，不能继续提交。" }), { stopReason: "toolUse" }),
+  ]);
+  const result = await runtime.evaluate(value, {
+    searchEvidence: async () => [{ ...value.context.new_paragraphs[0], text: "改过的另一版本", revision: 2 }],
+  });
+  assert.equal(result.action, "silent");
+  assert.deepEqual(result.metrics.tool_errors, [{ tool: "search_prior_evidence", code: "evidence_revision_changed" }]);
+});
+
+test("deep coach cannot spend its second turn on another evidence lookup", async () => {
+  const { faux, runtime } = harness();
+  const value = boundDeepRequest("deep-lookup-budget");
+  let searches = 0;
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("search_prior_evidence", { query: "发布条件" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("search_prior_evidence", { query: "另查上线条件" }), { stopReason: "toolUse" }),
+  ]);
+  await assert.rejects(() => runtime.evaluate(value, {
+    searchEvidence: async () => { searches += 1; return []; },
+  }), (error) => error.code === "missing_terminal_action"
+    && error.metrics.turns === 2
+    && Number.isFinite(error.metrics.timings.first_token_at_ms)
+    && error.metrics.timings.started_at_ms <= error.metrics.timings.first_token_at_ms
+    && error.metrics.timings.first_token_at_ms <= error.metrics.timings.completed_at_ms);
+  assert.equal(searches, 1);
 });
 
 test("candidate fast path prefers the scene skill event over a generic question", async () => {
@@ -1037,7 +1703,17 @@ test("compact candidate contract enforces the first preferred scene event", asyn
         // must enforce the scene-specific ``discovery_gap`` preference.
         event_type: "question_to_user",
         title: "先追问具体场景",
-        recommendation: "你最近一次遇到这个问题是什么时候？",
+        say_this: "你最近一次遇到这个问题是什么时候？",
+        urgency: "medium",
+        confidence: 0.9,
+      }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage(
+      fauxToolCall("submit_intervention", {
+        event_type: "question_to_user",
+        title: "追问具体场景",
+        say_this: "请说明这个问题出现在哪个环节，主要影响是什么？",
         urgency: "medium",
         confidence: 0.9,
       }),
@@ -1051,8 +1727,10 @@ test("compact candidate contract enforces the first preferred scene event", asyn
   assert.equal(result.intervention.event_type, "discovery_gap");
   assert.equal(
     result.intervention.recommendation,
-    "请具体说明这个问题发生在哪个环节、带来什么影响？",
+    "请说明这个问题出现在哪个环节，主要影响是什么？",
   );
+  assert.equal(result.metrics.turns, 2);
+  assert.equal(result.metrics.tool_errors.length, 1);
 });
 
 test("candidate fast path retries exact evidence after a rejected quote", async () => {
@@ -1446,7 +2124,8 @@ test("a contradiction cannot be submitted without prior evidence", async () => {
   ]);
 });
 
-test("the same Pi session retains bounded history across evaluations", async () => {
+for (const profile of ["candidate", "full", "deep"]) {
+test(`the same Pi session retains history only for full and deep: ${profile}`, async () => {
   const { faux, runtime } = harness();
   faux.setResponses([
     fauxAssistantMessage(fauxToolCall("keep_silent", { reason: "First moment is not actionable." }), {
@@ -1457,15 +2136,18 @@ test("the same Pi session retains bounded history across evaluations", async () 
     }),
   ]);
 
-  const first = await runtime.evaluate(request("request-1"));
-  const second = await runtime.evaluate(request("request-2"));
+  const makeRequest = profile === "candidate" ? request : profile === "full" ? fullRequest : boundDeepRequest;
+  const first = await runtime.evaluate(makeRequest("request-1"));
+  const second = await runtime.evaluate(makeRequest("request-2"));
 
   assert.equal(first.metrics.session_reused, false);
   assert.equal(second.metrics.session_reused, true);
   assert.equal(first.metrics.session_message_count_before, 0);
-  assert.ok(second.metrics.session_message_count_before > 0);
+  if (profile === "candidate") assert.equal(second.metrics.session_message_count_before, 0);
+  else assert.ok(second.metrics.session_message_count_before > 0);
   assert.equal(runtime.sessionCount, 1);
 });
+}
 
 test("session tool capability follows the current candidate profile", async () => {
   const { faux, runtime } = harness();
@@ -1494,10 +2176,10 @@ test("session tool capability follows the current candidate profile", async () =
     "submit_intervention",
     "keep_silent",
   ]);
-  assert.ok(second.metrics.session_message_count_before > 0);
+  assert.equal(second.metrics.session_message_count_before, 0);
   assert.equal(third.metrics.session_reused, false);
   assert.deepEqual(third.metrics.available_tool_names, ["submit_intervention", "keep_silent"]);
-  assert.ok(third.metrics.session_message_count_before > 0);
+  assert.equal(third.metrics.session_message_count_before, 0);
 });
 
 test("a host evidence channel does not disable compact terminal candidates", async () => {
@@ -1584,7 +2266,10 @@ test("Provider 5xx status survives the SDK failure path as a safe numeric metric
       && error.code === "agent_provider_error"
       && error.metrics?.provider_status_code === 503
       && typeof error.metrics?.provider_connect_ms === "number"
-      && error.metrics.provider_connect_ms >= 0,
+      && error.metrics.provider_connect_ms >= 0
+      && error.metrics.timings.clock === "unix_epoch_ms"
+      && error.metrics.timings.first_token_at_ms === null
+      && error.metrics.timings.completed_at_ms >= error.metrics.timings.started_at_ms,
   );
   assert.equal(runtime.sessionCount, 0);
 });
@@ -1646,7 +2331,7 @@ test("Provider requests cannot exceed the asynchronous deep bridge ceiling", () 
   assert.equal(backend.decisionTimeoutMs, 25_000);
 });
 
-test("explicit deep Answer revision forces the submit tool through non-streaming Responses", async () => {
+test("deep Answer revision permits evidence lookup through non-streaming Responses", async () => {
   const backend = createOpenAICompatibleBackend({
     base_url: "https://provider.example.test/v1",
     api_key: "test-only-key",
@@ -1731,7 +2416,8 @@ test("explicit deep Answer revision forces the submit tool through non-streaming
   const result = await runtime.evaluate(deep);
 
   assert.equal(requestBody.stream, false);
-  assert.deepEqual(requestBody.tool_choice, { type: "function", name: "submit_intervention" });
+  assert.equal(requestBody.tool_choice, undefined);
+  assert.ok(requestBody.tools.some((tool) => tool.name === "search_prior_evidence"));
   assert.equal(requestBody.max_output_tokens, 280);
   assert.equal(requestHeaders.has("session_id"), false);
   assert.equal(requestHeaders.has("x-client-request-id"), false);
@@ -1919,8 +2605,8 @@ test("Pi accepts grounded communication clarity coaching over sustained speech",
   }];
   faux.setResponses([
     (context) => {
-      assert.match(context.systemPrompt, /sustained microphone\/self_or_room speech is sufficient evidence/);
-      assert.match(context.systemPrompt, /never keep silent only because microphone speaker identity is unconfirmed/);
+      assert.match(context.systemPrompt, /表达问题可用两段原话中性帮助/);
+      assert.match(context.systemPrompt, /不因身份未知单独拒绝/);
       return fauxAssistantMessage(
         fauxToolCall("submit_intervention", {
           event_type: "communication_clarity",
@@ -1942,6 +2628,326 @@ test("Pi accepts grounded communication clarity coaching over sustained speech",
   assert.equal(result.action, "intervention");
   assert.equal(result.intervention.event_type, "communication_clarity");
   assert.deepEqual(result.intervention.evidence_segment_ids, ["local-expression-1", "local-expression-2"]);
+});
+
+for (const profile of ["candidate", "compact", "spark"]) {
+  test(`candidate evaluations replace old revisions and tool output: ${profile}`, async () => {
+    const { faux, runtime } = harness({ modelId: profile === "spark" ? "gpt-5.3-codex-spark" : undefined });
+    const first = request("revision-first");
+    first.context.compact_terminal_contract = profile !== "candidate";
+    first.context.new_paragraphs[0].text = "旧版本把演示安排在早上。";
+    first.context.context_paragraphs = [];
+    const second = structuredClone(first);
+    second.request_id = "revision-second";
+    second.context.state_revision = 8;
+    second.context.new_paragraphs[0].revision = 2;
+    second.context.new_paragraphs[0].text = "校对后原话是演示安排仍待讨论。";
+    second.context.new_paragraphs[0].correction_status = "changed";
+    second.context.new_paragraphs[0].evidence_quality = "reviewed";
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("keep_silent", { reason: "旧轮工具结果，不是本次事实。" }), { stopReason: "toolUse" }),
+      (context) => {
+        assert.equal(context.messages.filter((item) => item.role === "user").length, 1);
+        assert.ok(!JSON.stringify(context.messages).includes("旧版本把演示安排在早上"));
+        assert.ok(!JSON.stringify(context.messages).includes("旧轮工具结果"));
+        const payload = promptPayload(context);
+        const paragraph = (payload.new_paragraphs ?? payload.paragraphs).find((item) => item.id === "remote-1");
+        assert.equal(payload.state_revision, 8);
+        assert.equal(paragraph.revision, 2);
+        assert.equal(paragraph.text, second.context.new_paragraphs[0].text);
+        assert.equal(paragraph.correction_status, "changed");
+        assert.equal(paragraph.evidence_quality, "reviewed");
+        return fauxAssistantMessage(fauxToolCall("keep_silent", { reason: "只判断当前校对版本。" }), { stopReason: "toolUse" });
+      },
+    ]);
+    await runtime.evaluate(first);
+    const result = await runtime.evaluate(second);
+    assert.equal(result.metrics.session_reused, true);
+    assert.equal(result.metrics.session_message_count_before, 0);
+  });
+}
+
+for (const change of ["role", "question", "document", "memory"]) {
+  test(`candidate current host input replaces previous ${change}`, async () => {
+    const { faux, runtime } = harness();
+    const first = request("old-host-input");
+    first.context.compact_terminal_contract = true;
+    first.context.role_contract = "只帮助当前用户，旧角色标记不可跨作业重放。";
+    first.context.rolling_state.current_answer = { question: "旧问题标记", answer: "只供比较。" };
+    first.context.user_memory = { terms: [{ canonical: "旧术语标记", aliases: ["old-term"] }], preferences: {} };
+    withDocuments(first, [documentSource({ quote: "旧文档标记，仅第一场范围有效。" })]);
+    const second = structuredClone(first);
+    second.request_id = "new-host-input";
+    const oldMarker = { role: "旧角色标记", question: "旧问题标记", document: "旧文档标记", memory: "旧术语标记" }[change];
+    if (change === "role") second.context.role_contract = "新角色为中立主持者，不代答。";
+    if (change === "question") second.context.rolling_state.current_answer = { question: "新的问题", answer: "当前比较项。" };
+    if (change === "document") {
+      second.context.document_evidence = [];
+      second.context.knowledge_context.context_revision = 3;
+    }
+    if (change === "memory") second.context.user_memory = { terms: [], preferences: {} };
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("keep_silent", { reason: "第一轮不介入。" }), { stopReason: "toolUse" }),
+      (context) => {
+        assert.ok(!(context.systemPrompt + JSON.stringify(context.messages)).includes(oldMarker));
+        assert.equal(context.messages.filter((item) => item.role === "user").length, 1);
+        const payload = promptPayload(context);
+        if (change === "role") assert.ok(context.systemPrompt.includes(second.context.role_contract));
+        if (change === "question") assert.equal(payload.rolling_state.current_answer.question, "新的问题");
+        if (change === "document") assert.equal(payload.document_evidence, undefined);
+        if (change === "memory") assert.equal(payload.user_memory, undefined);
+        return fauxAssistantMessage(fauxToolCall("keep_silent", { reason: "当前输入没有新增介入价值。" }), { stopReason: "toolUse" });
+      },
+    ]);
+    await runtime.evaluate(first);
+    const result = await runtime.evaluate(second);
+    assert.equal(result.metrics.session_message_count_before, 0);
+  });
+}
+
+test("candidate scoped current evidence keeps revisions and recent resolution", async () => {
+  const { faux, runtime } = harness();
+  const value = request("cross-batch-current");
+  value.context.compact_terminal_contract = true;
+  value.context.candidate_evidence_paragraphs = [{ id: "cross-batch", text: "原先尚未明确验收条件。", revision: 4, source_track: "system_audio", correction_status: "changed", evidence_quality: "reviewed" }];
+  value.context.candidate_events[0].evidence_segment_ids = ["cross-batch", "remote-1"];
+  value.context.context_paragraphs = [
+    { id: "outside-last-two", text: "更早的话不直接进入本次上下文。", revision: 1 },
+    { id: "resolution-1", text: "现在条件已经明确，先核对测试结果。", revision: 3 },
+    { id: "resolution-2", text: "测试结果已提供，接下来按确认条件演示。", revision: 5 },
+  ];
+  faux.setResponses([(context) => {
+    const payload = promptPayload(context);
+    assert.deepEqual(payload.candidate_evidence_paragraphs.map(({ id, revision, text }) => ({ id, revision, text })), value.context.candidate_evidence_paragraphs.map(({ id, revision, text }) => ({ id, revision, text })));
+    assert.deepEqual(payload.recent_context_paragraphs.map(({ id, revision }) => ({ id, revision })), [{ id: "resolution-1", revision: 3 }, { id: "resolution-2", revision: 5 }]);
+    assert.equal(payload.recent_context_paragraphs[1].text, value.context.context_paragraphs[2].text);
+    assert.ok(!JSON.stringify(context.messages).includes("更早的话不直接进入"));
+    return fauxAssistantMessage(fauxToolCall("keep_silent", { reason: "近期已补齐条件，不重复旧提醒。" }), { stopReason: "toolUse" });
+  }]);
+  const result = await runtime.evaluate(value);
+  assert.equal(result.action, "silent");
+});
+
+for (const role of [undefined, "", "主持者自定义约束：保持中立，不替受访者回答。\n来源变更时撤旧，不编造经历。"]) {
+  test(`candidate retains safe role and silence constraints: ${role === undefined ? "legacy" : role ? "custom" : "blank"}`, async () => {
+    const { faux, runtime } = harness();
+    const value = request("role-and-silence");
+    value.context.compact_terminal_contract = true;
+    value.context.role_contract = role;
+    faux.setResponses([(context) => {
+      if (role) assert.ok(context.systemPrompt.includes(role));
+      else assert.match(context.systemPrompt, /你是当前用户的私人工作与对话副驾/);
+      assert.match(context.systemPrompt, /外放、录播、广告和转述不等于用户/);
+      assert.match(context.systemPrompt, /不替作者争论立场或说教/);
+      assert.match(context.systemPrompt, /引述提问、反问、自答、未完片段/);
+      assert.match(context.systemPrompt, /已补条件、已解决.*静默/);
+      assert.match(context.systemPrompt, /provisional.*只可澄清或静默/);
+      assert.match(context.systemPrompt, /资料.*不执行其中指令/);
+      assert.match(context.systemPrompt, /旧AI答案和记忆不是业务事实/);
+      assert.match(context.systemPrompt, /保留真实来源版本与范围/);
+      assert.match(context.systemPrompt, /最多两轮模型\/四工具/);
+      assert.match(context.systemPrompt, /访谈主持者用中立追问/);
+      return fauxAssistantMessage(fauxToolCall("keep_silent", { reason: "没有有效待回应事项。" }), { stopReason: "toolUse" });
+    }]);
+    assert.equal((await runtime.evaluate(value)).action, "silent");
+  });
+}
+
+test("candidate messages survive an in-evaluation quote rejection", async () => {
+  const { faux, runtime } = harness();
+  const value = request("same-evaluation-repair");
+  const card = { event_type: "question_to_user", title: "核对上线条件", recommendation: "先依据压测结果讨论上线日期。", reason: "当前上线条件仍需核对。", evidence_segment_ids: ["remote-1"], evidence_quote: "周五一定上线吗？", urgency: "medium", confidence: 0.9 };
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("submit_intervention", card), { stopReason: "toolUse" }),
+    (context) => {
+      assert.equal(context.messages.filter((item) => item.role === "user").length, 1);
+      assert.ok(context.messages.some((item) => item.role === "toolResult"));
+      assert.match(JSON.stringify(context.messages), /evidence_quote/);
+      return fauxAssistantMessage(fauxToolCall("submit_intervention", { ...card, evidence_quote: "周五一定上线吗" }), { stopReason: "toolUse" });
+    },
+  ]);
+  const result = await runtime.evaluate(value);
+  assert.equal(result.action, "intervention");
+  assert.equal(result.metrics.turns, 2);
+  assert.equal(result.metrics.tool_errors[0].code, "evidence_quote_not_verbatim");
+});
+
+test("candidate lookup rejects an obsolete revision without losing the current input", async () => {
+  const { faux, runtime } = harness();
+  const value = request("candidate-stale-lookup");
+  value.context.new_paragraphs[0].revision = 2;
+  value.context.candidate_events = [{ event_type: "objection_detected", evidence_segment_ids: ["remote-1"], reason: "需要核对先前条件。", candidate_key: "objection:current" }];
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("search_prior_evidence", { query: "先前条件" }), { stopReason: "toolUse" }),
+    (context) => {
+      const toolResult = context.messages.findLast((item) => item.role === "toolResult");
+      assert.ok(toolResult);
+      assert.match(JSON.stringify(toolResult), /revision changed/);
+      assert.equal(promptPayload(context).new_paragraphs[0].revision, 2);
+      assert.ok(!JSON.stringify(context.messages).includes("旧版本错把日期当承诺"));
+      return fauxAssistantMessage(fauxToolCall("keep_silent", { reason: "旧版本不能作为当前矛盾依据。" }), { stopReason: "toolUse" });
+    },
+  ]);
+  const result = await runtime.evaluate(value, { searchEvidence: async () => [{ ...value.context.new_paragraphs[0], revision: 1, text: "旧版本错把日期当承诺。" }] });
+  assert.equal(result.action, "silent");
+  assert.equal(result.metrics.turns, 2);
+  assert.equal(result.metrics.tool_errors[0].code, "evidence_revision_changed");
+});
+
+test("candidate timeout and late callback cannot enter the next evaluation", async () => {
+  const faux = fauxProvider({ provider: `r01-late-${Math.random()}` });
+  const models = createModels();
+  models.setProvider(faux.provider);
+  let evaluations = 0;
+  const runtime = new PiCoachRuntime({ backendFactory: () => {
+    evaluations += 1;
+    return { identity: "r01-late", model: faux.getModel(), decisionTimeoutMs: evaluations === 1 ? 15 : 1000,
+      streamFn: evaluations === 1 ? () => {
+        const stream = createAssistantMessageEventStream();
+        setTimeout(() => {
+          const message = fauxAssistantMessage(fauxToolCall("keep_silent", { reason: "过期作业的迟到标记。" }), { stopReason: "toolUse" });
+          stream.push({ type: "done", reason: "toolUse", message });
+          stream.end(message);
+        }, 45);
+        return stream;
+      } : models.streamSimple.bind(models) };
+  } });
+  const old = request("timeout-before-new-input");
+  old.context.new_paragraphs[0].text = "过期作业的原文标记。";
+  await assert.rejects(runtime.evaluate(old), (error) => error.code === "agent_deadline_exceeded");
+  faux.setResponses([(context) => {
+    assert.equal(context.messages.filter((item) => item.role === "user").length, 1);
+    assert.ok(!JSON.stringify(context.messages).includes("过期作业"));
+    return fauxAssistantMessage(fauxToolCall("keep_silent", { reason: "当前问题无需重复提示。" }), { stopReason: "toolUse" });
+  }]);
+  const result = await runtime.evaluate(request("fresh-after-timeout"));
+  assert.equal(result.metrics.session_message_count_before, 0);
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(runtime.sessionCount, 1);
+  assert.ok(!JSON.stringify(runtime.sessions.get("meeting-1").agent.state.messages).includes("过期作业"));
+});
+
+function r01bReleaseRequest(requestId) {
+  const value = request(requestId);
+  value.context.compact_terminal_contract = true;
+  value.context.new_paragraphs = [{ id: "release-question", text: "发布前还需要检查哪些条件？",
+    revision: 1, source_track: "system_audio", role_hint: "remote_mix", correction_status: "no_change",
+    evidence_quality: "reviewed" }];
+  value.context.context_paragraphs = [{ id: "release-condition", text: "压测还没通过，回滚方案也没有验收。",
+    revision: 1, source_track: "microphone", role_hint: "self_or_room", correction_status: "no_change",
+    evidence_quality: "reviewed" }];
+  value.context.candidate_events = [{ event_type: "question_pending", evidence_segment_ids: ["release-question"],
+    reason: "核对当前问题是否仍需回应。", candidate_key: "release-condition:question" }];
+  value.context.retrieval_paragraphs = [];
+  value.context.semantic_windows = [];
+  value.context.rolling_state = { topic: "发布前置条件" };
+  value.context.meeting_goal = "明确当前发布的前置条件，不承诺未经确认的结果。";
+  return value;
+}
+
+function r01bReleaseCard(sayThis) {
+  return { event_type: "question_to_user", title: "核对发布条件", say_this: sayThis,
+    urgency: "medium", confidence: 0.9 };
+}
+
+const R01B_GROUNDED_RELEASE_SENTENCE = "压测通过且回滚方案验收后，再确认发布条件。";
+
+test("R01b compact candidate accepts original release conditions on the first turn", async () => {
+  const { faux, runtime } = harness();
+  faux.setResponses([(context) => {
+    assert.match(context.systemPrompt, /直接列举原文条件，勿添加未引述数量、日期或阈值/);
+    assert.equal(promptPayload(context).recent_context_paragraphs[0].text, "压测还没通过，回滚方案也没有验收。");
+    return fauxAssistantMessage(fauxToolCall("submit_intervention", r01bReleaseCard(R01B_GROUNDED_RELEASE_SENTENCE)), { stopReason: "toolUse" });
+  }]);
+  const result = await runtime.evaluate(r01bReleaseRequest("r01b-original-release"));
+  assert.equal(result.action, "intervention");
+  assert.equal(result.intervention.say_this, R01B_GROUNDED_RELEASE_SENTENCE);
+  assert.deepEqual(result.intervention.evidence_segment_ids, ["release-question", "release-condition"]);
+  assert.equal(result.intervention.evidence_quote, "发布前还需要检查哪些条件？\n压测还没通过，回滚方案也没有验收。");
+  assert.equal(result.metrics.turns, 1);
+  assert.deepEqual(result.metrics.tool_errors, []);
+});
+
+test("R01b compact candidate accepts the exact next-step navigation cue", async () => {
+  const { faux, runtime } = harness();
+  const sentence = `下一步，${R01B_GROUNDED_RELEASE_SENTENCE}`;
+  faux.setResponses([fauxAssistantMessage(fauxToolCall("submit_intervention", r01bReleaseCard(sentence)), { stopReason: "toolUse" })]);
+  const result = await runtime.evaluate(r01bReleaseRequest("r01b-next-step"));
+  assert.equal(result.action, "intervention");
+  assert.equal(result.intervention.say_this, sentence);
+  assert.equal(result.metrics.turns, 1);
+  assert.deepEqual(result.metrics.tool_errors, []);
+});
+
+for (const [name, sentence] of [
+  ["next-step-with-unquoted-repetitions", "下一步，压测复测3次且回滚方案验收后，再确认发布条件。"],
+  ["unquoted-derived-count", "这两项都通过后，再确认发布条件。"],
+  ["unquoted-date", "明天压测通过且回滚方案验收后，再确认发布条件。"],
+  ["unquoted-threshold", "压测通过率达到95%且回滚方案验收后，再确认发布条件。"],
+  ["unquoted-single-item", "先确认一项发布条件，再检查回滚方案。"],
+  ["unquoted-step-count", "先完成一步验收，再确认发布条件。"],
+  ["unquoted-remaining-step", "只剩下一步即可发布。"],
+  ["unquoted-residual-step", "余下一步即可发布。"],
+]) {
+  test(`R01b compact candidate still rejects ${name} and repairs from original conditions`, async () => {
+    const { faux, runtime } = harness();
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("submit_intervention", r01bReleaseCard(sentence)), { stopReason: "toolUse" }),
+      (context) => {
+        const failure = context.messages.findLast((message) => message.role === "toolResult");
+        assert.ok(failure);
+        assert.match(JSON.stringify(failure), /unsupported date or number/);
+        assert.equal(promptPayload(context).recent_context_paragraphs[0].text, "压测还没通过，回滚方案也没有验收。");
+        return fauxAssistantMessage(fauxToolCall("submit_intervention", r01bReleaseCard(R01B_GROUNDED_RELEASE_SENTENCE)), { stopReason: "toolUse" });
+      },
+    ]);
+    const result = await runtime.evaluate(r01bReleaseRequest(`r01b-${name}`));
+    assert.equal(result.action, "intervention");
+    assert.equal(result.intervention.say_this, R01B_GROUNDED_RELEASE_SENTENCE);
+    assert.equal(result.metrics.turns, 2);
+    assert.deepEqual(result.metrics.tool_errors, [{ tool: "submit_intervention", code: "ungrounded_discovery" }]);
+  });
+}
+
+test("R01b next-step navigation preserves the original quoted quantity", async () => {
+  const { faux, runtime } = harness();
+  const value = r01bReleaseRequest("r01b-quoted-repetitions");
+  value.context.context_paragraphs[0].text = "压测还没通过，需要复测3次，回滚方案也没有验收。";
+  const sentence = "下一步，压测复测3次且回滚方案验收后，再确认发布条件。";
+  faux.setResponses([fauxAssistantMessage(fauxToolCall("submit_intervention", r01bReleaseCard(sentence)), { stopReason: "toolUse" })]);
+  const result = await runtime.evaluate(value);
+  assert.equal(result.action, "intervention");
+  assert.equal(result.intervention.say_this, sentence);
+  assert.equal(result.metrics.turns, 1);
+  assert.deepEqual(result.metrics.tool_errors, []);
+});
+
+test("R01b resolved release conditions replace the old revision and allow silence", async () => {
+  const { faux, runtime } = harness();
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("submit_intervention", r01bReleaseCard(R01B_GROUNDED_RELEASE_SENTENCE)), { stopReason: "toolUse" }),
+    (context) => {
+      const payload = promptPayload(context);
+      assert.equal(payload.state_revision, 8);
+      assert.equal(payload.recent_context_paragraphs[0].revision, 2);
+      assert.equal(payload.recent_context_paragraphs[0].text, "压测通过、回滚方案验收均已核对，这个问题已经回答，继续其他议题。");
+      assert.ok(!JSON.stringify(context.messages).includes("压测还没通过"));
+      assert.match(context.systemPrompt, /已补条件、已解决.*静默/);
+      return fauxAssistantMessage(fauxToolCall("keep_silent", { reason: "发布前置条件已核对，当前无需重复提醒。" }), { stopReason: "toolUse" });
+    },
+  ]);
+  const value = r01bReleaseRequest("r01b-before-resolution");
+  assert.equal((await runtime.evaluate(value)).action, "intervention");
+  value.request_id = "r01b-after-resolution";
+  value.context.state_revision = 8;
+  value.context.context_paragraphs[0].revision = 2;
+  value.context.context_paragraphs[0].text = "压测通过、回滚方案验收均已核对，这个问题已经回答，继续其他议题。";
+  const result = await runtime.evaluate(value);
+  assert.equal(result.action, "silent");
+  assert.equal(result.intervention, null);
+  assert.equal(result.metrics.turns, 1);
+  assert.equal(result.metrics.session_message_count_before, 0);
+  assert.deepEqual(result.metrics.tool_errors, []);
 });
 
 test("ordinary assistant text is not accepted as a business result", async () => {

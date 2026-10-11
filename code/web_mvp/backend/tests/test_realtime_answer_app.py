@@ -11,8 +11,51 @@ from fastapi.testclient import TestClient
 from meeting_copilot_web_mvp.app import ProviderRuntimeNotConfiguredDeferred, create_app
 
 
+def test_off_stops_fast_at_commit_and_rechecks_already_queued_work(tmp_path):
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    persistence = app.state.v2_persistence
+    app.state.meeting_preparation_store.save("automatic-off", proactive_suggestion_policy="off", updated_at_ms=1)
+    try:
+        committed = app.state.commit_v2_final("automatic-off", {
+            "segment_id": "new", "text": "本次发布为什么选择灰度？",
+            "source_track": "system_audio", "start_ms": 0, "end_ms": 1000,
+        })
+        assert "answer" not in committed["job_ids"]
+        old = persistence.commit_final_and_enqueue(
+            meeting_id="automatic-off", final_id="old-queued", segment_id="old",
+            text="这个项目选择了什么方案？", normalized_text="这个项目选择了什么方案？",
+            source_track="system_audio", started_at_ms=2000, ended_at_ms=3000,
+            evidence_hash="old-evidence", now_ms=10,
+        )
+        result = asyncio.run(app.state.v2_answer_job_handler_impl(persistence.get_job(old["job_ids"]["answer"])))
+        assert result["generated_answer_count"] == 0
+        assert result["reason"] == "automatic_policy_off"
+        assert persistence.get_snapshot("automatic-off")["suggestions"] == []
+    finally:
+        app.state.knowledge_repository.close()
+        persistence.close()
+
+
+def test_continuous_speech_without_goal_does_not_force_an_answer(tmp_path):
+    app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    try:
+        for index in range(6):
+            result = app.state.commit_v2_final("passive-listening", {
+                "segment_id": f"long-{index}",
+                "text": "今天的节目介绍了出游期间分摊支出的做法，提前记账可以减少散场后的沟通成本，也有人喜欢回家以后再慢慢核对账单。",
+                "source_track": "system_audio", "start_ms": index * 20_000, "end_ms": (index + 1) * 20_000,
+            })
+            assert "answer" not in result["job_ids"]
+    finally:
+        app.state.knowledge_repository.close()
+        app.state.v2_persistence.close()
+
+
 def test_continuous_statements_schedule_discussion_without_question_and_cool_down(tmp_path):
     app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    app.state.meeting_preparation_store.save(
+        "discussion-meeting", meeting_goal="比较补贴传导条件", proactive_suggestion_policy="standard", updated_at_ms=1,
+    )
     texts = [
         "财政贴息可以降低居民购房的实际融资成本，但贴息对象和适用范围目前还没有明确。银行也可能受益于贷款需求恢复。",
         "目前讨论主要围绕居民负担以及银行收益，居民利息减少和银行利润增加之间仍然存在传导条件，还要关注补贴承担方以及新增贷款的信用风险。",
@@ -37,9 +80,11 @@ def test_continuous_statements_schedule_discussion_without_question_and_cool_dow
         app.state.v2_persistence.close()
 
 
+@pytest.mark.parametrize("policy", ["standard", "low_frequency"])
 def test_llm_first_system_question_runs_independent_streaming_answer_lane(
     monkeypatch,
     tmp_path,
+    policy,
 ) -> None:
     requests: list[dict] = []
 
@@ -65,6 +110,9 @@ def test_llm_first_system_question_runs_independent_streaming_answer_lane(
     monkeypatch.delenv("LLM_GATEWAY_IS_MOCK", raising=False)
 
     app = create_app(data_dir=tmp_path, semantic_projection_mode="llm_first")
+    app.state.meeting_preparation_store.save(
+        "meeting-answer", proactive_suggestion_policy=policy, updated_at_ms=1,
+    )
     client = httpx.AsyncClient(transport=httpx.MockTransport(gateway), trust_env=False)
     app.state.answer_llm_client = client
     persistence = app.state.v2_persistence
@@ -106,10 +154,15 @@ def test_llm_first_system_question_runs_independent_streaming_answer_lane(
         assert result["grounding_removed_claim_types"] == ["deadline", "owner"]
         assert answer["model"] == "fast-model"
         assert answer["ttft_ms"] is not None
-        deep_job = persistence.get_job(result["deep_coach_job_id"])
-        assert deep_job["trigger_type"] == "answer_ready"
-        assert deep_job["work_item_id"] == answer["suggestion_id"]
-        assert deep_job["evidence_segment_id"] == "segment-answer"
+        if policy == "standard":
+            deep_job = persistence.get_job(result["deep_coach_job_id"])
+            assert deep_job["trigger_type"] == "answer_ready"
+            assert deep_job["work_item_id"] == answer["suggestion_id"]
+            assert deep_job["evidence_segment_id"] == "segment-answer"
+        else:
+            assert result["deep_coach_job_id"] is None
+            assert result["deep_coach_admission_reason"] == "fast_answer_sufficient_without_goal_or_evidence"
+            assert not any(job["trigger_type"] == "answer_ready" for job in persistence.list_jobs(meeting_id="meeting-answer"))
         assert snapshot_answer == answer
         hydrated = TestClient(app).get("/v2/meetings/meeting-answer/snapshot")
         assert hydrated.status_code == 200
@@ -257,6 +310,10 @@ def test_browser_microphone_question_runs_single_track_answer_and_queues_pi_deep
 
 
 def test_unconfigured_provider_is_visible_on_the_answer_draft(monkeypatch, tmp_path) -> None:
+    from meeting_copilot_web_mvp import llm_service
+
+    # Missing process env must not silently reload a developer's real .env.
+    monkeypatch.setattr(llm_service, "REPO_ENV_FILE", tmp_path / "absent-provider.env")
     for name in (
         "LLM_GATEWAY_BASE_URL",
         "LLM_GATEWAY_API_KEY",

@@ -66,6 +66,13 @@ export interface DataGovernanceSettings {
 }
 
 export interface TranscriptSegment {
+  recoveryJobId?: string;
+  recoveryProvenance?: {
+    jobId: string; track: "microphone" | "system_audio"; epoch: number;
+    startSample: number; endSample: number; audioDigest: string; coverageDigest: string;
+    candidateVersion: number; timing: "whole_audio_range"; recognition: "local_batch_asr";
+    correction: "not_requested"; userEdited: boolean;
+  };
   meetingId: string;
   segmentId: string;
   finalId: string;
@@ -123,7 +130,45 @@ export interface ActivePartial {
   segmentId: string;
   text: string;
   startedAtMs: number | null;
+  endedAtMs?: number | null;
+  textTruncated?: boolean;
+  sourceTextCharacters?: number | null;
   updatedAtMs: number;
+}
+
+export function isPartialTextTruncated(partial: ActivePartial): boolean {
+  const sourceLength = partial.sourceTextCharacters;
+  return partial.textTruncated === true
+    || (sourceLength != null && Number.isSafeInteger(sourceLength)
+      && sourceLength > Array.from(partial.text).length);
+}
+
+export function isCompletePartialText(partial: ActivePartial): boolean {
+  const text = partial.text.trim();
+  return text.length > 0 && text.length <= 4_000 && !isPartialTextTruncated(partial);
+}
+
+export function isPartialCoveredBySegment(
+  partial: ActivePartial,
+  segment: Pick<TranscriptSegment, "segmentId" | "text" | "normalizedText" | "startedAtMs" | "endedAtMs">,
+): boolean {
+  if (partial.segmentId !== segment.segmentId) return false;
+  // Older browser previews carry no end span: retain their same-id rule.
+  if (partial.endedAtMs == null) return !isPartialTextTruncated(partial);
+  const start = partial.startedAtMs;
+  const end = partial.endedAtMs;
+  if (start !== null && Number.isSafeInteger(start) && Number.isSafeInteger(end)
+    && start >= 0 && end > start && segment.startedAtMs !== null && segment.endedAtMs !== null
+    && segment.startedAtMs <= start && segment.endedAtMs >= end) return true;
+  const text = partial.text.trim();
+  return isCompletePartialText(partial)
+    && (segment.text.trim().includes(text) || segment.normalizedText.trim().includes(text));
+}
+
+export interface SuggestionContextEvidence {
+  segmentId: string;
+  evidenceHash: string;
+  revision: number;
 }
 
 export interface Suggestion {
@@ -137,6 +182,9 @@ export interface Suggestion {
   evidenceTranscriptSeq: number;
   evidenceHash: string;
   stateRevision: number;
+  contextEvidence?: SuggestionContextEvidence[];
+  supersedesSuggestionId?: string | null;
+  sourceEvidence?: DocumentSourceEvidence[];
   status: SuggestionStatus;
   draftText: string;
   draftSeq: number;
@@ -178,6 +226,7 @@ export interface TopicProjection {
   status: "active" | "changed" | "expired" | "unknown";
   evidenceSegmentIds: string[];
   updatedAtMs: number | null;
+  lastUpdatedSeq?: number;
   formalAi?: FormalAiProvenance | null;
 }
 
@@ -280,7 +329,10 @@ export interface CoachAgentMetrics {
   };
 }
 
-export interface CoachDecisionProjection {
+export interface CoachDecisionProjection extends ContributionFields {
+  /** Latest discussion snapshot included in this analysis, not its completion time. */
+  frozenAtMs?: number;
+  sourceEvidence?: DocumentSourceEvidence[];
   provenanceVersion?: string;
   origin?: CoachDecisionOrigin;
   status?: CoachDecisionStatus;
@@ -340,7 +392,50 @@ export interface PiCoachingPackage {
   confidence: number;
 }
 
-export interface FollowUpProjection {
+export interface MaterialContextSnapshot {
+  materialSetId: string;
+  materialContextRevision: number;
+  catalogTruncated: boolean;
+  catalogIsEvidence: false;
+  attachmentCatalog: {
+    attachmentId: string;
+    title: string;
+    versionId: string;
+    coverage: {
+      authorizedSpanCount: number;
+      authorizedCharacters: number;
+      providedSpanCount: number;
+      providedCharacters: number;
+      completeRead: boolean;
+      selection: "selected_spans" | "whole_document";
+    };
+  }[];
+}
+
+export interface ContributionFields {
+  analysisKind?: string;
+  proposalType?: "grounded_fact" | "professional_proposal" | "external_claim";
+  topicId?: string;
+  analysisBasisRevision?: number;
+  supportingFacts?: { text: string; sourceRef: string }[];
+  assumptions?: string[];
+  materialContext?: MaterialContextSnapshot;
+}
+
+export interface CoachUiRenderReceipt {
+  meetingId: string;
+  jobId: string;
+  decisionId: string;
+  eventSeq: number;
+  inputVersion: number;
+  draftSeq: 0;
+}
+
+export interface FollowUpProjection extends ContributionFields {
+  /** Latest discussion snapshot included in this analysis, not its completion time. */
+  frozenAtMs?: number;
+  uiRenderReceipt?: CoachUiRenderReceipt;
+  sourceEvidence?: DocumentSourceEvidence[];
   question: string;
   reason: string;
   /** Product-facing aliases; legacy question/reason remain supported. */
@@ -451,6 +546,9 @@ export interface EvidenceSpan {
 }
 
 export interface MeetingFactBase {
+  sourceMessageId?: string | null;
+  sourceEvidence?: DocumentSourceEvidence[];
+  evidenceStatus?: "valid" | "stale" | "unknown";
   id: string;
   text: string;
   status: MeetingFactStatus;
@@ -484,6 +582,12 @@ export interface RuntimeIndicator {
   detail: string | null;
   decision?: string | null;
   errorClass?: string | null;
+  jobId?: string | null;
+  topicId?: string | null;
+  analysisBasisRevision?: number | null;
+  inputTranscriptSeq?: number | null;
+  lastSemanticSeq?: number | null;
+  understandingStatus?: "waiting_reanalysis" | "reanalysis_queued" | "reanalysis_running" | "revision_deferred" | "reanalysis_deferred" | "partial_review";
   capabilities?: Record<string, RuntimeIndicator>;
 }
 
@@ -531,6 +635,8 @@ export interface ApproachReview {
   cards: ApproachCard[];
   degraded: boolean | null;
   updatedAtMs: number | null;
+  jobId?: string | null;
+  createdAtMs?: number | null;
 }
 
 export interface ReviewJob {
@@ -597,7 +703,7 @@ export interface ImportJob {
 }
 
 export interface MeetingAudioSummary {
-  status: "recording" | "saved" | "assembling" | "failed" | "unknown";
+  status: "recording" | "saved" | "assembling" | "failed" | "partial_failure" | "unknown";
   chunkCount: number;
   durationMs: number;
   fileSizeBytes: number;
@@ -605,8 +711,12 @@ export interface MeetingAudioSummary {
 }
 
 export type MeetingInputSource = "microphone" | "system_audio" | "dual_track";
+export type LiveAnalysisProfile = "participation" | "legacy";
+export type MeetingCorrectionMode = "local_and_llm" | "llm_only";
 
 export interface MeetingPreparationInput {
+  liveAnalysisProfile?: LiveAnalysisProfile;
+  correctionMode?: MeetingCorrectionMode;
   title?: string | null;
   hotwords: string[];
   inputSource: MeetingInputSource;
@@ -622,6 +732,8 @@ export interface MeetingPreparationInput {
 }
 
 export interface MeetingPreparationSnapshot {
+  liveAnalysisProfile?: LiveAnalysisProfile;
+  correctionMode?: MeetingCorrectionMode;
   meetingId: string;
   hotwords: string[];
   inputSource: MeetingInputSource;
@@ -638,15 +750,42 @@ export interface MeetingPreparationSnapshot {
   updatedAtMs: number;
 }
 
-export type AskAiScope = "selection" | "recent" | "chapter" | "meeting";
+export type AskAiScope = "selection" | "recent" | "chapter" | "meeting" | "project";
 
-export interface AskAiEvidence {
+export interface ProjectDocumentSourceEvidence {
+  sourceType: "document";
+  sourceId: string;
+  documentId: string;
+  projectId: string;
+  title: string;
+  versionId: string;
+  version: number;
+  contentHash: string;
+  locator: Record<string, unknown>;
+  quote: string;
+  contextRevision: number;
+}
+
+export interface MeetingAttachmentSourceEvidence {
+  ordinal?: number;
+  sourceType: "meeting_attachment"; sourceId: string; setId: string; meetingId: string; attachmentId: string;
+  title: string; versionId: string; version: number; contentHash: string; locator: Record<string, unknown>; quote: string; contextRevision: number;
+}
+export type DocumentSourceEvidence = ProjectDocumentSourceEvidence | MeetingAttachmentSourceEvidence;
+
+export interface TranscriptSourceEvidence {
+  sourceType?: "transcript";
+  revision?: number;
+  evidenceHash?: string;
+
   segmentId: string;
   transcriptSeq: number;
   startMs: number | null;
   endMs: number | null;
   quote: string;
 }
+
+export type AskAiEvidence = TranscriptSourceEvidence | DocumentSourceEvidence;
 
 export interface AskAiMessage {
   messageId: string;
@@ -656,6 +795,7 @@ export interface AskAiMessage {
   content: string;
   scope: AskAiScope;
   evidence: AskAiEvidence[];
+  evidenceStatus?: "valid" | "stale" | "unknown";
   status: "pending" | "completed" | "failed";
   errorClass: string | null;
   pinnedKind: "note" | "fact" | "action_item" | null;
@@ -685,6 +825,8 @@ export interface MeetingNoteEvidence {
 }
 
 export interface MeetingNote {
+  sourceEvidence?: DocumentSourceEvidence[];
+  evidenceStatus?: "valid" | "stale" | "unknown";
   noteId: string;
   meetingId: string | null;
   title: string;
@@ -771,6 +913,8 @@ export interface TranscriptPage {
 }
 
 export interface MeetingSnapshot {
+  liveAnalysisProfile?: LiveAnalysisProfile;
+  liveAnalysisProfileLocked?: boolean;
   meetingId: string;
   title: string | null;
   titleSource?: MeetingTitleSource;
@@ -855,6 +999,18 @@ function payloadRecord(value: unknown): Record<string, unknown> | null {
 
 function nonEmptyPayloadString(value: unknown): value is string {
   return typeof value === "string" && Boolean(value.trim());
+}
+
+/** Host invalidations can retract a known decision but never publish AI prose. */
+export function isHostCoachInvalidationPayload(value: unknown): value is Record<string, unknown> {
+  const payload = payloadRecord(value);
+  if (!payload || payload.source !== "host_input_invalidation" || payload.llm_called !== false) return false;
+  if ((payload.coach_intervention ?? payload.coachIntervention) != null || (payload.follow_up ?? payload.followUp) != null) return false;
+  const decision = payloadRecord(payload.coach_decision ?? payload.coachDecision);
+  if (!decision || decision.status !== "stale" || (decision.lifecycle_action ?? decision.lifecycleAction) !== "retract") return false;
+  const id = decision.decision_id ?? decision.decisionId;
+  const supersedes = decision.supersedes_decision_id ?? decision.supersedesDecisionId;
+  return nonEmptyPayloadString(id) && nonEmptyPayloadString(supersedes) && id !== supersedes;
 }
 
 /**

@@ -1,5 +1,9 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { useState } from "react";
+import type { KnowledgeApi, MeetingKnowledgeContext } from "../../api/knowledge";
+import type { ProjectOutcomesApi } from "../../api/projectOutcomes";
+import type { ProjectReconcileApi } from "../../api/projectReconcile";
 import { createInitialMeetingState } from "../../domain/reducer";
 import type {
   MeetingViewState,
@@ -104,6 +108,127 @@ beforeEach(() => {
 });
 
 describe("ReviewWorkspace document editing", () => {
+  it("shows each stored decision confirmation status in read mode without treating candidates or unknown states as confirmed", async () => {
+    const user = userEvent.setup();
+    const state = endedState();
+    state.documents = { ...state.documents, decisions: reviewDocument("decisions", { decisions: [
+      { id: "accepted", text: "已明确采用异步处理", status: "confirmed" },
+      { id: "proposed", text: "整体重试仍是候选方案", status: "candidate" },
+      { id: "discarded", text: "已放弃原有串行方案", status: "dismissed" },
+      { id: "unknown", text: "历史导入状态无法识别", status: "future-status" },
+    ] }) };
+    const onSaveDocument = vi.fn();
+    render(<ReviewWorkspace {...workspaceProps(state, { onSaveDocument })} />);
+
+    await user.click(screen.getByRole("tab", { name: "决策与待办" }));
+
+    expect(screen.getByRole("heading", { name: "决策记录" })).toBeVisible();
+    expect(screen.queryByRole("heading", { name: "已确认决策" })).not.toBeInTheDocument();
+    for (const [index, text, label] of [
+      [1, "已明确采用异步处理", "已确认"], [2, "整体重试仍是候选方案", "待确认"],
+      [3, "已放弃原有串行方案", "已放弃"], [4, "历史导入状态无法识别", "状态待核对"],
+    ] as const) {
+      const article = screen.getByText(text).closest("article")!;
+      expect(within(article).getByLabelText(`决策 ${index} 状态：${label}`)).toBeVisible();
+      expect(within(article).getByText(label)).toBeVisible();
+      if (index !== 1) expect(within(article).queryByText("已确认")).not.toBeInTheDocument();
+    }
+    expect(screen.queryByRole("textbox", { name: "编辑决策 1" })).not.toBeInTheDocument();
+    expect(onSaveDocument).not.toHaveBeenCalled();
+  });
+
+  it("archives a meeting with no preselected project only after explicit scope binding and a saved human final", async () => {
+    const user = userEvent.setup();
+    let context: MeetingKnowledgeContext = { meetingId: "meeting-next-017", projectId: null, folderId: null, documentIds: null, selectionMode: "none", revision: 0 };
+    const emptyPage = { items: [], hasMore: false, nextCursor: null };
+    const knowledgeApi = {
+      getMeetingContext: vi.fn(async () => context),
+      saveMeetingContext: vi.fn(async (_meeting: string, selection: { projectId: string | null; folderId: string | null; documentIds: string[] | null }) => { context = { ...context, ...selection, selectionMode: "documents", revision: 1 }; return context; }),
+      listProjects: vi.fn().mockResolvedValue({ ...emptyPage, items: [{ id: "project", name: "产品项目", description: "", revision: 1, archivedAtMs: null }] }),
+      listFolders: vi.fn().mockResolvedValue(emptyPage), listDocuments: vi.fn().mockResolvedValue(emptyPage),
+      importFinal: vi.fn().mockResolvedValue({ document: { id: "imported-final", projectId: "project" }, version: {}, created: true, alreadyImported: false }),
+    } as unknown as KnowledgeApi;
+    const projectApi = { listState: vi.fn().mockResolvedValue({ ...emptyPage, revision: 1 }) } as unknown as ProjectOutcomesApi;
+    const reconcileApi = { list: vi.fn().mockResolvedValue(emptyPage), create: vi.fn() } as unknown as ProjectReconcileApi;
+    const onSave = vi.fn(); const openDocument = vi.fn();
+    function Host() {
+      const [state, setState] = useState(() => ({ ...endedState(), documents: { minutes: reviewDocument("minutes", { markdown: "待人工确认的会议初稿" }, 1, "ai_generated") } }));
+      return <ReviewWorkspace {...workspaceProps(state)} knowledgeApi={knowledgeApi} projectApi={projectApi} reconcileApi={reconcileApi} onOpenKnowledgeDocument={openDocument} onSaveDocument={async (kind, revision, content) => { const saved = { ...reviewDocument(kind, content, revision + 1), dirtyState: "saved" as const }; onSave(kind, revision, content); setState((value) => ({ ...value, documents: { ...value.documents, [kind]: saved } })); return saved; }} />;
+    }
+    render(<Host />);
+    expect(await screen.findByText(/会前无需选择项目/)).toBeVisible();
+    expect(knowledgeApi.saveMeetingContext).not.toHaveBeenCalled(); expect(knowledgeApi.importFinal).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "把已保存人工终稿加入资料库" })).toBeDisabled();
+    await user.click(screen.getByText("选择会后归档项目"));
+    await screen.findByRole("option", { name: "产品项目" });
+    await user.selectOptions(screen.getByRole("combobox", { name: "会议资料项目" }), "project");
+    await user.selectOptions(screen.getByRole("combobox", { name: "会议资料选择方式" }), "none");
+    expect(knowledgeApi.saveMeetingContext).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "保存资料范围" }));
+    await waitFor(() => expect(knowledgeApi.saveMeetingContext).toHaveBeenCalledWith("meeting-next-017", expect.objectContaining({ projectId: "project", folderId: null, documentIds: [] }), 0));
+    await waitFor(() => expect(screen.queryByText("选择会后归档项目")).not.toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "把已保存人工终稿加入资料库" })).toBeDisabled();
+    await user.click(screen.getByRole("button", { name: "编辑" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "编辑会议复盘" }), { target: { value: "已确认下单与通知失败隔离，待办由后端负责。" } });
+    await user.click(screen.getByRole("button", { name: "退出编辑" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "把已保存人工终稿加入资料库" })).toBeEnabled());
+    expect(onSave).toHaveBeenCalledWith("minutes", 1, { markdown: "已确认下单与通知失败隔离，待办由后端负责。" });
+    await user.click(screen.getByRole("button", { name: "把已保存人工终稿加入资料库" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "导入当前原文为草稿" })).toBeEnabled());
+    expect(screen.getByRole("combobox", { name: "入库项目" })).toBeDisabled();
+    expect(screen.getByRole("combobox", { name: "入库项目" })).toHaveValue("project");
+    await user.click(screen.getByRole("button", { name: "导入当前原文为草稿" }));
+    expect(await screen.findByText("已保存为资料草稿，尚未用于会议。")).toBeVisible();
+    expect(knowledgeApi.importFinal).toHaveBeenCalledWith("meeting-next-017", { documentKind: "minutes", expectedSourceVersion: 1, folderId: null });
+    expect(knowledgeApi.saveMeetingContext).toHaveBeenCalledOnce(); expect(reconcileApi.create).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "到资料库检查并确认" }));
+    expect(openDocument).toHaveBeenCalledWith({ documentId: "imported-final", projectId: "project" });
+  });
+  it("keeps failed edits open, blocks exporting an old version, then exports after explicit save retry", async () => {
+    const user = userEvent.setup(); const state = endedState();
+    state.documents = { minutes: reviewDocument("minutes", { markdown: "服务端旧版本" }) };
+    const onSaveDocument = vi.fn().mockRejectedValueOnce(new Error("磁盘写入失败")).mockImplementationOnce(async (kind: ReviewDocumentKind, revision: number, content: unknown) => reviewDocument(kind, content, revision + 1));
+    const onExport = vi.fn().mockResolvedValue(undefined);
+    render(<ReviewWorkspace {...workspaceProps(state, { onSaveDocument, onExport })} />);
+    await user.click(screen.getByRole("button", { name: "编辑" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "编辑会议复盘" }), { target: { value: "人工确认的新版本" } });
+    await user.click(screen.getByRole("button", { name: "退出编辑" }));
+    expect(await screen.findByText("磁盘写入失败")).toBeVisible();
+    expect(screen.getByRole("textbox", { name: "编辑会议复盘" })).toHaveValue("人工确认的新版本");
+    await user.click(screen.getByRole("button", { name: "导出会议" }));
+    await user.click(screen.getByRole("menuitem", { name: "Markdown" }));
+    expect(onExport).not.toHaveBeenCalled();
+    expect(screen.getByText(/还有修改尚未保存/)).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "重试保存" }));
+    await waitFor(() => expect(screen.queryByText("磁盘写入失败")).not.toBeInTheDocument());
+    await user.click(screen.getByRole("button", { name: "退出编辑" }));
+    expect(screen.queryByRole("textbox", { name: "编辑会议复盘" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "导出会议" }));
+    await user.click(screen.getByRole("menuitem", { name: "Markdown" }));
+    await waitFor(() => expect(onExport).toHaveBeenCalledWith("markdown"));
+    expect(onSaveDocument).toHaveBeenNthCalledWith(2, "minutes", 3, { markdown: "人工确认的新版本" });
+  });
+  it("does not label raw text or an unsaved manual draft as confirmed", async () => {
+    const user = userEvent.setup(); const state = endedState(); state.fullTranscript = [transcriptSegment()];
+    const view = render(<ReviewWorkspace {...workspaceProps(state)} />);
+    expect(screen.getByText("已有文字，待人工核对")).toBeVisible();
+    expect(screen.queryByText("文字已确认")).not.toBeInTheDocument();
+    const manual = { ...reviewDocument("transcript", { segments: [{ segment_id: "segment-1", text: "人工保存文字" }] }), dirtyState: "saved" };
+    view.rerender(<ReviewWorkspace {...workspaceProps({ ...state, documents: { transcript: manual } })} />);
+    expect(screen.getByText("人工文字已保存")).toBeVisible();
+    await user.click(screen.getByRole("tab", { name: "会议文字" }));
+    await user.click(screen.getByRole("button", { name: "编辑最终文字" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "编辑会议文字第 1 段" }), { target: { value: "尚未保存的修改" } });
+    expect(screen.getByText("文字修改尚未保存")).toBeVisible();
+    expect(screen.queryByText("人工文字已保存")).not.toBeInTheDocument();
+  });
+  it("shows durable source invalidation even when a later AI generation updated the timestamp", () => {
+    const state = endedState();
+    state.documents = { minutes: { ...reviewDocument("minutes", { markdown: "保留人工最终稿" }), dirtyState: "stale", updatedAtMs: 99_000 } };
+    render(<ReviewWorkspace {...workspaceProps(state)} />);
+    expect(screen.getByText(/会议文字已更新，当前复盘可能基于旧版本/)).toBeVisible();
+    expect(screen.getByText("保留人工最终稿")).toBeVisible();
+  });
   it("shows corrected canonical text instead of a stale AI document and warns about older minutes", async () => {
     const user = userEvent.setup();
     const state = endedState();
@@ -124,8 +249,8 @@ describe("ReviewWorkspace document editing", () => {
     expect(screen.getByText("支持一百病发")).not.toBeVisible();
     await user.click(screen.getByText("查看识别原文"));
     expect(screen.getByText("支持一百病发")).toBeVisible();
-    await user.click(screen.getByRole("tab", { name: "会中问答" }));
-    expect(screen.getByText("本场会议还没有问答记录。")).toBeVisible();
+    await user.click(screen.getByRole("tab", { name: "会中建议与问答" }));
+    expect(screen.getByText("本场会议还没有问答与建议记录。")).toBeVisible();
   });
 
   it("auto-saves minutes, decisions, action items, risks, and transcript to their own document kinds", async () => {
@@ -398,6 +523,7 @@ describe("ReviewWorkspace independent retries", () => {
     async (kind, label) => {
       const user = userEvent.setup();
       const state = endedState();
+      state.segments = [transcriptSegment()];
       state.reviewJobs = {
         minutes: reviewJob("minutes", kind === "minutes" ? "failed" : "succeeded"),
         approach: reviewJob("approach", kind === "approach" ? "failed" : "succeeded"),
@@ -422,6 +548,7 @@ describe("ReviewWorkspace independent retries", () => {
   it("keeps retry failures isolated and leaves the other artifact controls available", async () => {
     const user = userEvent.setup();
     const state = endedState();
+    state.segments = [transcriptSegment()];
     state.reviewJobs = {
       minutes: reviewJob("minutes"),
       approach: reviewJob("approach"),

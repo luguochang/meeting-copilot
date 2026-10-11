@@ -1,5 +1,6 @@
 import {
   LayoutDashboard,
+  Library,
   Moon,
   NotebookPen,
   PackageCheck,
@@ -13,12 +14,13 @@ import {
 import { useEffect, useState } from "react";
 import { BrandMark } from "./BrandMark";
 
-type NavigationPage = "meetings" | "live" | "notes" | "capabilities";
+type NavigationPage = "meetings" | "live" | "notes" | "knowledge" | "capabilities";
 
 interface ProductNavigationProps {
   active: NavigationPage;
   onOpenMeetings?: () => void;
   onOpenNotes?: () => void;
+  onOpenKnowledge?: () => void;
   onOpenCapabilities?: () => void;
   activeMeeting?: ActiveMeetingNavigation | null;
   onOpenActiveMeeting?: () => void;
@@ -121,6 +123,7 @@ function ProductNavigationBody({
   active,
   onOpenMeetings,
   onOpenNotes,
+  onOpenKnowledge,
   onOpenCapabilities,
   activeMeeting,
   onOpenActiveMeeting,
@@ -182,6 +185,12 @@ function ProductNavigationBody({
           label="笔记"
           icon={NotebookPen}
           onClick={active === "notes" ? undefined : onOpenNotes}
+        />
+        <NavigationItem
+          active={active === "knowledge"}
+          label="资料库"
+          icon={Library}
+          onClick={active === "knowledge" ? undefined : onOpenKnowledge}
         />
         <NavigationItem
           active={active === "capabilities"}

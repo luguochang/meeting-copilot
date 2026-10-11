@@ -14,7 +14,9 @@ from meeting_copilot_web_mvp.audio_assets import (
     RealtimeWavAssetWriter,
     assemble_realtime_wav_asset,
     audio_metadata_for_file,
+    audio_io_path,
     delete_audio_asset,
+    derive_local_continuous_wav_asset,
     persist_uploaded_audio_asset_from_path,
     safe_audio_path,
 )
@@ -469,6 +471,47 @@ def test_realtime_writer_persists_native_pcm_sequence_and_timestamp_ranges(tmp_p
 def test_safe_audio_path_rejects_paths_outside_data_dir(tmp_path, relative_path):
     with pytest.raises(ValueError):
         safe_audio_path(tmp_path, relative_path)
+
+
+def test_continuous_audio_long_path_preserves_epochs_cache_and_owned_cleanup(tmp_path):
+    # Source WAV paths stay below MAX_PATH; the derived filename exceeds it.
+    # This exercises real Windows file I/O, including hash, cache and playback.
+    suffix = "data-" + "x" * max(1, 190 - len(str(tmp_path)) - 6)
+    data_dir = tmp_path / suffix
+    meeting_id = "long-recording"
+    sources = []
+    for epoch, value in ((1, 0.1), (2, 0.2)):
+        relative = f"audio_assets/{meeting_id}/epoch-{epoch}.wav"
+        path = data_dir / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with wave.open(str(path), "wb") as source:
+            source.setnchannels(1)
+            source.setsampwidth(2)
+            source.setframerate(16_000)
+            source.writeframes(struct.pack("<h", _pcm16_sample(value)) * 1_600)
+        sources.append({"track_id": "microphone", "epoch": epoch,
+                        "output_relative_path": relative,
+                        "output_sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
+    derived = derive_local_continuous_wav_asset(data_dir=data_dir, meeting_id=meeting_id,
+                                               track_id="microphone", sources=sources)
+    assert len(str(data_dir / derived["relative_path"])) > 260
+    assert not derived["relative_path"].startswith("\\\\?\\")
+    assert safe_audio_path(data_dir, derived["relative_path"]) == (data_dir / derived["relative_path"]).resolve()
+    path = audio_io_path(safe_audio_path(data_dir, derived["relative_path"]))
+    params, samples = _read_wav_samples(path)
+    assert params.nframes == 3_200
+    assert samples[:1_600] == (_pcm16_sample(0.1),) * 1_600
+    assert samples[1_600:] == (_pcm16_sample(0.2),) * 1_600
+    mtime = path.stat().st_mtime_ns
+    cached = derive_local_continuous_wav_asset(data_dir=data_dir, meeting_id=meeting_id,
+                                              track_id="microphone", sources=sources)
+    assert cached["sha256"] == derived["sha256"]
+    assert path.stat().st_mtime_ns == mtime
+    assert all((data_dir / source["output_relative_path"]).is_file() for source in sources)
+    with pytest.raises(ValueError):
+        safe_audio_path(data_dir, "../outside.wav")
+    assert delete_audio_asset(data_dir, derived) == "deleted"
+    assert not path.exists()
 
 
 @pytest.mark.parametrize(

@@ -1,6 +1,12 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MeetingPreflightDialog } from "./MeetingPreflightDialog";
+import type { MemoryApi } from "../../api/memory";
+import type { KnowledgeApi } from "../../api/knowledge";
+import type { ProjectOutcomesApi } from "../../api/projectOutcomes";
+import type { MaterialsApi, MaterialSet } from "../../api/materials";
+import { materialDraftPointerKey, rememberMaterialDraft } from "./materialDraftPointer";
+import { correctionCapabilityFixture, requestedCorrectionMode } from "../../test/correctionCapabilityFixture";
 
 class FakeAnalyser {
   fftSize = 1_024;
@@ -82,6 +88,7 @@ describe("MeetingPreflightDialog", () => {
     vi.stubGlobal("AudioContext", FakeProbeAudioContext);
     vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
       const url = String(input);
+      if (url.startsWith("/providers/asr/correction-capability?")) return Promise.resolve(response(correctionCapabilityFixture(requestedCorrectionMode(url))));
       if (url.endsWith("/v2/storage/preflight")) {
         return Promise.resolve(response({
           allowed: true,
@@ -156,7 +163,86 @@ describe("MeetingPreflightDialog", () => {
       inputDeviceId: "mic-1",
       inputDeviceName: "MacBook Microphone",
       noticeAcknowledged: true,
+      liveAnalysisProfile: "participation",
+      correctionMode: "local_and_llm",
     }));
+  });
+  it("starts without a topic, role or materials using participation by default", async () => {
+    const onStart = vi.fn().mockResolvedValue(undefined);
+    render(<MeetingPreflightDialog open busy={false} onCancel={vi.fn()} onStart={onStart} />);
+    await screen.findByText("本地中文实时识别可用");
+    expect(screen.getByRole("radio", { name: "帮助我参与讨论" })).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByText(/无需先填写主题或上传资料/)).toBeVisible();
+    await completeBrowserProbe(); fireEvent.click(screen.getByLabelText("我已告知参会者并确认可以录音"));
+    fireEvent.click(screen.getByRole("button", { name: "开始会议" }));
+    await waitFor(() => expect(onStart).toHaveBeenCalledWith(expect.objectContaining({ liveAnalysisProfile: "participation", hotwords: [] })));
+    expect(onStart.mock.calls[0][0]).not.toHaveProperty("meetingGoal");
+    expect(onStart.mock.calls[0][0]).not.toHaveProperty("participantRole");
+  });
+  it("keeps the explicit answering choice while optional goals and presets change", async () => {
+    const onStart = vi.fn().mockResolvedValue(undefined);
+    render(<MeetingPreflightDialog open busy={false} onCancel={vi.fn()} onStart={onStart} />);
+    await screen.findByText("本地中文实时识别可用");
+    fireEvent.click(screen.getByRole("radio", { name: "优先回答听到的问题" }));
+    fireEvent.click(screen.getByText("会议与教练设置"));
+    fireEvent.change(screen.getByDisplayValue("通用对话教练"), { target: { value: "project" } });
+    fireEvent.change(screen.getByPlaceholderText("本场会议需要达成什么结果"), { target: { value: "确认订单边界" } });
+    expect(screen.getByRole("radio", { name: "优先回答听到的问题" })).toHaveAttribute("aria-checked", "true");
+    await completeBrowserProbe(); fireEvent.click(screen.getByLabelText("我已告知参会者并确认可以录音")); fireEvent.click(screen.getByRole("button", { name: "开始会议" }));
+    await waitFor(() => expect(onStart).toHaveBeenCalledWith(expect.objectContaining({ liveAnalysisProfile: "legacy", meetingGoal: "确认订单边界", presetId: "project" })));
+  });
+  it("displays the persisted profile read-only once the meeting has audio, without blocking other optional edits", async () => {
+    render(<MeetingPreflightDialog open busy={false} initialLiveAnalysisProfile="legacy" liveAnalysisProfileLocked onCancel={vi.fn()} onStart={vi.fn()} />);
+    await screen.findByText("本地中文实时识别可用");
+    expect(screen.getByRole("radio", { name: "优先回答听到的问题" })).toBeDisabled();
+    expect(screen.getByRole("radio", { name: "帮助我参与讨论" })).toBeDisabled();
+    fireEvent.click(screen.getByText("会议与教练设置"));
+    expect(screen.getByPlaceholderText("本场会议需要达成什么结果")).toBeEnabled();
+  });
+  it("waits for a persisted draft read before start and keeps the receipt when preflight is cancelled", async () => {
+    const draft: MaterialSet = { id: "prepared-materials", state: "draft", meeting_id: null, revision: 8, context_revision: 0 };
+    rememberMaterialDraft(window.location.origin, draft.id); sessionStorage.clear();
+    let finish!: (value: { material_set: MaterialSet; attachments: [] }) => void;
+    const materialsApi = { get: vi.fn(() => new Promise((resolve) => { finish = resolve; })), create: vi.fn(), forMeeting: vi.fn() } as unknown as MaterialsApi;
+    const changed = vi.fn(); const onStart = vi.fn(); const onCancel = vi.fn();
+    const rendered = render(<MeetingPreflightDialog open busy={false} materialsApi={materialsApi} onMaterialSetChange={changed} onCancel={onCancel} onStart={onStart} />);
+    await screen.findByText("本地中文实时识别可用");
+    await completeBrowserProbe(); fireEvent.click(screen.getByLabelText("我已告知参会者并确认可以录音"));
+    expect(screen.getByRole("button", { name: "开始会议" })).toBeDisabled();
+    expect(screen.getByText("等待会前资料恢复")).toBeVisible();
+    expect(materialsApi.create).not.toHaveBeenCalled(); expect(materialsApi.forMeeting).not.toHaveBeenCalled();
+    await act(async () => { finish({ material_set: draft, attachments: [] }); });
+    await waitFor(() => expect(screen.getByRole("button", { name: "开始会议" })).toBeEnabled());
+    expect(changed).toHaveBeenCalledWith(draft);
+    fireEvent.click(screen.getByRole("button", { name: "取消" })); expect(onCancel).toHaveBeenCalledOnce(); expect(onStart).not.toHaveBeenCalled();
+    rendered.unmount();
+    expect(window.localStorage.getItem(materialDraftPointerKey(window.location.origin))).toContain(draft.id);
+    window.localStorage.removeItem(materialDraftPointerKey(window.location.origin)); sessionStorage.clear();
+  });
+  it("shows the selected project brief before creating a meeting without any extra AI probe", async () => {
+    const onStart = vi.fn();
+    const knowledgeApi = { listProjects: vi.fn().mockResolvedValue({ items: [{ id: "project", name: "会前项目", archivedAtMs: null }], hasMore: false, nextCursor: null }), listFolders: vi.fn().mockResolvedValue({ items: [], hasMore: false, nextCursor: null }) } as unknown as KnowledgeApi;
+    const projectApi = { previewBrief: vi.fn().mockResolvedValue({ projectId: "project", projectName: "会前项目", revision: 12, folderId: null, documentIds: null, generatedAtMs: 1000, decisions: [{ id: "decision", projectId: "project", type: "decision", text: "上次已确认需法务审核", status: "active", owner: null, due: null, sourceRefs: [], revision: 1 }], unfinishedTasks: [], openQuestions: [], needsReview: [], needsReviewDocuments: [], truncated: false }) } as unknown as ProjectOutcomesApi;
+    render(<MeetingPreflightDialog open busy={false} onCancel={vi.fn()} onStart={onStart} knowledgeApi={knowledgeApi} projectApi={projectApi} />);
+    fireEvent.click(screen.getByText("项目资料与会前准备（可选）"));
+    await screen.findByRole("option", { name: "会前项目" }); fireEvent.change(screen.getByLabelText("会议资料项目"), { target: { value: "project" } });
+    expect(await screen.findByText("上次已确认需法务审核")).toBeVisible(); expect(screen.getByText(/项目第 12 版/)).toBeVisible();
+    expect(projectApi.previewBrief).toHaveBeenCalledWith({ projectId: "project", folderId: null, documentIds: null }, expect.any(AbortSignal));
+    expect(onStart).not.toHaveBeenCalled(); expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).includes("/providers/llm/probe"))).toBe(false);
+  });
+  it("inherits confirmed defaults then preserves an explicit meeting override across scene changes", async () => {
+    const onStart = vi.fn().mockResolvedValue(undefined);
+    const memoryApi = { preview: vi.fn().mockResolvedValue({ projectId: null, scene: "general", preferences: { suggestion_policy: "off" }, sources: [{ id: "global-pref", scope: "global", scene: "", revision: 1 }] }) } as unknown as MemoryApi;
+    render(<MeetingPreflightDialog open busy={false} memoryApi={memoryApi} onCancel={vi.fn()} onStart={onStart} />);
+    await screen.findByText("本地中文实时识别可用"); fireEvent.click(screen.getByText("会议与教练设置")); await waitFor(() => expect(screen.getByRole("combobox", { name: /^主动建议/ })).toHaveValue("off")); expect(screen.getByText(/已读取全局已确认偏好/)).toBeVisible();
+    fireEvent.change(screen.getByRole("combobox", { name: /^主动建议/ }), { target: { value: "standard" } }); fireEvent.change(screen.getByDisplayValue("通用对话教练"), { target: { value: "project" } }); expect(screen.getByRole("combobox", { name: /^主动建议/ })).toHaveValue("standard"); expect(memoryApi.preview).toHaveBeenCalledOnce();
+    await completeBrowserProbe(); fireEvent.click(screen.getByLabelText("我已告知参会者并确认可以录音")); fireEvent.click(screen.getByRole("button", { name: "开始会议" })); await waitFor(() => expect(onStart).toHaveBeenCalledWith(expect.objectContaining({ proactiveSuggestionPolicy: "standard", presetId: "project" })));
+  });
+  it("waits for default lookup before start and allows a deliberate local override", async () => {
+    const onStart = vi.fn().mockResolvedValue(undefined);
+    const memoryApi = { preview: vi.fn().mockReturnValue(new Promise(() => undefined)) } as unknown as MemoryApi;
+    render(<MeetingPreflightDialog open busy={false} memoryApi={memoryApi} onCancel={vi.fn()} onStart={onStart} />);
+    await screen.findByText("本地中文实时识别可用"); await completeBrowserProbe(); fireEvent.click(screen.getByLabelText("我已告知参会者并确认可以录音")); expect(screen.getByRole("button", { name: "开始会议" })).toBeDisabled(); fireEvent.click(screen.getByText("会议与教练设置")); fireEvent.change(screen.getByRole("combobox", { name: /^主动建议/ }), { target: { value: "off" } }); await waitFor(() => expect(screen.getByRole("button", { name: "开始会议" })).toBeEnabled()); fireEvent.click(screen.getByRole("button", { name: "开始会议" })); await waitFor(() => expect(onStart).toHaveBeenCalledWith(expect.objectContaining({ proactiveSuggestionPolicy: "off" })));
   });
 
   it("selects a scene coach skill and explains its realtime behavior", async () => {
@@ -229,6 +315,8 @@ describe("MeetingPreflightDialog", () => {
       inputSource: "dual_track",
       inputDeviceId: null,
       inputDeviceName: "麦克风 + 系统音频",
+      correctionMode: "local_and_llm",
+      liveAnalysisProfile: "participation",
       noticeAcknowledged: true,
     }));
     expect(invokeMock).toHaveBeenCalledWith("dual_track_adapter_status", undefined);
@@ -319,6 +407,8 @@ describe("MeetingPreflightDialog", () => {
       inputSource: "system_audio",
       inputDeviceId: "wasapi-render-1",
       inputDeviceName: "Speakers (USB)",
+      correctionMode: "local_and_llm",
+      liveAnalysisProfile: "participation",
       noticeAcknowledged: true,
     }));
     expect(invokeMock.mock.calls.map(([command]) => command)).toEqual([
@@ -886,6 +976,7 @@ describe("MeetingPreflightDialog", () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockImplementation((input: RequestInfo | URL) => {
       const url = String(input);
+      if (url.startsWith("/providers/asr/correction-capability?")) return Promise.resolve(response(correctionCapabilityFixture(requestedCorrectionMode(url))));
       if (url.endsWith("/v2/storage/preflight")) {
         return Promise.resolve(response({
           allowed: true,
@@ -958,6 +1049,7 @@ describe("MeetingPreflightDialog", () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockImplementation((input: RequestInfo | URL) => {
       const url = String(input);
+      if (url.startsWith("/providers/asr/correction-capability?")) return Promise.resolve(response(correctionCapabilityFixture(requestedCorrectionMode(url))));
       if (url.endsWith("/v2/storage/preflight")) {
         return Promise.resolve(response({
           allowed: true,

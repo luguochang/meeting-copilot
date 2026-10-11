@@ -1,6 +1,9 @@
+import { parseDocumentSources } from "../api/sourceEvidence";
+import { parseCoachUiRenderReceipt } from "./coachUiRenderReceipt";
 import {
   isCoachInterventionProjection,
   isFormalLlmFirstPayload,
+  isHostCoachInvalidationPayload,
   isLocalReflexCoachProjection,
   isLocalReflexCoachPayload,
 } from "./events";
@@ -39,6 +42,7 @@ function unknownIndicator(label: string) {
 export function createInitialMeetingState(meetingId: string): MeetingViewState {
   return {
     meetingId,
+    liveAnalysisProfile: "legacy",
     title: null,
     titleSource: "unknown",
     updatedAtMs: 0,
@@ -188,6 +192,18 @@ function mergeSuggestion(
   authoritative = false,
 ): Suggestion {
   if (!existing) return incoming;
+  // A reconnect snapshot can invalidate a committed answer without replaying
+  // the superseded event. Retain the readable historical body while accepting
+  // this one-way state change; ordinary late drafts still cannot reopen it.
+  if (existing.generationId === incoming.generationId && existing.status === "committed"
+    && incoming.status === "superseded" && (authoritative || (
+      incoming.stateRevision >= existing.stateRevision && incoming.updatedAtMs >= existing.updatedAtMs
+    ))) {
+    return { ...existing, ...incoming, kind: existing.kind ?? incoming.kind,
+      questionText: existing.questionText ?? incoming.questionText,
+      text: existing.text ?? incoming.text, draftText: existing.draftText || incoming.draftText,
+      formalAi: incoming.formalAi ?? existing.formalAi, feedback: incoming.feedback ?? existing.feedback };
+  }
   if (authoritative) {
     return { ...existing, ...incoming, feedback: incoming.feedback ?? existing.feedback };
   }
@@ -396,6 +412,21 @@ function eventSuggestion(event: MeetingEvent): Suggestion | null {
   const text = stringValue(value, "text");
   if (status === "committed" && !text) return null;
   const feedback = value.feedback;
+  const contextValue = value.context_evidence ?? value.contextEvidence;
+  const contextEvidence: NonNullable<Suggestion["contextEvidence"]> = [];
+  if (Array.isArray(contextValue)) {
+    for (const raw of contextValue.slice(0, 16)) {
+      const source = asRecord(raw);
+      if (!source) continue;
+      const segmentId = stringValue(source, "segment_id", "segmentId");
+      const evidenceHash = stringValue(source, "evidence_hash", "evidenceHash");
+      const revision = numberValue(source, "revision");
+      if (segmentId && evidenceHash && revision !== null && Number.isInteger(revision) && revision > 0
+        && !contextEvidence.some((item) => item.segmentId === segmentId)) {
+        contextEvidence.push({ segmentId, evidenceHash, revision });
+      }
+    }
+  }
   return {
     suggestionId,
     meetingId: stringValue(value, "meeting_id", "meetingId") ?? event.meetingId,
@@ -407,6 +438,10 @@ function eventSuggestion(event: MeetingEvent): Suggestion | null {
     evidenceTranscriptSeq,
     evidenceHash: stringValue(value, "evidence_hash", "evidenceHash") ?? "",
     stateRevision: numberValue(value, "state_revision", "stateRevision") ?? 1,
+    ...("source_evidence" in value || "sourceEvidence" in value ? { sourceEvidence: parseDocumentSources(value.source_evidence ?? value.sourceEvidence) } : {}),
+    ...(Array.isArray(contextValue) ? { contextEvidence } : {}),
+    ...("supersedes_suggestion_id" in value || "supersedesSuggestionId" in value
+      ? { supersedesSuggestionId: stringValue(value, "supersedes_suggestion_id", "supersedesSuggestionId") } : {}),
     status,
     draftText: stringValue(value, "draft_text", "draftText") ?? "",
     draftSeq,
@@ -442,6 +477,7 @@ function eventTopic(event: MeetingEvent): TopicProjection | null {
       : "unknown",
     evidenceSegmentIds: Array.isArray(evidence) ? evidence.filter((item): item is string => typeof item === "string") : [],
     updatedAtMs: numberValue(value, "updated_at_ms", "updatedAtMs") ?? event.occurredAtMs,
+    lastUpdatedSeq: numberValue(value, "last_updated_seq", "lastUpdatedSeq") ?? undefined,
     formalAi: formalAiFromPayload(provenance),
   };
 }
@@ -592,7 +628,10 @@ function eventFollowUp(event: MeetingEvent, lane: "coach" | "semantic" = "coach"
     ? metadata.supersedes_decision_id
     : metadata.supersedesDecisionId;
   const supersededByValue = "superseded_by" in metadata ? metadata.superseded_by : metadata.supersededBy;
+  const uiRenderReceipt = lane === "coach" ? parseCoachUiRenderReceipt(value.ui_render_receipt) : undefined;
   return {
+    ...(uiRenderReceipt ? { uiRenderReceipt } : {}),
+    ...((value.source_evidence ?? value.sourceEvidence ?? metadata.source_evidence ?? metadata.sourceEvidence) !== undefined ? { sourceEvidence: parseDocumentSources(value.source_evidence ?? value.sourceEvidence ?? metadata.source_evidence ?? metadata.sourceEvidence) } : {}),
     question,
     reason,
     ...(sayThis ? { sayThis } : {}),
@@ -617,8 +656,12 @@ function eventFollowUp(event: MeetingEvent, lane: "coach" | "semantic" = "coach"
     ...(triggerType ? { triggerType } : {}),
     ...(userRequest ? { userRequest } : {}),
     ...(coachingPackage ? { coachingPackage } : {}),
+    ...parseContributionFields({ ...metadata, ...value }),
     ...(evidenceRevision !== null ? { evidenceRevision } : {}),
     ...(validUntil !== null ? { validUntil } : {}),
+    ...(numberValue(metadata, "frozen_at_ms", "frozenAtMs") !== null
+      ? { frozenAtMs: numberValue(metadata, "frozen_at_ms", "frozenAtMs")! }
+      : {}),
     ...(lifecycleAction ? { lifecycleAction } : {}),
     ...(lifecycleStatus ? { lifecycleStatus } : {}),
     ...(typeof supersedesDecisionIdValue === "string" || supersedesDecisionIdValue === null
@@ -664,6 +707,8 @@ function eventCoachDecision(event: MeetingEvent): CoachDecisionProjection | null
   const supersededByValue = "superseded_by" in value ? value.superseded_by : value.supersededBy;
   const agentMetrics = parseCoachAgentMetrics(value.agent_metrics ?? value.agentMetrics);
   return {
+    ...parseContributionFields(value),
+    sourceEvidence: parseDocumentSources(value.source_evidence ?? value.sourceEvidence),
     ...(stringValue(value, "provenance_version", "provenanceVersion") ? { provenanceVersion: stringValue(value, "provenance_version", "provenanceVersion")! } : {}),
     ...(origin ? { origin } : {}),
     ...(status ? { status } : {}),
@@ -677,6 +722,7 @@ function eventCoachDecision(event: MeetingEvent): CoachDecisionProjection | null
     ...(typeof value.triggered === "boolean" ? { triggered: value.triggered } : {}),
     ...(numberValue(value, "created_at_ms", "createdAtMs") !== null ? { createdAtMs: numberValue(value, "created_at_ms", "createdAtMs")! } : {}),
     ...(numberValue(value, "completed_at_ms", "completedAtMs") !== null ? { completedAtMs: numberValue(value, "completed_at_ms", "completedAtMs")! } : {}),
+    ...(numberValue(value, "frozen_at_ms", "frozenAtMs") !== null ? { frozenAtMs: numberValue(value, "frozen_at_ms", "frozenAtMs")! } : {}),
     ...(numberValue(value, "deadline_at_ms", "deadlineAtMs") !== null ? { deadlineAtMs: numberValue(value, "deadline_at_ms", "deadlineAtMs")! } : {}),
     ...(validUntil !== null ? { validUntil } : {}),
     ...(stringValue(value, "prompt_profile", "promptProfile")
@@ -786,8 +832,10 @@ function mergeRecentContextHistory(current: RecentContextEntry[], incoming: Rece
 }
 
 function coachHistoryEntryFromEvent(event: MeetingEvent, followUp: FollowUpProjection): CoachHistoryEntry {
+  const historical = { ...followUp };
+  delete historical.uiRenderReceipt;
   return {
-    ...followUp,
+    ...historical,
     historyId: event.eventId,
     createdAtMs: event.occurredAtMs,
   };
@@ -888,6 +936,9 @@ function eventFact(event: MeetingEvent, kind: MeetingFactKind): MeetingFact | nu
       ? directEvidence
       : evidenceSpans.map((span) => span.segmentId),
     evidenceSpans,
+    sourceEvidence: parseDocumentSources(value.source_evidence ?? value.sourceEvidence),
+    sourceMessageId: stringValue(value, "source_message_id", "sourceMessageId"),
+    evidenceStatus: value.evidence_status === "valid" || value.evidence_status === "stale" ? value.evidence_status : "unknown",
     updatedAtMs: numberValue(value, "updated_at_ms", "updatedAtMs") ?? event.occurredAtMs,
     formalAi: formalAiFromPayload(event.payload),
   };
@@ -978,11 +1029,16 @@ function eventApproach(event: MeetingEvent): MeetingSnapshot["approach"] | null 
     cards,
     degraded: booleanValue(value, "degraded"),
     updatedAtMs: numberValue(value, "updated_at_ms", "updatedAtMs") ?? event.occurredAtMs,
+    jobId: stringValue(value, "job_id", "jobId") ?? event.causationId,
+    createdAtMs: numberValue(value, "created_at_ms", "createdAtMs"),
   };
 }
 
 function completeReviewJob(state: MeetingViewState, kind: ReviewJobKind, event: MeetingEvent): MeetingViewState {
   const current = state.reviewJobs[kind];
+  // An artifact ready event does not establish the identified task's outcome.
+  // Snapshots retain the durable task status, including a cancelled late writer.
+  if (current?.id) return state;
   return {
     ...state,
     reviewJobs: {
@@ -1036,7 +1092,8 @@ function applyEvent(state: MeetingViewState, event: MeetingEvent): MeetingViewSt
   const answerSuggestionEvent = formalAiEvent && suggestionPayload.kind === "answer";
   const localReflexEvent = event.type === "meeting.intelligence.applied" &&
     isLocalReflexCoachPayload(event.payload);
-  if (formalAiEvent && !isFormalLlmFirstPayload(event.payload) && !localReflexEvent && !answerSuggestionEvent) return next;
+  const hostInvalidationEvent = event.type === "meeting.intelligence.applied" && isHostCoachInvalidationPayload(event.payload);
+  if (formalAiEvent && !isFormalLlmFirstPayload(event.payload) && !localReflexEvent && !hostInvalidationEvent && !answerSuggestionEvent) return next;
 
   if (event.type === "transcript.segment.finalized" || event.type === "transcript.segment.corrected" ||
       event.type === "transcript.segment.revised") {
@@ -1179,6 +1236,17 @@ function applyEvent(state: MeetingViewState, event: MeetingEvent): MeetingViewSt
       audio: next.audio.status === "recording" ? { ...next.audio, status: "assembling" } : next.audio,
       runtime: endedRuntime(next.runtime),
     };
+  } else if (event.type === "review_document.source.changed") {
+    const kind = stringValue(event.payload, "document_kind");
+    if (kind === "minutes" || kind === "decisions" || kind === "action_items" || kind === "risks" || kind === "transcript") {
+      const current = next.documents?.[kind];
+      const revision = numberValue(event.payload, "revision");
+      if (current && revision !== null && revision >= current.revision) {
+        next = { ...next, documents: { ...next.documents, [kind]: {
+          ...current, revision, dirtyState: "stale", updatedAtMs: event.occurredAtMs,
+        } } };
+      }
+    }
   } else if (event.type === "meeting.minutes.ready") {
     const minutes = eventMinutes(event);
     next = completeReviewJob(minutes ? { ...next, minutes } : next, "minutes", event);
@@ -1263,6 +1331,8 @@ function applySnapshot(state: MeetingViewState, snapshot: MeetingSnapshot, recei
   return {
     ...state,
     ...snapshot,
+    liveAnalysisProfile: snapshot.liveAnalysisProfile ?? "legacy",
+    liveAnalysisProfileLocked: snapshot.liveAnalysisProfileLocked,
     semanticParagraphs: snapshot.semanticParagraphs ?? [],
     activeParagraph: snapshot.activeParagraph ?? null,
     ...compacted,
@@ -1380,3 +1450,4 @@ export function createSnapshotForTest(overrides: Partial<MeetingSnapshot> = {}):
     meetingId,
   };
 }
+import { parseContributionFields } from "./contribution";

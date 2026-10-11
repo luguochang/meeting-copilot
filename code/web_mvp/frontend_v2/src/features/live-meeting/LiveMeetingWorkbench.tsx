@@ -1,3 +1,9 @@
+import type { KnowledgeApi, MeetingKnowledgeSelection } from "../../api/knowledge";
+import type { ProjectOutcomesApi } from "../../api/projectOutcomes";
+import type { MemoryApi } from "../../api/memory";
+import type { ProjectReconcileApi } from "../../api/projectReconcile";
+import type { DocumentSourceEvidence } from "../../domain/events";
+import { isPartialCoveredBySegment } from "../../domain/events";
 import {
   AlertCircle,
   ArrowLeft,
@@ -15,8 +21,13 @@ import {
   Users,
   Video,
 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import type { MaterialsApi, MaterialSet } from "../../api/materials";
+import type { MeetingAttachmentSourceEvidence } from "../../domain/events";
+import { MeetingAttachments } from "./MeetingAttachments";
+import { persistMaterialStartAttempt, readMaterialStartAttempt, type MaterialStartAttempt } from "./materialStartAttempt";
 import type { MeetingApi } from "../../api/client";
+import { ApiError, checkAsrCapturePreparation } from "../../api/client";
 import type { MeetingEventTransport } from "../../api/eventTransport";
 import { motionAwareScrollBehavior } from "../../app/motion";
 import { useMeetingProjection } from "../../app/useMeetingProjection";
@@ -28,6 +39,8 @@ import type {
   MeetingFactKind,
   MeetingFactStatus,
   MeetingPreparationInput,
+  LiveAnalysisProfile,
+  MeetingCorrectionMode,
   RuntimeIndicator,
 } from "../../domain/events";
 import { segmentDomId } from "./domIds";
@@ -35,10 +48,14 @@ import { AiWorkspace } from "./AiWorkspace";
 import { MeetingSplitPane } from "./MeetingSplitPane";
 import { MeetingPreflightDialog } from "./MeetingPreflightDialog";
 import { captureHealthSummary, resolveMeetingSessionState, type MeetingSessionState } from "./meetingSessionState";
+import { TranscriptRecoveryStatus } from "./TranscriptRecoveryStatus";
+import { readTranscriptRecovery } from "./transcriptRecovery";
 import { TranscriptPane, type TranscriptSelection, type TranscriptSelectionAction } from "./TranscriptPane";
 import { MeetingHistory } from "../history/MeetingHistory";
 import { ImportRecordingDialog } from "../history/ImportRecordingDialog";
+import { ImportedRecordingStatus } from "../history/ImportedRecordingStatus";
 import { ReviewWorkspace } from "../review/ReviewWorkspace";
+import type { TranscriptRecoveryApi } from "../../api/transcriptRecovery";
 import { ProviderSettingsControl } from "../settings/ProviderSettingsControl";
 import {
   type BrowserMicrophoneController,
@@ -47,6 +64,17 @@ import {
 import { useMeetingMicrophone } from "./useMeetingMicrophone";
 
 interface LiveMeetingWorkbenchProps {
+  materialsApi?: MaterialsApi;
+  initialAttachmentSource?: MeetingAttachmentSourceEvidence | null;
+  onAttachmentSourceClosed?(): void;
+  recoveryApi?: TranscriptRecoveryApi;
+  reconcileApi?: ProjectReconcileApi;
+  onOpenKnowledgeDocument?: (target: { documentId: string; projectId: string }) => void;
+  onOpenProjectProposals?: (projectId: string) => void;
+  memoryApi?: MemoryApi;
+  projectApi?: ProjectOutcomesApi;
+  knowledgeApi?: KnowledgeApi;
+  onKnowledgeSource?: (value: DocumentSourceEvidence, sourceMeetingId?: string) => void;
   meetingId: string | null;
   api: MeetingApi;
   transport: MeetingEventTransport;
@@ -56,6 +84,7 @@ interface LiveMeetingWorkbenchProps {
   onBackToMeetings?: () => void;
   onOpenNotes?: () => void;
   onOpenCapabilities?: () => void;
+  onOpenKnowledge?: () => void;
   initialEvidenceSegmentId?: string | null;
   onEvidenceFocused?: () => void;
   microphoneController?: BrowserMicrophoneController;
@@ -97,27 +126,6 @@ function formatMeetingDate(timestamp: number | null | undefined): string {
     hour: "2-digit",
     minute: "2-digit",
   }).format(timestamp);
-}
-
-interface TranscriptBackfillDiagnostic {
-  status: "running" | "completed" | "failed";
-  startMs: number;
-  endMs: number;
-}
-
-function transcriptBackfillDiagnostic(value: unknown): TranscriptBackfillDiagnostic | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const source = value as Record<string, unknown>;
-  const status = source.status;
-  if (status !== "running" && status !== "completed" && status !== "failed") return null;
-  const startMs = typeof source.start_ms === "number" ? source.start_ms : source.startMs;
-  const endMs = typeof source.end_ms === "number" ? source.end_ms : source.endMs;
-  if (typeof startMs !== "number" || typeof endMs !== "number") return null;
-  return {
-    status,
-    startMs: Math.max(0, startMs),
-    endMs: Math.max(0, endMs),
-  };
 }
 
 function localInputIndicator(
@@ -165,6 +173,12 @@ function localInputIndicator(
 const endableCapturePhases = new Set(["requesting", "connecting", "reconnecting", "starting", "recording", "paused", "stopping", "error"]);
 
 export function LiveMeetingWorkbench({
+  materialsApi, initialAttachmentSource, onAttachmentSourceClosed,
+  reconcileApi, recoveryApi, onOpenKnowledgeDocument, onOpenProjectProposals,
+  memoryApi,
+  projectApi,
+  knowledgeApi,
+  onKnowledgeSource,
   meetingId,
   api,
   transport,
@@ -174,6 +188,7 @@ export function LiveMeetingWorkbench({
   onBackToMeetings,
   onOpenNotes,
   onOpenCapabilities,
+  onOpenKnowledge,
   initialEvidenceSegmentId,
   onEvidenceFocused,
   microphoneController,
@@ -189,9 +204,84 @@ export function LiveMeetingWorkbench({
   const microphone = microphoneController ?? liveMicrophone;
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
   const [message, setMessage] = useState("");
+  const startCheckPending = useRef(false);
   const [importDialogOpen, setImportDialogOpen] = useState(false);
   const [preflightOpen, setPreflightOpen] = useState(false);
   const [starting, setStarting] = useState(false);
+  const [materialSet, setMaterialSet] = useState<MaterialSet | null>(null);
+  const [restoredStart] = useState(() => readMaterialStartAttempt(meetingId));
+  const startAttempt = useRef<MaterialStartAttempt | null>(restoredStart);
+  const [startRecovery, setStartRecovery] = useState<"reading" | "ready" | "blocked" | null>(restoredStart ? "reading" : null);
+  const [startRecoveryError, setStartRecoveryError] = useState("");
+  const [profileRead, setProfileRead] = useState<{ meetingId: string; status: "reading" | "ready" | "failed"; value: LiveAnalysisProfile; correctionMode?: MeetingCorrectionMode; error: string } | null>(null);
+  const [profileReload, setProfileReload] = useState(0);
+  const [profileReadKey, setProfileReadKey] = useState(0);
+  const startRecoveryConsumed = useRef(false);
+  useEffect(() => {
+    if (startAttempt.current && meetingId !== startAttempt.current.meetingId) startAttempt.current = null;
+    setMaterialSet((current) => current?.state === "bound" && current.meeting_id !== meetingId ? null : current);
+  }, [meetingId]);
+  useEffect(() => {
+    if (!restoredStart || startRecoveryConsumed.current || (meetingId && meetingId !== restoredStart.meetingId)) { setStartRecovery(null); return; }
+    if (!materialsApi) { setStartRecovery("blocked"); setStartRecoveryError("当前无法读取上次的资料准备，请从会议列表查看原会议。"); return; }
+    const controller = new AbortController(); setStartRecovery("reading");
+    void materialsApi.get(restoredStart.setId, controller.signal).then((value) => {
+      if (controller.signal.aborted || startRecoveryConsumed.current) return;
+      const material = value.material_set;
+      if (material.state === "deleted" || (material.state === "bound" && material.meeting_id !== restoredStart.meetingId)) throw new Error("上次资料已删除或属于其他会议，请从会议列表核对原会议。");
+      if (restoredStart.created && material.state !== "bound") throw new Error("上次会议与资料绑定状态不一致，请从会议列表核对；不会猜测新会议。");
+      const attempt = { ...restoredStart, created: material.state === "bound" };
+      startAttempt.current = attempt; persistMaterialStartAttempt(attempt); setMaterialSet(material); setStartRecovery("ready");
+    }).catch((error) => { if (!controller.signal.aborted) { setStartRecovery("blocked"); setStartRecoveryError(error instanceof Error ? error.message : "上次会议准备状态无法确认，请从会议列表核对。"); } });
+    return () => controller.abort();
+  }, [meetingId, materialsApi, restoredStart]);
+  const existingPreparedMeetingId = meetingId ?? (startRecovery === "ready" && startAttempt.current?.created ? startAttempt.current.meetingId : null);
+  useEffect(() => {
+    if (!preflightOpen || !existingPreparedMeetingId) return;
+    const controller = new AbortController();
+    const target = existingPreparedMeetingId;
+    const fallback = state.liveAnalysisProfile ?? "legacy";
+    if (!api.getMeetingPreparation) {
+      setProfileRead({ meetingId: target, status: "ready", value: fallback, error: "" });
+      setProfileReadKey((value) => value + 1);
+      return;
+    }
+    setProfileRead({ meetingId: target, status: "reading", value: fallback, error: "" });
+    const timer = window.setTimeout(() => {
+      controller.abort();
+      setProfileRead({ meetingId: target, status: "failed", value: fallback, error: "本场帮助方式读取超时，请重试；原会议和资料会保留。" });
+    }, 6_000);
+    void api.getMeetingPreparation(target, controller.signal).then((preparation) => {
+      if (controller.signal.aborted) return;
+      if (preparation.meetingId !== target) throw new Error("读取到的准备内容不属于本场会议，请重新核对。");
+      setProfileRead({ meetingId: target, status: "ready", value: preparation.liveAnalysisProfile ?? "legacy", correctionMode: preparation.correctionMode ?? "local_and_llm", error: "" });
+      setProfileReadKey((value) => value + 1);
+    }).catch((failure) => {
+      if (controller.signal.aborted) return;
+      // A known old meeting may legitimately have no preparation yet.
+      if (failure instanceof ApiError && failure.status === 404) { setProfileRead({ meetingId: target, status: "ready", value: "legacy", error: "" }); setProfileReadKey((value) => value + 1); }
+      else setProfileRead({ meetingId: target, status: "failed", value: fallback, error: failure instanceof Error ? failure.message : "无法读取本场帮助方式，请重试。" });
+    }).finally(() => window.clearTimeout(timer));
+    return () => { controller.abort(); window.clearTimeout(timer); };
+  }, [api, existingPreparedMeetingId, preflightOpen, profileReload, state.liveAnalysisProfile]);
+  const profileMatches = profileRead?.meetingId === existingPreparedMeetingId;
+  const liveAnalysisProfileLoading = startRecovery === "reading" || Boolean(existingPreparedMeetingId && (!profileMatches || profileRead?.status === "reading"));
+  const liveAnalysisProfileError = profileMatches && profileRead?.status === "failed" ? profileRead.error : "";
+  const liveAnalysisProfileLocked = Boolean(existingPreparedMeetingId && (
+    state.meetingId !== existingPreparedMeetingId || state.lastSyncedAtMs === null
+    || state.liveAnalysisProfileLocked === true
+    || state.archivedSegmentCount > 0 || state.segments.length > 0 || state.audio.chunkCount > 0 || state.audio.fileSizeBytes > 0 || (state.audio.durationMs ?? 0) > 0
+    || ((activeCaptureMeetingId === existingPreparedMeetingId || meetingId === existingPreparedMeetingId) && ["recording", "paused", "stopping"].includes(microphone.state.phase))
+  ));
+  const profilePreflightProps = {
+    initialLiveAnalysisProfile: existingPreparedMeetingId ? (profileMatches ? profileRead?.value : state.liveAnalysisProfile) ?? "legacy" : "participation" as LiveAnalysisProfile,
+    initialCorrectionMode: (profileMatches ? profileRead?.correctionMode : undefined) ?? "local_and_llm" as MeetingCorrectionMode,
+    liveAnalysisProfileLoading,
+    liveAnalysisProfileReadKey: existingPreparedMeetingId ? profileReadKey : 0,
+    liveAnalysisProfileError,
+    liveAnalysisProfileLocked,
+    onRetryLiveAnalysisProfile: () => setProfileReload((value) => value + 1),
+  };
   const [transcriptSelection, setTranscriptSelection] = useState<TranscriptSelection | null>(null);
   const [askSelectionNonce, setAskSelectionNonce] = useState(0);
   const [askSelectionAction, setAskSelectionAction] = useState<TranscriptSelectionAction>("ask");
@@ -269,6 +359,7 @@ export function LiveMeetingWorkbench({
 
   useEffect(() => {
     if (!meetingId || state.meetingId !== meetingId.trim() || state.lastSyncedAtMs === null) return;
+    if (state.importJob) { onMeetingSessionStateChange?.(meetingId, "ended"); return; }
     onMeetingSessionStateChange?.(meetingId, resolveMeetingSessionState({
       meetingPhase: state.runtime.phase,
       capturePhase: microphone.state.phase,
@@ -281,38 +372,87 @@ export function LiveMeetingWorkbench({
     microphone.state.phase,
     onMeetingSessionStateChange,
     state.lastSyncedAtMs,
+    state.importJob,
     state.meetingId,
     state.runtime.capture?.state,
     state.runtime.phase,
   ]);
 
-  const startMeeting = async (preparation: MeetingPreparationInput) => {
-    const activeMeetingId = meetingId ?? onCreateMeeting?.();
+  const startMeeting = async (preparation: MeetingPreparationInput, knowledgeSelection?: MeetingKnowledgeSelection) => {
+    if (startRecovery === "reading" || startRecovery === "blocked") throw new Error(startRecoveryError || "正在核对上次会议准备，请稍候；不会重复新建会议。");
+    if (liveAnalysisProfileLoading || liveAnalysisProfileError) throw new Error(liveAnalysisProfileError || "正在读取本场帮助方式，请稍候；不会重复新建会议。");
+    if (liveAnalysisProfileLocked && preparation.liveAnalysisProfile !== profilePreflightProps.initialLiveAnalysisProfile) throw new Error("本场已开始采集或已有会议文字，不能切换帮助方式，请沿用本场设置。");
+    if (liveAnalysisProfileLocked && preparation.correctionMode !== profilePreflightProps.initialCorrectionMode) throw new Error("本场已开始采集或已有会议文字，不能切换校对模式，请沿用本场设置。");
+    if (startCheckPending.current) return;
+    startCheckPending.current = true;
+    setStarting(true);
+    let activeMeetingId: string | undefined | null;
+    try {
+      await checkAsrCapturePreparation(preparation.correctionMode);
+      activeMeetingId = startAttempt.current?.meetingId ?? meetingId ?? onCreateMeeting?.();
+    } catch (error) {
+      startCheckPending.current = false;
+      setStarting(false);
+      throw error;
+    }
     const createdFromList = meetingId === null && Boolean(activeMeetingId);
     if (!activeMeetingId) {
       setMessage("无法创建会议");
+      startCheckPending.current = false;
+      setStarting(false);
       return;
     }
     let meetingCreated = false;
+    const hasMaterials = Boolean(materialSet);
+    if (materialSet && (!startAttempt.current || startAttempt.current.setId !== materialSet.id)) startAttempt.current = { meetingId: activeMeetingId, setId: materialSet.id, setRevision: materialSet.revision, key: crypto.randomUUID(), created: false, title: preparation.title ?? null, inputSource: preparation.inputSource };
+    if (hasMaterials && startAttempt.current) persistMaterialStartAttempt(startAttempt.current);
     setStarting(true);
     try {
-      await api.createMeeting(activeMeetingId, preparation.title ?? null, preparation.inputSource);
+      if (!startAttempt.current?.created) {
+        if (hasMaterials && startAttempt.current) await api.createMeeting(activeMeetingId, startAttempt.current.title, startAttempt.current.inputSource, undefined, { materialSetId: startAttempt.current.setId, expectedMaterialSetRevision: startAttempt.current.setRevision, idempotencyKey: startAttempt.current.key });
+        else await api.createMeeting(activeMeetingId, preparation.title ?? null, preparation.inputSource);
+        if (startAttempt.current) { startAttempt.current.created = true; persistMaterialStartAttempt(startAttempt.current); }
+      }
       meetingCreated = true;
+      if (hasMaterials && materialsApi) setMaterialSet(await materialsApi.forMeeting(activeMeetingId));
       await api.saveMeetingPreparation(activeMeetingId, preparation);
+      if (preparation.liveAnalysisProfile) setProfileRead({ meetingId: activeMeetingId, status: "ready", value: preparation.liveAnalysisProfile, correctionMode: preparation.correctionMode, error: "" });
+      if (knowledgeSelection) {
+        if (!knowledgeApi) throw new Error("当前无法保存所选资料范围，会议尚未开始。");
+        await knowledgeApi.saveMeetingContext(activeMeetingId, knowledgeSelection);
+      }
       setPreparationRefreshKey((current) => current + 1);
+      await checkAsrCapturePreparation(preparation.correctionMode, activeMeetingId);
       if (createdFromList) onOpenMeeting?.(activeMeetingId);
       await microphone.start(activeMeetingId, {
         inputDeviceId: preparation.inputDeviceId,
         inputSource: preparation.inputSource,
       });
       onMeetingStarted?.(activeMeetingId);
+      startRecoveryConsumed.current = true; persistMaterialStartAttempt(null); setStartRecovery(null);
       setPreflightOpen(false);
       setMessage("会议已开始");
     } catch (error) {
-      const captureError = error instanceof Error ? error.message : "声音采集启动失败";
-      if (createdFromList && meetingCreated) {
+      const profileLockedOnServer = error instanceof ApiError && error.status === 409 && (error.body as { detail?: { error?: string } } | null)?.detail?.error === "live_analysis_profile_locked";
+      const captureError = profileLockedOnServer ? "本场已产生录音或会议文字，不能切换帮助方式。正在重新读取原设置，请沿用本场方式继续。" : error instanceof Error ? error.message : "声音采集启动失败";
+      if (profileLockedOnServer) { setProfileReload((value) => value + 1); void actions.refresh(); }
+      // A known revision conflict has not consumed a draft. Refresh its CAS
+      // revision for the next explicit attempt, while unknown network outcomes
+      // retain the original body and idempotency key for safe receipt replay.
+      if (hasMaterials && !meetingCreated && error instanceof ApiError && error.status === 409 && materialsApi && startAttempt.current) {
+        try {
+          const fresh = (await materialsApi.get(startAttempt.current.setId)).material_set;
+          setMaterialSet(fresh);
+          if (fresh.state === "draft") startAttempt.current = { ...startAttempt.current, setRevision: fresh.revision, key: crypto.randomUUID() };
+          else if (fresh.meeting_id === activeMeetingId) startAttempt.current.created = true;
+          persistMaterialStartAttempt(startAttempt.current);
+        } catch { /* Keep the original attempt if its outcome is not confirmed. */ }
+      }
+      if (createdFromList && meetingCreated && !hasMaterials) {
         try {
           await api.deleteMeeting(activeMeetingId);
+          startAttempt.current = null;
+          persistMaterialStartAttempt(null);
         } catch (rollbackError) {
           const rollbackMessage = rollbackError instanceof Error ? rollbackError.message : "会议回滚失败";
           const combinedMessage = `${captureError}；新会议清理失败：${rollbackMessage}`;
@@ -320,9 +460,14 @@ export function LiveMeetingWorkbench({
           throw new Error(combinedMessage);
         }
       }
+      if (hasMaterials) {
+        if (meetingCreated) onOpenMeeting?.(activeMeetingId);
+        throw new Error(`${captureError}；${meetingCreated ? "资料已保留，请重试同一会议的声音输入。" : "资料仍在本地，请核对状态后重新开始会议。"}`);
+      }
       if (createdFromList) onBackToMeetings?.();
       throw new Error(captureError);
     } finally {
+      startCheckPending.current = false;
       setStarting(false);
     }
   };
@@ -381,7 +526,7 @@ export function LiveMeetingWorkbench({
           : "返回正在会议";
     return (
       <div className="product-app product-app--home">
-        <ProductNavigation active="meetings" onOpenMeetings={onBackToMeetings} onOpenNotes={onOpenNotes} onOpenCapabilities={onOpenCapabilities} activeMeeting={activeMeeting} onOpenActiveMeeting={onOpenActiveMeeting} />
+        <ProductNavigation active="meetings" onOpenMeetings={onBackToMeetings} onOpenNotes={onOpenNotes} onOpenCapabilities={onOpenCapabilities} onOpenKnowledge={onOpenKnowledge} activeMeeting={activeMeeting} onOpenActiveMeeting={onOpenActiveMeeting} />
         <main className="start-home">
           <section className="start-command">
             <div className="start-command-copy">
@@ -415,6 +560,7 @@ export function LiveMeetingWorkbench({
                   className="start-meeting-button"
                   type="button"
                   onClick={() => setPreflightOpen(true)}
+                  disabled={startRecovery === "reading" || startRecovery === "blocked"}
                 >
                   {microphone.state.phase === "requesting" ? <LoaderCircle className="spin" size={17} /> : <Mic size={17} />}
                   {microphone.state.phase === "requesting" ? "正在请求权限" : "开始会议"}
@@ -422,6 +568,7 @@ export function LiveMeetingWorkbench({
               )}
             </div>
             {microphone.state.error ? <p className="unbound-error">{microphone.state.error}</p> : null}
+            {startRecovery ? <div className="start-command-message" role="status"><p>{startRecovery === "reading" ? "正在只读核对上次会议准备；尚未开启任何声音输入。" : startRecovery === "ready" ? "上次会议准备已恢复。点击开始会议继续同一场；尚未开启声音输入。" : startRecoveryError}</p>{startRecovery !== "reading" ? <><button type="button" className="secondary-button" onClick={() => { const id = startAttempt.current?.meetingId ?? restoredStart?.meetingId; if (id) onOpenMeeting?.(id); }}>只查看原会议</button><button type="button" className="secondary-button" onClick={() => { startRecoveryConsumed.current = true; startAttempt.current = null; persistMaterialStartAttempt(null); setStartRecovery(null); setMaterialSet(null); onBackToMeetings?.(); }}>结束恢复，查看会议列表</button></> : null}</div> : null}
             {message ? (
               <p
                 className="start-command-message"
@@ -447,7 +594,11 @@ export function LiveMeetingWorkbench({
             onOpenMeeting?.(importedMeetingId);
           }}
         />
-        <MeetingPreflightDialog
+        <MeetingPreflightDialog materialsApi={materialsApi} materialSet={materialSet} onMaterialSetChange={setMaterialSet}
+          {...profilePreflightProps}
+          projectApi={projectApi}
+          knowledgeApi={knowledgeApi}
+          memoryApi={memoryApi}
           open={preflightOpen}
           busy={starting}
           onCancel={() => setPreflightOpen(false)}
@@ -462,7 +613,7 @@ export function LiveMeetingWorkbench({
   if (snapshotLoading) {
     return (
       <div className="product-app product-app--live">
-        <ProductNavigation active="live" onOpenMeetings={onBackToMeetings} onOpenNotes={onOpenNotes} onOpenCapabilities={onOpenCapabilities} activeMeeting={activeMeeting} onOpenActiveMeeting={onOpenActiveMeeting} />
+        <ProductNavigation active="live" onOpenMeetings={onBackToMeetings} onOpenNotes={onOpenNotes} onOpenCapabilities={onOpenCapabilities} onOpenKnowledge={onOpenKnowledge} activeMeeting={activeMeeting} onOpenActiveMeeting={onOpenActiveMeeting} />
         <div className="workbench-shell">
           <header className="app-header">
             <div className="meeting-identity">
@@ -492,7 +643,11 @@ export function LiveMeetingWorkbench({
             <span>正在加载会议状态</span>
           </main>
         </div>
-        <MeetingPreflightDialog
+        <MeetingPreflightDialog materialsApi={materialsApi} materialSet={materialSet} onMaterialSetChange={setMaterialSet}
+          {...profilePreflightProps}
+          projectApi={projectApi}
+          knowledgeApi={knowledgeApi}
+          memoryApi={memoryApi}
           open={preflightOpen}
           busy={starting}
           onCancel={() => setPreflightOpen(false)}
@@ -503,12 +658,12 @@ export function LiveMeetingWorkbench({
   }
 
   const localInput = localInputIndicator(microphone.state, microphone.inputSource);
-  const transcriptBackfill = transcriptBackfillDiagnostic(
+  const transcriptBackfill = readTranscriptRecovery(
     state.diagnostics.transcript_backfill ?? state.diagnostics.transcriptBackfill,
   );
-  const transcriptBackfillRange = transcriptBackfill
-    ? `${formatElapsed(transcriptBackfill.startMs)}–${formatElapsed(transcriptBackfill.endMs)}`
-    : null;
+  const transcriptBackfillRange = transcriptBackfill?.range
+    ? `${formatElapsed(transcriptBackfill.range.startMs)}–${formatElapsed(transcriptBackfill.range.endMs)}`
+    : "待读取的范围";
   const backfillInputIndicator: RuntimeIndicator | null = transcriptBackfill?.status === "running"
     ? {
         state: "busy",
@@ -517,7 +672,8 @@ export function LiveMeetingWorkbench({
         detail: `正在补齐 ${transcriptBackfillRange} 的会议文字`,
       }
     : null;
-  const meetingEnded = state.runtime.phase === "ended";
+  const importedRecording = Boolean(state.importJob);
+  const meetingEnded = state.runtime.phase === "ended" || importedRecording;
   const captureBelongsToMeeting = !activeCaptureMeetingId || activeCaptureMeetingId === meetingId;
   const otherMeetingCapturing = Boolean(activeCaptureMeetingId && activeCaptureMeetingId !== meetingId);
   const sessionState = resolveMeetingSessionState({
@@ -527,7 +683,7 @@ export function LiveMeetingWorkbench({
     backendCaptureState: state.runtime.capture?.state,
   });
   const remoteCaptureActive = sessionState === "capturing_elsewhere";
-  const localCaptureActive = ["preparing", "capturing", "paused", "reconnecting", "ending"].includes(sessionState);
+  const localCaptureActive = !importedRecording && ["preparing", "capturing", "paused", "reconnecting", "ending"].includes(sessionState);
   const inputIndicator = meetingEnded
     ? state.runtime.input
     : backfillInputIndicator ?? (captureBelongsToMeeting ? localInput : null) ?? state.runtime.input;
@@ -535,13 +691,11 @@ export function LiveMeetingWorkbench({
     ? state.runtime.elapsedMs
     : microphone.state.elapsedMs ?? state.runtime.elapsedMs;
   const showEndCommand = localCaptureActive && sessionState !== "ending";
-  const canStartCapture = ["idle", "recoverable", "error"].includes(sessionState) && !otherMeetingCapturing;
-  const candidatePartial = meetingEnded || !captureBelongsToMeeting ? null : microphone.state.activePartial ?? state.activePartial;
-  const committedSegmentIds = new Set([
-    ...state.segments.map((segment) => segment.segmentId),
-    ...state.fullTranscript.map((segment) => segment.segmentId),
-  ]);
-  const partial = candidatePartial && !committedSegmentIds.has(candidatePartial.segmentId)
+  const canStartCapture = !importedRecording && ["idle", "recoverable", "error"].includes(sessionState) && !otherMeetingCapturing;
+  const candidatePartial = meetingEnded ? null
+    : (captureBelongsToMeeting ? microphone.state.activePartial : null) ?? state.activePartial;
+  const partial = candidatePartial && ![...state.segments, ...state.fullTranscript]
+    .some((segment) => isPartialCoveredBySegment(candidatePartial, segment))
     ? candidatePartial
     : null;
   const nativeSystemAudioHealth = !meetingEnded
@@ -549,6 +703,7 @@ export function LiveMeetingWorkbench({
     ? microphone.state.systemAudioHealth ?? null
     : null;
   const aiCapabilities = state.runtime.ai.capabilities ?? {};
+  const ownTranscriptIndicator = aiCapabilities.transcript;
   const asrIndicator: RuntimeIndicator = transcriptBackfill?.status === "running"
     ? { state: "busy", label: "补齐中", level: null, detail: "正在补齐中断处会议文字" }
     : meetingEnded
@@ -557,15 +712,20 @@ export function LiveMeetingWorkbench({
         ? { state: "error", label: "已断开", level: null, detail: "实时识别连接已中断，录音仍会保存" }
         : state.connection === "connecting" || state.connection === "reconnecting"
           ? { state: "busy", label: "连接中", level: null, detail: null }
-          : { state: "active", label: "实时识别", level: null, detail: null };
+          : ownTranscriptIndicator ?? { state: "active", label: "实时识别", level: null, detail: null };
   const llmIndicator: RuntimeIndicator = aiCapabilities.provider ?? {
     state: state.runtime.ai.state,
     label: state.runtime.ai.label,
     level: null,
     detail: state.runtime.ai.detail,
   };
+  const reportedCoachRuntime = aiCapabilities.proactive_suggestions ?? aiCapabilities.intelligence ?? state.runtime.ai;
+  const coachWaitingForTranscript = !meetingEnded && state.archivedSegmentCount + state.segments.length === 0
+    && state.fullTranscript.length === 0 && reportedCoachRuntime.state !== "busy";
   const taskCapabilities = {
-    realtime_suggestions: aiCapabilities.proactive_suggestions ?? aiCapabilities.intelligence ?? state.runtime.ai,
+    realtime_suggestions: coachWaitingForTranscript
+      ? { ...reportedCoachRuntime, state: "paused" as const, label: "教练等待确认文字", detail: "录音与识别草稿仍保留，尚无已确认文字可供现场分析。" }
+      : reportedCoachRuntime,
     minutes: state.reviewJobs.minutes
       ? {
           state: state.reviewJobs.minutes.status === "failed" ? "error" as const : ["pending", "running", "retry_wait"].includes(state.reviewJobs.minutes.status) ? "busy" as const : "idle" as const,
@@ -609,7 +769,7 @@ export function LiveMeetingWorkbench({
           </a>
         </nav>
       ) : null}
-      <ProductNavigation active="live" onOpenMeetings={onBackToMeetings} onOpenNotes={onOpenNotes} onOpenCapabilities={onOpenCapabilities} activeMeeting={activeMeeting} onOpenActiveMeeting={onOpenActiveMeeting} />
+      <ProductNavigation active="live" onOpenMeetings={onBackToMeetings} onOpenNotes={onOpenNotes} onOpenCapabilities={onOpenCapabilities} onOpenKnowledge={onOpenKnowledge} activeMeeting={activeMeeting} onOpenActiveMeeting={onOpenActiveMeeting} />
       <div className={`workbench-shell${nativeSystemAudioHealth || transcriptBackfill || canStartCapture || otherMeetingCapturing || remoteCaptureActive ? " workbench-shell--status-band" : ""}`}>
       <header className="app-header">
         <div className="meeting-identity">
@@ -637,10 +797,11 @@ export function LiveMeetingWorkbench({
                 }}
               />
               <div className="meeting-header-meta" aria-label="会议基本信息">
-                <span><CalendarDays size={12} />{formatMeetingDate(state.updatedAtMs)}</span>
+                <span className="meeting-header-updated-at" aria-label={`最近更新 ${formatMeetingDate(state.updatedAtMs)}`}><CalendarDays size={12} aria-hidden="true" />最近更新 {formatMeetingDate(state.updatedAtMs)}</span>
                 <span><Clock3 size={12} />{formatElapsed(elapsedMs)}</span>
                 <span><FileText size={12} />{state.archivedSegmentCount + state.segments.length} 段文字</span>
                 <span><Users size={12} />{state.speakers.length || 1} 个说话人</span>
+                {!importedRecording ? <span aria-label="本场主要帮助">{(profileRead?.meetingId === meetingId && profileRead.status === "ready" ? profileRead.value : state.liveAnalysisProfile) === "participation" ? "帮助我参与讨论" : "优先回答听到的问题"}</span> : null}
               </div>
           </div>
         </div>
@@ -650,12 +811,12 @@ export function LiveMeetingWorkbench({
             className="capture-health-summary"
             type="button"
             onClick={() => setDiagnosticsOpen(true)}
-            aria-label={`采集健康：${captureHealth.label}；${captureHealth.aiLabel}。打开运行诊断`}
+            aria-label={importedRecording ? "本地录音导入。打开运行诊断" : `采集健康：${captureHealth.label}；${captureHealth.aiLabel}。打开运行诊断`}
             title="查看录音、声音、识别、精修、说话人、模型和任务详情"
           >
             <span className={`status-dot status-dot--${captureHealth.state}`} aria-hidden="true" />
             <span>
-              <strong>{captureHealth.label}</strong>
+              <strong>{importedRecording ? "本地录音导入" : captureHealth.label}</strong>
               <small>{captureHealth.aiLabel}</small>
             </span>
           </button>
@@ -665,6 +826,7 @@ export function LiveMeetingWorkbench({
         </div>
 
         <div className="header-actions">
+          {materialsApi ? <MeetingAttachments api={materialsApi} meetingId={meetingId} materialSet={materialSet?.meeting_id === meetingId ? materialSet : null} onSetChange={setMaterialSet} source={initialAttachmentSource} onSourceClosed={onAttachmentSourceClosed} onChanged={() => { setPreparationRefreshKey((n) => n + 1); void actions.refresh(); }} /> : null}
           <ProviderSettingsControl />
           {localCaptureActive
           && microphone.state.phase !== "stopping"
@@ -751,36 +913,8 @@ export function LiveMeetingWorkbench({
             </div>
           </div>
         ) : null}
-        {transcriptBackfill ? (
-          <div
-            className={`transcript-backfill-status transcript-backfill-status--${transcriptBackfill.status}`}
-            role={transcriptBackfill.status === "failed" ? "alert" : "status"}
-            aria-live="polite"
-          >
-            {transcriptBackfill.status === "running" ? (
-              <LoaderCircle className="spin" size={15} aria-hidden="true" />
-            ) : transcriptBackfill.status === "completed" ? (
-              <CircleCheck size={15} aria-hidden="true" />
-            ) : (
-              <AlertCircle size={15} aria-hidden="true" />
-            )}
-            <strong>
-              {transcriptBackfill.status === "running"
-                ? "正在补齐中断处文字"
-                : transcriptBackfill.status === "completed"
-                  ? "中断处文字已补齐"
-                  : "中断处文字暂未补齐"}
-            </strong>
-            <span>
-              {transcriptBackfillRange}
-              {transcriptBackfill.status === "running"
-                ? " · 录音仍在继续保存"
-                : transcriptBackfill.status === "completed"
-                  ? " · 已合并到同一会议正文"
-                  : " · 录音已保存，这一小段文字可能缺失"}
-            </span>
-          </div>
-        ) : null}
+        <TranscriptRecoveryStatus diagnostic={state.diagnostics.transcript_backfill ?? state.diagnostics.transcriptBackfill}
+          audioAvailable={Boolean(state.audioDetail?.assembled && state.audioDetail.playbackUrl)} />
         {nativeSystemAudioHealth ? (
           <div className="native-capture-health" role="status" aria-live="polite" aria-label="系统音频分层健康状态">
           <span data-ready={nativeSystemAudioHealth.transportReady}>
@@ -809,8 +943,18 @@ export function LiveMeetingWorkbench({
         </div>
       ) : null}
 
+      {state.importJob ? <ImportedRecordingStatus key={meetingId} job={state.importJob}
+        onRefresh={actions.refresh}
+        onRetry={async () => {
+          await api.retryImportJob(meetingId);
+          try { await actions.refresh(); }
+          catch { setMessage("录音导入重试已提交，但状态刷新未完成。请刷新导入状态；无需再次提交重试。"); }
+        }} /> : null}
       {meetingEnded ? (
         <ReviewWorkspace
+          recoveryApi={recoveryApi}
+          onKnowledgeSource={onKnowledgeSource}
+          knowledgeApi={knowledgeApi} projectApi={projectApi} reconcileApi={reconcileApi} onOpenKnowledgeDocument={onOpenKnowledgeDocument} onOpenProjectProposals={onOpenProjectProposals}
           state={state}
           onReloadTranscript={actions.loadFullTranscript}
           onReloadAudio={actions.loadAudio}
@@ -903,6 +1047,12 @@ export function LiveMeetingWorkbench({
             tabIndex={-1}
           >
             <AiWorkspace
+              projectApi={projectApi}
+              memoryApi={memoryApi}
+              knowledgeApi={knowledgeApi}
+              onKnowledgeSource={onKnowledgeSource}
+              onEntitiesChanged={() => void actions.refresh()}
+              onKnowledgeContextSaved={() => { setPreparationRefreshKey((value) => value + 1); void actions.refresh(); }}
               meetingId={meetingId}
               api={api}
               selection={transcriptSelection}
@@ -914,8 +1064,10 @@ export function LiveMeetingWorkbench({
               semanticFollowUp={state.semanticFollowUp}
               coachDecision={state.coachDecision}
               coachHistory={state.coachHistory}
+              coachDueItems={state.coachDueItems}
               recentContextHistory={state.recentContextHistory}
               coachRuntime={taskCapabilities.realtime_suggestions}
+              discussionRuntime={aiCapabilities.discussion_state}
               openQuestions={state.openQuestions}
               suggestions={state.suggestions}
               decisionCandidates={state.decisionCandidates}
@@ -932,7 +1084,7 @@ export function LiveMeetingWorkbench({
         </MeetingSplitPane>
       )}
 
-      <div className="sr-live" role="status" aria-live="polite">{message}</div>
+      <div className="sr-live" role="status" aria-label="操作反馈" aria-live="polite">{message}</div>
       {state.endError || message ? (
         <div className={`toast ${state.endError ? "toast--error" : ""}`} aria-hidden="true">
           {state.endError ?? message}
@@ -947,7 +1099,11 @@ export function LiveMeetingWorkbench({
         state={state}
         transportKind={transportKind}
       />
-      <MeetingPreflightDialog
+      <MeetingPreflightDialog materialsApi={materialsApi} materialSet={materialSet} onMaterialSetChange={setMaterialSet}
+          {...profilePreflightProps}
+          projectApi={projectApi}
+          knowledgeApi={knowledgeApi}
+          memoryApi={memoryApi}
         open={preflightOpen}
         busy={starting}
         onCancel={() => setPreflightOpen(false)}

@@ -343,6 +343,18 @@ def test_repeated_migration_does_not_repair_a_mixed_live_meeting(
     report = V1ToV2ShadowMigrator(database_path).run()
 
     assert report["status"] == "completed_with_issues"
+    with sqlite3.connect(database_path) as connection:
+        raw_before = connection.execute(
+            "SELECT text, normalized_text, revision, correction_status, "
+            "correction_before_text, correction_after_text FROM transcript_segments "
+            "WHERE meeting_id='meeting-1' AND segment_id='seg-1'"
+        ).fetchone()
+        assert raw_before == (
+            "结构化 function call。", "结构化 function call。", 1, "pending", None, None,
+        )
+        assert connection.execute(
+            "SELECT state FROM meetings WHERE id='meeting-1'"
+        ).fetchone() == ("ended",)
     persistence = V2Persistence(database_path)
     try:
         segment = persistence.get_snapshot("meeting-1")["segments"][0]
@@ -350,9 +362,18 @@ def test_repeated_migration_does_not_repair_a_mixed_live_meeting(
         persistence.close()
     assert segment["text"] == "结构化 function call。"
     assert segment["revision"] == 1
-    assert segment["correction_status"] == "pending"
+    assert segment["correction_status"] == "failed_preserved_original"
     assert segment["correction_before_text"] is None
     assert segment["correction_after_text"] is None
+
+    assert segment["correction_error_class"] == "correction_not_evaluated"
+    assert segment["correction_status_provenance"] == "terminal_job_projection"
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT text, normalized_text, revision, correction_status, "
+            "correction_before_text, correction_after_text FROM transcript_segments "
+            "WHERE meeting_id='meeting-1' AND segment_id='seg-1'"
+        ).fetchone() == raw_before
 
 
 def test_interrupted_migration_keeps_legacy_data_and_resumes_idempotently(

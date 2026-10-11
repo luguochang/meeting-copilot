@@ -17,6 +17,7 @@ from scripts.streaming_contract import (
     StreamingTranscriptEvent,
     build_provider_transcript_from_stream,
 )
+from scripts.funasr_cpu_checkpoint_loader import install_funasr_cpu_checkpoint_loader
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 REQUIRED_LOCAL_MODEL_FILES = ("model.pt", "config.yaml")
@@ -85,6 +86,7 @@ def transcribe(
     with contextlib.redirect_stdout(sys.stderr):
         from funasr import AutoModel
 
+        install_funasr_cpu_checkpoint_loader(AutoModel)
         model = AutoModel(**model_kwargs)
         result = model.generate(
             input=str(audio_path),
@@ -344,6 +346,7 @@ def transcribe_offline_batch(
     with contextlib.redirect_stdout(sys.stderr):
         from funasr import AutoModel
 
+        install_funasr_cpu_checkpoint_loader(AutoModel)
         model = AutoModel(**model_kwargs)
 
     model_load_latency_ms = int((time.monotonic() - model_started) * 1000)
@@ -458,6 +461,7 @@ def _load_streaming_model(
     resolved_model = _resolve_offline_model(model_name, local_model_dir)
     from funasr import AutoModel
 
+    install_funasr_cpu_checkpoint_loader(AutoModel)
     return AutoModel(model=resolved_model, device=device, disable_update=True)
 
 

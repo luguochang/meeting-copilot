@@ -69,8 +69,9 @@ _SKILLS: Mapping[str, Mapping[str, Any]] = MappingProxyType(
         },
         "interview": {
             "id": "interview",
-            "version": 1,
+            "version": 2,
             "name": "User interview coach",
+            "role_guidance": "用户研究访谈：用户作为访谈者或主持者时给中立追问，不替受访者编答案，也不默认使用求职面试框架。",
             "objective": (
                 "Help the interviewer uncover concrete behavior, context, frequency, impact, and "
                 "counterexamples without leading the interviewee."

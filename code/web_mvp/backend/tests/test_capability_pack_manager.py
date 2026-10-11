@@ -238,6 +238,25 @@ def test_rejects_wrong_platform(tmp_path):
 def test_local_capability_api_imports_package_and_reports_status(tmp_path, monkeypatch):
     package, base = _fixture_package(tmp_path)
     data_dir = tmp_path / "data"
+    # This fixture describes a base-only manifest, independent of a developer's
+    # explicitly configured source runtime (which takes precedence for realtime ASR).
+    for name in (
+        "MEETING_COPILOT_FUNASR_PYTHON",
+        "MEETING_COPILOT_FUNASR_WORKER",
+        "MEETING_COPILOT_FUNASR_MODEL_DIR",
+        "MEETING_COPILOT_FUNASR_ENGINE",
+        "MEETING_COPILOT_BATCH_FUNASR_PYTHON",
+        "MEETING_COPILOT_BATCH_TRANSCRIBE_WORKER",
+        "MEETING_COPILOT_FILE_ASR_MODEL_DIR",
+        "MEETING_COPILOT_FILE_ASR_VAD_MODEL_DIR",
+        "MEETING_COPILOT_FILE_ASR_PUNC_MODEL_DIR",
+        "MEETING_COPILOT_REALTIME_REFINER_PYTHON",
+        "MEETING_COPILOT_REALTIME_REFINER_WORKER",
+        "MEETING_COPILOT_REALTIME_REFINER_MODEL",
+        "MEETING_COPILOT_REALTIME_REFINER_VAD_MODEL",
+        "MEETING_COPILOT_REALTIME_REFINER_PUNC_MODEL",
+    ):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("MEETING_COPILOT_DESKTOP_RUNTIME", "1")
     monkeypatch.setenv(
         "MEETING_COPILOT_RUNTIME_MANIFEST",
@@ -265,7 +284,12 @@ def test_local_capability_api_imports_package_and_reports_status(tmp_path, monke
         current = client.get("/v2/local-capabilities")
 
     assert initial.status_code == 200
-    assert initial.json() == {
+    initial_body = initial.json()
+    assert initial_body.pop("deployment_mode") == "desktop"
+    runtime = initial_body.pop("runtime_capabilities")
+    assert runtime["realtime_asr"]["available"] is False
+    assert runtime["file_asr"]["available"] is False
+    assert initial_body == {
         "schema_version": "meeting_copilot.local_capability_status.v1",
         "platform": "windows-x86_64",
         "base_app_ready": True,
@@ -286,6 +310,8 @@ def test_local_capability_api_imports_package_and_reports_status(tmp_path, monke
     assert imported.json()["installed"] is True
     assert imported.json()["restart_required"] is True
     assert current.json()["package_id"] == "fixture-full"
+    # Import advertises package contents; it does not load a running ASR worker.
+    assert current.json()["runtime_capabilities"]["file_asr"]["available"] is False
     assert (tmp_path / "capability-packs" / "active.json").is_file()
 
 

@@ -17,6 +17,11 @@ import time
 from pathlib import Path
 from typing import Any
 
+if __package__ in {None, ""}:
+    from funasr_cpu_checkpoint_loader import install_funasr_cpu_checkpoint_loader
+else:
+    from .funasr_cpu_checkpoint_loader import install_funasr_cpu_checkpoint_loader
+
 
 def _emit(payload: dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
@@ -75,6 +80,7 @@ def main(argv: list[str] | None = None) -> None:
         import numpy as np
         from funasr import AutoModel
 
+        install_funasr_cpu_checkpoint_loader(AutoModel)
         model = AutoModel(
             model=str(args.model),
             vad_model=str(args.vad_model),

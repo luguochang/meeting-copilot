@@ -95,6 +95,29 @@ function formalAiPayload(segmentId = "segment-1") {
   };
 }
 
+it.each([8, undefined])("preserves only the supplied topic cursor through an SSE update (%s)", (topicSeq) => {
+  const state = meetingReducer(createInitialMeetingState("meeting-1"), { type: "events.received", receivedAtMs: 2_000,
+    events: [event({ seq: 99, type: "meeting.topic.updated", payload: { ...formalAiPayload(),
+      topic: { id: "historical", text: "上次话题", status: "active", last_updated_seq: topicSeq } } })] });
+  expect(state.currentTopic?.text).toBe("上次话题");
+  expect(state.currentTopic?.lastUpdatedSeq).toBe(topicSeq);
+});
+
+it("marks an existing review document stale from its durable source event without replacing human content", () => {
+  const state = { ...createInitialMeetingState("meeting-1"), documents: { minutes: {
+    documentId: "doc", meetingId: "meeting-1", kind: "minutes" as const, revision: 2,
+    sourceRevision: 1, contentJson: { markdown: "保留人工稿" }, aiVersion: 1, userVersion: 1,
+    source: "user_final" as const, dirtyState: "saved", updatedAtMs: 100,
+  } } };
+  const next = meetingReducer(state, { type: "events.received", receivedAtMs: 200, events: [event({
+    type: "review_document.source.changed", seq: 1,
+    payload: { document_kind: "minutes", revision: 3, dirty_state: "stale" },
+  })] });
+  expect(next.documents?.minutes).toMatchObject({
+    revision: 3, dirtyState: "stale", source: "user_final", contentJson: { markdown: "保留人工稿" },
+  });
+});
+
 function localReflexPayload(overrides: Record<string, unknown> = {}) {
   return {
     source: "local_reflex",
@@ -136,6 +159,12 @@ function localReflexPayload(overrides: Record<string, unknown> = {}) {
 }
 
 describe("meetingReducer", () => {
+  it("hydrates the persisted main help mode, while an older snapshot explicitly returns to legacy", () => {
+    const participating = meetingReducer(createInitialMeetingState("meeting-1"), { type: "snapshot.received", snapshot: snapshot({ liveAnalysisProfile: "participation", liveAnalysisProfileLocked: true }), receivedAtMs: 500 });
+    expect(participating.liveAnalysisProfile).toBe("participation"); expect(participating.liveAnalysisProfileLocked).toBe(true);
+    const old = meetingReducer(participating, { type: "snapshot.received", snapshot: snapshot({ lastSeq: 2 }), receivedAtMs: 600 });
+    expect(old.liveAnalysisProfile).toBe("legacy"); expect(old.liveAnalysisProfileLocked).toBeUndefined();
+  });
   it("projects sealed and ready recording events without waiting for a full snapshot", () => {
     const initial = meetingReducer(createInitialMeetingState("meeting-1"), {
       type: "snapshot.received",
@@ -281,6 +310,62 @@ describe("meetingReducer", () => {
       text: "请确认上线负责人。",
       feedback: "kept",
     });
+  });
+
+  it("accepts source invalidation from a reconnect snapshot while preserving the historical answer", () => {
+    const committed = suggestion({ kind: "answer", status: "committed", text: "方案已验收，可以发布。",
+      contextEvidence: [{ segmentId: "context", evidenceHash: "old-context", revision: 1 }], updatedAtMs: 100 });
+    const initial = meetingReducer(createInitialMeetingState("meeting-1"), {
+      type: "snapshot.received", snapshot: snapshot({ suggestions: [committed] }), receivedAtMs: 500,
+    });
+    const revised = meetingReducer(initial, {
+      type: "snapshot.received", snapshot: snapshot({ lastSeq: 2, suggestions: [{ ...committed, status: "superseded",
+        errorClass: "transcript_revised", text: null, draftText: "", updatedAtMs: 2000 }] }), receivedAtMs: 2100,
+    });
+    expect(revised.suggestions[0]).toMatchObject({ status: "superseded", errorClass: "transcript_revised",
+      text: committed.text, contextEvidence: committed.contextEvidence });
+    const late = meetingReducer(revised, {
+      type: "snapshot.received", snapshot: snapshot({ lastSeq: 3, suggestions: [{ ...committed, updatedAtMs: 3000 }] }), receivedAtMs: 3100,
+    });
+    expect(late.suggestions[0].status).toBe("superseded");
+  });
+
+  it("projects real answer revision fields from superseded and replacement events", () => {
+    const committed = suggestion({ kind: "answer", status: "committed", text: "原回答正文。" });
+    const initial = meetingReducer(createInitialMeetingState("meeting-1"), {
+      type: "snapshot.received", snapshot: snapshot({ suggestions: [committed] }), receivedAtMs: 500,
+    });
+    const bindings = [{ segment_id: "context", evidence_hash: "context-before", revision: 1 }];
+    const revised = meetingReducer(initial, {
+      type: "events.received", receivedAtMs: 2500,
+      events: [event({ seq: 2, type: "suggestion.superseded", aggregateType: "suggestion", aggregateId: committed.suggestionId,
+        payload: { ...committed, kind: "answer", status: "superseded", error_class: "transcript_revised",
+          context_evidence: bindings, supersedes_suggestion_id: null, updated_at_ms: 2000 } }),
+      event({ seq: 3, type: "suggestion.committed", aggregateType: "suggestion", aggregateId: "answer-updated",
+        payload: { ...committed, suggestion_id: "answer-updated", generation_id: "generation-updated", kind: "answer",
+          status: "committed", text: "依据修订后的回答。", context_evidence: [{ ...bindings[0], evidence_hash: "context-after", revision: 2 }],
+          supersedes_suggestion_id: committed.suggestionId, updated_at_ms: 2300 } })],
+    });
+    expect(revised.suggestions.find((item) => item.suggestionId === committed.suggestionId)).toMatchObject({
+      status: "superseded", errorClass: "transcript_revised", text: committed.text,
+      contextEvidence: [{ segmentId: "context", evidenceHash: "context-before", revision: 1 }], supersedesSuggestionId: null,
+    });
+    expect(revised.suggestions.find((item) => item.suggestionId === "answer-updated")).toMatchObject({
+      status: "committed", supersedesSuggestionId: committed.suggestionId,
+      contextEvidence: [{ segmentId: "context", evidenceHash: "context-after", revision: 2 }],
+    });
+  });
+
+  it("does not let an older invalidation snapshot retract a newer committed generation state", () => {
+    const committed = suggestion({ status: "committed", text: "当前回答。", stateRevision: 2, updatedAtMs: 2000 });
+    const initial = meetingReducer(createInitialMeetingState("meeting-1"), {
+      type: "snapshot.received", snapshot: snapshot({ suggestions: [committed] }), receivedAtMs: 2100,
+    });
+    const late = meetingReducer(initial, {
+      type: "snapshot.received", snapshot: snapshot({ lastSeq: 2, suggestions: [{ ...committed, status: "superseded",
+        stateRevision: 1, updatedAtMs: 1000 }] }), receivedAtMs: 2200,
+    });
+    expect(late.suggestions[0]).toMatchObject({ status: "committed", text: "当前回答。" });
   });
 
   it("applies an authoritative superseded event to a committed suggestion", () => {
@@ -1724,4 +1809,9 @@ describe("meetingReducer", () => {
     expect(renamed.semanticParagraphs?.[0].speakerLabel).toBe("张工");
     expect(renamed.activeParagraph?.speakerLabel).toBe("张工");
   });
+});
+
+it("keeps typed document binding on a committed answer event alongside transcript context", () => {
+  const current = meetingReducer(createInitialMeetingState("meeting-1"), { type: "events.received", receivedAtMs: 1000, events: [event({ type: "suggestion.committed", payload: { kind: "answer", suggestion: { suggestion_id: "answer", meeting_id: "meeting-1", kind: "answer", generation_id: "gen", status: "committed", text: "依据资料的回答", evidence_segment_id: "segment-1", evidence_transcript_seq: 1, evidence_hash: "transcript-hash", state_revision: 1, source_evidence: [{ source_type: "document", source_id: "span-1", document_id: "doc", project_id: "project", title: "预算", version_id: "version-2", version: 2, content_hash: "doc-hash", locator: { type: "pdf_page", page: 2 }, quote: "预算三万元", context_revision: 3 }] } } })] });
+  expect(current.suggestions[0].sourceEvidence?.[0]).toMatchObject({ sourceType: "document", sourceId: "span-1", contentHash: "doc-hash", contextRevision: 3 }); expect(current.suggestions[0].sourceEvidence?.[0]).not.toHaveProperty("segmentId");
 });

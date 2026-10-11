@@ -21,6 +21,25 @@ def _version(path: Path) -> int:
         return int(connection.execute("PRAGMA user_version").fetchone()[0])
 
 
+def test_memory_jobs_migration_preserves_v21_manual_memory_and_exclusion(tmp_path: Path) -> None:
+    from meeting_copilot_web_mvp.sqlite_schema import migrate_sqlite_schema
+    database = tmp_path / "memory-v21.db"
+    migrate_sqlite_schema(database, application_schema.APPLICATION_SCHEMA_MIGRATIONS[:21], current_version=21, max_supported_version=21)
+    with sqlite3.connect(database) as connection:
+        connection.execute("INSERT INTO user_memories(id,scope,scope_id,kind,memory_key,value,status,origin,fingerprint,created_at_ms,updated_at_ms) "
+                           "VALUES('manual','global','','preference','response_length','brief','active','user','original-hash',1,1)")
+        connection.execute("INSERT INTO memory_exclusions VALUES('deleted-original-hash',1)")
+        fingerprints = connection.execute("SELECT version,fingerprint FROM meeting_copilot_schema_migrations ORDER BY version").fetchall()
+    result = migrate_sqlite_schema(database, application_schema.APPLICATION_SCHEMA_MIGRATIONS[:22], current_version=22, max_supported_version=22)
+    assert result.applied_versions == (22,)
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT value,status,revision,reconciliation_job_id FROM user_memories WHERE id='manual'").fetchone() == ("brief", "active", 1, None)
+        assert connection.execute("SELECT fingerprint FROM memory_exclusions").fetchone()[0] == "deleted-original-hash"
+        assert connection.execute("SELECT version,fingerprint FROM meeting_copilot_schema_migrations WHERE version<=21 ORDER BY version").fetchall() == fingerprints
+        assert connection.execute("SELECT COUNT(*) FROM memory_reconcile_jobs").fetchone()[0] == 0
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
 def _objects(path: Path, object_type: str) -> set[str]:
     with sqlite3.connect(path) as connection:
         return {
@@ -83,6 +102,21 @@ def test_fresh_database_bootstraps_legacy_and_v2_schema(tmp_path: Path) -> None:
     }.issubset(_objects(database_path, "index"))
     with sqlite3.connect(database_path) as connection:
         assert connection.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+        assert {"request_context_json"}.issubset(
+            {row[1] for row in connection.execute("PRAGMA table_info(jobs)")}
+        )
+        assert {"context_json", "input_context_json"}.issubset(
+            {row[1] for row in connection.execute("PRAGMA table_info(agent_work_items)")}
+        )
+        assert {"set_id", "active_version_id", "enabled"}.issubset(
+            {row[1] for row in connection.execute("PRAGMA table_info(meeting_attachments)")}
+        )
+        assert {
+            "material_sets", "meeting_attachments", "meeting_attachment_versions",
+            "meeting_attachment_spans", "meeting_attachment_jobs", "meeting_attachment_search",
+        }.issubset({row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )})
         migration_history = connection.execute(
             "SELECT version, name FROM meeting_copilot_schema_migrations ORDER BY version"
         ).fetchall()
@@ -99,7 +133,45 @@ def test_fresh_database_bootstraps_legacy_and_v2_schema(tmp_path: Path) -> None:
             (10, "add_intelligence_input_coverage"),
             (11, "add_durable_pi_work_items"),
             (12, "add_realtime_answer_copilot_fields"),
+        (13, "bind_answer_context_evidence_versions"),
+        (14, "add_local_project_knowledge_library"),
+        (15, "add_durable_knowledge_jobs"),
+        (16, "add_confirmed_project_outcomes"),
+        (17, "bind_live_document_evidence"),
+        (18, "allow_user_entities_before_audio"),
+        (19, "add_controlled_user_memory"),
+        (20, "link_versioned_notes_and_human_finals"),
+        (21, "add_explicit_project_reconciliation_jobs"),
+        (22, "add_source_bound_memory_reconciliation"),
+        (23, "add_explicit_project_preparation"),
+        (24, "add_explicit_historical_transcript_recovery"),
+        (25, "add_realtime_participation_context"),
+        (26, "add_meeting_material_sets"),
     ]
+
+
+def test_pre_audio_entity_migration_preserves_existing_facts_and_rejects_negative_sequence(tmp_path: Path) -> None:
+    from meeting_copilot_web_mvp.sqlite_schema import migrate_sqlite_schema
+
+    database = tmp_path / "before-audio.db"
+    migrate_sqlite_schema(database, application_schema.APPLICATION_SCHEMA_MIGRATIONS[:17], current_version=17, max_supported_version=17)
+    original = ("meeting", "fact", "decision_candidate", "confirmed", "原有决定", 0.91,
+                '{"segment_id":"segment"}', '["segment"]', "张先生", "下周", "措施", 1234, 4, 3, 8)
+    with sqlite3.connect(database) as connection:
+        connection.execute("INSERT INTO meeting_entities VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", original)
+    result = bootstrap_application_schema(database)
+    assert result.backup_path is not None
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT * FROM meeting_entities WHERE entity_id='fact'").fetchone() == original
+        connection.execute("INSERT INTO meeting_entities VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                           ("meeting", "before", "decision_candidate", "candidate", "资料事实", 1,
+                            "{}", "[]", None, None, None, 2345, 1, 0, 0))
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("UPDATE meeting_entities SET first_seen_seq=-1 WHERE entity_id='before'")
+        assert connection.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    with sqlite3.connect(result.backup_path) as backup:
+        assert backup.execute("SELECT * FROM meeting_entities WHERE entity_id='fact'").fetchone() == original
 
 
 def test_existing_legacy_v1_database_is_backed_up_and_upgraded_without_data_loss(
@@ -136,6 +208,21 @@ def test_existing_legacy_v1_database_is_backed_up_and_upgraded_without_data_loss
             '{"session_id":"preserve-me"}',
         )
         assert connection.execute("SELECT 1 FROM meeting_events").fetchone() is None
+        assert {"request_context_json"}.issubset(
+            {row[1] for row in connection.execute("PRAGMA table_info(jobs)")}
+        )
+        assert {"context_json", "input_context_json"}.issubset(
+            {row[1] for row in connection.execute("PRAGMA table_info(agent_work_items)")}
+        )
+        assert {"set_id", "active_version_id", "enabled"}.issubset(
+            {row[1] for row in connection.execute("PRAGMA table_info(meeting_attachments)")}
+        )
+        assert {
+            "material_sets", "meeting_attachments", "meeting_attachment_versions",
+            "meeting_attachment_spans", "meeting_attachment_jobs", "meeting_attachment_search",
+        }.issubset({row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )})
         assert connection.execute(
             "SELECT version, name FROM meeting_copilot_schema_migrations ORDER BY version"
         ).fetchall() == [
@@ -150,6 +237,20 @@ def test_existing_legacy_v1_database_is_backed_up_and_upgraded_without_data_loss
                             (10, "add_intelligence_input_coverage"),
                             (11, "add_durable_pi_work_items"),
                             (12, "add_realtime_answer_copilot_fields"),
+            (13, "bind_answer_context_evidence_versions"),
+            (14, "add_local_project_knowledge_library"),
+            (15, "add_durable_knowledge_jobs"),
+            (16, "add_confirmed_project_outcomes"),
+            (17, "bind_live_document_evidence"),
+            (18, "allow_user_entities_before_audio"),
+            (19, "add_controlled_user_memory"),
+            (20, "link_versioned_notes_and_human_finals"),
+            (21, "add_explicit_project_reconciliation_jobs"),
+            (22, "add_source_bound_memory_reconciliation"),
+            (23, "add_explicit_project_preparation"),
+            (24, "add_explicit_historical_transcript_recovery"),
+            (25, "add_realtime_participation_context"),
+            (26, "add_meeting_material_sets"),
                 ]
 
 

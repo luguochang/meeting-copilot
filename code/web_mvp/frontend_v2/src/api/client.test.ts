@@ -15,6 +15,13 @@ function response(body: unknown, status = 200): Response {
 }
 
 describe("HttpMeetingApi", () => {
+  it("loads opaque note pages and fetches current versions for explicit conflict recovery", async () => {
+    const note = { note_id: "笔记/a", title: "项目复盘", body: "已核对文本", version: 4, status: "active", evidence: [], source_kind: "manual" };
+    const fetcher = vi.fn().mockResolvedValueOnce(response({ items: [note], has_more: true, next_cursor: "opaque+/=" })).mockResolvedValueOnce(response({ note })); vi.stubGlobal("fetch", fetcher);
+    const api = new HttpMeetingApi("http://localhost:9000"); const page = await api.listNotesPage({ meetingId: "会议/a", query: "  复盘  ", cursor: "opaque+/=", limit: 50 });
+    const url = new URL(fetcher.mock.calls[0][0]); expect(url.pathname).toBe("/v2/notes/page"); expect(url.searchParams.get("meeting_id")).toBe("会议/a"); expect(url.searchParams.get("cursor")).toBe("opaque+/="); expect(url.searchParams.get("query")).toBe("复盘"); expect(page.nextCursor).toBe("opaque+/="); expect(page.items[0].version).toBe(4);
+    expect((await api.getNote(note.note_id)).version).toBe(4); expect(fetcher.mock.calls[1][0]).toContain(encodeURIComponent(note.note_id)); expect(fetcher.mock.calls.every(([, init]) => init.method === undefined)).toBe(true);
+  });
   it("loads and uploads local capability packages through the typed API", async () => {
     const body = {
       schema_version: "meeting_copilot.local_capability_status.v1",
@@ -799,7 +806,7 @@ describe("HttpMeetingApi", () => {
   it.each([
     [{ jobs: [{ id: "job-1", status: "running" }] }, "pending"],
     [{ jobs: [{ id: "job-1", status: "succeeded" }], coach_history: [{ job_id: "job-1", status: "intervention" }] }, "succeeded"],
-    [{ jobs: [{ id: "job-1", status: "succeeded" }], diagnostics: { coach_runtime_history: [{ job_id: "job-1", status: "timed_out", outcome: "failure" }] } }, "failed"],
+    [{ jobs: [{ id: "job-1", status: "succeeded" }], diagnostics: { coach_runtime_history: [{ job_id: "job-1", status: "timed_out", outcome: "failure" }] } }, "timed_out"],
     [{ jobs: [{ id: "job-1", status: "succeeded" }] }, "no_change"],
     [{ jobs: [{ id: "job-1", status: "failed" }] }, "failed"],
     [{ jobs: [] }, "failed"],

@@ -22,7 +22,7 @@ def test_all_supported_skills_have_a_bounded_versioned_contract() -> None:
         "general": 1,
         "decision": 1,
         "project": 1,
-        "interview": 1,
+        "interview": 2,
         "brainstorm": 2,
     }
     for skill_id in SUPPORTED_COACH_SKILL_IDS:
@@ -45,3 +45,10 @@ def test_each_scene_skill_only_enables_its_own_extra_event() -> None:
     assert coach_skill_event_types("general") == BASE_COACH_EVENT_TYPES
     assert coach_skill_event_types("interview") == BASE_COACH_EVENT_TYPES | {"discovery_gap"}
     assert "execution_gap" not in coach_skill_event_types("interview")
+
+
+def test_interview_role_contract_is_explicitly_user_research():
+    skill = coach_skill_payload("interview")
+    assert "用户研究访谈" in skill["role_guidance"]
+    assert "中立追问" in skill["role_guidance"]
+    assert "不默认使用求职面试框架" in skill["role_guidance"]

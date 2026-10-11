@@ -1,6 +1,7 @@
 """Distribution must not silently lose recognition, refinement, or Pi."""
 import importlib.util
 from pathlib import Path
+import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +22,7 @@ def test_quality_profile_overrides_low_quality_inherited_defaults(monkeypatch, t
     assert env["MEETING_COPILOT_FUNASR_ENGINE"] == "pytorch"
     assert "MEETING_COPILOT_FUNASR_PYTHONPATH" not in env
     assert "MEETING_COPILOT_RUNTIME_MANIFEST" not in env
+    assert env["MEETING_COPILOT_SOURCE_RUNTIME"] == "1"
     assert env["MEETING_COPILOT_FILE_ASR_MODEL_DIR"] == env["MEETING_COPILOT_REALTIME_REFINER_MODEL"]
     assert env["MEETING_COPILOT_FILE_ASR_VAD_MODEL_DIR"] == env["MEETING_COPILOT_DIARIZATION_VAD_DIR"]
 
@@ -62,3 +64,33 @@ def test_incomplete_profile_refuses_to_start(monkeypatch, tmp_path):
     monkeypatch.setattr(tool.sys, "argv", ["web_quality.py", "start", "--data-dir", str(tmp_path)])
     monkeypatch.setattr(tool.subprocess, "run", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not start")))
     assert tool.main() == 1
+
+
+def test_doctor_handles_utf8_dependency_output_on_legacy_windows_locale(monkeypatch, tmp_path):
+    frontend = tmp_path / "code/web_mvp/frontend_v2/dist/index.html"
+    frontend.parent.mkdir(parents=True)
+    frontend.touch()
+    monkeypatch.setattr(tool, "ROOT", tmp_path)
+    monkeypatch.setattr(tool, "model_specs", lambda: {})
+    real_run = tool.subprocess.run
+    outputs = []
+    script = (
+        "import sys; sys.stdout.buffer.write("
+        + repr("本地语音预热中…\n".encode("utf-8"))
+        + "); sys.stderr.buffer.write(b'\\xae')"
+    )
+
+    def run_dependency_probe(command, **kwargs):
+        # Simulate a GBK Windows host while retaining actual subprocess decoding.
+        kwargs.setdefault("encoding", "cp936")
+        kwargs.setdefault("errors", "strict")
+        result = real_run([sys.executable, "-c", script], **kwargs)
+        outputs.append(result)
+        return result
+
+    monkeypatch.setattr(tool.subprocess, "run", run_dependency_probe)
+    report = tool.doctor(tmp_path / "models", tmp_path / "data")
+    assert report["ready"] is True
+    assert len(outputs) == 4
+    assert all(result.stdout == "本地语音预热中…\n" for result in outputs)
+    assert all(result.stderr == "\ufffd" for result in outputs)

@@ -32,6 +32,83 @@ _CHUNK_NAME_PATTERN = re.compile(r"^chunk-(\d{8})\.pcm$")
 DUAL_TRACK_IDS = frozenset({"microphone", "system_audio"})
 
 
+def realtime_audio_relative_path(
+    session_id: str, *, track_id: str | None = None, epoch: int = 0, source_type: str = ""
+) -> Path:
+    if not SESSION_ID_PATTERN.fullmatch(session_id):
+        raise ValueError(f"unsafe session_id: {session_id}")
+    track_id = str(track_id or "").strip() or ("system_audio" if "system_audio" in source_type else None)
+    if track_id is not None and track_id not in DUAL_TRACK_IDS:
+        raise ValueError("invalid realtime audio track")
+    epoch = int(epoch)
+    if epoch < 0:
+        raise ValueError("audio epoch must be non-negative")
+    base = Path("audio_assets") / session_id
+    if track_id is not None:
+        base = base / "tracks" / track_id / f"epoch-{epoch}"
+    return base / "audio.wav"
+
+
+def resolve_realtime_recording_layout(
+    *, recording: Mapping[str, Any], chunks: list[dict[str, Any]], data_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Resolve one capture's journal from its committed paths, preserving legacy layouts.
+
+    Database output paths from older interrupted captures can be defaults.
+    Committed chunk paths are stronger evidence and must all identify the same
+    approved meeting/track/epoch directory. Never search another capture.
+    """
+    session_id = str(recording["meeting_id"])
+    track = str(recording["track"])
+    epoch = int(recording["epoch"])
+    legacy = realtime_audio_relative_path(session_id)
+    tracked = realtime_audio_relative_path(session_id, track_id=track, epoch=epoch)
+    candidates = {legacy.as_posix(): None, tracked.as_posix(): track}
+    outputs = set()
+    for chunk in chunks:
+        relative = str(chunk["relative_path"]).replace("\\", "/")
+        sequence = int(chunk["chunk_seq"])
+        matching = [output for output in candidates
+                    if relative == (PurePosixPath(output).parent / "chunks" / f"chunk-{sequence:08d}.pcm").as_posix()]
+        if len(matching) != 1:
+            raise ValueError("recording chunk path does not match its capture identity")
+        outputs.add(matching[0])
+    if len(outputs) > 1:
+        raise ValueError("recording chunk journal contains mixed layouts")
+    if outputs:
+        output = outputs.pop()
+    else:
+        output = str(recording.get("output_relative_path") or legacy.as_posix()).replace("\\", "/")
+        if output not in candidates:
+            raise ValueError("recording output path does not match its capture identity")
+        if data_dir is not None and output == legacy.as_posix():
+            populated = []
+            for candidate in candidates:
+                parent = safe_audio_path(data_dir, PurePosixPath(candidate).parent)
+                chunk_dir = parent / "chunks"
+                manifest_path = parent / "audio.manifest.json"
+                if manifest_path.is_file():
+                    try:
+                        identity = json.loads(manifest_path.read_text(encoding="utf-8"))
+                        if (not isinstance(identity, dict)
+                                or (identity.get("epoch") is not None and int(identity["epoch"]) != epoch)
+                                or (identity.get("track_id") is not None and identity["track_id"] != track)):
+                            continue
+                    except (OSError, ValueError, TypeError):
+                        continue
+                elif candidate == legacy.as_posix() and epoch > 0:
+                    # Unscoped legacy data without an epoch cannot establish
+                    # ownership of a new epoch that has no committed chunks.
+                    continue
+                if chunk_dir.is_dir() and next(chunk_dir.glob("chunk-*.pcm"), None) is not None:
+                    populated.append(candidate)
+            if len(populated) > 1:
+                raise ValueError("recording has ambiguous legacy and epoch journals")
+            if populated:
+                output = populated[0]
+    return {"output_relative_path": output, "track_id": candidates[output], "epoch": epoch}
+
+
 class Float32PcmPayloadError(ValueError):
     """Raised when a realtime audio frame violates the Float32 PCM contract."""
 
@@ -143,12 +220,7 @@ class RealtimeWavAssetWriter:
         self._assembled = False
         self._buffer = bytearray()
         self._pending_source_spans: deque[dict[str, Any]] = deque()
-        if self._track_id is None:
-            self._relative_path = Path("audio_assets") / session_id / "audio.wav"
-        else:
-            self._relative_path = (
-                Path("audio_assets") / session_id / "tracks" / self._track_id / f"epoch-{epoch}" / "audio.wav"
-            )
+        self._relative_path = realtime_audio_relative_path(session_id, track_id=self._track_id, epoch=epoch)
         self._relative_chunks_dir = self._relative_path.parent / "chunks"
         self._path = self._data_dir / self._relative_path
         self._session_dir = self._path.parent
@@ -783,7 +855,7 @@ def derive_local_continuous_wav_asset(
     output_relative_path = (
         Path("audio_assets") / meeting_id / "derived" / "continuous" / track_id / f"{asset_id}.wav"
     )
-    output_path = safe_audio_path(data_dir, output_relative_path)
+    output_path = audio_io_path(safe_audio_path(data_dir, output_relative_path))
     ensure_private_directory(output_path.parent)
     if output_path.parent.is_symlink():
         raise ValueError("continuous audio output directory must not be a symlink")
@@ -795,7 +867,7 @@ def derive_local_continuous_wav_asset(
         for source in ordered_sources:
             relative_path = str(source.get("output_relative_path") or "")
             _require_meeting_owned_audio_path(meeting_id, relative_path)
-            source_path = safe_audio_path(data_dir, relative_path)
+            source_path = audio_io_path(safe_audio_path(data_dir, relative_path))
             if not source_path.is_file() or source_path.is_symlink():
                 raise ValueError(f"source recording epoch is unavailable: {source.get('epoch')}")
             _size, source_sha256 = _file_size_and_sha256(source_path)
@@ -898,6 +970,8 @@ def inspect_realtime_audio_journal(
     data_dir: str | Path,
     session_id: str,
     sample_rate_hz: int,
+    track_id: str | None = None,
+    epoch: int = 0,
 ) -> dict[str, Any]:
     """Validate and describe a durable PCM journal without changing it."""
 
@@ -907,7 +981,8 @@ def inspect_realtime_audio_journal(
     if sample_rate_hz <= 0:
         raise ValueError("sample_rate_hz must be positive")
 
-    session_dir = safe_audio_path(data_dir, Path("audio_assets") / session_id)
+    relative_dir = realtime_audio_relative_path(session_id, track_id=track_id, epoch=epoch).parent
+    session_dir = safe_audio_path(data_dir, relative_dir)
     if session_dir.is_symlink():
         raise ValueError("audio journal session directory must not be a symlink")
     chunks_dir = session_dir / "chunks"
@@ -933,6 +1008,9 @@ def inspect_realtime_audio_journal(
             raise ValueError("audio chunk manifest format does not match recording")
         if not isinstance(loaded.get("chunks", []), list):
             raise ValueError("audio chunk manifest has invalid chunks")
+        if ((track_id is not None and loaded.get("track_id") not in {None, track_id})
+                or (loaded.get("epoch") is not None and int(loaded["epoch"]) != int(epoch))):
+            raise ValueError("audio chunk manifest does not match its capture identity")
         manifest = loaded
 
     indexed_paths: list[tuple[int, Path]] = []
@@ -959,7 +1037,7 @@ def inspect_realtime_audio_journal(
             {
                 "chunk_seq": chunk_seq,
                 "name": path.name,
-                "relative_path": (Path("audio_assets") / session_id / "chunks" / path.name).as_posix(),
+                "relative_path": (relative_dir / "chunks" / path.name).as_posix(),
                 "sample_rate_hz": sample_rate_hz,
                 "sample_count": sample_count,
                 "duration_ms": round(sample_count / sample_rate_hz * 1_000),
@@ -977,6 +1055,29 @@ def inspect_realtime_audio_journal(
             expected.get(key) != actual[key] for key in ("name", "sample_count", "file_size_bytes", "sha256")
         ):
             raise ValueError("audio chunk does not match its manifest")
+
+        source_keys = ("source_sequence_start", "source_sequence_end",
+                       "source_timestamp_start_ms", "source_timestamp_end_ms")
+        present = [expected.get(key) is not None for key in source_keys]
+        if any(present):
+            if not all(present):
+                raise ValueError("audio chunk has incomplete native PCM source metadata")
+            source_values = {key: int(expected[key]) for key in source_keys}
+            if (source_values["source_sequence_start"] <= 0
+                    or source_values["source_sequence_end"] < source_values["source_sequence_start"]
+                    or source_values["source_timestamp_start_ms"] < 0
+                    or source_values["source_timestamp_end_ms"] < source_values["source_timestamp_start_ms"]):
+                raise ValueError("audio chunk has invalid native PCM source metadata")
+            actual.update(source_values)
+
+    if manifest is not None and manifest.get("started_at_ms") is not None:
+        started_at_ms = max(0, int(manifest["started_at_ms"]))
+        preceding_samples = int(manifest.get("base_sample_count") or 0)
+        if preceding_samples < 0:
+            raise ValueError("audio chunk manifest has invalid base_sample_count")
+        for chunk in chunks:
+            chunk["timestamp_ms"] = started_at_ms + round(preceding_samples / sample_rate_hz * 1_000)
+            preceding_samples += int(chunk["sample_count"])
 
     return {
         "session_id": session_id,
@@ -1143,6 +1244,19 @@ def audio_metadata_for_file(
     }
 
 
+def audio_io_path(path: Path) -> Path:
+    """Use Win32 extended-length paths only after canonical ownership checks."""
+
+    if os.name != "nt":
+        return path
+    absolute = str(path)
+    if absolute.startswith("\\\\?\\"):
+        return path
+    if absolute.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + absolute[2:])
+    return Path("\\\\?\\" + absolute)
+
+
 def safe_audio_path(data_dir: str | Path, relative_path: str | Path) -> Path:
     root = Path(data_dir).resolve()
     raw = Path(relative_path)
@@ -1190,13 +1304,13 @@ def _controlled_session_audio_dir(data_dir: str | Path, relative_path: str) -> P
     target = safe_audio_path(root, Path(*parts))
     if root not in session_dir.parents or (target != session_dir and session_dir not in target.parents):
         raise ValueError("audio cleanup path escapes its controlled session")
-    return session_dir
+    return audio_io_path(session_dir)
 
 
 def _file_size_and_sha256(path: Path) -> tuple[int, str]:
     digest = hashlib.sha256()
     file_size_bytes = 0
-    with path.open("rb") as source:
+    with audio_io_path(path).open("rb") as source:
         while data := source.read(_HASH_BUFFER_BYTES):
             file_size_bytes += len(data)
             digest.update(data)

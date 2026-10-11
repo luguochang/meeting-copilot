@@ -16,11 +16,30 @@ import {
   type ProviderProbeStatus,
   type ProviderProbeResult,
   type ProviderStatus,
+  type ProviderLaneStatus,
 } from "../../api/schema";
 import { resolveTauriInvoke } from "../../desktop/tauri";
 import { useModalDialog } from "../../components/useModalDialog";
 
 type ProviderApiStyle = "chat_completions" | "responses";
+
+function laneLabel(lane: ProviderLaneStatus): string {
+  if (!lane.configured) return "未配置";
+  if (!lane.enabled) return "已关闭";
+  if (lane.circuit_status === "open" || lane.circuit_status === "half_open") return "暂不可用";
+  if (lane.circuit_status === "unknown") return "状态未知";
+  if (lane.probe_scope === "realtime_model_tool_call" && lane.probe_status === "succeeded") return "工具调用通过";
+  if (lane.probe_status === "failed") return "测试失败";
+  return "已配置，待专项验证";
+}
+
+const laneNames = {
+  answer: "即时回答", pi_realtime: "主动提醒", pi_deep: "深入建议", direct_semantic: "结构化整理", correction: "文字校对",
+} as const;
+const resultLabels: Record<string, string> = {
+  success: "请求完成", timeout: "请求超时", rate_limit: "请求限流", provider_5xx: "服务错误",
+  transport_error: "连接错误", cancelled: "请求已取消", validation_error: "结果校验失败", failed: "请求失败",
+};
 
 interface ProviderConfigResponse {
   command_status: "ok" | "error";
@@ -653,6 +672,27 @@ export function ProviderSettingsControl() {
                   ) : null}
                 </div>
               </section>
+
+              {providerStatus.provider_lanes ? (
+                <section className="provider-lane-status" aria-label="AI 功能通道状态">
+                  <strong>各功能当前状态</strong>
+                  <p className="provider-settings-note">连接测试仅验证实时模型的最小工具调用。各功能的实际效果和速度需独立确认。</p>
+                  <dl>
+                    {Object.entries(laneNames).map(([name, label]) => {
+                      const lane = providerStatus.provider_lanes?.[name as keyof typeof laneNames];
+                      return <div key={name}>
+                        <dt>{label}</dt>
+                        <dd>{lane ? <>
+                          <strong>{laneLabel(lane)}</strong>{lane.model ? ` · ${lane.model}` : ""}
+                          {lane.active_count !== null && lane.active_count > 0 ? ` · ${lane.admission_group === "realtime" ? "实时共享通道" : "当前通道"}处理中 ${lane.active_count}` : ""}
+                          {lane.pending_count !== null && lane.pending_count > 0 ? ` · 等待 ${lane.pending_count}` : ""}
+                          {lane.last_result ? <p className="provider-settings-note">本次运行最近请求：{resultLabels[lane.last_result.outcome] ?? "结果未知"}；不代表当前配置已验证</p> : null}
+                        </> : "状态未知"}</dd>
+                      </div>;
+                    })}
+                  </dl>
+                </section>
+              ) : null}
 
               {phase === "unavailable" ? (
                 <div className="provider-desktop-only" role="status">

@@ -50,6 +50,23 @@ def test_startup_health_timeout_covers_local_funasr_model_prewarm():
     assert tool.STARTUP_HEALTH_TIMEOUT_SECONDS >= 60
 
 
+@pytest.mark.parametrize("policy,cold_budget,expected", [
+    ("on_demand", "180", 60),
+    ("online_only", "180", 60),
+    ("prewarm", "180", 210),
+    ("prewarm", "999999", 240),
+    ("prewarm", "invalid", 90),
+    ("prewarm", "NaN", 90),
+    ("prewarm", "inf", 90),
+])
+def test_supervisor_preserves_bounded_explicit_cold_start_budget(policy, cold_budget, expected):
+    tool = _load_tool()
+    assert tool.startup_health_timeout_seconds({
+        "MEETING_COPILOT_REALTIME_REFINER_POLICY": policy,
+        "MEETING_COPILOT_REALTIME_REFINER_PREWARM_TIMEOUT_SECONDS": cold_budget,
+    }) == expected
+
+
 def test_windows_child_process_does_not_inherit_launcher_console():
     tool = _load_tool()
 
@@ -265,7 +282,7 @@ def test_build_child_env_wires_cached_file_asr_models_when_staging_dir_is_absent
     cache_root = tmp_path / "cache" / "models" / "iic"
     models = _write_cached_file_asr_models(cache_root)
     monkeypatch.setenv(tool.LOCAL_FILE_ASR_MODEL_CACHE_ENV, str(cache_root))
-    python = tmp_path / "code" / "asr_runtime" / ".venv-funasr" / "bin" / "python"
+    python = tmp_path / "code" / "asr_runtime" / ".venv-funasr" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     worker = tmp_path / "code" / "asr_runtime" / "scripts" / "funasr_offline_refiner_worker.py"
     python.parent.mkdir(parents=True)
     worker.parent.mkdir(parents=True)
@@ -345,3 +362,27 @@ def test_windows_pid_liveness_uses_process_handle_state_not_posix_signal(monkeyp
     monkeypatch.setattr(tool.os, "kill", unexpected_kill)
 
     assert tool.pid_running(12345) is False
+
+
+def test_local_asr_path_defaults_do_not_load_credentials_and_shell_paths_win(monkeypatch, tmp_path):
+    tool = _load_tool()
+    monkeypatch.setattr(tool, "REPO_ROOT", tmp_path)
+    (tmp_path / ".env").write_text(
+        "MEETING_COPILOT_REALTIME_REFINER_PYTHON=local-python\n"
+        "MEETING_COPILOT_FILE_ASR_MODEL_DIR=local-model\n"
+        "MEETING_COPILOT_BATCH_TRANSCRIBE_WORKER=local-batch-worker\n"
+        "MEETING_COPILOT_SOURCE_RUNTIME=1\n"
+        "MEETING_COPILOT_FFMPEG=local-converter\n"
+        "LLM_GATEWAY_API_KEY=fixture-only-do-not-load\n", encoding="utf-8")
+    monkeypatch.delenv("MEETING_COPILOT_FILE_ASR_MODEL_DIR", raising=False)
+    for key in ("MEETING_COPILOT_BATCH_TRANSCRIBE_WORKER", "MEETING_COPILOT_SOURCE_RUNTIME", "MEETING_COPILOT_FFMPEG"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_REFINER_PYTHON", "deployment-python")
+    monkeypatch.delenv("LLM_GATEWAY_API_KEY", raising=False)
+    env = tool.build_child_env(data_dir=tmp_path / "data", provider_mode="safe")
+    assert env["MEETING_COPILOT_REALTIME_REFINER_PYTHON"] == "deployment-python"
+    assert env["MEETING_COPILOT_FILE_ASR_MODEL_DIR"] == "local-model"
+    assert env["MEETING_COPILOT_BATCH_TRANSCRIBE_WORKER"] == "local-batch-worker"
+    assert env["MEETING_COPILOT_SOURCE_RUNTIME"] == "1"
+    assert env["MEETING_COPILOT_FFMPEG"] == "local-converter"
+    assert "LLM_GATEWAY_API_KEY" not in env

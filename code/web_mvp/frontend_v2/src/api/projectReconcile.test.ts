@@ -1,0 +1,12 @@
+import { afterEach, expect, it, vi } from "vitest";
+import { HttpProjectReconcileApi } from "./projectReconcile";
+const job = { id: "job/a", project_id: "project", meeting_id: "meeting/a", document_kind: "minutes", status: "pending", base_project_revision: 7, attempts: 0, result_proposal_id: null, error_class: null, error_message: null, source_version: 2, context_truncated: false };
+function response(body: unknown, status = 200) { return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } }); }
+afterEach(() => vi.unstubAllGlobals());
+it("carries true source/project versions and creates only on an explicit call", async () => {
+  const fetcher = vi.fn().mockResolvedValueOnce(response({ items: [job], has_more: false, next_cursor: null })).mockResolvedValueOnce(response({ job })).mockResolvedValueOnce(response({ job })).mockResolvedValueOnce(response({ job })); vi.stubGlobal("fetch", fetcher); const api = new HttpProjectReconcileApi("http://localhost:9000/"); await api.list("project", "meeting/a", "opaque+/="); expect(new URL(fetcher.mock.calls[0][0]).searchParams.get("cursor")).toBe("opaque+/="); expect(fetcher.mock.calls[0][1].method).toBeUndefined(); await api.create("meeting/a", "minutes", 7, 2); await api.retry(job.id, 8, 3); await api.cancel(job.id); expect(JSON.parse(fetcher.mock.calls[1][1].body)).toEqual({ document_kind: "minutes", expected_project_revision: 7, expected_source_version: 2 }); expect(JSON.parse(fetcher.mock.calls[2][1].body)).toEqual({ expected_project_revision: 8, expected_source_version: 3 }); expect(fetcher.mock.calls[3][0]).toContain(encodeURIComponent(job.id));
+});
+it("requires saved modified human final before a retry input is captured", async () => {
+  const doc = { document_id: "final", meeting_id: "meeting", document_kind: "minutes", revision: 4, dirty_state: "saved", ai_generated: { version: 1, content: { markdown: "初稿" } }, user_final: { version: 2, modified: true, content: { markdown: "人工终稿" } } };
+  const fetcher = vi.fn().mockResolvedValueOnce(response({ document: doc })).mockResolvedValueOnce(response({ document: { ...doc, user_final: { ...doc.user_final, modified: false } } })); vi.stubGlobal("fetch", fetcher); const api = new HttpProjectReconcileApi(); expect((await api.getCurrentFinal("meeting", "minutes")).userVersion).toBe(2); await expect(api.getCurrentFinal("meeting", "minutes")).rejects.toThrow("请先核对并保存"); expect(fetcher.mock.calls.every(([, options]) => options.method === undefined)).toBe(true);
+});

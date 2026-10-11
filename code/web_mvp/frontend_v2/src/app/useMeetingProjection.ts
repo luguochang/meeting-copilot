@@ -6,11 +6,13 @@ import {
   isLocalReflexCoachPayload,
   isRealtimeAiProjectionEventType,
 } from "../domain/events";
-import type { MeetingEvent, MeetingViewState, SuggestionFeedback } from "../domain/events";
+import type { CoachUiRenderReceipt, MeetingEvent, MeetingViewState, SuggestionFeedback } from "../domain/events";
+import { parseCoachUiRenderReceipt } from "../domain/coachUiRenderReceipt";
 import { createInitialMeetingState, meetingReducer } from "../domain/reducer";
 
 const ASR_FINALIZATION_RETRY_WINDOW_MS = 10_000;
 const ASR_FINALIZATION_RETRY_INTERVAL_MS = 250;
+type PendingRenderAck = { event: MeetingEvent } | { receipt: CoachUiRenderReceipt };
 
 function isAsrFinalizationPending(error: unknown): boolean {
   if (!(error instanceof ApiError) || error.status !== 409) return false;
@@ -50,7 +52,7 @@ export function useMeetingProjection(
   const [state, dispatch] = useReducer(meetingReducer, normalizedMeetingId, createInitialMeetingState);
   const snapshotInFlight = useRef(false);
   const lastSeqRef = useRef(0);
-  const pendingRenderAcksRef = useRef(new Map<string, MeetingEvent>());
+  const pendingRenderAcksRef = useRef(new Map<string, PendingRenderAck>());
   const sentRenderAcksRef = useRef(new Set<string>());
 
   useEffect(() => {
@@ -71,12 +73,25 @@ export function useMeetingProjection(
       // Silent/terminal decisions do not produce a card. Do not retain them
       // in the pending map while a long meeting continues to receive events.
       if (!eventMayRenderCard(event)) return;
+      const intervention = payloadRecord(event.payload.coach_intervention ?? event.payload.coachIntervention
+        ?? event.payload.follow_up ?? event.payload.followUp);
+      const decision = payloadRecord(event.payload.coach_decision ?? event.payload.coachDecision);
+      if (isParticipationCard(intervention) || isParticipationCard(decision)) {
+        const receipt = parseCoachUiRenderReceipt(intervention?.ui_render_receipt);
+        // New participation publications require exact host measurement identity.
+        // Legacy/previous publications stay readable without clock backfilling.
+        if (receipt && receipt.meetingId === event.meetingId && receipt.jobId === eventJobId(event)
+          && receipt.eventSeq === event.seq) {
+          pendingRenderAcksRef.current.set(`${receipt.jobId}:${receipt.eventSeq}`, { receipt });
+        }
+        return;
+      }
     } else if (isRealtimeAiProjectionEventType(event.type) && !isFormalLlmFirstPayload(event.payload)) {
       return;
     }
     const jobId = eventJobId(event);
     if (!jobId) return;
-    pendingRenderAcksRef.current.set(`${jobId}:${event.seq}`, event);
+    pendingRenderAcksRef.current.set(`${jobId}:${event.seq}`, { event });
   };
 
   useEffect(() => {
@@ -89,6 +104,10 @@ export function useMeetingProjection(
       snapshotInFlight.current = true;
       try {
         const snapshot = await api.getSnapshot(normalizedMeetingId, signal);
+        const receipt = snapshot.followUp?.uiRenderReceipt;
+        if (receipt && receipt.meetingId === normalizedMeetingId) {
+          pendingRenderAcksRef.current.set(`${receipt.jobId}:${receipt.eventSeq}`, { receipt });
+        }
         dispatch({ type: "snapshot.received", snapshot, receivedAtMs: Date.now() });
         lastSeqRef.current = Math.max(lastSeqRef.current, snapshot.lastSeq);
       } finally {
@@ -231,11 +250,26 @@ export function useMeetingProjection(
   }, [loadAudio, loadFullTranscript, state.runtime.phase]);
 
   useEffect(() => {
-    const ready = [...pendingRenderAcksRef.current.entries()].filter(([, event]) => eventIsRendered(state, event));
+    for (const [key, candidate] of pendingRenderAcksRef.current) {
+      if ("receipt" in candidate && !receiptMatchesCurrentCard(state, candidate.receipt)) {
+        pendingRenderAcksRef.current.delete(key);
+      }
+    }
+    const ready = [...pendingRenderAcksRef.current.entries()].filter(([, candidate]) =>
+      "receipt" in candidate ? receiptMatchesCurrentCard(state, candidate.receipt) : eventIsRendered(state, candidate.event));
     if (!ready.length) return;
     const frame = window.requestAnimationFrame(() => {
-      for (const [key, event] of ready) {
+      for (const [key, candidate] of ready) {
         if (sentRenderAcksRef.current.has(key)) continue;
+        if ("receipt" in candidate) {
+          if (!api.markCoachUiRendered || !receiptMatchesCurrentCard(state, candidate.receipt)
+            || !receiptHasVisibleUiTarget(candidate.receipt, state.followUp?.sayThis ?? "")) continue;
+          sentRenderAcksRef.current.add(key);
+          pendingRenderAcksRef.current.delete(key);
+          void api.markCoachUiRendered(candidate.receipt).catch(() => undefined);
+          continue;
+        }
+        const event = candidate.event;
         // State projection alone does not prove that the card is mounted:
         // switching away from the Insights tab unmounts the rail. Keep the
         // event pending until the corresponding card is present in the DOM.
@@ -411,5 +445,45 @@ function eventHasVisibleUiTarget(event: MeetingEvent): boolean {
     if (typeof window.getComputedStyle !== "function") return true;
     const style = window.getComputedStyle(node);
     return style.display !== "none" && style.visibility !== "hidden";
+  });
+}
+
+function isParticipationCard(value: Record<string, unknown> | null): boolean {
+  return value?.analysis_kind === "participation" || value?.analysis_kind === "discussion_update"
+    || value?.prompt_profile === "participation";
+}
+
+function receiptMatchesCurrentCard(state: MeetingViewState, receipt: CoachUiRenderReceipt): boolean {
+  const card = state.followUp;
+  const decision = state.coachDecision;
+  if (state.runtime.phase === "ended" || receipt.meetingId !== state.meetingId || receipt.eventSeq > state.lastSeq
+    || !card || !decision || card.status !== "intervention" || decision.status !== "intervention"
+    || card.formalAi?.source !== "llm_first" || card.formalAi.llmCalled !== true
+    || card.formalAi.jobId !== receipt.jobId || decision.jobId !== receipt.jobId
+    || card.decisionId !== receipt.decisionId || decision.decisionId !== receipt.decisionId
+    || !card.uiRenderReceipt || card.uiRenderReceipt.eventSeq !== receipt.eventSeq
+    || card.uiRenderReceipt.inputVersion !== receipt.inputVersion
+    || !card.sayThis?.trim() || !card.whyNow?.trim()) return false;
+  const valid = (value: typeof card | typeof decision) => value.lifecycleAction !== "retract"
+    && value.lifecycleAction !== "deprioritize" && !value.lifecycleStatus && !value.supersededBy
+    && typeof value.validUntil === "number" && value.validUntil > Date.now();
+  return valid(card) && valid(decision) && (!card.topicId || !decision.topicId || card.topicId === decision.topicId)
+    && (card.analysisBasisRevision === undefined || decision.analysisBasisRevision === undefined
+      || card.analysisBasisRevision === decision.analysisBasisRevision);
+}
+
+function receiptHasVisibleUiTarget(receipt: CoachUiRenderReceipt, recommendation: string): boolean {
+  return Array.from(document.querySelectorAll<HTMLElement>("[data-ui-render-card='coach']")).some((node) => {
+    if (node.dataset.uiRenderMeetingId !== receipt.meetingId || node.dataset.uiRenderJobId !== receipt.jobId
+      || node.dataset.uiRenderDecisionId !== receipt.decisionId || node.dataset.uiRenderEventSeq !== String(receipt.eventSeq)
+      || node.dataset.uiRenderInputVersion !== String(receipt.inputVersion)) return false;
+    const body = node.querySelector<HTMLElement>("[data-ui-render-body='coach-recommendation']");
+    if (!body || body.textContent !== recommendation || !recommendation.trim()) return false;
+    for (let ancestor: HTMLElement | null = body; ancestor; ancestor = ancestor.parentElement) {
+      if (ancestor.hidden || ancestor.getAttribute("aria-hidden") === "true") return false;
+      const style = window.getComputedStyle(ancestor);
+      if (style.display === "none" || style.visibility === "hidden") return false;
+    }
+    return true;
   });
 }

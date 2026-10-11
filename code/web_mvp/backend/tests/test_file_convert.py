@@ -444,6 +444,9 @@ def test_transcribe_file_session_unavailable_when_funasr_missing(monkeypatch):
 
 
 def test_batch_transcribe_file_report_runs_offline_batch_cli(monkeypatch, tmp_path):
+    # Preserve the legacy non-Windows CLI/environment contract independently
+    # of the Windows resource-gated Popen tests.
+    monkeypatch.setattr(batch_transcribe, "_windows_resource_guard_enabled", lambda: False)
     audio = tmp_path / "meeting.wav"
     audio.write_bytes(b"fake")
     manifest_path, manifest = _file_asr_bundle(tmp_path, include_models=True)
@@ -471,7 +474,9 @@ def test_batch_transcribe_file_report_runs_offline_batch_cli(monkeypatch, tmp_pa
     monkeypatch.setenv("PYTHONHOME", "/backend/python")
     monkeypatch.setenv("PYTHONPATH", "/backend/site-packages")
 
-    def fake_run(cmd, capture_output, text, timeout, env):
+    def fake_run(cmd, capture_output, text, timeout, env, encoding, errors):
+        assert encoding == "utf-8" and errors == "replace"
+        assert env["PYTHONIOENCODING"] == "utf-8"
         calls.append(cmd)
         child_environments.append(env)
         return subprocess.CompletedProcess(
@@ -707,3 +712,42 @@ def test_batch_runtime_rejects_user_model_cache_paths(tmp_path):
         capability["components"][name]["reason"] == "development_or_user_cache_path_forbidden"
         for name in capability["invalid_components"]
     )
+
+
+def test_explicit_source_profile_allows_only_repository_runtime_paths(monkeypatch, tmp_path):
+    monkeypatch.setattr(batch_transcribe, "_SOURCE_ROOT", tmp_path)
+    python = tmp_path / "code/asr_runtime/.venv-funasr/Scripts/python.exe"
+    converter = tmp_path / "code/web_mvp/backend/.venv/Lib/site-packages/imageio_ffmpeg/ffmpeg.exe"
+    env = {"MEETING_COPILOT_SOURCE_RUNTIME": "1"}
+    for name, path in (("funasr_python", python), ("converter", converter)):
+        assert batch_transcribe._source_runtime_path_allowed(path, env, name)
+        assert not batch_transcribe._source_runtime_path_allowed(path, {}, name)
+        assert not batch_transcribe._source_runtime_path_allowed(
+            path, env | {"MEETING_COPILOT_RUNTIME_MANIFEST": "installed.json"}, name,
+        )
+    assert not batch_transcribe._source_runtime_path_allowed(
+        tmp_path / "other/.venv/Scripts/python.exe", env, "funasr_python",
+    )
+    assert not batch_transcribe._source_runtime_path_allowed(
+        tmp_path / ".cache/modelscope/model", env, "offline_model",
+    )
+    resolved = batch_transcribe._resolve_runtime_components(env | {
+        "MEETING_COPILOT_BATCH_FUNASR_PYTHON": str(python),
+        "MEETING_COPILOT_FFMPEG": str(converter),
+    })
+    assert resolved["components"]["funasr_python"]["configuration_errors"] == []
+    assert resolved["components"]["converter"]["configuration_errors"] == []
+
+
+def test_explicit_source_profile_uses_repository_imageio_converter(monkeypatch, tmp_path):
+    import imageio_ffmpeg
+
+    converter = tmp_path / "code/web_mvp/backend/.venv/Lib/site-packages/imageio_ffmpeg/ffmpeg.exe"
+    converter.parent.mkdir(parents=True)
+    converter.touch()
+    monkeypatch.setattr(batch_transcribe, "_SOURCE_ROOT", tmp_path)
+    monkeypatch.setenv("MEETING_COPILOT_SOURCE_RUNTIME", "1")
+    monkeypatch.delenv("MEETING_COPILOT_RUNTIME_MANIFEST", raising=False)
+    monkeypatch.setattr(batch_transcribe, "_ffmpeg_path", None)
+    monkeypatch.setattr(imageio_ffmpeg, "get_ffmpeg_exe", lambda: str(converter))
+    assert batch_transcribe._get_ffmpeg(packaged_mode=False) == str(converter)

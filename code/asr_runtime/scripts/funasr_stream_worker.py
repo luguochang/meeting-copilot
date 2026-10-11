@@ -662,6 +662,8 @@ def _emit_utterance_boundary_complete(
     drain_ms: float | None = None,
     skipped_preview_bytes: int = 0,
     skipped_silence_bytes: int = 0,
+    inference_calls: int | None = None,
+    inference_max_ms: float | None = None,
 ) -> None:
     payload = {
         "event_type": "utterance_boundary_complete",
@@ -677,6 +679,10 @@ def _emit_utterance_boundary_complete(
         payload["skipped_preview_bytes"] = skipped_preview_bytes
     if skipped_silence_bytes:
         payload["skipped_silence_bytes"] = skipped_silence_bytes
+    if inference_calls is not None:
+        payload["inference_calls"] = inference_calls
+    if inference_max_ms is not None:
+        payload["inference_max_ms"] = inference_max_ms
     _write_event(payload)
 
 
@@ -1069,21 +1075,26 @@ def _run_resident_mode(
                     continue
                 completed_utterance_index = state.utterance_index
                 started_at = time.monotonic()
-                skipped_silence_bytes = _process_resident_audio(
-                    model=model,
-                    np_module=np_module,
-                    args=args,
-                    hotwords=list(state.hotwords),
-                    state=state,
-                    flush=True,
+                # Ordinary VAD boundaries invalidate the unfinished preview
+                # tail. A preview is replaceable; the host owns every raw PCM
+                # frame and performs its independent authoritative refinement.
+                # Running another is_final model call here delays the causal
+                # reset/ACK without producing a product final. END below keeps
+                # its existing terminal snapshot behavior. Any in-flight model
+                # call has already completed on this single consumer thread.
+                skipped_tail_bytes = len(state.audio_buffer)
+                skipped_silence_bytes = (
+                    skipped_tail_bytes
+                    if not _pcm_contains_preview_speech(np_module=np_module, pcm_bytes=bytes(state.audio_buffer))
+                    else 0
                 )
                 state.completed_boundaries[boundary_id] = completed_utterance_index
                 if len(state.completed_boundaries) > 128:
                     oldest_boundary_id = next(iter(state.completed_boundaries))
                     state.completed_boundaries.pop(oldest_boundary_id, None)
                 _reset_resident_utterance(state)
-                # `_generate_chunk` writes any residual partial synchronously.
-                # The ACK proves that older preview bytes were either processed
+                # Previously completed partials precede this ACK. It proves
+                # that older preview bytes were either processed
                 # or explicitly invalidated and that the next command sees a
                 # fresh cache.
                 _emit_utterance_boundary_complete(
@@ -1092,8 +1103,10 @@ def _run_resident_mode(
                     utterance_index=completed_utterance_index,
                     duplicate=False,
                     drain_ms=round((time.monotonic() - started_at) * 1_000, 2),
-                    skipped_preview_bytes=buffered.skipped_preview_bytes,
+                    skipped_preview_bytes=buffered.skipped_preview_bytes + skipped_tail_bytes,
                     skipped_silence_bytes=skipped_silence_bytes,
+                    inference_calls=state.inference_calls,
+                    inference_max_ms=round(state.inference_max_s * 1_000, 2),
                 )
                 continue
             if command.command == "end_session":

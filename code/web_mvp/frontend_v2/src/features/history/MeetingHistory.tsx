@@ -159,13 +159,13 @@ function meetingStatus(
     return { text: "会议未结束 · 可恢复", filter: "live" };
   }
   const failed = failedReviewNames(meeting);
-  if (failed.length) return { text: `文字和录音已保留 · ${failed.join("、")}失败`, filter: "failed" };
+  if (failed.length) return { text: `会议记录已保留 · ${failed.join("、")}失败`, filter: "failed" };
   const reviewWorking = Object.values(meeting.reviewJobs ?? {}).some((job) =>
     job && ["pending", "running", "retry_wait"].includes(job.status),
   );
   if (reviewWorking) return { text: "会后整理中", filter: "processing" };
   if (meeting.hasMinutes) return { text: "复盘已就绪", filter: "ready" };
-  return { text: "文字和录音已保存", filter: "ready" };
+  return { text: meeting.audioStatus === "saved" ? "文字和录音已保存" : "会议记录已保存", filter: "ready" };
 }
 
 export function MeetingHistory({ api, onOpenMeeting, activeMeetingId = null }: MeetingHistoryProps) {
@@ -452,7 +452,7 @@ export function MeetingHistory({ api, onOpenMeeting, activeMeetingId = null }: M
         </article>
         <article>
           <span className="history-overview-icon history-overview-icon--ready"><CircleCheck size={20} /></span>
-          <div><span>已完成</span><strong>{historyStats.ready}</strong><small>复盘就绪</small></div>
+          <div><span>已完成</span><strong>{historyStats.ready}</strong><small>可回看</small></div>
         </article>
         <article>
           <span className="history-overview-icon history-overview-icon--segments"><FileText size={20} /></span>

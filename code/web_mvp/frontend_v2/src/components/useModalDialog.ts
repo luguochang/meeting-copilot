@@ -37,6 +37,9 @@ export function useModalDialog(
     });
 
     const onKeyDown = (event: KeyboardEvent) => {
+      // A nested attachment drawer owns keyboard navigation until it closes.
+      const modalDialogs = [...document.querySelectorAll<HTMLElement>('[role="dialog"][aria-modal="true"]')];
+      if (modalDialogs.length && modalDialogs[modalDialogs.length - 1] !== dialog) return;
       if (event.key === "Escape" && !closeDisabledRef.current) {
         event.preventDefault();
         onCloseRef.current();

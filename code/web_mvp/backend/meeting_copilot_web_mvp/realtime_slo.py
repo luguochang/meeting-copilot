@@ -40,6 +40,19 @@ METRIC_STAGE_PAIRS = {
     "event_to_ui_ms": ("event_emitted", "ui_rendered"),
 }
 
+# Additive observations have independent definitions and no implicit SLO gate.
+# Pi evaluation boundaries are never substituted for Provider connection time.
+ADDITIONAL_METRIC_STAGE_PAIRS = {
+    "trigger_to_first_token_ms": ("job_queued", "first_token"),
+    "trigger_to_decision_ms": ("job_queued", "evaluation_completed"),
+    "trigger_to_event_emitted_ms": ("job_queued", "event_emitted"),
+    "trigger_to_ui_ms": ("job_queued", "ui_rendered"),
+    "evaluation_ttft_ms": ("evaluation_started", "first_token"),
+    "evaluation_total_ms": ("evaluation_started", "evaluation_completed"),
+    "request_ttft_ms": ("provider_attempt_started", "first_token"),
+}
+ALL_METRIC_STAGE_PAIRS = {**METRIC_STAGE_PAIRS, **ADDITIONAL_METRIC_STAGE_PAIRS}
+
 # P95 targets follow the accepted product latency windows. Component targets
 # make a failed end-to-end verdict diagnosable without redefining the product SLO.
 DEFAULT_REALTIME_SLO_THRESHOLDS_MS: dict[str, dict[str, float]] = {
@@ -489,6 +502,14 @@ def _normalized_execution(
             "invalid_reasons": [
                 _bounded_token(reason, "timing invalid reason") for reason in raw_reasons
             ],
+            "attempt_started_monotonic_ns": _optional_non_negative_int(
+                raw_timing.get("attempt_started_monotonic_ns"), "Provider attempt start",
+            ),
+            "evaluation": {
+                name: _non_negative_int(value, f"{name} timestamp")
+                for name, value in (raw_timing.get("evaluation") or {}).items()
+                if name in {"evaluation_started", "first_token", "evaluation_completed"}
+            } if isinstance(raw_timing.get("evaluation"), Mapping) else {},
         }
 
     # Old snapshots predate execution outcomes. A cancellation flag does not
@@ -638,7 +659,7 @@ class _LaneAccumulator:
             for stage in REQUIRED_PROVENANCE_STAGES
         }
         self.uncategorized_failure_count = 0
-        self.metrics = {metric: _MetricAccumulator(max_samples) for metric in METRIC_STAGE_PAIRS}
+        self.metrics = {metric: _MetricAccumulator(max_samples) for metric in ALL_METRIC_STAGE_PAIRS}
 
     def add_trace(self, trace: Mapping[str, Any]) -> None:
         stages = trace["stages"]
@@ -702,10 +723,22 @@ class _LaneAccumulator:
             if cancellation.get("remote_ack_unavailable") is True:
                 self.remote_abort_ack_unavailable_count += 1
 
-        for metric, (start_stage, end_stage) in METRIC_STAGE_PAIRS.items():
-            if start_stage not in stages or end_stage not in stages:
+        boundaries = dict(stages)
+        if isinstance(timing_contract, Mapping):
+            boundaries.update(timing_contract.get("evaluation") or {})
+            attempt_start = timing_contract.get("attempt_started_monotonic_ns")
+            if attempt_start is not None:
+                boundaries["provider_attempt_started"] = attempt_start
+        for metric, (start_stage, end_stage) in ALL_METRIC_STAGE_PAIRS.items():
+            if metric.startswith("final_to_") and trace["lane"] == "pi_deep":
                 continue
-            duration_ns = stages[end_stage] - stages[start_stage]
+            if metric.startswith("trigger_to_") and trace["lane"] != "pi_deep":
+                continue
+            if metric == "trigger_to_decision_ms" and (not terminal or terminal.get("result_outcome") != "success"):
+                continue
+            if start_stage not in boundaries or end_stage not in boundaries:
+                continue
+            duration_ns = boundaries[end_stage] - boundaries[start_stage]
             if duration_ns < 0:
                 raise ValueError(f"{end_stage} timestamp precedes {start_stage}")
             self.metrics[metric].add(_milliseconds(duration_ns))
@@ -865,7 +898,7 @@ class _LaneAccumulator:
         }
         lane.metrics = {
             metric: _MetricAccumulator.from_state(metrics.get(metric, {}), max_samples=max_samples)
-            for metric in METRIC_STAGE_PAIRS
+            for metric in ALL_METRIC_STAGE_PAIRS
         }
         lane.job_outcome_counts = {
             outcome: _non_negative_int(raw_job_outcomes.get(outcome, 0), f"job {outcome} count")
@@ -1057,7 +1090,6 @@ def _lane_verdict(
     if (
         failed_result_count
         or failed_attempt_count
-        or provider_attempt_incomplete_count
         or invalid_timing_count
         or uncategorized_failure_count
         or (
@@ -1069,7 +1101,12 @@ def _lane_verdict(
         availability_status = "fail"
     elif job_terminal_count == 0 and provider_attempt_count == 0:
         availability_status = "no_data"
-    elif partial_timing_count:
+    elif (
+        partial_timing_count
+        or timing_contract_counts.get("missing", 0) and provider_attempt_count > 0
+        or provider_attempt_incomplete_count
+        or required_provenance_incomplete_count > 0
+    ):
         availability_status = "insufficient_data"
     else:
         availability_status = "pass"
@@ -1119,6 +1156,14 @@ def _report_from_accumulator(
     lane_statuses: dict[str, str] = {}
     for lane_name, lane in lanes.items():
         metrics = {metric: metric_accumulator.summary() for metric, metric_accumulator in lane.metrics.items()}
+        for metric, summary in metrics.items():
+            not_applicable = (
+                lane_name == "pi_deep" and metric.startswith("final_to_")
+                or lane_name != "pi_deep" and metric.startswith("trigger_to_")
+                or metric in {"event_to_ui_ms", "trigger_to_ui_ms"} and lane.count > 0
+                and lane.provenance_stage_counts["ui_render_ack"]["not_required"] == lane.count
+            )
+            summary["measurement_status"] = "not_applicable" if not_applicable else "observed" if summary["count"] else "unknown"
         verdict = _lane_verdict(
             lane_name,
             metrics,
@@ -1150,6 +1195,10 @@ def _report_from_accumulator(
         lane_statuses[lane_name] = verdict["status"]
         lane_reports[lane_name] = {
             "count": lane.count,
+            "metric_definitions": {
+                metric: {"start": start, "end": end, "clock": "monotonic_ns"}
+                for metric, (start, end) in ALL_METRIC_STAGE_PAIRS.items()
+            },
             "percentile_sample_limit": lane.max_samples,
             "missing_trace_count": lane.missing_trace_count,
             "missing_stage_counts": dict(lane.missing_stage_counts),

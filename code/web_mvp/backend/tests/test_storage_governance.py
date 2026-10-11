@@ -18,6 +18,7 @@ from meeting_copilot_web_mvp.storage_governance import (
     PRODUCT_SOFT_LIMIT_BYTES,
     RESERVED_FREE_BYTES,
     ManagedLogRotator,
+    ManagedStorageScan,
     UnsafeManagedPathError,
     estimate_pcm16_storage_bytes,
     harden_managed_storage_permissions,
@@ -166,12 +167,21 @@ def test_preflight_blocks_when_two_gib_reserve_would_be_consumed(tmp_path):
     assert "2 GiB" in result.user_message
 
 
-def test_preflight_blocks_at_twenty_percent_quota_before_ten_gib(tmp_path):
+def test_preflight_blocks_at_twenty_percent_quota_before_ten_gib(tmp_path, monkeypatch):
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     existing = 2 * GIB - 100
-    with (data_dir / "managed.bin").open("wb") as managed_file:
-        managed_file.truncate(existing)
+    (data_dir / "managed.bin").write_bytes(b"managed")
+    scan = scan_managed_storage(data_dir)
+    # Simulate quota-sized usage without allocating GiB of test data on Windows.
+    monkeypatch.setattr(
+        "meeting_copilot_web_mvp.storage_governance.scan_managed_storage",
+        lambda _path: ManagedStorageScan(
+            total_bytes=existing,
+            file_count=scan.file_count,
+            directory_count=scan.directory_count,
+        ),
+    )
 
     result = preflight_meeting_storage(
         data_dir=data_dir,
@@ -181,6 +191,9 @@ def test_preflight_blocks_at_twenty_percent_quota_before_ten_gib(tmp_path):
     )
 
     assert result.product_quota_bytes == 2 * GIB
+    assert result.managed_usage_bytes == existing
+    assert result.projected_managed_usage_bytes == existing + 32_000
+    assert result.product_quota_remaining_bytes == 100
     assert result.allowed is False
     assert result.reason_code == "product_quota_exceeded"
     assert "20%" in result.user_message

@@ -7,6 +7,7 @@ Callers remain responsible for prompt construction and result validation.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import inspect
 import json
@@ -21,6 +22,8 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
+from meeting_copilot_web_mvp.provider_transport import provider_httpx_options
+
 from meeting_copilot_web_mvp.openai_protocol import (
     chat_body_to_responses,
     responses_finish_reason,
@@ -32,6 +35,7 @@ from meeting_copilot_web_mvp.openai_protocol import (
 class TransportMode(str, Enum):
     STREAMING = "streaming"
     NON_STREAMING_FALLBACK = "non_streaming_fallback"
+    NON_STREAMING = "non_streaming"
 
 
 class ProviderErrorCategory(str, Enum):
@@ -102,6 +106,32 @@ class ProviderTimings:
 
 
 @dataclass(frozen=True)
+class NonStreamingProviderTimings:
+    """Full-body JSON transport does not observe connection or first-token time."""
+
+    started_at: float
+    completed_at: float
+    connected_at: None = None
+    first_token_at: None = None
+
+    @property
+    def time_to_connect_seconds(self) -> None:
+        return None
+
+    @property
+    def time_to_first_token_seconds(self) -> None:
+        return None
+
+    @property
+    def generation_seconds(self) -> None:
+        return None
+
+    @property
+    def total_seconds(self) -> float:
+        return self.completed_at - self.started_at
+
+
+@dataclass(frozen=True)
 class CompletionDelta:
     text: str
     sequence: int
@@ -113,7 +143,7 @@ class CompletionDelta:
 class ChatCompletionResult:
     content: str
     transport_mode: TransportMode
-    timings: ProviderTimings
+    timings: ProviderTimings | NonStreamingProviderTimings
     usage: TokenUsage | None
     response_id: str | None
     model: str | None
@@ -194,7 +224,7 @@ class OpenAICompatibleStreamingProvider:
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(
             timeout=self._timeout_seconds,
-            trust_env=False,
+            **provider_httpx_options(),
         )
 
     async def aclose(self) -> None:
@@ -208,6 +238,22 @@ class OpenAICompatibleStreamingProvider:
         await self.aclose()
 
     async def complete(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        on_delta: DeltaCallback | None = None,
+        idempotency_key: str | None = None,
+        **parameters: Any,
+    ) -> ChatCompletionResult:
+        try:
+            async with asyncio.timeout(self._timeout_seconds):
+                return await self._complete_with_transport_timeout(messages, on_delta=on_delta,
+                                                                   idempotency_key=idempotency_key, **parameters)
+        except TimeoutError as exc:
+            raise StreamingProviderError(ProviderErrorCategory.TIMEOUT, retryable=True,
+                                         detail="provider completion exceeded total deadline") from exc
+
+    async def _complete_with_transport_timeout(
         self,
         messages: Sequence[Mapping[str, Any]],
         *,

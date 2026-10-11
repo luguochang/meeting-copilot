@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import hmac
 import json
+import math
 import os
 import signal
 import socket
@@ -37,10 +38,12 @@ HEALTH_SERVICE = "meeting-copilot-web-mvp"
 MAX_JSON_PROBE_BYTES = 64 * 1024
 MAX_WORKBENCH_PROBE_BYTES = 2 * 1024 * 1024
 MAX_IDENTITY_RECORD_BYTES = 16 * 1024
+PI_COACH_SOURCE_ROOT = REPO_ROOT / "code" / "agent_runtime" / "pi_coach_bridge" / "src"
 RUNTIME_SOURCE_ROOTS = (
     ("backend", WEB_BACKEND_ROOT / "meeting_copilot_web_mvp", frozenset({".py"})),
     ("core", CORE_ROOT / "meeting_copilot_core", frozenset({".py"})),
     ("frontend", FRONTEND_V2_DIST_ROOT, None),
+    ("pi", PI_COACH_SOURCE_ROOT, frozenset({".mjs"})),
 )
 SECRET_PROVIDER_ENV_KEYS = {
     "LLM_GATEWAY_BASE_URL",
@@ -177,6 +180,26 @@ def build_child_env(
     realtime_coach_cutoff_ms: int | None = None,
 ) -> dict[str, str]:
     env = dict(os.environ)
+    # Installed development ASR assets may live outside the historic staging
+    # cache. Read only these non-secret local runtime defaults before capability
+    # discovery; an explicit shell/deployment value always wins.
+    local_runtime_keys = {
+        "MEETING_COPILOT_REALTIME_REFINER_PYTHON", "MEETING_COPILOT_REALTIME_REFINER_WORKER",
+        "MEETING_COPILOT_REALTIME_REFINER_MODEL", "MEETING_COPILOT_REALTIME_REFINER_VAD_MODEL",
+        "MEETING_COPILOT_REALTIME_REFINER_PUNC_MODEL", "MEETING_COPILOT_BATCH_FUNASR_PYTHON",
+        "MEETING_COPILOT_FILE_ASR_MODEL_DIR", "MEETING_COPILOT_FILE_ASR_VAD_MODEL_DIR",
+        "MEETING_COPILOT_FILE_ASR_PUNC_MODEL_DIR",
+        "MEETING_COPILOT_BATCH_TRANSCRIBE_WORKER", "MEETING_COPILOT_SOURCE_RUNTIME",
+        "MEETING_COPILOT_FFMPEG",
+    }
+    try:
+        from dotenv import dotenv_values
+        path_defaults = dotenv_values(REPO_ROOT / ".env")
+    except ImportError:
+        path_defaults = {}
+    for key in local_runtime_keys:
+        if path_defaults.get(key):
+            env.setdefault(key, str(path_defaults[key]))
     if provider_mode == "safe":
         for key in SECRET_PROVIDER_ENV_KEYS:
             env.pop(key, None)
@@ -842,6 +865,19 @@ def status_report(*, port: int, pid_file: Path) -> dict[str, Any]:
     }
 
 
+def startup_health_timeout_seconds(env: dict[str, str]) -> float:
+    """Give explicit guarded cold prewarm its budget before supervising health."""
+    if env.get("MEETING_COPILOT_REALTIME_REFINER_POLICY") != "prewarm":
+        return float(STARTUP_HEALTH_TIMEOUT_SECONDS)
+    try:
+        prewarm = float(env.get("MEETING_COPILOT_REALTIME_REFINER_PREWARM_TIMEOUT_SECONDS", "60"))
+    except (TypeError, ValueError):
+        prewarm = 60.0
+    if not math.isfinite(prewarm) or prewarm <= 0:
+        prewarm = 60.0
+    return min(240.0, max(float(STARTUP_HEALTH_TIMEOUT_SECONDS), prewarm + 30.0))
+
+
 def start_server(
     *,
     port: int,
@@ -911,7 +947,8 @@ def start_server(
             "safe_to_force_kill": False,
         }
 
-    deadline = time.time() + STARTUP_HEALTH_TIMEOUT_SECONDS
+    startup_budget = startup_health_timeout_seconds(env)
+    deadline = time.time() + startup_budget
     health = {"ok": False, "error": "not checked"}
     while time.time() < deadline:
         health = _bind_health_to_managed_runtime(
@@ -933,6 +970,7 @@ def start_server(
             "port": port,
             "pid": process.pid,
             "returncode": process.poll(),
+            "startup_health_budget_seconds": startup_budget,
             "health": health,
             "owned_process_cleanup": (
                 "complete" if cleanup_complete else "blocked_process_still_running"
@@ -953,6 +991,7 @@ def start_server(
         "pid_file": str(pid_file),
         "provider_mode": provider_mode,
         "realtime_refiner_policy": env.get("MEETING_COPILOT_REALTIME_REFINER_POLICY"),
+        "startup_health_budget_seconds": startup_budget,
     }
 
 

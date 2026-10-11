@@ -103,6 +103,7 @@ def quality_environment(model_root: Path, data_dir: Path) -> dict[str, str]:
     scripts = ASR_ROOT / "scripts"
     env.update({
         "MEETING_COPILOT_DATA_DIR": str(data_dir),
+        "MEETING_COPILOT_SOURCE_RUNTIME": "1",
         "MEETING_COPILOT_FUNASR_PYTHON": runtime,
         "MEETING_COPILOT_FUNASR_WORKER": str(scripts / "funasr_stream_worker.py"),
         "MEETING_COPILOT_FUNASR_ENGINE": "pytorch",
@@ -162,7 +163,10 @@ def doctor(model_root: Path, data_dir: Path) -> dict:
     ]
     for name, command in commands:
         try:
-            result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=90)
+            result = subprocess.run(
+                command, env=env, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=90,
+            )
             # Never dump inherited configuration or provider secrets in diagnostics.
             check(name, result.returncode == 0, "ok" if result.returncode == 0 else f"exit={result.returncode}; check installation")
         except (OSError, subprocess.TimeoutExpired) as exc:

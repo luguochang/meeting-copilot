@@ -1,0 +1,143 @@
+{
+  "schema": "talktrace.synthetic_participation_value.v1",
+  "scope": "合成文字与材料；不调用麦克风、外放或ASR。semantic是已有topic_update/state_changes的确定性夹具，不能据此宣称语义模型已理解连续会议。",
+  "runner_contract": {
+    "preparation": null,
+    "fast_answer_required": false,
+    "automatic_default": false,
+    "projection": "按turn顺序commit_final_and_enqueue，claim并apply对应intelligence响应后complete；再按coach_request通过HTTP请求实际Pi。所有来源必须属于该场独立会议。",
+    "model_budget": "每个标记coach_request最多一次主动请求；失败不得静默重试或换模型，保留失败。四场共5次主动请求，切题场前后各一次；种子delta/纠正等后台任务另计，不能隐去或把五次主动请求当系统总调用。",
+    "evaluation": "人工评分和硬性失败都记录；succeeded、token数、终端通过均不等于有用户价值。",
+    "timing": "从请求接收到正式完整句发布/DOM可见分别计时；4场不能估计P95或代替真实声音与整场验收。"
+  },
+  "cases": [
+    {
+      "id": "requirement_business_boundary",
+      "title": "需求评审：识别业务成功与附属动作边界",
+      "materials": [],
+      "turns": [
+        {
+          "segment_id": "value-requirement-1",
+          "text": "我们评审付款后的权益发放。用户付钱后要立即看见权益，短信通知可以稍后送达。当前候选是把发权益和短信放在同一个同步流程，任何一步失败就整体重试。业务真正想减少的是用户付钱后以为没有买成功的投诉。",
+          "semantic": {
+            "topic_update": {"operation": "add", "title": "付款后的权益与通知边界", "summary": "讨论付款成功后的用户可见结果与通知失败边界"},
+            "state_changes": [
+              {"type": "decision", "operation": "add", "item_id": "value-req-solution", "content": "把发权益和短信放在同一个同步流程，任何一步失败就整体重试", "status": "candidate", "evidence_segment_ids": ["value-requirement-1"], "evidence_quote": "同一个同步流程，任何一步失败就整体重试", "confidence": 0.9}
+            ]
+          },
+          "coach_request": {"intent": "ask_question"},
+          "snapshot_checks": {"current_solution_contains": "候选方案", "current_problem_contains": "权益与通知"}
+        }
+      ],
+      "expected": {
+        "terminal": "useful_contribution",
+        "worth_saying": "围绕付款后权益可见的业务成功标准，指出短信失败与权益失败用户影响不同，提出值得当场澄清的边界；可以询问是否让通知失败改变已生效权益。",
+        "accepted_directions": ["业务成功标准与通知送达分开", "只重试失败步骤，避免已完成权益被重复执行", "讨论付款状态、权益状态与通知状态对用户的可见性"],
+        "fail_if": ["只总结原话或问负责人/期限", "把未确认的通知异步化说成已采用的项目事实", "机械建议上消息队列或微服务而不解释当前业务影响", "凭空给并发规模、成功率或时限"],
+        "evidence_required": ["至少一条事实逐字来自value-requirement-1", "analysis_kind=participation，proposal_type=professional_proposal", "与冻结topic_id/basis一致"]
+      }
+    },
+    {
+      "id": "architecture_tradeoff_with_material",
+      "title": "方案取舍：小规模复用与第三方超时语义",
+      "materials": [
+        {"filename": "第三方通知接口约束.md", "title": "第三方通知接口约束", "purpose": "核对重试与超时边界", "text": "# 调用结果\n接口响应超时不代表通知未送达。调用方可以凭请求号查询通知结果。\n\n# 重复请求\n接口不会替调用方去重。调用方应保持业务请求号稳定，避免同一业务产生多次通知。\n\n# 本场设计约束\n本轮订单规模较小，尽量复用现有服务，不建设新的平台。未来是否增加其他权益类型尚未决定。\n"}
+      ],
+      "turns": [
+        {
+          "segment_id": "value-tradeoff-1",
+          "text": "我们比较支付回调后的权益与通知方案。规模暂时不大，现有服务和订单表都可以改。候选是拆开权益发放和通知重试，在现有服务里用订单处理状态推进。遇到通知超时就直接再发一次。未来是否增加其他权益还没确定。",
+          "semantic": {
+            "topic_update": {"operation": "add", "title": "支付回调后的重试方案取舍", "summary": "讨论复用现有服务与第三方通知的不确定结果"},
+            "state_changes": [
+              {"type": "decision", "operation": "add", "item_id": "value-tradeoff-solution", "content": "在现有服务里用订单处理状态推进，拆开权益发放和通知重试", "status": "candidate", "evidence_segment_ids": ["value-tradeoff-1"], "evidence_quote": "在现有服务里用订单处理状态推进", "confidence": 0.9},
+              {"type": "open_question", "operation": "add", "item_id": "value-tradeoff-timeout", "content": "通知超时后是否应该直接重复发送", "evidence_segment_ids": ["value-tradeoff-1"], "evidence_quote": "遇到通知超时就直接再发一次", "confidence": 0.9}
+            ]
+          },
+          "coach_request": {"intent": "compare_options"},
+          "snapshot_checks": {"current_solution_contains": "现有服务"}
+        }
+      ],
+      "expected": {
+        "terminal": "useful_contribution",
+        "worth_saying": "用文件中超时不等于失败、可以按请求号查询的条款，实质改变盲目重发的判断；比较稳定请求号/查询/恢复状态的取舍，并遵守规模小与复用现有服务的约束。",
+        "accepted_directions": ["超时先标记待确认并按稳定请求号查询，再决定是否重试", "建议在现有服务内持久记录业务处理状态而不过早建设新平台", "说明新增状态和查询路径的维护成本，避免把未来需求当已确定"],
+        "fail_if": ["无条件超时就重发", "只有文件名或引用但建议未因条款改变", "声称第三方已有去重能力", "必须上队列/微服务/新平台", "仅说保持幂等而未解释超时结果未知及恢复路径"],
+        "evidence_required": ["至少一条真实启用附件的逐字事实和typed source_ref", "至少一条value-tradeoff-1的本场原文依据", "不得自称读过整个文件或对外部实时版本做已查证声明"]
+      }
+    },
+    {
+      "id": "answered_point_progression",
+      "title": "已回应推进：重试已实现，转向重复处理边界",
+      "materials": [],
+      "turns": [
+        {
+          "segment_id": "value-response-1",
+          "text": "我们讨论付款回调失败后的处理，想确认系统是否已经支持失败重试。当前候选是权益发放先于通知，通知失败不阻断权益。",
+          "semantic": {
+            "topic_update": {"operation": "add", "title": "付款回调的重试与重复处理", "summary": "讨论重试现状和权益重复执行的边界"},
+            "state_changes": [
+              {"type": "decision", "operation": "add", "item_id": "value-response-solution", "content": "权益发放先于通知，通知失败不阻断权益", "status": "candidate", "evidence_segment_ids": ["value-response-1"], "evidence_quote": "权益发放先于通知，通知失败不阻断权益", "confidence": 0.9},
+              {"type": "open_question", "operation": "add", "item_id": "value-response-retry", "content": "系统是否已经支持失败重试", "evidence_segment_ids": ["value-response-1"], "evidence_quote": "系统是否已经支持失败重试", "confidence": 0.9}
+            ]
+          }
+        },
+        {
+          "segment_id": "value-response-2",
+          "text": "失败重试已经实现了，这个问题不用再确认。现在没定的是同一个订单被重放回调时如何避免重复发权益；不能因为重试把用户的权益多发几次。通知失败不阻断权益这个边界继续保留。",
+          "semantic": {
+            "topic_update": null,
+            "state_changes": [
+              {"type": "open_question", "operation": "resolve", "item_id": "value-response-retry", "content": "失败重试已经实现了", "evidence_segment_ids": ["value-response-2"], "evidence_quote": "失败重试已经实现了", "confidence": 0.9},
+              {"type": "open_question", "operation": "add", "item_id": "value-response-repeat", "content": "同一订单回调重放时如何避免重复发权益", "evidence_segment_ids": ["value-response-2"], "evidence_quote": "同一个订单被重放回调时如何避免重复发权益", "confidence": 0.9}
+            ]
+          },
+          "coach_request": {"intent": "formulate_response"},
+          "snapshot_checks": {"current_solution_contains": "权益发放先于通知", "responded_contains": "失败重试已经实现了", "open_excludes": "系统是否已经支持失败重试", "basis_advanced": true, "topic_same_as_previous": true}
+        }
+      ],
+      "expected": {
+        "terminal": "useful_contribution",
+        "worth_saying": "承接已经有重试的回答，把发言推进到订单级重复处理、状态持久化与并发回调边界；可以给出一个条件式方案或一句针对未决边界的回应。",
+        "accepted_directions": ["业务订单号与权益处理状态用于重复调用识别", "讨论重试/并发回调是否原子检查并推进处理状态", "建议把重复发权益边界与通知重试各自验证"],
+        "fail_if": ["再次问是否支持重试", "把已回应的重试问题仍作为当前阻断点", "仅说需要防重而无机制/边界或可用发言", "声称现有系统已支持业务去重或事务保证", "未经转写归属推断谁负责/谁已经承诺"],
+        "evidence_required": ["value-response-retry进入responded_points且离开open_points", "候选方案保留原文来源，尚未宣告采用", "相同topic、basis因回应推进而改变"]
+      }
+    },
+    {
+      "id": "topic_switch_and_silence",
+      "title": "切题沉默：旧支付建议收束，不制造行政通知问题",
+      "materials": [],
+      "turns": [
+        {
+          "segment_id": "value-silence-1",
+          "text": "现在讨论订单退款后的权益撤销。退款完成后要撤销权益，当前候选是退款和撤销分别重试，失败时还有恢复边界没有讲清楚。",
+          "semantic": {
+            "topic_update": {"operation": "add", "title": "退款与权益撤销的恢复边界", "summary": "讨论退款成功而权益撤销失败的处理"},
+            "state_changes": [
+              {"type": "decision", "operation": "add", "item_id": "value-silence-old-plan", "content": "退款和权益撤销分别重试", "status": "candidate", "evidence_segment_ids": ["value-silence-1"], "evidence_quote": "退款和撤销分别重试", "confidence": 0.9}
+            ]
+          },
+          "coach_request": {"intent": "compare_options"}
+        },
+        {
+          "segment_id": "value-silence-2",
+          "text": "退款这项到此为止，另开议题。下一项只是通知：本周演示移到下午三点，所有人已确认，安排已更新，不需要技术方案，也没有待办或未决问题。",
+          "semantic": {
+            "topic_update": {"operation": "add", "title": "本周演示时间通知", "summary": "安排已经确认，无需追加方案或行动"},
+            "state_changes": []
+          },
+          "coach_request": {"intent": "freeform"},
+          "snapshot_checks": {"current_problem_contains": "演示时间", "current_solution_empty": true, "topic_changes_from_previous": true, "prior_discussion_superseded": true}
+        }
+      ],
+      "expected": {
+        "terminal": "validated_silence_after_switch",
+        "worth_saying": "新议题没有值得增加的问题时保持沉默；旧退款贡献只能留在历史，不能继续作为当前可说建议。",
+        "accepted_directions": ["keep_silent，理由为安排已确认且没有新增贡献", "旧topic结果撤回或标过时，当前topic不同"],
+        "fail_if": ["退款/撤销旧建议仍顶在当前位", "继续让用户确认演示时间/负责人/提醒所有人", "捏造演示技术风险或新待办", "用timeout/failed/no provider attempt冒充正确沉默", "为了凑贡献而无条件发卡"],
+        "evidence_required": ["实际终端keep_silent且durable decision是protected_silent等正常沉默状态", "旧贡献有supersedes/retract或source binding失效证据", "无需调用录音或真实ASR即可复现；不能据此覆盖真实整场验收"]
+      }
+    }
+  ]
+}

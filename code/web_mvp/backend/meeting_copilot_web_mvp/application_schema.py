@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 import sqlite3
 import time
+from .meeting_materials_schema import MATERIAL_SCHEMA_STATEMENTS
 
 from .sqlite_schema import (
     MIGRATION_HISTORY_TABLE,
@@ -26,7 +27,7 @@ from .sqlite_schema import (
 )
 
 
-APPLICATION_SCHEMA_VERSION = 12
+APPLICATION_SCHEMA_VERSION = 26
 APPLICATION_MAX_SUPPORTED_SCHEMA_VERSION = APPLICATION_SCHEMA_VERSION
 
 _SHANGHAI_TIMEZONE = timezone(timedelta(hours=8))
@@ -1178,6 +1179,252 @@ APPLICATION_SCHEMA_MIGRATIONS = (
             "ALTER TABLE suggestions ADD COLUMN error_class TEXT",
         ),
     ),
+    sql_migration(
+        13,
+        "bind_answer_context_evidence_versions",
+        (
+            "ALTER TABLE suggestions ADD COLUMN context_evidence_json TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE suggestions ADD COLUMN supersedes_suggestion_id TEXT",
+        ),
+    ),
+    sql_migration(
+        14,
+        "add_local_project_knowledge_library",
+        (
+            "CREATE TABLE knowledge_projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', "
+            "archived_at_ms INTEGER, revision INTEGER NOT NULL DEFAULT 1, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL)",
+            "CREATE TABLE knowledge_folders (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT, name TEXT NOT NULL, "
+            "revision INTEGER NOT NULL DEFAULT 1, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL, "
+            "UNIQUE(id, project_id), FOREIGN KEY(project_id) REFERENCES knowledge_projects(id), "
+            "FOREIGN KEY(parent_id, project_id) REFERENCES knowledge_folders(id, project_id))",
+            "CREATE INDEX idx_knowledge_folders_project ON knowledge_folders(project_id, parent_id, id)",
+            "CREATE TABLE knowledge_documents (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, folder_id TEXT, kind TEXT NOT NULL, "
+            "title TEXT NOT NULL, source_meeting_id TEXT, filename TEXT, content_type TEXT, file_size_bytes INTEGER NOT NULL DEFAULT 0, "
+            "original_sha256 TEXT, original_relative_path TEXT, active_version_id TEXT, "
+            "status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','active','disabled','deleted')), "
+            "import_status TEXT NOT NULL DEFAULT 'pending' CHECK(import_status IN ('pending','extracted','needs_ocr','unavailable','failed')), "
+            "error_code TEXT, revision INTEGER NOT NULL DEFAULT 1, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL, "
+            "FOREIGN KEY(project_id) REFERENCES knowledge_projects(id), "
+            "FOREIGN KEY(folder_id, project_id) REFERENCES knowledge_folders(id, project_id))",
+            "CREATE INDEX idx_knowledge_documents_page ON knowledge_documents(project_id, status, updated_at_ms DESC, id DESC)",
+            "CREATE INDEX idx_knowledge_documents_folder ON knowledge_documents(folder_id, status)",
+            "CREATE TABLE knowledge_versions (id TEXT PRIMARY KEY, document_id TEXT NOT NULL, number INTEGER NOT NULL, "
+            "content TEXT NOT NULL, content_hash TEXT NOT NULL, origin TEXT NOT NULL, confirmed_at_ms INTEGER, "
+            "created_at_ms INTEGER NOT NULL, UNIQUE(document_id, number), FOREIGN KEY(document_id) REFERENCES knowledge_documents(id))",
+            "CREATE TABLE knowledge_spans (id TEXT PRIMARY KEY, version_id TEXT NOT NULL, ordinal INTEGER NOT NULL, "
+            "text TEXT NOT NULL, locator_json TEXT NOT NULL, UNIQUE(version_id, ordinal), "
+            "FOREIGN KEY(version_id) REFERENCES knowledge_versions(id))",
+            "CREATE INDEX idx_knowledge_spans_version ON knowledge_spans(version_id, ordinal)",
+            "CREATE VIRTUAL TABLE knowledge_search USING fts5(document_id UNINDEXED, version_id UNINDEXED, span_id UNINDEXED, "
+            "title_tokens, body_tokens, tokenize='unicode61')",
+            "CREATE TABLE meeting_knowledge_context (meeting_id TEXT PRIMARY KEY, project_id TEXT, folder_id TEXT, "
+            "selection_mode TEXT NOT NULL CHECK(selection_mode IN ('project','documents','none')), "
+            "selected_document_ids_json TEXT NOT NULL DEFAULT '[]', context_revision INTEGER NOT NULL DEFAULT 1, updated_at_ms INTEGER NOT NULL, "
+            "FOREIGN KEY(meeting_id) REFERENCES meetings(id) ON DELETE CASCADE, "
+            "FOREIGN KEY(project_id) REFERENCES knowledge_projects(id), "
+            "FOREIGN KEY(folder_id, project_id) REFERENCES knowledge_folders(id, project_id))",
+        ),
+    ),
+    sql_migration(
+        15,
+        "add_durable_knowledge_jobs",
+        (
+            "CREATE TABLE knowledge_jobs (id TEXT PRIMARY KEY, document_id TEXT NOT NULL, project_id TEXT NOT NULL, "
+            "type TEXT NOT NULL CHECK(type IN ('import','cleanup')), input_revision INTEGER NOT NULL, "
+            "status TEXT NOT NULL CHECK(status IN ('queued','running','succeeded','failed','cancelled')), "
+            "progress TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 0, error_code TEXT, result_version_id TEXT, "
+            "lease_token TEXT, lease_until_ms INTEGER, next_retry_at_ms INTEGER NOT NULL DEFAULT 0, "
+            "created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL, "
+            "FOREIGN KEY(document_id) REFERENCES knowledge_documents(id), FOREIGN KEY(project_id) REFERENCES knowledge_projects(id))",
+            "CREATE INDEX idx_knowledge_jobs_claim ON knowledge_jobs(status,next_retry_at_ms,created_at_ms)",
+            "CREATE INDEX idx_knowledge_jobs_page ON knowledge_jobs(project_id,updated_at_ms DESC,id DESC)",
+            "CREATE UNIQUE INDEX idx_knowledge_jobs_live_document ON knowledge_jobs(document_id,type) WHERE status IN ('queued','running')",
+        ),
+    ),
+    sql_migration(
+        16,
+        "add_confirmed_project_outcomes",
+        (
+            "CREATE TABLE project_state_items (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, type TEXT NOT NULL "
+            "CHECK(type IN ('decision','task','question')), text TEXT NOT NULL, status TEXT NOT NULL "
+            "CHECK(status IN ('active','done','cancelled','unknown','superseded','discarded','needs_review')), "
+            "owner TEXT, due TEXT, source_meeting_id TEXT, source_refs_json TEXT NOT NULL DEFAULT '[]', "
+            "origin TEXT NOT NULL CHECK(origin IN ('user','confirmed_proposal')), supersedes_id TEXT, "
+            "revision INTEGER NOT NULL DEFAULT 1, effective_at_ms INTEGER NOT NULL, confirmed_at_ms INTEGER NOT NULL, "
+            "created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL, "
+            "FOREIGN KEY(project_id) REFERENCES knowledge_projects(id), FOREIGN KEY(supersedes_id) REFERENCES project_state_items(id))",
+            "CREATE INDEX idx_project_state_page ON project_state_items(project_id,status,updated_at_ms DESC,id DESC)",
+            "CREATE TABLE project_change_proposals (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, meeting_id TEXT, "
+            "origin TEXT NOT NULL CHECK(origin IN ('ai','user')), base_revision INTEGER NOT NULL, changes_json TEXT NOT NULL, "
+            "status TEXT NOT NULL CHECK(status IN ('pending','confirmed','rejected','needs_review')), revision INTEGER NOT NULL DEFAULT 1, "
+            "result_item_ids_json TEXT NOT NULL DEFAULT '[]', created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL, "
+            "FOREIGN KEY(project_id) REFERENCES knowledge_projects(id))",
+            "CREATE INDEX idx_project_proposals_page ON project_change_proposals(project_id,status,updated_at_ms DESC,id DESC)",
+            "CREATE TABLE project_state_history (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, item_id TEXT NOT NULL, "
+            "revision INTEGER NOT NULL, snapshot_json TEXT NOT NULL, reason TEXT NOT NULL, created_at_ms INTEGER NOT NULL, "
+            "UNIQUE(item_id,revision), FOREIGN KEY(project_id) REFERENCES knowledge_projects(id), FOREIGN KEY(item_id) REFERENCES project_state_items(id))",
+        ),
+    ),
+    sql_migration(
+        17,
+        "bind_live_document_evidence",
+        (
+            "ALTER TABLE suggestions ADD COLUMN source_evidence_json TEXT NOT NULL DEFAULT '[]'",
+            "CREATE TABLE coach_source_bindings (meeting_id TEXT NOT NULL, decision_id TEXT NOT NULL, job_id TEXT NOT NULL, "
+            "source_evidence_json TEXT NOT NULL, payload_json TEXT NOT NULL, invalidated_at_ms INTEGER, created_at_ms INTEGER NOT NULL, "
+            "PRIMARY KEY(meeting_id,decision_id), FOREIGN KEY(meeting_id) REFERENCES meetings(id) ON DELETE CASCADE)",
+            "CREATE INDEX idx_coach_source_active ON coach_source_bindings(meeting_id,invalidated_at_ms)",
+        ),
+    ),
+    sql_migration(
+        18,
+        "allow_user_entities_before_audio",
+        (
+            "DROP INDEX idx_meeting_entities_projection",
+            "ALTER TABLE meeting_entities RENAME TO meeting_entities_before_audio",
+            "CREATE TABLE meeting_entities (meeting_id TEXT NOT NULL, entity_id TEXT NOT NULL, "
+            "kind TEXT NOT NULL CHECK (kind IN ('current_topic','open_question','decision_candidate','action_item','risk')), "
+            "status TEXT NOT NULL, text TEXT NOT NULL, confidence REAL NOT NULL DEFAULT 0, "
+            "evidence_json TEXT NOT NULL DEFAULT '{}', evidence_segment_ids_json TEXT NOT NULL, "
+            "owner TEXT, deadline TEXT, mitigation TEXT, updated_at_ms INTEGER, "
+            "version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0), "
+            "first_seen_seq INTEGER NOT NULL DEFAULT 0 CHECK(first_seen_seq >= 0), "
+            "last_updated_seq INTEGER NOT NULL DEFAULT 0 CHECK(last_updated_seq >= 0), PRIMARY KEY(meeting_id,entity_id))",
+            "INSERT INTO meeting_entities SELECT meeting_id,entity_id,kind,status,text,confidence,evidence_json,"
+            "evidence_segment_ids_json,owner,deadline,mitigation,updated_at_ms,version,first_seen_seq,last_updated_seq "
+            "FROM meeting_entities_before_audio",
+            "DROP TABLE meeting_entities_before_audio",
+            "CREATE INDEX idx_meeting_entities_projection ON meeting_entities(meeting_id, kind, updated_at_ms)",
+        ),
+    ),
+    sql_migration(
+        19,
+        "add_controlled_user_memory",
+        (
+            "CREATE TABLE user_memories (id TEXT PRIMARY KEY, scope TEXT NOT NULL CHECK(scope IN ('global','project','meeting')), "
+            "scope_id TEXT NOT NULL, scene TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL CHECK(kind IN ('term','preference')), "
+            "memory_key TEXT NOT NULL, value TEXT NOT NULL, aliases_json TEXT NOT NULL DEFAULT '[]', "
+            "status TEXT NOT NULL CHECK(status IN ('candidate','active','disabled','deleted','needs_review')), "
+            "origin TEXT NOT NULL CHECK(origin IN ('user','ai')), source_refs_json TEXT NOT NULL DEFAULT '[]', "
+            "fingerprint TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1 CHECK(revision>0), created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL)",
+            "CREATE UNIQUE INDEX idx_memory_active_slot ON user_memories(scope,scope_id,scene,kind,memory_key) WHERE status='active'",
+            "CREATE INDEX idx_memory_scope ON user_memories(scope,scope_id,status,updated_at_ms,id)",
+            "CREATE TABLE memory_exclusions (fingerprint TEXT PRIMARY KEY, created_at_ms INTEGER NOT NULL)",
+            "ALTER TABLE suggestions ADD COLUMN input_context_json TEXT NOT NULL DEFAULT '{}'",
+            "ALTER TABLE coach_source_bindings ADD COLUMN input_context_json TEXT NOT NULL DEFAULT '{}'",
+            "ALTER TABLE ask_messages ADD COLUMN input_context_json TEXT NOT NULL DEFAULT '{}'",
+        ),
+    ),
+    sql_migration(
+        20,
+        "link_versioned_notes_and_human_finals",
+        (
+            "CREATE TABLE knowledge_source_bindings (source_kind TEXT NOT NULL CHECK(source_kind IN ('review_document','note')), "
+            "source_id TEXT NOT NULL, project_id TEXT NOT NULL, document_id TEXT NOT NULL UNIQUE, created_at_ms INTEGER NOT NULL, "
+            "PRIMARY KEY(source_kind,source_id,project_id), FOREIGN KEY(project_id) REFERENCES knowledge_projects(id), "
+            "FOREIGN KEY(document_id) REFERENCES knowledge_documents(id))",
+            "CREATE TABLE knowledge_source_versions (library_version_id TEXT PRIMARY KEY, document_id TEXT NOT NULL, "
+            "source_kind TEXT NOT NULL CHECK(source_kind IN ('review_document','note')), source_id TEXT NOT NULL, "
+            "source_version INTEGER NOT NULL, source_hash TEXT NOT NULL, created_at_ms INTEGER NOT NULL, "
+            "FOREIGN KEY(library_version_id) REFERENCES knowledge_versions(id) ON DELETE CASCADE, "
+            "FOREIGN KEY(document_id) REFERENCES knowledge_documents(id))",
+            "CREATE INDEX idx_knowledge_source_versions_source ON knowledge_source_versions(source_kind,source_id,source_version)",
+        ),
+    ),
+    sql_migration(
+        21,
+        "add_explicit_project_reconciliation_jobs",
+        (
+            "CREATE TABLE project_reconcile_jobs (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL, project_id TEXT NOT NULL, "
+            "document_kind TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending','running','succeeded','failed','cancelled')), "
+            "base_project_revision INTEGER NOT NULL, input_context_json TEXT NOT NULL, source_refs_json TEXT NOT NULL, "
+            "source_payload_json TEXT NOT NULL, input_hash TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts>=0), "
+            "defer_count INTEGER NOT NULL DEFAULT 0 CHECK(defer_count>=0), next_attempt_at_ms INTEGER NOT NULL DEFAULT 0, "
+            "lease_owner TEXT, lease_until_ms INTEGER, result_proposal_id TEXT, error_class TEXT, "
+            "created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL, completed_at_ms INTEGER, "
+            "FOREIGN KEY(meeting_id) REFERENCES meetings(id) ON DELETE CASCADE, FOREIGN KEY(project_id) REFERENCES knowledge_projects(id), "
+            "FOREIGN KEY(result_proposal_id) REFERENCES project_change_proposals(id))",
+            "CREATE INDEX idx_project_reconcile_claim ON project_reconcile_jobs(status,next_attempt_at_ms,created_at_ms,id)",
+            "CREATE UNIQUE INDEX idx_project_reconcile_active ON project_reconcile_jobs(meeting_id,input_hash) WHERE status IN ('pending','running')",
+        ),
+    ),
+    sql_migration(
+        22,
+        "add_source_bound_memory_reconciliation",
+        (
+            "CREATE TABLE memory_reconcile_settings (project_id TEXT PRIMARY KEY, mode TEXT NOT NULL DEFAULT 'explicit_only' "
+            "CHECK(mode IN ('off','explicit_only')), revision INTEGER NOT NULL DEFAULT 1 CHECK(revision>0), updated_at_ms INTEGER NOT NULL, "
+            "FOREIGN KEY(project_id) REFERENCES knowledge_projects(id))",
+            "CREATE TABLE memory_reconcile_jobs (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, document_id TEXT NOT NULL, "
+            "source_version_id TEXT NOT NULL, source_version INTEGER NOT NULL, source_hash TEXT NOT NULL, "
+            "status TEXT NOT NULL CHECK(status IN ('pending','running','succeeded','failed','cancelled')), "
+            "snapshot_json TEXT NOT NULL, source_payload_json TEXT NOT NULL, input_hash TEXT NOT NULL, "
+            "attempts INTEGER NOT NULL DEFAULT 0, retry_count INTEGER NOT NULL DEFAULT 0, paid_started INTEGER NOT NULL DEFAULT 0, "
+            "lease_owner TEXT, lease_until_ms INTEGER, defer_count INTEGER NOT NULL DEFAULT 0, next_attempt_at_ms INTEGER NOT NULL DEFAULT 0, "
+            "result_memory_ids_json TEXT NOT NULL DEFAULT '[]', error_code TEXT, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL, "
+            "completed_at_ms INTEGER, FOREIGN KEY(project_id) REFERENCES knowledge_projects(id), "
+            "FOREIGN KEY(document_id) REFERENCES knowledge_documents(id) ON DELETE CASCADE, FOREIGN KEY(source_version_id) REFERENCES knowledge_versions(id) ON DELETE CASCADE)",
+            "CREATE UNIQUE INDEX idx_memory_reconcile_source ON memory_reconcile_jobs(document_id,source_version_id)",
+            "CREATE INDEX idx_memory_reconcile_claim ON memory_reconcile_jobs(status,next_attempt_at_ms,created_at_ms,id)",
+            "CREATE TABLE memory_source_exclusions (semantic_fingerprint TEXT NOT NULL, document_id TEXT NOT NULL, quote_hash TEXT NOT NULL, "
+            "created_at_ms INTEGER NOT NULL, PRIMARY KEY(semantic_fingerprint,document_id,quote_hash))",
+            "ALTER TABLE user_memories ADD COLUMN reconciliation_job_id TEXT",
+        ),
+    ),
+    sql_migration(
+        23,
+        "add_explicit_project_preparation",
+        (
+            "CREATE TABLE project_preparation_jobs (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, "
+            "status TEXT NOT NULL CHECK(status IN ('pending','running','succeeded','failed','cancelled')), "
+            "snapshot_json TEXT NOT NULL, source_payload_json TEXT NOT NULL, input_hash TEXT NOT NULL, "
+            "base_project_revision INTEGER NOT NULL, revision INTEGER NOT NULL DEFAULT 1, "
+            "attempts INTEGER NOT NULL DEFAULT 0, paid_started INTEGER NOT NULL DEFAULT 0, "
+            "defer_count INTEGER NOT NULL DEFAULT 0, next_attempt_at_ms INTEGER NOT NULL DEFAULT 0, "
+            "lease_owner TEXT, lease_until_ms INTEGER, result_json TEXT, error_code TEXT, "
+            "created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL, completed_at_ms INTEGER, "
+            "FOREIGN KEY(project_id) REFERENCES knowledge_projects(id) ON DELETE CASCADE)",
+            "CREATE INDEX idx_preparation_page ON project_preparation_jobs(project_id,updated_at_ms DESC,id DESC)",
+            "CREATE INDEX idx_preparation_claim ON project_preparation_jobs(status,next_attempt_at_ms,created_at_ms,id)",
+            "CREATE TABLE preparation_source_versions(job_id TEXT NOT NULL, version_id TEXT NOT NULL, "
+            "PRIMARY KEY(job_id,version_id), FOREIGN KEY(job_id) REFERENCES project_preparation_jobs(id) ON DELETE CASCADE, "
+            "FOREIGN KEY(version_id) REFERENCES knowledge_versions(id) ON DELETE CASCADE)",
+            "CREATE TRIGGER preparation_source_version_delete BEFORE DELETE ON knowledge_versions BEGIN "
+            "DELETE FROM project_preparation_jobs WHERE id IN (SELECT job_id FROM preparation_source_versions WHERE version_id=OLD.id); END",
+        ),
+    ),
+    sql_migration(
+        24,
+        "add_explicit_historical_transcript_recovery",
+        (
+            "CREATE TABLE transcript_recovery_jobs (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL, "
+            "request_key TEXT NOT NULL UNIQUE, track TEXT NOT NULL CHECK(track IN ('microphone','system_audio')), "
+            "epoch INTEGER NOT NULL CHECK(epoch>=0), start_sample INTEGER NOT NULL CHECK(start_sample>=0), "
+            "end_sample INTEGER NOT NULL CHECK(end_sample>start_sample), start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL, "
+            "audio_digest TEXT NOT NULL, coverage_digest TEXT NOT NULL, "
+            "status TEXT NOT NULL CHECK(status IN ('queued','waiting_resources','running','candidate_ready','failed','cancelled','merged','stale')), "
+            "version INTEGER NOT NULL DEFAULT 1 CHECK(version>0), candidate_version INTEGER NOT NULL DEFAULT 0, "
+            "original_candidate_text TEXT, candidate_text TEXT, attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts BETWEEN 0 AND 3), "
+            "lease_owner TEXT, lease_until_ms INTEGER, execution_version INTEGER, error_code TEXT, merged_segment_ids_json TEXT NOT NULL DEFAULT '[]', "
+            "created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL, merged_at_ms INTEGER, "
+            "FOREIGN KEY(meeting_id) REFERENCES meetings(id) ON DELETE CASCADE)",
+            "CREATE INDEX idx_transcript_recovery_claim ON transcript_recovery_jobs(status,created_at_ms,id)",
+            "CREATE INDEX idx_transcript_recovery_source ON transcript_recovery_jobs(meeting_id,track,epoch,start_sample,end_sample)",
+            "ALTER TABLE transcript_segments ADD COLUMN recovery_job_id TEXT",
+            "ALTER TABLE transcript_segments ADD COLUMN recovery_provenance_json TEXT",
+        ),
+    ),
+    sql_migration(
+        25,
+        "add_realtime_participation_context",
+        (
+            "ALTER TABLE jobs ADD COLUMN request_context_json TEXT NOT NULL DEFAULT '{}'",
+            "ALTER TABLE agent_work_items ADD COLUMN context_json TEXT NOT NULL DEFAULT '{}'",
+            "ALTER TABLE agent_work_items ADD COLUMN input_context_json TEXT NOT NULL DEFAULT '{}'",
+            "CREATE INDEX idx_agent_work_items_kind ON agent_work_items(meeting_id,kind,updated_at_ms DESC)",
+        ),
+    ),
+    sql_migration(26, "add_meeting_material_sets", MATERIAL_SCHEMA_STATEMENTS),
 )
 
 

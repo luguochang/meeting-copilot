@@ -38,6 +38,7 @@ from typing import Any, Callable, Mapping, Protocol
 
 from meeting_copilot_web_mvp.logging_config import get_logger
 from meeting_copilot_web_mvp.meeting_preparation import (
+    normalize_correction_mode,
     normalize_hotwords,
     normalize_meeting_id,
 )
@@ -87,8 +88,17 @@ from meeting_copilot_web_mvp.local_runtime_paths import (
     venv_python_path,
 )
 from meeting_copilot_web_mvp.asr_refiner import (
+    RefinementResult,
+    BACKGROUND_REFINEMENT_WARMING_REASON,
+    ONLINE_FINAL_RESOURCE_GUARD_ERRORS,
     ONLINE_ONLY_REFINEMENT_REASON,
+    RESOURCE_GUARD_ONLINE_FINAL_REASON,
+    WARMING_ONLINE_FINAL_REASON,
+    WARMING_REFINEMENT_REASON,
+    get_refiner_readiness_waiter,
+    refiner_resource_refusal_for_meeting,
     refine_pcm_f32,
+    realtime_refiner_policy,
     release_refiner_for_meeting,
     retain_refiner_for_meeting,
 )
@@ -153,6 +163,9 @@ MAX_SESSION_HOTWORD_REGISTRATIONS = 128
 FUNASR_BOUNDARY_MAX_WAIT_S = FUNASR_BOUNDARY_ACK_TIMEOUT_S * 2
 FUNASR_BOUNDARY_MAX_WAIT_ATTEMPTS = 2
 FUNASR_BOUNDARY_MIN_WAIT_S = 0.001
+# After the normal budget, allow one read-only wait for the already queued
+# ACK. No PCM is consumed during this wait; failure closes the stream.
+FUNASR_BOUNDARY_RECOVERY_WAIT_S = 2.5
 
 _SESSION_HOTWORDS: dict[str, tuple[str, ...]] = {}
 _SESSION_HOTWORDS_LOCK = threading.RLock()
@@ -260,6 +273,45 @@ def _uses_online_final_resource_policy(refinement: Any, fallback_text: str) -> b
     )
 
 
+def _uses_online_final_resource_guard(
+    refinement: Any,
+    fallback_text: str,
+    *,
+    boundary_acknowledged: bool,
+    has_speech_audio: bool,
+) -> bool:
+    """Keep a closed online utterance when optional refinement lacks capacity.
+
+    This never authorizes a partial by itself, retries a heavy worker, or
+    treats a transport/model/probe failure as a resource refusal.
+    """
+    return (
+        realtime_refiner_policy()["mode"] in {"on_demand", "prewarm"}
+        and str(getattr(refinement, "status", "")) == "failed"
+        and str(getattr(refinement, "reason", "")) in ONLINE_FINAL_RESOURCE_GUARD_ERRORS
+        and boundary_acknowledged
+        and has_speech_audio
+        and _is_meaningful_authoritative_final(fallback_text)
+    )
+
+
+def _uses_online_final_warming(
+    refinement: Any,
+    fallback_text: str,
+    *,
+    boundary_acknowledged: bool,
+    has_speech_audio: bool,
+) -> bool:
+    return (
+        realtime_refiner_policy()["mode"] == "on_demand"
+        and str(getattr(refinement, "status", "")) == "unavailable"
+        and str(getattr(refinement, "reason", "")) == WARMING_REFINEMENT_REASON
+        and boundary_acknowledged
+        and has_speech_audio
+        and _is_meaningful_authoritative_final(fallback_text)
+    )
+
+
 def _refinement_degradation_reason(
     refinement: Any,
     *,
@@ -275,6 +327,12 @@ def _refinement_degradation_reason(
 
     if rejected_short_text:
         return "offline_refinement_text_too_short"
+    if (realtime_refiner_policy()["mode"] == "on_demand"
+            and str(getattr(refinement, "status", "")) == "unavailable"
+            and str(getattr(refinement, "reason", "")) == WARMING_REFINEMENT_REASON):
+        # An empty initial endpoint may demand preparation, but must not leave
+        # a permanent model-failure blocker on later closed online utterances.
+        return BACKGROUND_REFINEMENT_WARMING_REASON
     if str(getattr(refinement, "reason", "") or "").strip() == ONLINE_ONLY_REFINEMENT_REASON:
         return ONLINE_ONLY_REFINEMENT_REASON
     return "offline_refinement_unavailable"
@@ -386,6 +444,9 @@ _ASR_BOUNDARY_DIAGNOSTIC_FIELDS = frozenset(
         "utterance_index",
         "drain_ms",
         "skipped_silence_bytes",
+        "skipped_preview_bytes",
+        "inference_calls",
+        "inference_max_ms",
     }
 )
 _ASR_WORKER_DIAGNOSTIC_FIELDS = frozenset(
@@ -519,6 +580,12 @@ STABLE_PARTIAL_CANDIDATE_MARKERS = (
     "checklist",
     "风险",
 )
+
+
+class _FunasrBoundaryRecoveryFailed(FunasrResidentUnavailableError):
+    def __init__(self, error_code: str):
+        super().__init__(error_code)
+        self.error_code = error_code
 
 
 class StreamRecognizer(Protocol):
@@ -2203,6 +2270,7 @@ async def handle_stream(
     audio_source: str | None = None,
     audio_asset_data_dir: str | Path | None = None,
     l3_normalize_enabled: bool = True,
+    correction_mode: str = "local_and_llm",
     on_final_committed: Callable[[dict[str, Any]], Any] | None = None,
     on_audio_chunk_committed: Callable[[dict[str, Any]], Any] | None = None,
     authorize_audio_chunk_commit: Callable[[dict[str, Any]], bool] | None = None,
@@ -2226,6 +2294,36 @@ async def handle_stream(
     pipeline is connected end-to-end (llm-execution-runs / approach-cards /
     minutes can then run on the real ASR session).
     """
+    selected_correction_mode = normalize_correction_mode(correction_mode)
+    llm_only_correction = selected_correction_mode == "llm_only"
+    refiner_readiness_resource_reason: str | None = None
+    last_refinement_reason: str | None = None
+
+    def refine_selected_pcm(payload: bytes) -> RefinementResult:
+        nonlocal last_refinement_reason
+        if llm_only_correction:
+            # Do not touch the offline capability, owner, lease, or worker.
+            return RefinementResult(text="", status="bypassed", reason=ONLINE_ONLY_REFINEMENT_REASON)
+        result = refine_pcm_f32(payload)
+        last_refinement_reason = result.reason
+        return result
+
+    def _selected_online_policy_final(refinement, text, *, acknowledged, speech_audio) -> bool:
+        return _uses_online_final_resource_policy(refinement, text) and (
+            not llm_only_correction or (acknowledged and speech_audio)
+        )
+
+    def correction_mode_metadata(reason: str | None = None) -> dict[str, Any]:
+        fallback = reason or last_refinement_reason or refiner_readiness_resource_reason
+        if not fallback and realtime_refiner_policy()["mode"] == "online_only":
+            fallback = ONLINE_ONLY_REFINEMENT_REASON
+        effective = ("llm_only" if llm_only_correction or fallback in ONLINE_FINAL_RESOURCE_GUARD_ERRORS
+                     or fallback == WARMING_REFINEMENT_REASON
+                     or realtime_refiner_policy()["mode"] == "online_only" else "local_and_llm")
+        return {"requested_correction_mode": selected_correction_mode,
+                "effective_correction_mode": effective,
+                "correction_fallback_reason": None if llm_only_correction else fallback}
+
     await websocket.accept()
     if emit_transport_ready:
         # See the recording-only path above. This frame is deliberately sent
@@ -2277,6 +2375,8 @@ async def handle_stream(
             event,
             l3_normalize_enabled=l3_normalize_enabled,
         )
+        if normalized.get("event_type") == "final":
+            normalized.update(correction_mode_metadata(normalized.get("refinement_reason")))
         capture_epoch = max(0, int(native_capture_epoch or 0))
         capture_track = str(native_track_id or "").strip()
         segment_id = str(normalized.get("segment_id") or "").strip()
@@ -2482,6 +2582,7 @@ async def handle_stream(
     pending_funasr_boundary_started_at: float | None = None
     pending_funasr_boundary_attempts = 0
     pending_funasr_boundary_budget_exhausted = False
+    pending_funasr_boundary_force = False
     # Raw PCM for the current VAD segment. This is the only input accepted by
     # the post-endpoint refiner; online partial text is never used as audio
     # evidence and is never concatenated into a final.
@@ -3000,6 +3101,7 @@ async def handle_stream(
     async def _maybe_vad_endpoint_event(
         *,
         force_boundary: bool = False,
+        online_terminal_boundary: bool = False,
     ) -> dict[str, Any] | None:
         nonlocal endpoint_final_count, endpoint_committed_source_text, endpoint_committed_end_ms
         # The online worker can emit a delayed partial after the preceding
@@ -3048,7 +3150,7 @@ async def handle_stream(
         candidate_source_text = str(endpoint_candidate.get("source_text") or text).strip()
         speech_offset = max(0, int(segment_speech_start_offset_bytes or 0))
         refinement = await _run_blocking(
-            refine_pcm_f32,
+            refine_selected_pcm,
             bytes(segment_pcm_buffer[speech_offset:]),
         )
         refined_text = refinement.text.strip()
@@ -3057,10 +3159,26 @@ async def handle_stream(
             and refined_text
             and not _is_meaningful_authoritative_final(refined_text)
         )
-        online_policy_final = _uses_online_final_resource_policy(refinement, text)
+        online_policy_final = _selected_online_policy_final(
+            refinement, text, acknowledged=online_terminal_boundary,
+            speech_audio=bool(segment_has_speech and segment_pcm_buffer[speech_offset:]),
+        )
+        online_resource_guard_final = _uses_online_final_resource_guard(
+            refinement,
+            text,
+            boundary_acknowledged=online_terminal_boundary,
+            has_speech_audio=bool(segment_pcm_buffer[speech_offset:]),
+        )
+        online_warming_final = _uses_online_final_warming(
+            refinement,
+            text,
+            boundary_acknowledged=online_terminal_boundary,
+            has_speech_audio=bool(segment_pcm_buffer[speech_offset:]),
+        )
+        online_final = online_policy_final or online_resource_guard_final or online_warming_final
         authoritative = (
             refinement.authoritative and not rejected_short_text
-        ) or online_policy_final
+        ) or online_final
         refinement_status = "rejected_short_text" if rejected_short_text else refinement.status
         refinement_reason = "offline_refinement_text_too_short" if rejected_short_text else refinement.reason
         if authoritative:
@@ -3070,6 +3188,12 @@ async def handle_stream(
             provider_metadata["degradation_reasons"].append(
                 ONLINE_ONLY_REFINEMENT_REASON
             )
+        elif online_resource_guard_final:
+            provider_metadata["degradation_reasons"].append(
+                RESOURCE_GUARD_ONLINE_FINAL_REASON
+            )
+        elif online_warming_final:
+            provider_metadata["degradation_reasons"].append(WARMING_ONLINE_FINAL_REASON)
         elif not authoritative:
             provider_metadata["degradation_reasons"].append(
                 _refinement_degradation_reason(
@@ -3077,7 +3201,7 @@ async def handle_stream(
                     rejected_short_text=rejected_short_text,
                 )
             )
-        final_text = (refined_text or text) if authoritative else text
+        final_text = text if online_final else (refined_text or text) if authoritative else text
         if not final_text:
             return None
         if authoritative:
@@ -3094,12 +3218,12 @@ async def handle_stream(
             "received_at_ms": end_ms,
             **_asr_confidence_metadata(
                 endpoint_candidate,
-                offline_refinement=authoritative and not online_policy_final,
+                offline_refinement=authoritative and not online_final,
             ),
             "authoritative": authoritative,
             "final_source": (
                 "local_realtime_online_final"
-                if online_policy_final
+                if online_final
                 else "local_offline_refinement"
                 if authoritative
                 else "online_terminal_partial"
@@ -3110,6 +3234,10 @@ async def handle_stream(
             "endpoint_source": (
                 "server_vad_online_final_resource_policy"
                 if online_policy_final
+                else "server_vad_online_final_resource_guard"
+                if online_resource_guard_final
+                else "server_vad_online_final_warming"
+                if online_warming_final
                 else "server_vad_offline_refined"
                 if authoritative
                 else "server_vad_refinement_unavailable"
@@ -3188,7 +3316,7 @@ async def handle_stream(
             [*_current_degradation_reasons(), "stream_interrupted"],
         )
         speech_offset = max(0, int(segment_speech_start_offset_bytes or 0))
-        refinement = refine_pcm_f32(bytes(segment_pcm_buffer[speech_offset:]))
+        refinement = refine_selected_pcm(bytes(segment_pcm_buffer[speech_offset:]))
         refined_text = refinement.text.strip()
         rejected_short_text = bool(
             refinement.authoritative
@@ -3359,9 +3487,11 @@ async def handle_stream(
             "source": ASR_LIVE_SOURCE,
             "trace_kind": ASR_LIVE_TRACE_KIND,
             "settings_snapshot": {
-                "asr": {"l3_normalize_enabled": bool(l3_normalize_enabled)},
+                "asr": {"l3_normalize_enabled": bool(l3_normalize_enabled),
+                        "correction_mode": selected_correction_mode},
                 "scope": "websocket_connection_start",
             },
+            **correction_mode_metadata(),
             **(
                 {"transcript_backfill": dict(interrupted_backfill_state)}
                 if interrupted_backfill_state
@@ -3488,6 +3618,8 @@ async def handle_stream(
         return deduped
 
     readiness_waiter = getattr(recognizer, "wait_ready", None)
+    refiner_readiness_waiter = None
+    refiner_readiness_cancelled = threading.Event()
     readiness_is_required = callable(readiness_waiter)
     readiness_event_required = readiness_is_required or provider_metadata["provider"] == "sherpa_onnx_realtime"
     pending_messages: deque[dict[str, Any]] = deque()
@@ -3658,6 +3790,7 @@ async def handle_stream(
             )
 
     async def _cancel_readiness_task(readiness_task: asyncio.Task[Any] | None) -> None:
+        refiner_readiness_cancelled.set()
         if readiness_task is None or readiness_task.done():
             return
         readiness_task.cancel()
@@ -3808,6 +3941,9 @@ async def handle_stream(
                         "ready": True,
                         "ready_latency_ms": 0.0,
                         "message": "实时识别已就绪。",
+                        **correction_mode_metadata(),
+                        **({"offline_refinement_ready": False,
+                            "offline_refinement_reason": "meeting_llm_only"} if llm_only_correction else {}),
                     },
                     ensure_ascii=False,
                 )
@@ -3816,127 +3952,175 @@ async def handle_stream(
             return True
 
         ready_started_at = time.monotonic()
-        readiness_task = asyncio.create_task(asyncio.to_thread(readiness_waiter, ASR_READY_TIMEOUT_S))
-        while True:
-            receive_task = asyncio.create_task(websocket.receive())
-            done, _pending = await asyncio.wait(
-                {readiness_task, receive_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if receive_task in done:
-                try:
-                    message = _decode_stream_message(receive_task.result())
-                except NativePcmProtocolError as exc:
-                    await _cancel_readiness_task(readiness_task)
-                    return await _finish_invalid_audio_payload(exc)
-                except Exception as exc:
-                    await _finish_before_readiness(
-                        readiness_task,
-                        error_code="stream_interrupted",
-                        message="实时识别未就绪，会议录音已保留但本次转写被中断。",
-                        reason="stream_interrupted",
-                    )
-                    _log.warning(
-                        "asr.stream.ready_receive_failed",
-                        session_id=session_id,
-                        error=str(exc),
-                    )
+        def wait_for_stream_ready() -> bool:
+            nonlocal refiner_readiness_resource_reason
+            deadline = ready_started_at + ASR_READY_TIMEOUT_S
+            if callable(readiness_waiter) and not readiness_waiter(max(0.0, deadline - time.monotonic())):
+                return False
+            if refiner_readiness_cancelled.is_set():
+                return False
+            if refiner_readiness_waiter is not None:
+                offline_ready = refiner_readiness_waiter(
+                    max(0.0, deadline - time.monotonic()), refiner_readiness_cancelled,
+                )
+                if offline_ready:
+                    return True
+                if refiner_readiness_cancelled.is_set() or time.monotonic() >= deadline:
                     return False
-                pcm_payload = message.get("bytes")
-                if pcm_payload is not None:
+                # The online recognizer really became ready above. Continue
+                # only across an observed resource refusal of this retained
+                # offline owner; a timeout/False alone cannot authorize it.
+                refiner_readiness_resource_reason = refiner_resource_refusal_for_meeting(session_id)
+                return refiner_readiness_resource_reason is not None
+            return True
+
+        readiness_task = asyncio.create_task(asyncio.to_thread(wait_for_stream_ready))
+        receive_task = None
+        try:
+            while True:
+                receive_task = asyncio.create_task(websocket.receive())
+                done, _pending = await asyncio.wait(
+                    {readiness_task, receive_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if receive_task in done:
                     try:
-                        audio_activity = _observe_audio_activity(pcm_payload)
-                    except Float32PcmPayloadError as exc:
+                        message = _decode_stream_message(receive_task.result())
+                    except NativePcmProtocolError as exc:
+                        await _abort_before_readiness_terminal(readiness_task)
                         return await _finish_invalid_audio_payload(exc)
-                    if audio_activity is not None:
-                        audio_activity.update(
-                            _native_pcm_event_identity(message.get("_native_pcm_frame"))
+                    except Exception as exc:
+                        await _finish_before_readiness(
+                            readiness_task,
+                            error_code="stream_interrupted",
+                            message="实时识别未就绪，会议录音已保留但本次转写被中断。",
+                            reason="stream_interrupted",
                         )
-                    if audio_activity is not None and on_audio_active is not None:
-                        await _run_blocking(on_audio_active, audio_activity)
-                    await _run_blocking(
-                        _record_audio_payload,
-                        pcm_payload,
-                        native_frame=message.get("_native_pcm_frame"),
-                    )
-                    if len(pending_messages) < pending_message_limit:
-                        pending_messages.append(
-                            {
-                                "bytes": pcm_payload,
-                                "_audio_recorded": True,
-                                "_native_pcm_decoded": True,
-                                "_native_pcm_frame": message.get("_native_pcm_frame"),
-                            }
+                        _log.warning(
+                            "asr.stream.ready_receive_failed",
+                            session_id=session_id,
+                            error=str(exc),
                         )
-                    else:
-                        pending_asr_audio_dropped = True
+                        return False
+                    pcm_payload = message.get("bytes")
+                    if pcm_payload is not None:
+                        try:
+                            audio_activity = _observe_audio_activity(pcm_payload)
+                        except Float32PcmPayloadError as exc:
+                            await _abort_before_readiness_terminal(readiness_task)
+                            return await _finish_invalid_audio_payload(exc)
+                        if audio_activity is not None:
+                            audio_activity.update(
+                                _native_pcm_event_identity(message.get("_native_pcm_frame"))
+                            )
+                        if audio_activity is not None and on_audio_active is not None:
+                            await _run_blocking(on_audio_active, audio_activity)
+                        await _run_blocking(
+                            _record_audio_payload,
+                            pcm_payload,
+                            native_frame=message.get("_native_pcm_frame"),
+                        )
+                        if len(pending_messages) < pending_message_limit:
+                            pending_messages.append(
+                                {
+                                    "bytes": pcm_payload,
+                                    "_audio_recorded": True,
+                                    "_native_pcm_decoded": True,
+                                    "_native_pcm_frame": message.get("_native_pcm_frame"),
+                                }
+                            )
+                        else:
+                            if not pending_asr_audio_dropped:
+                                provider_metadata["degradation_reasons"].append("asr_ready_buffer_overflow")
+                            pending_asr_audio_dropped = True
+                        if not readiness_task.done():
+                            continue
+                    if message.get("text") == "END":
+                        if not readiness_task.done():
+                            return await _finish_before_readiness(
+                                readiness_task,
+                                error_code="asr_not_ready_at_stop",
+                                message="实时识别尚未就绪，本次会议录音已保存，可稍后重新转写。",
+                                reason="asr_not_ready_at_stop",
+                            )
+                        try:
+                            ready_when_end_received = bool(readiness_task.result())
+                        except Exception:
+                            ready_when_end_received = False
+                        if not ready_when_end_received:
+                            return await _finish_before_readiness(
+                                readiness_task,
+                                error_code="asr_ready_timeout",
+                                message="本地实时识别模型未在限定时间内就绪，会议录音已保存，请稍后重新转写。",
+                                reason="asr_ready_timeout",
+                            )
+                        pending_messages.append({"text": "END"})
+                        # The readiness task and END completed together. Preserve
+                        # message order and let the normal stream loop finalize.
+                    elif message.get("text") == STREAM_FLUSH_COMMAND:
+                        # Pause is a non-terminal utterance boundary. Preserve it
+                        # behind any PCM buffered during model warm-up so the same
+                        # authoritative refinement path runs once readiness wins.
+                        pending_messages.append({"text": STREAM_FLUSH_COMMAND})
                     if not readiness_task.done():
                         continue
-                if message.get("text") == "END":
-                    if not readiness_task.done():
-                        return await _finish_before_readiness(
-                            readiness_task,
-                            error_code="asr_not_ready_at_stop",
-                            message="实时识别尚未就绪，本次会议录音已保存，可稍后重新转写。",
-                            reason="asr_not_ready_at_stop",
-                        )
-                    try:
-                        ready_when_end_received = bool(readiness_task.result())
-                    except Exception:
-                        ready_when_end_received = False
-                    if not ready_when_end_received:
-                        return await _finish_before_readiness(
-                            readiness_task,
-                            error_code="asr_ready_timeout",
-                            message="本地实时识别模型未在限定时间内就绪，会议录音已保存，请稍后重新转写。",
-                            reason="asr_ready_timeout",
-                        )
-                    pending_messages.append({"text": "END"})
-                    # The readiness task and END completed together. Preserve
-                    # message order and let the normal stream loop finalize.
-                elif message.get("text") == STREAM_FLUSH_COMMAND:
-                    # Pause is a non-terminal utterance boundary. Preserve it
-                    # behind any PCM buffered during model warm-up so the same
-                    # authoritative refinement path runs once readiness wins.
-                    pending_messages.append({"text": STREAM_FLUSH_COMMAND})
-                if not readiness_task.done():
-                    continue
 
-            if not receive_task.done():
+                if not receive_task.done():
+                    receive_task.cancel()
+                    await asyncio.gather(receive_task, return_exceptions=True)
+                try:
+                    ready = bool(readiness_task.result())
+                except Exception as exc:
+                    ready = False
+                    _log.warning(
+                        "asr.stream.ready_check_failed",
+                        session_id=session_id,
+                        provider=provider_metadata["provider"],
+                        error=str(exc),
+                    )
+                if not ready:
+                    return await _finish_before_readiness(
+                        readiness_task,
+                        error_code="asr_ready_timeout",
+                        message="本地实时识别模型未在限定时间内就绪，会议录音已保存，请稍后重新转写。",
+                        reason="asr_ready_timeout",
+                    )
+                readiness_latency_ms = round((time.monotonic() - ready_started_at) * 1000, 1)
+                await websocket.send_text(
+                    json.dumps(
+                        {
+                            "event_type": "asr_ready",
+                            "provider": provider_metadata["provider"],
+                            "ready": True,
+                            "ready_latency_ms": readiness_latency_ms,
+                            **correction_mode_metadata(),
+                            "message": (
+                                "实时识别已就绪；本地精修因资源限制暂不可用，闭合识别原文将保存。"
+                                if refiner_readiness_resource_reason else "实时识别已就绪。"
+                            ),
+                            **({"offline_refinement_ready": not bool(refiner_readiness_resource_reason),
+                                "offline_refinement_reason": refiner_readiness_resource_reason}
+                               if refiner_readiness_waiter is not None else {}),
+                            **({"offline_refinement_ready": False,
+                                "offline_refinement_reason": "meeting_llm_only"} if llm_only_correction else {}),
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                _mark_real_asr_ready_healthy()
+                return True
+        except AsyncCancelledError:
+            await _abort_before_readiness_terminal(readiness_task)
+            await _abort_diarization()
+            reasons = [*_current_degradation_reasons(), "stream_interrupted"]
+            if pending_asr_audio_dropped:
+                reasons.append("asr_ready_buffer_overflow")
+            await _persist_terminal_readiness_stream(_dedupe(reasons))
+            raise
+        finally:
+            if receive_task is not None and not receive_task.done():
                 receive_task.cancel()
                 await asyncio.gather(receive_task, return_exceptions=True)
-            try:
-                ready = bool(readiness_task.result())
-            except Exception as exc:
-                ready = False
-                _log.warning(
-                    "asr.stream.ready_check_failed",
-                    session_id=session_id,
-                    provider=provider_metadata["provider"],
-                    error=str(exc),
-                )
-            if not ready:
-                return await _finish_before_readiness(
-                    readiness_task,
-                    error_code="asr_ready_timeout",
-                    message="本地实时识别模型未在限定时间内就绪，会议录音已保存，请稍后重新转写。",
-                    reason="asr_ready_timeout",
-                )
-            readiness_latency_ms = round((time.monotonic() - ready_started_at) * 1000, 1)
-            await websocket.send_text(
-                json.dumps(
-                    {
-                        "event_type": "asr_ready",
-                        "provider": provider_metadata["provider"],
-                        "ready": True,
-                        "ready_latency_ms": readiness_latency_ms,
-                        "message": "实时识别已就绪。",
-                    },
-                    ensure_ascii=False,
-                )
-            )
-            _mark_real_asr_ready_healthy()
-            return True
 
     async def _next_stream_message() -> dict[str, Any]:
         if pending_messages:
@@ -4075,6 +4259,7 @@ async def handle_stream(
         nonlocal funasr_boundary_sequence, pending_funasr_boundary_id
         nonlocal pending_funasr_boundary_started_at, pending_funasr_boundary_attempts
         nonlocal pending_funasr_boundary_budget_exhausted
+        nonlocal pending_funasr_boundary_force
         if not is_funasr_realtime or not segment_has_speech:
             return {
                 "acknowledged": True,
@@ -4105,38 +4290,31 @@ async def handle_stream(
             pending_funasr_boundary_started_at = time.monotonic()
             pending_funasr_boundary_attempts = 0
             pending_funasr_boundary_budget_exhausted = False
+            pending_funasr_boundary_force = force_boundary
         boundary_id = pending_funasr_boundary_id
         started_at = time.monotonic()
         boundary_started_at = pending_funasr_boundary_started_at or started_at
         elapsed_s = max(0.0, started_at - boundary_started_at)
         remaining_s = max(0.0, FUNASR_BOUNDARY_MAX_WAIT_S - elapsed_s)
-        if pending_funasr_boundary_budget_exhausted or (
+        recovering = pending_funasr_boundary_budget_exhausted or (
             pending_funasr_boundary_attempts >= FUNASR_BOUNDARY_MAX_WAIT_ATTEMPTS
-        ):
-            # Keep the pending token and PCM for the terminal fail-closed path,
-            # but do not re-enter the wait loop for every subsequent audio
-            # frame or client FLUSH.  A later explicit END still observes the
-            # same stable timeout result and cannot enqueue another command.
+        ) or remaining_s <= 0
+        if recovering:
             pending_funasr_boundary_budget_exhausted = True
-            reason = "funasr_boundary_ack_timeout"
-            if reason not in provider_metadata["degradation_reasons"]:
-                provider_metadata["degradation_reasons"].append(reason)
-            return {
-                "acknowledged": False,
-                "status": "timeout",
-                "boundary_id": boundary_id,
-                "boundary_diagnostics": _boundary_diagnostics(),
-                "error_code": reason,
-                "wait_budget_exhausted": True,
-                "wait_attempt": pending_funasr_boundary_attempts,
-                "wait_budget_remaining_ms": round(remaining_s * 1_000, 1),
-            }
-        # Keep the first attempt at the historical 1.25s slice.  A retry gets
-        # only the remaining absolute budget, preventing repeated FLUSH/END
-        # messages from extending the endpoint indefinitely.
-        wait_timeout_s = min(FUNASR_BOUNDARY_ACK_TIMEOUT_S, remaining_s)
-        wait_timeout_s = max(FUNASR_BOUNDARY_MIN_WAIT_S, wait_timeout_s)
-        pending_funasr_boundary_attempts += 1
+            # The worker may have completed after both caller wait slices.
+            # Only the resident adapter can safely wait on that existing token
+            # without enqueueing another flush/reset. Never keep receiving
+            # audio with an exhausted barrier and an ever-growing PCM buffer.
+            flush_utterance = getattr(recognizer, "wait_for_utterance_boundary", None)
+            await websocket.send_text(json.dumps({"event_type": "asr_ready", "ready": False}))
+            if not callable(flush_utterance):
+                raise _FunasrBoundaryRecoveryFailed("funasr_boundary_ack_timeout")
+            wait_timeout_s = FUNASR_BOUNDARY_RECOVERY_WAIT_S
+        else:
+            # A retry only receives the remaining absolute normal budget.
+            wait_timeout_s = min(FUNASR_BOUNDARY_ACK_TIMEOUT_S, remaining_s)
+            wait_timeout_s = max(FUNASR_BOUNDARY_MIN_WAIT_S, wait_timeout_s)
+            pending_funasr_boundary_attempts += 1
         wait_attempt = pending_funasr_boundary_attempts
         try:
             boundary_events = await _run_blocking(
@@ -4147,14 +4325,21 @@ async def handle_stream(
         except (FunasrResidentBoundaryTimeoutError, TimeoutError):
             reason = "funasr_boundary_ack_timeout"
             provider_metadata["degradation_reasons"].append(reason)
-            if pending_funasr_boundary_attempts >= FUNASR_BOUNDARY_MAX_WAIT_ATTEMPTS:
-                pending_funasr_boundary_budget_exhausted = True
             _log.warning(
                 "asr.stream.funasr_boundary_timeout",
                 session_id=session_id,
                 boundary_id=boundary_id,
                 elapsed_ms=round((time.monotonic() - started_at) * 1_000, 1),
+                recovering=recovering,
+                boundary_diagnostics=[item for item in _boundary_diagnostics() if item.get("boundary_id") == boundary_id],
             )
+            if recovering:
+                raise _FunasrBoundaryRecoveryFailed(reason) from None
+            if pending_funasr_boundary_attempts >= FUNASR_BOUNDARY_MAX_WAIT_ATTEMPTS:
+                pending_funasr_boundary_budget_exhausted = True
+                # Depth is bounded to one recovery call. This call consumes no
+                # further input and cannot enqueue another worker command.
+                return await _synchronize_funasr_boundary(force_boundary=force_boundary)
             return {
                 "acknowledged": False,
                 "status": "timeout",
@@ -4176,16 +4361,7 @@ async def handle_stream(
                 boundary_id=boundary_id,
                 error_class=type(exc).__name__,
             )
-            return {
-                "acknowledged": False,
-                "status": "failed",
-                "boundary_id": boundary_id,
-                "boundary_diagnostics": _boundary_diagnostics(),
-                "error_code": reason,
-                "wait_timeout_ms": round(wait_timeout_s * 1_000, 1),
-                "wait_budget_remaining_ms": round(remaining_s * 1_000, 1),
-                "wait_attempt": wait_attempt,
-            }
+            raise _FunasrBoundaryRecoveryFailed(reason) from exc
         # Reader dispatch is FIFO: these residual partials were emitted before
         # the matching ACK. Merge them while the original raw PCM is still
         # owned by this endpoint, then run the authoritative refinement.
@@ -4197,9 +4373,18 @@ async def handle_stream(
         pending_funasr_boundary_started_at = None
         pending_funasr_boundary_attempts = 0
         pending_funasr_boundary_budget_exhausted = False
+        pending_funasr_boundary_force = False
+        if recovering:
+            _log.info(
+                "asr.stream.funasr_boundary_recovered",
+                session_id=session_id,
+                boundary_id=boundary_id,
+                elapsed_ms=round((time.monotonic() - started_at) * 1_000, 1),
+            )
+            await websocket.send_text(json.dumps({"event_type": "asr_ready", "ready": True}))
         return {
             "acknowledged": True,
-            "status": "acknowledged",
+            "status": "recovered" if recovering else "acknowledged",
             "boundary_id": boundary_id,
             "boundary_diagnostics": _boundary_diagnostics(),
             "event_count": len(boundary_events),
@@ -4227,6 +4412,12 @@ async def handle_stream(
             return False, False, boundary_result
         endpoint_event = await _maybe_vad_endpoint_event(
             force_boundary=force_boundary,
+            online_terminal_boundary=bool(
+                is_funasr_realtime
+                and boundary_result.get("acknowledged")
+                and boundary_result.get("status") in {"acknowledged", "recovered"}
+                and boundary_result.get("boundary_id")
+            ),
         )
         if endpoint_event is None:
             # The resident ACK is a causal hand-off: the worker has already
@@ -4292,8 +4483,12 @@ async def handle_stream(
             _reset_segment_audio()
         return True, final_committed, boundary_result
 
-    refiner_meeting_lease = retain_refiner_for_meeting(session_id)
+    refiner_meeting_lease = False if llm_only_correction else retain_refiner_for_meeting(session_id)
     try:
+        if refiner_meeting_lease and is_funasr_realtime and provider_metadata["provider_mode"] == "real":
+            refiner_readiness_waiter = get_refiner_readiness_waiter(session_id)
+            if refiner_readiness_waiter is not None:
+                readiness_event_required = readiness_is_required = True
         ready_for_stream = await _prepare_before_asr_ready()
     except BaseException:
         if refiner_meeting_lease:
@@ -4308,6 +4503,11 @@ async def handle_stream(
 
     try:
         while True:
+            if pending_funasr_boundary_id is not None:
+                # Finish the already enqueued barrier before reading more PCM.
+                # The worker may have reset its cache after a late ACK; audio
+                # from the next utterance must not enter the retained old span.
+                await _process_endpoint_boundary(force_boundary=pending_funasr_boundary_force)
             try:
                 msg = await _next_stream_message()
             except NativePcmProtocolError as exc:
@@ -4361,13 +4561,7 @@ async def handle_stream(
                     events,
                     native_frame=msg.get("_native_pcm_frame"),
                 )
-                # Once the same boundary has exhausted its bounded ACK
-                # budget, retain the pending PCM for the terminal fail-closed
-                # path but stop invoking the barrier on every incoming frame.
-                # This is an automatic-VAD guard only; an explicit FLUSH/END
-                # still returns the stable timeout result below.
-                if not pending_funasr_boundary_budget_exhausted:
-                    await _process_endpoint_boundary()
+                await _process_endpoint_boundary()
             elif msg.get("text") == STREAM_FLUSH_COMMAND:
                 (
                     boundary_processed,
@@ -4499,7 +4693,7 @@ async def handle_stream(
                         # non-authoritative partial if refinement is missing.
                         speech_offset = max(0, int(segment_speech_start_offset_bytes or 0))
                         refinement = await _run_blocking(
-                            refine_pcm_f32,
+                            refine_selected_pcm,
                             bytes(segment_pcm_buffer[speech_offset:]),
                         )
                         accumulated_endpoint_text = (
@@ -4515,9 +4709,11 @@ async def handle_stream(
                             and candidate_refined_text
                             and not _is_meaningful_authoritative_final(candidate_refined_text)
                         )
-                        online_policy_final = _uses_online_final_resource_policy(
+                        online_policy_final = _selected_online_policy_final(
                             refinement,
                             fallback_text,
+                            acknowledged=not terminal_boundary_failed and finalization_started,
+                            speech_audio=bool(segment_has_speech and segment_pcm_buffer[speech_offset:]),
                         )
                         authoritative = (
                             refinement.authoritative and not rejected_short_text
@@ -4708,7 +4904,7 @@ async def handle_stream(
                     # any speech not already closed by VAD silence.
                     speech_offset = max(0, int(segment_speech_start_offset_bytes or 0))
                     refinement = await _run_blocking(
-                        refine_pcm_f32,
+                        refine_selected_pcm,
                         bytes(segment_pcm_buffer[speech_offset:]),
                     )
                     fallback_text = str(endpoint_candidate.get("text") or "").strip()
@@ -4718,9 +4914,11 @@ async def handle_stream(
                         and candidate_refined_text
                         and not _is_meaningful_authoritative_final(candidate_refined_text)
                     )
-                    online_policy_final = _uses_online_final_resource_policy(
+                    online_policy_final = _selected_online_policy_final(
                         refinement,
                         fallback_text,
+                        acknowledged=not terminal_boundary_failed and finalization_started,
+                        speech_audio=bool(segment_has_speech and segment_pcm_buffer[speech_offset:]),
                     )
                     authoritative = (
                         refinement.authoritative and not rejected_short_text
@@ -4914,6 +5112,13 @@ async def handle_stream(
                 )
                 return
     except (Exception, AsyncCancelledError) as exc:
+        boundary_recovery_failed = isinstance(exc, _FunasrBoundaryRecoveryFailed)
+        if boundary_recovery_failed:
+            provider_metadata["degradation_reasons"].append(
+                "asr_stream_terminated_after_boundary_timeout"
+                if exc.error_code == "funasr_boundary_ack_timeout"
+                else "asr_stream_terminated_after_boundary_failure"
+            )
         await _abort_diarization()
         if audio_writer is not None:
             try:
@@ -4977,7 +5182,31 @@ async def handle_stream(
             session_id=session_id,
             error_class=type(exc).__name__,
             error_origin=_exception_origin(exc),
+            asr_diagnostics=_content_free_asr_diagnostics(getattr(recognizer, "shutdown_diagnostics", {})),
         )
+        try:
+            if boundary_recovery_failed:
+                # Cleanup and recording persistence precede the terminal
+                # transport error. Existing clients reconnect on socket close.
+                await _shutdown_session_executor()
+                await websocket.send_text(json.dumps({
+                    "event_type": "provider_error",
+                    "error_code": exc.error_code,
+                    "message": (
+                        "实时转写的句段确认未完成，正在尝试重连；已收到的录音已保留。"
+                        if audio_asset and audio_asset.get("saved")
+                        else "实时转写的句段确认未完成，正在尝试重连。"
+                    ),
+                    "provider": provider_metadata["provider"],
+                    "provider_mode": provider_metadata["provider_mode"],
+                    "degradation_reasons": _current_degradation_reasons(),
+                    "boundary_id": pending_funasr_boundary_id,
+                    "boundary_diagnostics": _boundary_diagnostics(),
+                    "recording_saved": bool(audio_asset and audio_asset.get("saved")),
+                    "recoverable": True,
+                }, ensure_ascii=False))
+        except Exception:
+            pass
         try:
             await websocket.close()
         except Exception:

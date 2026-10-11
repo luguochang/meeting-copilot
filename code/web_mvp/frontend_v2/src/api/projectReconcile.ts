@@ -1,0 +1,28 @@
+import { ApiError } from "./client";
+import { ContractError, parseReviewDocument } from "./schema";
+import type { KnowledgePage } from "./knowledge";
+import type { ReviewDocument, ReviewDocumentKind } from "../domain/events";
+export interface ReconcileJob { id: string; projectId: string; meetingId: string; documentKind: ReviewDocumentKind; status: "pending" | "running" | "succeeded" | "failed" | "cancelled"; baseRevision: number; attempts: number; resultProposalId: string | null; errorClass: string | null; errorMessage: string | null; sourceVersion: number | null; contextTruncated: boolean }
+export interface ProjectReconcileApi {
+  list(projectId: string, meetingId?: string | null, cursor?: string | null, signal?: AbortSignal): Promise<KnowledgePage<ReconcileJob>>;
+  get(id: string, signal?: AbortSignal): Promise<ReconcileJob>;
+  create(meetingId: string, kind: ReviewDocumentKind, projectRevision: number, sourceVersion: number): Promise<ReconcileJob>;
+  cancel(id: string): Promise<ReconcileJob>;
+  retry(id: string, projectRevision: number, sourceVersion: number): Promise<ReconcileJob>;
+  getCurrentFinal(meetingId: string, kind: ReviewDocumentKind): Promise<ReviewDocument>;
+}
+function record(raw: unknown): Record<string, unknown> { if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new ContractError("项目核对数据格式错误"); return raw as Record<string, unknown>; }
+function str(value: unknown): string { if (typeof value !== "string") throw new ContractError("项目核对文本字段无效"); return value; }
+function int(value: unknown): number { if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) throw new ContractError("项目核对版本字段无效"); return value; }
+function parse(raw: unknown): ReconcileJob { const x = record(raw); if (!["pending", "running", "succeeded", "failed", "cancelled"].includes(String(x.status)) || !["minutes", "decisions", "action_items", "risks", "transcript"].includes(String(x.document_kind))) throw new ContractError("项目核对状态无效"); return { id: str(x.id), projectId: str(x.project_id), meetingId: str(x.meeting_id), documentKind: x.document_kind as ReviewDocumentKind, status: x.status as ReconcileJob["status"], baseRevision: int(x.base_project_revision), attempts: int(x.attempts), resultProposalId: typeof x.result_proposal_id === "string" ? x.result_proposal_id : null, errorClass: typeof x.error_class === "string" ? x.error_class : null, errorMessage: typeof x.error_message === "string" ? x.error_message : null, sourceVersion: typeof x.source_version === "number" ? int(x.source_version) : null, contextTruncated: x.context_truncated === true }; }
+export class HttpProjectReconcileApi implements ProjectReconcileApi {
+  private readonly base: string;
+  constructor(base = "") { this.base = base.trim().replace(/\/+$/, ""); }
+  private async request(path: string, init: RequestInit = {}) { const response = await fetch(`${this.base}${path}`, { ...init, headers: { Accept: "application/json", ...(init.body ? { "Content-Type": "application/json" } : {}) } }); const raw = await response.json().catch(() => null); if (!response.ok) { const detail = raw && typeof raw === "object" ? (raw as { detail?: unknown }).detail : null; throw new ApiError(response.status, typeof detail === "string" ? detail : detail && typeof detail === "object" && "message" in detail && typeof detail.message === "string" ? detail.message : `项目核对未完成（${response.status}）`, raw); } return record(raw); }
+  async list(projectId: string, meetingId?: string | null, cursor?: string | null, signal?: AbortSignal) { const q = new URLSearchParams({ project_id: projectId, limit: "25" }); if (meetingId) q.set("meeting_id", meetingId); if (cursor) q.set("cursor", cursor); const x = await this.request(`/v2/knowledge/project-reconcile/jobs?${q}`, { signal }); if (!Array.isArray(x.items) || typeof x.has_more !== "boolean") throw new ContractError("项目核对分页格式错误"); return { items: x.items.map(parse), nextCursor: typeof x.next_cursor === "string" ? x.next_cursor : null, hasMore: x.has_more }; }
+  async get(id: string, signal?: AbortSignal) { return parse((await this.request(`/v2/knowledge/project-reconcile/jobs/${encodeURIComponent(id)}`, { signal })).job); }
+  async create(meetingId: string, kind: ReviewDocumentKind, projectRevision: number, sourceVersion: number) { return parse((await this.request(`/v2/knowledge/meetings/${encodeURIComponent(meetingId)}/project-reconcile`, { method: "POST", body: JSON.stringify({ document_kind: kind, expected_project_revision: projectRevision, expected_source_version: sourceVersion }) })).job); }
+  async cancel(id: string) { return parse((await this.request(`/v2/knowledge/project-reconcile/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" })).job); }
+  async retry(id: string, projectRevision: number, sourceVersion: number) { return parse((await this.request(`/v2/knowledge/project-reconcile/jobs/${encodeURIComponent(id)}/retry`, { method: "POST", body: JSON.stringify({ expected_project_revision: projectRevision, expected_source_version: sourceVersion }) })).job); }
+  async getCurrentFinal(meetingId: string, kind: ReviewDocumentKind) { const x = await this.request(`/v2/meetings/${encodeURIComponent(meetingId)}/documents/${encodeURIComponent(kind)}`); const raw = record(x.document); if (!raw.user_final || typeof raw.user_final !== "object" || Array.isArray(raw.user_final)) throw new Error("请先核对并保存这份人工终稿。"); const final = record(raw.user_final); const document = parseReviewDocument(raw, kind, meetingId); if (final.modified !== true || document.source !== "user_final" || document.dirtyState !== "saved" || document.userVersion < 1) throw new Error("请先核对并保存这份人工终稿。"); return document; }
+}

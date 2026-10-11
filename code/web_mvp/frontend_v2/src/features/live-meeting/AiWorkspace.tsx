@@ -1,3 +1,11 @@
+import type { KnowledgeApi } from "../../api/knowledge";
+import type { ProjectOutcomesApi } from "../../api/projectOutcomes";
+import { MeetingProjectState } from "../project-workspace/MeetingProjectState";
+import type { MemoryApi } from "../../api/memory";
+import { MemoryPanel } from "../memory/MemoryPanel";
+import { isTranscriptEvidence } from "../../api/sourceEvidence";
+import { MeetingKnowledgeScope } from "../knowledge-library/MeetingKnowledgeScope";
+import { SourceEvidenceList } from "../knowledge-library/SourceEvidenceList";
 import { Check, ChevronDown, ChevronUp, Clock3, FileCheck2, ListTodo, LoaderCircle, MessageSquareText, NotebookPen, Plus, Quote, Save, Send, Target } from "lucide-react";
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ComponentProps, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import ReactMarkdown from "react-markdown";
@@ -8,12 +16,17 @@ import { MeetingFactsPanel } from "./MeetingFactsPanel";
 import type { TranscriptSelection, TranscriptSelectionAction } from "./TranscriptPane";
 
 interface AiWorkspaceProps extends ComponentProps<typeof NowRail> {
+  memoryApi?: MemoryApi;
+  projectApi?: ProjectOutcomesApi;
   meetingId: string;
   api: MeetingApi;
   selection: TranscriptSelection | null;
   askSelectionNonce: number;
   selectionAction?: TranscriptSelectionAction;
   preparationRefreshKey?: number;
+  knowledgeApi?: KnowledgeApi;
+  onKnowledgeContextSaved?: () => void;
+  onEntitiesChanged?: () => void;
 }
 
 const SCOPE_LABELS: Record<AskAiScope, string> = {
@@ -21,6 +34,7 @@ const SCOPE_LABELS: Record<AskAiScope, string> = {
   recent: "最近内容",
   chapter: "当前章节",
   meeting: "整场会议",
+  project: "本场资料（无需会议文字）",
 };
 
 const SELECTION_ACTION_PROMPTS: Partial<Record<TranscriptSelectionAction, string>> = {
@@ -52,7 +66,7 @@ function readWorkspaceViewState(meetingId: string): AiWorkspaceViewState {
 }
 
 function assistantEvidence(message: AskAiMessage): string | null {
-  return message.evidence[0]?.segmentId ?? null;
+  return message.evidence.find(isTranscriptEvidence)?.segmentId ?? null;
 }
 
 function recentContextKindLabel(kind: "topic" | "decision" | "question"): string {
@@ -71,12 +85,18 @@ function recentContextTime(updatedAtMs: number): string {
 }
 
 export function AiWorkspace({
+  memoryApi,
+  projectApi,
   meetingId,
   api,
   selection,
   askSelectionNonce,
   selectionAction = "ask",
   preparationRefreshKey = 0,
+  knowledgeApi,
+  onKnowledgeSource,
+  onKnowledgeContextSaved,
+  onEntitiesChanged,
   onEvidence,
   onMessage,
   ...railProps
@@ -84,6 +104,9 @@ export function AiWorkspace({
   // Realtime coaching is the primary meeting workflow; Ask AI remains available as a deliberate follow-up tool.
   const [tab, setTab] = useState<WorkspaceTab>(() => readWorkspaceViewState(meetingId).tab);
   const [scope, setScope] = useState<AskAiScope>("recent");
+  const [includeKnowledge, setIncludeKnowledge] = useState(true);
+  const [knowledgeRefresh, setKnowledgeRefresh] = useState(0);
+  const [memoryProjectId, setMemoryProjectId] = useState<string | null>(null);
   const [recentMinutes, setRecentMinutes] = useState<1 | 3 | 5 | 10>(3);
   const [recentContextOpen, setRecentContextOpen] = useState(true);
   const [recentContextExpanded, setRecentContextExpanded] = useState(false);
@@ -107,6 +130,26 @@ export function AiWorkspace({
   const [contextSaving, setContextSaving] = useState(false);
   const questionRef = useRef<HTMLTextAreaElement | null>(null);
   const workspaceId = useId();
+  useEffect(() => {
+    if (!memoryApi || !knowledgeApi) return;
+    const controller = new AbortController();
+    void knowledgeApi.getMeetingContext(meetingId, controller.signal).then((context) => { if (!controller.signal.aborted) setMemoryProjectId(context.projectId); }).catch(() => { if (!controller.signal.aborted) setMemoryProjectId(null); });
+    return () => controller.abort();
+  }, [knowledgeApi, knowledgeRefresh, meetingId, memoryApi]);
+  const addProjectCandidate = projectApi ? async (factType: "decision" | "action_item", factId: string) => {
+    const fact = (factType === "decision" ? railProps.decisionCandidates : railProps.actionItems).find((value) => value.id === factId);
+    try {
+      if (!fact || fact.status !== "confirmed" || fact.evidenceStatus === "stale") throw new Error("请先人工确认当前会议事项，再加入项目候选。");
+      const context = await projectApi.getMeetingState(meetingId);
+      if (!context.projectId || context.revision === null) throw new Error("请先保存本场项目资料范围。");
+      const source = await projectApi.getSource({ sourceType: "meeting_entity", sourceId: fact.id, projectId: context.projectId, meetingId });
+      if (source.version !== fact.version) throw new Error("会议事项已更新，请刷新本场内容后重新加入候选。");
+      const task = factType === "action_item" ? railProps.actionItems.find((value) => value.id === factId) : null;
+      await projectApi.createProposal(context.projectId, [{ action: "create", type: factType === "decision" ? "decision" : "task", text: fact.text, status: "active", ...(task ? { owner: task.owner, due: task.deadline } : {}), sourceRefs: [source] }], context.revision, meetingId);
+      onMessage("已加入项目候选，请在资料库的项目状态中审核；尚未进入项目 Wiki。");
+      setKnowledgeRefresh((value) => value + 1);
+    } catch (e) { onMessage(e instanceof Error ? e.message : "项目候选保存失败，请重试。"); }
+  } : undefined;
 
   useEffect(() => {
     const stored = readWorkspaceViewState(meetingId);
@@ -156,7 +199,7 @@ export function AiWorkspace({
       if (!cancelled) setLoading(false);
     });
     return () => { cancelled = true; };
-  }, [loadWorkspace]);
+  }, [loadWorkspace, knowledgeRefresh]);
 
   useEffect(() => {
     if (!api.getMeetingPreparation) return;
@@ -225,14 +268,24 @@ export function AiWorkspace({
           chapterId: effectiveScope === "chapter" ? chapterId : undefined,
           recentMinutes: effectiveScope === "recent" ? recentMinutes : undefined,
           intent: questionOverride === CATCH_UP_PROMPT ? "catch_up" : undefined,
+          includeKnowledge: effectiveScope === "project" || includeKnowledge,
         },
         (delta) => setStreamText((current) => current + delta),
       );
       await loadWorkspace(result.threadId);
-      onMessage("AI 回答已保存");
+      if (result.message.evidenceStatus === "stale" || result.message.errorClass === "EvidenceSuperseded") {
+        onMessage("依据已变化，旧回答已保留供核对，请重新提问。");
+        setQuestion(normalizedQuestion);
+      } else if (result.message.status !== "completed") {
+        setError("本次回答未完成，历史内容已保留。请重试提问。");
+        setQuestion(normalizedQuestion);
+      } else {
+        onMessage("AI 回答已保存");
+      }
     } catch (askError) {
       setError(askError instanceof Error ? askError.message : "AI 回答失败");
       setQuestion(normalizedQuestion);
+      await loadWorkspace().catch(() => undefined);
     } finally {
       setAsking(false);
       setPendingQuestion("");
@@ -241,13 +294,13 @@ export function AiWorkspace({
   };
 
   const saveMessageAsNote = async (message: AskAiMessage) => {
-    if (!api.createNote || savedNoteMessageIds.has(message.messageId)) return;
+    if (!api.createNote || savedNoteMessageIds.has(message.messageId) || message.evidenceStatus === "stale" || message.errorClass === "EvidenceSuperseded") return;
     try {
       await api.createNote(meetingId, {
         body: message.content,
         sourceKind: "ask_ai",
         sourceMessageId: message.messageId,
-        evidence: message.evidence.map((item) => ({
+        evidence: message.evidence.filter(isTranscriptEvidence).map((item) => ({
           segmentId: item.segmentId,
           transcriptSeq: item.transcriptSeq,
           startMs: item.startMs,
@@ -263,7 +316,7 @@ export function AiWorkspace({
   };
 
   const saveMessageAsEntity = async (message: AskAiMessage, kind: "decision_candidate" | "action_item") => {
-    if (!api.createMeetingEntity) return;
+    if (!api.createMeetingEntity || message.evidenceStatus === "stale" || message.errorClass === "EvidenceSuperseded") return;
     const key = `${message.messageId}:${kind}`;
     if (savedEntityKeys.has(key)) return;
     try {
@@ -271,9 +324,11 @@ export function AiWorkspace({
         kind,
         text: message.content,
         sourceMessageId: message.messageId,
-        evidence: message.evidence,
+        evidence: message.evidence.filter(isTranscriptEvidence),
+        sourceEvidence: message.evidence.filter((item) => item.sourceType === "document"),
       });
       setSavedEntityKeys((current) => new Set(current).add(key));
+      onEntitiesChanged?.();
       onMessage(kind === "decision_candidate" ? "已保存为候选事实" : "已保存为候选行动项");
     } catch (saveError) {
       onMessage(saveError instanceof Error ? saveError.message : "保存失败");
@@ -290,6 +345,7 @@ export function AiWorkspace({
         inputDeviceId: preparation.inputDeviceId,
         inputDeviceName: preparation.inputDeviceName,
         noticeAcknowledged: true,
+        liveAnalysisProfile: preparation.liveAnalysisProfile ?? "legacy",
         presetId: preparation.presetId,
         meetingGoal: contextGoal.trim() || null,
         participantRole: contextRole.trim() || null,
@@ -318,6 +374,21 @@ export function AiWorkspace({
   const getCoachRequestStatus = useCallback((jobId: string, signal?: AbortSignal) => {
     if (!api.getCoachRequestStatus) return Promise.reject(new Error("任务进度接口不可用"));
     return api.getCoachRequestStatus(meetingId, jobId, signal);
+  }, [api, meetingId]);
+  const getCoachRequestOutcome = useCallback((jobId: string, signal?: AbortSignal) => {
+    if (!api.getCoachRequestOutcome) return Promise.reject(new Error("请求结果接口不可用"));
+    return api.getCoachRequestOutcome(meetingId, jobId, signal);
+  }, [api, meetingId]);
+  const requestContribution = async (intent: import("../../api/client").ContributionIntent) => {
+    if (!api.requestRealtimeCoach) throw new Error("当前服务尚未提供现场贡献，请检查 AI 连接。");
+    // The host captures the current discussion and source revision. An inferred
+    // display topic is not necessarily the persistent discussion identity.
+    return api.requestRealtimeCoach(meetingId, "", null, undefined, { intent });
+  };
+  const readDiscussion = useCallback((signal?: AbortSignal) => api.getDiscussion ? api.getDiscussion(meetingId, signal) : Promise.resolve(null), [api, meetingId]);
+  const updateDiscussion = useCallback((item: import("../../api/client").DiscussionWorkItem, changes: { title?: string; context?: Record<string, unknown>; state?: string }) => {
+    if (!api.updateDiscussion) return Promise.reject(new Error("当前服务尚未支持议题纠正。"));
+    return api.updateDiscussion(meetingId, item, changes);
   }, [api, meetingId]);
 
   const historyContext = railProps.recentContextHistory ?? [];
@@ -426,9 +497,18 @@ export function AiWorkspace({
             viewStateKey={meetingId}
             activeCoachSkillId={preparation?.presetId ?? "general"}
             onEvidence={onEvidence}
+            sourceMeetingId={meetingId}
+            knowledgeApi={knowledgeApi}
+            onKnowledgeSource={onKnowledgeSource}
+            onProjectCandidate={addProjectCandidate}
             onMessage={onMessage}
             onCoachRefine={requestCoachRefinement}
+            onContribute={requestContribution}
+            onOpenAsk={() => setTab("ask")}
+            onReadDiscussion={api.getDiscussion ? readDiscussion : undefined}
+            onUpdateDiscussion={api.updateDiscussion ? updateDiscussion : undefined}
             onCoachRequestStatus={getCoachRequestStatus}
+            onCoachRequestOutcome={api.getCoachRequestOutcome ? getCoachRequestOutcome : undefined}
           />
         </div>
       ) : tab === "context" ? (
@@ -443,6 +523,7 @@ export function AiWorkspace({
             <div><span>会中上下文</span><strong>会议目标</strong></div>
             <small>{preparation ? `版本 ${preparation.version} · 共 ${Math.max(preparationVersionCount, preparation.version)} 个版本` : "正在加载"}</small>
           </header>
+          {preparation ? <p className="preflight-help">本场主要帮助：{preparation.liveAnalysisProfile === "participation" ? "帮助我参与讨论" : "优先回答听到的问题"}。会中修改目标或提出单次贡献会保留这个方式。</p> : null}
           <label>
             <span>本次会议目标</span>
             <textarea value={contextGoal} onChange={(event) => setContextGoal(event.target.value)} maxLength={2_000} placeholder="明确本次会议需要达成的结果" />
@@ -461,7 +542,10 @@ export function AiWorkspace({
             {contextSaving ? "正在保存" : "保存新版本"}
           </button>
           </> : <header><strong>会议上下文</strong></header>}
-          <MeetingFactsPanel {...railProps} onEvidence={onEvidence} onMessage={onMessage} />
+          {knowledgeApi ? <MeetingKnowledgeScope api={knowledgeApi} meetingId={meetingId} onSaved={() => { setKnowledgeRefresh((value) => value + 1); onKnowledgeContextSaved?.(); }} /> : null}
+          {projectApi ? <MeetingProjectState api={projectApi} knowledgeApi={knowledgeApi} meetingId={meetingId} refreshKey={knowledgeRefresh + preparationRefreshKey} onDocument={onKnowledgeSource} /> : null}
+          {memoryApi ? <MemoryPanel key={`${meetingId}:${memoryProjectId}`} api={memoryApi} projectApi={projectApi} projectId={memoryProjectId} meetingId={meetingId} onChanged={() => { setKnowledgeRefresh((value) => value + 1); onKnowledgeContextSaved?.(); }} onDocument={(source) => { if (!knowledgeApi || !onKnowledgeSource || !source.documentId || !source.versionId) return; void knowledgeApi.getMeetingContext(meetingId).then((context) => onKnowledgeSource({ sourceType: "document", sourceId: source.sourceId, documentId: source.documentId!, projectId: source.projectId, title: source.title ?? "项目资料", versionId: source.versionId!, version: source.version, contentHash: source.contentHash, locator: source.locator, quote: source.quote, contextRevision: context.revision }, meetingId)).catch((e) => onMessage(e instanceof Error ? e.message : "来源不可用，请重新核对。")); }} /> : null}
+          <MeetingFactsPanel {...railProps} onProjectCandidate={addProjectCandidate} knowledgeApi={knowledgeApi} sourceMeetingId={meetingId} onKnowledgeSource={onKnowledgeSource} onEvidence={onEvidence} onMessage={onMessage} />
         </section>
       ) : (
         <div
@@ -527,7 +611,9 @@ export function AiWorkspace({
               <article className={`ask-ai-message ask-ai-message--${message.role}`} key={message.messageId}>
                 <span>{message.role === "user" ? "你" : "AI"}</span>
                 <div><ReactMarkdown>{message.content || (message.status === "failed" ? "本次回答失败，请重试。" : "")}</ReactMarkdown></div>
-                {message.role === "assistant" && message.status === "completed" ? (
+                {message.role === "assistant" && (message.evidenceStatus === "stale" || message.errorClass === "EvidenceSuperseded") ? <p className="inline-error" role="status">回答依据已变化或移出范围，此回答已过期，保留内容仅供历史核对。请重新提问。</p> : message.role === "assistant" && message.evidenceStatus === "unknown" ? <p>这一历史回答的依据版本未完整记录，请核对原文。</p> : null}
+                {message.role === "assistant" ? <SourceEvidenceList evidence={message.evidence} api={knowledgeApi} meetingId={meetingId} onTranscript={onEvidence} onDocument={onKnowledgeSource} stale={message.evidenceStatus === "stale" || message.errorClass === "EvidenceSuperseded"} /> : null}
+                {message.role === "assistant" && message.status === "completed" && message.evidenceStatus !== "stale" && message.errorClass !== "EvidenceSuperseded" ? (
                   <footer>
                     <button type="button" onClick={() => assistantEvidence(message) && onEvidence(assistantEvidence(message)!)} disabled={!assistantEvidence(message)}>
                       <Quote size={13} />查看依据
@@ -568,7 +654,7 @@ export function AiWorkspace({
             <div className="ask-ai-scope-row">
               <select value={scope} onChange={(event) => setScope(event.target.value as AskAiScope)} aria-label="提问范围">
                 {(Object.keys(SCOPE_LABELS) as AskAiScope[]).map((value) => (
-                  <option key={value} value={value} disabled={value === "selection" && !selection}>{SCOPE_LABELS[value]}</option>
+                  <option key={value} value={value} disabled={(value === "selection" && !selection) || (value === "project" && !knowledgeApi)}>{SCOPE_LABELS[value]}</option>
                 ))}
               </select>
               {scope === "chapter" ? (
@@ -585,6 +671,7 @@ export function AiWorkspace({
                 我刚错过了什么
               </button>
             </div>
+            {scope !== "project" && knowledgeApi ? <label><input type="checkbox" checked={includeKnowledge} onChange={(event) => setIncludeKnowledge(event.target.checked)} disabled={asking} />同时参考本场已启用附件与所选项目的已确认资料</label> : scope === "project" ? <p>只询问本场已启用附件及所选项目范围内的已确认资料；不要求已有语音文字。</p> : null}
             {scope === "selection" && selection ? <blockquote>{selection.text}</blockquote> : null}
             <div className="ask-ai-input-row">
               <textarea

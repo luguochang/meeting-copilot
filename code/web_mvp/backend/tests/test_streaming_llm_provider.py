@@ -439,6 +439,29 @@ async def test_classifies_transport_timeout() -> None:
 
 
 @_async_test
+@pytest.mark.parametrize("api_style", ["chat_completions", "responses"])
+async def test_sse_keepalive_cannot_extend_total_deadline_and_closes_local_stream(api_style):
+    closed = asyncio.Event()
+    class Heartbeats(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            while True:
+                yield b": heartbeat\n\n"
+                await asyncio.sleep(.01)
+        async def aclose(self):
+            closed.set()
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=Heartbeats())))
+    provider = OpenAICompatibleStreamingProvider(base_url="https://example.com", api_key="fake", model="fake", client=client,
+                                                timeout_seconds=.05, api_style=api_style)
+    try:
+        with pytest.raises(StreamingProviderError) as error:
+            await asyncio.wait_for(provider.complete([{"role": "user", "content": "test"}]), timeout=1)
+        assert error.value.category is ProviderErrorCategory.TIMEOUT
+        assert closed.is_set()
+    finally:
+        await client.aclose()
+
+
+@_async_test
 @pytest.mark.parametrize(
     ("body", "category"),
     [

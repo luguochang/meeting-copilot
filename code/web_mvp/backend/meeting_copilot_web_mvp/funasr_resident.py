@@ -169,6 +169,8 @@ class FunasrResidentSession:
             "drain_ms": None,
             "skipped_preview_bytes": 0,
             "skipped_silence_bytes": 0,
+            "inference_calls": None,
+            "inference_max_ms": None,
         }
         self._boundary_diagnostics[boundary_id] = diagnostic
         return diagnostic
@@ -251,6 +253,12 @@ class FunasrResidentSession:
             and skipped_preview_bytes >= 0
         ):
             diagnostic["skipped_preview_bytes"] = skipped_preview_bytes
+        inference_calls = event.get("inference_calls")
+        if isinstance(inference_calls, int) and not isinstance(inference_calls, bool) and inference_calls >= 0:
+            diagnostic["inference_calls"] = inference_calls
+        inference_max_ms = event.get("inference_max_ms")
+        if isinstance(inference_max_ms, (int, float)) and not isinstance(inference_max_ms, bool) and math.isfinite(inference_max_ms) and inference_max_ms >= 0:
+            diagnostic["inference_max_ms"] = inference_max_ms
 
     def _snapshot_boundary_diagnostics(self) -> list[dict[str, Any]]:
         with self._state_lock:
@@ -392,9 +400,36 @@ class FunasrResidentSession:
         """Drain one worker utterance and wait for its causal boundary ACK.
 
         The worker emits any residual incremental partial before the ACK. A
-        timeout is fail-closed: no text is promoted and the session remains
-        usable so a later ``END`` can retry over the retained PCM.
+        timeout is fail-closed: no text is promoted. The same attempt remains
+        addressable for a bounded late-ACK wait over the retained PCM.
         """
+
+        return self._wait_for_utterance_boundary(
+            boundary_id, timeout, enqueue_if_missing=True
+        )
+
+    def wait_for_utterance_boundary(
+        self,
+        boundary_id: str,
+        timeout: float = FUNASR_BOUNDARY_ACK_TIMEOUT_S,
+    ) -> list[dict[str, Any]]:
+        """Consume an existing boundary ACK without issuing any worker command.
+
+        Recovery must never reset the streaming cache by enqueueing a fresh
+        flush. A missing/stale token therefore fails instead of starting work.
+        """
+
+        return self._wait_for_utterance_boundary(
+            boundary_id, timeout, enqueue_if_missing=False
+        )
+
+    def _wait_for_utterance_boundary(
+        self,
+        boundary_id: str,
+        timeout: float,
+        *,
+        enqueue_if_missing: bool,
+    ) -> list[dict[str, Any]]:
 
         if (
             not isinstance(boundary_id, str)
@@ -430,6 +465,10 @@ class FunasrResidentSession:
                     )
                 attempt = self._boundary_inflight.get(boundary_id)
                 if attempt is None:
+                    if not enqueue_if_missing:
+                        raise FunasrResidentUnavailableError(
+                            "FunASR resident session has no matching inflight boundary"
+                        )
                     attempt = _BoundaryAttempt(waiter=threading.Event())
                     self._boundary_inflight[boundary_id] = attempt
                     self._boundary_waiters[boundary_id] = attempt.waiter
@@ -443,7 +482,11 @@ class FunasrResidentSession:
                 # ``enqueued_at_monotonic`` is initialized when the attempt is
                 # created.  Only the first caller writes the worker command;
                 # retries reuse the persistent attempt state.
-                should_enqueue = not attempt.command_enqueued
+                if not enqueue_if_missing and not attempt.command_enqueued:
+                    raise FunasrResidentUnavailableError(
+                        "FunASR resident boundary has not been enqueued"
+                    )
+                should_enqueue = enqueue_if_missing and not attempt.command_enqueued
             else:
                 should_enqueue = False
 

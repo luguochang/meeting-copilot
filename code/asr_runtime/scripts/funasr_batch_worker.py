@@ -11,6 +11,11 @@ import json
 import sys
 from pathlib import Path
 
+if __package__ in {None, ""}:
+    from funasr_cpu_checkpoint_loader import install_funasr_cpu_checkpoint_loader
+else:
+    from .funasr_cpu_checkpoint_loader import install_funasr_cpu_checkpoint_loader
+
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="FunASR batch transcribe worker.")
@@ -20,6 +25,7 @@ def main() -> None:
     with contextlib.redirect_stdout(sys.stderr):
         from funasr import AutoModel  # noqa: delayed import (slow model load)
 
+        install_funasr_cpu_checkpoint_loader(AutoModel)
         model = AutoModel(
             model=args.model,
             vad_model="fsmn-vad",

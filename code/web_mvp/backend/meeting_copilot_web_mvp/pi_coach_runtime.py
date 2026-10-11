@@ -15,6 +15,16 @@ import time
 from typing import Any, Mapping, Sequence
 
 from meeting_copilot_web_mvp.coach_skills import coach_skill_payload
+from meeting_copilot_web_mvp.coach_contract import (
+    COACH_ROLE_CONTRACT,
+    COACH_ROLE_CONTRACT_VERSION,
+    extract_role_context,
+)
+from meeting_copilot_web_mvp.participation_contract import (
+    PARTICIPATION_PROFILE,
+    PARTICIPATION_ROLE_CONTRACT,
+    PARTICIPATION_CONTRACT_VERSION,
+)
 
 
 PROTOCOL = "talktrace-pi-coach-jsonl.v1"
@@ -94,7 +104,10 @@ def build_pi_coach_request(
 ) -> dict[str, Any]:
     """Serialize the already-validated intelligence request for the Pi bridge."""
 
+    from .user_memory import memory_model_projection
+
     normalized_priority_mode = str(priority_mode or "realtime").strip().lower()
+    direct_participation = getattr(request, "request_metadata", {}).get("automatic_direct") is True
     if normalized_priority_mode not in {"realtime", "deep"}:
         raise ValueError("priority_mode must be realtime or deep")
 
@@ -125,6 +138,11 @@ def build_pi_coach_request(
         if paragraph_id not in already_visible_ids
         if (paragraph := paragraphs_by_id.get(paragraph_id)) is not None
     ][:3]
+    role_context = extract_role_context(
+        request.meeting_goal,
+        participant_role=getattr(request, "participant_role", None),
+        focus_points=getattr(request, "focus_points", ()),
+    )
     return {
         "request_id": str(request_id),
         "session_id": str(request.meeting_id),
@@ -141,6 +159,14 @@ def build_pi_coach_request(
             ),
         },
         "context": {
+            "coach_profile": getattr(request, "coach_profile", "legacy"),
+            "request_metadata": dict(getattr(request, "request_metadata", {})),
+            "role_contract": (PARTICIPATION_ROLE_CONTRACT
+                              if getattr(request, "coach_profile", "legacy") == PARTICIPATION_PROFILE
+                              else COACH_ROLE_CONTRACT),
+            "role_contract_version": (PARTICIPATION_CONTRACT_VERSION
+                                      if getattr(request, "coach_profile", "legacy") == PARTICIPATION_PROFILE
+                                      else COACH_ROLE_CONTRACT_VERSION),
             "state_revision": int(request.state_revision),
             "trigger_type": str(request.trigger_type),
             "work_item_id": request.work_item_id,
@@ -149,11 +175,12 @@ def build_pi_coach_request(
             # Pi is a decision lane, not the transcript index. Keep its
             # prompt small and let the bounded search tool retrieve older
             # evidence only when the current decision needs it.
-            "context_paragraphs": [asdict(item) for item in request.context_paragraphs[-3 if normalized_priority_mode == "deep" else -2:]],
+            "context_paragraphs": [asdict(item) for item in (request.context_paragraphs if direct_participation
+                else request.context_paragraphs[-3 if normalized_priority_mode == "deep" else -2:])],
             # Historical evidence is available through Pi's bounded search
             # tool. Keep the initial prompt small; replaying a long meeting
             # here made later coach turns pay for the same text repeatedly.
-            "retrieval_paragraphs": [asdict(item) for item in request.retrieval_paragraphs[-8:]],
+            "retrieval_paragraphs": [asdict(item) for item in request.retrieval_paragraphs[-12 if direct_participation else -8:]],
             # Cross-batch clarity candidates may cite one older paragraph.
             # Send only the exact referenced evidence so the fast Pi prompt
             # can inspect it without replaying the whole retrieval window.
@@ -167,6 +194,13 @@ def build_pi_coach_request(
             "compact_terminal_contract": bool(candidate_events),
             "rolling_state": dict(request.rolling_state),
             "meeting_goal": request.meeting_goal,
+            "participant_role": role_context["participant_role"],
+            "focus_points": role_context["focus_points"],
+            "document_evidence": list(getattr(request, "document_evidence", ())),
+            "knowledge_context": dict(getattr(request, "knowledge_context", {})),
+            "user_memory": memory_model_projection(getattr(request, "user_memory", {})),
+            # The host request already validates glossary size and term length.
+            "glossary": list(request.glossary),
             "coach_skill": coach_skill_payload(request.coach_skill_id),
         },
     }
@@ -194,6 +228,9 @@ class PiCoachSidecar:
         self._ready = threading.Event()
         self._cancel_requested = threading.Event()
         self._lock = threading.Lock()
+        self._inflight_condition = threading.Condition()
+        self._active_evaluations = 0
+        self._capabilities: frozenset[str] = frozenset()
         self.stderr_bytes_drained = 0
 
     def prewarm(self) -> dict[str, Any]:
@@ -249,6 +286,17 @@ class PiCoachSidecar:
     def available(self) -> bool:
         return bool(self.command)
 
+    def wait_until_idle(self, timeout: float = 0.75) -> bool:
+        """Wait for cancellation to release this channel, without starting work."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._inflight_condition:
+            while self._active_evaluations:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._inflight_condition.wait(timeout=remaining)
+        return True
+
     async def evaluate(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         try:
             return await asyncio.to_thread(self._evaluate_sync, dict(payload))
@@ -260,13 +308,38 @@ class PiCoachSidecar:
             raise
 
     def _evaluate_sync(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._inflight_condition:
+            self._active_evaluations += 1
+        try:
+            return self._evaluate_sync_impl(payload)
+        finally:
+            with self._inflight_condition:
+                self._active_evaluations -= 1
+                self._inflight_condition.notify_all()
+
+    def _evaluate_sync_impl(self, payload: dict[str, Any]) -> dict[str, Any]:
+        reconcile_mode = (payload.get("context") or {}).get("task_mode") == "project_reconcile"
+        memory_mode = (payload.get("context") or {}).get("task_mode") == "memory_reconcile"
+        preparation_mode = (payload.get("context") or {}).get("task_mode") == "meeting_preparation"
         registry = (
             self._evidence_registry_factory(str(payload.get("session_id") or ""))
             if self._evidence_registry_factory is not None else None
         )
         payload = {**payload, "host_evidence_enabled": registry is not None}
+        documents = (payload.get("context") or {}).get("document_evidence") or []
+        if documents:
+            if registry is None or not hasattr(registry, "register_documents"):
+                raise PiCoachRuntimeError("Pi document registry unavailable", code="pi_invalid_request")
+            if (payload.get("context") or {}).get("coach_profile") == "participation":
+                registry.register_documents(documents, max_sources=12, max_characters=8000)
+            else:
+                registry.register_documents(documents)
         host_calls: set[str] = set()
         retrieved: dict[str, dict[str, Any]] = {}
+        project_changes = None
+        memory_update = None
+        preparation_brief = None
+        project_state = None
         encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         if len(encoded.encode("utf-8")) > MAX_REQUEST_BYTES:
             raise PiCoachRuntimeError("Pi request exceeds the byte budget", code="pi_request_too_large")
@@ -286,6 +359,10 @@ class PiCoachSidecar:
                 )
                 startup_started = time.perf_counter()
                 self._ensure_started_unlocked()
+                if ((payload.get("context") or {}).get("coach_profile") == "participation"
+                        and "participation.v1" not in self._capabilities):
+                    raise PiCoachRuntimeError("Pi bridge does not support participation.v1",
+                                              code="pi_unsupported_profile")
                 bridge_startup_ms = max(0.0, (time.perf_counter() - startup_started) * 1_000)
                 process = self._process
                 if process is None or process.stdin is None or process.poll() is not None:
@@ -358,8 +435,9 @@ class PiCoachSidecar:
                         call_id = response.get("call_id")
                         tool_name = response.get("tool")
                         if (registry is None or call_id != f"evidence-{len(host_calls) + 1}"
-                                or call_id in host_calls or len(host_calls) >= 4
-                                or tool_name not in {"search_prior_evidence", "read_transcript_span"}):
+                                or call_id in host_calls or len(host_calls) >= (5 if preparation_mode else 3 if memory_mode else 6 if reconcile_mode else 4)
+                                or tool_name not in ({"search_project_documents", "read_project_state", "submit_preparation_brief"} if preparation_mode else {"propose_memory_update"} if memory_mode else {"search_project_documents", "read_project_state", "propose_project_changes"} if reconcile_mode else
+                                                     {"search_prior_evidence", "read_transcript_span", "search_project_documents", "read_project_state"})):
                             self._stop_unlocked()
                             raise PiCoachRuntimeError("Invalid host tool request", code="pi_protocol_error")
                         host_calls.add(call_id)
@@ -369,7 +447,22 @@ class PiCoachSidecar:
                             arguments = response.get("arguments")
                             if not isinstance(arguments, Mapping):
                                 raise ValueError("invalid tool arguments")
-                            if tool_name == "search_prior_evidence":
+                            if tool_name == "submit_preparation_brief":
+                                if preparation_brief is not None or not hasattr(registry, "validate_preparation_brief"):
+                                    raise ValueError("preparation terminal already captured or unavailable")
+                                preparation_brief = registry.validate_preparation_brief(arguments)
+                                rows = preparation_brief
+                            elif tool_name == "propose_memory_update":
+                                if memory_update is not None or not hasattr(registry, "validate_memory_update"):
+                                    raise ValueError("memory terminal already captured or unavailable")
+                                memory_update = registry.validate_memory_update(arguments)
+                                rows = memory_update
+                            elif tool_name == "propose_project_changes":
+                                if project_changes is not None or not hasattr(registry, "validate_project_changes"):
+                                    raise ValueError("project terminal already captured or unavailable")
+                                project_changes = registry.validate_project_changes(arguments)
+                                rows = project_changes
+                            elif tool_name == "search_prior_evidence":
                                 if set(arguments) - {"query", "max_results", "include_neighbors"}:
                                     raise ValueError("invalid search arguments")
                                 search_kwargs = {"limit": arguments.get("max_results", 4)}
@@ -378,7 +471,7 @@ class PiCoachSidecar:
                                 if arguments.get("include_neighbors") is True:
                                     search_kwargs["include_neighbors"] = True
                                 rows = registry.search(arguments.get("query"), **search_kwargs)
-                            else:
+                            elif tool_name == "read_transcript_span":
                                 if set(arguments) - {"segment_id", "before", "after"}:
                                     raise ValueError("invalid span arguments")
                                 rows = registry.read_span(
@@ -386,12 +479,23 @@ class PiCoachSidecar:
                                     before=arguments.get("before", 1),
                                     after=arguments.get("after", 1),
                                 )
-                            paragraphs = [self._host_evidence_paragraph(row) for row in rows]
+                            elif tool_name == "search_project_documents":
+                                if set(arguments) - {"query", "max_results"}:
+                                    raise ValueError("invalid document search arguments")
+                                rows = registry.search_documents(arguments.get("query"), limit=arguments.get("max_results", 6))
+                            else:
+                                if arguments:
+                                    raise ValueError("project state tool accepts no model-supplied scope")
+                                rows = registry.read_project_state()
+                                if not reconcile_mode and not preparation_mode and isinstance(rows, list) and len(rows) == 1:
+                                    project_state = dict(rows[0])
+                            paragraphs = rows if tool_name in {"search_project_documents", "read_project_state", "propose_project_changes", "propose_memory_update", "submit_preparation_brief"} else [self._host_evidence_paragraph(row) for row in rows]
                             reply.update(ok=True, results=paragraphs)
                             reply_text = json.dumps(reply, ensure_ascii=False, separators=(",", ":"))
                             if len(reply_text.encode("utf-8")) > 48_000:
                                 raise ValueError("host evidence exceeds byte budget")
-                            retrieved.update({row["segment_id"]: row for row in rows})
+                            if tool_name not in {"search_project_documents", "read_project_state", "propose_project_changes", "propose_memory_update", "submit_preparation_brief"}:
+                                retrieved.update({row["segment_id"]: row for row in rows})
                         except Exception:
                             # Database/error text must never enter model context.
                             reply = {"protocol": PROTOCOL, "event": "host_tool_response",
@@ -405,11 +509,38 @@ class PiCoachSidecar:
                         continue
                     validation_started = time.perf_counter()
                     try:
-                        validated = self._validate_response(response)
+                        validated = self._validate_response(response, task_mode="meeting_preparation" if preparation_mode else "memory_reconcile" if memory_mode else "project_reconcile" if reconcile_mode else "realtime")
                         # Never accept extra evidence supplied by the bridge itself.
                         validated.pop("host_evidence", None)
+                        validated.pop("host_source_evidence", None)
+                        validated.pop("host_project_changes", None)
+                        validated.pop("host_memory_update", None)
+                        validated.pop("host_preparation_brief", None)
+                        validated.pop("host_project_state", None)
+                        if not reconcile_mode and not preparation_mode and project_state is not None:
+                            validated["host_project_state"] = registry.validate_project_state(project_state)
+                        if reconcile_mode:
+                            if project_changes is None or validated.get("project_changes") != project_changes:
+                                raise PiCoachRuntimeError("Project result was not captured by the host", code="pi_protocol_error")
+                            registry.validate_project_changes(project_changes)
+                            validated["host_project_changes"] = project_changes
+                        if memory_mode:
+                            if memory_update is None or validated.get("memory_update") != memory_update:
+                                raise PiCoachRuntimeError("Memory result was not captured by the host", code="pi_protocol_error")
+                            registry.validate_memory_update(memory_update)
+                            validated["host_memory_update"] = memory_update
+                        if preparation_mode:
+                            if preparation_brief is None or validated.get("preparation_brief") != preparation_brief:
+                                raise PiCoachRuntimeError("Preparation was not captured by the host", code="pi_protocol_error")
+                            registry.validate_preparation_brief(preparation_brief)
+                            validated["host_preparation_brief"] = preparation_brief
                         intervention = validated.get("intervention")
                         if registry is not None and isinstance(intervention, Mapping):
+                            refs = intervention.get("document_evidence_refs") or []
+                            if refs:
+                                validated["host_source_evidence"] = registry.validate_documents(refs)
+                                intervention = {**intervention, "source_evidence": validated["host_source_evidence"]}
+                                validated["intervention"] = intervention
                             ids = intervention.get("evidence_segment_ids") or []
                             quotes = {key: retrieved[key]["normalized_text"] for key in ids if key in retrieved}
                             if quotes:
@@ -559,6 +690,11 @@ class PiCoachSidecar:
                         )
                         return
                     if payload.get("event") == "ready":
+                        if self._process is process:
+                            self._capabilities = frozenset(
+                                str(item) for item in payload.get("capabilities", [])
+                                if isinstance(item, str)
+                            )
                         ready_event.set()
                         continue
                     self._put_response(payload, response_queue)
@@ -593,7 +729,7 @@ class PiCoachSidecar:
             pass
 
     @staticmethod
-    def _validate_response(response: dict[str, Any]) -> dict[str, Any]:
+    def _validate_response(response: dict[str, Any], *, task_mode: str = "realtime") -> dict[str, Any]:
         if response.get("protocol") != PROTOCOL:
             raise PiCoachRuntimeError("Pi response protocol mismatch", code="pi_protocol_error")
         if response.get("ok") is not True:
@@ -602,6 +738,18 @@ class PiCoachSidecar:
             message = str(error.get("message") or "Pi agent failed")[:500]
             metrics = error.get("metrics") if isinstance(error.get("metrics"), Mapping) else None
             raise PiCoachRuntimeError(message, code=code, metrics=metrics)
+        if task_mode == "meeting_preparation":
+            if response.get("action") != "preparation_brief" or not isinstance(response.get("preparation_brief"), Mapping):
+                raise PiCoachRuntimeError("Invalid preparation response", code="pi_protocol_error")
+            return response
+        if task_mode == "project_reconcile":
+            if response.get("action") != "project_changes" or not isinstance(response.get("project_changes"), Mapping):
+                raise PiCoachRuntimeError("Project changes response is invalid", code="pi_protocol_error")
+            return response
+        if task_mode == "memory_reconcile":
+            if response.get("action") != "memory_update" or not isinstance(response.get("memory_update"), Mapping):
+                raise PiCoachRuntimeError("Memory update response is invalid", code="pi_protocol_error")
+            return response
         if response.get("action") not in {"intervention", "silent"}:
             raise PiCoachRuntimeError("Pi response action is invalid", code="pi_protocol_error")
         if response.get("action") == "intervention" and not isinstance(response.get("intervention"), Mapping):
@@ -615,23 +763,34 @@ class PiCoachSidecar:
 
     def _stop_unlocked(self) -> None:
         process = self._process
-        self._process = None
         self._ready.clear()
+        self._capabilities = frozenset()
         if process is None:
             return
-        for stream_name in ("stdin", "stdout", "stderr"):
-            stream = getattr(process, stream_name, None)
-            if stream is not None:
-                try:
-                    stream.close()
-                except OSError:
-                    pass
+        # TextIOWrapper.close() can wait for a reader's buffered-pipe lock.
+        # Stop the producer first so blocking stdout/stderr reads receive EOF;
+        # never place an unbounded pipe close before terminate/kill.
         if process.poll() is None:
             try:
                 process.terminate()
                 process.wait(timeout=2.0)
             except (OSError, subprocess.TimeoutExpired):
+                pass
+        if process.poll() is None:
+            try:
+                process.kill()
+                process.wait(timeout=2.0)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        if process.poll() is None:
+            # Retain the process for a later cleanup attempt and do not close
+            # its live pipes, which could block the cancelling caller again.
+            raise PiCoachRuntimeError("Pi process exit was not acknowledged", code="pi_stop_unconfirmed") from None
+        self._process = None
+        for stream_name in ("stdin", "stdout", "stderr"):
+            stream = getattr(process, stream_name, None)
+            if stream is not None:
                 try:
-                    process.kill()
-                except OSError:
+                    stream.close()
+                except (OSError, ValueError):
                     pass

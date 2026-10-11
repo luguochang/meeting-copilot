@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import queue
+import subprocess
+import sys
 import threading
+import time
+from dataclasses import replace
 from io import StringIO
 
 import pytest
 
+from meeting_copilot_web_mvp.coach_contract import COACH_ROLE_CONTRACT, COACH_ROLE_CONTRACT_VERSION
 from meeting_copilot_web_mvp.pi_coach_runtime import (
     PROTOCOL,
     PiCoachRuntimeError,
@@ -138,6 +143,66 @@ def test_pi_request_without_candidates_keeps_full_terminal_contract() -> None:
 
     assert payload["context"]["candidate_events"] == []
     assert payload["context"]["compact_terminal_contract"] is False
+
+
+def _serialize_context(request):
+    return build_pi_coach_request(
+        request, request_id="role-context", base_url="https://gateway.example.test",
+        api_key="private-test-key", model="coach-model", api_style="chat_completions",
+        timeout_seconds=10,
+    )["context"]
+
+
+def test_pi_role_contract_carries_explicit_role_focus_glossary_and_full_goal():
+    request = RealtimeIntelligenceRequest.from_payload(
+        meeting_id="pi-role-context", state_revision=1,
+        new_paragraphs=[{"id": "s1", "text": "我们在核对发布条件。", "revision": 2,
+                         "correction_status": "changed"}],
+        context_paragraphs=[], rolling_state={}, meeting_goal="核对发布条件",
+        participant_role="项目主持人", focus_points=["放行条件", "未完成事项"],
+        glossary=["P99", "checkout-service"], coach_skill_id="project",
+    )
+    context = _serialize_context(request)
+
+    assert context["role_contract"] == COACH_ROLE_CONTRACT
+    assert context["role_contract_version"] == COACH_ROLE_CONTRACT_VERSION
+    assert context["meeting_goal"] == "核对发布条件"
+    assert context["participant_role"] == "项目主持人"
+    assert context["focus_points"] == ["放行条件", "未完成事项"]
+    assert context["glossary"] == ["P99", "checkout-service"]
+    assert context["new_paragraphs"][0]["correction_status"] == "changed"
+    assert context["new_paragraphs"][0]["revision"] == 2
+
+
+def test_pi_legacy_delimited_goal_is_preserved_and_explicit_role_wins():
+    goal = "了解真实需求；参会角色：旧主持人；重点关注：频率、替代方案；输出格式：brief"
+    request = replace(_request(), meeting_goal=goal)
+    legacy = _serialize_context(request)
+    assert legacy["meeting_goal"] == goal
+    assert legacy["participant_role"] == "旧主持人"
+    assert legacy["focus_points"] == ["频率", "替代方案"]
+
+    explicit = _serialize_context(replace(request, participant_role="新访谈者", focus_points=("具体行为",)))
+    assert explicit["participant_role"] == "新访谈者"
+    assert explicit["focus_points"] == ["具体行为"]
+
+
+def test_pi_mapping_goal_is_not_dropped_and_plain_goal_does_not_infer_identity():
+    structured = {"meeting_goal": "核对交付范围", "participant_role": "主持人",
+                  "focus_points": ["验收前提"]}
+    context = _serialize_context(replace(_request(), meeting_goal=structured))
+    assert context["meeting_goal"] == structured
+    assert context["participant_role"] == "主持人"
+    assert context["focus_points"] == ["验收前提"]
+
+    plain = _serialize_context(replace(_request(), meeting_goal="说明参会角色：主持人如何推进讨论"))
+    assert plain["participant_role"] is None
+    assert plain["focus_points"] == []
+
+
+def test_pi_preserves_all_host_validated_glossary_terms():
+    glossary = tuple(f"业务术语{index}" for index in range(100))
+    assert _serialize_context(replace(_request(), glossary=glossary))["glossary"] == list(glossary)
 
 
 def test_pi_request_can_select_the_explicit_deep_lane() -> None:
@@ -362,12 +427,13 @@ def test_sidecar_timeout_keeps_local_phase_metrics_for_diagnosis() -> None:
         stdin = Stream()
         stdout = Stream()
         stderr = Stream()
+        returncode = None
 
         def poll(self):
-            return None
+            return self.returncode
 
         def terminate(self) -> None:
-            return None
+            self.returncode = -15
 
         def wait(self, timeout=None) -> None:
             return None
@@ -472,3 +538,175 @@ def test_stale_stdout_reader_cannot_inject_error_into_next_generation() -> None:
     assert new_ready.is_set() is False
     with pytest.raises(queue.Empty):
         new_queue.get_nowait()
+
+
+def _silent_pipe_sidecar() -> PiCoachSidecar:
+    """Real child/production reader threads, with no SDK or Provider work."""
+    code = (
+        "import json,time;print(json.dumps("
+        + repr({"protocol": PROTOCOL, "event": "ready", "capabilities": []})
+        + "),flush=True);time.sleep(30)"
+    )
+    sidecar = PiCoachSidecar(command=[sys.executable, "-u", "-c", code])
+    with sidecar._lock:
+        sidecar._ensure_started_unlocked()
+    assert sidecar._process is not None and sidecar._process.poll() is None
+    assert sidecar._ready.is_set()
+    # After the ready line, stdout waits for its next line while stderr's
+    # read(4096) waits on a live, empty pipe. Closing either first can deadlock.
+    time.sleep(0.05)
+    return sidecar
+
+
+def test_real_blocking_pipe_cancellation_exits_promptly_and_cannot_poison_next_channel() -> None:
+    sidecar = _silent_pipe_sidecar()
+    process = sidecar._process
+    old_queue = sidecar._responses
+    next_queue: queue.Queue[dict] = queue.Queue(maxsize=8)
+    next_ready = threading.Event()
+    sidecar._responses = next_queue
+    sidecar._ready = next_ready
+    watchdog_fired = threading.Event()
+    finished = threading.Event()
+    errors: list[BaseException] = []
+
+    def watchdog() -> None:
+        watchdog_fired.set()
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=1)
+
+    def cancel() -> None:
+        try:
+            sidecar.close()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    guard = threading.Timer(3.0, watchdog)
+    guard.daemon = True
+    worker = threading.Thread(target=cancel, daemon=True)
+    started = time.perf_counter()
+    guard.start()
+    worker.start()
+    try:
+        assert finished.wait(timeout=4), "stop did not return after watchdog cleanup"
+        assert time.perf_counter() - started < 1
+        assert not watchdog_fired.is_set()
+        assert not errors
+        assert process.poll() is not None
+        assert sidecar._process is None
+        for reader in (sidecar._reader, sidecar._stderr_reader):
+            reader.join(timeout=1)
+            assert not reader.is_alive()
+        assert old_queue.get_nowait() == {"_bridge_error": "Pi bridge output closed"}
+        assert next_ready.is_set() is False
+        with pytest.raises(queue.Empty):
+            next_queue.get_nowait()
+        sidecar.close()  # Repeated cancellation has no process left to stop.
+    finally:
+        guard.cancel()
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=1)
+        worker.join(timeout=1)
+        for stream in (process.stdin, process.stdout, process.stderr):
+            stream.close()
+
+
+def test_real_already_exited_bridge_can_be_closed_without_restarting() -> None:
+    sidecar = _silent_pipe_sidecar()
+    process = sidecar._process
+    try:
+        process.terminate()
+        process.wait(timeout=1)
+        sidecar.close()
+        assert sidecar._process is None
+        assert all(stream.closed for stream in (process.stdin, process.stdout, process.stderr))
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=1)
+        sidecar.close()
+
+
+def test_stop_escalates_to_kill_and_closes_only_after_confirmed_exit() -> None:
+    class Stream:
+        closed = False
+
+        def close(self) -> None:
+            assert process.poll() is not None
+            self.closed = True
+
+    class Process:
+        def __init__(self) -> None:
+            self.stdin, self.stdout, self.stderr = Stream(), Stream(), Stream()
+            self.returncode = None
+            self.terminate_calls = 0
+            self.kill_calls = 0
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.terminate_calls += 1
+
+        def wait(self, timeout=None):
+            if self.returncode is None:
+                raise subprocess.TimeoutExpired("fixed-test-child", timeout)
+            return self.returncode
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+            self.returncode = -9
+
+    process = Process()
+    sidecar = PiCoachSidecar(command=["unused-test-command"])
+    sidecar._process = process
+    sidecar.close()
+    assert process.terminate_calls == process.kill_calls == 1
+    assert all(stream.closed for stream in (process.stdin, process.stdout, process.stderr))
+    assert sidecar._process is None
+
+
+def test_unconfirmed_exit_retains_process_and_never_closes_live_pipes() -> None:
+    class Stream:
+        closed = False
+
+        def close(self) -> None:
+            assert process.poll() is not None
+            self.closed = True
+
+    class Process:
+        def __init__(self) -> None:
+            self.stdin, self.stdout, self.stderr = Stream(), Stream(), Stream()
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self) -> None:
+            raise OSError("fixed-test-termination-denied")
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired("fixed-test-child", timeout)
+
+        def kill(self) -> None:
+            raise OSError("fixed-test-kill-denied")
+
+    process = Process()
+    sidecar = PiCoachSidecar(command=["unused-test-command"])
+    sidecar._process = process
+    sidecar._ready.set()
+    with pytest.raises(PiCoachRuntimeError) as caught:
+        sidecar.close()
+    assert caught.value.code == "pi_stop_unconfirmed"
+    assert sidecar._process is process
+    assert not sidecar._ready.is_set()
+    assert not any(stream.closed for stream in (process.stdin, process.stdout, process.stderr))
+    # A later cleanup can confirm exit and release the retained pipe handles.
+    process.returncode = -9
+    sidecar.close()
+    assert sidecar._process is None
+    assert all(stream.closed for stream in (process.stdin, process.stdout, process.stderr))

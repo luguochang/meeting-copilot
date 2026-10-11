@@ -444,6 +444,8 @@ def test_llm_config_from_env_reads_values(monkeypatch):
 def test_explicit_realtime_model_env_is_prioritized_with_provenance(monkeypatch):
     llm_service.clear_runtime_config()
     monkeypatch.delenv("MEETING_COPILOT_DESKTOP_RUNTIME", raising=False)
+    monkeypatch.delenv("LLM_GATEWAY_CORRECTION_MODEL", raising=False)
+    monkeypatch.setenv("LLM_GATEWAY_API_STYLE", "chat_completions")
     monkeypatch.setenv("LLM_GATEWAY_BASE_URL", "https://gw.example")
     monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-x")
     monkeypatch.setenv("LLM_GATEWAY_MODEL", "general-model")
@@ -658,6 +660,9 @@ def test_llm_config_from_env_does_not_read_dotenv_when_process_env_is_complete(m
 
 
 def test_llm_config_from_env_loads_repo_dotenv_when_process_env_missing(monkeypatch, tmp_path):
+    # This test reads only its synthetic file even when the suite disables the
+    # developer's real dotenv configuration.
+    monkeypatch.delenv("PYTHON_DOTENV_DISABLED", raising=False)
     monkeypatch.delenv("LLM_GATEWAY_BASE_URL", raising=False)
     monkeypatch.delenv("LLM_GATEWAY_API_KEY", raising=False)
     monkeypatch.delenv("LLM_GATEWAY_MODEL", raising=False)
@@ -829,3 +834,92 @@ def test_call_with_retry_does_not_retry_permanent_provider_error(monkeypatch):
         llm_service._call_with_retry(fake, "https://gateway.example", {}, {}, 5, retries=2)
 
     assert len(fake.calls) == 1
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize(
+    ("timeout_type", "expected_origin"),
+    [
+        (llm_service.httpx.PoolTimeout, "pool"),
+        (llm_service.httpx.ConnectTimeout, "connect"),
+        (llm_service.httpx.ReadTimeout, "read"),
+        (llm_service.httpx.WriteTimeout, "write"),
+        (llm_service.httpx.TimeoutException, "unknown"),
+    ],
+)
+def test_provider_timeout_origin_preserves_contract_without_sensitive_details(
+    is_async, timeout_type, expected_origin,
+):
+    request = llm_service.httpx.Request("POST", "https://private.example/secret-route")
+    original = timeout_type("private body and credential sk-must-not-escape", request=request)
+    calls = []
+
+    class FailingClient:
+        def post(self, url, **kwargs):
+            calls.append((url, kwargs))
+            raise original
+
+    class FailingAsyncClient:
+        async def post(self, url, **kwargs):
+            calls.append((url, kwargs))
+            raise original
+
+    with pytest.raises(llm_service.LlmProviderTransportError) as caught:
+        if is_async:
+            asyncio.run(llm_service._provider_post_async(FailingAsyncClient(), "unused", {}, {"model": "m"}, 4.0))
+        else:
+            llm_service._provider_post(FailingClient(), "unused", {}, {"model": "m"})
+
+    error = caught.value
+    assert error.timeout_origin == expected_origin
+    assert error.category == "timeout"
+    assert error.retryable is True
+    assert error.status_code is None
+    assert error.provider_code is None
+    assert str(error) == "llm_provider_timeout"
+    assert llm_service.provider_failure_message(error) == "AI 中转站请求超时，请稍后重试"
+    assert error.__cause__ is None
+    assert error.__suppress_context__ is True
+    assert vars(error) == {
+        "category": "timeout",
+        "retryable": True,
+        "status_code": None,
+        "provider_code": None,
+        "timeout_origin": expected_origin,
+    }
+    assert len(calls) == 1
+    assert calls[0][1]["json"] == {"model": "m"}
+    if is_async:
+        assert calls[0][1]["timeout"] == 4.0
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_provider_transport_error_keeps_unknown_timeout_origin(is_async):
+    class FailingClient:
+        def post(self, *_args, **_kwargs):
+            raise llm_service.httpx.ConnectError("private transport details")
+
+    class FailingAsyncClient:
+        async def post(self, *_args, **_kwargs):
+            raise llm_service.httpx.ConnectError("private transport details")
+
+    with pytest.raises(llm_service.LlmProviderTransportError) as caught:
+        if is_async:
+            asyncio.run(llm_service._provider_post_async(FailingAsyncClient(), "unused", {}, {}, 4.0))
+        else:
+            llm_service._provider_post(FailingClient(), "unused", {}, {})
+
+    error = caught.value
+    assert error.timeout_origin == "unknown"
+    assert error.category == "transport"
+    assert error.retryable is True
+    assert error.status_code is None
+    assert error.provider_code is None
+    assert str(error) == "llm_provider_transport"
+    assert llm_service.provider_failure_message(error) == "无法连接 AI 中转站，请检查网络和中转站地址"
+
+
+def test_provider_timeout_origin_defaults_unknown_and_rejects_untrusted_values():
+    assert llm_service.LlmProviderTransportError("timeout").timeout_origin == "unknown"
+    assert llm_service.LlmProviderTransportError("timeout", timeout_origin="private-secret").timeout_origin == "unknown"
+    assert llm_service.LlmProviderTransportError("transport", timeout_origin="read").timeout_origin == "unknown"

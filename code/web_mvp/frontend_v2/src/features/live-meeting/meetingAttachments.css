@@ -1,0 +1,17 @@
+.meeting-attachments-layer { z-index: 120; }
+.meeting-attachments-dialog { position: fixed; inset: 5vh 5vw; background: #fff; z-index: 1; padding: 24px; border-radius: 14px; display: flex; flex-direction: column; overflow: hidden; box-shadow: 0 20px 80px #0f172a30; }
+.meeting-attachments-dialog header { display: flex; justify-content: space-between; gap: 12px; }
+.meeting-attachments-dialog header h2 { margin: 0; }.meeting-attachments-dialog header p { font-size: 13px; color: #64748b; }
+.attachment-upload { display: flex; align-items: center; gap: 12px; padding: 12px 0; font-size: 13px; }
+.attachment-upload input[type=file] { position: absolute; width: 1px; height: 1px; clip-path: inset(50%); overflow: hidden; }
+.attachment-upload .secondary-button { cursor: pointer; flex-shrink: 0; }.attachment-upload small { color: #64748b; }
+.attachment-upload:focus-within .secondary-button { outline: 2px solid #6366f1; outline-offset: 2px; }
+.meeting-attachments-content { display: grid; grid-template-columns: minmax(180px, 25%) 1fr; gap: 24px; min-height: 0; flex: 1; }
+.meeting-attachments-content nav { display: flex; flex-direction: column; gap: 8px; overflow: auto; }.meeting-attachments-content nav button { display: flex; flex-shrink: 0; gap: 8px; text-align: left; padding: 12px; border: 1px solid #e2e8f0; border-radius: 8px; background: #f8fafc; }
+.meeting-attachments-content nav button[aria-pressed=true] { border-color: #6366f1; background: #eef2ff; }.meeting-attachments-content small { display: block; color: #64748b; font-size: 12px; }
+.meeting-attachments-content > section { display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }.attachment-body-scroll { min-height: 0; flex: 1; overflow: auto; padding-right: 8px; }.attachment-spans p { white-space: pre-wrap; font-size: 14px; line-height: 1.7; }.attachment-spans article { padding: 10px; border-bottom: 1px solid #e2e8f0; }.attachment-span-highlight { background: #fef3c7; }
+.meeting-attachments-content textarea { width: 100%; min-height: 280px; }.meeting-attachments-content footer { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }.meeting-attachments-dialog button { cursor: pointer; }.meeting-attachments-dialog button:disabled { cursor: default; opacity: .55; }
+.meeting-attachments-content footer { flex-shrink: 0; padding-top: 10px; border-top: 1px solid #e2e8f0; }.meeting-attachments-content .attachment-management { margin-top: 8px; padding-top: 6px; border-top: 0; font-size: 12px; }
+.attachment-range { border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px 12px; font-size: 12px; margin: 10px 0; }.attachment-range legend { font-weight: 600; }.attachment-range label { display: inline-flex; gap: 6px; align-items: center; margin-right: 14px; }.attachment-range p { color: #64748b; margin: 6px 0; }
+.attachment-draft-tools { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 0 0 12px; font-size: 12px; color: #64748b; }.attachment-draft-tools p { margin: 0; }
+@media (max-width: 700px) { .meeting-attachments-dialog { inset: 2vh 2vw; padding: 16px; }.meeting-attachments-content { display: flex; flex-direction: column; gap: 12px; }.meeting-attachments-content nav { max-height: 110px; flex-shrink: 0; }.meeting-attachments-content > section { flex: 1; }.attachment-upload { flex-direction: column; align-items: flex-start; }.meeting-attachments-content footer { margin-top: 8px; } }

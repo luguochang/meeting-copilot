@@ -2,17 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import hashlib
 import json
+from pathlib import Path
 import queue
+import struct
 import subprocess
 import threading
 import time
 from typing import Any
+from types import SimpleNamespace
 
 import pytest
 
-from meeting_copilot_web_mvp import funasr_resident
+from meeting_copilot_web_mvp import asr_stream, funasr_resident
+from meeting_copilot_web_mvp.asr_live_repository import InMemoryAsrLiveSessionRepository
 
 
 _EOF = object()
@@ -248,6 +254,222 @@ def _wait_until(predicate, timeout: float = 1.0) -> None:
             return
         time.sleep(0.005)
     raise AssertionError("condition was not reached before timeout")
+
+
+def test_readonly_boundary_wait_never_enqueues_an_unknown_token(manager_and_factory):
+    manager, factory = manager_and_factory
+    session = manager.create_session("readonly-missing")
+    assert session.wait_ready(0.5)
+
+    with pytest.raises(funasr_resident.FunasrResidentUnavailableError, match="matching inflight"):
+        session.wait_for_utterance_boundary("never-issued", timeout=0.01)
+
+    assert not [command for command in factory.processes[0].commands
+                if command["command"] == "flush_utterance"]
+    assert session.boundary_diagnostics == []
+    session.abort()
+
+
+def test_readonly_late_ack_keeps_causal_fence_without_another_worker_command(manager_and_factory):
+    manager, factory = manager_and_factory
+    session = manager.create_session("readonly-late")
+    assert session.wait_ready(0.5)
+    process = factory.processes[0]
+    process.flush_ack_mode = "none"
+    token = "readonly-late-boundary"
+    for _ in range(2):
+        with pytest.raises(funasr_resident.FunasrResidentBoundaryTimeoutError):
+            session.flush_utterance(token, timeout=0.01)
+
+    # The resident reader processes these in order. Recovery consumes only
+    # events before the matching ACK; the next utterance stays deferred.
+    process.emit_event({"event_type": "partial", "session_id": session.session_id,
+                        "segment_id": "before-ack", "text": "确认当前段"})
+    process.emit_event({"event_type": "utterance_boundary_complete", "session_id": session.session_id,
+                        "boundary_id": token})
+    process.emit_event({"event_type": "partial", "session_id": session.session_id,
+                        "segment_id": "after-ack", "text": "下一段内容"})
+    _wait_until(lambda: session._receive_sequence >= 3)
+    events = session.wait_for_utterance_boundary(token, timeout=0.1)
+
+    assert [event["segment_id"] for event in events] == ["readonly-late_before-ack"]
+    assert [event["segment_id"] for event in session._drain_events()] == ["readonly-late_after-ack"]
+    assert session.wait_for_utterance_boundary(token, timeout=0.01) == []
+    assert len([command for command in process.commands
+                if command["command"] == "flush_utterance"]) == 1
+    assert session.boundary_diagnostics[0]["status"] == "acknowledged"
+    assert session.boundary_diagnostics[0]["timeout_count"] == 2
+    session.abort()
+
+
+def test_readonly_boundary_wait_rejects_registered_but_unenqueued_attempt(manager_and_factory):
+    manager, factory = manager_and_factory
+    session = manager.create_session("readonly-unenqueued")
+    assert session.wait_ready(0.5)
+    token = "registered-only-boundary"
+    attempt = funasr_resident._BoundaryAttempt(waiter=threading.Event())
+    session._boundary_inflight[token] = attempt
+    session._boundary_waiters[token] = attempt.waiter
+
+    with pytest.raises(funasr_resident.FunasrResidentUnavailableError, match="not been enqueued"):
+        session.wait_for_utterance_boundary(token, timeout=0.01)
+
+    assert attempt.command_enqueued is False
+    assert not [command for command in factory.processes[0].commands
+                if command["command"] == "flush_utterance"]
+    assert token not in session._completed_boundaries
+    session.abort()
+
+
+class _RecoveryWebSocket:
+    def __init__(self, messages):
+        self.messages = list(messages)
+        self.sent = []
+        self.closed = False
+
+    async def accept(self):
+        return None
+
+    async def receive(self):
+        return self.messages.pop(0)
+
+    async def send_text(self, payload):
+        self.sent.append(json.loads(payload))
+
+    async def close(self):
+        self.closed = True
+
+
+def _short_boundary_budgets(monkeypatch):
+    monkeypatch.setattr(asr_stream, "FUNASR_BOUNDARY_ACK_TIMEOUT_S", 0.01)
+    # Allow Windows timer/executor scheduling overhead within the absolute
+    # budget; the two-attempt cap still limits normal waits to two slices.
+    monkeypatch.setattr(asr_stream, "FUNASR_BOUNDARY_MAX_WAIT_S", 0.2)
+    monkeypatch.setattr(asr_stream, "FUNASR_BOUNDARY_RECOVERY_WAIT_S", 0.05)
+
+
+@pytest.mark.parametrize("boundary_trigger", ["client_flush", "natural_vad"])
+def test_stream_late_ack_after_normal_budget_recovers_and_next_segment_commits(
+    manager_and_factory, monkeypatch, boundary_trigger,
+):
+    manager, factory = manager_and_factory
+    session = manager.create_session("stream-late-ack")
+    assert session.wait_ready(0.5)
+    process = factory.processes[0]
+    process.flush_ack_mode = "none"
+    _short_boundary_budgets(monkeypatch)
+    monkeypatch.setattr(asr_stream, "get_recognizer", lambda _sid: session)
+    refinement_payloads = []
+
+    def refine(payload):
+        refinement_payloads.append(payload)
+        return SimpleNamespace(text=f"第{len(refinement_payloads)}段内容已经确认", status="refined",
+                               model_id="test-refiner", reason=None, authoritative=True)
+
+    monkeypatch.setattr(asr_stream, "refine_pcm_f32", refine)
+    original_wait = session.wait_for_utterance_boundary
+    recovery_calls = []
+
+    def late_ack(token, timeout):
+        recovery_calls.append((token, timeout))
+        process.emit_event({"event_type": "partial", "session_id": session.session_id,
+                            "segment_id": "late-tail", "text": "当前段的迟到尾部",
+                            "start_ms": 0, "end_ms": 300, "partial_semantics": "incremental_chunk"})
+        process.emit_event({"event_type": "utterance_boundary_complete", "session_id": session.session_id,
+                            "boundary_id": token})
+        process.flush_ack_mode = "immediate"
+        return original_wait(token, timeout)
+
+    monkeypatch.setattr(session, "wait_for_utterance_boundary", late_ack)
+    # These bytes encode valid voiced float32 PCM and remain UTF-8-compatible
+    # with the lightweight fake process protocol's audio collector.
+    speech = b"????" * 4_800
+    assert struct.unpack("<f", speech[:4])[0] > asr_stream.VAD_SILENCE_RMS_THRESHOLD
+    silence = b"\0" * len(speech)
+    first_segment = ([{"bytes": speech}, *({"bytes": silence} for _ in range(3))]
+                     if boundary_trigger == "natural_vad"
+                     else [{"bytes": speech}, {"text": "FLUSH"}])
+    websocket = _RecoveryWebSocket([*first_segment, {"bytes": speech}, {"text": "FLUSH"}, {"text": "END"}])
+    repository = InMemoryAsrLiveSessionRepository()
+    committed = []
+    asyncio.run(asr_stream.handle_stream(websocket, session.session_id, asr_live_repo=repository,
+                                        on_final_committed=committed.append))
+
+    assert len(recovery_calls) == 1
+    assert recovery_calls[0][1] == asr_stream.FUNASR_BOUNDARY_RECOVERY_WAIT_S
+    boundary_commands = [command for command in process.commands if command["command"] == "flush_utterance"]
+    assert [command["boundary_id"] for command in boundary_commands] == [
+        "utterance-boundary-00000001", "utterance-boundary-00000002"]
+    assert refinement_payloads == [speech + silence * 3 if boundary_trigger == "natural_vad" else speech, speech]
+    assert len(committed) == 2
+    assert committed[0]["end_ms"] == 300
+    assert committed[0]["end_ms"] <= committed[1]["start_ms"]
+    assert session.boundary_diagnostics[0]["timeout_count"] == 2
+    assert [event["ready"] for event in websocket.sent if event["event_type"] == "asr_ready"] == [True, False, True]
+    assert not [event for event in websocket.sent if event["event_type"] == "provider_error"]
+    assert websocket.closed is True
+    assert process.kill_calls == 0
+    assert manager.status()["active_session_count"] == 0
+
+
+@pytest.mark.parametrize("boundary_trigger", ["client_flush", "natural_vad"])
+def test_stream_missing_late_ack_closes_releases_worker_and_preserves_only_received_pcm(
+    manager_and_factory, monkeypatch, tmp_path, boundary_trigger,
+):
+    manager, factory = manager_and_factory
+    session = manager.create_session("stream-no-ack")
+    assert session.wait_ready(0.5)
+    process = factory.processes[0]
+    process.flush_ack_mode = "none"
+    _short_boundary_budgets(monkeypatch)
+    monkeypatch.setattr(asr_stream, "get_recognizer", lambda _sid: session)
+
+    def forbidden_refinement(_payload):
+        raise AssertionError("Unacknowledged audio must not become a final")
+
+    monkeypatch.setattr(asr_stream, "refine_pcm_f32", forbidden_refinement)
+    speech = b"????" * 4_800
+    silence = b"\0" * len(speech)
+    first_segment = ([{"bytes": speech}, *({"bytes": silence} for _ in range(3))]
+                     if boundary_trigger == "natural_vad"
+                     else [{"bytes": speech}, {"text": "FLUSH"}, {"text": "FLUSH"}])
+    websocket = _RecoveryWebSocket([*first_segment, *({"bytes": speech} for _ in range(200))])
+    repository = InMemoryAsrLiveSessionRepository()
+    committed = []
+    started = time.monotonic()
+    asyncio.run(asr_stream.handle_stream(websocket, session.session_id, asr_live_repo=repository,
+                                        on_final_committed=committed.append, audio_source="browser_live_mic",
+                                        audio_asset_data_dir=tmp_path))
+
+    assert time.monotonic() - started < 1.0
+    assert websocket.closed is True
+    assert len(websocket.messages) == (200 if boundary_trigger == "natural_vad" else 201)
+    assert session._audio_chunk_attempts == (4 if boundary_trigger == "natural_vad" else 1)
+    assert len([command for command in process.commands if command["command"] == "flush_utterance"]) == 1
+    assert [command["command"] for command in process.commands][-1] == "abort_session"
+    assert not [command for command in process.commands if command["command"] == "end_session"]
+    assert manager.status()["active_session_count"] == 0
+    assert process.kill_calls == 0
+    error = websocket.sent[-1]
+    assert error["event_type"] == "provider_error"
+    assert error["error_code"] == "funasr_boundary_ack_timeout"
+    assert error["recording_saved"] is True
+    assert error["recoverable"] is True
+    assert error["boundary_diagnostics"][0]["timeout_count"] == 3
+    assert committed == []
+    record = repository.get(session.session_id)
+    assert "asr_stream_terminated_after_boundary_timeout" in record["degradation_reasons"]
+    assert record["transcript_backfill"]["status"] == "blocked"
+    assert not [event for event in record["events"] if event["event_type"] == "transcript_final"]
+    audio = record["audio"]
+    assert audio["saved"] is True
+    assert audio["duration_ms"] == (1_200 if boundary_trigger == "natural_vad" else 300)
+    audio_path = Path(tmp_path, audio["relative_path"])
+    assert hashlib.sha256(audio_path.read_bytes()).hexdigest() == audio["sha256"]
+    next_session = manager.create_session("stream-after-recovery-error")
+    assert next_session.wait_ready(0.5)
+    assert len(factory.processes) == 1
+    next_session.abort()
 
 
 def test_flush_utterance_sends_boundary_and_drains_late_partial_after_matching_ack(
@@ -650,6 +872,8 @@ def test_boundary_diagnostics_track_timeout_late_ack_and_consumption(
             "drain_ms": 4.5,
             "skipped_preview_bytes": 128,
             "skipped_silence_bytes": 64,
+            "inference_calls": 6,
+            "inference_max_ms": 5142.2,
             # Worker payload fields outside the diagnostics allowlist must not
             # leak into the exported lifecycle evidence.
             "command": "should-not-be-exported",
@@ -674,6 +898,8 @@ def test_boundary_diagnostics_track_timeout_late_ack_and_consumption(
             "drain_ms": 4.5,
             "skipped_preview_bytes": 128,
             "skipped_silence_bytes": 64,
+            "inference_calls": 6,
+            "inference_max_ms": 5142.2,
         }
     ]
     item = acknowledged[0]
@@ -729,6 +955,8 @@ def test_boundary_diagnostics_are_bounded_and_worker_payload_free(manager_and_fa
         "drain_ms",
         "skipped_preview_bytes",
         "skipped_silence_bytes",
+        "inference_calls",
+        "inference_max_ms",
     } for item in diagnostics)
     session.abort()
 

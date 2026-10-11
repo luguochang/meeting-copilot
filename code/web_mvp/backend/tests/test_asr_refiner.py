@@ -13,6 +13,12 @@ import pytest
 from meeting_copilot_web_mvp import asr_refiner
 
 
+@pytest.fixture(autouse=True)
+def fake_capacity_for_fake_workers(monkeypatch):
+    guard = asr_refiner.resource_guard
+    monkeypatch.setattr(guard, "read_memory_snapshot", lambda: guard.MemorySnapshot(16 * guard.GIB, 16 * guard.GIB, 1))
+
+
 def _write_packaged_refiner_runtime(tmp_path: Path) -> Path:
     paths = {
         "python": "runtime/funasr-python/python.exe",
@@ -279,7 +285,7 @@ def test_refiner_converts_float32_to_pcm16_for_resident_worker(monkeypatch):
     observed = {}
 
     class FakeResidentRefiner:
-        def refine(self, pcm16, *, timeout_s):
+        def refine_on_demand(self, pcm16, *, timeout_s):
             observed["samples"] = [sample[0] for sample in struct.iter_unpack("<h", pcm16)]
             observed["timeout"] = timeout_s
             return asr_refiner.RefinementResult(
@@ -341,7 +347,7 @@ def test_refiner_uses_its_packaged_python_home_and_path_instead_of_backend_value
 def test_refiner_rejects_non_ok_worker_result(monkeypatch):
     monkeypatch.setenv(asr_refiner.REALTIME_REFINER_POLICY_ENV, "on_demand")
     class FailedResidentRefiner:
-        def refine(self, _pcm16, *, timeout_s):
+        def refine_on_demand(self, _pcm16, *, timeout_s):
             assert timeout_s == 30.0
             return asr_refiner.RefinementResult(
                 text="",

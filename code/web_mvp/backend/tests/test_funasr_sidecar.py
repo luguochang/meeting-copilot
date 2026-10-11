@@ -568,6 +568,7 @@ def test_funasr_sidecar_uses_local_model_and_exposes_worker_ready(monkeypatch, t
     (model_dir / "config.yaml").write_text("model: local\n", encoding="utf-8")
     proc = _ControlledProc()
     monkeypatch.setattr(asr_stream, "_FUNASR_MODEL_DIR", model_dir)
+    monkeypatch.setenv("MEETING_COPILOT_FUNASR_MODEL_DIR", str(model_dir))
     popen_calls = []
     monkeypatch.setattr(
         asr_stream.subprocess,

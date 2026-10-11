@@ -299,3 +299,20 @@ def test_public_migration_lock_is_reentrant_and_owner_only(tmp_path: Path) -> No
             },
         )
         assert child.returncode == 0, child.stderr
+
+
+def test_migration_backup_preserves_long_named_database(tmp_path: Path) -> None:
+    # The source path fits Windows' ordinary path limit; copying its entire
+    # basename plus a timestamp/UUID into the backup used to exceed it.
+    database_path = tmp_path / ("meeting-" + "x" * 45 + ".db")
+    _create_database(database_path)
+    result = migrate_sqlite_schema(
+        database_path, migrations=_test_migrations(), current_version=2,
+        max_supported_version=2, backup_dir=tmp_path / "backups",
+    )
+    assert _schema_version(database_path) == 2
+    assert result.backup_path is not None
+    with sqlite3.connect(result.backup_path) as backup:
+        assert backup.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+        assert backup.execute("SELECT value FROM legacy_items").fetchall() == [("preserved",)]
+        assert int(backup.execute("PRAGMA user_version").fetchone()[0]) == 0

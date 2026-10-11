@@ -1,3 +1,5 @@
+import { parseDocumentSources } from "./sourceEvidence";
+import { parseCoachUiRenderReceipt } from "../domain/coachUiRenderReceipt";
 import { isLocalReflexCoachProjection } from "../domain/events";
 import type {
   ActivePartial,
@@ -28,6 +30,8 @@ import type {
   ImportJob,
   ImportJobStage,
   LocalReflexKind,
+  LiveAnalysisProfile,
+  MeetingCorrectionMode,
   MeetingRuntime,
   MeetingSpeaker,
   MeetingSnapshot,
@@ -97,6 +101,31 @@ export interface RealtimeProviderCircuitStatus {
   last_failure_class: string | null;
 }
 
+export type ProviderLaneName = "answer" | "pi_realtime" | "pi_deep" | "direct_semantic" | "correction";
+export interface ProviderLaneStatus {
+  configured: boolean;
+  enabled: boolean;
+  model: string | null;
+  model_source: string | null;
+  transport: string;
+  circuit_status: "closed" | "open" | "half_open" | "not_applicable" | "unknown";
+  circuit: RealtimeProviderCircuitStatus | null;
+  admission_group: string | null;
+  active_count: number | null;
+  pending_count: number | null;
+  max_active: number | null;
+  probe_scope: "realtime_model_tool_call" | "not_probed";
+  probe_status: ProviderProbeStatus;
+  last_result: {
+    outcome: string;
+    http_status: number | null;
+    age_ms: number;
+    scope: "process_history";
+    configuration_match: "unknown";
+  } | null;
+}
+export type ProviderLaneStatuses = Partial<Record<ProviderLaneName, ProviderLaneStatus>>;
+
 export interface ProviderStatus {
   configured: boolean;
   runtime_synced: boolean;
@@ -116,6 +145,105 @@ export interface ProviderStatus {
   probe_usage: ProviderProbeUsage | null;
   realtime_cutoff_ms: number;
   realtime_circuit?: RealtimeProviderCircuitStatus | null;
+  provider_lanes?: ProviderLaneStatuses;
+}
+
+export interface AsrRuntimeStatus {
+  residentEnabled: boolean | null;
+  onlineReady: boolean | null;
+  offlinePolicy: "prewarm" | "on_demand" | "online_only" | null;
+  offlineReady: boolean | null;
+}
+
+/** Unknown/older contracts remain unknown, never a positive readiness claim. */
+export function parseAsrRuntimeStatus(value: unknown): AsrRuntimeStatus | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const row = value as JsonRecord;
+  if (row.schema_version !== "asr_runtime_status.v1" || typeof row.resident_enabled !== "boolean") return null;
+  const record = (item: unknown): JsonRecord => item && typeof item === "object" && !Array.isArray(item) ? item as JsonRecord : {};
+  const ready = (item: unknown): boolean | null => {
+    const worker = record(item);
+    const values = [worker.spawned, worker.process_running, worker.process_ready];
+    if (values.some((part) => part === false)) return false;
+    return values.every((part) => part === true) ? true : null;
+  };
+  const offline = record(row.offline_refinement);
+  const capability = record(offline.capability);
+  const policy = record(capability.realtime_policy).mode;
+  return {
+    residentEnabled: row.resident_enabled,
+    onlineReady: ready(row.resident),
+    offlinePolicy: policy === "prewarm" || policy === "on_demand" || policy === "online_only" ? policy : null,
+    offlineReady: capability.status === "unavailable" ? false : ready(offline.worker),
+  };
+}
+
+export interface MeetingCorrectionCapability {
+  requestedMode: MeetingCorrectionMode;
+  effectiveMode: MeetingCorrectionMode;
+  recommendedMode: MeetingCorrectionMode;
+  fallbackReason: string | null;
+  localRefinement: { available: boolean; workerReady: boolean; recoveryRequired: boolean; lastErrorCode: string | null; reason: string | null };
+  memory: {
+    checked: boolean;
+    commitAvailableBytes: number | null;
+    physicalAvailableBytes: number | null;
+    totalPhysicalBytes: number | null;
+    requiredCommitBytes: number;
+    requiredPhysicalBytes: number;
+    profile: string;
+    sampledAtMs: number | null;
+  };
+  llmCorrection: { enabled: boolean; configured: boolean };
+}
+
+export function parseMeetingCorrectionMode(value: unknown): MeetingCorrectionMode {
+  if (value === undefined) return "local_and_llm";
+  if (value === "local_and_llm" || value === "llm_only") return value;
+  throw new ContractError("本场校对模式格式错误，请重新读取会议准备。");
+}
+
+/** Resource checks must be explicit; missing or future contracts cannot imply readiness. */
+export function parseMeetingCorrectionCapability(value: unknown): MeetingCorrectionCapability | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const row = value as JsonRecord;
+  if (row.schema_version !== "meeting_correction_capability.v1") return null;
+  const record = (item: unknown): JsonRecord => item && typeof item === "object" && !Array.isArray(item) ? item as JsonRecord : {};
+  const local = record(row.local_refinement), memory = record(row.memory), llm = record(row.llm_correction);
+  const mode = (item: unknown): item is MeetingCorrectionMode => item === "local_and_llm" || item === "llm_only";
+  const bytes = (item: unknown): item is number => typeof item === "number" && Number.isFinite(item) && item >= 0;
+  const nullableNumber = (item: unknown): number | null => bytes(item) ? item : null;
+  if (!mode(row.requested_mode) || !mode(row.effective_mode) || !mode(row.recommended_mode)
+    || typeof local.available !== "boolean" || typeof local.worker_ready !== "boolean"
+    || typeof memory.checked !== "boolean" || !bytes(memory.required_commit_bytes) || !bytes(memory.required_physical_bytes)
+    || typeof llm.enabled !== "boolean" || typeof llm.configured !== "boolean") return null;
+  return {
+    requestedMode: row.requested_mode, effectiveMode: row.effective_mode, recommendedMode: row.recommended_mode,
+    fallbackReason: typeof row.fallback_reason === "string" ? row.fallback_reason : null,
+    localRefinement: { available: local.available, workerReady: local.worker_ready, recoveryRequired: local.recovery_required === true,
+      lastErrorCode: typeof local.last_error_code === "string" ? local.last_error_code : null, reason: typeof local.reason === "string" ? local.reason : null },
+    memory: {
+      checked: memory.checked, commitAvailableBytes: nullableNumber(memory.commit_available_bytes),
+      physicalAvailableBytes: nullableNumber(memory.physical_available_bytes), totalPhysicalBytes: nullableNumber(memory.total_physical_bytes),
+      requiredCommitBytes: memory.required_commit_bytes, requiredPhysicalBytes: memory.required_physical_bytes,
+      profile: typeof memory.profile === "string" ? memory.profile : "", sampledAtMs: nullableNumber(memory.sampled_at_ms),
+    },
+    llmCorrection: { enabled: llm.enabled, configured: llm.configured },
+  };
+}
+
+export function asrPreparationBlocker(status: AsrRuntimeStatus | null, capability?: MeetingCorrectionCapability | null): string | null {
+  if (capability?.effectiveMode === "local_and_llm" && !capability.localRefinement.available) {
+    return capability.localRefinement.reason === "asr_resource_probe_failed"
+      ? "暂时无法确认本地精修可用内存，请重新检查识别状态，或选择仅大模型校对。"
+      : "本地精修暂不可用，请重新检查识别状态，或选择仅大模型校对。";
+  }
+  if (status?.residentEnabled !== true) return null;
+  if (status.onlineReady === false) return "本地识别尚未准备完成：实时识别进程尚未就绪，请稍后重新检查识别状态。";
+  if (capability?.effectiveMode === "llm_only") return null;
+  if (capability?.localRefinement.workerReady === true) return null;
+  if (status.offlinePolicy === "prewarm" && status.offlineReady === false) return "本地识别尚未准备完成，请先准备离线识别，再开始会议。";
+  return null;
 }
 
 export interface DesktopProviderStatusLike {
@@ -137,6 +265,7 @@ export interface DesktopProviderStatusLike {
   probe_usage?: ProviderProbeUsage | null;
   realtime_cutoff_ms?: number | null;
   realtime_circuit?: RealtimeProviderCircuitStatus | null;
+  provider_lanes?: ProviderLaneStatuses;
 }
 
 export const DEFAULT_PROVIDER_REALTIME_CUTOFF_MS = 2_500;
@@ -348,6 +477,38 @@ function optionalRealtimeProviderCircuit(value: unknown): RealtimeProviderCircui
   };
 }
 
+function optionalProviderLanes(value: unknown): ProviderLaneStatuses | undefined {
+  if (value === undefined || value === null) return undefined;
+  const source = record(value, "provider lanes");
+  const lanes: ProviderLaneStatuses = {};
+  for (const name of ["answer", "pi_realtime", "pi_deep", "direct_semantic", "correction"] as const) {
+    if (source[name] === undefined) continue;
+    const lane = record(source[name], `provider lane ${name}`);
+    if (typeof lane.configured !== "boolean" || typeof lane.enabled !== "boolean") throw new ContractError("provider lane configuration is invalid");
+    if (!["closed", "open", "half_open", "not_applicable", "unknown"].includes(String(lane.circuit_status))) throw new ContractError("provider lane circuit status is invalid");
+    if (!["not_run", "probing", "succeeded", "failed"].includes(String(lane.probe_status))) throw new ContractError("provider lane probe status is invalid");
+    if (!["realtime_model_tool_call", "not_probed"].includes(String(lane.probe_scope))) throw new ContractError("provider lane probe scope is invalid");
+    const count = (value: unknown) => value === undefined || value === null ? null : nonNegativeInteger(value, "provider lane count");
+    let last: ProviderLaneStatus["last_result"] = null;
+    if (lane.last_result !== undefined && lane.last_result !== null) {
+      const result = record(lane.last_result, "provider lane last result");
+      if (!["success", "timeout", "rate_limit", "provider_5xx", "transport_error", "cancelled", "validation_error", "failed"].includes(String(result.outcome))
+        || result.scope !== "process_history" || result.configuration_match !== "unknown") throw new ContractError("provider lane last result is invalid");
+      const httpStatus = count(result.http_status);
+      if (httpStatus !== null && (httpStatus < 100 || httpStatus > 599)) throw new ContractError("provider lane HTTP status is invalid");
+      last = { outcome: String(result.outcome), http_status: httpStatus, age_ms: nonNegativeInteger(result.age_ms, "provider lane result age"), scope: "process_history", configuration_match: "unknown" };
+    }
+    lanes[name] = {
+      configured: lane.configured, enabled: lane.enabled, model: optionalString(lane.model), model_source: optionalString(lane.model_source),
+      transport: optionalString(lane.transport) ?? "unknown", circuit_status: lane.circuit_status as ProviderLaneStatus["circuit_status"],
+      circuit: optionalRealtimeProviderCircuit(lane.circuit), admission_group: optionalString(lane.admission_group),
+      active_count: count(lane.active_count), pending_count: count(lane.pending_count), max_active: count(lane.max_active),
+      probe_scope: lane.probe_scope as ProviderLaneStatus["probe_scope"], probe_status: lane.probe_status as ProviderProbeStatus, last_result: last,
+    };
+  }
+  return lanes;
+}
+
 export function parseProviderStatus(value: unknown): ProviderStatus {
   const source = record(value, "provider status");
   const probeStatus = source.probe_status;
@@ -369,6 +530,7 @@ export function parseProviderStatus(value: unknown): ProviderStatus {
     ? DEFAULT_PROVIDER_REALTIME_CUTOFF_MS
     : nonNegativeInteger(source.realtime_cutoff_ms, "provider status.realtime_cutoff_ms");
   const probeUsage = optionalProviderProbeUsage(source.probe_usage);
+  const circuit = optionalRealtimeProviderCircuit(source.realtime_circuit);
   if (probeStatus === "succeeded" && realtimeReady !== null && (
     operational !== true
     || realtimeCutoffMs <= 0
@@ -388,7 +550,7 @@ export function parseProviderStatus(value: unknown): ProviderStatus {
   }
   if (probeStatus === "succeeded" && realtimeReady !== null && probeLatencyMs !== null) {
     const derivedRealtimeReady = probeLatencyMs <= realtimeCutoffMs;
-    if (realtimeReady !== derivedRealtimeReady) {
+    if (realtimeReady !== derivedRealtimeReady && !(realtimeReady === false && circuit && circuit.state !== "closed")) {
       throw new ContractError("provider status readiness contradicts its latency evidence");
     }
   }
@@ -410,7 +572,8 @@ export function parseProviderStatus(value: unknown): ProviderStatus {
     probe_latency_ms: probeStatus === "succeeded" ? probeLatencyMs : null,
     probe_usage: probeStatus === "succeeded" ? probeUsage : null,
     realtime_cutoff_ms: realtimeCutoffMs || DEFAULT_PROVIDER_REALTIME_CUTOFF_MS,
-    realtime_circuit: optionalRealtimeProviderCircuit(source.realtime_circuit),
+    realtime_circuit: circuit,
+    ...(source.provider_lanes === undefined ? {} : { provider_lanes: optionalProviderLanes(source.provider_lanes) }),
   };
 }
 
@@ -524,6 +687,8 @@ export function reconcileProviderStatus(
     realtime_circuit: runtimeSynced
       ? runtime?.realtime_circuit ?? desktop.realtime_circuit ?? null
       : null,
+    ...(runtimeSynced && (runtime?.provider_lanes ?? desktop.provider_lanes)
+      ? { provider_lanes: runtime?.provider_lanes ?? desktop.provider_lanes } : {}),
   };
 }
 
@@ -542,6 +707,25 @@ function first(source: JsonRecord, ...keys: string[]): unknown {
   return undefined;
 }
 
+function recoveryProvenance(value: unknown): TranscriptSegment["recoveryProvenance"] {
+  if (value === undefined || value === null) return undefined;
+  const x = record(value, "recovery_provenance");
+  if ((x.track !== "microphone" && x.track !== "system_audio") || x.timing !== "whole_audio_range" || x.recognition !== "local_batch_asr" || x.correction !== "not_requested" || typeof x.user_edited !== "boolean") throw new ContractError("补识别来源格式无效");
+  const int = (raw: unknown) => { if (typeof raw !== "number" || !Number.isSafeInteger(raw) || raw < 0) throw new ContractError("补识别来源范围无效"); return raw; };
+  const hash = (raw: unknown) => { if (typeof raw !== "string" || !/^[a-f0-9]{64}$/i.test(raw)) throw new ContractError("补识别来源摘要无效"); return raw; };
+  const startSample = int(x.start_sample), endSample = int(x.end_sample), candidateVersion = int(x.candidate_version);
+  if (endSample <= startSample || candidateVersion < 1) throw new ContractError("补识别来源版本或范围无效");
+  return { jobId: requiredString(x.job_id, "recovery_provenance.job_id"), track: x.track, epoch: int(x.epoch), startSample, endSample,
+    audioDigest: hash(x.audio_digest), coverageDigest: hash(x.coverage_digest), candidateVersion, timing: x.timing, recognition: x.recognition, correction: x.correction, userEdited: x.user_edited };
+}
+
+export function parseLiveAnalysisProfile(value: unknown): LiveAnalysisProfile {
+  // Existing meetings without the new field retain their original answering mode.
+  if (value === undefined) return "legacy";
+  if (value === "participation" || value === "legacy") return value;
+  throw new ContractError("本场帮助方式无效，请刷新会议状态；不会自动切换分析方式。");
+}
+
 function parseSegment(value: unknown, index: number): TranscriptSegment {
   const item = record(value, `segments[${index}]`);
   const text = requiredString(item.text, `segments[${index}].text`);
@@ -551,6 +735,8 @@ function parseSegment(value: unknown, index: number): TranscriptSegment {
     finalId: requiredString(first(item, "final_id", "finalId"), `segments[${index}].final_id`),
     transcriptSeq: requiredNumber(first(item, "transcript_seq", "transcriptSeq"), `segments[${index}].transcript_seq`),
     text,
+    recoveryJobId: optionalString(first(item, "recovery_job_id", "recoveryJobId")) ?? undefined,
+    recoveryProvenance: recoveryProvenance(first(item, "recovery_provenance", "recoveryProvenance")),
     normalizedText: optionalString(first(item, "normalized_text", "normalizedText")) ?? text,
     startedAtMs: optionalNumber(first(item, "started_at_ms", "startedAtMs")),
     endedAtMs: optionalNumber(first(item, "ended_at_ms", "endedAtMs")),
@@ -690,16 +876,19 @@ export function parseReviewDocument(
   const userModified = optionalBoolean(first(userFinal ?? {}, "modified")) ?? false;
   const userContent = userFinal ? first(userFinal, "content", "content_json", "contentJson") : undefined;
   const aiContent = aiGenerated ? first(aiGenerated, "content", "content_json", "contentJson") : undefined;
+  const selectUserFinal = userModified || (userVersion > 0 && aiVersion === 0);
+  const selectedVersion = selectUserFinal ? userFinal : aiGenerated;
   return {
     documentId: optionalString(first(item, "id", "document_id", "documentId")),
     meetingId: optionalString(first(item, "meeting_id", "meetingId")) ?? fallbackMeetingId,
     kind,
     revision: optionalNumber(item.revision) ?? 0,
-    sourceRevision: optionalNumber(first(item, "source_transcript_revision", "sourceTranscriptRevision", "source_revision", "sourceRevision")),
-    contentJson: userContent ?? aiContent ?? first(item, "content_json", "contentJson", "content") ?? {},
+    sourceRevision: optionalNumber(first(selectedVersion ?? {}, "source_transcript_revision", "sourceTranscriptRevision"))
+      ?? optionalNumber(first(item, "source_transcript_revision", "sourceTranscriptRevision", "source_revision", "sourceRevision")),
+    contentJson: (selectUserFinal ? userContent ?? aiContent : aiContent ?? userContent) ?? first(item, "content_json", "contentJson", "content") ?? {},
     aiVersion,
     userVersion,
-    source: userModified || (userVersion > 0 && aiVersion === 0)
+    source: selectUserFinal
       ? "user_final"
       : aiVersion > 0
         ? "ai_generated"
@@ -890,6 +1079,9 @@ function parseFactBase(value: unknown): {
   confidence: number | null;
   evidenceSegmentIds: string[];
   evidenceSpans: EvidenceSpan[];
+  sourceEvidence?: NonNullable<DecisionCandidate["sourceEvidence"]>;
+  sourceMessageId?: string | null;
+  evidenceStatus?: "valid" | "stale" | "unknown";
   updatedAtMs: number;
   version: number;
   firstSeenSeq: number;
@@ -909,6 +1101,9 @@ function parseFactBase(value: unknown): {
     confidence: optionalNumber(item.confidence),
     evidenceSegmentIds: evidenceSegmentIds(item),
     evidenceSpans,
+    sourceEvidence: parseDocumentSources(first(item, "source_evidence", "sourceEvidence")),
+    sourceMessageId: optionalString(first(item, "source_message_id", "sourceMessageId")),
+    evidenceStatus: item.evidence_status === "valid" || item.evidence_status === "stale" ? item.evidence_status : "unknown",
     updatedAtMs: optionalNumber(first(item, "updated_at_ms", "updatedAtMs")) ?? 0,
     version: optionalNumber(item.version) ?? 1,
     firstSeenSeq: optionalNumber(first(item, "first_seen_seq", "firstSeenSeq")) ?? 0,
@@ -966,8 +1161,10 @@ function degradedFromReviewJob(job: ReviewJob | undefined): boolean | null {
   return job?.output ? optionalBoolean(job.output.degraded) : null;
 }
 
-function parseApproach(value: unknown, job: ReviewJob | undefined): ApproachReview {
+function parseApproach(value: unknown, job: ReviewJob | undefined, identityValue?: unknown): ApproachReview {
   const artifact = optionalRecord(value);
+  const identity = optionalRecord(identityValue) ?? artifact;
+  const jobId = identity ? optionalString(first(identity, "job_id", "jobId")) : null;
   const cardValues = Array.isArray(value)
     ? value
     : artifact && Array.isArray(artifact.cards)
@@ -978,15 +1175,16 @@ function parseApproach(value: unknown, job: ReviewJob | undefined): ApproachRevi
     .filter((card): card is ApproachCard => card !== null);
   return {
     cards,
-    degraded: artifact ? optionalBoolean(artifact.degraded) ?? degradedFromReviewJob(job) : degradedFromReviewJob(job),
-    updatedAtMs: artifact
-      ? optionalNumber(first(artifact, "updated_at_ms", "updatedAtMs")) ?? job?.updatedAtMs ?? null
-      : job?.updatedAtMs ?? null,
+    degraded: (artifact ? optionalBoolean(artifact.degraded) : null)
+      ?? (jobId && jobId === job?.id ? degradedFromReviewJob(job) : null),
+    jobId,
+    createdAtMs: identity ? optionalNumber(first(identity, "created_at_ms", "createdAtMs")) : null,
+    updatedAtMs: identity ? optionalNumber(first(identity, "updated_at_ms", "updatedAtMs")) : null,
   };
 }
 
 function parseAudioStatus(value: unknown): MeetingAudioSummary["status"] {
-  return value === "recording" || value === "saved" || value === "assembling" || value === "failed"
+  return value === "recording" || value === "saved" || value === "assembling" || value === "failed" || value === "partial_failure"
     ? value
     : "unknown";
 }
@@ -1092,6 +1290,22 @@ function parseFeedback(value: unknown): SuggestionFeedback | null {
     : null;
 }
 
+function parseSuggestionContextEvidence(value: unknown, field: string): NonNullable<Suggestion["contextEvidence"]> {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value) || value.length > 16) throw new ContractError(`${field} must be a bounded array`);
+  const seen = new Set<string>();
+  return value.map((source, index) => {
+    const item = record(source, `${field}[${index}]`);
+    const segmentId = requiredString(first(item, "segment_id", "segmentId"), `${field}[${index}].segment_id`);
+    const revision = requiredNumber(item.revision, `${field}[${index}].revision`);
+    if (!Number.isInteger(revision) || revision < 1 || seen.has(segmentId)) {
+      throw new ContractError(`${field} requires unique sources with positive integer revisions`);
+    }
+    seen.add(segmentId);
+    return { segmentId, revision, evidenceHash: requiredString(first(item, "evidence_hash", "evidenceHash"), `${field}[${index}].evidence_hash`) };
+  });
+}
+
 function parseSuggestion(value: unknown, index: number): Suggestion {
   const item = record(value, `suggestions[${index}]`);
   return {
@@ -1105,6 +1319,9 @@ function parseSuggestion(value: unknown, index: number): Suggestion {
     evidenceTranscriptSeq: requiredNumber(first(item, "evidence_transcript_seq", "evidenceTranscriptSeq"), `suggestions[${index}].evidence_transcript_seq`),
     evidenceHash: optionalString(first(item, "evidence_hash", "evidenceHash")) ?? "",
     stateRevision: optionalNumber(first(item, "state_revision", "stateRevision")) ?? 1,
+    sourceEvidence: parseDocumentSources(first(item, "source_evidence", "sourceEvidence")),
+    contextEvidence: parseSuggestionContextEvidence(first(item, "context_evidence", "contextEvidence"), `suggestions[${index}].context_evidence`),
+    supersedesSuggestionId: optionalString(first(item, "supersedes_suggestion_id", "supersedesSuggestionId")),
     status: parseSuggestionStatus(item.status),
     draftText: optionalString(first(item, "draft_text", "draftText")) ?? "",
     draftSeq: optionalNumber(first(item, "draft_seq", "draftSeq")) ?? 0,
@@ -1139,6 +1356,7 @@ function parseTopic(value: unknown): TopicProjection | null {
     status: status === "active" || status === "changed" || status === "expired" ? status : "unknown",
     evidenceSegmentIds: strings(first(item, "evidence_segment_ids", "evidenceSegmentIds")),
     updatedAtMs: optionalNumber(first(item, "updated_at_ms", "updatedAtMs")),
+    lastUpdatedSeq: optionalNumber(first(item, "last_updated_seq", "lastUpdatedSeq")) ?? undefined,
     formalAi: parseFormalAi(item),
   };
 }
@@ -1329,7 +1547,10 @@ function parseFollowUp(value: unknown, metadataValue?: unknown): FollowUpProject
     : null;
   const supersedesDecisionIdValue = first(item, "supersedes_decision_id", "supersedesDecisionId");
   const supersededByValue = first(item, "superseded_by", "supersededBy");
+  const uiRenderReceipt = parseCoachUiRenderReceipt(item.ui_render_receipt);
   const parsed: FollowUpProjection = {
+    ...(uiRenderReceipt ? { uiRenderReceipt } : {}),
+    sourceEvidence: parseDocumentSources(first(item, "source_evidence", "sourceEvidence") ?? (metadataValue && typeof metadataValue === "object" ? first(metadataValue as Record<string, unknown>, "source_evidence", "sourceEvidence") : undefined)),
     question,
     reason,
     ...(sayThis ? { sayThis } : {}),
@@ -1354,8 +1575,12 @@ function parseFollowUp(value: unknown, metadataValue?: unknown): FollowUpProject
     ...(triggerType ? { triggerType } : {}),
     ...(userRequest ? { userRequest } : {}),
     ...(coachingPackage ? { coachingPackage } : {}),
+    ...parseContributionFields(item),
     ...(evidenceRevision !== null ? { evidenceRevision } : {}),
     ...(validUntil !== null ? { validUntil } : {}),
+    ...(optionalNumber(first(item, "frozen_at_ms", "frozenAtMs")) !== null
+      ? { frozenAtMs: optionalNumber(first(item, "frozen_at_ms", "frozenAtMs"))! }
+      : {}),
     ...(softDeadlineAtMs !== null ? { softDeadlineAtMs } : {}),
     ...(softCutoffElapsedMs !== null ? { softCutoffElapsedMs } : {}),
     ...(softTimeoutProjectionAtMs !== null ? { softTimeoutProjectionAtMs } : {}),
@@ -1405,6 +1630,8 @@ function parseCoachDecision(value: unknown): CoachDecisionProjection | null {
   const supersededByValue = first(item, "superseded_by", "supersededBy");
   const agentMetrics = parseCoachAgentMetrics(first(item, "agent_metrics", "agentMetrics"));
   return {
+    ...parseContributionFields(item),
+    sourceEvidence: parseDocumentSources(first(item, "source_evidence", "sourceEvidence")),
     provenanceVersion: stringField("provenance_version", "provenanceVersion"),
     origin,
     status,
@@ -1418,6 +1645,7 @@ function parseCoachDecision(value: unknown): CoachDecisionProjection | null {
     triggered: typeof item.triggered === "boolean" ? item.triggered : undefined,
     createdAtMs: numberField("created_at_ms", "createdAtMs"),
     completedAtMs: numberField("completed_at_ms", "completedAtMs"),
+    frozenAtMs: numberField("frozen_at_ms", "frozenAtMs"),
     deadlineAtMs: numberField("deadline_at_ms", "deadlineAtMs"),
     softDeadlineAtMs: numberField("soft_deadline_at_ms", "softDeadlineAtMs"),
     softCutoffElapsedMs: numberField("soft_cutoff_elapsed_ms", "softCutoffElapsedMs"),
@@ -1466,6 +1694,7 @@ function parseCoachHistoryEntry(value: unknown, index: number): CoachHistoryEntr
   const item = optionalRecord(value);
   const followUp = parseFollowUp(value, item ? first(item, "coach_decision", "coachDecision") : undefined);
   if (!item || !followUp) return null;
+  delete followUp.uiRenderReceipt;
   return {
     ...followUp,
     historyId: optionalString(first(item, "history_id", "historyId")) ?? `coach-history-${index}`,
@@ -1517,6 +1746,9 @@ function parsePartial(value: unknown): ActivePartial | null {
     segmentId: optionalString(first(item, "segment_id", "segmentId")) ?? "active-partial",
     text,
     startedAtMs: optionalNumber(first(item, "started_at_ms", "startedAtMs")),
+    endedAtMs: optionalNumber(first(item, "ended_at_ms", "endedAtMs")),
+    textTruncated: optionalBoolean(first(item, "text_truncated", "textTruncated")) ?? undefined,
+    sourceTextCharacters: optionalNumber(first(item, "source_text_characters", "sourceTextCharacters")),
     updatedAtMs: optionalNumber(first(item, "updated_at_ms", "updatedAtMs")) ?? Date.now(),
   };
 }
@@ -1525,6 +1757,16 @@ function runtimeState(value: unknown): RuntimeState {
   return value === "active" || value === "busy" || value === "idle" || value === "paused" || value === "offline" || value === "error"
     ? value
     : "unknown";
+}
+
+function parseUnderstandingStatus(value: unknown): RuntimeIndicator["understandingStatus"] {
+  switch (value) {
+    case "waiting_reanalysis": case "reanalysis_queued": case "reanalysis_running":
+    case "revision_deferred": case "reanalysis_deferred": case "partial_review":
+      return value;
+    default:
+      return undefined;
+  }
 }
 
 function parseIndicator(value: unknown, fallbackLabel: string): RuntimeIndicator {
@@ -1541,6 +1783,12 @@ function parseIndicator(value: unknown, fallbackLabel: string): RuntimeIndicator
     detail: optionalString(item.detail),
     decision: optionalString(item.decision),
     errorClass: optionalString(first(item, "error_class", "errorClass")),
+    ...(first(item, "job_id", "jobId") !== undefined ? { jobId: optionalString(first(item, "job_id", "jobId")) } : {}),
+    ...(first(item, "topic_id", "topicId") !== undefined ? { topicId: optionalString(first(item, "topic_id", "topicId")) } : {}),
+    ...(first(item, "analysis_basis_revision", "analysisBasisRevision") !== undefined ? { analysisBasisRevision: optionalNumber(first(item, "analysis_basis_revision", "analysisBasisRevision")) } : {}),
+    ...(first(item, "input_transcript_seq", "inputTranscriptSeq") !== undefined ? { inputTranscriptSeq: optionalNumber(first(item, "input_transcript_seq", "inputTranscriptSeq")) } : {}),
+    ...(first(item, "last_semantic_seq", "lastSemanticSeq") !== undefined ? { lastSemanticSeq: optionalNumber(first(item, "last_semantic_seq", "lastSemanticSeq")) } : {}),
+    ...(first(item, "understanding_status", "understandingStatus") !== undefined ? { understandingStatus: parseUnderstandingStatus(first(item, "understanding_status", "understandingStatus")) } : {}),
     capabilities: rawCapabilities
       ? Object.fromEntries(Object.entries(rawCapabilities).map(([key, capability]) => [
         key,
@@ -1581,6 +1829,8 @@ function parseRuntime(source: JsonRecord): MeetingRuntime {
 
 export function parseMeetingSnapshot(value: unknown): MeetingSnapshot {
   const source = record(value);
+  const liveAnalysisProfileLocked = first(source, "live_analysis_profile_locked", "liveAnalysisProfileLocked");
+  if (liveAnalysisProfileLocked !== undefined && typeof liveAnalysisProfileLocked !== "boolean") throw new ContractError("本场帮助方式锁定状态无效，请刷新会议状态。");
   const meetingId = requiredString(first(source, "meeting_id", "meetingId"), "meeting_id");
   const segmentValues = source.segments;
   const semanticParagraphValues = first(source, "semantic_paragraphs", "semanticParagraphs");
@@ -1618,13 +1868,14 @@ export function parseMeetingSnapshot(value: unknown): MeetingSnapshot {
     ? null
     : parsedCoachDecision;
   const knownKeys = new Set([
+    "live_analysis_profile", "liveAnalysisProfile", "live_analysis_profile_locked", "liveAnalysisProfileLocked",
     "meeting_id", "meetingId", "title", "last_seq", "lastSeq", "segments", "suggestions",
     "semantic_paragraphs", "semanticParagraphs", "active_paragraph", "activeParagraph",
     "decision_candidates", "decisionCandidates", "action_items", "actionItems", "risks", "riskItems",
     "current_topic", "currentTopic", "open_questions", "openQuestions", "open_question", "openQuestion",
     "follow_up", "followUp", "coach_intervention", "coachIntervention", "semantic_follow_up", "semanticFollowUp",
     "coach_decision", "coachDecision", "coach_history", "coachHistory", "recent_context_history", "recentContextHistory",
-    "active_partial", "activePartial", "minutes", "approach_cards", "approachCards", "review_jobs", "reviewJobs",
+    "active_partial", "activePartial", "minutes", "approach_cards", "approachCards", "approach_artifact", "approachArtifact", "review_jobs", "reviewJobs",
     "audio", "runtime", "meeting_status", "meetingStatus", "status", "diagnostics", "transcript_page", "jobs",
     "title_source", "titleSource", "updated_at_ms", "updatedAtMs", "documents", "review_documents", "reviewDocuments",
     "import_job", "importJob",
@@ -1633,6 +1884,8 @@ export function parseMeetingSnapshot(value: unknown): MeetingSnapshot {
 
   return {
     meetingId,
+    liveAnalysisProfile: parseLiveAnalysisProfile(first(source, "live_analysis_profile", "liveAnalysisProfile")),
+    liveAnalysisProfileLocked,
     title: optionalString(source.title),
     titleSource: parseTitleSource(first(source, "title_source", "titleSource")),
     updatedAtMs: optionalNumber(first(source, "updated_at_ms", "updatedAtMs")) ?? 0,
@@ -1670,7 +1923,8 @@ export function parseMeetingSnapshot(value: unknown): MeetingSnapshot {
       ? recentContextHistoryValues.map(parseRecentContextEntry).filter((item): item is RecentContextEntry => item !== null)
       : [],
     minutes: parseMinutes(source.minutes),
-    approach: parseApproach(first(source, "approach_cards", "approachCards"), reviewJobs.approach),
+    approach: parseApproach(first(source, "approach_cards", "approachCards"), reviewJobs.approach,
+      first(source, "approach_artifact", "approachArtifact")),
     reviewJobs,
     documents: parseReviewDocuments(first(source, "documents", "review_documents", "reviewDocuments"), meetingId),
     importJob: parseImportJob(first(source, "import_job", "importJob")),
@@ -1894,7 +2148,7 @@ export function parseMeetingAudio(value: unknown): MeetingAudioWithTracks {
     playbackUrl: optionalString(first(source, "playback_url", "playbackUrl")),
     format: optionalString(source.format),
     chunks: source.chunks.map(parseAudioChunk),
-    status: overallStatus === "partial_failure" ? "failed" : overallStatus,
+    status: overallStatus,
     overallStatus,
     expectedTracks: Array.isArray(expectedTrackValues)
       ? expectedTrackValues.map((track, index) => parseAudioTrackId(track, `expected_tracks[${index}]`))
@@ -1906,3 +2160,4 @@ export function parseMeetingAudio(value: unknown): MeetingAudioWithTracks {
     mixedCreateUrl: optionalString(first(source, "mixed_create_url", "mixedCreateUrl")),
   };
 }
+import { parseContributionFields } from "../domain/contribution";

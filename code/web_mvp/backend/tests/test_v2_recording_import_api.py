@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 from io import BytesIO
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import threading
 import time
 import wave
+import pytest
 
 from fastapi.testclient import TestClient
 
 from meeting_copilot_web_mvp import app as app_module
 from meeting_copilot_web_mvp.asr_refiner import RefinementResult
 from meeting_copilot_web_mvp import audio_assets
+from meeting_copilot_web_mvp import asr_resource_guard
 from meeting_copilot_web_mvp.app import create_app
 
 
@@ -267,6 +270,7 @@ def test_import_audio_reuses_resident_offline_refiner_when_batch_runtime_is_miss
     tmp_path,
     monkeypatch,
 ):
+    monkeypatch.setattr(asr_resource_guard, "check_capacity", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(app_module.batch_transcribe, "is_available", lambda: False)
     monkeypatch.setattr(
         app_module.asr_refiner,
@@ -429,6 +433,11 @@ def test_failed_import_can_be_retried_without_reuploading_the_managed_source(
     available = False
     monkeypatch.setattr(app_module.batch_transcribe, "is_available", lambda: available)
     monkeypatch.setattr(
+        app_module.asr_refiner,
+        "refinement_capability",
+        lambda: {"status": "unavailable"},
+    )
+    monkeypatch.setattr(
         app_module.batch_transcribe,
         "transcribe_file_report",
         lambda _path, **_kwargs: {
@@ -470,3 +479,186 @@ def test_failed_import_can_be_retried_without_reuploading_the_managed_source(
     assert completed["attempts"] == 1
     assert source_path.read_bytes() == original_payload
     assert snapshot.json()["segments"][0]["text"] == "原文件保留后重试成功。"
+
+
+@pytest.mark.parametrize("code", [
+    "asr_capacity_unavailable", "asr_resource_probe_failed",
+    "asr_resource_guard_triggered", "asr_cold_start_busy",
+])
+def test_resource_failure_is_terminal_keeps_recording_and_requires_manual_retry(
+    tmp_path, monkeypatch, code,
+):
+    attempts = []
+    monkeypatch.setattr(app_module.batch_transcribe, "is_available", lambda: True)
+
+    def refuse(path, **_kwargs):
+        attempts.append(path)
+        raise asr_resource_guard.AsrResourceError(code)
+
+    monkeypatch.setattr(app_module.batch_transcribe, "transcribe_file_report", refuse)
+    app = create_app(data_dir=tmp_path)
+    with TestClient(app) as client:
+        response = client.post(
+            "/v2/meetings/import-audio",
+            files={"file": ("protected.wav", _wav_bytes(), "audio/wav")},
+        )
+        assert response.status_code == 202
+        body = response.json()
+        meeting_id = body["meeting_id"]
+        failed = _wait_for_import_job(client, meeting_id, "failed")
+        assert failed["error_class"] == code
+        assert "原始录音已保留" in failed["error_message"]
+        assert "手动重试" in failed["error_message"]
+        assert failed["attempts"] == 1
+        # Even a claim far after the automatic retry delay cannot restart it.
+        assert app.state.v2_persistence.claim_import_job(
+            worker_id="check-no-auto-retry", now_ms=failed["updated_at_ms"] + 60_000,
+            lease_ms=30_000,
+        ) is None
+        for _ in range(3):
+            assert client.get(f"/v2/meetings/{meeting_id}/import-job").status_code == 200
+        assert app.state.v2_persistence.list_jobs(meeting_id=meeting_id) == []
+        assert (tmp_path / body["source_audio"]["relative_path"]).read_bytes() == _wav_bytes()
+        assert len(attempts) == 1
+
+
+def test_explicit_import_retry_unlocks_only_one_refiner_attempt(tmp_path, monkeypatch):
+    attempts = []
+    monkeypatch.setattr(asr_resource_guard, "check_capacity", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(app_module.batch_transcribe, "is_available", lambda: False)
+    monkeypatch.setattr(app_module.batch_transcribe, "ensure_wav_16k_mono", lambda path: path)
+    monkeypatch.setattr(app_module.asr_refiner, "refinement_capability", lambda: {"status": "ready"})
+
+    def refine(_path, **kwargs):
+        attempts.append(kwargs.get("retry_failed", False))
+        return RefinementResult(text="", status="failed", reason="asr_capacity_unavailable")
+
+    monkeypatch.setattr(app_module.asr_refiner, "refine_wav_file", refine)
+    app = create_app(data_dir=tmp_path)
+    with TestClient(app) as client:
+        body = client.post(
+            "/v2/meetings/import-audio",
+            files={"file": ("latch.wav", _wav_bytes(), "audio/wav")},
+        ).json()
+        meeting_id = body["meeting_id"]
+        first = _wait_for_import_job(client, meeting_id, "failed")
+        assert first["error_class"] == "asr_capacity_unavailable"
+        assert attempts == [False]
+        assert client.post(f"/v2/meetings/{meeting_id}/import-job/retry").status_code == 202
+        second = _wait_for_import_job(client, meeting_id, "failed")
+        assert second["error_class"] == "asr_capacity_unavailable"
+        assert attempts == [False, True]
+        another = client.post(
+            "/v2/meetings/import-audio",
+            files={"file": ("unrelated.wav", _wav_bytes(), "audio/wav")},
+        ).json()
+        _wait_for_import_job(client, another["meeting_id"], "failed")
+        assert attempts == [False, True, False]
+        assert (tmp_path / body["source_audio"]["relative_path"]).read_bytes() == _wav_bytes()
+
+
+def test_fallback_capacity_refusal_happens_before_normalization(tmp_path, monkeypatch):
+    monkeypatch.setattr(app_module.batch_transcribe, "is_available", lambda: False)
+    monkeypatch.setattr(app_module.asr_refiner, "refinement_capability", lambda: {"status": "ready"})
+
+    def refuse(*_args, **_kwargs):
+        raise asr_resource_guard.AsrResourceError("asr_resource_probe_failed")
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("no converter or model starts after failed resource probe")
+
+    monkeypatch.setattr(asr_resource_guard, "check_capacity", refuse)
+    monkeypatch.setattr(app_module.batch_transcribe, "ensure_wav_16k_mono", unexpected)
+    monkeypatch.setattr(app_module.asr_refiner, "refine_wav_file", unexpected)
+    with TestClient(create_app(data_dir=tmp_path)) as client:
+        body = client.post(
+            "/v2/meetings/import-audio",
+            files={"file": ("no-probe.wav", _wav_bytes(), "audio/wav")},
+        ).json()
+        failed = _wait_for_import_job(client, body["meeting_id"], "failed")
+        assert failed["error_class"] == "asr_resource_probe_failed"
+        assert (tmp_path / body["source_audio"]["relative_path"]).read_bytes() == _wav_bytes()
+
+
+def test_online_prewarm_finishes_before_explicit_offline_preparation(tmp_path, monkeypatch):
+    events = []
+    monkeypatch.setenv("MEETING_COPILOT_REALTIME_REFINER_POLICY", "prewarm")
+    monkeypatch.setattr(app_module.asr_refiner, "refinement_capability", lambda: {"status": "ready"})
+
+    def online():
+        events.append("online-start")
+        time.sleep(0.1)
+        events.append("online-ready")
+        return True
+
+    def offline(**kwargs):
+        assert events == ["online-start", "online-ready"]
+        assert kwargs.get("retry_failed", False) is True
+        events.append("offline-capacity-check")
+        return False
+
+    monkeypatch.setattr(app_module.asr_stream, "prewarm_funasr_resident_manager", online)
+    monkeypatch.setattr(app_module.asr_refiner, "prewarm_refiner_worker", offline)
+    monkeypatch.setattr(app_module.asr_stream, "shutdown_funasr_resident_manager", lambda: None)
+    monkeypatch.setattr(app_module.asr_refiner, "shutdown_refiner_worker", lambda: None)
+    with TestClient(create_app(data_dir=tmp_path, prewarm_funasr=True)) as client:
+        assert client.get("/health").status_code == 200
+        assert client.app.state.funasr_resident_prewarm_ready is True
+        assert client.app.state.funasr_refiner_prewarm_ready is False
+        assert events == ["online-start", "online-ready"]
+        preparation = client.post("/providers/asr/prewarm", headers={
+            "origin": "http://127.0.0.1", "x-meeting-copilot-verification": "1",
+        })
+        assert preparation.status_code == 503  # The controlled preparation is refused, never marked ready.
+    assert events == ["online-start", "online-ready", "offline-capacity-check"]
+
+
+def test_concurrent_import_retries_preserve_first_recovery_authorization(tmp_path, monkeypatch):
+    attempts = []
+    retry_entered = threading.Event()
+    allow_retry = threading.Event()
+    retries = []
+    monkeypatch.setattr(asr_resource_guard, "check_capacity", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(app_module.batch_transcribe, "is_available", lambda: False)
+    monkeypatch.setattr(app_module.batch_transcribe, "ensure_wav_16k_mono", lambda path: path)
+    monkeypatch.setattr(app_module.asr_refiner, "refinement_capability", lambda: {"status": "ready"})
+
+    def refine(_path, **kwargs):
+        attempts.append(kwargs.get("retry_failed", False))
+        return RefinementResult(text="", status="failed", reason="asr_capacity_unavailable")
+
+    monkeypatch.setattr(app_module.asr_refiner, "refine_wav_file", refine)
+    app = create_app(data_dir=tmp_path)
+    original_retry = app.state.v2_persistence.retry_import_job
+
+    def delayed_retry(**kwargs):
+        retries.append(kwargs)
+        assert len(retries) == 1, "a concurrent rejected retry must not reach persistence"
+        retry_entered.set()
+        assert allow_retry.wait(3)
+        return original_retry(**kwargs)
+
+    monkeypatch.setattr(app.state.v2_persistence, "retry_import_job", delayed_retry)
+    try:
+        with TestClient(app) as client:
+            body = client.post(
+                "/v2/meetings/import-audio",
+                files={"file": ("concurrent.wav", _wav_bytes(), "audio/wav")},
+            ).json()
+            meeting_id = body["meeting_id"]
+            _wait_for_import_job(client, meeting_id, "failed")
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                first = executor.submit(client.post, f"/v2/meetings/{meeting_id}/import-job/retry")
+                try:
+                    assert retry_entered.wait(2)
+                    second = client.post(f"/v2/meetings/{meeting_id}/import-job/retry")
+                    assert second.status_code == 409
+                    assert len(retries) == 1
+                finally:
+                    allow_retry.set()
+                assert first.result(3).status_code == 202
+            _wait_for_import_job(client, meeting_id, "failed")
+            assert attempts == [False, True]
+            assert (tmp_path / body["source_audio"]["relative_path"]).read_bytes() == _wav_bytes()
+    finally:
+        allow_retry.set()

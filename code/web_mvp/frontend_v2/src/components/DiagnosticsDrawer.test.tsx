@@ -6,6 +6,33 @@ import { createInitialMeetingState } from "../domain/reducer";
 import { DiagnosticsDrawer } from "./DiagnosticsDrawer";
 
 describe("DiagnosticsDrawer", () => {
+  it("shows blocked transcription even when the connection and model are available", () => {
+    const base = createInitialMeetingState("meeting-asr-blocked");
+    render(<DiagnosticsDrawer open onClose={vi.fn()} onRefresh={vi.fn()}
+      onExport={vi.fn().mockResolvedValue(undefined)} transportKind="sse" state={{
+        ...base, connection: "live", runtime: { ...base.runtime, phase: "live", ai: {
+          ...base.runtime.ai, state: "active", label: "AI 已连接", capabilities: {
+            transcript: { state: "paused", label: "精修暂不可用", level: null,
+              detail: "录音继续保存，识别草稿尚未确认。", errorClass: "asr_capacity_unavailable" },
+          },
+        } },
+      }} />);
+    expect(screen.getByText("会议文字待恢复")).toBeVisible();
+    expect(screen.getByText("录音继续保存，识别草稿尚未确认。")).toBeVisible();
+    expect(screen.queryByText("运行正常")).not.toBeInTheDocument();
+    expect(screen.getByText("尚无已确认文字，教练等待可分析的内容")).toBeVisible();
+  });
+
+  it("does not claim the realtime pipeline is healthy before any confirmed words arrive", () => {
+    const base = createInitialMeetingState("meeting-asr-waiting");
+    render(<DiagnosticsDrawer open onClose={vi.fn()} onRefresh={vi.fn()}
+      onExport={vi.fn().mockResolvedValue(undefined)} transportKind="sse" state={{
+        ...base, connection: "live", runtime: { ...base.runtime, phase: "live" },
+      }} />);
+    expect(screen.getByText("等待会议文字")).toBeVisible();
+    expect(screen.queryByText("本地服务和 AI 实时能力正常")).not.toBeInTheDocument();
+  });
+
   it("supports Escape, traps keyboard focus, and restores focus to its trigger", async () => {
     const state = {
       ...createInitialMeetingState("meeting-dialog-contract"),
@@ -131,9 +158,8 @@ describe("DiagnosticsDrawer", () => {
       />,
     );
 
-    expect(screen.getByText("AI 实时能力异常")).toBeVisible();
-    expect(screen.getAllByText("本场曾发生 Pi Provider 超时，本场未生成 Pi 建议")).toHaveLength(2);
-    expect(screen.queryByText("运行正常")).not.toBeInTheDocument();
+    expect(screen.getAllByText("本场记录过 Pi Provider 超时；当前结果请查看实时教练")).toHaveLength(2);
+    expect(screen.queryByText("AI 实时能力异常")).not.toBeInTheDocument();
   });
 
   it("reports local reflex provenance without counting it as a Pi intervention", () => {
@@ -164,6 +190,49 @@ describe("DiagnosticsDrawer", () => {
     expect(screen.getByText("运行正常")).toBeVisible();
     expect(screen.getAllByText("本场有 1 轮使用本地实时提示，未调用 Pi Provider")).toHaveLength(2);
     expect(screen.queryByText("Pi 实时教练执行失败，本轮未生成建议")).not.toBeInTheDocument();
+  });
+
+  it("does not claim a meeting never produced advice when a produced intervention was withdrawn", () => {
+    const base = createInitialMeetingState("meeting-produced-then-withdrawn");
+    render(<DiagnosticsDrawer open onClose={vi.fn()} onRefresh={vi.fn()}
+      onExport={vi.fn().mockResolvedValue(undefined)} transportKind="sse" state={{
+        ...base, connection: "live", coachDecision: { origin: "pi", status: "stale" },
+        diagnostics: { coach_runtime_history: [
+          { origin: "pi", status: "intervention", outcome: "success", pi_provider_attempted: true },
+          { origin: "pi", status: "failed", outcome: "failure", pi_provider_attempted: true },
+        ] },
+      }} />);
+    expect(screen.queryAllByText(/本场未生成 Pi 建议/)).toHaveLength(0);
+    expect(screen.getAllByText("本场记录过 Pi 实时教练执行失败；当前结果请查看实时教练")).toHaveLength(2);
+    expect(screen.queryByText("AI 实时能力异常")).not.toBeInTheDocument();
+  });
+
+  it("does not classify an evidence withdrawal followed by a current intervention as execution failure", () => {
+    const base = createInitialMeetingState("meeting-real-withdrawal-history");
+    render(<DiagnosticsDrawer open onClose={vi.fn()} onRefresh={vi.fn()}
+      onExport={vi.fn().mockResolvedValue(undefined)} transportKind="sse" state={{
+        ...base, connection: "live", coachDecision: { origin: "pi", status: "intervention" },
+        diagnostics: { coach_runtime_history: [
+          { origin: "pi", status: "intervention", outcome: "intervention", pi_provider_attempted: true },
+          { origin: "pi", status: "stale", status_reason: "discussion_evidence_revised", outcome: "failure", pi_provider_attempted: true },
+          { origin: "pi", status: "intervention", outcome: "intervention", pi_provider_attempted: true },
+        ] },
+      }} />);
+    expect(screen.queryByText("AI 实时能力异常")).not.toBeInTheDocument();
+    expect(screen.queryAllByText(/本场记录过 .*失败/)).toHaveLength(0);
+  });
+
+  it("keeps a true historical timeout informational after the current request succeeds", () => {
+    const base = createInitialMeetingState("meeting-recovered-pi");
+    render(<DiagnosticsDrawer open onClose={vi.fn()} onRefresh={vi.fn()}
+      onExport={vi.fn().mockResolvedValue(undefined)} transportKind="sse" state={{
+        ...base, connection: "live", coachDecision: { origin: "pi", status: "intervention" },
+        diagnostics: { coach_runtime_history: [
+          { origin: "pi", status: "timed_out", status_reason: "provider_timeout", outcome: "failure", pi_provider_attempted: true },
+        ] },
+      }} />);
+    expect(screen.queryByText("AI 实时能力异常")).not.toBeInTheDocument();
+    expect(screen.getAllByText("本场记录过 Pi Provider 超时；当前结果请查看实时教练")).toHaveLength(2);
   });
 
   it("distinguishes a Pi attempt that fell back from a local-only reflex", () => {

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from threading import Barrier, Thread
 
+import pytest
+
+from meeting_copilot_web_mvp.realtime_intelligence import IntelligenceResponseValidationError
 from meeting_copilot_web_mvp.realtime_provider_circuit import (
     RealtimeProviderCircuit,
     classify_realtime_provider_failure,
@@ -108,6 +111,23 @@ def test_non_retryable_failure_does_not_open_the_availability_circuit() -> None:
     assert classify_realtime_provider_failure({"status_code": 401}) is None
     assert classify_realtime_provider_failure({"status_code": 503}) == "provider_server"
     assert classify_realtime_provider_failure({"fallback_reason": "provider_timeout"}) == "timeout"
+
+
+@pytest.mark.parametrize("category", ["semantic_safety", "evidence", "structural"])
+def test_host_validation_failure_never_counts_as_provider_outage(category: str) -> None:
+    error = IntelligenceResponseValidationError("test-only invalid model output", category=category)
+    circuit = RealtimeProviderCircuit()
+    for _ in range(3):
+        attempt = circuit.acquire("pi-deep")
+        assert attempt.admitted and attempt.permit is not None
+        assert classify_realtime_provider_failure(error) is None
+        assert classify_realtime_provider_failure({"category": category, "status": "failed"}) is None
+        # Host schema failures release admission, as finish_provider_circuit does.
+        attempt.permit.release()
+    snapshot = circuit.snapshot("pi-deep")
+    assert snapshot.state == "closed"
+    assert snapshot.failure_count == 0
+    assert circuit.snapshot("direct-semantic").state == "closed"
 
 
 def test_half_open_allows_only_one_concurrent_trial() -> None:

@@ -120,6 +120,33 @@ afterEach(() => {
 });
 
 describe("ProviderSettingsControl", () => {
+  it("shows an independent deep failure and leaves unprobed lanes unverified", async () => {
+    const invoke = vi.fn(async () => configured);
+    window.__TAURI__ = { core: { invoke: invoke as unknown as TauriInvoke } };
+    const circuit = { state: "open", reason: "rate_limit", failure_count: 1, retry_after_ms: 1000, half_open: false, identity_generation: 1, last_failure_class: "rate_limit" };
+    const lane = { configured: true, enabled: true, model: "gpt-realtime-test", model_source: "runtime_realtime_model", transport: "pi_tool_call", circuit_status: "not_applicable", circuit: null, admission_group: null, active_count: null, pending_count: null, max_active: null, probe_scope: "not_probed", probe_status: "not_run", last_result: null };
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      if (String(input) === "/providers/status") return Promise.resolve(jsonResponse({
+        ...connectedProviderStatus,
+        provider_lanes: {
+          pi_realtime: { ...lane, circuit_status: "closed", probe_scope: "realtime_model_tool_call", probe_status: "succeeded" },
+          pi_deep: { ...lane, circuit_status: "open", circuit },
+          correction: { ...lane, model: "correct", transport: "json" },
+        },
+      }));
+      if (String(input).startsWith("/cost/stats")) return Promise.resolve(jsonResponse(costStats));
+      return Promise.reject(new Error("unexpected request"));
+    }));
+    render(<ProviderSettingsControl />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "打开 AI 设置" })).toHaveTextContent("AI 已连接"));
+    await userEvent.setup().click(screen.getByRole("button", { name: "打开 AI 设置" }));
+    const section = await screen.findByRole("region", { name: "AI 功能通道状态" });
+    expect(within(section).getByText("暂不可用")).toBeVisible();
+    expect(within(section).getByText("已配置，待专项验证")).toBeVisible();
+    expect(within(section).getAllByText("状态未知")).toHaveLength(2);
+    expect(within(section).getByText("工具调用通过")).toBeVisible();
+  });
+
   it("keeps the connected model label after a component remount", async () => {
     const invoke = vi.fn(async (command: string) => {
       if (command === "provider_config_status") return configured;

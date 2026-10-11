@@ -638,7 +638,7 @@ button:focus-visible,
 
 .transcript-pane {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr) auto;
   min-width: 0;
   min-height: 0;
   border-right: 1px solid var(--border);
@@ -738,7 +738,7 @@ button:focus-visible,
   overscroll-behavior: contain;
   scroll-behavior: smooth;
   scrollbar-gutter: stable;
-  padding: 10px 0 88px;
+  padding: 10px 0 24px;
   background: var(--surface);
 }
 
@@ -1191,6 +1191,20 @@ button:focus-visible,
   margin: 0;
 }
 
+.note-editor-empty--guide {
+  grid-row: 1 / -1;
+  gap: 16px;
+  padding: 32px clamp(20px, 5vw, 56px);
+  line-height: 1.8;
+  text-align: center;
+  overflow: auto;
+}
+
+.note-editor-empty--guide h2 { margin: 0; color: var(--text-primary); font-size: 18px; }
+.note-editor-empty--guide p { max-width: 560px; }
+.review-project-binding { margin: 16px 0; }
+.review-project-binding > summary { cursor: pointer; font-weight: 600; }
+
 .note-editor-toolbar {
   display: flex;
   min-width: 0;
@@ -1592,11 +1606,8 @@ button:focus-visible,
 }
 
 .active-partial-slot {
-  position: sticky;
-  z-index: 2;
-  bottom: 0;
   display: flex;
-  min-height: 66px;
+  min-height: 0;
   align-items: flex-end;
   padding: 8px 26px 10px 29px;
   pointer-events: none;
@@ -1621,6 +1632,8 @@ button:focus-visible,
 
 .active-partial p {
   color: var(--text-secondary);
+  max-height: 80px;
+  overflow-y: auto;
 }
 
 .preflight-input-meter {
@@ -2625,11 +2638,24 @@ button:focus-visible,
 }
 
 .meeting-preflight-body {
-  display: grid;
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
   gap: 15px;
   min-height: 0;
   padding: 18px 20px;
   overflow-y: auto;
+}
+
+.meeting-preflight-body > * {
+  flex-shrink: 0;
+}
+
+/* The dialog body owns scrolling, so expanded project context keeps its full height. */
+.meeting-preflight-body .meeting-project-brief ul,
+.meeting-preflight-body .meeting-project-brief li > p:first-child {
+  max-height: none;
+  overflow: visible;
 }
 
 .import-recording-body {
@@ -2813,6 +2839,22 @@ button:focus-visible,
 
 .preflight-system-audio-summary small {
   color: var(--text-muted);
+}
+
+.preflight-correction-modes {
+  margin: 8px 0;
+}
+
+.preflight-correction-result {
+  margin-bottom: 8px;
+}
+
+.preflight-memory-readout {
+  margin: 6px 0;
+  padding: 6px 8px;
+  background: var(--surface);
+  border-radius: 4px;
+  font-variant-numeric: tabular-nums;
 }
 
 .preflight-field-heading {
@@ -6730,9 +6772,9 @@ button.product-nav-item:focus-visible {
 }
 
 .transcript-segment {
-  grid-template-columns: 94px minmax(0, 1fr);
-  gap: 16px;
-  padding: 15px 24px;
+  grid-template-columns: 82px minmax(0, 1fr);
+  gap: 12px;
+  padding: 18px 22px;
   border-bottom: 1px solid #eef1f6;
 }
 
@@ -6744,9 +6786,20 @@ button.product-nav-item:focus-visible {
 .active-partial p,
 .transcript-archive p {
   color: #344054;
-  font-size: 13px;
-  line-height: 1.78;
+  font-size: 16px;
+  line-height: 1.9;
 }
+
+.transcript-pane > .active-partial-slot {
+  padding: 10px 18px;
+  border-top: 1px solid var(--border);
+  background: var(--surface-subtle);
+}
+
+.transcript-pane .active-partial { grid-template-columns: 64px minmax(0, 1fr); gap: 10px; padding: 8px 10px; }
+.transcript-pane .active-partial p { font-size: 13px; line-height: 1.6; }
+.transcript-pane .active-partial small { font-size: 11px; line-height: 1.6; color: var(--text-muted); }
+.transcript-pane .correction-mark--pending { color: var(--text-muted); }
 
 .ai-workspace {
   background: #f6f7fa;
@@ -7381,6 +7434,11 @@ button.product-nav-item:focus-visible {
   border-bottom: 1px solid var(--border);
 }
 
+.note-import-button {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
 .note-title-input,
 .note-body-input {
   margin-inline: 32px;
@@ -7862,6 +7920,7 @@ button.product-nav-item:focus-visible {
 
 .diagnostics-list {
   margin: 16px 20px;
+  flex-shrink: 0;
   overflow: hidden;
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -8298,7 +8357,18 @@ button.product-nav-item:focus-visible {
   }
 
   .meeting-header-meta {
+    display: flex;
+    margin-top: 2px;
+  }
+
+  .meeting-header-meta > span:not(.meeting-header-updated-at) {
     display: none;
+  }
+
+  .meeting-header-meta > .meeting-header-updated-at {
+    min-width: 0;
+    line-height: 1.2;
+    white-space: normal;
   }
 
   .meeting-grid {
@@ -8633,4 +8703,31 @@ button.product-nav-item:focus-visible {
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+}
+
+.provider-lane-status {
+  min-width: 0;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.provider-lane-status dl {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+}
+
+.provider-lane-status dl > div {
+  display: grid;
+  grid-template-columns: minmax(80px, 0.35fr) minmax(0, 1fr);
+  gap: 12px;
+  padding: 8px 0;
+}
+
+.provider-lane-status dt,
+.provider-lane-status dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+  line-height: 1.6;
 }

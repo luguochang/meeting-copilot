@@ -1314,6 +1314,9 @@ def test_capture_heartbeat_end_seal_race_keeps_terminal_recording_and_ws_open(
         async def send_text(self, payload):
             self.sent.append(payload)
 
+        async def receive(self):
+            raise AssertionError("callback-only fixture unexpectedly received a frame")
+
         async def close(self, *args, **kwargs):
             self.close_calls.append((args, kwargs))
 
@@ -1463,6 +1466,9 @@ def test_capture_heartbeat_live_lease_loss_still_closes_ws(
 
         async def send_text(self, _payload):
             return None
+
+        async def receive(self):
+            raise AssertionError("callback-only fixture unexpectedly received a frame")
 
         async def close(self, *args, **kwargs):
             self.close_calls.append((args, kwargs))
@@ -3910,7 +3916,7 @@ def test_funasr_partial_final_and_canonical_share_l3_normalization_snapshot(
     assert transcript_final["payload"]["source_segment_id"] == expected_source_segment_id
     assert record["canonical_transcript"]["full_text"] == expected_text
     assert record["settings_snapshot"] == {
-        "asr": {"l3_normalize_enabled": l3_normalize_enabled},
+        "asr": {"l3_normalize_enabled": l3_normalize_enabled, "correction_mode": "local_and_llm"},
         "scope": "websocket_connection_start",
     }
 
@@ -4021,7 +4027,7 @@ def test_asr_stream_same_session_reconnect_reprojects_from_raw_source(
     canonical = project_canonical_transcript(session_id=sid, events=record["events"])
     assert canonical["full_text"] == expected_projection
     assert record["settings_snapshot"] == {
-        "asr": {"l3_normalize_enabled": second_l3},
+        "asr": {"l3_normalize_enabled": second_l3, "correction_mode": "local_and_llm"},
         "scope": "websocket_connection_start",
     }
 
@@ -5039,6 +5045,7 @@ class _BoundaryBarrierWebSocket:
     def __init__(self, messages):
         self.messages = list(messages)
         self.sent = []
+        self.closed = False
 
     async def accept(self):
         return None
@@ -5050,7 +5057,7 @@ class _BoundaryBarrierWebSocket:
         self.sent.append(json.loads(payload))
 
     async def close(self):
-        return None
+        self.closed = True
 
 
 def _run3_boundary_refinement(_payload):
@@ -5421,9 +5428,8 @@ def test_funasr_boundary_retry_uses_one_absolute_wait_budget(
         )
     )
 
-    # The resident attempt remains addressable, but the endpoint adapter makes
-    # only one bounded retry. Subsequent FLUSH/END messages return the same
-    # safe timeout result without enqueueing another command.
+    # The adapter makes one bounded retry, then closes rather than keeping an
+    # exhausted token active through arbitrary later FLUSH/audio messages.
     assert len(recognizer.flush_calls) == asr_stream.FUNASR_BOUNDARY_MAX_WAIT_ATTEMPTS
     assert len({boundary_id for boundary_id, _ in recognizer.flush_calls}) == 1
     assert all(
@@ -5435,11 +5441,16 @@ def test_funasr_boundary_retry_uses_one_absolute_wait_budget(
     flush_results = [
         event for event in websocket.sent if event.get("event_type") == "flush_complete"
     ]
-    assert len(flush_results) == 3
+    assert len(flush_results) == 1
     assert all(result["boundary_acknowledged"] is False for result in flush_results)
     assert all(isinstance(result["boundary_diagnostics"], list) for result in flush_results)
     assert flush_results[-1]["boundary_status"] == "timeout"
     assert flush_results[-1]["error_code"] == "funasr_boundary_ack_timeout"
+    assert websocket.closed is True
+    assert websocket.sent[-1]["event_type"] == "provider_error"
+    assert websocket.sent[-1]["error_code"] == "funasr_boundary_ack_timeout"
+    assert websocket.sent[-1]["recoverable"] is True
+    assert len(websocket.messages) == 3
     assert not [
         event for event in websocket.sent if event.get("event_type") == "final"
     ]
@@ -5450,14 +5461,13 @@ def test_funasr_boundary_retry_uses_one_absolute_wait_budget(
 def test_funasr_boundary_budget_exhaustion_stops_automatic_vad_reentry(
     monkeypatch,
 ):
-    """A timed-out token must not call the barrier once per later PCM frame."""
+    """A timed-out token closes before accepting unbounded later PCM frames."""
 
     speech = struct.pack("<f", 0.05) * 4_800
     silence = struct.pack("<f", 0.0) * 4_800
     recognizer = _BoundaryBarrierRecognizer(timeout_count=4)
-    # Three silence frames reach the first natural VAD boundary; the next
-    # reaches the one permitted retry. More frames keep endpoint silence above
-    # the threshold and would previously re-enter the exhausted wait branch.
+    # Three silence frames reach the first natural VAD boundary. The adapter
+    # retries before consuming any more frames, then closes on exhaustion.
     websocket = _BoundaryBarrierWebSocket(
         [
             {"bytes": speech},
@@ -5481,6 +5491,13 @@ def test_funasr_boundary_budget_exhaustion_stops_automatic_vad_reentry(
     )
 
     assert len(recognizer.flush_calls) == asr_stream.FUNASR_BOUNDARY_MAX_WAIT_ATTEMPTS
+    assert recognizer._seq == 4
+    assert recognizer.abort_calls == 1
+    assert recognizer.finalize_calls == 0
+    assert websocket.closed is True
+    assert len(websocket.messages) == 10
+    assert websocket.sent[-1]["event_type"] == "provider_error"
+    assert websocket.sent[-1]["error_code"] == "funasr_boundary_ack_timeout"
     assert len(
         [event for event in websocket.sent if event.get("event_type") == "flush_complete"]
     ) == 0

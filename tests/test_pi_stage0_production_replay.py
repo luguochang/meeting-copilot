@@ -1552,7 +1552,7 @@ def test_stream_wav_uses_production_microphone_websocket_and_f32le(tmp_path: Pat
             self.closed = False
 
         def settimeout(self, _timeout):
-            return None
+            self.timeout = _timeout
 
         def recv(self):
             if not self.ready_sent:
@@ -1567,9 +1567,11 @@ def test_stream_wav_uses_production_microphone_websocket_and_f32le(tmp_path: Pat
             raise replay.websocket.WebSocketTimeoutException()
 
         def send_binary(self, payload):
+            assert self.timeout >= 1.0, "a short receive poll must not leak into writes"
             self.sent_binary.append(payload)
 
         def send(self, payload):
+            assert self.timeout >= 1.0, "the END frame needs a separate bounded write budget"
             self.sent_text.append(payload)
 
         def close(self):
@@ -1691,6 +1693,94 @@ def test_stream_wav_does_not_treat_an_early_final_then_quiet_as_terminal(
     assert fake_ws.sent_text == ["END"]
     assert exc_info.value.transport_stats["termination"] == "finalize_timeout"
     assert exc_info.value.transport_stats["non_empty_final_count"] == 1
+    assert exc_info.value.transport_stats["send_error_class"] is None
+    assert exc_info.value.transport_stats["send_error_operation"] is None
+
+
+@pytest.mark.parametrize("failure_phase,expected_operation", [
+    ("source", "source_audio_binary_write"),
+    ("tail", "tail_silence_binary_write"),
+    ("end", "end_text_write"),
+])
+@pytest.mark.parametrize("write_budget", [5.0, 10.0])
+def test_stream_wav_diagnoses_write_failure_without_resending_a_partial_frame(
+    tmp_path, monkeypatch, failure_phase, expected_operation, write_budget,
+):
+    wav_path = tmp_path / "fixture.wav"
+    _write_wav(wav_path, [1000, -1000, 1000])
+
+    class WriteFailureSocket:
+        def __init__(self):
+            self.binary_attempts = 0
+            self.text_attempts = 0
+            self.ready_sent = False
+            self.close_calls = 0
+            self.current_timeout = None
+            self.poll_timeouts = []
+
+        def settimeout(self, timeout):
+            self.current_timeout = timeout
+
+        def recv(self):
+            assert 0.01 <= self.current_timeout <= 0.5
+            self.poll_timeouts.append(self.current_timeout)
+            if not self.ready_sent:
+                self.ready_sent = True
+                return json.dumps({"event_type": "asr_ready", "ready": True})
+            raise replay.websocket.WebSocketTimeoutException("ordinary receive poll")
+
+        def send_binary(self, _payload):
+            assert self.current_timeout == write_budget
+            self.binary_attempts += 1
+            if failure_phase == "source" or failure_phase == "tail" and self.binary_attempts == 2:
+                raise replay.websocket.WebSocketTimeoutException("private write error not in safe diagnosis")
+
+        def send(self, _payload):
+            assert self.current_timeout == write_budget
+            self.text_attempts += 1
+            if failure_phase == "end":
+                raise replay.websocket.WebSocketTimeoutException("private END error")
+
+        def close(self):
+            self.close_calls += 1
+
+    class Client:
+        origin = "http://127.0.0.1:8878"
+        cookie = ""
+
+        def websocket_url(self, _path, _query):
+            return "ws://127.0.0.1:8878/live/asr/stream/ws/test"
+
+    socket = WriteFailureSocket()
+    monkeypatch.setattr(replay.websocket, "create_connection", lambda *_args, **_kwargs: socket)
+    with pytest.raises(replay.ReplayFailure) as raised:
+        replay.stream_wav(Client(), meeting_id="test_write_fault", wav_path=wav_path,
+                          wav_info=replay.inspect_wav(wav_path), pace=1000, chunk_seconds=0.3,
+                          tail_silence_seconds=0.001 if failure_phase == "tail" else 0,
+                          ready_timeout_seconds=1, finalize_timeout_seconds=0.02, event_sink=[],
+                          write_timeout_seconds=write_budget)
+    stats = raised.value.transport_stats
+    assert stats["send_error_operation"] == expected_operation
+    assert stats["send_error_class"] == "WebSocketTimeoutException"
+    assert stats["send_error_elapsed_ms"] >= 0
+    assert stats["write_timeout_seconds"] == write_budget
+    assert socket.binary_attempts == (2 if failure_phase == "tail" else 1)
+    assert socket.text_attempts == (1 if failure_phase == "end" else 0)
+    assert socket.close_calls == 1
+    if failure_phase != "source":
+        assert socket.poll_timeouts and max(socket.poll_timeouts) <= 0.5
+
+
+@pytest.mark.parametrize("invalid_budget", [0.0, 10.01, float("nan"), float("inf")])
+def test_stream_write_budget_rejects_invalid_range_before_websocket(tmp_path, monkeypatch, invalid_budget):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("invalid transport budget attempted a connection")
+
+    monkeypatch.setattr(replay.websocket, "create_connection", forbidden)
+    with pytest.raises(replay.ReplayFailure, match="write timeout"):
+        replay.stream_wav(None, meeting_id="invalid_budget", wav_path=tmp_path / "not-read.wav", wav_info=None,
+                          pace=1, chunk_seconds=0.3, tail_silence_seconds=0, ready_timeout_seconds=1,
+                          finalize_timeout_seconds=1, event_sink=[], write_timeout_seconds=invalid_budget)
 
 
 def test_stream_wav_preserves_transport_stats_when_server_closes_before_final(

@@ -1,4 +1,7 @@
+import { isTranscriptEvidence, parseDocumentSourceEvidence, parseDocumentSources, serializeDocumentSource } from "./sourceEvidence";
+import { coachUiRenderReceiptWire, parseCoachUiRenderReceipt } from "../domain/coachUiRenderReceipt";
 import type {
+  CoachUiRenderReceipt,
   DataDeletionScope,
   DataGovernanceSettings,
   DataRetentionPolicy,
@@ -6,6 +9,7 @@ import type {
   MeetingFactKind,
   MeetingFactStatus,
   AskAiMessage,
+  DocumentSourceEvidence,
   AskAiScope,
   AskAiThread,
   MeetingChapter,
@@ -14,6 +18,7 @@ import type {
   MeetingHistoryPage,
   ImportJob,
   MeetingInputSource,
+  MeetingCorrectionMode,
   MeetingPreparationInput,
   MeetingPreparationSnapshot,
   MeetingNote,
@@ -42,20 +47,42 @@ import {
   parseMeetingSpeaker,
   parseMeetingSpeakers,
   parseMeetingSnapshot,
+  parseLiveAnalysisProfile,
   parseImportJob,
   parseProviderStatus,
+  parseAsrRuntimeStatus,
+  parseMeetingCorrectionMode,
+  parseMeetingCorrectionCapability,
+  type MeetingCorrectionCapability,
+  asrPreparationBlocker,
+  type AsrRuntimeStatus,
   parseReviewDocument,
   parseReviewDocumentRevisions,
   parseTranscriptPage,
   type ProviderStatus,
 } from "./schema";
 
+import { coachRequestOutcomeFromSnapshot, type CoachRequestOutcome } from "./coachRequestOutcome";
+export type { CoachRequestOutcome, CoachRequestStatus, CoachRequestFailureCategory } from "./coachRequestOutcome";
+export type ContributionIntent = "ask_question" | "compare_options" | "formulate_response" | "freeform";
+export interface ContributionRequestOptions {
+  intent: ContributionIntent;
+  topicId?: string;
+  expectedBasisRevision?: number;
+  selectedSegmentIds?: string[];
+}
+export interface MeetingCreateOptions { materialSetId?: string; expectedMaterialSetRevision?: number; idempotencyKey?: string }
+export interface DiscussionWorkItem { id: string; title: string; state: string; version: number; context: Record<string, unknown>; analysis_basis_revision?: number }
+
 export interface MeetingApi {
+  getDiscussion?(meetingId: string, signal?: AbortSignal): Promise<DiscussionWorkItem | null>;
+  updateDiscussion?(meetingId: string, item: DiscussionWorkItem, changes: { title?: string; context?: Record<string, unknown>; state?: string }): Promise<DiscussionWorkItem>;
   createMeeting(
     meetingId: string,
     title?: string | null,
     inputSourceOrSignal?: MeetingInputSource | AbortSignal,
     signal?: AbortSignal,
+    options?: MeetingCreateOptions,
   ): Promise<void>;
   saveMeetingPreparation(
     meetingId: string,
@@ -113,12 +140,14 @@ export interface MeetingApi {
     feedback: SuggestionFeedback,
     signal?: AbortSignal,
   ): Promise<void>;
-  getCoachRequestStatus?(meetingId: string, jobId: string, signal?: AbortSignal): Promise<"pending" | "succeeded" | "failed" | "no_change">;
+  getCoachRequestStatus?(meetingId: string, jobId: string, signal?: AbortSignal): Promise<"pending" | "succeeded" | "failed" | "timed_out" | "no_change">;
+  getCoachRequestOutcome?(meetingId: string, jobId: string, signal?: AbortSignal): Promise<CoachRequestOutcome>;
   requestRealtimeCoach?(
     meetingId: string,
     request: string,
     answerId?: string | null,
     signal?: AbortSignal,
+    options?: ContributionRequestOptions,
   ): Promise<string | void>;
   saveFactStatus(
     meetingId: string,
@@ -148,6 +177,7 @@ export interface MeetingApi {
     draftSeq: number,
     signal?: AbortSignal,
   ): Promise<void>;
+  markCoachUiRendered?(receipt: CoachUiRenderReceipt, signal?: AbortSignal): Promise<void>;
   getMeetingPreparation?(meetingId: string, signal?: AbortSignal): Promise<MeetingPreparationSnapshot>;
   getMeetingPreparationVersions?(meetingId: string, signal?: AbortSignal): Promise<MeetingPreparationSnapshot[]>;
   getChapters?(meetingId: string, query?: string, signal?: AbortSignal): Promise<MeetingChapter[]>;
@@ -162,6 +192,7 @@ export interface MeetingApi {
       chapterId?: string | null;
       recentMinutes?: 1 | 3 | 5 | 10;
       intent?: "catch_up";
+      includeKnowledge?: boolean;
     },
     onDelta: (text: string) => void,
     signal?: AbortSignal,
@@ -176,6 +207,8 @@ export interface MeetingApi {
     query?: { meetingId?: string | null; status?: MeetingNoteStatus | "all"; query?: string; limit?: number },
     signal?: AbortSignal,
   ): Promise<MeetingNote[]>;
+  listNotesPage?(query?: { meetingId?: string | null; status?: MeetingNoteStatus | "all"; query?: string; limit?: number; cursor?: string | null }, signal?: AbortSignal): Promise<{ items: MeetingNote[]; nextCursor: string | null; hasMore: boolean }>;
+  getNote?(noteId: string, signal?: AbortSignal): Promise<MeetingNote>;
   createNote?(
     meetingId: string,
     input: {
@@ -207,6 +240,7 @@ export interface MeetingApi {
       text: string;
       sourceMessageId?: string | null;
       evidence?: AskAiMessage["evidence"];
+      sourceEvidence?: DocumentSourceEvidence[];
     },
     signal?: AbortSignal,
   ): Promise<void>;
@@ -231,6 +265,18 @@ export interface ImportRecordingResult {
   job: ImportJob | null;
 }
 
+export type LocalRuntimeState = "ready" | "starting" | "idle" | "available" | "disabled" | "unavailable" | "failed" | "unknown";
+
+export interface LocalRuntimeCapability {
+  available: boolean | null;
+  state: LocalRuntimeState;
+  source: string;
+  reason: string | null;
+  processReady: boolean | null;
+  processRunning: boolean | null;
+  formats?: Record<string, boolean>;
+}
+
 export interface LocalCapabilityStatus {
   schemaVersion: string;
   platform: string;
@@ -247,6 +293,12 @@ export interface LocalCapabilityStatus {
   downloadPageUrl: string | null;
   importAvailable: boolean;
   errors: string[];
+  deploymentMode?: "source" | "packaged" | "desktop" | "unknown";
+  runtimeCapabilities?: {
+    realtimeAsr: LocalRuntimeCapability;
+    fileAsr: LocalRuntimeCapability;
+    offlineRefinement: LocalRuntimeCapability;
+  };
 }
 
 function apiRecord(value: unknown, label: string): Record<string, unknown> {
@@ -267,6 +319,23 @@ function parseLocalCapabilityStatus(value: unknown): LocalCapabilityStatus {
   if (schemaVersion !== "meeting_copilot.local_capability_status.v1") {
     throw new ContractError("local capability schema_version is unsupported");
   }
+  const runtime = item.runtime_capabilities === undefined ? null : apiRecord(item.runtime_capabilities, "runtime capabilities");
+  const parseRuntime = (value: unknown): LocalRuntimeCapability => {
+    const capability = apiRecord(value, "runtime capability");
+    const states: LocalRuntimeState[] = ["ready", "starting", "idle", "available", "disabled", "unavailable", "failed", "unknown"];
+    if (!states.includes(capability.state as LocalRuntimeState)) throw new ContractError("runtime capability state is unsupported");
+    return {
+      available: typeof capability.available === "boolean" ? capability.available : null,
+      state: capability.state as LocalRuntimeState,
+      source: typeof capability.source === "string" ? capability.source : "unknown",
+      reason: typeof capability.reason === "string" ? capability.reason : null,
+      processReady: typeof capability.process_ready === "boolean" ? capability.process_ready : null,
+      processRunning: typeof capability.process_running === "boolean" ? capability.process_running : null,
+      ...(capability.formats && typeof capability.formats === "object" && !Array.isArray(capability.formats)
+        ? { formats: Object.fromEntries(Object.entries(capability.formats).filter((entry): entry is [string, boolean] => typeof entry[1] === "boolean")) }
+        : {}),
+    };
+  };
   return {
     schemaVersion,
     platform: apiString(item.platform, "local capability platform"),
@@ -285,6 +354,15 @@ function parseLocalCapabilityStatus(value: unknown): LocalCapabilityStatus {
     errors: Array.isArray(item.errors)
       ? item.errors.filter((error): error is string => typeof error === "string")
       : [],
+    ...(item.deployment_mode === undefined ? {} : {
+      deploymentMode: ["source", "packaged", "desktop"].includes(String(item.deployment_mode))
+        ? item.deployment_mode as "source" | "packaged" | "desktop" : "unknown",
+    }),
+    ...(runtime ? { runtimeCapabilities: {
+      realtimeAsr: parseRuntime(runtime.realtime_asr),
+      fileAsr: parseRuntime(runtime.file_asr),
+      offlineRefinement: parseRuntime(runtime.offline_refinement),
+    } } : {}),
   };
 }
 
@@ -304,6 +382,8 @@ function parseMeetingPreparation(value: unknown): MeetingPreparationSnapshot {
     : "low_frequency";
   return {
     meetingId: typeof item.meeting_id === "string" ? item.meeting_id : "",
+    liveAnalysisProfile: parseLiveAnalysisProfile(item.live_analysis_profile),
+    correctionMode: parseMeetingCorrectionMode(item.correction_mode),
     hotwords: Array.isArray(item.hotwords) ? item.hotwords.filter((entry): entry is string => typeof entry === "string") : [],
     inputSource,
     inputDeviceId: typeof item.input_device_id === "string" ? item.input_device_id : null,
@@ -322,11 +402,15 @@ function parseMeetingPreparation(value: unknown): MeetingPreparationSnapshot {
 
 function parseAskEvidence(value: unknown): AskAiMessage["evidence"] {
   if (!Array.isArray(value)) return [];
-  return value.flatMap((raw) => {
+  return value.flatMap<AskAiMessage["evidence"][number]>((raw) => {
     const item = apiRecord(raw, "Ask AI evidence");
+    if (item.source_type === "document" || item.source_type === "meeting_attachment") return [parseDocumentSourceEvidence(item)];
     const segmentId = typeof item.segment_id === "string" ? item.segment_id : "";
     if (!segmentId) return [];
     return [{
+      sourceType: "transcript" as const,
+      ...(typeof item.revision === "number" ? { revision: item.revision } : {}),
+      ...(typeof item.evidence_hash === "string" ? { evidenceHash: item.evidence_hash } : {}),
       segmentId,
       transcriptSeq: typeof item.transcript_seq === "number" ? item.transcript_seq : 0,
       startMs: typeof item.start_ms === "number" ? item.start_ms : null,
@@ -339,7 +423,7 @@ function parseAskEvidence(value: unknown): AskAiMessage["evidence"] {
 function parseAskMessage(value: unknown): AskAiMessage {
   const item = apiRecord(value, "Ask AI message");
   const role = item.role === "assistant" ? "assistant" : "user";
-  const scope = ["selection", "recent", "chapter", "meeting"].includes(String(item.scope))
+  const scope = ["selection", "recent", "chapter", "meeting", "project"].includes(String(item.scope))
     ? item.scope as AskAiScope
     : "recent";
   const status = ["pending", "completed", "failed"].includes(String(item.status))
@@ -356,6 +440,7 @@ function parseAskMessage(value: unknown): AskAiMessage {
     content: typeof item.content === "string" ? item.content : "",
     scope,
     evidence: parseAskEvidence(item.evidence),
+    evidenceStatus: item.evidence_status === "valid" || item.evidence_status === "stale" ? item.evidence_status : "unknown",
     status,
     errorClass: typeof item.error_class === "string" ? item.error_class : null,
     pinnedKind,
@@ -400,6 +485,8 @@ function parseMeetingNote(value: unknown): MeetingNote {
     createdAtMs: typeof item.created_at_ms === "number" ? item.created_at_ms : 0,
     updatedAtMs: typeof item.updated_at_ms === "number" ? item.updated_at_ms : 0,
     evidence: parseNoteEvidence(item.evidence),
+    sourceEvidence: parseDocumentSources(item.source_evidence),
+    evidenceStatus: item.evidence_status === "valid" || item.evidence_status === "stale" ? item.evidence_status : "unknown",
   };
 }
 
@@ -464,7 +551,108 @@ export async function fetchProviderStatus(signal?: AbortSignal): Promise<Provide
   return parseProviderStatus(body);
 }
 
+// These two local operations do not acquire audio, a meeting lease, or an LLM lane.
+async function asrPreparationRequest(path: string, method: "GET" | "POST", signal?: AbortSignal): Promise<{ ok: boolean; body: unknown }> {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (signal?.aborted) controller.abort();
+  signal?.addEventListener("abort", abort, { once: true });
+  const timer = setTimeout(abort, method === "POST" ? 65_000 : 6_000);
+  try {
+    const response = await fetch(path, { method, signal: controller.signal, cache: "no-store", headers: {
+      Accept: "application/json",
+      ...(method === "POST" ? { "x-meeting-copilot-verification": "1" } : {}),
+    } });
+    return { ok: response.ok, body: await response.json().catch(() => null) };
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", abort);
+  }
+}
+
+export async function fetchAsrRuntimeStatus(signal?: AbortSignal): Promise<AsrRuntimeStatus | null> {
+  try {
+    const response = await asrPreparationRequest("/providers/asr/runtime", "GET", signal);
+    return response.ok ? parseAsrRuntimeStatus(response.body) : null;
+  } catch {
+    // The older legitimate capture paths retain their existing native BEGIN checks.
+    return null;
+  }
+}
+
+export async function fetchMeetingCorrectionCapability(mode: MeetingCorrectionMode, signal?: AbortSignal, meetingId?: string): Promise<MeetingCorrectionCapability | null> {
+  const query = new URLSearchParams({ correction_mode: mode });
+  if (meetingId) query.set("meeting_id", meetingId);
+  try {
+    const response = await asrPreparationRequest(`/providers/asr/correction-capability?${query}`, "GET", signal);
+    return response.ok ? parseMeetingCorrectionCapability(response.body) : null;
+  } catch { return null; }
+}
+
+export async function prepareLocalAsrRefiner(signal?: AbortSignal): Promise<void> {
+  let message = "离线识别准备失败，请先重新检查识别状态，再决定是否重新准备。";
+  try {
+    const response = await asrPreparationRequest("/providers/asr/prewarm", "POST", signal);
+    const body = response.body;
+    if (!response.ok || !body || typeof body !== "object" || !("ok" in body) || body.ok !== true) {
+      const detail = body && typeof body === "object" && "detail" in body ? body.detail : null;
+      const code = detail && typeof detail === "object" && "error_code" in detail ? detail.error_code : null;
+      const reasons: Record<string, string> = {
+        asr_capacity_unavailable: "本机内存资源不足，请释放内存后重新检查识别状态。",
+        asr_resource_probe_failed: "暂时无法确认可用内存，请先重新检查识别状态。",
+        asr_resource_guard_triggered: "本次准备触发资源保护，请稍后重新检查识别状态。",
+        asr_cold_start_busy: "另一个识别模型正在加载，请等待后重新检查识别状态。",
+        worker_out_of_memory: "本机内存不足，请释放内存后重新检查识别状态。",
+        worker_dependency_load_failed: "本地识别组件加载失败，请修复组件后重新准备。",
+        worker_dependency_unavailable: "本地识别组件缺失，请补齐组件后重新准备。",
+        worker_model_file_missing: "本地模型文件缺失，请补齐模型后重新准备。",
+        worker_model_file_unreadable: "本地模型文件不可读，请检查文件权限后重新准备。",
+        worker_checkpoint_load_failed: "本地模型加载失败，请核对模型完整性后重新准备。",
+        worker_model_load_failed: "本地模型或参数不兼容，请核对配置后重新准备。",
+        worker_start_timeout: "等待启动超时，请先重新检查识别状态，再决定是否重新准备。",
+        worker_spawn_failed: "本地识别进程无法启动，请核对运行环境后重新准备。",
+        worker_exited_before_ready: "本地识别在准备完成前退出，请核对运行环境后重新准备。",
+        worker_exited: "本地识别已退出，请先重新检查识别状态。",
+        worker_write_failed: "本地识别连接中断，请先重新检查识别状态。",
+        worker_timeout: "本地识别等待超时，请先重新检查识别状态，再决定是否重新准备。",
+      };
+      if (typeof code === "string" && Object.hasOwn(reasons, code)) message = `离线识别准备失败：${reasons[code]}`;
+      throw new Error(message);
+    }
+  } catch {
+    throw new Error(message);
+  }
+}
+
+export async function checkAsrCapturePreparation(mode?: MeetingCorrectionMode, meetingId?: string): Promise<void> {
+  const [status, capability] = await Promise.all([
+    fetchAsrRuntimeStatus(),
+    mode ? fetchMeetingCorrectionCapability(mode, undefined, meetingId) : Promise.resolve(undefined),
+  ]);
+  if (mode && !capability) throw new Error("未取得本场校对模式和资源检查结果，请重新检查识别状态后开始会议。");
+  if (mode && capability?.requestedMode !== mode) throw new Error("本场校对模式已变化，请重新读取会议准备后开始。");
+  const blocker = asrPreparationBlocker(status, capability);
+  if (blocker) throw new Error(blocker);
+}
+
 export class HttpMeetingApi implements MeetingApi {
+  async getDiscussion(meetingId: string, signal?: AbortSignal): Promise<DiscussionWorkItem | null> {
+    const body = apiRecord(await this.request(`/v2/meetings/${encodeURIComponent(meetingId)}/work-items?kind=discussion&limit=20`, { signal }), "议题工作状态");
+    if (!Array.isArray(body.items)) throw new ContractError("议题列表格式错误");
+    const found = body.items.find((value) => value && typeof value === "object" && ["investigating", "waiting_for_evidence", "ready"].includes((value as { state?: string }).state ?? ""));
+    if (!found) return null;
+    const x = apiRecord(found, "当前议题");
+    const id = typeof x.work_item_id === "string" ? x.work_item_id : x.id;
+    if (typeof id !== "string" || typeof x.title !== "string" || typeof x.version !== "number") throw new ContractError("当前议题格式错误");
+    return { ...(x as unknown as DiscussionWorkItem), id, context: x.context && typeof x.context === "object" ? x.context as Record<string, unknown> : {} };
+  }
+  async updateDiscussion(meetingId: string, item: DiscussionWorkItem, changes: { title?: string; context?: Record<string, unknown>; state?: string }): Promise<DiscussionWorkItem> {
+    const body = apiRecord(await this.request(`/v2/meetings/${encodeURIComponent(meetingId)}/work-items/${encodeURIComponent(item.id)}`, { method: "PATCH", body: JSON.stringify({ ...changes, expected_version: item.version }) }), "议题更新");
+    const x = apiRecord(body.work_item, "当前议题");
+    const id = typeof x.work_item_id === "string" ? x.work_item_id : x.id;
+    if (typeof id !== "string" || typeof x.version !== "number") throw new ContractError("议题更新未返回版本");
+    return { ...(x as unknown as DiscussionWorkItem), id };
+  }
   readonly baseUrl: string;
 
   constructor(baseUrl = import.meta.env.VITE_API_BASE_URL ?? "") {
@@ -491,15 +679,18 @@ export class HttpMeetingApi implements MeetingApi {
     title?: string | null,
     inputSourceOrSignal: MeetingInputSource | AbortSignal = "microphone",
     signal?: AbortSignal,
+    options?: MeetingCreateOptions,
   ): Promise<void> {
     const inputSource = typeof inputSourceOrSignal === "string" ? inputSourceOrSignal : "microphone";
     const requestSignal = typeof inputSourceOrSignal === "string" ? signal : inputSourceOrSignal;
     await this.request("/v2/meetings", {
       method: "POST",
+      ...(options?.idempotencyKey ? { headers: { "Idempotency-Key": options.idempotencyKey } } : {}),
       body: JSON.stringify({
         meeting_id: meetingId,
         expected_duration_seconds: 3_600,
         track_count: inputSource === "dual_track" ? 2 : 1,
+        ...(options?.materialSetId ? { material_set_id: options.materialSetId, expected_material_set_revision: options.expectedMaterialSetRevision } : {}),
         ...(title?.trim() ? { title: title.trim() } : {}),
       }),
       signal: requestSignal,
@@ -521,6 +712,8 @@ export class HttpMeetingApi implements MeetingApi {
           input_device_id: preparation.inputDeviceId,
           input_device_name: preparation.inputDeviceName,
           notice_acknowledged: preparation.noticeAcknowledged,
+          ...(preparation.liveAnalysisProfile !== undefined ? { live_analysis_profile: preparation.liveAnalysisProfile } : {}),
+          ...(preparation.correctionMode !== undefined ? { correction_mode: preparation.correctionMode } : {}),
           ...(preparation.presetId ? { preset_id: preparation.presetId } : {}),
           ...(preparation.meetingGoal !== undefined ? { meeting_goal: preparation.meetingGoal } : {}),
           ...(preparation.participantRole !== undefined ? { participant_role: preparation.participantRole } : {}),
@@ -903,6 +1096,7 @@ export class HttpMeetingApi implements MeetingApi {
     request: string,
     answerId: string | null = null,
     signal?: AbortSignal,
+    options?: ContributionRequestOptions,
   ): Promise<string> {
     const idempotencyKey = typeof crypto.randomUUID === "function"
       ? crypto.randomUUID()
@@ -912,7 +1106,12 @@ export class HttpMeetingApi implements MeetingApi {
       {
         method: "POST",
         headers: { "Idempotency-Key": idempotencyKey },
-        body: JSON.stringify({ request, answer_id: answerId }),
+        body: JSON.stringify({ request, answer_id: answerId, ...(options ? {
+          intent: options.intent,
+          ...(options.topicId ? { topic_id: options.topicId } : {}),
+          ...(options.expectedBasisRevision !== undefined ? { expected_basis_revision: options.expectedBasisRevision } : {}),
+          ...(options.selectedSegmentIds?.length ? { selected_segment_ids: options.selectedSegmentIds } : {}),
+        } : {}) }),
         signal,
       },
     );
@@ -921,15 +1120,25 @@ export class HttpMeetingApi implements MeetingApi {
     return jobId;
   }
 
-  async getCoachRequestStatus(meetingId: string, jobId: string, signal?: AbortSignal): Promise<"pending" | "succeeded" | "failed" | "no_change"> {
+  async getCoachRequestOutcome(meetingId: string, jobId: string, signal?: AbortSignal): Promise<CoachRequestOutcome> {
+    const snapshot = await this.request(`/v2/meetings/${encodeURIComponent(meetingId)}/snapshot`, { signal });
+    return coachRequestOutcomeFromSnapshot(meetingId, jobId, snapshot);
+  }
+
+  async getCoachRequestStatus(meetingId: string, jobId: string, signal?: AbortSignal): Promise<"pending" | "succeeded" | "failed" | "timed_out" | "no_change"> {
     const snapshot = await this.request(`/v2/meetings/${encodeURIComponent(meetingId)}/snapshot`, { signal }) as {
       jobs?: Array<{ id: string; status: string }>;
       coach_history?: Array<{ job_id?: string; status?: string }>;
+      coach_decision?: { job_id?: string; status?: string };
       diagnostics?: { coach_runtime_history?: Array<{ job_id?: string; status?: string; outcome?: string }> };
     };
+    const decision = snapshot.coach_decision?.job_id === jobId ? snapshot.coach_decision : null;
+    if (decision?.status === "timed_out") return "timed_out";
+    if (decision?.status === "failed") return "failed";
     if (snapshot.coach_history?.some((item) => item.job_id === jobId && item.status === "intervention")) return "succeeded";
     const result = snapshot.diagnostics?.coach_runtime_history?.find((item) => item.job_id === jobId);
-    if (result?.outcome === "failure" || ["failed", "timed_out"].includes(result?.status ?? "")) return "failed";
+    if (result?.status === "timed_out") return "timed_out";
+    if (result?.outcome === "failure" || result?.status === "failed") return "failed";
     const job = snapshot.jobs?.find((item) => item.id === jobId);
     if (!job) return "failed";
     if (job?.status === "succeeded") return "no_change";
@@ -1011,6 +1220,14 @@ export class HttpMeetingApi implements MeetingApi {
         signal,
       },
     );
+  }
+
+  async markCoachUiRendered(receipt: CoachUiRenderReceipt, signal?: AbortSignal): Promise<void> {
+    const body = coachUiRenderReceiptWire(receipt);
+    if (!parseCoachUiRenderReceipt(body)) throw new ContractError("建议渲染回执身份无效");
+    await this.request(`/v2/traces/${encodeURIComponent(receipt.jobId)}/ui-rendered`, {
+      method: "POST", body: JSON.stringify(body), signal,
+    });
   }
 
   async markUiRendered(
@@ -1100,6 +1317,19 @@ export class HttpMeetingApi implements MeetingApi {
     return body.notes.map(parseMeetingNote);
   }
 
+  async listNotesPage(query: { meetingId?: string | null; status?: MeetingNoteStatus | "all"; query?: string; limit?: number; cursor?: string | null } = {}, signal?: AbortSignal) {
+    const params = new URLSearchParams({ limit: String(query.limit ?? 50) });
+    if (query.meetingId) params.set("meeting_id", query.meetingId);
+    if (query.status) params.set("status", query.status);
+    if (query.query?.trim()) params.set("query", query.query.trim());
+    if (query.cursor) params.set("cursor", query.cursor);
+    const body = apiRecord(await this.request(`/v2/notes/page?${params}`, { signal }), "notes page");
+    if (!Array.isArray(body.items) || typeof body.has_more !== "boolean") throw new ContractError("笔记分页格式无效");
+    return { items: body.items.map(parseMeetingNote), nextCursor: typeof body.next_cursor === "string" ? body.next_cursor : null, hasMore: body.has_more };
+  }
+
+  async getNote(noteId: string, signal?: AbortSignal) { return parseMeetingNote(apiRecord(await this.request(`/v2/notes/${encodeURIComponent(noteId)}`, { signal }), "note").note); }
+
   async createNote(
     meetingId: string,
     input: {
@@ -1181,6 +1411,7 @@ export class HttpMeetingApi implements MeetingApi {
       text: string;
       sourceMessageId?: string | null;
       evidence?: AskAiMessage["evidence"];
+      sourceEvidence?: DocumentSourceEvidence[];
     },
     signal?: AbortSignal,
   ): Promise<void> {
@@ -1192,7 +1423,8 @@ export class HttpMeetingApi implements MeetingApi {
           kind: input.kind,
           text: input.text,
           source_message_id: input.sourceMessageId || undefined,
-          evidence: (input.evidence ?? []).map((item) => ({
+          source_evidence: (input.sourceEvidence ?? []).map(serializeDocumentSource),
+          evidence: (input.evidence ?? []).filter(isTranscriptEvidence).map((item) => ({
             segment_id: item.segmentId,
             transcript_seq: item.transcriptSeq,
             start_ms: item.startMs,
@@ -1215,6 +1447,7 @@ export class HttpMeetingApi implements MeetingApi {
       chapterId?: string | null;
       recentMinutes?: 1 | 3 | 5 | 10;
       intent?: "catch_up";
+      includeKnowledge?: boolean;
     },
     onDelta: (text: string) => void,
     signal?: AbortSignal,
@@ -1233,6 +1466,7 @@ export class HttpMeetingApi implements MeetingApi {
         chapter_id: input.chapterId || undefined,
         recent_minutes: input.recentMinutes,
         intent: input.intent,
+        include_knowledge: input.includeKnowledge,
       }),
       signal,
     });

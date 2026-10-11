@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 import type { MeetingSpeaker, SemanticParagraph, TranscriptSegment } from "../../domain/events";
 import { TranscriptPane } from "./TranscriptPane";
+import { parseMeetingSnapshot } from "../../api/schema";
 
 function segment(
   id: string,
@@ -52,6 +53,130 @@ function meetingSpeaker(
 }
 
 describe("TranscriptPane", () => {
+  it("keeps new saved text readable before paragraph catch-up and separates a growing draft", () => {
+    const checkpoints = [segment("old", 1, "已经保存的讨论。", 0, 1_000),
+      { ...segment("new", 2, "新发言的识别原文。", 1_200, 2_000), correctionStatus: "pending" as const }];
+    const props = { ...baseProps, segments: checkpoints, semanticParagraphs: [{
+      meetingId: "meeting-transcript", paragraphId: "old-paragraph", revision: 1,
+      text: checkpoints[0].text, startMs: 0, endMs: 1_000, status: "stable" as const,
+      checkpointIds: ["old"], createdAtMs: 1_000, updatedAtMs: 1_000,
+    }] };
+    const view = render(<TranscriptPane {...props} activePartial={{ segmentId: "draft",
+      text: "仍在识别的长草稿", startedAtMs: 2_100, endedAtMs: 3_000, updatedAtMs: 3_000 }} />);
+    const body = screen.getByTestId("transcript-scroll");
+    expect(within(body).getByText("已经保存的讨论。")).toBeVisible();
+    expect(within(body).getByText("新发言的识别原文。")).toBeVisible();
+    expect(screen.getByText("2 段已保存")).toBeVisible();
+    expect(screen.getByText("识别原文", { exact: true })).toBeVisible();
+    expect(screen.queryByText("等待校对")).not.toBeInTheDocument();
+    expect(body).not.toContainElement(screen.getByLabelText("未确认识别草稿"));
+    view.rerender(<TranscriptPane {...props} activePartial={{ segmentId: "draft",
+      text: "草稿继续变化", startedAtMs: 2_100, endedAtMs: 4_000, updatedAtMs: 4_000 }} />);
+    expect(within(body).getByText("新发言的识别原文。")).toBeVisible();
+  });
+  it.each(["semantic", "merged"])("keeps incomplete correction visible in a mixed %s paragraph", (projection) => {
+    const checkpoints: TranscriptSegment[] = [
+      { ...segment("verified", 1, "权益先到账。", 0, 1_000), correctionStatus: "changed" },
+      { ...segment("raw", 2, "通知的时间需要核对。", 1_200, 2_000), correctionStatus: "failed_preserved_original" },
+    ];
+    const paragraphs: SemanticParagraph[] = [{
+      meetingId: "meeting-transcript", paragraphId: "mixed", revision: 1,
+      text: "权益先到账。通知的时间需要核对。", startMs: 0, endMs: 2_000,
+      status: "stable", checkpointIds: ["verified", "raw"], createdAtMs: 2_000, updatedAtMs: 2_000,
+    }];
+    const { rerender } = render(<TranscriptPane {...baseProps} segments={checkpoints}
+      semanticParagraphs={projection === "semantic" ? paragraphs : []} mergeSegments />);
+    expect(screen.getByText("部分已校对，仍有原文")).toBeVisible();
+    expect(screen.queryByText("已校对", { exact: true })).not.toBeInTheDocument();
+    rerender(<TranscriptPane {...baseProps} segments={[
+      checkpoints[0], { ...checkpoints[1], correctionStatus: "pending" },
+    ]} semanticParagraphs={projection === "semantic" ? paragraphs : []} mergeSegments />);
+    expect(screen.getByText("部分已校对，仍有原文")).toBeVisible();
+    rerender(<TranscriptPane {...baseProps} segments={[
+      checkpoints[0], { ...checkpoints[1], correctionStatus: "no_change" },
+    ]} semanticParagraphs={projection === "semantic" ? paragraphs : []} mergeSegments />);
+    expect(screen.getByText("已校对", { exact: true })).toBeVisible();
+    expect(screen.queryByText("部分已校对，仍有原文")).not.toBeInTheDocument();
+  });
+  it("does not borrow the aggregate span of a later checkpoint to hide a growing tail", () => {
+    render(<TranscriptPane {...baseProps} segments={[
+      segment("same", 1, "已确认原句。", 1_000, 2_000),
+      segment("later", 2, "另一个已确认片段。", 2_000, 6_000),
+    ]} activePartial={{ segmentId: "same", text: "已确认原句。新增未确认尾部。",
+      startedAtMs: 1_000, endedAtMs: 4_000, updatedAtMs: 7_000 }} />);
+    expect(screen.getByLabelText("未确认识别草稿")).toHaveTextContent("新增未确认尾部。");
+  });
+
+  it("does not borrow a multi-checkpoint semantic paragraph aggregate span", () => {
+    render(<TranscriptPane {...baseProps} segments={[
+      segment("same", 1, "已确认原句。", 1_000, 2_000),
+      segment("later", 2, "另一个已确认片段。", 2_000, 6_000),
+    ]} semanticParagraphs={[{ meetingId: "meeting-transcript", paragraphId: "semantic-aggregate",
+      revision: 1, text: "已确认原句。另一个已确认片段。", startMs: 1_000, endMs: 6_000,
+      status: "stable", checkpointIds: ["same", "later"], createdAtMs: 7_000, updatedAtMs: 7_000,
+    }]} activePartial={{ segmentId: "same", text: "已确认原句。新增未确认尾部。",
+      startedAtMs: 1_000, endedAtMs: 4_000, updatedAtMs: 7_000 }} />);
+    expect(screen.getByLabelText("未确认识别草稿")).toHaveTextContent("新增未确认尾部。");
+  });
+
+  it.each(["same", "different"])("keeps a parsed truncated prefix visible for %s identity", (id) => {
+    const text = "甲".repeat(4_000);
+    const partial = parseMeetingSnapshot({ meeting_id: "meeting-transcript", last_seq: 0,
+      segments: [], suggestions: [], active_partial: { segment_id: id, text,
+        started_at_ms: 1_000, ended_at_ms: 4_000, updated_at_ms: 7_000,
+        text_truncated: true, source_text_characters: 5_000,
+      } }).activePartial;
+    render(<TranscriptPane {...baseProps} segments={[segment("same", 1, text, 1_000, 2_000)]}
+      activePartial={partial} />);
+    expect(screen.getByLabelText("未确认识别草稿")).toBeVisible();
+  });
+
+  it("still suppresses a truncated preview when its real same-id full span is covered", () => {
+    const partial = parseMeetingSnapshot({ meeting_id: "meeting-transcript", last_seq: 0,
+      segments: [], suggestions: [], active_partial: { segment_id: "same", text: "甲".repeat(4_000),
+        started_at_ms: 1_000, ended_at_ms: 4_000, updated_at_ms: 7_000,
+        text_truncated: true, source_text_characters: 5_000,
+      } }).activePartial;
+    render(<TranscriptPane {...baseProps} segments={[segment("same", 1, "已完成正式校对。", 1_000, 4_000)]}
+      activePartial={partial} />);
+    expect(screen.queryByLabelText("未确认识别草稿")).not.toBeInTheDocument();
+  });
+
+  it("keeps a same-segment partial tail beyond the durable span and text visible", () => {
+    render(<TranscriptPane {...baseProps} segments={[segment("same", 1, "已确认原句。", 1_000, 2_000)]}
+      activePartial={{ segmentId: "same", text: "已确认原句。新增尾部尚待处理。",
+        startedAtMs: 1_000, endedAtMs: 4_000, updatedAtMs: 5_000 }} />);
+    expect(screen.getByLabelText("未确认识别草稿")).toHaveTextContent("新增尾部尚待处理。");
+  });
+
+  it("hides a same-segment partial only when its known full span is committed", () => {
+    render(<TranscriptPane {...baseProps} segments={[segment("same", 1, "已校对正式原句。", 1_000, 4_000)]}
+      activePartial={{ segmentId: "same", text: "校对前的临时文字。", startedAtMs: 1_000,
+        endedAtMs: 3_000, updatedAtMs: 5_000 }} />);
+    expect(screen.queryByLabelText("未确认识别草稿")).not.toBeInTheDocument();
+  });
+
+  it("hides a known-span partial whose entire text is already committed", () => {
+    render(<TranscriptPane {...baseProps} segments={[segment("same", 1, "完整确认的原句。", 1_000, 2_000)]}
+      activePartial={{ segmentId: "same", text: "完整确认的原句。", startedAtMs: 1_000,
+        endedAtMs: 4_000, updatedAtMs: 5_000 }} />);
+    expect(screen.queryByLabelText("未确认识别草稿")).not.toBeInTheDocument();
+  });
+
+  it("retains the legacy same-id duplicate rule without a known end span", () => {
+    render(<TranscriptPane {...baseProps} segments={[segment("same", 1, "正式原句。", 1_000, 2_000)]}
+      activePartial={{ segmentId: "same", text: "旧浏览器未带跨度的草稿。",
+        startedAtMs: 1_000, updatedAtMs: 5_000 }} />);
+    expect(screen.queryByLabelText("未确认识别草稿")).not.toBeInTheDocument();
+  });
+
+  it("does not hide a different-id growing tail merely because it starts with durable text", () => {
+    render(<TranscriptPane {...baseProps} segments={[segment("old", 1, "已确认的连续讨论。", 1_000, 2_000)]}
+      activePartial={{ segmentId: "next", text: "已确认的连续讨论。后半句仍是草稿。",
+        startedAtMs: 1_000, endedAtMs: 4_000, updatedAtMs: 5_000 }} />);
+    expect(screen.getByLabelText("未确认识别草稿")).toHaveTextContent("后半句仍是草稿。");
+  });
+
   it("shows a floating selection toolbar and preserves the selected evidence scope", async () => {
     const onSelectionChange = vi.fn();
     const onAskSelection = vi.fn();

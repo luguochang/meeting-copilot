@@ -29,6 +29,7 @@ from meeting_copilot_web_mvp.openai_protocol import (
     responses_url_for_chat_url,
 )
 from meeting_copilot_web_mvp.streaming_llm_provider import provider_idempotency_header_value
+from meeting_copilot_web_mvp.provider_transport import provider_httpx_options
 
 _log = get_logger("meeting_copilot_web_mvp.llm_service")
 
@@ -204,11 +205,16 @@ class LlmProviderHttpError(RuntimeError):
 
 
 class LlmProviderTransportError(RuntimeError):
-    def __init__(self, category: str) -> None:
+    def __init__(self, category: str, *, timeout_origin: str = "unknown") -> None:
         self.category = category if category in {"timeout", "transport"} else "transport"
         self.retryable = True
         self.status_code = None
         self.provider_code = None
+        self.timeout_origin = (
+            timeout_origin
+            if self.category == "timeout" and timeout_origin in {"pool", "connect", "read", "write"}
+            else "unknown"
+        )
         super().__init__(f"llm_provider_{self.category}")
 
 
@@ -219,7 +225,7 @@ class HttpxLlmClient:
         self.api_style = _validated_api_style(api_style)
 
     def post_json(self, url, headers, body, timeout):
-        with httpx.Client(timeout=timeout, trust_env=False) as client:
+        with httpx.Client(timeout=timeout, **provider_httpx_options()) as client:
             if self.api_style == "responses":
                 responses_url = responses_url_for_chat_url(url)
                 responses_body = chat_body_to_responses(body, stream=False)
@@ -258,7 +264,7 @@ class AsyncHttpxLlmClient:
     ) -> None:
         self.api_style = _validated_api_style(api_style)
         self._owns_client = client is None
-        self._client = client or httpx.AsyncClient(trust_env=False)
+        self._client = client or httpx.AsyncClient(**provider_httpx_options())
 
     async def aclose(self) -> None:
         if self._owns_client and not self._client.is_closed:
@@ -349,6 +355,20 @@ def provider_failure_message(error: Exception) -> str:
     return f"LLM 探测失败: {type(error).__name__}"
 
 
+def _provider_timeout_origin(error: httpx.TimeoutException) -> str:
+    """Keep only the known timeout phase, never exception text or request data."""
+
+    for timeout_type, origin in (
+        (httpx.PoolTimeout, "pool"),
+        (httpx.ConnectTimeout, "connect"),
+        (httpx.ReadTimeout, "read"),
+        (httpx.WriteTimeout, "write"),
+    ):
+        if isinstance(error, timeout_type):
+            return origin
+    return "unknown"
+
+
 def _provider_post(
     client: httpx.Client,
     url: str,
@@ -357,8 +377,8 @@ def _provider_post(
 ) -> Any:
     try:
         return client.post(url, headers=headers, json=body)
-    except httpx.TimeoutException:
-        raise LlmProviderTransportError("timeout") from None
+    except httpx.TimeoutException as exc:
+        raise LlmProviderTransportError("timeout", timeout_origin=_provider_timeout_origin(exc)) from None
     except httpx.RequestError:
         raise LlmProviderTransportError("transport") from None
 
@@ -377,8 +397,8 @@ async def _provider_post_async(
             json=body,
             timeout=timeout,
         )
-    except httpx.TimeoutException:
-        raise LlmProviderTransportError("timeout") from None
+    except httpx.TimeoutException as exc:
+        raise LlmProviderTransportError("timeout", timeout_origin=_provider_timeout_origin(exc)) from None
     except httpx.RequestError:
         raise LlmProviderTransportError("transport") from None
 
@@ -1385,13 +1405,22 @@ def build_approach_cards(
 
 # ---------- Post-meeting minutes (Phase P1-3) ----------
 
-MINUTES_PROMPT_VERSION = "web_mvp.minutes.v1"
+MINUTES_PROMPT_VERSION = "web_mvp.minutes.v2"
 
 _MINUTES_SYSTEM_PROMPT = (
     "你是中文技术会议纪要生成器。基于转写，输出结构化纪要 JSON："
     "{\"background\": str, \"decisions\": [str], \"action_items\": [{\"item\":str,\"owner\":str,\"deadline\":str}], "
     "\"risks\": [str], \"open_questions\": [str], \"evidence_quotes\": [str]}。"
     "evidence_quotes 必须来自转写原文。输入可能包含 ASR 错字、同音字和断句错误；"
+    "按全文出现顺序核对同一对象、同一属性的问答。后续明确更正或澄清应更新对应事实，"
+    "替代此前的歧义；若紧接该明确命题的是明确肯定或否定短答，可确认或否定该命题，"
+    "但不能确认其他选项或扩大范围。"
+    "将已确认事实写入 background，不因前文曾以疑问形式提出就继续列为 open_questions；"
+    "evidence_quotes 应包含实际完成闭环的澄清或答复原话，不能只引用此前的歧义问题。"
+    "事实被确认不等于作出决策或行动承诺；仅明确作出的决策写入 decisions，"
+    "仅明确约定的行动写入 action_items，不将建议或待讨论方案写成承诺。"
+    "不同对象、含糊指代、无法确定短答归属或后续仍有矛盾时，"
+    "保留需要核实的具体问题，不用最近一句无条件覆盖前文，也不推断未说出的数值、单位或责任。"
     "如果负责人姓名只以孤立短句出现，或与相邻句语义断裂，不要猜测或直接确认为真实姓名，"
     "owner 填'待确认'，并在 open_questions 中说明需要核对原音。"
     "其他未确认信息也标'待确认'。禁止编造。无内容时返回空数组。"

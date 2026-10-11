@@ -130,3 +130,23 @@ def test_dual_track_source_round_trips_without_downgrading_to_microphone(tmp_pat
 
     assert saved.input_source == "dual_track"
     assert store.get("meeting-dual-track") == saved
+
+
+def test_live_profile_omission_preserves_choice_and_old_versions_default_legacy(tmp_path):
+    store = MeetingPreparationStore(tmp_path)
+    old = store.save("old", updated_at_ms=1)
+    assert old.live_analysis_profile == "legacy"
+    chosen = store.save("old", live_analysis_profile="participation", updated_at_ms=2)
+    edited = store.save("old", hotwords=["订单"], updated_at_ms=3)
+    assert edited.live_analysis_profile == chosen.live_analysis_profile == "participation"
+    assert [item.live_analysis_profile for item in store.list_versions("old")] == ["legacy", "participation", "participation"]
+    legacy_payload = old.to_dict()
+    legacy_payload.pop("live_analysis_profile")
+    (tmp_path / "old.json").write_text(json.dumps(legacy_payload), encoding="utf-8")
+    assert store.get("old").live_analysis_profile == "legacy"
+
+
+@pytest.mark.parametrize("invalid", ["", "automatic", True, 1, " participation"])
+def test_live_profile_rejects_unknown_values(tmp_path, invalid):
+    with pytest.raises(ValueError, match="live_analysis_profile"):
+        MeetingPreparationStore(tmp_path).save("review", live_analysis_profile=invalid, updated_at_ms=1)

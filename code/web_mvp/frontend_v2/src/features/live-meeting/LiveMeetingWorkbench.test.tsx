@@ -1,10 +1,15 @@
+import type { KnowledgeApi } from "../../api/knowledge";
+import type { MaterialsApi, MaterialSet } from "../../api/materials";
+import { MATERIAL_START_KEY } from "./materialStartAttempt";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { ApiError, type MeetingApi } from "../../api/client";
-import type { MeetingEventTransport } from "../../api/eventTransport";
+import { ApiError, HttpMeetingApi, type MeetingApi } from "../../api/client";
+import { PollingEventTransport, type MeetingEventTransport } from "../../api/eventTransport";
 import type { FormalAiProvenance, MeetingSnapshot } from "../../domain/events";
 import { LiveMeetingWorkbench } from "./LiveMeetingWorkbench";
+import { parseMeetingSnapshot } from "../../api/schema";
 import type { BrowserMicrophoneController } from "./useBrowserMicrophone";
+import { correctionCapabilityFixture, requestedCorrectionMode } from "../../test/correctionCapabilityFixture";
 
 class WorkbenchProbeAudioContext {
   readonly state = "running" as AudioContextState;
@@ -18,9 +23,15 @@ class WorkbenchProbeAudioContext {
 }
 
 beforeEach(() => {
+  sessionStorage.removeItem(MATERIAL_START_KEY);
+  for (let index = window.localStorage.length - 1; index >= 0; index--) {
+    const key = window.localStorage.key(index);
+    if (key?.startsWith("talktrace-material-draft:v1:")) window.localStorage.removeItem(key);
+  }
   delete window.__TAURI__;
   delete window.__TAURI_INTERNALS__;
   vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+    if (String(input).startsWith("/providers/asr/correction-capability?")) return Promise.resolve(new Response(JSON.stringify(correctionCapabilityFixture(requestedCorrectionMode(String(input)))), { status: 200, headers: { "content-type": "application/json" } }));
     if (String(input).endsWith("/v2/storage/preflight")) {
       return Promise.resolve(new Response(JSON.stringify({
         allowed: true,
@@ -336,7 +347,208 @@ function microphoneController(
   };
 }
 
+function preparedMaterials(): MaterialsApi {
+  const draft: MaterialSet = { id: "prepared-set", state: "draft", meeting_id: null, revision: 4, context_revision: 1 };
+  return {
+    create: vi.fn(), get: vi.fn(async () => ({ material_set: draft, attachments: [] })),
+    getForMeeting: vi.fn(async () => null), forMeeting: vi.fn(async (id) => ({ ...draft, state: "bound" as const, meeting_id: id, revision: 5 })),
+    upload: vi.fn(), detail: vi.fn(), spans: vi.fn(), save: vi.fn(), use: vi.fn(), retry: vi.fn(), cancel: vi.fn(), remove: vi.fn(), removeDraft: vi.fn(), source: vi.fn(),
+  };
+}
+
 describe("LiveMeetingWorkbench", () => {
+  it.each(["busy", "idle"] as const)("uses this meeting's %s transcript state and waits without confirmed input", async (transcriptState) => {
+    const { api, transport } = dependencies();
+    const snapshot = realSnapshot();
+    const label = transcriptState === "busy" ? "精修模型加载中，草稿已保留" : "等待正式文字";
+    vi.mocked(api.getSnapshot).mockResolvedValue({ ...snapshot, segments: [], suggestions: [],
+      followUp: null, coachDecision: null, runtime: {
+        ...snapshot.runtime, ai: { ...snapshot.runtime.ai, capabilities: {
+          transcript: { state: transcriptState, label, detail: null, level: null },
+          proactive_suggestions: { state: "idle", label: "Pi 教练监听中", detail: null, level: null },
+        } },
+      } });
+    render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport}
+      microphoneController={microphoneController({ phase: "recording", inputLevel: 0.05, asrReady: true })} />);
+    expect(await screen.findByText("教练等待确认文字")).toBeVisible();
+    expect(screen.queryByText("Pi 教练监听中")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "我可以问什么" })).toBeEnabled();
+    if (transcriptState === "busy") expect(screen.getByText("录音正常 · 识别准备中")).toBeVisible();
+    fireEvent.click(screen.getByTitle("查看录音、声音、识别、精修、说话人、模型和任务详情"));
+    expect(screen.getByText(label)).toBeVisible();
+  });
+
+  it("keeps an actual busy coach task visible while its transcript is loading", async () => {
+    const { api, transport } = dependencies();
+    const snapshot = realSnapshot();
+    vi.mocked(api.getSnapshot).mockResolvedValue({ ...snapshot, segments: [], suggestions: [],
+      followUp: null, coachDecision: null, runtime: {
+        ...snapshot.runtime, ai: { ...snapshot.runtime.ai, capabilities: {
+          transcript: { state: "busy", label: "精修模型加载中", detail: null, level: null },
+          proactive_suggestions: { state: "busy", label: "正在处理本次主动请求", detail: null, level: null },
+        } },
+      } });
+    render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport}
+      microphoneController={microphoneController()} />);
+    expect(await screen.findByText("正在处理本次主动请求")).toBeVisible();
+    expect(screen.queryByText("教练等待确认文字")).not.toBeInTheDocument();
+  });
+
+  it("shows the restored tail when the same segment's durable span is incomplete", async () => {
+    const { api, transport } = dependencies();
+    const snapshot = realSnapshot();
+    vi.mocked(api.getSnapshot).mockResolvedValue({ ...snapshot, activePartial: {
+      segmentId: "segment-1", text: "支付服务周五上线但是负责人还没定；新增恢复尾部。",
+      startedAtMs: 2_000, endedAtMs: 8_000, updatedAtMs: 10_000,
+    } });
+    render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport}
+      microphoneController={microphoneController()} />);
+    expect(await screen.findByLabelText("未确认识别草稿")).toHaveTextContent("新增恢复尾部。");
+  });
+
+  it("keeps a parsed truncated prefix preview with an unconfirmed tail visible", async () => {
+    const { api, transport } = dependencies();
+    const snapshot = realSnapshot();
+    const text = "甲".repeat(4_000);
+    const activePartial = parseMeetingSnapshot({ meeting_id: "meeting-1", last_seq: 0,
+      segments: [], suggestions: [], active_partial: { segment_id: "segment-1", text,
+        started_at_ms: 2_000, ended_at_ms: 8_000, updated_at_ms: 10_000,
+        text_truncated: true, source_text_characters: 5_000,
+      } }).activePartial;
+    vi.mocked(api.getSnapshot).mockResolvedValue({ ...snapshot, activePartial,
+      segments: [{ ...snapshot.segments[0], text, normalizedText: text }] });
+    render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport}
+      microphoneController={microphoneController()} />);
+    expect(await screen.findByLabelText("未确认识别草稿")).toBeVisible();
+  });
+
+  it("shows the coach waiting for confirmed input when transcription is blocked", async () => {
+    const { api, transport } = dependencies();
+    const snapshot = realSnapshot();
+    vi.mocked(api.getSnapshot).mockResolvedValue({ ...snapshot, segments: [], suggestions: [],
+      followUp: null, coachDecision: null, runtime: {
+        ...snapshot.runtime, ai: { ...snapshot.runtime.ai, capabilities: {
+          transcript: { state: "paused", label: "精修暂不可用", detail: "识别草稿未确认", level: null, errorClass: "asr_capacity_unavailable" },
+          proactive_suggestions: { state: "idle", label: "Pi 教练监听中", detail: null, level: null },
+        } },
+      } });
+    render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport}
+      microphoneController={microphoneController()} />);
+    expect(await screen.findByText("教练等待确认文字")).toBeVisible();
+    expect(screen.queryByText("Pi 教练监听中")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "我可以问什么" })).toBeEnabled();
+  });
+
+  it("shows this meeting's restored draft without leaking another meeting's microphone partial", async () => {
+    const { api, transport } = dependencies();
+    render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport}
+      activeCaptureMeetingId="meeting-other" microphoneController={microphoneController({
+        phase: "recording", activePartial: { segmentId: "other-partial", text: "另一场的声音草稿", startedAtMs: 1, updatedAtMs: 2 },
+      })} />);
+    expect(await screen.findByText("回滚窗口我们还需要再确认")).toBeVisible();
+    expect(screen.queryByText("另一场的声音草稿")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("未确认识别草稿")).toBeVisible();
+  });
+
+  it("refreshes same-sequence understanding and an automatic timeout without capture/events, keeping an explicit manual request independent", async () => {
+    vi.useFakeTimers();
+    const { api, transport } = dependencies();
+    const capture = microphoneController();
+    const previousFetch = globalThis.fetch;
+    let stage = 0;
+    let manualRequested = false;
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/coach/request")) {
+        expect(init?.method).toBe("POST");
+        expect(JSON.parse(String(init?.body))).toMatchObject({ intent: "ask_question", request: "", answer_id: null });
+        manualRequested = true;
+        return new Response(JSON.stringify({ job: { id: "manual-after-timeout" } }), { status: 202, headers: { "content-type": "application/json" } });
+      }
+      if (String(input).endsWith("/snapshot")) return new Response(JSON.stringify({
+        meeting_id: "meeting-1", title: "合成自然触发状态", last_seq: 4, live_analysis_profile: "participation",
+        segments: realSnapshot().segments, suggestions: [],
+        jobs: [...(stage === 3 ? [{ id: "automatic-current", status: "succeeded" }] : []), ...(manualRequested ? [{ id: "manual-after-timeout", status: "pending" }] : [])],
+        coach_decision: stage === 3 ? { job_id: "automatic-current", decision_id: "automatic-decision", status: "timed_out", status_reason: "provider_timeout", analysis_kind: "participation" } : null,
+        runtime: { phase: "live", recording: { state: "idle" }, input: { state: "idle" }, ai: { state: "idle", capabilities: {
+          proactive_suggestions: stage === 2 ? { state: "busy", label: "现场建议正在检查" }
+            : stage === 3 ? { state: "error", label: "Pi 补充暂不可用", detail: "旧补充错误" }
+              : { state: "idle", label: "Pi 教练等待录音" },
+          discussion_state: { state: stage === 1 ? "busy" : stage >= 2 ? "active" : "idle", decision: stage === 1 ? "running" : stage >= 2 ? "succeeded" : "not_started", label: "安全宿主状态", job_id: stage ? "current-understanding" : null, topic_id: "topic-current", analysis_basis_revision: 2, input_transcript_seq: 1, last_semantic_seq: stage >= 2 ? 1 : 0 },
+        } } },
+      }), { status: 200, headers: { "content-type": "application/json" } });
+      return previousFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetcher);
+    const http = new HttpMeetingApi();
+    api.getSnapshot = vi.fn((id, signal) => http.getSnapshot(id, signal));
+    api.requestRealtimeCoach = (id, request, answerId, signal, options) => http.requestRealtimeCoach(id, request, answerId, signal, options);
+    api.getCoachRequestStatus = (id, jobId, signal) => http.getCoachRequestStatus(id, jobId, signal);
+    const view = render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} microphoneController={capture} />);
+    try {
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      expect(screen.getByRole("status", { name: "当前讨论的理解状态" })).toHaveTextContent("等待下一轮讨论理解");
+      expect(api.getSnapshot).toHaveBeenCalledOnce();
+      stage = 1;
+      await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
+      expect(screen.getByRole("status", { name: "当前讨论的理解状态" })).toHaveTextContent("正在理解本轮讨论");
+      stage = 2;
+      await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
+      expect(screen.getByRole("status", { name: "当前讨论的理解状态" })).toHaveTextContent("讨论状态已更新");
+      expect(screen.getByRole("status", { name: "当前会议的 Pi 状态" })).toHaveTextContent("正在结合本场讨论分析");
+      stage = 3;
+      await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
+      expect(api.getSnapshot).toHaveBeenCalledTimes(4);
+      expect(screen.getByRole("status", { name: "当前讨论的理解状态" })).toHaveTextContent("这不代表已生成新的建议");
+      expect(screen.getByRole("status", { name: "当前会议的 Pi 状态" })).toHaveTextContent("本次建议未及时生成，可重试");
+      expect(screen.queryByText("Pi 教练等待录音")).not.toBeInTheDocument();
+      expect(screen.queryByText("正在积累讨论内容")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("follow-up-card")).not.toBeInTheDocument();
+      expect(fetcher.mock.calls.some(([, init]) => init?.method === "POST")).toBe(false);
+      expect(capture.start).not.toHaveBeenCalled();
+      await act(async () => { fireEvent.click(screen.getByRole("button", { name: "我可以问什么" })); await vi.advanceTimersByTimeAsync(0); });
+      expect(fetcher.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(1);
+      expect(screen.getByRole("status", { name: "当前会议的 Pi 状态" })).toHaveTextContent("本次建议未及时生成，可重试");
+      expect(screen.getByText("我可以问什么 · 正在结合当前讨论分析")).toBeVisible();
+      expect(capture.start).not.toHaveBeenCalled();
+    } finally {
+      view.unmount();
+      sessionStorage.removeItem("talktrace-contribution:meeting-1");
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(["failed", "retry_wait"] as const)("renders current discussion %s from HttpMeetingApi even when the old coach is listening and bounded jobs are empty", async (phase) => {
+    const { api, transport } = dependencies();
+    const capture = microphoneController();
+    const previousFetch = globalThis.fetch;
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/snapshot")) return new Response(JSON.stringify({
+        meeting_id: "meeting-1", title: "合成需求评审", last_seq: 4, live_analysis_profile: "participation",
+        segments: realSnapshot().segments, suggestions: [], jobs: [],
+        runtime: { phase: "live", recording: { state: "idle" }, input: { state: "idle" }, ai: { state: "paused", capabilities: {
+          proactive_suggestions: { state: "idle", label: "Pi 教练监听中" },
+          discussion_state: { state: phase === "failed" ? "paused" : "idle", decision: phase,
+            error_class: phase === "failed" ? "evidence_rejected" : null, label: "安全宿主标签", detail: "宿主状态说明",
+            job_id: "understand-current", topic_id: "current-topic", analysis_basis_revision: 4, input_transcript_seq: 1, last_semantic_seq: 0 },
+        } } },
+      }), { status: 200, headers: { "content-type": "application/json" } });
+      return previousFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetcher);
+    const http = new HttpMeetingApi();
+    api.getSnapshot = vi.fn((id, signal) => http.getSnapshot(id, signal));
+    render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} microphoneController={capture} />);
+    const status = await screen.findByRole("status", { name: "当前讨论的理解状态" });
+    expect(status).toHaveTextContent(phase === "failed" ? "未通过依据核对" : "等待后台重试，当前未在执行");
+    expect(status).toHaveTextContent("原文已保留");
+    expect(screen.getByText("支付服务周五上线，但是负责人还没确定。")).toBeVisible();
+    expect(screen.queryByText("正在积累讨论内容")).not.toBeInTheDocument();
+    expect(screen.queryByText(/正在结合本场讨论分析/)).not.toBeInTheDocument();
+    expect(capture.start).not.toHaveBeenCalled();
+    expect(api.createMeeting).not.toHaveBeenCalled();
+    expect(fetcher.mock.calls.some(([, init]) => init?.method === "POST")).toBe(false);
+  });
+
   it("marks a backend-live meeting without a browser stream as recoverable", async () => {
     const user = userEvent.setup();
     const { api, transport } = dependencies();
@@ -612,6 +824,7 @@ describe("LiveMeetingWorkbench", () => {
       expect.objectContaining({
         inputDeviceId: "mic-1",
         noticeAcknowledged: true,
+        liveAnalysisProfile: "participation",
       }),
     );
     expect(microphone.start).toHaveBeenCalledWith("rec_new_meeting", {
@@ -644,7 +857,7 @@ describe("LiveMeetingWorkbench", () => {
       updatedAtMs: 1,
     };
     api.getMeetingPreparation = vi.fn(async () => {
-      if (!preparationSaved) throw new Error("meeting preparation not found");
+      if (!preparationSaved) throw new ApiError(404, "meeting preparation not found", {});
       return projectPreparation;
     });
     api.getMeetingPreparationVersions = vi.fn(async () => (
@@ -680,7 +893,7 @@ describe("LiveMeetingWorkbench", () => {
       expect.objectContaining({ presetId: "project" }),
     ));
     expect(await screen.findByText("项目执行")).toBeVisible();
-    expect(api.getMeetingPreparation).toHaveBeenCalledTimes(2);
+    expect(api.getMeetingPreparation).toHaveBeenCalledTimes(3);
   });
 
   it("passes the packaged system-audio selection to the single capture owner", async () => {
@@ -851,6 +1064,67 @@ describe("LiveMeetingWorkbench", () => {
     expect(screen.getByRole("alert")).toHaveTextContent("麦克风权限请求超时");
   });
 
+  it("preserves bound pre-meeting materials and retries capture in the same meeting", async () => {
+    const user = userEvent.setup(); const { api, transport } = dependencies(); const capture = microphoneController();
+    const materials = preparedMaterials(); const createId = vi.fn().mockReturnValueOnce("rec_materials").mockReturnValue("must-not-be-used"); const opened = vi.fn();
+    vi.mocked(capture.start).mockRejectedValueOnce(new Error("声音输入暂时不可用")).mockResolvedValue(undefined);
+    sessionStorage.setItem("talktrace-material-draft", "prepared-set");
+    render(<LiveMeetingWorkbench meetingId={null} api={api} materialsApi={materials} transport={transport} microphoneController={capture} onCreateMeeting={createId} onOpenMeeting={opened} />);
+    await confirmMeetingPreflight(user);
+    await screen.findByText(/资料已保留，请重试同一会议/);
+    expect(api.createMeeting).toHaveBeenCalledWith("rec_materials", null, "microphone", undefined, { materialSetId: "prepared-set", expectedMaterialSetRevision: 4, idempotencyKey: expect.any(String) });
+    expect(api.deleteMeeting).not.toHaveBeenCalled();
+    expect(opened).toHaveBeenCalledWith("rec_materials");
+    const dialog = screen.getByRole("dialog", { name: "准备开始会议" });
+    await completeDialogMicrophoneCheck(dialog);
+    fireEvent.click(within(dialog).getByRole("button", { name: "开始会议" }));
+    await waitFor(() => expect(capture.start).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(capture.start).mock.calls.map((call) => call[0])).toEqual(["rec_materials", "rec_materials"]);
+    expect(api.createMeeting).toHaveBeenCalledTimes(1); expect(createId).toHaveBeenCalledTimes(1);
+    sessionStorage.removeItem("talktrace-material-draft");
+  });
+  it("replays a lost create receipt after remount with the exact same meeting and idempotency key", async () => {
+    const user = userEvent.setup(); const { api, transport } = dependencies(); const capture = microphoneController(); const materials = preparedMaterials();
+    vi.mocked(api.createMeeting).mockRejectedValueOnce(new Error("网络响应未确认")).mockResolvedValue(undefined);
+    sessionStorage.setItem("talktrace-material-draft", "prepared-set");
+    const first = render(<LiveMeetingWorkbench meetingId={null} api={api} materialsApi={materials} transport={transport} microphoneController={capture} onCreateMeeting={() => "rec_receipt"} />);
+    await confirmMeetingPreflight(user);
+    await screen.findByText(/资料仍在本地/);
+    const original = vi.mocked(api.createMeeting).mock.calls[0];
+    expect(sessionStorage.getItem(MATERIAL_START_KEY)).toContain("rec_receipt"); first.unmount();
+    const newId = vi.fn(() => "must-not-create-new-meeting");
+    render(<LiveMeetingWorkbench meetingId={null} api={api} materialsApi={materials} transport={transport} microphoneController={capture} onCreateMeeting={newId} />);
+    await screen.findByText(/上次会议准备已恢复/);
+    expect(api.createMeeting).toHaveBeenCalledTimes(1); expect(capture.start).not.toHaveBeenCalled();
+    await confirmMeetingPreflight(user);
+    await waitFor(() => expect(capture.start).toHaveBeenCalledWith("rec_receipt", expect.any(Object)));
+    expect(vi.mocked(api.createMeeting).mock.calls[1]).toEqual(original);
+    expect(newId).not.toHaveBeenCalled(); expect(sessionStorage.getItem(MATERIAL_START_KEY)).toBeNull();
+    sessionStorage.removeItem("talktrace-material-draft");
+  });
+  it("only reads an already-bound restored meeting and waits for an explicit start before capture", async () => {
+    const { api, transport } = dependencies(); const capture = microphoneController(); const materials = preparedMaterials(); const opened = vi.fn();
+    sessionStorage.setItem(MATERIAL_START_KEY, JSON.stringify({ meetingId: "rec_bound", setId: "prepared-set", setRevision: 4, key: "original-key", created: false, title: null, inputSource: "microphone" }));
+    vi.mocked(materials.get).mockResolvedValue({ material_set: { id: "prepared-set", state: "bound", meeting_id: "rec_bound", revision: 5, context_revision: 2 }, attachments: [] });
+    render(<LiveMeetingWorkbench meetingId={null} api={api} materialsApi={materials} transport={transport} microphoneController={capture} onOpenMeeting={opened} onCreateMeeting={() => "wrong-meeting"} />);
+    await screen.findByText(/上次会议准备已恢复/);
+    expect(api.createMeeting).not.toHaveBeenCalled(); expect(materials.forMeeting).not.toHaveBeenCalled(); expect(capture.start).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "只查看原会议" }));
+    expect(opened).toHaveBeenCalledWith("rec_bound"); expect(capture.start).not.toHaveBeenCalled();
+    sessionStorage.removeItem(MATERIAL_START_KEY);
+  });
+  it("blocks a mismatched restored scope rather than inventing a new meeting", async () => {
+    const { api, transport } = dependencies(); const capture = microphoneController(); const materials = preparedMaterials(); const newId = vi.fn(); const opened = vi.fn();
+    sessionStorage.setItem(MATERIAL_START_KEY, JSON.stringify({ meetingId: "rec_original", setId: "prepared-set", setRevision: 4, key: "original-key", created: false, title: null, inputSource: "microphone" }));
+    vi.mocked(materials.get).mockResolvedValue({ material_set: { id: "prepared-set", state: "bound", meeting_id: "other-meeting", revision: 5, context_revision: 2 }, attachments: [] });
+    render(<LiveMeetingWorkbench meetingId={null} api={api} materialsApi={materials} transport={transport} microphoneController={capture} onCreateMeeting={newId} onOpenMeeting={opened} />);
+    await screen.findByText(/上次资料已删除或属于其他会议/);
+    expect(screen.getByRole("button", { name: "开始会议" })).toBeDisabled();
+    expect(newId).not.toHaveBeenCalled(); expect(api.createMeeting).not.toHaveBeenCalled(); expect(capture.start).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "只查看原会议" })); expect(opened).toHaveBeenCalledWith("rec_original");
+    sessionStorage.removeItem(MATERIAL_START_KEY);
+  });
+
   it("keeps capture controls hidden until the initial meeting snapshot arrives", async () => {
     const { api, transport } = dependencies();
     let resolveSnapshot: ((snapshot: MeetingSnapshot) => void) | undefined;
@@ -960,7 +1234,7 @@ describe("LiveMeetingWorkbench", () => {
 
     render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} />);
 
-    expect(await screen.findByText("无需校对")).toBeVisible();
+    expect(await screen.findByText("校对未改字")).toBeVisible();
     expect(screen.queryByText("已校对")).not.toBeInTheDocument();
   });
 
@@ -1062,7 +1336,7 @@ describe("LiveMeetingWorkbench", () => {
     await waitFor(() =>
       expect(api.saveSuggestionFeedback).toHaveBeenCalledWith("meeting-1", "suggestion-1", "kept"),
     );
-    expect(await screen.findByRole("status")).toHaveTextContent("建议已保留");
+    expect(await screen.findByRole("status", { name: "操作反馈" })).toHaveTextContent("建议已保留");
   });
 
   it("reports a committed suggestion after render and ignores receipt failure", async () => {
@@ -1130,6 +1404,157 @@ describe("LiveMeetingWorkbench", () => {
     await waitFor(() => expect(api.markUiRendered).toHaveBeenCalledWith("job-2", 1, 4));
     expect(screen.getByText("回滚窗口和触发条件是否已经确认？")).toBeVisible();
     expect(screen.queryByText("trace unavailable")).not.toBeInTheDocument();
+  });
+
+  it.each(["snapshot", "event"] as const)("acknowledges a newly marked automatic participation publication once through real HttpMeetingApi with %s delivery and no Fast answer", async (delivery) => {
+    const { api } = dependencies();
+    const capture = microphoneController();
+    const previousFetch = globalThis.fetch;
+    const jobId = "synthetic-auto-render-job";
+    const decisionId = "synthetic-auto-render-decision";
+    const eventSeq = 14;
+    const evidence = { segment_ids: ["segment-1"], quote: "负责人还没有确定", evidence_hash: "hash-1", state_revision: 1 };
+    const provenance = { source: "llm_first", job_id: jobId, batch_id: "synthetic-auto-batch", provider: "openai_compatible_gateway", model: "fixture-model", llm_called: true, evidence };
+    const decision = { origin: "pi", status: "intervention", job_id: jobId, decision_id: decisionId, run_id: "synthetic-auto-run", meeting_id: "meeting-1", prompt_profile: "participation", analysis_kind: "participation", topic_id: "synthetic-auto-topic", analysis_basis_revision: 2, trigger_type: "discussion_update", valid_until_ms: Date.now() + 60_000, lifecycle_action: "retain" };
+    const receipt = { meeting_id: "meeting-1", job_id: jobId, decision_id: decisionId, event_seq: eventSeq, input_version: 2, draft_seq: 0 };
+    const intervention = { ...provenance, ...decision, ui_render_receipt: receipt, say_this: "先明确负责人，再决定上线条件。", why_now: "当前上线方案缺少负责人。", evidence_segment_ids: ["segment-1"], evidence_quote: evidence.quote, event_type: "execution_gap", title: "明确上线条件", urgency: "medium", proposal_type: "professional_proposal" };
+    const event = { meeting_id: "meeting-1", seq: eventSeq, event_id: "synthetic-auto-event", type: "meeting.intelligence.applied", aggregate_type: "meeting_intelligence", aggregate_id: jobId, occurred_at_ms: Date.now(), correlation_id: "meeting-1", causation_id: jobId, idempotency_key: `applied:${jobId}`, payload: { ...provenance, coach_decision: decision, coach_intervention: intervention } };
+    let eventDelivered = false;
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input), window.location.href);
+      const reply = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+      if (url.pathname.endsWith("/snapshot")) {
+        const published = delivery === "snapshot" || eventDelivered;
+        return reply({ meeting_id: "meeting-1", title: "合成自动建议回执核查", last_seq: published ? eventSeq : eventSeq - 1, live_analysis_profile: "participation", segments: realSnapshot().segments, suggestions: [], runtime: { phase: "live" }, ...(published ? { coach_intervention: intervention, coach_decision: decision } : {}) });
+      }
+      if (url.pathname.endsWith("/events")) {
+        const afterSeq = Number(url.searchParams.get("after_seq"));
+        const events = delivery === "event" && afterSeq < eventSeq ? [event] : [];
+        if (events.length) eventDelivered = true;
+        return reply({ meeting_id: "meeting-1", after_seq: afterSeq, last_seq: eventSeq, events, has_more: false, next_after_seq: eventSeq });
+      }
+      if (url.pathname.endsWith(`/traces/${jobId}/ui-rendered`)) return reply({});
+      return previousFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetcher);
+    const http = new HttpMeetingApi();
+    api.getSnapshot = (id, signal) => http.getSnapshot(id, signal);
+    api.markUiRendered = (id, seq, draftSeq, signal) => http.markUiRendered(id, seq, draftSeq, signal);
+    api.markCoachUiRendered = (value, signal) => http.markCoachUiRendered(value, signal);
+    const view = render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={new PollingEventTransport(http, 100_000)} microphoneController={capture} />);
+    try {
+      const card = await screen.findByTestId("follow-up-card");
+      expect(card).toBeVisible();
+      expect(card).toHaveTextContent(intervention.say_this);
+      expect(card).toHaveAttribute("data-ui-render-job-id", jobId);
+      expect(screen.queryByTestId("answer-card")).not.toBeInTheDocument();
+      const ackCalls = () => fetcher.mock.calls.filter(([input, init]) => String(input).includes(`/traces/${jobId}/ui-rendered`) && init?.method === "POST");
+      await waitFor(() => expect(ackCalls()).toHaveLength(1));
+      expect(JSON.parse(String(ackCalls()[0][1]?.body))).toEqual(receipt);
+      await act(async () => { await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve())); });
+      expect(ackCalls()).toHaveLength(1);
+      expect(fetcher.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(1);
+      expect(capture.start).not.toHaveBeenCalled();
+    } finally {
+      view.unmount();
+    }
+  });
+
+  it.each(["old", "old-event", "unknown-field", "fractional-version", "cross-meeting", "wrong-job", "wrong-decision", "expired", "withdrawn", "topic-changed", "basis-changed", "hidden", "ended"] as const)("does not backfill a participation DOM receipt for %s through the real HTTP client", async (scenario) => {
+    const { api } = dependencies();
+    const capture = microphoneController();
+    const previousFetch = globalThis.fetch;
+    const jobId = "synthetic-rejected-render";
+    const decisionId = "synthetic-rejected-decision";
+    const receipt: Record<string, unknown> = { meeting_id: "meeting-1", job_id: jobId, decision_id: decisionId, event_seq: 14, input_version: 2, draft_seq: 0 };
+    if (scenario === "unknown-field") receipt.future_identity = "untrusted";
+    if (scenario === "fractional-version") receipt.input_version = 1.5;
+    if (scenario === "cross-meeting") receipt.meeting_id = "other-meeting";
+    if (scenario === "wrong-job") receipt.job_id = "other-job";
+    if (scenario === "wrong-decision") receipt.decision_id = "other-decision";
+    const provenance = { source: "llm_first", job_id: jobId, batch_id: "synthetic-batch", provider: "openai_compatible_gateway", model: "fixture-model", llm_called: true, evidence: { segment_ids: ["segment-1"] } };
+    const decision = { origin: "pi", status: scenario === "withdrawn" ? "stale" : "intervention", job_id: jobId, decision_id: decisionId, prompt_profile: "participation", analysis_kind: "participation", topic_id: "topic-current", analysis_basis_revision: 2, valid_until_ms: scenario === "expired" ? Date.now() - 1 : Date.now() + 60_000, lifecycle_action: scenario === "withdrawn" ? "retract" : "retain" };
+    const intervention = { ...provenance, ...decision, say_this: "这条合成建议保持可核对。", why_now: "合成材料中的边界需要核对。", evidence_segment_ids: ["segment-1"], evidence_quote: "负责人尚未确定", event_type: "execution_gap", urgency: "medium", ...(scenario === "old" || scenario === "old-event" ? {} : { ui_render_receipt: receipt }) };
+    if (scenario === "topic-changed") decision.topic_id = "topic-new";
+    if (scenario === "basis-changed") decision.analysis_basis_revision = 3;
+    let eventDelivered = false;
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input), window.location.href);
+      const reply = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+      if (url.pathname.endsWith("/snapshot")) {
+        const published = scenario !== "old-event" || eventDelivered;
+        return reply({ meeting_id: "meeting-1", title: "合成回执拒绝反例", last_seq: published ? 14 : 13, live_analysis_profile: "participation", segments: realSnapshot().segments, suggestions: [], runtime: { phase: scenario === "ended" ? "ended" : "live" }, ...(published ? { coach_intervention: intervention, coach_decision: decision, coach_history: scenario === "ended" ? [{ ...intervention, history_id: "old-history", created_at_ms: 1 }] : [] } : {}) });
+      }
+      if (url.pathname.endsWith("/events")) {
+        const afterSeq = Number(url.searchParams.get("after_seq"));
+        const events = scenario === "old-event" && !eventDelivered ? [{ meeting_id: "meeting-1", seq: 14, event_id: "old-event", type: "meeting.intelligence.applied", aggregate_type: "meeting_intelligence", aggregate_id: jobId, occurred_at_ms: Date.now(), correlation_id: "meeting-1", causation_id: jobId, idempotency_key: jobId, payload: { ...provenance, coach_intervention: intervention, coach_decision: decision } }] : [];
+        eventDelivered = true;
+        return reply({ meeting_id: "meeting-1", after_seq: afterSeq, last_seq: 14, events, has_more: false, next_after_seq: 14 });
+      }
+      return previousFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetcher);
+    const http = new HttpMeetingApi();
+    api.getSnapshot = (id, signal) => http.getSnapshot(id, signal);
+    api.markUiRendered = (id, seq, draftSeq, signal) => http.markUiRendered(id, seq, draftSeq, signal);
+    api.markCoachUiRendered = (value, signal) => http.markCoachUiRendered(value, signal);
+    const view = render(<div hidden={scenario === "hidden"}><LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={new PollingEventTransport(http, 100_000)} microphoneController={capture} /></div>);
+    try {
+      await screen.findByText("合成回执拒绝反例");
+      if (!["expired", "withdrawn", "ended"].includes(scenario)) {
+        const card = await screen.findByTestId("follow-up-card");
+        expect(card).toHaveTextContent(intervention.say_this);
+      }
+      await act(async () => { await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve())); });
+      expect(fetcher.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(0);
+      expect(capture.start).not.toHaveBeenCalled();
+    } finally { view.unmount(); }
+  });
+
+  it("acknowledges only the explicitly selected new publication while the actual-client reader holds the previous card", async () => {
+    vi.useFakeTimers();
+    const readerKey = "meeting-copilot-participation-reader:meeting-1:live";
+    sessionStorage.removeItem(readerKey);
+    const { api, transport } = dependencies();
+    const capture = microphoneController();
+    const previousFetch = globalThis.fetch;
+    let current = 0;
+    const receipt = { meeting_id: "meeting-1", job_id: "new-render-job", decision_id: "new-render-decision", event_seq: 15, input_version: 3, draft_seq: 0 };
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input), window.location.href);
+      const reply = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+      if (url.pathname.endsWith("/snapshot")) {
+        const jobId = current ? receipt.job_id : "previous-render-job";
+        const decisionId = current ? receipt.decision_id : "previous-render-decision";
+        const provenance = { source: "llm_first", job_id: jobId, batch_id: "synthetic-batch", provider: "openai_compatible_gateway", model: "fixture-model", llm_called: true, evidence: { segment_ids: ["segment-1"] } };
+        const decision = { origin: "pi", status: "intervention", job_id: jobId, decision_id: decisionId, topic_id: "same-topic", analysis_basis_revision: 2, valid_until_ms: Date.now() + 60_000, lifecycle_action: "retain", analysis_kind: "participation", prompt_profile: "participation" };
+        const card = { ...provenance, ...decision, say_this: current ? "这是明确切换之后的新建议正文。" : "这是正在阅读的旧建议正文。", why_now: "合成讨论边界尚待核对。", evidence_segment_ids: ["segment-1"], evidence_quote: "边界待核对", event_type: "execution_gap", urgency: "medium", ...(current ? { ui_render_receipt: receipt } : {}) };
+        return reply({ meeting_id: "meeting-1", title: "合成阅读锁回执", last_seq: current ? 20 : 14, live_analysis_profile: "participation", segments: realSnapshot().segments, suggestions: [], runtime: { phase: "live" }, coach_intervention: card, coach_decision: decision });
+      }
+      if (url.pathname.endsWith("/ui-rendered")) return reply({});
+      return previousFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetcher);
+    const http = new HttpMeetingApi();
+    api.getSnapshot = (id, signal) => http.getSnapshot(id, signal);
+    api.markCoachUiRendered = (value, signal) => http.markCoachUiRendered(value, signal);
+    const view = render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} microphoneController={capture} />);
+    try {
+      await act(async () => { await vi.advanceTimersByTimeAsync(20); });
+      fireEvent.mouseDown(screen.getByTestId("follow-up-card"));
+      current = 1;
+      await act(async () => { await vi.advanceTimersByTimeAsync(3020); });
+      expect(screen.getByTestId("follow-up-card")).toHaveTextContent("这是正在阅读的旧建议正文。");
+      expect(screen.getByTestId("follow-up-card")).toHaveAttribute("data-ui-render-job-id", "previous-render-job");
+      expect(fetcher.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(0);
+      fireEvent.click(screen.getByRole("button", { name: "有新建议，查看最新" }));
+      await act(async () => { await vi.advanceTimersByTimeAsync(3020); });
+      expect(screen.getByTestId("follow-up-card")).toHaveTextContent("这是明确切换之后的新建议正文。");
+      const posts = fetcher.mock.calls.filter(([, init]) => init?.method === "POST");
+      expect(posts).toHaveLength(1);
+      expect(JSON.parse(String(posts[0][1]?.body))).toEqual(receipt);
+      expect(capture.start).not.toHaveBeenCalled();
+    } finally { view.unmount(); sessionStorage.removeItem(readerKey); vi.useRealTimers(); }
   });
 
   it("reports a Pi coach trace only after the intervention card is mounted", async () => {
@@ -1362,6 +1787,71 @@ describe("LiveMeetingWorkbench", () => {
     expect(screen.queryByRole("button", { name: "打开会议：网关改造评审" })).not.toBeInTheDocument();
   });
 
+  it.each([false, true])("submits an import retry from the full page through HttpMeetingApi with HTTP failure=%s", async (fail) => {
+    const user = userEvent.setup();
+    const meetingId = "import/模拟录音";
+    const retryPath = `/v2/meetings/${encodeURIComponent(meetingId)}/import-job/retry`;
+    let job = { id: "import-job", meeting_id: meetingId, status: "failed", stage: "transcribing", progress: 40, error_class: "LocalASRUnavailable", error_message: "本地转写组件尚未就绪", retryable: true, updated_at_ms: 2000 };
+    const previousFetch = globalThis.fetch;
+    const jsonResponse = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input), "http://localhost:8768").pathname;
+      if (path === retryPath && init?.method === "POST") {
+        expect(JSON.parse(String(init.body))).toEqual({});
+        if (fail) return jsonResponse({ detail: "导入重试服务暂不可用，请稍后重试。" }, 503);
+        job = { ...job, status: "pending", stage: "reading", error_class: "", error_message: "", retryable: false, updated_at_ms: 3000 };
+        return jsonResponse({ import_job: job });
+      }
+      if (path.endsWith("/snapshot")) return jsonResponse({ meeting_id: meetingId, title: "模拟录音导入", last_seq: 1, segments: [], suggestions: [], runtime: { phase: "live" }, import_job: job });
+      if (path.endsWith("/speakers")) return jsonResponse({ speakers: [] });
+      if (path.endsWith("/transcript")) return jsonResponse({ meeting_id: meetingId, segments: [], has_more: false, next_after_transcript_seq: 0 });
+      return previousFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetcher);
+    const api = new HttpMeetingApi("http://localhost:8768");
+    const { transport } = dependencies();
+    const microphone = microphoneController();
+    render(<LiveMeetingWorkbench meetingId={meetingId} api={api} transport={transport} microphoneController={microphone} />);
+    const panel = await screen.findByRole("region", { name: "本地录音导入状态" });
+    await user.click(within(panel).getByRole("button", { name: "重试本次录音导入" }));
+    await waitFor(() => expect(fetcher).toHaveBeenCalledWith(`http://localhost:8768${retryPath}`, expect.objectContaining({ method: "POST", body: "{}" })));
+    expect(fetcher.mock.calls.filter(([input, init]) => String(input).endsWith("/import-job/retry") && init?.method === "POST")).toHaveLength(1);
+    if (fail) expect(await within(panel).findByText("导入重试服务暂不可用，请稍后重试。")).toBeVisible();
+    else await waitFor(() => expect(panel).toHaveTextContent("正在处理导入录音"));
+    expect(microphone.start).not.toHaveBeenCalled();
+    expect(fetcher.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(1);
+  });
+
+  it.each(["failed", "pending"] as const)("opens an imported %s recording in its own recovery view and never starts device capture", async (status) => {
+    const user = userEvent.setup();
+    const { api, transport } = dependencies();
+    const microphone = microphoneController();
+    const imported = { ...realSnapshot(), importJob: { id: "import-job-1", meetingId: "meeting-1", status, stage: "transcribing" as const, progress: 40, errorClass: status === "failed" ? "LocalASRUnavailable" : null,
+      errorMessage: status === "failed" ? "本地转写组件尚未就绪" : null, retryable: status === "failed", updatedAtMs: 2000 }, runtime: { ...realSnapshot().runtime, phase: "live" as const } };
+    vi.mocked(api.getSnapshot).mockResolvedValue(imported);
+    vi.mocked(api.retryImportJob).mockImplementation(async () => {
+      const job = { ...imported.importJob, status: "pending" as const, errorMessage: null, errorClass: null, retryable: false, updatedAtMs: 3000 };
+      vi.mocked(api.getSnapshot).mockResolvedValue({ ...imported, importJob: job });
+      return job;
+    });
+    render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} microphoneController={microphone} />);
+    expect(await screen.findByRole("tab", { name: "复盘" })).toBeVisible();
+    const panel = screen.getByRole("region", { name: "本地录音导入状态" });
+    expect(panel).toHaveTextContent("此页面不会启动麦克风或系统声音采集");
+    expect(screen.queryByRole("button", { name: /立即开始录音|恢复录音|结束并整理/ })).not.toBeInTheDocument();
+    if (status === "failed") {
+      expect(panel).toHaveTextContent("本地转写组件尚未就绪");
+      await user.click(within(panel).getByRole("button", { name: "重试本次录音导入" }));
+      await waitFor(() => expect(panel).toHaveTextContent("正在处理导入录音"));
+      expect(api.retryImportJob).toHaveBeenCalledExactlyOnceWith("meeting-1");
+      expect(screen.queryByRole("button", { name: "重试本次录音导入" })).not.toBeInTheDocument();
+    } else expect(api.retryImportJob).not.toHaveBeenCalled();
+    expect(microphone.start).not.toHaveBeenCalled();
+    expect(api.createMeeting).not.toHaveBeenCalled();
+    expect(api.importRecording).not.toHaveBeenCalled();
+    expect(api.regenerateDocument).not.toHaveBeenCalled();
+  });
+
   it("shows review including meeting answers and saved recording after meeting end", async () => {
     const user = userEvent.setup();
     const { api, transport } = dependencies();
@@ -1408,7 +1898,7 @@ describe("LiveMeetingWorkbench", () => {
     expect(screen.getByRole("heading", { level: 1, name: "支付服务发布评审" })).toBeVisible();
     expect(screen.queryByRole("heading", { level: 1, name: "实时会议" })).not.toBeInTheDocument();
     expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual([
-      "复盘", "决策与待办", "会中问答", "会议文字", "录音",
+      "复盘", "决策与待办", "会中建议与问答", "会议文字", "录音",
     ]);
     expect(screen.getByRole("heading", { level: 3, name: "会议结论" })).toBeVisible();
     expect(screen.getByRole("heading", { level: 3, name: "行动项" })).toBeVisible();
@@ -1587,7 +2077,8 @@ describe("LiveMeetingWorkbench", () => {
     render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} />);
 
     expect(await screen.findByText("正在补齐中断处文字")).toBeVisible();
-    expect(screen.getByText("00:00–00:01 · 录音仍在继续保存")).toBeVisible();
+    expect(screen.getByText("0:00–0:01 · 已有正文仍可查看。")).toBeVisible();
+    expect(screen.getByText(/本提示不表示录音已完整保存/)).toBeVisible();
     expect(screen.getByRole("button", { name: /采集健康：录音待恢复/ })).toBeVisible();
   });
 
@@ -1607,8 +2098,8 @@ describe("LiveMeetingWorkbench", () => {
     });
     const view = render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} />);
 
-    expect(await screen.findByText("中断处文字已补齐")).toBeVisible();
-    expect(screen.getByText("00:00–00:02 · 已合并到同一会议正文")).toBeVisible();
+    expect(await screen.findByText("这段中断处文字已补齐")).toBeVisible();
+    expect(screen.getByText(/0:00–0:02.*不代表全场文字已经人工确认/)).toBeVisible();
 
     vi.mocked(api.getSnapshot).mockResolvedValue({
       ...realSnapshot(),
@@ -1626,7 +2117,8 @@ describe("LiveMeetingWorkbench", () => {
     render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} />);
 
     expect(await screen.findByText("中断处文字暂未补齐")).toBeVisible();
-    expect(screen.getByText("00:00–00:02 · 录音已保存，这一小段文字可能缺失")).toBeVisible();
+    expect(screen.getByText(/0:00–0:02.*这段文字可能仍有缺口/)).toBeVisible();
+    expect(screen.getByText(/本提示不表示录音已完整保存/)).toBeVisible();
   });
 
   it("does not enter review until the backend confirms that the meeting ended", async () => {
@@ -1718,5 +2210,263 @@ describe("LiveMeetingWorkbench", () => {
     await user.click(screen.getByRole("tab", { name: "实时教练" }));
     expect(screen.getByRole("heading", { name: "AI 实时教练" })).toBeVisible();
     expect(screen.queryByRole("region", { name: "会议事实" })).not.toBeInTheDocument();
+  });
+});
+
+it.each([false, true])("saves the meeting knowledge scope before starting capture (failure=%s)", async (fail) => {
+  const user = userEvent.setup(); const { api, transport } = dependencies(); const capture = microphoneController();
+  const knowledge = { listProjects: vi.fn().mockResolvedValue({ items: [], nextCursor: null, hasMore: false }), saveMeetingContext: fail ? vi.fn().mockRejectedValue(new Error("资料范围保存失败，尚未开始会议。")) : vi.fn().mockResolvedValue({ revision: 1 }) } as unknown as KnowledgeApi;
+  render(<LiveMeetingWorkbench meetingId={null} api={api} knowledgeApi={knowledge} transport={transport} onCreateMeeting={() => "meeting-1"} microphoneController={capture} />);
+  await confirmMeetingPreflight(user);
+  await waitFor(() => expect(knowledge.saveMeetingContext).toHaveBeenCalledWith("meeting-1", { projectId: null, folderId: null, documentIds: null }));
+  if (fail) { expect(capture.start).not.toHaveBeenCalled(); await screen.findByText("资料范围保存失败，尚未开始会议。"); expect(api.deleteMeeting).toHaveBeenCalledWith("meeting-1"); }
+  else { await waitFor(() => expect(capture.start).toHaveBeenCalled()); expect(vi.mocked(knowledge.saveMeetingContext).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(capture.start).mock.invocationCallOrder[0]); }
+});
+
+function wireLiveProfileHttp(api: MeetingApi, read: () => Response | Promise<Response>, write?: () => Response | Promise<Response>) {
+  const previous = vi.mocked(fetch).getMockImplementation();
+  const fetcher = vi.fn((input: RequestInfo | URL, options?: RequestInit) => {
+    const url = String(input);
+    if (url.endsWith("/preparation/versions")) return Promise.resolve(new Response(JSON.stringify({ versions: [] }), { headers: { "content-type": "application/json" } }));
+    if (url.endsWith("/preparation")) {
+      if (options?.method === "PUT") return Promise.resolve(write ? write() : new Response("{}", { headers: { "content-type": "application/json" } }));
+      return Promise.resolve(read());
+    }
+    return previous?.(input, options) ?? Promise.reject(new Error(`Unexpected route ${url}`));
+  });
+  vi.stubGlobal("fetch", fetcher); const http = new HttpMeetingApi();
+  api.getMeetingPreparation = http.getMeetingPreparation.bind(http);
+  api.getMeetingPreparationVersions = http.getMeetingPreparationVersions.bind(http);
+  api.saveMeetingPreparation = http.saveMeetingPreparation.bind(http);
+  return fetcher;
+}
+const profileResponse = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+
+it.each(["participation", "legacy"] as const)("persists a new meeting's explicit %s mode through real HTTP before capture", async (profile) => {
+  const user = userEvent.setup(); const { api, transport } = dependencies(); const capture = microphoneController();
+  const fetcher = wireLiveProfileHttp(api, () => profileResponse({ meeting_id: "rec-profile", live_analysis_profile: profile }));
+  const order: string[] = [];
+  const save = api.saveMeetingPreparation.bind(api);
+  api.saveMeetingPreparation = async (...args) => { await save(...args); order.push("preparation-committed"); };
+  vi.mocked(capture.start).mockImplementation(async () => { order.push("capture-started"); });
+  render(<LiveMeetingWorkbench meetingId={null} api={api} transport={transport} microphoneController={capture} onCreateMeeting={() => "rec-profile"} />);
+  await user.click(screen.getByRole("button", { name: "开始会议" }));
+  const dialog = await screen.findByRole("dialog", { name: "准备开始会议" });
+  await within(dialog).findByText("本地中文实时识别可用");
+  expect(within(dialog).getByRole("radio", { name: "帮助我参与讨论" })).toHaveAttribute("aria-checked", "true");
+  if (profile === "legacy") await user.click(within(dialog).getByRole("radio", { name: "优先回答听到的问题" }));
+  await completeDialogMicrophoneCheck(dialog); await user.click(within(dialog).getByLabelText("我已告知参会者并确认可以录音")); await user.click(within(dialog).getByRole("button", { name: "开始会议" }));
+  await waitFor(() => expect(capture.start).toHaveBeenCalledWith("rec-profile", expect.any(Object)));
+  const puts = fetcher.mock.calls.filter(([url, init]) => String(url).endsWith("/preparation") && init?.method === "PUT");
+  expect(puts).toHaveLength(1); const body = JSON.parse(String(puts[0][1]?.body));
+  expect(body.live_analysis_profile).toBe(profile); expect(body).not.toHaveProperty("meeting_goal"); expect(body).not.toHaveProperty("participant_role");
+  expect(order).toEqual(["preparation-committed", "capture-started"]);
+});
+
+it("recovers an old preparation via HTTP and preserves legacy while changing the goal", async () => {
+  const user = userEvent.setup(); const { api, transport } = dependencies(); const capture = microphoneController();
+  const fetcher = wireLiveProfileHttp(api, () => profileResponse({ meeting_id: "meeting-1", version: 1 }));
+  render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} microphoneController={capture} />);
+  await user.click(await screen.findByRole("button", { name: "恢复录音" }));
+  const dialog = await screen.findByRole("dialog", { name: "准备开始会议" });
+  await waitFor(() => expect(within(dialog).getByRole("radio", { name: "优先回答听到的问题" })).toHaveAttribute("aria-checked", "true"));
+  expect(within(dialog).getByRole("radio", { name: "帮助我参与讨论" })).toBeDisabled();
+  expect(capture.start).not.toHaveBeenCalled();
+  await within(dialog).findByText("本地中文实时识别可用"); await completeDialogMicrophoneCheck(dialog);
+  await user.click(within(dialog).getByText("会议与教练设置"));
+  await user.type(within(dialog).getByPlaceholderText("本场会议需要达成什么结果"), "继续评审订单边界");
+  await user.click(within(dialog).getByLabelText("我已告知参会者并确认可以录音")); await user.click(within(dialog).getByRole("button", { name: "开始会议" }));
+  await waitFor(() => expect(capture.start).toHaveBeenCalled());
+  const writes = fetcher.mock.calls.filter(([url, init]) => String(url).endsWith("/preparation") && init?.method === "PUT");
+  expect(writes).toHaveLength(1); expect(JSON.parse(String(writes[0][1]?.body))).toMatchObject({ live_analysis_profile: "legacy", meeting_goal: "继续评审订单边界" });
+  expect(fetcher.mock.calls.findIndex(([, init]) => init?.method === "PUT")).toBeGreaterThan(fetcher.mock.calls.findIndex(([url, init]) => String(url).endsWith("/preparation") && init?.method === undefined));
+});
+
+it("does not use the new-meeting default after a failed recovery read and only retries GET on user request", async () => {
+  const user = userEvent.setup(); const { api, transport } = dependencies(); const capture = microphoneController(); let unavailable = true;
+  const fetcher = wireLiveProfileHttp(api, () => unavailable ? profileResponse({ detail: "准备读取失败" }, 503) : profileResponse({ meeting_id: "meeting-1", live_analysis_profile: "participation" }));
+  render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} microphoneController={capture} />);
+  await user.click(await screen.findByRole("button", { name: "恢复录音" }));
+  const dialog = await screen.findByRole("dialog", { name: "准备开始会议" }); await within(dialog).findByRole("button", { name: "重新读取本场帮助方式" });
+  expect(within(dialog).getByRole("button", { name: "开始会议" })).toBeDisabled();
+  expect(within(dialog).getByRole("radio", { name: "帮助我参与讨论" })).toBeDisabled();
+  expect(fetcher.mock.calls.some(([, init]) => init?.method === "PUT")).toBe(false); expect(api.createMeeting).not.toHaveBeenCalled(); expect(capture.start).not.toHaveBeenCalled();
+  unavailable = false; await user.click(within(dialog).getByRole("button", { name: "重新读取本场帮助方式" }));
+  await waitFor(() => expect(within(dialog).getByRole("radio", { name: "帮助我参与讨论" })).toHaveAttribute("aria-checked", "true"));
+  expect(within(dialog).getByRole("radio", { name: "帮助我参与讨论" })).toBeDisabled();
+  expect(fetcher.mock.calls.some(([, init]) => init?.method === "PUT")).toBe(false); expect(capture.start).not.toHaveBeenCalled();
+});
+
+it("does not treat backend live phase without audio or final text as a profile lock", async () => {
+  const user = userEvent.setup(); const { api, transport } = dependencies();
+  const empty = { ...realSnapshot(), segments: [], activePartial: null, archivedSegmentCount: 0, audio: { status: "unknown" as const, chunkCount: 0, durationMs: 0, fileSizeBytes: 0, tracks: [] } };
+  vi.mocked(api.getSnapshot).mockResolvedValue(empty); vi.mocked(api.getTranscript).mockResolvedValue([]);
+  wireLiveProfileHttp(api, () => profileResponse({ meeting_id: "meeting-1", live_analysis_profile: "legacy" }));
+  render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} microphoneController={microphoneController()} />);
+  await user.click(await screen.findByRole("button", { name: "恢复录音" })); const dialog = await screen.findByRole("dialog", { name: "准备开始会议" });
+  await waitFor(() => expect(within(dialog).getByRole("radio", { name: "帮助我参与讨论" })).toBeEnabled());
+  await user.click(within(dialog).getByRole("radio", { name: "帮助我参与讨论" })); expect(within(dialog).getByRole("radio", { name: "帮助我参与讨论" })).toHaveAttribute("aria-checked", "true");
+});
+
+it("respects the host's first-audio lock before any audio chunk or final text is available", async () => {
+  const user = userEvent.setup(); const { api, transport } = dependencies();
+  const empty = { ...realSnapshot(), liveAnalysisProfile: "participation" as const, liveAnalysisProfileLocked: true, segments: [], activePartial: null, audio: { status: "unknown" as const, chunkCount: 0, durationMs: 0, fileSizeBytes: 0, tracks: [] } };
+  vi.mocked(api.getSnapshot).mockResolvedValue(empty); vi.mocked(api.getTranscript).mockResolvedValue([]);
+  wireLiveProfileHttp(api, () => profileResponse({ meeting_id: "meeting-1", live_analysis_profile: "participation" }));
+  render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} microphoneController={microphoneController()} />);
+  await user.click(await screen.findByRole("button", { name: "恢复录音" })); const dialog = await screen.findByRole("dialog", { name: "准备开始会议" });
+  await waitFor(() => expect(within(dialog).getByRole("radio", { name: "帮助我参与讨论" })).toHaveAttribute("aria-checked", "true"));
+  expect(within(dialog).getByRole("radio", { name: "优先回答听到的问题" })).toBeDisabled();
+});
+
+it("keeps a restored bound meeting ID while reading its original mode and never captures before explicit start", async () => {
+  const user = userEvent.setup(); const { api, transport } = dependencies(); const materials = preparedMaterials(); const capture = microphoneController(); const newId = vi.fn(() => "wrong-new-id");
+  sessionStorage.setItem(MATERIAL_START_KEY, JSON.stringify({ meetingId: "rec_bound", setId: "prepared-set", setRevision: 4, key: "original-key", created: true, title: null, inputSource: "microphone" }));
+  vi.mocked(materials.get).mockResolvedValue({ material_set: { id: "prepared-set", state: "bound", meeting_id: "rec_bound", revision: 5, context_revision: 2 }, attachments: [] });
+  const fetcher = wireLiveProfileHttp(api, () => profileResponse({ meeting_id: "rec_bound", live_analysis_profile: "legacy" }));
+  render(<LiveMeetingWorkbench meetingId={null} api={api} materialsApi={materials} transport={transport} microphoneController={capture} onCreateMeeting={newId} />);
+  await screen.findByText(/上次会议准备已恢复/); await user.click(screen.getByRole("button", { name: "开始会议" }));
+  const dialog = await screen.findByRole("dialog", { name: "准备开始会议" });
+  await waitFor(() => expect(within(dialog).getByRole("radio", { name: "优先回答听到的问题" })).toHaveAttribute("aria-checked", "true"));
+  expect(fetcher.mock.calls.some(([url]) => String(url) === "/v2/meetings/rec_bound/preparation")).toBe(true);
+  expect(fetcher.mock.calls.some(([, init]) => init?.method === "PUT")).toBe(false);
+  expect(capture.start).not.toHaveBeenCalled(); expect(newId).not.toHaveBeenCalled(); expect(api.createMeeting).not.toHaveBeenCalled();
+  await user.click(within(dialog).getByRole("button", { name: "取消" }));
+  expect(sessionStorage.getItem(MATERIAL_START_KEY)).toContain("rec_bound");
+});
+
+it("shows a server audio-lock race in Chinese and does not capture or delete the existing meeting", async () => {
+  const user = userEvent.setup(); const { api, transport } = dependencies(); const capture = microphoneController();
+  const empty = { ...realSnapshot(), segments: [], activePartial: null, audio: { status: "unknown" as const, chunkCount: 0, durationMs: 0, fileSizeBytes: 0, tracks: [] } };
+  vi.mocked(api.getSnapshot).mockResolvedValue(empty); vi.mocked(api.getTranscript).mockResolvedValue([]);
+  const fetcher = wireLiveProfileHttp(api, () => profileResponse({ meeting_id: "meeting-1", live_analysis_profile: "legacy" }), () => profileResponse({ detail: { error: "live_analysis_profile_locked" } }, 409));
+  render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} microphoneController={capture} />);
+  await user.click(await screen.findByRole("button", { name: "恢复录音" })); const dialog = await screen.findByRole("dialog", { name: "准备开始会议" });
+  await within(dialog).findByText("本地中文实时识别可用"); await waitFor(() => expect(within(dialog).getByRole("radio", { name: "帮助我参与讨论" })).toBeEnabled());
+  await user.click(within(dialog).getByRole("radio", { name: "帮助我参与讨论" })); await completeDialogMicrophoneCheck(dialog); await user.click(within(dialog).getByLabelText("我已告知参会者并确认可以录音")); await user.click(within(dialog).getByRole("button", { name: "开始会议" }));
+  expect(await within(dialog).findByText(/本场已产生录音或会议文字，不能切换帮助方式/)).toBeVisible();
+  expect(capture.start).not.toHaveBeenCalled(); expect(api.deleteMeeting).not.toHaveBeenCalled();
+  expect(fetcher.mock.calls.filter(([, init]) => init?.method === "PUT")).toHaveLength(1);
+  await waitFor(() => expect(within(dialog).getByRole("radio", { name: "优先回答听到的问题" })).toHaveAttribute("aria-checked", "true"));
+});
+
+describe("truthful automatic policy and unprocessed discussion through HttpMeetingApi", () => {
+  function wire(api: MeetingApi, read: () => Record<string, unknown>) {
+    const previous = globalThis.fetch;
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const reply = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+      if (String(input).endsWith("/snapshot")) return reply(read());
+      if (String(input).endsWith("/coach/request")) return reply({ job: { id: "explicit-new-request" } }, 202);
+      return previous(input, init);
+    });
+    vi.stubGlobal("fetch", fetcher);
+    const http = new HttpMeetingApi();
+    api.getSnapshot = (id, signal) => http.getSnapshot(id, signal);
+    api.requestRealtimeCoach = (id, request, answerId, signal, options) => http.requestRealtimeCoach(id, request, answerId, signal, options);
+    api.getCoachRequestStatus = (id, jobId, signal) => http.getCoachRequestStatus(id, jobId, signal);
+    return fetcher;
+  }
+  function snapshot(decision: string, input: number | null = 3, understood: number | null = 2, suffix = "existing") {
+    const jobId = `presentation-${suffix}`;
+    const provenance = { source: "llm_first", job_id: jobId, batch_id: "synthetic-runtime", provider: "synthetic", model: "fixture", llm_called: true, evidence: { segment_ids: ["segment-1"] } };
+    const cardDecision = { ...provenance, origin: "pi", status: "intervention", job_id: jobId, decision_id: `decision-${suffix}`, prompt_profile: "participation", analysis_kind: "participation", topic_id: "payment-topic", analysis_basis_revision: 2, trigger_type: "user_request", valid_until_ms: Date.now() + 60_000, lifecycle_action: "retain" };
+    const card = { ...cardDecision, say_this: `可读建议 ${suffix}`, why_now: "公开合成讨论的边界需要核对。", title: "核对付款恢复", event_type: "execution_gap", urgency: "medium", evidence_segment_ids: ["segment-1"], evidence_quote: "付款边界尚待确认", proposal_type: "professional_proposal", supporting_facts: [{ text: "付款边界尚待确认", source_ref: "segment-1" }] };
+    return { meeting_id: "meeting-1", title: "公开合成运行语义", last_seq: 20, live_analysis_profile: "participation", segments: realSnapshot().segments, suggestions: [], current_topic: { ...provenance, id: "payment-topic", text: "付款恢复边界", status: "active" }, coach_intervention: card, coach_decision: cardDecision,
+      coach_history: [{ ...card, history_id: `history-${suffix}`, created_at_ms: Date.now() }],
+      runtime: { phase: "live", ai: { state: "active", capabilities: { proactive_suggestions: { state: "paused", label: "自动建议已关闭", reason: "disabled_by_meeting_policy", detail: "仍可主动提问、比较方案或组织回应；结果以本次任务状态为准。" }, discussion_state: { state: decision === "failed" ? "paused" : decision === "running" ? "busy" : "idle", decision, error_class: decision === "failed" ? "evidence_rejected" : null, label: "不可信的状态标签", input_transcript_seq: input, last_semantic_seq: understood } } } } };
+  }
+  it("keeps an explicit successful card and three deliberate entries while only automatic suggestions are off", async () => {
+    const { api, transport } = dependencies(); const capture = microphoneController();
+    const fetcher = wire(api, () => snapshot("succeeded", 2, 2));
+    render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} microphoneController={capture} />);
+    expect(await screen.findByTestId("follow-up-card")).toHaveTextContent("可读建议 existing");
+    expect(screen.getByText("自动建议已关闭")).toBeVisible();
+    expect(screen.queryByText("实时教练已关闭")).not.toBeInTheDocument();
+    for (const label of ["我可以问什么", "还有什么方案", "帮我组织回应"]) expect(screen.getByRole("button", { name: label })).toBeEnabled();
+    expect(fetcher.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(0);
+    fireEvent.click(screen.getByRole("button", { name: "我可以问什么" }));
+    await screen.findByText("我可以问什么 · 正在结合当前讨论分析");
+    const posts = fetcher.mock.calls.filter(([, init]) => init?.method === "POST");
+    expect(posts).toHaveLength(1); expect(posts[0][0]).toBe("/v2/meetings/meeting-1/coach/request");
+    expect(JSON.parse(String(posts[0][1]?.body))).toMatchObject({ intent: "ask_question" });
+    expect(capture.start).not.toHaveBeenCalled();
+  });
+  it.each(["not_started", "pending", "running", "failed"])("cautions about new unprocessed discussion in %s without invalidating a readable publication", async (phase) => {
+    const { api, transport } = dependencies(); const capture = microphoneController();
+    const fetcher = wire(api, () => snapshot(phase));
+    render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} microphoneController={capture} />);
+    const card = await screen.findByTestId("follow-up-card");
+    expect(screen.getByRole("status", { name: "当前讨论的理解状态" })).toHaveTextContent("有新的讨论尚未理解；请核对已生成的建议是否仍适用。");
+    if (phase === "not_started") expect(screen.getByRole("status", { name: "当前讨论的理解状态" })).toHaveTextContent("等待下一轮讨论理解");
+    expect(screen.queryByText(/等待足够/)).not.toBeInTheDocument();
+    expect(screen.getByText("最近已理解的话题：付款恢复边界")).toBeVisible();
+    expect(card).toHaveTextContent("可读建议 existing");
+    expect(card).toHaveAttribute("data-valid-until-ms");
+    expect(card).toHaveAttribute("data-ui-render-job-id", "presentation-existing");
+    expect(screen.queryByTestId("historical-contribution-card")).not.toBeInTheDocument();
+    expect(fetcher.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(0);
+    expect(capture.start).not.toHaveBeenCalled();
+  });
+  it.each([[2, 2], [3, null], [3.5, 2], [3, 0]])("does not infer semantic lag from equal, absent, invalid or initial cursors %s/%s", async (input, understood) => {
+    const { api, transport } = dependencies(); const fetcher = wire(api, () => snapshot("not_started", input, understood));
+    render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} microphoneController={microphoneController()} />);
+    await screen.findByTestId("follow-up-card");
+    expect(screen.queryByText(/有新的讨论尚未理解/)).not.toBeInTheDocument();
+    expect(screen.getByText("正在讨论：付款恢复边界")).toBeVisible();
+    expect(fetcher.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(0);
+  });
+  it("does not label a fresh deliberate card old just because the independent understanding cursor lags", async () => {
+    const { api, transport } = dependencies(); wire(api, () => snapshot("pending", 3, 2, "new-manual"));
+    render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} microphoneController={microphoneController()} />);
+    const card = await screen.findByTestId("follow-up-card");
+    expect(card).toHaveTextContent("可读建议 new-manual");
+    expect(card).not.toHaveTextContent(/上一轮建议|旧建议|已过期|已失效/);
+    expect(screen.getByRole("status", { name: "当前讨论的理解状态" })).toHaveTextContent("请核对已生成的建议是否仍适用");
+  });
+  it("does not claim a visible suggestion exists when new discussion arrives before any publication", async () => {
+    const { api, transport } = dependencies(); const capture = microphoneController();
+    const unprocessed = { ...snapshot("not_started"), coach_intervention: null, coach_decision: null, coach_history: [] };
+    const fetcher = wire(api, () => unprocessed);
+    render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} microphoneController={capture} />);
+    const understanding = await screen.findByRole("status", { name: "当前讨论的理解状态" });
+    expect(understanding).toHaveTextContent("有新的讨论尚未理解；请核对已生成的建议是否仍适用。");
+    expect(understanding).not.toHaveTextContent(/下方是|已生成新的建议/);
+    expect(screen.queryByTestId("follow-up-card")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("historical-contribution-card")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "我可以问什么" })).toBeEnabled();
+    expect(fetcher.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(0);
+    expect(capture.start).not.toHaveBeenCalled();
+  });
+  it("does not turn a failed explicit request into success or normal silence when automatic suggestions are off", async () => {
+    const { api, transport } = dependencies();
+    const failed = { ...snapshot("succeeded", 2, 2), coach_intervention: null,
+      coach_decision: { job_id: "failed-manual", decision_id: "failed-decision", origin: "pi", status: "failed", analysis_kind: "participation", prompt_profile: "participation", trigger_type: "user_request" } };
+    const fetcher = wire(api, () => failed);
+    render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} microphoneController={microphoneController()} />);
+    expect(await screen.findByRole("status", { name: "当前会议的 Pi 状态" })).toHaveTextContent("本次建议未完成，可重试");
+    expect(screen.getByRole("status", { name: "当前会议的 Pi 状态" })).not.toHaveTextContent(/保持静默|已生成/);
+    expect(screen.queryByTestId("follow-up-card")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "我可以问什么" })).toBeEnabled();
+    expect(fetcher.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(0);
+  });
+  it("clears only the lag caution when understanding catches up and keeps the reader until an explicit switch", async () => {
+    vi.useFakeTimers();
+    const { api, transport } = dependencies(); const capture = microphoneController(); let caughtUp = false;
+    const fetcher = wire(api, () => snapshot(caughtUp ? "succeeded" : "running", 3, caughtUp ? 3 : 2, caughtUp ? "new" : "existing"));
+    const view = render(<LiveMeetingWorkbench meetingId="meeting-1" api={api} transport={transport} microphoneController={capture} />);
+    try {
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      fireEvent.mouseDown(screen.getByText("已知条件与待核实假设"));
+      fireEvent.click(screen.getByText("已知条件与待核实假设"));
+      expect(screen.getByTestId("follow-up-card")).toHaveTextContent("可读建议 existing");
+      caughtUp = true; await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
+      expect(screen.queryByText(/有新的讨论尚未理解/)).not.toBeInTheDocument();
+      expect(screen.getByText("正在讨论：付款恢复边界")).toBeVisible();
+      expect(screen.getByTestId("follow-up-card")).toHaveTextContent("可读建议 existing");
+      fireEvent.click(screen.getByRole("button", { name: "有新建议，查看最新" }));
+      expect(screen.getByTestId("follow-up-card")).toHaveTextContent("可读建议 new");
+      expect(fetcher.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(0);
+      expect(capture.start).not.toHaveBeenCalled();
+    } finally { view.unmount(); vi.useRealTimers(); }
   });
 });

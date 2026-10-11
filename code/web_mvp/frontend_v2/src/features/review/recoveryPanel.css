@@ -1,0 +1,18 @@
+.recovery-panel { margin: 16px 0; padding: 18px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); }
+.recovery-panel header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.recovery-panel h3, .recovery-panel h4 { margin: 0 0 8px; }
+.recovery-panel p { line-height: 1.7; }
+.recovery-panel button { padding: 8px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); cursor: pointer; }
+.recovery-panel button:disabled { opacity: .5; cursor: default; }
+.recovery-panel fieldset { margin: 16px 0; border: 1px solid var(--border); border-radius: 10px; padding: 14px; }
+.recovery-panel label { display: flex; flex-direction: column; gap: 8px; margin: 12px 0; }
+.recovery-panel select, .recovery-panel textarea { width: 100%; color: inherit; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 10px; font: inherit; }
+.recovery-panel textarea { min-height: 150px; resize: vertical; line-height: 1.7; }
+.recovery-panel__jobs { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0; }
+.recovery-panel__jobs [aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); }
+.recovery-panel__candidate { border-top: 1px solid var(--border); padding-top: 16px; }
+.recovery-panel__candidate > button { margin-right: 8px; margin-bottom: 8px; }
+.recovery-panel pre { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.7; }
+.recovery-panel__notice { background: var(--accent-soft); padding: 10px 12px; border-radius: 8px; }
+.recovery-panel__error { color: var(--danger, #a32d27); }
+@media (max-width: 700px) { .recovery-panel header { flex-direction: column; } }

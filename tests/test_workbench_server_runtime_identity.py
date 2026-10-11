@@ -97,6 +97,44 @@ def test_current_clean_workbench_runtime_identity_is_accepted(tmp_path, monkeypa
         assert tool.runtime_identity_file(pid_file).stat().st_mode & 0o777 == 0o600
 
 
+def _only_pi_source(tool, monkeypatch, tmp_path):
+    assert ("pi", tool.PI_COACH_SOURCE_ROOT, frozenset({".mjs"})) in tool.RUNTIME_SOURCE_ROOTS
+    source_root = tmp_path / "pi" / "src"
+    source_root.mkdir(parents=True)
+    source = source_root / "runtime.mjs"
+    source.write_text("export const version = 1;\n", encoding="utf-8")
+    monkeypatch.setattr(tool, "RUNTIME_SOURCE_ROOTS", (("pi", source_root, frozenset({".mjs"})),))
+    return source
+
+
+def test_pi_only_change_affects_source_fingerprint_but_logs_and_dependencies_do_not(tmp_path, monkeypatch):
+    tool = _load_tool()
+    source = _only_pi_source(tool, monkeypatch, tmp_path)
+    before = tool.runtime_source_fingerprint()
+    (source.parent / "runtime.log").write_text("log data", encoding="utf-8")
+    outside = tmp_path / "pi" / "node_modules"
+    outside.mkdir()
+    (outside / "dependency.mjs").write_text("unrelated dependency", encoding="utf-8")
+    assert tool.runtime_source_fingerprint() == before
+    source.write_text("export const version = 2;\n", encoding="utf-8")
+    assert tool.runtime_source_fingerprint() != before
+
+
+def test_identity_rejects_old_launch_after_only_pi_source_changes(tmp_path, monkeypatch):
+    tool = _load_tool()
+    source = _only_pi_source(tool, monkeypatch, tmp_path)
+    port = 18765
+    pid_file = tmp_path / "workbench.pid"
+    pid_file.write_text(str(os.getpid()), encoding="utf-8")
+    monkeypatch.setattr(tool, "process_start_marker", lambda pid: "a" * 64)
+    _install_runtime_routes(monkeypatch, tool, _clean_runtime_routes(tool))
+    tool.write_runtime_identity(pid_file=pid_file, pid=os.getpid(), port=port)
+    source.write_text("export const version = 2;\n", encoding="utf-8")
+    report = tool.status_report(port=port, pid_file=pid_file)
+    assert report["runtime_identity_verified"] is False
+    assert report["health"]["runtime_identity"]["checks"]["current_source_provenance"] is False
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows process marker contract")
 def test_windows_process_start_marker_uses_process_creation_time():
     tool = _load_tool()

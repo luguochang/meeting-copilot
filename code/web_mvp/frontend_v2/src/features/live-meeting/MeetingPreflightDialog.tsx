@@ -1,3 +1,11 @@
+import { EMPTY_KNOWLEDGE_SELECTION, type KnowledgeApi, type MeetingKnowledgeSelection } from "../../api/knowledge";
+import { KnowledgeScopePicker } from "../knowledge-library/KnowledgeScopePicker";
+import { MeetingAttachments } from "./MeetingAttachments";
+import type { MaterialsApi, MaterialSet } from "../../api/materials";
+import type { ProjectOutcomesApi } from "../../api/projectOutcomes";
+import { MeetingProjectBrief } from "../project-workspace/MeetingProjectBrief";
+import { PreparationBriefPanel } from "../project-workspace/PreparationBriefPanel";
+import type { MemoryApi, MemoryPreview } from "../../api/memory";
 import {
   AlertTriangle,
   AudioLines,
@@ -11,7 +19,7 @@ import {
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { fetchProviderStatus } from "../../api/client";
+import { fetchProviderStatus, fetchAsrRuntimeStatus, fetchMeetingCorrectionCapability, prepareLocalAsrRefiner } from "../../api/client";
 import { motionAwareScrollBehavior } from "../../app/motion";
 import {
   parseProviderStatus,
@@ -19,18 +27,34 @@ import {
   type DesktopProviderStatusLike,
   type RealtimeProviderCircuitStatus,
   type ProviderStatus,
+  type AsrRuntimeStatus,
+  type MeetingCorrectionCapability,
+  asrPreparationBlocker,
 } from "../../api/schema";
 import { resolveTauriInvoke } from "../../desktop/tauri";
 import { dualTrackStatus, isDualTrackCapabilityAvailable } from "../../desktop/dualTrackAdapter";
 import type { NativeCaptureHealthFields } from "../../desktop/nativeCaptureHealth";
-import type { MeetingInputSource, MeetingPreparationInput } from "../../domain/events";
+import type { LiveAnalysisProfile, MeetingCorrectionMode, MeetingInputSource, MeetingPreparationInput } from "../../domain/events";
 import { useModalDialog } from "../../components/useModalDialog";
 
 interface MeetingPreflightDialogProps {
+  materialsApi?: MaterialsApi;
+  materialSet?: MaterialSet | null;
+  onMaterialSetChange?(set: MaterialSet | null): void;
+  memoryApi?: MemoryApi;
+  projectApi?: ProjectOutcomesApi;
   open: boolean;
   busy: boolean;
+  initialLiveAnalysisProfile?: LiveAnalysisProfile;
+  initialCorrectionMode?: MeetingCorrectionMode;
+  liveAnalysisProfileLoading?: boolean;
+  liveAnalysisProfileReadKey?: number;
+  liveAnalysisProfileError?: string;
+  liveAnalysisProfileLocked?: boolean;
+  onRetryLiveAnalysisProfile?(): void;
   onCancel(): void;
-  onStart(preparation: MeetingPreparationInput): Promise<void>;
+  knowledgeApi?: KnowledgeApi;
+  onStart(preparation: MeetingPreparationInput, knowledgeSelection?: MeetingKnowledgeSelection): Promise<void>;
 }
 
 interface StoragePreflight {
@@ -136,6 +160,20 @@ const MICROPHONE_AUDIO_CONTEXT_CLOSE_TIMEOUT_MS = 500;
 const PREFLIGHT_REQUEST_TIMEOUT_MS = 8_000;
 const NATIVE_CAPTURE_REQUEST_TIMEOUT_MS = 5_000;
 const AUDIBLE_RMS_THRESHOLD = 0.002;
+
+const CORRECTION_MODE_LABELS: Record<MeetingCorrectionMode, string> = {
+  local_and_llm: "本地精修＋大模型校对", llm_only: "仅大模型校对",
+};
+function correctionFallbackReason(reason: string | null): string {
+  if (reason === "asr_capacity_unavailable" || reason === "asr_resource_guard_triggered" || reason === "worker_out_of_memory") return "可用内存未达到本地精修要求";
+  if (reason === "asr_resource_probe_failed") return "暂时无法确认本机可用内存";
+  if (reason === "asr_cold_start_busy") return "另一个本地识别模型正在加载";
+  if (reason?.includes("policy") || reason?.includes("disabled")) return "当前服务未启用本地精修";
+  return "本地精修组件暂不可用";
+}
+function memoryAmount(bytes: number | null): string {
+  return bytes === null ? "未取得数值" : `${(bytes / 1024 ** 3).toFixed(2)} GiB`;
+}
 
 type MeetingPresetId = NonNullable<MeetingPreparationInput["presetId"]>;
 type MeetingOutputFormat = NonNullable<MeetingPreparationInput["outputFormat"]>;
@@ -450,14 +488,34 @@ function windowsAudioDevices(response: WindowsAudioDeviceResponse | null): Selec
 }
 
 export function MeetingPreflightDialog({
+  materialsApi, materialSet, onMaterialSetChange,
+  memoryApi,
+  projectApi,
+  knowledgeApi,
   open,
   busy,
+  initialLiveAnalysisProfile = "participation",
+  initialCorrectionMode = "local_and_llm",
+  liveAnalysisProfileLoading = false,
+  liveAnalysisProfileReadKey = 0,
+  liveAnalysisProfileError = "",
+  liveAnalysisProfileLocked = false,
+  onRetryLiveAnalysisProfile,
   onCancel,
   onStart,
 }: MeetingPreflightDialogProps) {
+  const [knowledgeSelection, setKnowledgeSelection] = useState<MeetingKnowledgeSelection>(EMPTY_KNOWLEDGE_SELECTION);
   const [storage, setStorage] = useState<StoragePreflight | null>(null);
   const [providers, setProviders] = useState<ProviderHealth | null>(null);
   const [providerStatus, setProviderStatus] = useState<ProviderStatus | null>(null);
+  const [asrRuntime, setAsrRuntime] = useState<AsrRuntimeStatus | null>(null);
+  const [correctionMode, setCorrectionMode] = useState<MeetingCorrectionMode>(initialCorrectionMode);
+  const [correctionCapability, setCorrectionCapability] = useState<MeetingCorrectionCapability | null>(null);
+  const [correctionChecking, setCorrectionChecking] = useState(false);
+  const [asrPreparing, setAsrPreparing] = useState(false);
+  const [asrChecking, setAsrChecking] = useState(false);
+  const [asrPreparationError, setAsrPreparationError] = useState<string | null>(null);
+  const asrObservation = useRef<{ generation: number; controller: AbortController | null }>({ generation: 0, controller: null });
   const [devices, setDevices] = useState<SelectableAudioDevice[]>([]);
   const [deviceId, setDeviceId] = useState("");
   const [systemAudioDevices, setSystemAudioDevices] = useState<SelectableAudioDevice[]>([]);
@@ -468,11 +526,17 @@ export function MeetingPreflightDialog({
   const [hotwordsText, setHotwordsText] = useState("");
   const [title, setTitle] = useState("");
   const [presetId, setPresetId] = useState<MeetingPresetId>("general");
+  const [liveAnalysisProfile, setLiveAnalysisProfile] = useState<LiveAnalysisProfile>(initialLiveAnalysisProfile);
   const [meetingGoal, setMeetingGoal] = useState("");
   const [participantRole, setParticipantRole] = useState("");
   const [focusPointsText, setFocusPointsText] = useState("");
   const [outputFormat, setOutputFormat] = useState<MeetingOutputFormat>("standard");
   const [suggestionPolicy, setSuggestionPolicy] = useState<SuggestionPolicy>("low_frequency");
+  const [policyTouched, setPolicyTouched] = useState(false);
+  const [memoryPreview, setMemoryPreview] = useState<MemoryPreview | null>(null);
+  const [memoryPreviewError, setMemoryPreviewError] = useState<string | null>(null);
+  const [memoryPreviewLoading, setMemoryPreviewLoading] = useState(false);
+  const [materialRecoveryPending, setMaterialRecoveryPending] = useState(false);
   const [noticeAcknowledged, setNoticeAcknowledged] = useState(false);
   const [inputCheck, setInputCheck] = useState<InputCheck>("idle");
   const [browserInputCheckStage, setBrowserInputCheckStage] = useState<BrowserInputCheckStage>("idle");
@@ -489,6 +553,32 @@ export function MeetingPreflightDialog({
     controller: null,
   });
   const nativeDesktop = Boolean(resolveTauriInvoke());
+  useEffect(() => { if (open) setPolicyTouched(false); }, [open]);
+  useEffect(() => {
+    if (open && !liveAnalysisProfileLoading && !liveAnalysisProfileError) setLiveAnalysisProfile(initialLiveAnalysisProfile);
+  }, [initialLiveAnalysisProfile, liveAnalysisProfileError, liveAnalysisProfileLoading, liveAnalysisProfileReadKey, open]);
+  useEffect(() => {
+    if (open && !liveAnalysisProfileLoading && !liveAnalysisProfileError) setCorrectionMode(initialCorrectionMode);
+  }, [initialCorrectionMode, liveAnalysisProfileError, liveAnalysisProfileLoading, liveAnalysisProfileReadKey, open]);
+  useEffect(() => {
+    if (!open || liveAnalysisProfileLoading || liveAnalysisProfileError) return;
+    const controller = new AbortController();
+    setCorrectionCapability(null);
+    setCorrectionChecking(true);
+    void fetchMeetingCorrectionCapability(correctionMode, controller.signal).then((actual) => {
+      if (!controller.signal.aborted) setCorrectionCapability(actual?.requestedMode === correctionMode ? actual : null);
+    }).finally(() => { if (!controller.signal.aborted) setCorrectionChecking(false); });
+    return () => controller.abort();
+  }, [correctionMode, liveAnalysisProfileError, liveAnalysisProfileLoading, open]);
+  useEffect(() => {
+    if (!open || !memoryApi || policyTouched) { setMemoryPreviewLoading(false); return; }
+    const controller = new AbortController(); setMemoryPreview(null); setMemoryPreviewError(null); setMemoryPreviewLoading(true);
+    void operationWithTimeout(() => memoryApi.preview(knowledgeSelection.projectId, presetId, controller.signal), 6_000, () => new Error("默认偏好读取超时，可手动选择本场设置。")).then((preview) => {
+      if (controller.signal.aborted) return;
+      setMemoryPreview(preview); setSuggestionPolicy(preview.preferences.suggestion_policy ?? "low_frequency");
+    }).catch((e) => { if (!controller.signal.aborted) setMemoryPreviewError(e instanceof Error ? e.message : "默认偏好读取失败，可手动选择本场设置。"); }).finally(() => { if (!controller.signal.aborted) setMemoryPreviewLoading(false); });
+    return () => controller.abort();
+  }, [knowledgeSelection.projectId, memoryApi, open, policyTouched, presetId]);
 
   const cancelInputCheck = useCallback(() => {
     inputCheckRuntimeRef.current.generation += 1;
@@ -497,13 +587,16 @@ export function MeetingPreflightDialog({
   }, []);
   const closeDialog = useCallback(() => {
     cancelInputCheck();
+    asrObservation.current.generation += 1;
+    asrObservation.current.controller?.abort();
+    asrObservation.current.controller = null;
     onCancel();
   }, [cancelInputCheck, onCancel]);
   const dialogRef = useModalDialog(open, closeDialog, busy);
 
   const refreshPreflight = useCallback(async (isCancelled: () => boolean = () => false) => {
     const invoke = resolveTauriInvoke();
-    const [storageResult, providerResult, runtimeStatus, desktopStatus, deviceResult, dualTrackResult] = await Promise.all([
+    const [storageResult, providerResult, runtimeStatus, desktopStatus, deviceResult, dualTrackResult, asrResult] = await Promise.all([
       operationWithTimeout(
         () => fetch("/v2/storage/preflight").then((response) => responseJson<StoragePreflight>(response)),
         PREFLIGHT_REQUEST_TIMEOUT_MS,
@@ -566,10 +659,12 @@ export function MeetingPreflightDialog({
           () => new Error("双轨能力检查超时"),
         ).catch(() => null)
         : Promise.resolve(null),
+      fetchAsrRuntimeStatus(),
     ]);
     if (isCancelled()) return null;
     setStorage(storageResult);
     setProviders(providerResult);
+    setAsrRuntime(asrResult);
     const status = reconcileProviderStatus(
       desktopStatus,
       runtimeStatus ?? providerStatusFromHealth(providerResult),
@@ -590,6 +685,7 @@ export function MeetingPreflightDialog({
 
   useEffect(() => {
     if (!open) return;
+    const observation = asrObservation.current;
     let cancelled = false;
     setLoading(true);
     setError(null);
@@ -600,6 +696,10 @@ export function MeetingPreflightDialog({
     setInputCheck("idle");
     setBrowserInputCheckStage("idle");
     setProviderStatus(null);
+    setAsrRuntime(null);
+    setAsrPreparing(false);
+    setAsrChecking(false);
+    setAsrPreparationError(null);
     setInputLevel(0);
     setInputRms(0);
     setInputLevelAvailable(false);
@@ -615,8 +715,47 @@ export function MeetingPreflightDialog({
     return () => {
       cancelled = true;
       cancelInputCheck();
+      observation.generation += 1;
+      observation.controller?.abort();
+      observation.controller = null;
     };
   }, [cancelInputCheck, open, refreshPreflight]);
+
+  const observeAsr = async (prepare: boolean) => {
+    if (busy || asrObservation.current.controller) return;
+    const generation = ++asrObservation.current.generation;
+    const controller = new AbortController();
+    asrObservation.current.controller = controller;
+    setAsrPreparing(prepare);
+    setAsrChecking(!prepare);
+    if (prepare) setAsrPreparationError(null);
+    try {
+      let prepareError: string | null = null;
+      if (prepare) {
+        try { await prepareLocalAsrRefiner(controller.signal); }
+        catch (error) { prepareError = error instanceof Error ? error.message : "离线识别准备失败，请重新检查识别状态。"; }
+      }
+      if (controller.signal.aborted) return;
+      const [actual, capability] = await Promise.all([
+        fetchAsrRuntimeStatus(controller.signal), fetchMeetingCorrectionCapability(correctionMode, controller.signal),
+      ]);
+      if (!controller.signal.aborted && generation === asrObservation.current.generation) {
+        setAsrRuntime(actual);
+        setCorrectionCapability(capability?.requestedMode === correctionMode ? capability : null);
+        setAsrPreparationError(prepareError);
+      }
+    } catch (error) {
+      if (!controller.signal.aborted && generation === asrObservation.current.generation) {
+        setAsrPreparationError(error instanceof Error ? error.message : "离线识别准备失败，请重新准备。");
+      }
+    } finally {
+      if (generation === asrObservation.current.generation) {
+        asrObservation.current.controller = null;
+        setAsrPreparing(false);
+        setAsrChecking(false);
+      }
+    }
+  };
 
   const selectedDevice = useMemo(
     () => devices.find((device) => device.deviceId === deviceId) ?? null,
@@ -862,13 +1001,13 @@ export function MeetingPreflightDialog({
   };
 
   const submit = async () => {
-    if (!noticeAcknowledged || storage?.allowed !== true || !localAsrReady || !sourceReady || busy) return;
+    if (!noticeAcknowledged || storage?.allowed !== true || !localAsrReady || !sourceReady || busy || asrPreparing || asrChecking || correctionChecking || !correctionCapability || asrPreparationBlocker(asrRuntime, correctionCapability) || memoryPreviewLoading || materialRecoveryPending || liveAnalysisProfileLoading || liveAnalysisProfileError) return;
     cancelInputCheck();
     setInputCheck("idle");
     setBrowserInputCheckStage("idle");
     setError(null);
     try {
-      await onStart({
+      const preparation: MeetingPreparationInput = {
         ...(title.trim() ? { title: title.trim() } : {}),
         hotwords: parseHotwords(hotwordsText),
         inputSource,
@@ -880,13 +1019,17 @@ export function MeetingPreflightDialog({
           : inputSource === "system_audio" ? selectedSystemAudioDevice?.label || "系统音频"
           : selectedDevice?.label || (nativeDesktop ? "系统默认麦克风" : null),
         noticeAcknowledged: true,
+        liveAnalysisProfile,
+        correctionMode,
         ...(presetId !== "general" ? { presetId } : {}),
         ...(meetingGoal.trim() ? { meetingGoal: meetingGoal.trim() } : {}),
         ...(participantRole.trim() ? { participantRole: participantRole.trim() } : {}),
         ...(focusPointsText.trim() ? { focusPoints: parseFocusPoints(focusPointsText) } : {}),
         ...(outputFormat !== "standard" ? { outputFormat } : {}),
         ...(suggestionPolicy !== "low_frequency" ? { proactiveSuggestionPolicy: suggestionPolicy } : {}),
-      });
+      };
+      if (knowledgeApi) await onStart(preparation, knowledgeSelection);
+      else await onStart(preparation);
     } catch (startError) {
       setError(startError instanceof Error ? startError.message : "声音采集启动失败");
     }
@@ -922,9 +1065,17 @@ export function MeetingPreflightDialog({
     && (inputSource !== "system_audio" || systemAudioCheck === "available")
     && (inputSource !== "dual_track" || dualTrackAvailable);
   const startBlockers = [
+    ...(liveAnalysisProfileLoading ? [{ id: "preflight-live-analysis-profile", label: "等待本场帮助方式读取" }] : []),
+    ...(liveAnalysisProfileError ? [{ id: "preflight-live-analysis-profile", label: "重新读取本场帮助方式" }] : []),
+    ...(materialRecoveryPending ? [{ id: "preflight-runtime-status", label: "等待会前资料恢复" }] : []),
+    ...(memoryPreviewLoading ? [{ id: "preflight-runtime-status", label: "等待默认偏好读取，或手动设置主动建议" }] : []),
     ...(loading ? [{ id: "preflight-runtime-status", label: "等待本地服务检查" }] : []),
     ...(storage?.allowed !== true && !loading ? [{ id: "preflight-runtime-status", label: "确认本地存储可写" }] : []),
     ...(!localAsrReady && !loading ? [{ id: "preflight-runtime-status", label: "恢复本地实时识别" }] : []),
+    ...(asrPreparing || asrChecking ? [{ id: "preflight-asr-preparation", label: "等待识别准备检查" }] : []),
+    ...(correctionChecking ? [{ id: "preflight-asr-preparation", label: "等待校对模式和资源检查" }] : []),
+    ...(!correctionChecking && !correctionCapability && !loading ? [{ id: "preflight-asr-preparation", label: "重新检查校对模式和资源" }] : []),
+    ...(asrPreparationBlocker(asrRuntime, correctionCapability) ? [{ id: "preflight-asr-preparation", label: "核对本地识别准备" }] : []),
     ...(!microphoneReady ? [{
       id: "preflight-microphone",
       label: inputCheck === "permission_denied"
@@ -984,6 +1135,51 @@ export function MeetingPreflightDialog({
               </div>
             </div>
           )}
+
+          {!loading && <div id="preflight-asr-preparation" tabIndex={-1} className="preflight-system-audio-summary" aria-label="识别准备">
+            <Mic size={18} />
+            <div className="preflight-field-group">
+            <strong>本场文字校对</strong>
+            <div className="preflight-source-segmented preflight-correction-modes" role="radiogroup" aria-label="本场文字校对模式">
+              {(["local_and_llm", "llm_only"] as const).map((mode) => <button key={mode} type="button" role="radio" aria-checked={correctionMode === mode} className={correctionMode === mode ? "is-selected" : ""} disabled={busy || asrPreparing || asrChecking || liveAnalysisProfileLoading || liveAnalysisProfileLocked} onClick={() => { setAsrPreparationError(null); setCorrectionMode(mode); }}>{CORRECTION_MODE_LABELS[mode]}</button>)}
+            </div>
+            {liveAnalysisProfileLocked && <small>本场已有录音或会议文字，沿用已保存的校对模式。</small>}
+            {correctionChecking ? <p role="status">正在检查校对模式和本机资源…</p>
+              : !correctionCapability ? <p role="alert">未取得校对模式和资源检查结果，请重新检查识别状态。</p>
+              : <div className="preflight-correction-result">
+                <p><strong>{correctionCapability.effectiveMode === "local_and_llm" && !correctionCapability.localRefinement.available ? "当前选择：" : "本场将使用："}{CORRECTION_MODE_LABELS[correctionCapability.effectiveMode]}</strong></p>
+                {correctionCapability.requestedMode !== correctionCapability.effectiveMode && <p>{correctionFallbackReason(correctionCapability.fallbackReason)}；本场跳过本地精修，在线转写照常保存。</p>}
+                {correctionCapability.effectiveMode === "local_and_llm" && !correctionCapability.localRefinement.available && <p role="alert">{correctionFallbackReason(correctionCapability.localRefinement.reason)}；请重新检查，或选择仅大模型校对。</p>}
+                {correctionCapability.effectiveMode === "local_and_llm" && correctionCapability.localRefinement.recoveryRequired && <p>上次本地精修准备未完成，请点击重新准备。</p>}
+                {correctionMode === "llm_only" && <p>保留本地在线转写，不加载离线精修模型。</p>}
+                <p>{!correctionCapability.llmCorrection.enabled ? correctionCapability.effectiveMode === "llm_only" ? "大模型校对已关闭：本场仅保存在线识别原文。" : "大模型校对已关闭：保留本地识别文字，不进行大模型校对。"
+                  : !correctionCapability.llmCorrection.configured ? correctionCapability.effectiveMode === "llm_only" ? "大模型校对缺少配置：本场仅保存在线识别原文。请在设置中配置校对模型。" : "大模型校对缺少配置：可使用本地识别，不会自动进行大模型校对。请在设置中配置校对模型。"
+                  : `大模型校对已启用${providerStatus?.correction_model ? ` · ${providerStatus.correction_model}` : ""}：原文先保存，再在后台校对。`}</p>
+                <div className="preflight-memory-readout" aria-label="本机内存与本地精修门槛">
+                  <p>可用提交内存 {memoryAmount(correctionCapability.memory.commitAvailableBytes)} / 离线精修门槛 {memoryAmount(correctionCapability.memory.requiredCommitBytes)}</p>
+                  <p>可用物理内存 {memoryAmount(correctionCapability.memory.physicalAvailableBytes)} / 离线精修门槛 {memoryAmount(correctionCapability.memory.requiredPhysicalBytes)}{correctionCapability.memory.totalPhysicalBytes !== null ? `（总内存 ${memoryAmount(correctionCapability.memory.totalPhysicalBytes)}）` : ""}</p>
+                  {!correctionCapability.memory.checked && <small>{correctionMode === "llm_only" ? "此模式不依赖离线精修内存检查。" : "资源检查未完成，请重新检查，或选择仅大模型校对。"}</small>}
+                  <small>这里是离线精修的保守启动余量，不是最低机器总内存。提交额度与空闲物理内存不同；开始时会复查，资源不足时改用仅大模型校对。</small>
+                </div>
+              </div>}
+            {asrPreparing || asrChecking ? <p>正在核对识别准备状态…</p>
+              : !asrRuntime || asrRuntime.residentEnabled === null ? <p>识别准备状态未知；将沿用当前识别方式。</p>
+              : asrRuntime.residentEnabled === false ? <p>当前识别方式无需提前准备</p>
+              : <>
+                <p>{asrRuntime.onlineReady === true ? "实时识别进程已就绪" : asrRuntime.onlineReady === false ? "实时识别进程尚未就绪" : "实时识别进程准备状态未知"}</p>
+                {correctionCapability?.effectiveMode !== "llm_only" && <p>{asrRuntime.offlinePolicy === "online_only" ? "离线精修未启用"
+                  : asrRuntime.offlinePolicy === "on_demand" ? "离线精修将在首个正式段按需加载"
+                  : asrRuntime.offlinePolicy === "prewarm" ? asrRuntime.offlineReady === true ? "离线精修进程已就绪" : asrRuntime.offlineReady === false ? "离线精修进程尚未就绪" : "离线精修进程准备状态未知"
+                  : "离线精修方式待确认"}</p>}
+              </>}
+            <p>此操作只准备本地识别，不会启动录音。</p>
+            {correctionCapability?.effectiveMode === "local_and_llm" && correctionCapability.localRefinement.available && asrRuntime?.residentEnabled === true && asrRuntime.offlinePolicy === "prewarm" && <button type="button" className="button secondary-button" disabled={busy || asrPreparing || asrChecking || correctionChecking} onClick={() => void observeAsr(true)}>
+              {asrPreparing ? "正在准备离线识别…" : asrPreparationError || correctionCapability.localRefinement.recoveryRequired ? "重新准备" : "准备离线识别"}
+            </button>}
+            <button type="button" className="button secondary-button" disabled={busy || asrPreparing || asrChecking || correctionChecking} onClick={() => void observeAsr(false)}>{asrChecking ? "正在检查识别状态…" : "重新检查识别状态"}</button>
+            {asrPreparationError && <p role="alert">{asrPreparationError}</p>}
+            </div>
+          </div>}
 
           {nativeDesktop && !loading && !llmReady ? (
             <button
@@ -1082,7 +1278,7 @@ export function MeetingPreflightDialog({
                   {nativeDesktop
                     ? "正在读取麦克风输入，请对着所选设备说一句话。"
                     : browserInputCheckStage === "permission"
-                      ? "等待麦克风权限：请在浏览器提示或地址栏左侧的麦克风图标中选择“允许”。没有弹窗时，请检查浏览器和 macOS 的麦克风权限。8 秒内未返回会自动结束，可直接重试。"
+                      ? "等待麦克风权限：请在浏览器提示或地址栏左侧的麦克风图标中选择“允许”。没有弹窗时，请检查浏览器和系统的麦克风权限。8 秒内未返回会自动结束，可直接重试。"
                       : "麦克风权限已通过，正在采样输入音量，请对着麦克风说一句话。"}
                 </p>
               ) : null}
@@ -1154,6 +1350,24 @@ export function MeetingPreflightDialog({
             <span>我已告知参会者并确认可以录音</span>
           </label>
 
+          <section id="preflight-live-analysis-profile" tabIndex={-1} className="preflight-source-field" aria-label="本场主要帮助设置">
+            <span className="preflight-source-label">本场主要帮助 <small>可选，已提供默认方式</small></span>
+            <div className="preflight-source-segmented" role="radiogroup" aria-label="本场主要帮助">
+              <button className={liveAnalysisProfile === "participation" ? "is-selected" : ""} type="button" role="radio" aria-checked={liveAnalysisProfile === "participation"} disabled={busy || liveAnalysisProfileLoading || Boolean(liveAnalysisProfileError) || liveAnalysisProfileLocked} onClick={() => setLiveAnalysisProfile("participation")}>帮助我参与讨论</button>
+              <button className={liveAnalysisProfile === "legacy" ? "is-selected" : ""} type="button" role="radio" aria-checked={liveAnalysisProfile === "legacy"} disabled={busy || liveAnalysisProfileLoading || Boolean(liveAnalysisProfileError) || liveAnalysisProfileLocked} onClick={() => setLiveAnalysisProfile("legacy")}>优先回答听到的问题</button>
+            </div>
+            <small>{liveAnalysisProfile === "participation" ? "围绕当前讨论提供追问、方案比较和可说出口的回应。无需先填写主题或上传资料。" : "优先回答会议中听到的问题。仍可用主动贡献入口提出追问、比较方案或组织回应。"}</small>
+            {liveAnalysisProfileLoading ? <p role="status">正在读取已有会议的帮助方式，读取后才可继续录音。</p> : null}
+            {liveAnalysisProfileError ? <div><p className="inline-error" role="alert">{liveAnalysisProfileError}</p>{onRetryLiveAnalysisProfile ? <button className="secondary-button" type="button" disabled={busy} onClick={onRetryLiveAnalysisProfile}>重新读取本场帮助方式</button> : null}</div> : null}
+            {liveAnalysisProfileLocked ? <small>继续录音会沿用本场已保存的方式；已有录音或文字后不能切换，其他会前设置仍可调整。</small> : null}
+          </section>
+
+          {materialsApi ? <MeetingAttachments api={materialsApi} meetingId={materialSet?.meeting_id ?? null} materialSet={materialSet} onSetChange={onMaterialSetChange} onRecoveryPending={setMaterialRecoveryPending} /> : null}
+          <details className="preflight-optional-settings"><summary>项目资料与会前准备（可选）</summary>
+          {knowledgeApi ? <KnowledgeScopePicker api={knowledgeApi} value={knowledgeSelection} onChange={setKnowledgeSelection} disabled={busy} /> : null}
+          {knowledgeApi && projectApi ? <MeetingProjectBrief api={projectApi} selection={knowledgeSelection} open={open} /> : null}
+          {knowledgeApi && projectApi?.preparation ? <PreparationBriefPanel api={projectApi.preparation} projectApi={projectApi} input={{ selection: knowledgeSelection, goal: meetingGoal, role: participantRole, focus: parseFocusPoints(focusPointsText).slice(0, 8), scene: presetId }} open={open} /> : null}
+          </details>
           <details className="preflight-optional-settings">
             <summary>
               <span>会议与教练设置</span>
@@ -1235,11 +1449,13 @@ export function MeetingPreflightDialog({
                 </label>
                 <label>
                   <span>主动建议</span>
-                  <select value={suggestionPolicy} onChange={(event) => setSuggestionPolicy(event.target.value as SuggestionPolicy)} disabled={busy}>
+                  <select value={suggestionPolicy} onChange={(event) => { setPolicyTouched(true); setSuggestionPolicy(event.target.value as SuggestionPolicy); }} disabled={busy}>
                     <option value="low_frequency">低频高信号</option>
                     <option value="standard">标准频率</option>
                     <option value="off">关闭</option>
                   </select>
+                  {memoryApi ? <small>{policyTouched ? "本场已手动设置，切换项目或技能包会保留这个选择。" : memoryPreview?.sources.length ? `已读取${memoryPreview.sources.some((x) => x.scope === "project") ? "项目" : "全局"}已确认偏好，本场可直接调整。` : "当前采用本场默认设置。"}</small> : null}
+                  {memoryPreviewError ? <small role="status">默认偏好未加载：{memoryPreviewError} 可以手动选择后开始。</small> : null}
                 </label>
               </div>
 

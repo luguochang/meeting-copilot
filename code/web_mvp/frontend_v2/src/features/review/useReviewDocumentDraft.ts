@@ -125,18 +125,19 @@ export function useReviewDocumentDraft<T>({
   }, [document?.revision, document?.source, document?.updatedAtMs, serverValueJson]);
 
   const setDraft = useCallback((value: T | ((current: T) => T)) => {
-    setDraftState((current) => {
-      const next = typeof value === "function" ? (value as (current: T) => T)(current) : value;
-      draftRef.current = next;
-      try {
-        window.localStorage.setItem(key, JSON.stringify({ baseRevision: revisionRef.current, value: next }));
-      } catch {
-        // In-memory editing remains available when local storage is unavailable.
-      }
-      return next;
-    });
-    setSaveState("unsaved");
-    saveStateRef.current = "unsaved";
+    const next = typeof value === "function" ? (value as (current: T) => T)(draftRef.current) : value;
+    draftRef.current = next;
+    setDraftState(next);
+    try {
+      window.localStorage.setItem(key, JSON.stringify({ baseRevision: revisionRef.current, value: next }));
+    } catch {
+      // In-memory editing remains available when local storage is unavailable.
+    }
+    // Keep the pending request exclusive even if the user keeps typing.
+    if (saveStateRef.current !== "saving") {
+      setSaveState("unsaved");
+      saveStateRef.current = "unsaved";
+    }
     setError(null);
   }, [key]);
 
@@ -147,25 +148,33 @@ export function useReviewDocumentDraft<T>({
     setSaveState("saving");
     saveStateRef.current = "saving";
     setError(null);
+    const submittedContent = toContent(draftRef.current);
+    const submittedJson = JSON.stringify(submittedContent);
     try {
-      const saved = await onSave(revisionRef.current, toContent(draftRef.current));
+      const saved = await onSave(revisionRef.current, submittedContent);
       if (requestGenerationRef.current !== generation) return false;
       setRevision(saved.revision);
       revisionRef.current = saved.revision;
       setSavedAtMs(saved.updatedAtMs || Date.now());
-      setSaveState("saved");
-      saveStateRef.current = "saved";
-      setRecoveredLocalDraft(false);
       if (saved.source === "user_final") {
         setUserFinalProtected(true);
         userFinalProtectedRef.current = true;
       }
+      const changedWhileSaving = JSON.stringify(toContent(draftRef.current)) !== submittedJson;
+      const nextSaveState = changedWhileSaving ? "unsaved" : "saved";
+      setSaveState(nextSaveState);
+      saveStateRef.current = nextSaveState;
+      if (!changedWhileSaving) setRecoveredLocalDraft(false);
       try {
-        window.localStorage.removeItem(key);
+        if (changedWhileSaving) {
+          window.localStorage.setItem(key, JSON.stringify({ baseRevision: saved.revision, value: draftRef.current }));
+        } else {
+          window.localStorage.removeItem(key);
+        }
       } catch {
         // The server save succeeded even if local storage is unavailable.
       }
-      return true;
+      return !changedWhileSaving;
     } catch (saveError) {
       if (requestGenerationRef.current !== generation) return false;
       const currentRevision = conflictRevision(saveError);

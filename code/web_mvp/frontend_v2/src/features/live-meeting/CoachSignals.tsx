@@ -1,3 +1,9 @@
+import { coachLifecycleView } from "./coachLifecycle";
+import { SourceEvidenceList } from "../knowledge-library/SourceEvidenceList";
+import { ContributionBasis } from "./ContributionBasis";
+import { PiSupplement } from "./PiSupplement";
+import { piRevisionIdentity } from "./answerThreads";
+import { useContributionReading } from "./useContributionReading";
 import { Bookmark, Check, ChevronDown, ChevronUp, CircleHelp, Copy, EyeOff, Flag, History, MessageCircleQuestion, MoreHorizontal, Quote, TimerOff } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { useDismissablePopover } from "../../components/useDismissablePopover";
@@ -90,59 +96,6 @@ function renderJobId(
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
-interface CoachLifecycleView {
-  state: "not_triggered" | "protected_silent" | "timed_out" | "failed" | "stale" | "expired";
-  label: string;
-  detail: string;
-}
-
-function coachLifecycleView(
-  followUp: Pick<FollowUpProjection, "validUntil" | "status" | "decisionReason" | "lifecycleAction">,
-  nowMs: number,
-): CoachLifecycleView | null {
-  if (followUp.lifecycleAction === "retract") {
-    return {
-      state: "stale",
-      label: "建议已撤回",
-      detail: followUp.decisionReason ?? "新证据已使上一条建议失效。",
-    };
-  }
-  if (followUp.lifecycleAction === "deprioritize") {
-    return {
-      state: "stale",
-      label: "建议已替换",
-      detail: followUp.decisionReason ?? "这条建议已不再是当前最高优先级。",
-    };
-  }
-  if (followUp.validUntil !== undefined && followUp.validUntil <= nowMs) {
-    return {
-      state: "expired",
-      label: "建议已过期",
-      detail: followUp.decisionReason ?? "这条建议已超过当前对话的有效时间。",
-    };
-  }
-  if (!followUp.status || followUp.status === "intervention") return null;
-  const labels = {
-    not_triggered: "本轮未触发",
-    protected_silent: "本轮保持静默",
-    timed_out: "本轮已超时",
-    failed: "本轮分析失败",
-    stale: "建议已撤回",
-  } as const;
-  const details = {
-    not_triggered: "当前输入未达到实时教练的介入门槛。",
-    protected_silent: "当前没有高置信度且可立即执行的建议。",
-    timed_out: "本轮超出实时响应预算，迟到结果不会显示。",
-    failed: "本轮未能形成可靠建议，已保持静默。",
-    stale: "新证据已使这轮判断失效。",
-  } as const;
-  return {
-    state: followUp.status,
-    label: labels[followUp.status],
-    detail: followUp.decisionReason ?? details[followUp.status],
-  };
-}
-
 function coachHistoryState(item: CoachHistoryEntry, nowMs: number): string | null {
   if (item.lifecycleStatus === "resolved") return "已解决";
   if (item.lifecycleStatus === "retracted") return "已撤回";
@@ -187,22 +140,23 @@ function coachHistoryTime(createdAtMs: number): string {
   }).format(new Date(createdAtMs));
 }
 
-export function CoachSignals({ historyOnly = false, followUp, semanticFollowUp: semanticFollowUpProp = null, coachDecision = null, coachHistory = [], coachRuntime, activeCoachSkillId = "general", suggestions, onEvidence, onFeedback, onMessage }: NowRailProps) {
+function DiscussionBasisTime({ frozenAtMs }: { frozenAtMs?: number }) {
+  if (frozenAtMs === undefined || !Number.isFinite(frozenAtMs) || frozenAtMs < 0) return null;
+  const date = new Date(frozenAtMs);
+  if (Number.isNaN(date.getTime())) return null;
+  const time = new Intl.DateTimeFormat("zh-CN", {
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23",
+  }).format(date);
+  return <small className="follow-up-validity" title="本条建议只包含生成前已收到的讨论内容。">
+    基于截至 <time dateTime={date.toISOString()}>{time}</time> 的讨论
+  </small>;
+}
+
+export function CoachSignals({ viewStateKey, historyOnly = false, suppressActivityStatus = false, suppressEmptyExpectation = false, followUp, semanticFollowUp: semanticFollowUpProp = null, coachDecision = null, coachHistory = [], coachRuntime, knowledgeApi, sourceMeetingId, onKnowledgeSource, activeCoachSkillId = "general", suggestions, onEvidence, onFeedback, onMessage }: NowRailProps & { suppressActivityStatus?: boolean; suppressEmptyExpectation?: boolean }) {
   const [, refreshCoachExpiration] = useState(0);
   const nowMs = Date.now();
   const coachDecisionValidUntil = coachDecision?.validUntil;
   const followUpValidUntil = followUp?.validUntil;
-  useEffect(() => {
-    const validUntil = coachDecisionValidUntil ?? followUpValidUntil;
-    if (validUntil === undefined) return undefined;
-    const remainingMs = validUntil - Date.now();
-    if (remainingMs <= 0) return undefined;
-    const timer = window.setTimeout(
-      () => refreshCoachExpiration((current) => current + 1),
-      Math.min(remainingMs + 25, 2_147_483_647),
-    );
-    return () => window.clearTimeout(timer);
-  }, [coachDecisionValidUntil, followUpValidUntil]);
   const suggestion = useMemo(() => currentSuggestion(suggestions.filter((item) => item.kind !== "answer" && isFormalAi(item))), [suggestions]);
   const formalFollowUpCandidate = followUp && isTrustedCoachProjection(followUp) ? followUp : null;
   const coachLifecycle = coachDecision
@@ -227,8 +181,25 @@ export function CoachSignals({ historyOnly = false, followUp, semanticFollowUp: 
     ? formalSemanticFollowUpCandidate
     : null;
   const formalCoachHistory = coachHistory
-    .filter((item) => isTrustedCoachProjection(item) && isCoachInterventionProjection(item))
+    .filter((item) => {
+      // Retractions preserve an earlier real card for review; failed rounds
+      // without a published intervention are never promoted into history.
+      const original = item.status === "stale" ? { ...item, status: "intervention" as const } : item;
+      return isTrustedCoachProjection(original) && isCoachInterventionProjection(original);
+    })
     .sort((left, right) => left.createdAtMs - right.createdAtMs);
+  const reading = useContributionReading(historyOnly ? null : formalFollowUp, formalCoachHistory, coachDecision,
+    `${viewStateKey ?? sourceMeetingId ?? "current"}:${historyOnly ? "review" : "live"}`, nowMs);
+  const displayedFollowUp = historyOnly ? formalFollowUp : reading.selected;
+  const displayedValidUntil = displayedFollowUp?.validUntil;
+  useEffect(() => {
+    const deadlines = [coachDecisionValidUntil, followUpValidUntil, displayedValidUntil]
+      .filter((value): value is number => value !== undefined && value > Date.now());
+    if (!deadlines.length) return undefined;
+    const timer = window.setTimeout(() => refreshCoachExpiration((current) => current + 1),
+      Math.min(Math.min(...deadlines) - Date.now() + 25, 2_147_483_647));
+    return () => window.clearTimeout(timer);
+  }, [coachDecisionValidUntil, followUpValidUntil, displayedValidUntil]);
   const currentCoachHistoryId = formalFollowUp
     ? [...formalCoachHistory].reverse().find((item) =>
       formalFollowUp.decisionId && item.decisionId
@@ -237,6 +208,7 @@ export function CoachSignals({ historyOnly = false, followUp, semanticFollowUp: 
     : null;
   const pastCoachHistory = formalCoachHistory
     .filter((item) => item.historyId !== currentCoachHistoryId)
+    .filter((item) => !reading.held || !displayedFollowUp || piRevisionIdentity(item) !== piRevisionIdentity(displayedFollowUp))
     .filter((item) => !(
       item.promptProfile === "deep_answer" && Boolean(item.answerId)
     ))
@@ -288,13 +260,13 @@ export function CoachSignals({ historyOnly = false, followUp, semanticFollowUp: 
       <section className="rail-section suggestion-section" aria-labelledby="suggestion-title">
         <header className="rail-heading">
           <MessageCircleQuestion size={16} />
-          <h2 id="suggestion-title">{historyOnly ? "会中问答与 Pi 补充" : "AI 实时教练"}</h2>
+          <h2 id="suggestion-title">{historyOnly ? "会中独立建议" : "AI 实时教练"}</h2>
           {activeCoachSkillId ? (
             <span className="coach-skill-badge" title="本轮实时教练使用的场景技能包">
               {COACH_SKILL_LABELS[activeCoachSkillId]}
             </span>
           ) : null}
-          {coachRuntime ? (
+          {coachRuntime && !suppressActivityStatus ? (
             <span className="coach-runtime-badge" data-state={coachRuntime.state} title={coachRuntime.detail ?? coachRuntime.label}>
               <span aria-hidden="true" />{coachRuntime.label}
             </span>
@@ -304,59 +276,78 @@ export function CoachSignals({ historyOnly = false, followUp, semanticFollowUp: 
           ) : null}
         </header>
 
-        {coachRuntime?.detail && coachRuntime.state === "error" ? (
+        {coachRuntime?.detail && coachRuntime.state === "error" && !suppressActivityStatus ? (
           <p className="coach-runtime-detail" role="status">{coachRuntime.detail}</p>
         ) : null}
-        {formalFollowUp ? (
+        {displayedFollowUp ? (
           <div
-            className="follow-up-card"
-            data-testid="follow-up-card"
-            data-ui-render-card="coach"
-            data-ui-render-job-id={renderJobId(formalFollowUp, coachDecision)}
-            data-valid-until-ms={formalFollowUp.validUntil ?? undefined}
+            key={piRevisionIdentity(displayedFollowUp)}
+            className={`follow-up-card${reading.invalid ? " follow-up-card--historical" : ""}`}
+            data-testid={reading.invalid ? "historical-contribution-card" : "follow-up-card"}
+            data-ui-render-card={reading.invalid ? undefined : "coach"}
+            data-ui-render-job-id={reading.invalid ? undefined : renderJobId(displayedFollowUp,
+              !reading.held || displayedFollowUp.decisionId && displayedFollowUp.decisionId === coachDecision?.decisionId ? coachDecision : null)}
+            data-ui-render-meeting-id={reading.invalid || historyOnly ? undefined : sourceMeetingId}
+            data-ui-render-decision-id={reading.invalid || historyOnly ? undefined : displayedFollowUp.decisionId}
+            data-ui-render-event-seq={reading.invalid || historyOnly ? undefined : displayedFollowUp.uiRenderReceipt?.eventSeq}
+            data-ui-render-input-version={reading.invalid || historyOnly ? undefined : displayedFollowUp.uiRenderReceipt?.inputVersion}
+            data-valid-until-ms={reading.invalid ? undefined : displayedFollowUp.validUntil ?? undefined}
+            onMouseDownCapture={reading.hold}
+            onFocusCapture={reading.hold}
           >
+            {reading.held ? <div className="contribution-reading-notice" role="status">
+              <span>{reading.invalid ? "这条建议已失效，仅保留供核对。" : "正在阅读这条建议，正文保持不变。"}</span>
+              {reading.newAvailable ? <button type="button" className="coach-text-button" onClick={reading.release}>有新建议，查看最新</button> : null}
+            </div> : null}
             <div className="follow-up-heading">
               <div className="follow-up-title">
-                <strong>{coachLabel(formalFollowUp)}</strong>
-                <CoachOriginBadge origin={formalFollowUp.origin} />
+                <strong>{coachLabel(displayedFollowUp)}</strong>
+                <CoachOriginBadge origin={displayedFollowUp.origin} />
               </div>
               <span
                 className="follow-up-reason"
-                title={`为什么现在提示：${formalFollowUp.whyNow ?? formalFollowUp.reason}${formalFollowUp.evidenceQuote ? `；依据：${formalFollowUp.evidenceQuote}` : ""}`}
+                title={`为什么现在提示：${displayedFollowUp.whyNow ?? displayedFollowUp.reason}${displayedFollowUp.evidenceQuote ? `；依据：${displayedFollowUp.evidenceQuote}` : ""}`}
               >
                 <CircleHelp size={15} aria-hidden="true" />
-                <span className="sr-only">{formalFollowUp.whyNow ?? formalFollowUp.reason}</span>
+                <span className="sr-only">{displayedFollowUp.whyNow ?? displayedFollowUp.reason}</span>
               </span>
             </div>
-            <div className="follow-up-field">
-              <span className="follow-up-field-label">为什么现在</span>
-              <p className="follow-up-reason-text">{formalFollowUp.whyNow ?? formalFollowUp.reason}</p>
-            </div>
+            <DiscussionBasisTime frozenAtMs={displayedFollowUp.frozenAtMs} />
             <div className="follow-up-field follow-up-field--say-this">
-              <span className="follow-up-field-label">建议说</span>
-              <blockquote>{formalFollowUp.sayThis ?? formalFollowUp.question}</blockquote>
+              <span className="follow-up-field-label">可以这样说</span>
+              <blockquote data-ui-render-body="coach-recommendation">{displayedFollowUp.sayThis ?? displayedFollowUp.question}</blockquote>
             </div>
-            {formalFollowUp.evidenceQuote ? (
+            {displayedFollowUp.coachingPackage ? <details className="coach-evidence-details coach-analysis-details">
+              <summary>展开分析与方案</summary>
+              <PiSupplement value={displayedFollowUp} stale={reading.invalid} onEvidence={onEvidence} knowledgeApi={knowledgeApi} meetingId={sourceMeetingId ?? ""} onKnowledgeSource={onKnowledgeSource} />
+            </details> : null}
+            <ContributionBasis value={displayedFollowUp} />
+            <details className="coach-evidence-details follow-up-context-details">
+            <summary>为什么现在 · 依据原话</summary>
+            <p className="follow-up-reason-text">{displayedFollowUp.whyNow ?? displayedFollowUp.reason}</p>
+            {displayedFollowUp.evidenceQuote ? (
               <div className="follow-up-evidence" aria-label="依据原话">
                 <span className="follow-up-field-label"><Quote size={12} aria-hidden="true" />依据原话</span>
-                <p>{formalFollowUp.evidenceQuote}</p>
+                <p>{displayedFollowUp.evidenceQuote}</p>
               </div>
             ) : null}
+            {displayedFollowUp.sourceEvidence?.length ? <SourceEvidenceList evidence={displayedFollowUp.sourceEvidence} api={knowledgeApi} meetingId={sourceMeetingId ?? ""} onTranscript={onEvidence} onDocument={onKnowledgeSource} stale={reading.invalid || displayedFollowUp.status === "stale"} /> : null}
+            </details>
             <div className="suggestion-footer">
-              {formalFollowUp.evidenceSegmentIds[0] ? (
+              {displayedFollowUp.evidenceSegmentIds[0] ? (
                 <button
                   className="evidence-link"
                   type="button"
-                  onClick={() => onEvidence(formalFollowUp.evidenceSegmentIds[0])}
+                  onClick={() => onEvidence(displayedFollowUp.evidenceSegmentIds[0])}
                 >
                   <Quote size={13} />查看依据
                 </button>
               ) : <span className="evidence-link evidence-link--disabled">暂无可定位依据</span>}
               <div className="follow-up-footer-meta">
-                {coachValidityLabel(formalFollowUp.validUntil, nowMs) ? (
-                  <span className="follow-up-validity">{coachValidityLabel(formalFollowUp.validUntil, nowMs)}</span>
+                {!reading.invalid && coachValidityLabel(displayedFollowUp.validUntil, nowMs) ? (
+                  <span className="follow-up-validity">{coachValidityLabel(displayedFollowUp.validUntil, nowMs)}</span>
                 ) : null}
-                <span className="follow-up-urgency">{formalFollowUp.urgency === "high" ? "紧急" : formalFollowUp.urgency === "low" ? "低优先" : "适时确认"}</span>
+                <span className="follow-up-urgency">{reading.invalid ? "历史建议" : displayedFollowUp.urgency === "high" ? "紧急" : displayedFollowUp.urgency === "low" ? "低优先" : "适时确认"}</span>
               </div>
             </div>
           </div>
@@ -381,20 +372,20 @@ export function CoachSignals({ historyOnly = false, followUp, semanticFollowUp: 
                 <span className="sr-only">{semanticFollowUp.reason}</span>
               </span>
             </div>
-            <div className="follow-up-field">
-              <span className="follow-up-field-label">为什么现在</span>
-              <p className="follow-up-reason-text">{semanticFollowUp.whyNow ?? semanticFollowUp.reason}</p>
-            </div>
             <div className="follow-up-field follow-up-field--say-this">
-              <span className="follow-up-field-label">建议说</span>
+              <span className="follow-up-field-label">可以这样说</span>
               <blockquote>{semanticFollowUp.sayThis ?? semanticFollowUp.question}</blockquote>
             </div>
+            <details className="coach-evidence-details follow-up-context-details">
+            <summary>为什么现在 · 依据原话</summary>
+            <p className="follow-up-reason-text">{semanticFollowUp.whyNow ?? semanticFollowUp.reason}</p>
             {semanticFollowUp.evidenceQuote ? (
               <div className="follow-up-evidence" aria-label="依据原话">
                 <span className="follow-up-field-label"><Quote size={12} aria-hidden="true" />依据原话</span>
                 <p>{semanticFollowUp.evidenceQuote}</p>
               </div>
             ) : null}
+            </details>
             <div className="suggestion-footer">
               {semanticFollowUp.evidenceSegmentIds[0] ? (
                 <button
@@ -420,6 +411,7 @@ export function CoachSignals({ historyOnly = false, followUp, semanticFollowUp: 
             data-ui-render-job-id={suggestion.jobId ?? suggestion.formalAi?.jobId ?? undefined}
           >
             <blockquote>{text}</blockquote>
+            {suggestion.sourceEvidence?.length ? <SourceEvidenceList evidence={suggestion.sourceEvidence} api={knowledgeApi} meetingId={sourceMeetingId ?? suggestion.meetingId} onTranscript={onEvidence} onDocument={onKnowledgeSource} stale={suggestion.status === "superseded"} /> : null}
             <div className="suggestion-footer">
               <button
                 className="evidence-link"
@@ -459,7 +451,7 @@ export function CoachSignals({ historyOnly = false, followUp, semanticFollowUp: 
               </div>
             </div>
           </div>
-        ) : (
+        ) : historyOnly || suppressEmptyExpectation && !coachLifecycle || suppressActivityStatus && (coachLifecycle || coachRuntime?.state === "error" || coachRuntime?.state === "busy") ? null : (
           <div className="coach-loop-empty" data-state={coachLifecycle?.state ?? coachRuntime?.state ?? "idle"}>
             <div className="coach-lifecycle-heading">
               <strong>{coachRuntime?.state === "error" ? "Pi 补充暂不可用" : coachLifecycle?.label ?? "正在积累讨论内容"}</strong>
@@ -477,9 +469,9 @@ export function CoachSignals({ historyOnly = false, followUp, semanticFollowUp: 
 
 
         {pastCoachHistory.length ? (
-          <div className="coach-history">
-            <div className="coach-history-heading">
-              <span><History size={13} />过去建议 <small>{pastCoachHistory.length}</small></span>
+          <details className="coach-history">
+            <summary className="coach-history-heading"><span><History size={13} />过去建议 <small>{pastCoachHistory.length}</small></span></summary>
+            <div className="coach-history-toolbar">
               {pastCoachHistory.length > 3 ? (
                 <button
                   className="icon-button icon-button--small"
@@ -502,6 +494,7 @@ export function CoachSignals({ historyOnly = false, followUp, semanticFollowUp: 
                       <time dateTime={new Date(item.createdAtMs).toISOString()}>{coachHistoryTime(item.createdAtMs)}</time>
                       <span>{coachLabel(item)}</span>
                       <CoachOriginBadge origin={item.origin} compact />
+                      <DiscussionBasisTime frozenAtMs={item.frozenAtMs} />
                       {coachHistoryState(item, nowMs) ? (
                         <span className="coach-history-state">{coachHistoryState(item, nowMs)}</span>
                       ) : null}
@@ -509,11 +502,15 @@ export function CoachSignals({ historyOnly = false, followUp, semanticFollowUp: 
                     {evidenceId ? (
                       <button type="button" onClick={() => onEvidence(evidenceId)}>{item.question}</button>
                     ) : <p>{item.question}</p>}
+                    <details className="coach-evidence-details">
+                      <summary>查看当时建议与依据</summary>
+                      <PiSupplement value={item} stale={item.status === "stale" || ["retracted", "superseded"].includes(item.lifecycleStatus ?? "")} onEvidence={onEvidence} knowledgeApi={knowledgeApi} meetingId={sourceMeetingId ?? ""} onKnowledgeSource={onKnowledgeSource} />
+                    </details>
                   </li>
                 );
               })}
             </ol>
-          </div>
+          </details>
         ) : null}
       </section>
 

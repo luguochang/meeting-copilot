@@ -38,7 +38,7 @@ def test_llm_provider_probe_fails_closed_when_not_configured(monkeypatch):
     assert response.json()["detail"]["error"] == "llm_not_configured"
 
 
-def test_llm_provider_probe_uses_running_service_configuration(monkeypatch):
+def test_llm_provider_probe_uses_running_service_configuration(monkeypatch, tmp_path):
     calls = []
 
     class Client:
@@ -52,10 +52,11 @@ def test_llm_provider_probe_uses_running_service_configuration(monkeypatch):
     monkeypatch.setenv("LLM_GATEWAY_API_KEY", "sk-probe-secret")
     monkeypatch.setenv("LLM_GATEWAY_MODEL", "probe-model")
     monkeypatch.setenv("LLM_GATEWAY_REALTIME_MODEL", "probe-fast-model")
+    monkeypatch.setenv("LLM_GATEWAY_API_STYLE", "chat_completions")
     monkeypatch.delenv("LLM_GATEWAY_IS_MOCK", raising=False)
     monkeypatch.setattr(llm_service, "HttpxLlmClient", lambda: Client())
 
-    client = TestClient(create_app())
+    client = TestClient(create_app(data_dir=tmp_path))
     response = client.post("/providers/llm/probe", headers=PROBE_HEADERS)
 
     assert response.status_code == 200

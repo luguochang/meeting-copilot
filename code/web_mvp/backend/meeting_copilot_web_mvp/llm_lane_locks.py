@@ -45,6 +45,10 @@ class LaneLockRegistry:
             lock = self._locks.get(key)
             return bool(lock is not None and lock.locked())
 
+    def any_active(self, lanes: set[str]) -> bool:
+        with self._guard:
+            return any(lane in lanes and lock.locked() for (_, lane), lock in self._locks.items())
+
     def try_acquire(self, meeting_id: str, lane: str) -> LaneLease | None:
         key = (str(meeting_id), str(lane))
         with self._guard:
@@ -98,6 +102,8 @@ class ProviderLaneRegistry:
         self._pending_deep: set[str] = set()
         self._active_deep: set[str] = set()
         self._active_correction = 0
+        self._reconcile_guard = Lock()
+        self._active_reconcile = 0
 
     @property
     def realtime_max_active(self) -> int:
@@ -302,6 +308,45 @@ class ProviderLaneRegistry:
         """Compatibility alias for callers not yet renamed to correction."""
 
         return self.try_acquire_correction()
+
+    @property
+    def has_urgent_work(self) -> bool:
+        """User-facing realtime/deep work preempts discussion understanding."""
+
+        return bool(self.active_realtime_count or self.pending_realtime_count or self.active_deep_count
+                    or self.pending_deep_count)
+
+    @property
+    def has_priority_work(self) -> bool:
+        """General project/memory reconciliation also yields to correction."""
+
+        return self.has_urgent_work or bool(self.active_correction_count)
+
+    def try_acquire_reconcile(self) -> LaneLease | None:
+        """One interruptible background task; never hold a guard used by realtime."""
+        return self._try_acquire_reconcile(allow_correction=False)
+
+    def try_acquire_discussion_state(self) -> LaneLease | None:
+        """Share the background lease without starvation from ongoing correction.
+
+        Canonical revision fences still reject stale state; correction being
+        active alone is not evidence that the frozen transcript changed.
+        """
+
+        return self._try_acquire_reconcile(allow_correction=True)
+
+    def _try_acquire_reconcile(self, *, allow_correction: bool) -> LaneLease | None:
+        with self._reconcile_guard:
+            priority_work = self.has_urgent_work if allow_correction else self.has_priority_work
+            if self._active_reconcile or priority_work:
+                return None
+            self._active_reconcile = 1
+
+        def release() -> None:
+            with self._reconcile_guard:
+                self._active_reconcile = 0
+
+        return LaneLease(release)
 
 
 # Keep the old import name for downstream callers while removing its shared

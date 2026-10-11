@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import json
+import math
 from typing import Any, Mapping
 
 
@@ -237,3 +239,129 @@ def value_text(value: Any, *keys: str) -> str:
                 return str(candidate).strip()
         return ""
     return str(value or "").strip()
+
+
+_LIBRARY_STATUS_LABELS = {
+    "confirmed": "已确认", "candidate": "待确认", "dismissed": "已放弃",
+    "open": "待处理", "in_progress": "进行中", "done": "已完成",
+    "unknown": "待核对", "needs_review": "待核对",
+}
+_LIBRARY_METADATA_KEYS = frozenset({
+    "id", "segment_id", "segmentId", "transcript_seq", "transcriptSeq",
+    "evidence_segment_id", "evidenceSegmentId", "evidence_segment_ids", "evidenceSegmentIds",
+    "evidence_hash", "evidenceHash", "speaker_id", "speakerId", "speaker_confidence", "speakerConfidence",
+})
+
+
+def _library_json_section(label: str, value: Any) -> str:
+    return f"{label}\n\n```json\n{json.dumps(value, ensure_ascii=False, indent=2)}\n```"
+
+
+def _library_status(value: Any) -> str:
+    if value is None or value == "":
+        return "未标明"
+    if isinstance(value, str) and value in _LIBRARY_STATUS_LABELS:
+        return _LIBRARY_STATUS_LABELS[value]
+    original = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    return f"待核对（原状态：{original}）"
+
+
+def _library_extra_fields(item: Mapping[str, Any], consumed: set[str]) -> dict[str, Any]:
+    # These IDs remain in the original saved source and provenance, not the reading body.
+    extra = {key: value for key, value in item.items() if key not in consumed | _LIBRARY_METADATA_KEYS}
+    evidence = extra.get("evidence")
+    if isinstance(evidence, Mapping):
+        remaining = {key: value for key, value in evidence.items()
+                     if key not in _LIBRARY_METADATA_KEYS | {"hash", "revision"}}
+        if remaining:
+            extra["evidence"] = remaining
+        else:
+            extra.pop("evidence")
+    return extra
+
+
+def _library_item_content(kind: str, item: Any) -> str:
+    if isinstance(item, str):
+        if not item.strip():
+            return _library_json_section("原始条目（空正文，完整保留）", item)
+        return f"- {item}\n  状态：未标明" if kind != "transcript" else item
+    if not isinstance(item, Mapping):
+        return _library_json_section("原始条目（未识别结构，完整保留）", item)
+    text_keys = ("normalized_text", "text") if kind == "transcript" else ("text", "item")
+    text_key = next((key for key in text_keys if isinstance(item.get(key), str) and item[key].strip()), None)
+    if text_key is None:
+        return _library_json_section("原始条目（未识别正文，完整保留）", item)
+    consumed = {text_key}
+    if kind == "transcript":
+        segment: dict[str, Any] = {"text": item[text_key]}
+        for target, aliases in (
+            ("started_at_ms", ("started_at_ms", "startedAtMs")),
+            ("ended_at_ms", ("ended_at_ms", "endedAtMs")),
+            ("speaker_label", ("speaker_label", "speakerLabel")),
+        ):
+            selected = next((key for key in aliases if item.get(key) is not None), None)
+            if selected is not None:
+                segment[target] = item[selected]
+                consumed.add(selected)
+        timing = [segment.get(key) for key in ("started_at_ms", "ended_at_ms")]
+        if any(value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))
+                                     or isinstance(value, float) and not math.isfinite(value) or value < 0)
+               for value in timing):
+            return _library_json_section("原始条目（时间格式待核对，完整保留）", item)
+        if timing[0] is not None and timing[1] is not None and timing[1] < timing[0]:
+            return _library_json_section("原始条目（时间顺序待核对，完整保留）", item)
+        if timing[0] is not None:
+            rendered = transcript_display_line(segment)
+        else:
+            speaker = value_text(segment, "speaker_label")
+            rendered = f"{speaker}：{item[text_key]}" if speaker else item[text_key]
+            if timing[1] is not None:
+                rendered = f"[结束 {format_offset(timing[1])}] {rendered}"
+    else:
+        consumed.add("status")
+        rendered = f"- {value_text(item, text_key)}\n  状态：{_library_status(item.get('status'))}"
+        if kind == "action_items":
+            details = (("负责人", ("owner",)), ("截止时间", ("deadline", "due", "due_date", "dueDate")))
+        elif kind == "risks":
+            details = (("级别", ("severity", "level")), ("缓解措施", ("mitigation",)),
+                       ("负责人", ("owner",)), ("影响", ("impact",)), ("概率", ("probability",)))
+        else:
+            details = ()
+        for label, aliases in details:
+            selected = next((key for key in aliases if key in item), None)
+            if selected is not None:
+                value = item[selected]
+                display = "未填写" if value is None else value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+                rendered += f"\n  {label}：{display}"
+                consumed.add(selected)
+    extra = _library_extra_fields(item, consumed)
+    return f"{rendered}\n\n{_library_json_section('补充字段（原值保留）', extra)}" if extra else rendered
+
+
+def review_library_content(kind: str, content: Any) -> str:
+    """Render only new copied bodies; raw source/hash/version and old copies stay authoritative."""
+    if isinstance(content, str):
+        return content
+    if kind == "minutes":
+        markdown = content.get("markdown") if isinstance(content, Mapping) else None
+        return markdown if isinstance(markdown, str) else json.dumps(content, ensure_ascii=False, indent=2)
+    headings = {"decisions": "决策记录", "action_items": "待办", "risks": "风险", "transcript": "会议文字"}
+    if kind not in headings:
+        return _library_json_section("原始内容（未识别文稿类型，完整保留）", content)
+    items = content_items(content, kind)
+    if items is None:
+        markdown = content.get("markdown") if isinstance(content, Mapping) else None
+        if isinstance(markdown, str) and set(content) == {"markdown"}:
+            return markdown
+        return _library_json_section("原始内容（未识别结构，完整保留）", content)
+    parts = [f"## {headings[kind]}"]
+    parts.extend(_library_item_content(kind, item) for item in items)
+    if not items:
+        parts.append("此终稿列表为空。")
+    if isinstance(content, Mapping):
+        keys = (kind, "items", "segments") if kind == "transcript" else (kind, "items")
+        selected_key = next(key for key in keys if content.get(key) is not None)
+        extra = {key: value for key, value in content.items() if key != selected_key}
+        if extra:
+            parts.append(_library_json_section("补充内容（原值保留）", extra))
+    return "\n\n".join(parts)

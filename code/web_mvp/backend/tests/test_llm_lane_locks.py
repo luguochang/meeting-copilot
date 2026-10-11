@@ -150,3 +150,70 @@ def test_provider_lane_reconciles_stale_pending_work_but_keeps_active_lease():
 
     active.release()
     correction.release()
+
+
+def test_discussion_state_admission_does_not_wait_for_continuous_correction():
+    registry = ProviderLaneRegistry()
+    correction = registry.try_acquire_correction()
+    assert correction is not None
+    try:
+        # Generic project/memory reconciliation must retain its old policy.
+        assert registry.has_priority_work
+        assert registry.try_acquire_reconcile() is None
+        assert registry.has_urgent_work is False
+        state = registry.try_acquire_discussion_state()
+        assert state is not None
+        try:
+            assert registry.active_correction_count == 1
+            assert registry.try_acquire_correction() is None
+            assert registry.try_acquire_discussion_state() is None
+            assert registry.try_acquire_reconcile() is None
+        finally:
+            state.release()
+    finally:
+        correction.release()
+
+
+def test_discussion_state_and_project_reconcile_share_one_background_lease():
+    registry = ProviderLaneRegistry()
+    project = registry.try_acquire_reconcile()
+    assert project is not None
+    try:
+        assert registry.try_acquire_discussion_state() is None
+    finally:
+        project.release()
+    state = registry.try_acquire_discussion_state()
+    assert state is not None
+    try:
+        # New correction can progress without stealing the state lease.
+        correction = registry.try_acquire_correction()
+        assert correction is not None
+        correction.release()
+        assert registry.try_acquire_reconcile() is None
+    finally:
+        state.release()
+    state.release()
+    next_project = registry.try_acquire_reconcile()
+    assert next_project is not None
+    next_project.release()
+
+
+@pytest.mark.parametrize("lane,active", [("realtime", False), ("realtime", True), ("deep", False), ("deep", True)])
+def test_discussion_state_preserves_urgent_pending_and_active_priority(lane, active):
+    registry = ProviderLaneRegistry()
+    getattr(registry, f"reserve_{lane}")("urgent")
+    lease = getattr(registry, f"try_acquire_{lane}")("urgent") if active else None
+    try:
+        assert registry.has_urgent_work
+        assert registry.try_acquire_discussion_state() is None
+    finally:
+        if lease is not None:
+            lease.release()
+        if lane == "deep":
+            registry.release_deep("urgent")
+        else:
+            registry.release_realtime_reservation("urgent")
+    assert registry.has_urgent_work is False
+    state = registry.try_acquire_discussion_state()
+    assert state is not None
+    state.release()

@@ -742,9 +742,12 @@ def _create_verified_backup(
     timeout_seconds: float,
 ) -> Path:
     backup_dir.mkdir(parents=True, exist_ok=True)
-    unique = f"{time.time_ns()}.{uuid4().hex}"
+    # A long source stem plus timestamp can push otherwise usable Windows
+    # runtime paths past the native SQLite/CRT path limit. UUID preserves the
+    # collision resistance; the directory and migration result identify the DB.
+    unique = uuid4().hex
     final_path = backup_dir / (
-        f"{database_path.stem}.pre-schema-v{source_version}-to-v{target_version}.{unique}.sqlite3"
+        f"schema-v{source_version}-v{target_version}.{unique}.sqlite3"
     )
     temporary_path = backup_dir / f".{final_path.name}.tmp"
     descriptor = _create_owner_only_regular_file(temporary_path)

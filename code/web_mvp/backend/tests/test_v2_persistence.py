@@ -52,6 +52,26 @@ def _commit_final(
     )
 
 
+def test_successful_correction_gate_skip_does_not_claim_text_was_checked(persistence):
+    committed = _commit_final(persistence)
+    job = persistence.claim_next_job(worker_id="correction", lane="correction", now_ms=1100, lease_ms=5000)
+    assert job["id"] == committed["job_ids"]["correction"]
+    persistence.complete_job(job_id=job["id"], worker_id="correction", now_ms=1200,
+                             output={"called": False, "gate": {"reason": "batch_accumulating"}})
+    segment = persistence.get_snapshot("meeting-1")["segments"][0]
+    assert segment["correction_status"] == "pending"
+    assert segment["correction_after_text"] is None
+
+
+def test_explicit_unchanged_result_survives_generic_job_completion(persistence):
+    _commit_final(persistence)
+    job = persistence.claim_next_job(worker_id="correction", lane="correction", now_ms=1100, lease_ms=5000)
+    persistence.mark_correction_segments_no_change(meeting_id="meeting-1", segment_ids=["segment-1"],
+                                                  max_input_transcript_seq=1, now_ms=1150)
+    persistence.complete_job(job_id=job["id"], worker_id="correction", now_ms=1200, output={"called": True})
+    assert persistence.get_snapshot("meeting-1")["segments"][0]["correction_status"] == "no_change"
+
+
 @pytest.fixture
 def persistence(tmp_path):
     instance = V2Persistence(tmp_path / "meeting_copilot.db")
@@ -4644,7 +4664,7 @@ def test_transcript_and_meeting_event_sequences_are_independent(persistence):
     assert second["event_seq"] > first["event_seq"]
 
 
-def test_transcript_revision_updates_canonical_fact_and_outbox_atomically(persistence):
+def test_format_revision_updates_canonical_fact_and_outbox_atomically(persistence):
     committed = _commit_final(persistence)
 
     suggestion = persistence.upsert_suggestion_draft(
@@ -4673,7 +4693,7 @@ def test_transcript_revision_updates_canonical_fact_and_outbox_atomically(persis
         meeting_id="meeting-1",
         segment_id="segment-1",
         expected_evidence_hash="hash-final-1",
-        corrected_text="我们需要确认发布负责人和回滚时间点。",
+        corrected_text="我们需要确认发布负责人和回滚时间",
         revision_id="revision-1",
         now_ms=2_000,
         correlation_id="meeting-1",
@@ -4684,13 +4704,13 @@ def test_transcript_revision_updates_canonical_fact_and_outbox_atomically(persis
         meeting_id="meeting-1",
         segment_id="segment-1",
         expected_evidence_hash="hash-final-1",
-        corrected_text="我们需要确认发布负责人和回滚时间点。",
+        corrected_text="我们需要确认发布负责人和回滚时间",
         revision_id="revision-1",
         now_ms=2_100,
     )
 
     assert revised["revision"] == 2
-    assert revised["normalized_text"] == "我们需要确认发布负责人和回滚时间点。"
+    assert revised["normalized_text"] == "我们需要确认发布负责人和回滚时间"
     assert revised["evidence_hash"] != "hash-final-1"
     assert duplicate == revised
     with pytest.raises(TranscriptRevisionIdentityConflict, match="idempotency key conflicts"):
@@ -4792,6 +4812,19 @@ def test_meeting_end_and_suggestion_feedback_are_durable_events(persistence):
         "suggestion.feedback.updated",
         "meeting.ended",
     ]
+
+
+def test_feedback_toggle_back_remains_auditable_and_repeat_is_idempotent(persistence):
+    committed = _commit_final(persistence)
+    persistence.upsert_suggestion_draft(suggestion_id="feedback-toggle", meeting_id="meeting-1", job_id=committed["job_ids"]["suggestion"],
+                                       generation_id="feedback-gen", evidence_segment_id="segment-1", evidence_transcript_seq=1,
+                                       evidence_hash="hash-final-1", state_revision=1, draft_text="建议", draft_seq=1, now_ms=2000)
+    for value in ("kept", "ignored", "kept", "kept"):
+        persistence.save_suggestion_feedback(meeting_id="meeting-1", suggestion_id="feedback-toggle", feedback=value, now_ms=2100)
+    events = [event for event in persistence.list_events("meeting-1") if event["type"] == "suggestion.feedback.updated"]
+    assert [event["payload"]["feedback"] for event in events] == ["kept", "ignored", "kept"]
+    assert events[-1]["payload"]["feedback_context"]["generation_id"] == "feedback-gen"
+    assert events[-1]["payload"]["feedback_context"]["evidence_hash"] == "hash-final-1"
 
 
 def test_meeting_end_enqueues_one_replacement_after_terminal_correction_failure(persistence):
@@ -5950,6 +5983,46 @@ def test_history_search_status_and_cursor_are_database_backed(persistence):
     )
     assert [item["id"] for item in live["meetings"]] == ["meeting-a"]
     assert {item["id"] for item in ready["meetings"]} == {"meeting-b", "meeting-c"}
+
+
+def test_snapshot_resumed_capture_is_active_without_erasing_prior_export_failure(persistence, monkeypatch):
+    meeting_id = "resumed-after-export-failure"
+    persistence.begin_recording(
+        meeting_id=meeting_id, track="microphone", epoch=1,
+        source_type="browser_live_mic", sample_rate_hz=16_000,
+        lease_owner="old-capture", lease_ms=30_000, now_ms=1_000,
+    )
+    persistence.record_audio_chunk(
+        meeting_id=meeting_id, track="microphone", epoch=1, chunk_seq=0,
+        relative_path=f"audio_assets/{meeting_id}/chunks/chunk-00000000.pcm",
+        sha256="a" * 64, sample_rate_hz=16_000, sample_count=16_000,
+        duration_ms=1_000, file_size_bytes=32_000, now_ms=1_100,
+    )
+    persistence.seal_recording_and_enqueue_export(
+        meeting_id=meeting_id, track="microphone", epoch=1,
+        lease_owner="old-capture", output_relative_path=f"audio_assets/{meeting_id}/audio.wav",
+        interrupted=True, now_ms=1_200,
+    )
+    for attempt in range(3):
+        job = persistence.claim_next_recording_export(worker_id="exporter", now_ms=2_000 + attempt, lease_ms=1_000)
+        persistence.retry_recording_export(
+            export_id=job["id"], worker_id="exporter", error_class="ValueError",
+            next_attempt_at_ms=2_000 + attempt, now_ms=2_000 + attempt,
+        )
+    assert persistence.get_recording_session(meeting_id, track="microphone", epoch=1)["status"] == "failed"
+    persistence.begin_recording(
+        meeting_id=meeting_id, track="microphone", epoch=4,
+        source_type="browser_live_mic", sample_rate_hz=16_000,
+        lease_owner="resumed-capture", lease_ms=30_000, now_ms=3_000,
+    )
+    monkeypatch.setattr("meeting_copilot_web_mvp.v2_persistence.time.time_ns", lambda: 4_000 * 1_000_000)
+    snapshot = persistence.get_snapshot(meeting_id)
+    assert snapshot["audio"]["status"] == "recording"
+    assert snapshot["runtime"]["recording"] == {"state": "active", "label": "正在录音"}
+    assert snapshot["runtime"]["capture"]["active_track_count"] == 1
+    assert persistence.get_recording_session(meeting_id, track="microphone", epoch=1)["error_class"] == "ValueError"
+    monkeypatch.setattr("meeting_copilot_web_mvp.v2_persistence.time.time_ns", lambda: 33_001 * 1_000_000)
+    assert persistence.get_snapshot(meeting_id)["audio"]["status"] == "failed"
 
 
 def test_history_and_snapshot_project_capture_lease_freshness(persistence, monkeypatch):

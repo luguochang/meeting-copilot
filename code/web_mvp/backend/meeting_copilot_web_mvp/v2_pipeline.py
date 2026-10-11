@@ -347,6 +347,7 @@ class DurableJobExecutor:
         *,
         meeting_id: str,
         replacement_job_id: str,
+        expected_job_id: str | None = None,
     ) -> bool:
         """Cancel obsolete in-flight work when the same meeting has fresher evidence."""
 
@@ -357,6 +358,7 @@ class DurableJobExecutor:
             active is None
             or str(active.get("meeting_id") or "") != str(meeting_id)
             or str(active.get("id") or "") == str(replacement_job_id)
+            or (expected_job_id is not None and str(active.get("id") or "") != str(expected_job_id))
         ):
             return False
         self._supersede_events[lane].set()
@@ -428,6 +430,8 @@ class DurableJobExecutor:
         job: dict[str, Any],
     ) -> None:
         resume_generation = self._resume_generations[lane]
+        claim_kwargs = ({"expected_attempt": int(job["attempts"])}
+                        if job.get("kind") in {"minutes", "approach", "index"} else {})
         handler_task = asyncio.create_task(
             self._invoke_handler(self._handlers[lane], job),
             name=f"v2-handler-{lane}-{job['id']}",
@@ -456,6 +460,7 @@ class DurableJobExecutor:
                     worker_id=worker_id,
                     now_ms=self._clock_ms(),
                     error_class="evidence_superseded",
+                    **claim_kwargs,
                 )
                 if cancelled is None:
                     self._logger.warning(
@@ -496,6 +501,7 @@ class DurableJobExecutor:
                         worker_id=worker_id,
                         now_ms=self._clock_ms(),
                         error_class="lease_lost",
+                        **claim_kwargs,
                     )
                     if cancelled is None:
                         self._notify_lifecycle(
@@ -547,6 +553,7 @@ class DurableJobExecutor:
                 worker_id=worker_id,
                 now_ms=self._clock_ms(),
                 output=output,
+                **claim_kwargs,
             )
             if completed is None:
                 self._logger.warning("Lost lease before completing V2 %s job %s", lane, job["id"])
@@ -593,6 +600,8 @@ class DurableJobExecutor:
     ) -> None:
         now_ms = self._clock_ms()
         attempt = max(1, int(job.get("attempts") or 1))
+        claim_kwargs = ({"expected_attempt": attempt}
+                        if job.get("kind") in {"minutes", "approach", "index"} else {})
         delay_ms = min(
             self._retry_max_ms,
             self._retry_initial_ms * (2 ** (attempt - 1)),
@@ -615,6 +624,7 @@ class DurableJobExecutor:
                 worker_id=worker_id,
                 now_ms=now_ms,
                 error_class="deadline_exceeded",
+                **claim_kwargs,
             )
         elif getattr(error, "superseded", False):
             retried = await asyncio.to_thread(
@@ -623,6 +633,7 @@ class DurableJobExecutor:
                 worker_id=worker_id,
                 now_ms=now_ms,
                 error_class="evidence_superseded",
+                **claim_kwargs,
             )
         elif getattr(error, "preserve_attempt", False):
             retried = await asyncio.to_thread(
@@ -632,16 +643,25 @@ class DurableJobExecutor:
                 now_ms=now_ms,
                 next_attempt_at_ms=now_ms + delay_ms,
                 error_class=error_class,
+                **claim_kwargs,
             )
         elif getattr(error, "retryable", True) is False:
+            failure_kwargs = {}
+            if getattr(error, "safe_failure_output", None) is not None:
+                failure_kwargs["failure_output"] = error.safe_failure_output
             retried = await asyncio.to_thread(
                 self._persistence.fail_job,
                 job_id=job["id"],
                 worker_id=worker_id,
                 now_ms=now_ms,
                 error_class=error_class,
+                **failure_kwargs,
+                **claim_kwargs,
             )
         else:
+            failure_kwargs = {}
+            if getattr(error, "safe_failure_output", None) is not None:
+                failure_kwargs["failure_output"] = error.safe_failure_output
             retried = await asyncio.to_thread(
                 self._persistence.retry_job,
                 job_id=job["id"],
@@ -649,6 +669,8 @@ class DurableJobExecutor:
                 now_ms=now_ms,
                 next_attempt_at_ms=now_ms + delay_ms,
                 error_class=error_class,
+                **failure_kwargs,
+                **claim_kwargs,
             )
         if retried is None:
             self._logger.warning("Lost lease before retrying V2 job %s", job["id"])

@@ -227,7 +227,20 @@ def test_provider_status_is_stable_across_refresh_probe_and_model_switch(monkeyp
             "last_failure_class": last_failure_class,
         }
 
-    assert client.get("/providers/status", headers=headers).json() == {
+    def status_fields(response):
+        body = response.json()
+        lanes = body.pop("provider_lanes")
+        assert set(lanes) == {"answer", "pi_realtime", "pi_deep", "direct_semantic", "correction"}
+        for name, lane in lanes.items():
+            assert lane["configured"] is body["configured"]
+            assert lane["model"] == body["correction_model" if name == "correction" else "realtime_model"]
+            assert lane["probe_status"] == (body["probe_status"] if name == "pi_realtime" else "not_run")
+        assert lanes["pi_realtime"]["circuit"] == body["realtime_circuit"]
+        assert lanes["answer"]["circuit_status"] == "not_applicable"
+        assert lanes["correction"]["circuit_status"] == "not_applicable"
+        return body
+
+    assert status_fields(client.get("/providers/status", headers=headers)) == {
         "configured": False,
         "runtime_synced": False,
         "probe_status": "not_run",
@@ -261,7 +274,7 @@ def test_provider_status_is_stable_across_refresh_probe_and_model_switch(monkeyp
         },
     )
     assert configured.status_code == 200
-    assert client.get("/providers/status", headers=headers).json() == {
+    assert status_fields(client.get("/providers/status", headers=headers)) == {
         "configured": True,
         "runtime_synced": True,
         "probe_status": "not_run",
@@ -342,8 +355,8 @@ def test_provider_status_is_stable_across_refresh_probe_and_model_switch(monkeyp
         "realtime_cutoff_ms": 2500,
         "realtime_circuit": circuit(identity_generation=3),
     }
-    assert client.get("/providers/status", headers=headers).json() == expected_connected
-    second_app_status = TestClient(create_app()).get("/providers/status", headers=headers).json()
+    assert status_fields(client.get("/providers/status", headers=headers)) == expected_connected
+    second_app_status = status_fields(TestClient(create_app()).get("/providers/status", headers=headers))
     # The circuit generation is process-local in the in-memory test app; all
     # provider-facing fields remain stable across app refresh.
     assert second_app_status == {
@@ -362,7 +375,7 @@ def test_provider_status_is_stable_across_refresh_probe_and_model_switch(monkeyp
         },
     )
     assert switched.status_code == 200
-    assert client.get("/providers/status", headers=headers).json() == {
+    assert status_fields(client.get("/providers/status", headers=headers)) == {
         "configured": True,
         "runtime_synced": True,
         "probe_status": "not_run",
@@ -397,7 +410,7 @@ def test_provider_status_is_stable_across_refresh_probe_and_model_switch(monkeyp
         },
     )
     assert failed_probe.status_code == 502
-    assert client.get("/providers/status", headers=headers).json() == {
+    assert status_fields(client.get("/providers/status", headers=headers)) == {
         "configured": True,
         "runtime_synced": True,
         "probe_status": "failed",

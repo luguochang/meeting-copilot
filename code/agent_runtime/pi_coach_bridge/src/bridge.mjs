@@ -40,9 +40,10 @@ const FAILURE_METRIC_KEYS = [
   "error_code",
   "error_category",
   "usage",
+  "timings",
 ];
 
-function safeFailureMetrics(error) {
+export function safeFailureMetrics(error) {
   const source = error?.metrics;
   if (!source || typeof source !== "object" || Array.isArray(source)) {
     const fallback = {};
@@ -61,6 +62,14 @@ function safeFailureMetrics(error) {
       result[key] = value;
     } else if (Array.isArray(value)) {
       result[key] = value.slice(0, 8);
+    } else if (value && typeof value === "object" && !Array.isArray(value) && key === "timings") {
+      if (value.clock !== "unix_epoch_ms") continue;
+      result.timings = { clock: "unix_epoch_ms" };
+      for (const field of ["started_at_ms", "first_token_at_ms", "completed_at_ms"]) {
+        if (value[field] === null || Number.isFinite(value[field]) && value[field] >= 0) {
+          result.timings[field] = value[field];
+        }
+      }
     } else if (value && typeof value === "object" && !Array.isArray(value) && key === "usage") {
       result[key] = {};
       for (const usageKey of [
@@ -105,7 +114,8 @@ function writeJson(payload) {
 }
 
 export async function runStdio(runtime = new PiCoachRuntime()) {
-  writeJson({ protocol: PROTOCOL, event: "ready", pid: process.pid });
+  writeJson({ protocol: PROTOCOL, event: "ready", pid: process.pid,
+    capabilities: ["participation.v1", "meeting_attachment.v1"] });
   const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
   let active = null;
   let channel = null;
@@ -127,12 +137,18 @@ export async function runStdio(runtime = new PiCoachRuntime()) {
         continue;
       }
       channel = request.host_evidence_enabled === true
-        ? new HostToolChannel(request.request_id, (payload) => writeJson({ protocol: PROTOCOL, ...payload }))
+        ? new HostToolChannel(request.request_id, (payload) => writeJson({ protocol: PROTOCOL, ...payload }),
+          { maxCalls: request.context?.task_mode === "meeting_preparation" ? 5 : request.context?.task_mode === "memory_reconcile" ? 3 : request.context?.task_mode === "project_reconcile" ? 6 : 4 })
         : null;
       const runChannel = channel;
       active = runtime.evaluate(request, {
         searchEvidence: runChannel ? (params) => runChannel.search(params) : null,
         readEvidenceSpan: runChannel ? (params) => runChannel.readSpan(params) : null,
+        searchDocuments: runChannel ? (params) => runChannel.searchDocuments(params) : null,
+        readProjectState: runChannel ? (params) => runChannel.readProjectState(params) : null,
+        proposeProjectChanges: runChannel ? (params) => runChannel.proposeProjectChanges(params) : null,
+        proposeMemoryUpdate: runChannel ? (params) => runChannel.proposeMemoryUpdate(params) : null,
+        submitPreparationBrief: runChannel ? (params) => runChannel.submitPreparationBrief(params) : null,
       }).then(writeJson, (error) => writeJson(errorPayload(request.request_id, error)))
         .finally(() => {
           runChannel?.close();

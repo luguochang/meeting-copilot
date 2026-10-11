@@ -508,6 +508,9 @@ def test_due_without_new_transcript_uses_pi_deep_recheck(
     app.state.pi_coach_runtime = object()
     persistence = app.state.v2_persistence
     now_ms = time.time_ns() // 1_000_000
+    app.state.meeting_preparation_store.save(
+        "due-local-recheck", meeting_goal="核对上线条件", updated_at_ms=now_ms,
+    )
     persistence.commit_final_and_enqueue(
         meeting_id="due-local-recheck",
         final_id="due-local-final-1",
@@ -529,6 +532,7 @@ def test_due_without_new_transcript_uses_pi_deep_recheck(
             occurred_at_ms=now_ms,
             idempotency_key="due-local-origin-event",
             payload={
+                "source": "llm_first", "llm_called": True,
                 "coach_decision": {
                     "decision_id": "due-local-decision-1",
                     "status": "intervention",

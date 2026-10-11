@@ -21,6 +21,8 @@ MIN_INTERVAL_MS = 15_000
 # Live finals still batch normally from MIN_BATCH_CHARS; backfills are split
 # into several auditable revisions instead of failing the whole transcript.
 MAX_BATCH_CHARS = 800
+MAX_READONLY_CONTEXT_CHARS = 600
+MAX_READONLY_CONTEXT_SEGMENTS = 3
 MIN_LENGTH_RATIO = 0.65
 MAX_LENGTH_RATIO = 1.40
 MIN_SIMILARITY = 0.65
@@ -190,6 +192,7 @@ def commit_batch_audit(
     degraded: bool = False,
     fallback: bool = True,
     retry: bool = False,
+    rejection_reasons: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     safe_batch_id = _safe_batch_id(batch_id)
     updated = dict(record)
@@ -222,6 +225,12 @@ def commit_batch_audit(
     }
     if error_code:
         audit["error_code"] = _safe_audit_value(error_code, fallback="provider_failed")
+    if rejection_reasons:
+        audit["rejection_reasons"] = {
+            segment_id: _safe_audit_value(rejection_reasons[segment_id], fallback="result_rejected")
+            for segment_id in audit["segment_ids"]
+            if segment_id in rejection_reasons
+        }
     audits = [
         dict(existing)
         for existing in list(correction_status.get("batch_audits") or [])
@@ -414,6 +423,25 @@ def decode_indexed_batch(corrected_batch: str, final_events: Iterable[dict[str, 
     return decoded
 
 
+def readonly_correction_context(record: dict[str, Any], segment_ids: Iterable[str]) -> str:
+    """Return only preceding evidence, bounded separately from editable text."""
+
+    targets = {str(segment_id) for segment_id in segment_ids}
+    preceding: list[str] = []
+    for event in effective_final_events(record):
+        payload = event.get("payload") or {}
+        segment_id = str(payload.get("supersedes_segment_id") or _event_segment_id(event))
+        if segment_id in targets:
+            break
+        text = _event_text(event)
+        if text:
+            preceding.append(text)
+    else:
+        # A missing target must not leak later speech into a causal request.
+        return ""
+    return "\n".join(preceding[-MAX_READONLY_CONTEXT_SEGMENTS:])[-MAX_READONLY_CONTEXT_CHARS:]
+
+
 def _batch_result(
     eligible: bool,
     reason: str,
@@ -465,23 +493,49 @@ def _revised_segment_ids(events: Iterable[dict[str, Any]]) -> set[str]:
 
 
 def _correction_is_safe(original: str, corrected: str) -> bool:
+    return correction_rejection_reason(original, corrected) is None
+
+
+def correction_rejection_reason(original: str, corrected: str) -> str | None:
+    """Explain a rejected edit with a bounded code, never with transcript text."""
+
     original = str(original or "").strip()
     corrected = str(corrected or "").strip()
-    if not original or not corrected or original == corrected:
-        return False
+    if not original or not corrected:
+        return "empty_text"
+    if original == corrected:
+        return "text_unchanged"
     if "<<<MC_" in corrected:
-        return False
+        return "batch_marker_in_text"
     normalized_original = _similarity_text(original)
     normalized_corrected = _similarity_text(corrected)
-    if not normalized_original or not normalized_corrected or normalized_original == normalized_corrected:
-        return False
+    if not normalized_original or not normalized_corrected:
+        return "empty_semantic_text"
+    if normalized_original == normalized_corrected:
+        return "format_only"
     length_ratio = len(normalized_corrected) / max(len(normalized_original), 1)
     if not MIN_LENGTH_RATIO <= length_ratio <= MAX_LENGTH_RATIO:
-        return False
+        return "length_ratio_out_of_bounds"
     if _fact_signature(original) != _fact_signature(corrected):
-        return False
+        return "meeting_fact_changed"
+    if _speech_mode_signature(original) != _speech_mode_signature(corrected):
+        return "speech_mode_changed"
     similarity = SequenceMatcher(None, normalized_original, normalized_corrected).ratio()
-    return similarity >= MIN_SIMILARITY
+    return None if similarity >= MIN_SIMILARITY else "text_similarity_too_low"
+
+
+def _speech_mode_signature(text: str) -> tuple[tuple[str, int], ...]:
+    # A close spelling match is insufficient when an edit turns a tentative,
+    # conditional or quoted utterance into a commitment. Leave ambiguous ASR
+    # wording in place rather than treating fluent output as acoustic truth.
+    markers = (
+        "可能", "也许", "大概", "未必", "好像", "似乎", "据说", "听说", "不一定",
+        "如果", "假如", "假设", "除非", "是否", "能否", "会不会", "是不是", "吗",
+        "尚未", "暂未", "没有", "并不", "不会", "不是", "不能", "不要", "不用",
+        "不", "没", "他说", "她说", "他们说", "有人说", "他认为", "她认为", "我觉得",
+        "“", "”", "‘", "’", '"',
+    )
+    return tuple((marker, text.count(marker)) for marker in markers if marker in text)
 
 
 def correction_is_safe(original: str, corrected: str) -> bool:

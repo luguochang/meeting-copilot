@@ -7,7 +7,7 @@ export interface CoachRequest {
   jobId: string;
   request: string;
   createdAtMs: number;
-  status: "sending" | "pending" | "succeeded" | "failed" | "no_change";
+  status: "sending" | "pending" | "succeeded" | "failed" | "timed_out" | "no_change";
   error?: string;
 }
 
@@ -22,7 +22,7 @@ function readRequests(key: string): CoachRequest[] {
       && typeof item.id === "string" && typeof item.answerId === "string"
       && typeof item.request === "string" && typeof item.jobId === "string"
       && typeof item.createdAtMs === "number"
-      && ["sending", "pending", "succeeded", "failed", "no_change"].includes(item.status));
+      && ["sending", "pending", "succeeded", "failed", "timed_out", "no_change"].includes(item.status));
   } catch { return []; }
 }
 
