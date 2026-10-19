@@ -1,5 +1,21 @@
 # 言迹 Talktrace
 
+> **想体验 Pi 实时参会教练等新增功能？请切换到 [`feat/pi-realtime-coach-agent-loop`](https://github.com/luguochang/meeting-copilot/tree/feat/pi-realtime-coach-agent-loop) 分支。**
+>
+> 该分支围绕「帮助使用者在讨论当场提出有价值的追问、替代方案和回应」继续开发，增加了 Pi Agent 教练、主动参与入口、本场资料转换与授权、项目资料/Wiki 复用，以及网页版会前—会中—会后流程。功能介绍、界面截图、Windows 网页版启动和配置说明集中在 [Pi 分支 README](https://github.com/luguochang/meeting-copilot/blob/feat/pi-realtime-coach-agent-loop/README.md)。这些分支新增能力尚未合并到 main；以下正文介绍 main 当前版本。
+
+已有本地仓库时，先提交或自行处理未保存的修改，再切换：
+
+```powershell
+git remote set-branches --add origin feat/pi-realtime-coach-agent-loop
+git fetch origin
+git switch feat/pi-realtime-coach-agent-loop
+```
+
+第一条命令把 Pi 分支加入 origin 的拉取范围，也适用于之前仅克隆 main 的 `--single-branch` 仓库。
+
+首次体验也可[直接按 Pi 分支 README 克隆和启动](https://github.com/luguochang/meeting-copilot/blob/feat/pi-realtime-coach-agent-loop/README.md#windows-快速启动)。该分支当前以 Windows 本机网页版为交付方式，不能把 main 的客户端安装包当作 Pi 新版。
+
 本地优先的中文技术会议工作台。言迹 Talktrace 将麦克风与系统音频采集、实时转写、证据化建议、会后复盘和个人笔记整合在一个桌面应用中。核心设计不是让单个模型同时承担低延迟和高准确率，而是采用“在线预览 + 离线精修 + 可选 LLM”的分层链路。
 
 [官网](https://talktrace.codexai.club/) · [GitHub](https://github.com/luguochang/meeting-copilot) · [CSDN 博客](https://blog.csdn.net/luguochang) · [AI 赞助商](https://codexai.club/)
